@@ -785,6 +785,7 @@ public:
     GPUTensor buf_dequant_;      // temp buffer for dequantized weights
     GPUTensor buf_logits_;       // [vocab_size] F32
     GPUTensor buf_scores_f32_;   // [n_experts] F32
+    GPUTensor buf_scores_bf16_;  // [n_experts] BF16
     GPUTensor buf_topk_vals_;    // [top_k] F32
     GPUTensor buf_topk_idx_;     // [top_k] I32
     GPUTensor buf_input_ids_;    // [MAX_SEQ_LEN] I32
@@ -1004,6 +1005,7 @@ public:
 
         // Decode: generate tokens one by one
         int position = (int)input_ids.size();
+        std::string token_buffer;
         for (int t = 0; t < max_tokens; t++) {
             // Sample from logits
             int next_token = sample_token(temperature, history);
@@ -1013,17 +1015,56 @@ public:
             history.push_back(next_token);
 
             std::string token_text = tokenizer_.decode({next_token});
-            if (g_log_tokens) {
-                printf("%s", token_text.c_str());
-                fflush(stdout);
+            token_buffer += token_text;
+
+            // Check if token_buffer ends with a complete UTF-8 character.
+            bool is_complete = true;
+            if (!token_buffer.empty()) {
+                int m = std::min((int)token_buffer.size(), 4);
+                for (int j = 1; j <= m; j++) {
+                    unsigned char b = token_buffer[token_buffer.size() - j];
+                    if ((b & 0xC0) != 0x80) { // Found leading byte or ASCII
+                        if ((b & 0x80) == 0) { // ASCII
+                            is_complete = true;
+                        } else if ((b & 0xE0) == 0xC0) {
+                            is_complete = (j >= 2);
+                        } else if ((b & 0xF0) == 0xE0) {
+                            is_complete = (j >= 3);
+                        } else if ((b & 0xF8) == 0xF0) {
+                            is_complete = (j >= 4);
+                        } else {
+                            is_complete = true; // invalid utf8 leading byte, just flush
+                        }
+                        break;
+                    }
+                }
             }
-            if (on_token) {
-                on_token(token_text);
+
+            if (is_complete) {
+                if (g_log_tokens) {
+                    printf("%s", token_buffer.c_str());
+                    fflush(stdout);
+                }
+                if (on_token) {
+                    on_token(token_buffer);
+                }
+                token_buffer.clear();
             }
 
             // Forward the new token
             forward_token(next_token, position);
             position++;
+        }
+
+        // Flush anything remaining in the buffer
+        if (!token_buffer.empty()) {
+            if (g_log_tokens) {
+                printf("%s", token_buffer.c_str());
+                fflush(stdout);
+            }
+            if (on_token) {
+                on_token(token_buffer);
+            }
         }
 
         if (g_log_tokens) {
@@ -1166,6 +1207,7 @@ private:
         buf_dequant_.alloc(128 * 1024 * 1024);  // 128 MB for largest dequant
         buf_logits_.alloc((size_t)cfg_.vocab_size * sizeof(float));
         buf_scores_f32_.alloc(cfg_.n_routed_experts * sizeof(float));
+        buf_scores_bf16_.alloc(cfg_.n_routed_experts * sizeof(__nv_bfloat16));
         buf_topk_vals_.alloc(cfg_.num_experts_per_tok * sizeof(float));
         buf_topk_idx_.alloc(cfg_.num_experts_per_tok * sizeof(int32_t));
         buf_input_ids_.alloc(sizeof(int32_t));
@@ -1635,13 +1677,12 @@ private:
             }
         } else {
             // Score-based routing
-            // scores = x @ gate_w.T -> [n_experts]
             // gate_w is BF16 [n_experts, dim]
-            gemm_bf16((__nv_bfloat16*)buf_scores_f32_.data, 1, n_experts, dim,
+            gemm_bf16(buf_scores_bf16_.bf16(), 1, n_experts, dim,
                       buf_hidden_.bf16(), lw.gate_w.bf16());
 
             // Convert to F32 and apply sqrtsoftplus
-            bf16_to_f32_cuda(buf_scores_f32_.f32(), (__nv_bfloat16*)buf_scores_f32_.data,
+            bf16_to_f32_cuda(buf_scores_f32_.f32(), buf_scores_bf16_.bf16(),
                              n_experts, main_stream_);
             sqrtsoftplus_cuda(buf_scores_f32_.f32(), buf_scores_f32_.f32(), n_experts, main_stream_);
 
