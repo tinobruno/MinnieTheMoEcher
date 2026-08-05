@@ -387,6 +387,14 @@ private:
                 }
             }
         }
+
+        std::string pattern = "\xe2\x96\x81";
+        size_t pos = 0;
+        while ((pos = result.find(pattern, pos)) != std::string::npos) {
+            result.replace(pos, pattern.length(), " ");
+            pos += 1;
+        }
+
         return result;
     }
 
@@ -1494,7 +1502,6 @@ private:
         int window = cfg_.sliding_window;
         bool dbg = (layer_id == 0 && position == 0);
 
-        if (layer_id == 0) LOG_INFO("    attn: wq_a dequant+gemm M=1 N=%d K=%d", q_lora, dim);
         // ── Q projection (low-rank) ─────────────────────────────────────────
         // q_raw = wq_a(x) -> [q_lora_rank]
         gemm_fp8_dequant(buf_lora_.bf16(), 1, q_lora, dim,
@@ -1507,7 +1514,6 @@ private:
                       lw.q_norm_w.bf16(), q_lora, cfg_.rms_norm_eps, main_stream_);
                 if (dbg) dump_bf16("q_normed", buf_lora_.bf16(), q_lora);
 
-        if (layer_id == 0) LOG_INFO("    attn: wq_b dequant+gemm M=1 N=%d K=%d", n_heads * head_dim_val, q_lora);
         // q = wq_b(q_normed) -> [n_heads * head_dim]
         gemm_fp8_dequant(buf_q_.bf16(), 1, n_heads * head_dim_val, q_lora,
                          buf_lora_.bf16(),
@@ -1524,7 +1530,6 @@ private:
                   position, rope_freqs_.f32(), false, main_stream_);
         
         // ── KV projection ───────────────────────────────────────────────────
-        if (layer_id == 0) LOG_INFO("    attn: wkv dequant+gemm M=1 N=%d K=%d", head_dim_val, dim);
         // kv = wkv(x) -> [head_dim]
         gemm_fp8_dequant(buf_kv_.bf16(), 1, head_dim_val, dim,
                          buf_hidden_.bf16(),
