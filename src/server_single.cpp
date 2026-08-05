@@ -625,12 +625,16 @@ public:
 
         auto& slot = cache_slots_[evict_slot];
         if (slot.layer_id >= 0) {
-            LOG_INFO("[ExpertCache] Evicted L%d E%d -> Loaded L%d E%d", 
-                     slot.layer_id, slot.expert_id, layer_id, expert_id);
+            if (g_log_experts) {
+                LOG_INFO("[ExpertCache] Evicted L%d E%d -> Loaded L%d E%d", 
+                         slot.layer_id, slot.expert_id, layer_id, expert_id);
+            }
             int64_t old_key = (int64_t)slot.layer_id * n_experts_ + slot.expert_id;
             key_to_slot_.erase(old_key);
         } else {
-            LOG_INFO("[ExpertCache] Loaded L%d E%d into free slot %d", layer_id, expert_id, evict_slot);
+            if (g_log_experts) {
+                LOG_INFO("[ExpertCache] Loaded L%d E%d into free slot %d", layer_id, expert_id, evict_slot);
+            }
         }
 
         slot.layer_id = layer_id;
