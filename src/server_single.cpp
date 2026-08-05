@@ -14,6 +14,13 @@
 #include <unistd.h>
 #include <sys/mman.h>
 #include <sys/stat.h>
+#include <stdlib.h>
+#include <map>
+#include <vector>
+#include <future>
+#include <mutex>
+#include <memory>
+#include "thread_pool.h"
 
 #include <cstdio>
 #include <cstdlib>
@@ -644,6 +651,10 @@ public:
             return nullptr;
         }
 
+        printf("\033[36m[CACHE] %s Layer %d Expert %d\033[0m\n", 
+               (evict_slot >= 0 && slot.layer_id >= 0) ? "Evicted & Loaded" : "Loaded", 
+               layer_id, expert_id);
+
         CUDA_CHECK(cudaMemcpyAsync(slot.gpu_data, stage.ptr, expert_block_size_,
                                     cudaMemcpyHostToDevice, stream));
         
@@ -671,8 +682,13 @@ class MoecherEngine {
 public:
     ModelConfig cfg_;
     BPETokenizer tokenizer_;
+    std::string model_dir_;
+    
+    // Thread pool for loading experts (max 16 concurrent reads)
+    std::unique_ptr<ThreadPool> expert_pool_;
+
+    cudaStream_t main_stream_;
     cublasHandle_t cublas_handle_ = nullptr;
-    cudaStream_t main_stream_ = 0;
     ExpertLoader expert_loader_;
 
     // ── Resident GPU tensors (loaded at startup) ────────────────────────────
@@ -789,6 +805,9 @@ public:
         CUDA_CHECK(cudaStreamCreate(&main_stream_));
         CUBLAS_CHECK(cublasCreate(&cublas_handle_));
         CUBLAS_CHECK(cublasSetStream(cublas_handle_, main_stream_));
+        cublasSetMathMode(cublas_handle_, CUBLAS_DEFAULT_MATH);
+
+        expert_pool_ = std::make_unique<ThreadPool>(16);
 
         // Determine available VRAM for expert cache
         size_t vram_free, vram_total;
@@ -959,14 +978,17 @@ public:
             forward_token(input_ids[i], (int)i);
         }
 
+        std::vector<int> history = input_ids;
+
         // Decode: generate tokens one by one
         int position = (int)input_ids.size();
         for (int t = 0; t < max_tokens; t++) {
             // Sample from logits
-            int next_token = sample_token(temperature);
+            int next_token = sample_token(temperature, history);
 
             if (next_token == cfg_.eos_token_id) break;
             output_ids.push_back(next_token);
+            history.push_back(next_token);
 
             if (on_token) {
                 on_token(tokenizer_.decode({next_token}));
@@ -1637,7 +1659,7 @@ private:
             int eid = expert_ids[k];
             if (eid < 0) continue;
 
-            expert_futures[k] = std::async(std::launch::async, [this, layer_id, eid]() {
+            expert_futures[k] = expert_pool_->enqueue([this, layer_id, eid]() {
                 return expert_loader_.get_expert(layer_id, eid, main_stream_);
             });
         }
@@ -1752,12 +1774,21 @@ private:
 
     // ── Sample from logits ──────────────────────────────────────────────────
 
-    int sample_token(float temperature) {
+    int sample_token(float temperature, const std::vector<int>& history) {
         int vocab = cfg_.vocab_size;
         std::vector<float> logits(vocab);
         CUDA_CHECK(cudaStreamSynchronize(main_stream_));
         CUDA_CHECK(cudaMemcpy(logits.data(), buf_logits_.f32(),
                                vocab * sizeof(float), cudaMemcpyDeviceToHost));
+
+        // Repetition penalty
+        float rep_penalty = 1.15f;
+        for (int token : history) {
+            if (token >= 0 && token < vocab) {
+                if (logits[token] > 0) logits[token] /= rep_penalty;
+                else logits[token] *= rep_penalty;
+            }
+        }
 
         // Debug: print top-5 logits on first decode
         static int dbg_count = 0;
@@ -1787,9 +1818,23 @@ private:
         }
         for (auto& l : logits) l /= sum_exp;
 
+        // Top-p (nucleus) sampling
+        float top_p = 0.9f;
+        std::vector<std::pair<float, int>> probs;
+        for (int i = 0; i < vocab; i++) probs.push_back({logits[i], i});
+        std::sort(probs.begin(), probs.end(), [](auto& a, auto& b) { return a.first > b.first; });
+
+        float cumsum = 0.0f;
+        std::vector<float> filtered_probs(vocab, 0.0f);
+        for (auto& p : probs) {
+            filtered_probs[p.second] = p.first;
+            cumsum += p.first;
+            if (cumsum > top_p) break;
+        }
+
         std::random_device rd;
         std::mt19937 gen(rd());
-        std::discrete_distribution<int> dist(logits.begin(), logits.end());
+        std::discrete_distribution<int> dist(filtered_probs.begin(), filtered_probs.end());
         return dist(gen);
     }
 };
