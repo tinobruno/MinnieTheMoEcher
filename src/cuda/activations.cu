@@ -518,6 +518,31 @@ void add_cuda(__nv_bfloat16* out, const __nv_bfloat16* a,
     add_kernel<<<blocks, threads, 0, stream>>>(out, a, b, n);
 }
 
+__global__ void add_f32_sigmoid_kernel(
+    float* __restrict__ out,
+    const float* __restrict__ a,
+    const float* __restrict__ bias,
+    int n, bool apply_sigmoid)
+{
+    int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    if (idx >= n) return;
+    float v = a[idx];
+    if (bias != nullptr) {
+        v += bias[idx];
+    }
+    if (apply_sigmoid) {
+        v = 1.0f / (1.0f + expf(-v));
+    }
+    out[idx] = v;
+}
+
+void add_f32_sigmoid_cuda(float* out, const float* a, const float* bias,
+                          int n, bool apply_sigmoid, cudaStream_t stream) {
+    int threads = 256;
+    int blocks = (n + threads - 1) / threads;
+    add_f32_sigmoid_kernel<<<blocks, threads, 0, stream>>>(out, a, bias, n, apply_sigmoid);
+}
+
 // ════════════════════════════════════════════════════════════════════════════════
 //  Weighted add (for expert accumulation)
 // ════════════════════════════════════════════════════════════════════════════════

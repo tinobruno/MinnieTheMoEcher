@@ -106,6 +106,14 @@ void add_cuda(
     int n,
     cudaStream_t stream = 0);
 
+void add_f32_sigmoid_cuda(
+    float* out,
+    const float* a,
+    const float* bias,
+    int n,
+    bool apply_sigmoid,
+    cudaStream_t stream = 0);
+
 // ── Weighted add (for expert combination) ──────────────────────────────────────
 // out += weight * x
 void weighted_add_cuda(

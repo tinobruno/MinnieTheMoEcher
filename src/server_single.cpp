@@ -1682,42 +1682,40 @@ private:
             gemm_bf16(buf_scores_bf16_.bf16(), 1, n_experts, dim,
                       buf_hidden_.bf16(), lw.gate_w.bf16());
 
-            // Convert to F32 and apply sqrtsoftplus
+            // Convert to F32
             bf16_to_f32_cuda(buf_scores_f32_.f32(), buf_scores_bf16_.bf16(),
                              n_experts, main_stream_);
-            sqrtsoftplus_cuda(buf_scores_f32_.f32(), buf_scores_f32_.f32(), n_experts, main_stream_);
 
-            // Copy original scores for weight computation
-            std::vector<float> original_scores(n_experts);
-            CUDA_CHECK(cudaMemcpy(original_scores.data(), buf_scores_f32_.f32(),
+            // Add bias if present, in F32!
+            if (lw.gate_bias.data) {
+                add_f32_sigmoid_cuda(buf_scores_f32_.f32(), buf_scores_f32_.f32(),
+                                     lw.gate_bias.f32(), n_experts, false /*apply_sigmoid*/, main_stream_);
+            }
+
+            // Apply sqrtsoftplus (or whatever activation the model uses)
+            sqrtsoftplus_cuda(buf_scores_f32_.f32(), buf_scores_f32_.f32(), n_experts, main_stream_);
+            CUDA_CHECK(cudaStreamSynchronize(main_stream_));
+
+            // Copy scores to CPU for top-k selection
+            std::vector<float> scores(n_experts);
+            CUDA_CHECK(cudaMemcpy(scores.data(), buf_scores_f32_.f32(),
                                    n_experts * sizeof(float), cudaMemcpyDeviceToHost));
 
-            // Add bias for top-k selection
-            if (lw.gate_bias.data) {
-                // Add bias on CPU (small vector)
-                std::vector<float> biased(n_experts);
-                std::vector<float> bias_host(n_experts);
-                CUDA_CHECK(cudaMemcpy(bias_host.data(), lw.gate_bias.f32(),
-                                       n_experts * sizeof(float), cudaMemcpyDeviceToHost));
-                for (int i = 0; i < n_experts; i++)
-                    biased[i] = original_scores[i] + bias_host[i];
+            // Top-k on CPU
+            std::vector<int> indices(n_experts);
+            std::iota(indices.begin(), indices.end(), 0);
+            std::partial_sort(indices.begin(), indices.begin() + top_k, indices.end(),
+                              [&](int a, int b) { return scores[a] > scores[b]; });
 
-                // Top-k on CPU
-                std::vector<int> indices(n_experts);
-                std::iota(indices.begin(), indices.end(), 0);
-                std::partial_sort(indices.begin(), indices.begin() + top_k, indices.end(),
-                                  [&](int a, int b) { return biased[a] > biased[b]; });
-
-                float weight_sum = 0;
-                for (int k = 0; k < top_k; k++) {
-                    expert_ids[k] = indices[k];
-                    expert_weights[k] = original_scores[indices[k]];
-                    weight_sum += expert_weights[k];
-                }
-                // Normalize and scale
-                for (int k = 0; k < top_k; k++)
-                    expert_weights[k] = expert_weights[k] / weight_sum * cfg_.routed_scaling_factor;
+            float weight_sum = 0;
+            for (int k = 0; k < top_k; k++) {
+                expert_ids[k] = indices[k];
+                expert_weights[k] = scores[indices[k]];
+                weight_sum += expert_weights[k];
             }
+            // Normalize and scale
+            for (int k = 0; k < top_k; k++)
+                expert_weights[k] = expert_weights[k] / weight_sum * cfg_.routed_scaling_factor;
         }
 
         // ── Zero accumulator ────────────────────────────────────────────────
@@ -1851,8 +1849,8 @@ private:
         CUDA_CHECK(cudaMemcpy(logits.data(), buf_logits_.f32(),
                                vocab * sizeof(float), cudaMemcpyDeviceToHost));
 
-        // Repetition penalty
-        float rep_penalty = 1.15f;
+        // Repetition penalty (disabled for now to test degradation)
+        float rep_penalty = 1.0f;
         std::unordered_set<int> seen_tokens;
         for (int token : history) {
             seen_tokens.insert(token);
