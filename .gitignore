@@ -1,0 +1,15 @@
+# Build directory
+build/
+
+# Large model binaries
+*.bin
+
+# Log files
+*.log
+
+# Generated manifest
+moecher_manifest.json
+
+# Python
+__pycache__/
+*.pyc
