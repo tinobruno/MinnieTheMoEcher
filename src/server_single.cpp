@@ -83,6 +83,9 @@ static constexpr int MAX_SEQ_LEN = 4096;
 
 static std::mutex g_log_mutex;
 static std::ofstream g_log_file;
+bool g_log_experts = false;
+bool g_log_tokens = true;
+
 
 static void log_msg(const char* level, const char* fmt, ...) {
     std::lock_guard<std::mutex> lock(g_log_mutex);
@@ -651,9 +654,12 @@ public:
             return nullptr;
         }
 
-        printf("\033[36m[CACHE] %s Layer %d Expert %d\033[0m\n", 
-               (evict_slot >= 0 && slot.layer_id >= 0) ? "Evicted & Loaded" : "Loaded", 
-               layer_id, expert_id);
+        // Output to console if enabled:
+        if (g_log_experts) {
+            printf("\033[36m[CACHE] %s Layer %d Expert %d\033[0m\n", 
+                   (evict_slot >= 0 && slot.layer_id >= 0) ? "Evicted & Loaded" : "Loaded", 
+                   layer_id, expert_id);
+        }
 
         CUDA_CHECK(cudaMemcpyAsync(slot.gpu_data, stage.ptr, expert_block_size_,
                                     cudaMemcpyHostToDevice, stream));
@@ -971,6 +977,10 @@ public:
         }
         LOG_INFO("First tokens: [%s]", ids_str.c_str());
 
+        if (g_log_tokens) {
+            printf("\n");
+        }
+
         std::vector<int> output_ids;
 
         // Prefill: process all prompt tokens
@@ -990,13 +1000,22 @@ public:
             output_ids.push_back(next_token);
             history.push_back(next_token);
 
+            std::string token_text = tokenizer_.decode({next_token});
+            if (g_log_tokens) {
+                printf("%s", token_text.c_str());
+                fflush(stdout);
+            }
             if (on_token) {
-                on_token(tokenizer_.decode({next_token}));
+                on_token(token_text);
             }
 
             // Forward the new token
             forward_token(next_token, position);
             position++;
+        }
+
+        if (g_log_tokens) {
+            printf("\n");
         }
 
         return tokenizer_.decode(output_ids);
@@ -2019,6 +2038,10 @@ int main(int argc, char** argv) {
             log_path = argv[++i];
         } else if (std::string(argv[i]) == "--max-vram" && i + 1 < argc) {
             max_vram_gb = std::stof(argv[++i]);
+        } else if (std::string(argv[i]) == "--log-experts") {
+            g_log_experts = true;
+        } else if (std::string(argv[i]) == "--no-log-tokens") {
+            g_log_tokens = false;
         }
     }
 

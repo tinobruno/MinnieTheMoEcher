@@ -24,6 +24,7 @@ mkdir -p build && cd build
 cmake .. && make -j$(nproc)
 
 # 3. Start the server (default auto-detects VRAM, or set explicit limit with --max-vram in GB)
+#    Use --log-experts to see SSD caching activity. Use --no-log-tokens to disable generation output to console.
 ./moecher --manifest ../moecher_manifest.json --port 8001 --max-vram 24
 
 # 4. Test it
