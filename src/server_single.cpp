@@ -38,6 +38,7 @@
 #include <mutex>
 #include <fstream>
 #include <sstream>
+#include <unordered_set>
 #include <chrono>
 #include <mutex>
 #include <memory>
@@ -1852,7 +1853,11 @@ private:
 
         // Repetition penalty
         float rep_penalty = 1.15f;
+        std::unordered_set<int> seen_tokens;
         for (int token : history) {
+            seen_tokens.insert(token);
+        }
+        for (int token : seen_tokens) {
             if (token >= 0 && token < vocab) {
                 if (logits[token] > 0) logits[token] /= rep_penalty;
                 else logits[token] *= rep_penalty;
