@@ -519,13 +519,20 @@ public:
     int expert_block_size_ = 0;
     int n_layers_ = 0;
     int n_experts_ = 0;
-    int expert_fd_ = -1;  // file descriptor for moe_experts.bin (O_DIRECT)
+    int expert_fd_ = -1;
 
     // LRU cache
     int cache_capacity_ = 0;
-    void* cache_pool_gpu_ = nullptr;   // GPU memory pool for cached experts
-    void* staging_buf_ = nullptr;      // page-aligned host staging buffer (pinned)
-    size_t staging_size_ = 0;
+    void* cache_pool_gpu_ = nullptr;
+
+    // Ring buffer for staging
+    static constexpr int NUM_STAGING_BUFFERS = 4;
+    struct StagingBuffer {
+        void* ptr = nullptr;
+        cudaEvent_t event = nullptr;
+    };
+    std::vector<StagingBuffer> staging_ring_;
+    int staging_idx_ = 0;
 
     std::vector<ExpertCacheEntry> cache_slots_;
     std::unordered_map<int64_t, int> key_to_slot_;  // (layer*n_experts+expert) -> slot index
@@ -537,10 +544,8 @@ public:
         n_layers_ = n_layers;
         n_experts_ = n_experts;
 
-        // Open with O_DIRECT
         expert_fd_ = open(expert_bin_path.c_str(), O_RDONLY | O_DIRECT);
         if (expert_fd_ < 0) {
-            // Fallback without O_DIRECT (e.g., filesystem doesn't support it)
             LOG_WARN("O_DIRECT not supported, falling back to buffered IO");
             expert_fd_ = open(expert_bin_path.c_str(), O_RDONLY);
         }
@@ -549,7 +554,6 @@ public:
             return false;
         }
 
-        // Allocate cache pool on GPU
         cache_capacity_ = (int)(cache_budget_bytes / block_size);
         if (cache_capacity_ < 64) cache_capacity_ = 64;
         LOG_INFO("Expert cache: %d slots (%.1f GB)", cache_capacity_,
@@ -557,18 +561,19 @@ public:
 
         CUDA_CHECK(cudaMalloc(&cache_pool_gpu_, (size_t)cache_capacity_ * block_size));
 
-        // Allocate page-aligned pinned staging buffer
-        staging_size_ = (size_t)block_size;
-        CUDA_CHECK(cudaMallocHost(&staging_buf_, staging_size_));
-        // Ensure page alignment for O_DIRECT
-        // cudaMallocHost should give page-aligned memory, but double-check
-        if ((uintptr_t)staging_buf_ % PAGE_SIZE != 0) {
-            cudaFreeHost(staging_buf_);
-            posix_memalign(&staging_buf_, PAGE_SIZE, staging_size_);
-            // Note: not pinned, but aligned. Pinning is optional for O_DIRECT.
+        // Initialize staging ring buffer
+        staging_ring_.resize(NUM_STAGING_BUFFERS);
+        for (int i = 0; i < NUM_STAGING_BUFFERS; i++) {
+            CUDA_CHECK(cudaMallocHost(&staging_ring_[i].ptr, block_size));
+            CUDA_CHECK(cudaEventCreateWithFlags(&staging_ring_[i].event, cudaEventDisableTiming));
+            // Record immediately so first wait passes
+            CUDA_CHECK(cudaEventRecord(staging_ring_[i].event, 0));
+            
+            if ((uintptr_t)staging_ring_[i].ptr % PAGE_SIZE != 0) {
+                LOG_WARN("Staging buffer %d is not page-aligned!", i);
+            }
         }
 
-        // Init cache slots
         cache_slots_.resize(cache_capacity_);
         for (int i = 0; i < cache_capacity_; i++) {
             cache_slots_[i].slot_index = i;
@@ -578,19 +583,16 @@ public:
         return true;
     }
 
-    // Get expert data on GPU, loading from SSD if not cached
     void* get_expert(int layer_id, int expert_id, cudaStream_t stream) {
         int64_t key = (int64_t)layer_id * n_experts_ + expert_id;
         access_counter_++;
 
-        // Check cache
         auto it = key_to_slot_.find(key);
         if (it != key_to_slot_.end()) {
             cache_slots_[it->second].last_used = access_counter_;
             return cache_slots_[it->second].gpu_data;
         }
 
-        // Cache miss — find slot to evict (LRU)
         int evict_slot = -1;
         int64_t oldest = INT64_MAX;
         for (int i = 0; i < cache_capacity_; i++) {
@@ -604,29 +606,35 @@ public:
             }
         }
 
-        // Evict old entry
         auto& slot = cache_slots_[evict_slot];
         if (slot.layer_id >= 0) {
+            LOG_INFO("[ExpertCache] Evicted L%d E%d -> Loaded L%d E%d", 
+                     slot.layer_id, slot.expert_id, layer_id, expert_id);
             int64_t old_key = (int64_t)slot.layer_id * n_experts_ + slot.expert_id;
             key_to_slot_.erase(old_key);
+        } else {
+            LOG_INFO("[ExpertCache] Loaded L%d E%d into free slot %d", layer_id, expert_id, evict_slot);
         }
 
-        // Load from SSD via O_DIRECT
+        // Wait for the staging buffer to be free
+        auto& stage = staging_ring_[staging_idx_];
+        CUDA_CHECK(cudaEventSynchronize(stage.event));
+
         int64_t file_offset = (int64_t)key * expert_block_size_;
-        // O_DIRECT requires aligned offset and size
-        ssize_t bytes_read = pread(expert_fd_, staging_buf_, expert_block_size_, file_offset);
+        ssize_t bytes_read = pread(expert_fd_, stage.ptr, expert_block_size_, file_offset);
         if (bytes_read != expert_block_size_) {
             LOG_ERROR("Expert read failed: layer=%d expert=%d offset=%ld got=%ld",
                       layer_id, expert_id, file_offset, bytes_read);
             return nullptr;
         }
 
-        // Copy to GPU
-        CUDA_CHECK(cudaMemcpyAsync(slot.gpu_data, staging_buf_, expert_block_size_,
+        CUDA_CHECK(cudaMemcpyAsync(slot.gpu_data, stage.ptr, expert_block_size_,
                                     cudaMemcpyHostToDevice, stream));
-        CUDA_CHECK(cudaStreamSynchronize(stream));
+        
+        // Record event on the stream so we know when the memcpy finishes
+        CUDA_CHECK(cudaEventRecord(stage.event, stream));
+        staging_idx_ = (staging_idx_ + 1) % NUM_STAGING_BUFFERS;
 
-        // Update slot
         slot.layer_id = layer_id;
         slot.expert_id = expert_id;
         slot.last_used = access_counter_;
@@ -638,7 +646,10 @@ public:
     void cleanup() {
         if (expert_fd_ >= 0) close(expert_fd_);
         if (cache_pool_gpu_) cudaFree(cache_pool_gpu_);
-        if (staging_buf_) cudaFreeHost(staging_buf_);
+        for (auto& stage : staging_ring_) {
+            if (stage.event) cudaEventDestroy(stage.event);
+            if (stage.ptr) cudaFreeHost(stage.ptr);
+        }
     }
 };
 
