@@ -23,8 +23,8 @@ python3 scripts/build_manifest.py \
 mkdir -p build && cd build
 cmake .. && make -j$(nproc)
 
-# 3. Start the server
-./moecher --manifest ../moecher_manifest.json --port 8001
+# 3. Start the server (default auto-detects VRAM, or set explicit limit with --max-vram in GB)
+./moecher --manifest ../moecher_manifest.json --port 8001 --max-vram 24
 
 # 4. Test it
 curl -X POST http://localhost:8001/v1/chat/completions \
@@ -80,6 +80,8 @@ The chat client supports multi-turn conversations, slash commands (`/clear`, `/s
 
 On a 3090 (24 GB): ~14 GB expert cache → ~1000 experts cached out of 11,008 total.
 On a 6000 Pro (96 GB): All experts fit in VRAM → no SSD reads during inference.
+
+You can restrict the maximum amount of VRAM the engine is allowed to use by passing the `--max-vram` flag (in GB) when starting the server. This is useful if you are running other applications alongside the engine.
 
 ## Files
 
