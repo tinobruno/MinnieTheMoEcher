@@ -162,3 +162,16 @@ void precompute_freqs_cuda(
 // ── BF16 <-> F32 conversions ───────────────────────────────────────────────────
 void bf16_to_f32_cuda(float* out, const __nv_bfloat16* in, int n, cudaStream_t stream = 0);
 void f32_to_bf16_cuda(__nv_bfloat16* out, const float* in, int n, cudaStream_t stream = 0);
+
+// ── Custom MLA Attention Kernel ─────────────────────────────────────────────
+void mla_attention_cuda(
+    const __nv_bfloat16* q,
+    const __nv_bfloat16* kv,
+    const float* attn_sink,
+    __nv_bfloat16* out,
+    int n_heads,
+    int cache_len,
+    int head_dim,
+    float scale,
+    cudaStream_t stream = 0);
+

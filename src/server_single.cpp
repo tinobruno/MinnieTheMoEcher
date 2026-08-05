@@ -27,6 +27,8 @@
 #include <map>
 #include <algorithm>
 #include <numeric>
+#include <future>
+#include <mutex>
 #include <fstream>
 #include <sstream>
 #include <chrono>
@@ -526,7 +528,7 @@ public:
     void* cache_pool_gpu_ = nullptr;
 
     // Ring buffer for staging
-    static constexpr int NUM_STAGING_BUFFERS = 4;
+    static constexpr int NUM_STAGING_BUFFERS = 32;
     struct StagingBuffer {
         void* ptr = nullptr;
         cudaEvent_t event = nullptr;
@@ -537,6 +539,7 @@ public:
     std::vector<ExpertCacheEntry> cache_slots_;
     std::unordered_map<int64_t, int> key_to_slot_;  // (layer*n_experts+expert) -> slot index
     int64_t access_counter_ = 0;
+    std::mutex cache_mutex_;
 
     bool init(const std::string& expert_bin_path, int block_size,
               int n_layers, int n_experts, size_t cache_budget_bytes) {
@@ -585,12 +588,16 @@ public:
 
     void* get_expert(int layer_id, int expert_id, cudaStream_t stream) {
         int64_t key = (int64_t)layer_id * n_experts_ + expert_id;
+        
+        std::unique_lock<std::mutex> lock(cache_mutex_);
         access_counter_++;
 
         auto it = key_to_slot_.find(key);
         if (it != key_to_slot_.end()) {
             cache_slots_[it->second].last_used = access_counter_;
-            return cache_slots_[it->second].gpu_data;
+            void* ptr = cache_slots_[it->second].gpu_data;
+            lock.unlock();
+            return ptr;
         }
 
         int evict_slot = -1;
@@ -616,8 +623,17 @@ public:
             LOG_INFO("[ExpertCache] Loaded L%d E%d into free slot %d", layer_id, expert_id, evict_slot);
         }
 
+        slot.layer_id = layer_id;
+        slot.expert_id = expert_id;
+        slot.last_used = access_counter_;
+        key_to_slot_[key] = evict_slot;
+
+        int stage_idx = staging_idx_;
+        staging_idx_ = (staging_idx_ + 1) % NUM_STAGING_BUFFERS;
+        lock.unlock();
+
         // Wait for the staging buffer to be free
-        auto& stage = staging_ring_[staging_idx_];
+        auto& stage = staging_ring_[stage_idx];
         CUDA_CHECK(cudaEventSynchronize(stage.event));
 
         int64_t file_offset = (int64_t)key * expert_block_size_;
@@ -633,12 +649,6 @@ public:
         
         // Record event on the stream so we know when the memcpy finishes
         CUDA_CHECK(cudaEventRecord(stage.event, stream));
-        staging_idx_ = (staging_idx_ + 1) % NUM_STAGING_BUFFERS;
-
-        slot.layer_id = layer_id;
-        slot.expert_id = expert_id;
-        slot.last_used = access_counter_;
-        key_to_slot_[key] = evict_slot;
 
         return slot.gpu_data;
     }
@@ -757,7 +767,7 @@ public:
 
     // ── Load model from manifest ────────────────────────────────────────────
 
-    bool load(const std::string& manifest_path) {
+    bool load(const std::string& manifest_path, float max_vram_gb = 0.0f) {
         LOG_INFO("Loading manifest: %s", manifest_path.c_str());
 
         std::ifstream f(manifest_path);
@@ -811,6 +821,21 @@ public:
         // Reserve VRAM: estimate resident usage, rest goes to expert cache
         CUDA_CHECK(cudaMemGetInfo(&vram_free, &vram_total));
         size_t cache_budget = vram_free - 2ULL * 1024 * 1024 * 1024;  // leave 2 GB headroom
+        
+        if (max_vram_gb > 0.0f) {
+            size_t max_vram_bytes = (size_t)(max_vram_gb * 1024.0 * 1024.0 * 1024.0);
+            size_t used_vram = vram_total - vram_free;
+            if (max_vram_bytes > used_vram + 2ULL * 1024 * 1024 * 1024) {
+                size_t user_budget = max_vram_bytes - used_vram - 2ULL * 1024 * 1024 * 1024;
+                if (user_budget < cache_budget) {
+                    cache_budget = user_budget;
+                }
+            } else {
+                cache_budget = 0;
+            }
+        }
+        
+        LOG_INFO("Expert cache budget: %.1f GB", cache_budget / 1e9);
         if (!expert_loader_.init(expert_path, expert_block_size,
                                   expert_n_layers, expert_n_experts,
                                   cache_budget)) return false;
@@ -914,7 +939,8 @@ public:
     // ── Generate tokens ─────────────────────────────────────────────────────
 
     std::string generate(const std::string& prompt, int max_tokens = 512,
-                         float temperature = 0.0f) {
+                         float temperature = 0.0f,
+                         std::function<void(const std::string&)> on_token = nullptr) {
         // Tokenize
         std::vector<int> input_ids = tokenizer_.encode(prompt);
         LOG_INFO("Prompt tokens: %zu", input_ids.size());
@@ -941,6 +967,10 @@ public:
 
             if (next_token == cfg_.eos_token_id) break;
             output_ids.push_back(next_token);
+
+            if (on_token) {
+                on_token(tokenizer_.decode({next_token}));
+            }
 
             // Forward the new token
             forward_token(next_token, position);
@@ -1425,61 +1455,52 @@ private:
         gemm_fp8_dequant(buf_lora_.bf16(), 1, q_lora, dim,
                          buf_hidden_.bf16(),
                          lw.wq_a_w.u8(), lw.wq_a_s.u8());
-        if (layer_id == 0) { CUDA_CHECK(cudaStreamSynchronize(main_stream_)); LOG_INFO("    attn: wq_a OK"); }
-        if (dbg) dump_bf16("wq_a_out", buf_lora_.bf16(), q_lora);
+                if (dbg) dump_bf16("wq_a_out", buf_lora_.bf16(), q_lora);
 
         // q_normed = q_norm(q_raw)
         rms_norm_cuda(buf_lora_.bf16(), buf_lora_.bf16(),
                       lw.q_norm_w.bf16(), q_lora, cfg_.rms_norm_eps, main_stream_);
-        if (layer_id == 0) { CUDA_CHECK(cudaStreamSynchronize(main_stream_)); LOG_INFO("    attn: q_norm OK"); }
-        if (dbg) dump_bf16("q_normed", buf_lora_.bf16(), q_lora);
+                if (dbg) dump_bf16("q_normed", buf_lora_.bf16(), q_lora);
 
         if (layer_id == 0) LOG_INFO("    attn: wq_b dequant+gemm M=1 N=%d K=%d", n_heads * head_dim_val, q_lora);
         // q = wq_b(q_normed) -> [n_heads * head_dim]
         gemm_fp8_dequant(buf_q_.bf16(), 1, n_heads * head_dim_val, q_lora,
                          buf_lora_.bf16(),
                          lw.wq_b_w.u8(), lw.wq_b_s.u8());
-        if (layer_id == 0) { CUDA_CHECK(cudaStreamSynchronize(main_stream_)); LOG_INFO("    attn: wq_b OK"); }
-
+        
         // Per-head Q normalization (DeepseekV4UnweightedRMSNorm)
         // q = q * rsqrt(mean(q^2) + eps) per head
         rms_norm_unweighted_batched_cuda(buf_q_.bf16(), buf_q_.bf16(),
                                          n_heads, head_dim_val, cfg_.rms_norm_eps,
                                          main_stream_);
-        if (layer_id == 0) { CUDA_CHECK(cudaStreamSynchronize(main_stream_)); LOG_INFO("    attn: q_head_norm OK"); }
-
+        
         // Apply RoPE to last rope_dim elements of each Q head
         rope_cuda(buf_q_.bf16(), n_heads, head_dim_val, rope_dim,
                   position, rope_freqs_.f32(), false, main_stream_);
-        if (layer_id == 0) { CUDA_CHECK(cudaStreamSynchronize(main_stream_)); LOG_INFO("    attn: q_rope OK"); }
-
+        
         // ── KV projection ───────────────────────────────────────────────────
         if (layer_id == 0) LOG_INFO("    attn: wkv dequant+gemm M=1 N=%d K=%d", head_dim_val, dim);
         // kv = wkv(x) -> [head_dim]
         gemm_fp8_dequant(buf_kv_.bf16(), 1, head_dim_val, dim,
                          buf_hidden_.bf16(),
                          lw.wkv_w.u8(), lw.wkv_s.u8());
-        if (layer_id == 0) { CUDA_CHECK(cudaStreamSynchronize(main_stream_)); LOG_INFO("    attn: wkv OK"); }
-        if (dbg) dump_bf16("wkv_out", buf_kv_.bf16(), head_dim_val);
+                if (dbg) dump_bf16("wkv_out", buf_kv_.bf16(), head_dim_val);
 
         // kv_norm
         rms_norm_cuda(buf_kv_.bf16(), buf_kv_.bf16(),
                       lw.kv_norm_w.bf16(), head_dim_val, cfg_.rms_norm_eps, main_stream_);
-        if (layer_id == 0) { CUDA_CHECK(cudaStreamSynchronize(main_stream_)); LOG_INFO("    attn: kv_norm OK"); }
-
+        
         // Apply RoPE to KV
         rope_cuda(buf_kv_.bf16(), 1, head_dim_val, rope_dim,
                   position, rope_freqs_.f32(), false, main_stream_);
-        if (layer_id == 0) { CUDA_CHECK(cudaStreamSynchronize(main_stream_)); LOG_INFO("    attn: kv_rope OK"); }
-
+        
         // Store KV in cache at position % window
         int cache_pos = position % window;
         CUDA_CHECK(cudaMemcpyAsync(
             lw.kv_cache.bf16() + (size_t)cache_pos * head_dim_val,
             buf_kv_.bf16(), head_dim_val * sizeof(__nv_bfloat16),
             cudaMemcpyDeviceToDevice, main_stream_));
-        if (layer_id == 0) { CUDA_CHECK(cudaStreamSynchronize(main_stream_)); LOG_INFO("    attn: kv_cache OK"); }
-        if (dbg) dump_bf16("kv_after_norm_rope", buf_kv_.bf16(), head_dim_val);
+                if (dbg) dump_bf16("kv_after_norm_rope", buf_kv_.bf16(), head_dim_val);
 
         // ── Attention computation ───────────────────────────────────────────
         // For each head: score = q_head @ kv_cache.T / sqrt(head_dim)
@@ -1487,65 +1508,12 @@ private:
 
         int cache_len = std::min(position + 1, window);
 
-        // Compute attention on CPU (small matrices during decode)
-        // q: [n_heads, head_dim], kv_cache: [cache_len, head_dim]
-        std::vector<__nv_bfloat16> q_host(n_heads * head_dim_val);
-        std::vector<__nv_bfloat16> kv_host(window * head_dim_val);
-        std::vector<__nv_bfloat16> attn_out_host(n_heads * head_dim_val, __float2bfloat16(0.0f));
-
-        CUDA_CHECK(cudaStreamSynchronize(main_stream_));
-        CUDA_CHECK(cudaMemcpy(q_host.data(), buf_q_.bf16(),
-                               n_heads * head_dim_val * sizeof(__nv_bfloat16),
-                               cudaMemcpyDeviceToHost));
-        CUDA_CHECK(cudaMemcpy(kv_host.data(), lw.kv_cache.bf16(),
-                               window * head_dim_val * sizeof(__nv_bfloat16),
-                               cudaMemcpyDeviceToHost));
-
-        float attn_sink_host[128];
-        CUDA_CHECK(cudaMemcpy(attn_sink_host, lw.attn_sink.f32(),
-                               n_heads * sizeof(float), cudaMemcpyDeviceToHost));
-
+        
         float scale = 1.0f / sqrtf((float)head_dim_val);
-
-        for (int h = 0; h < n_heads; h++) {
-            // Compute scores
-            std::vector<float> scores(cache_len);
-            for (int t = 0; t < cache_len; t++) {
-                float dot = 0;
-                for (int d = 0; d < head_dim_val; d++) {
-                    float qv = __bfloat162float(q_host[h * head_dim_val + d]);
-                    float kv = __bfloat162float(kv_host[t * head_dim_val + d]);
-                    dot += qv * kv;
-                }
-                scores[t] = dot * scale;
-            }
-            // Add attention sink bias (position 0 gets extra attention)
-            scores[0] += attn_sink_host[h];
-
-            // Softmax
-            float max_score = *std::max_element(scores.begin(), scores.begin() + cache_len);
-            float sum_exp = 0;
-            for (int t = 0; t < cache_len; t++) {
-                scores[t] = expf(scores[t] - max_score);
-                sum_exp += scores[t];
-            }
-            for (int t = 0; t < cache_len; t++) scores[t] /= sum_exp;
-
-            // Weighted sum
-            for (int d = 0; d < head_dim_val; d++) {
-                float v = 0;
-                for (int t = 0; t < cache_len; t++) {
-                    v += scores[t] * __bfloat162float(kv_host[t * head_dim_val + d]);
-                }
-                attn_out_host[h * head_dim_val + d] = __float2bfloat16(v);
-            }
-        }
-
-        // Upload attention output [n_heads * head_dim] to GPU
-        CUDA_CHECK(cudaMemcpy(buf_attn_out_.bf16(), attn_out_host.data(),
-                               n_heads * head_dim_val * sizeof(__nv_bfloat16),
-                               cudaMemcpyHostToDevice));
-
+        mla_attention_cuda(
+            buf_q_.bf16(), lw.kv_cache.bf16(), lw.attn_sink.f32(),
+            buf_attn_out_.bf16(), n_heads, cache_len, head_dim_val, scale, main_stream_
+        );
         // Inverse RoPE on attention output: K=V in DeepSeek V4, so the value
         // picked up RoPE rotation. Undo it with inverse rotation (-sin) before
         // the grouped output projection.
@@ -1580,8 +1548,7 @@ private:
             __nv_bfloat16* C_g = buf_lora_.bf16() + (size_t)g * o_lora;
             gemm_bf16(C_g, 1, o_lora, hpg_dim, A_g, B_g);
         }
-        if (layer_id == 0) { CUDA_CHECK(cudaStreamSynchronize(main_stream_)); LOG_INFO("    attn: wo_a OK"); }
-        if (dbg) {
+                if (dbg) {
             dump_bf16("attn_out_raw", buf_attn_out_.bf16(), n_heads * head_dim_val);
             dump_bf16("wo_a_result", buf_lora_.bf16(), o_groups * o_lora);
         }
@@ -1590,8 +1557,7 @@ private:
         gemm_fp8_dequant(buf_hidden_.bf16(), 1, dim, o_groups * o_lora,
                          buf_lora_.bf16(),
                          lw.wo_b_w.u8(), lw.wo_b_s.u8());
-        if (layer_id == 0) { CUDA_CHECK(cudaStreamSynchronize(main_stream_)); LOG_INFO("    attn: wo_b OK"); }
-        if (dbg) dump_bf16("wo_b_result", buf_hidden_.bf16(), dim);
+                if (dbg) dump_bf16("wo_b_result", buf_hidden_.bf16(), dim);
     }
 
     // ── MoE forward ─────────────────────────────────────────────────────────
@@ -1666,13 +1632,22 @@ private:
         CUDA_CHECK(cudaMemset(buf_moe_accum_.data, 0, dim * sizeof(__nv_bfloat16)));
 
         // ── Execute routed experts ──────────────────────────────────────────
+        std::future<void*> expert_futures[32];
+        for (int k = 0; k < top_k; k++) {
+            int eid = expert_ids[k];
+            if (eid < 0) continue;
+
+            expert_futures[k] = std::async(std::launch::async, [this, layer_id, eid]() {
+                return expert_loader_.get_expert(layer_id, eid, main_stream_);
+            });
+        }
+
         for (int k = 0; k < top_k; k++) {
             int eid = expert_ids[k];
             float weight = expert_weights[k];
             if (eid < 0) continue;
 
-            // Load expert from SSD (or cache)
-            void* expert_block = expert_loader_.get_expert(layer_id, eid, main_stream_);
+            void* expert_block = expert_futures[k].get();
             if (!expert_block) { LOG_ERROR("Failed to load expert L%d E%d", layer_id, eid); continue; }
 
             // Run SwiGLU: out = w2(silu(w1(x)) * w3(x))
@@ -1905,53 +1880,59 @@ static void run_server(MoecherEngine& engine, int port) {
             // Apply chat template
             std::string prompt = apply_chat_template(messages, engine.tokenizer_);
 
-            std::string response_text;
-            {
-                std::lock_guard<std::mutex> lock(g_engine_mutex);
-                response_text = engine.generate(prompt, max_tokens, temperature);
-            }
-
-            auto elapsed = std::chrono::steady_clock::now() - start;
-            double elapsed_ms = std::chrono::duration<double, std::milli>(elapsed).count();
-
+            
             if (stream) {
                 // SSE streaming
-                res.set_header("Content-Type", "text/event-stream");
-                res.set_header("Cache-Control", "no-cache");
-                res.set_header("Connection", "keep-alive");
+                res.set_chunked_content_provider(
+                    "text/event-stream",
+                    [&engine, prompt, max_tokens, temperature](size_t offset, httplib::DataSink &sink) {
+                        std::lock_guard<std::mutex> lock(g_engine_mutex);
+                        
+                        json chunk = {
+                            {"id", "chatcmpl-moecher"},
+                            {"object", "chat.completion.chunk"},
+                            {"created", std::chrono::system_clock::to_time_t(std::chrono::system_clock::now())},
+                            {"model", "deepseek-v4-flash"},
+                            {"choices", {{
+                                {"index", 0},
+                                {"delta", {{"role", "assistant"}}},
+                                {"finish_reason", nullptr}
+                            }}}
+                        };
+                        std::string sse = "data: " + chunk.dump(-1, ' ', false, json::error_handler_t::replace) + "\n\n";
+                        sink.write(sse.data(), sse.size());
 
-                std::string stream_body;
-                // Send content as a single chunk
-                json chunk = {
-                    {"id", "chatcmpl-moecher"},
-                    {"object", "chat.completion.chunk"},
-                    {"created", std::chrono::system_clock::to_time_t(std::chrono::system_clock::now())},
-                    {"model", "deepseek-v4-flash"},
-                    {"choices", {{
-                        {"index", 0},
-                        {"delta", {{"role", "assistant"}, {"content", response_text}}},
-                        {"finish_reason", nullptr}
-                    }}}
-                };
-                stream_body += "data: " + chunk.dump() + "\n\n";
+                        engine.generate(prompt, max_tokens, temperature, [&](const std::string& text) {
+                            chunk["choices"][0]["delta"] = {{"content", text}};
+                            std::string sse_chunk = "data: " + chunk.dump(-1, ' ', false, json::error_handler_t::replace) + "\n\n";
+                            sink.write(sse_chunk.data(), sse_chunk.size());
+                        });
 
-                // Send finish chunk
-                json finish = {
-                    {"id", "chatcmpl-moecher"},
-                    {"object", "chat.completion.chunk"},
-                    {"created", std::chrono::system_clock::to_time_t(std::chrono::system_clock::now())},
-                    {"model", "deepseek-v4-flash"},
-                    {"choices", {{
-                        {"index", 0},
-                        {"delta", json::object()},
-                        {"finish_reason", "stop"}
-                    }}}
-                };
-                stream_body += "data: " + finish.dump() + "\n\n";
-                stream_body += "data: [DONE]\n\n";
-
-                res.set_content(stream_body, "text/event-stream");
+                        json finish = {
+                            {"id", "chatcmpl-moecher"},
+                            {"object", "chat.completion.chunk"},
+                            {"created", std::chrono::system_clock::to_time_t(std::chrono::system_clock::now())},
+                            {"model", "deepseek-v4-flash"},
+                            {"choices", {{
+                                {"index", 0},
+                                {"delta", json::object()},
+                                {"finish_reason", "stop"}
+                            }}}
+                        };
+                        sse = "data: " + finish.dump(-1, ' ', false, json::error_handler_t::replace) + "\n\n";
+                        sink.write(sse.data(), sse.size());
+                        sink.write("data: [DONE]\n\n", 14);
+                        sink.done();
+                        return true;
+                    }
+                );
             } else {
+                std::string response_text;
+                {
+                    std::lock_guard<std::mutex> lock(g_engine_mutex);
+                    response_text = engine.generate(prompt, max_tokens, temperature);
+                }
+                
                 json response = {
                     {"id", "chatcmpl-moecher"},
                     {"object", "chat.completion"},
@@ -1961,17 +1942,13 @@ static void run_server(MoecherEngine& engine, int port) {
                         {"index", 0},
                         {"message", {{"role", "assistant"}, {"content", response_text}}},
                         {"finish_reason", "stop"}
-                    }}},
-                    {"usage", {
-                        {"prompt_tokens", -1},
-                        {"completion_tokens", -1},
-                        {"total_tokens", -1}
-                    }}
+                    }}}
                 };
-                res.set_content(response.dump(), "application/json");
+                res.set_content(response.dump(-1, ' ', false, json::error_handler_t::replace), "application/json");
             }
-
-            LOG_INFO("RESPONSE (%.0fms): %s", elapsed_ms, response_text.c_str());
+            auto end = std::chrono::steady_clock::now();
+            auto elapsed_ms = std::chrono::duration<double, std::milli>(end - start).count();
+            LOG_INFO("RESPONSE (%.0fms)", elapsed_ms);
         });
 
     LOG_INFO("Server listening on port %d", port);
@@ -1985,6 +1962,7 @@ static void run_server(MoecherEngine& engine, int port) {
 int main(int argc, char** argv) {
     std::string manifest_path = "moecher_manifest.json";
     int port = 8001;
+    float max_vram_gb = 0.0f;
     std::string log_path = "moecher.log";
 
     for (int i = 1; i < argc; i++) {
@@ -1994,6 +1972,8 @@ int main(int argc, char** argv) {
             port = std::stoi(argv[++i]);
         } else if (std::string(argv[i]) == "--log" && i + 1 < argc) {
             log_path = argv[++i];
+        } else if (std::string(argv[i]) == "--max-vram" && i + 1 < argc) {
+            max_vram_gb = std::stof(argv[++i]);
         }
     }
 
@@ -2002,7 +1982,7 @@ int main(int argc, char** argv) {
     LOG_INFO("═══ moecher starting ═══");
 
     MoecherEngine engine;
-    if (!engine.load(manifest_path)) {
+    if (!engine.load(manifest_path, max_vram_gb)) {
         LOG_ERROR("Failed to load model");
         return 1;
     }

@@ -1,0 +1,1 @@
+{"choices":[{"finish_reason":"stop","index":0,"message":{"content":"Sure, one for you:\n\nWhy did the phone call go to the bathroom","role":"assistant"}}],"created":1785959004,"id":"chatcmpl-moecher","model":"deepseek-v4-flash","object":"chat.completion","usage":{"completion_tokens":-1,"prompt_tokens":-1,"total_tokens":-1}}

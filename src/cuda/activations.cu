@@ -745,3 +745,111 @@ __global__ void f32_to_bf16_kernel(__nv_bfloat16* out, const float* in, int n) {
 void f32_to_bf16_cuda(__nv_bfloat16* out, const float* in, int n, cudaStream_t stream) {
     f32_to_bf16_kernel<<<(n+255)/256, 256, 0, stream>>>(out, in, n);
 }
+
+// ── Custom MLA Attention Kernel ─────────────────────────────────────────────
+
+__global__ void mla_attention_kernel(
+    const __nv_bfloat16* __restrict__ q,       // [n_heads, head_dim]
+    const __nv_bfloat16* __restrict__ kv,      // [cache_len, head_dim]
+    const float* __restrict__ attn_sink,       // [n_heads]
+    __nv_bfloat16* __restrict__ out,           // [n_heads, head_dim]
+    int cache_len,
+    int head_dim,
+    float scale
+) {
+    int h = blockIdx.x;
+    int tid = threadIdx.x;
+    int n_threads = blockDim.x;
+
+    // Use dynamically allocated shared memory for scores
+    extern __shared__ float scores[]; // size: cache_len * sizeof(float)
+
+    // 1. Q @ KV.T
+    for (int t = tid; t < cache_len; t += n_threads) {
+        float dot = 0.0f;
+        for (int d = 0; d < head_dim; d++) {
+            float qv = __bfloat162float(q[h * head_dim + d]);
+            float kv_v = __bfloat162float(kv[t * head_dim + d]);
+            dot += qv * kv_v;
+        }
+        scores[t] = dot * scale;
+    }
+    __syncthreads();
+
+    // Add attn_sink
+    if (tid == 0) {
+        scores[0] += attn_sink[h];
+    }
+    __syncthreads();
+
+    // 2. Softmax
+    // Find max score
+    float local_max = -1e38f;
+    for (int t = tid; t < cache_len; t += n_threads) {
+        local_max = fmaxf(local_max, scores[t]);
+    }
+    // Block-wide max reduction
+    __shared__ float s_max[32];
+    int lane = tid & 31;
+    int warp = tid >> 5;
+    float warp_max = local_max;
+    for (int offset = 16; offset > 0; offset /= 2) warp_max = fmaxf(warp_max, __shfl_down_sync(0xffffffff, warp_max, offset));
+    if (lane == 0) s_max[warp] = warp_max;
+    __syncthreads();
+    
+    float block_max = -1e38f;
+    if (tid < (n_threads >> 5)) block_max = s_max[tid];
+    for (int offset = 16; offset > 0; offset /= 2) block_max = fmaxf(block_max, __shfl_down_sync(0xffffffff, block_max, offset));
+    // Broadcast block_max
+    if (tid == 0) s_max[0] = block_max;
+    __syncthreads();
+    block_max = s_max[0];
+
+    // Exp and sum
+    float local_sum = 0.0f;
+    for (int t = tid; t < cache_len; t += n_threads) {
+        float e = expf(scores[t] - block_max);
+        scores[t] = e;
+        local_sum += e;
+    }
+    // Block-wide sum reduction
+    __shared__ float s_sum[32];
+    float warp_sum = local_sum;
+    for (int offset = 16; offset > 0; offset /= 2) warp_sum += __shfl_down_sync(0xffffffff, warp_sum, offset);
+    if (lane == 0) s_sum[warp] = warp_sum;
+    __syncthreads();
+
+    float block_sum = 0.0f;
+    if (tid < (n_threads >> 5)) block_sum = s_sum[tid];
+    for (int offset = 16; offset > 0; offset /= 2) block_sum += __shfl_down_sync(0xffffffff, block_sum, offset);
+    if (tid == 0) s_sum[0] = block_sum;
+    __syncthreads();
+    block_sum = s_sum[0];
+
+    // Normalize and compute out = scores @ KV
+    for (int d = tid; d < head_dim; d += n_threads) {
+        float v = 0.0f;
+        for (int t = 0; t < cache_len; t++) {
+            v += (scores[t] / block_sum) * __bfloat162float(kv[t * head_dim + d]);
+        }
+        out[h * head_dim + d] = __float2bfloat16(v);
+    }
+}
+
+void mla_attention_cuda(
+    const __nv_bfloat16* q,
+    const __nv_bfloat16* kv,
+    const float* attn_sink,
+    __nv_bfloat16* out,
+    int n_heads,
+    int cache_len,
+    int head_dim,
+    float scale,
+    cudaStream_t stream) 
+{
+    int n_threads = 256;
+    size_t smem_bytes = cache_len * sizeof(float);
+    mla_attention_kernel<<<n_heads, n_threads, smem_bytes, stream>>>(
+        q, kv, attn_sink, out, cache_len, head_dim, scale
+    );
+}

@@ -43,31 +43,43 @@ BANNER = f"""
 """
 
 
-def chat_completion(url: str, messages: list, max_tokens: int,
-                    temperature: float, model: str = "deepseek-v4-flash") -> str:
-    """Send a chat completion request and return the assistant reply."""
+def chat_completion_stream(url: str, messages: list, max_tokens: int,
+                           temperature: float, model: str = "deepseek-v4-flash"):
+    """Send a chat completion request and yield assistant reply chunks."""
     payload = json.dumps({
         "model": model,
         "messages": messages,
         "max_tokens": max_tokens,
         "temperature": temperature,
+        "stream": True
     }).encode("utf-8")
 
     req = urllib.request.Request(
         f"{url}/v1/chat/completions",
         data=payload,
-        headers={"Content-Type": "application/json"},
+        headers={"Content-Type": "application/json", "Accept": "text/event-stream"},
         method="POST",
     )
 
     try:
         with urllib.request.urlopen(req, timeout=600) as resp:
-            body = json.loads(resp.read().decode("utf-8"))
-            return body["choices"][0]["message"]["content"]
+            for line in resp:
+                if line.startswith(b"data: "):
+                    line = line[6:].strip()
+                    if line == b"[DONE]":
+                        break
+                    try:
+                        chunk = json.loads(line)
+                        delta = chunk["choices"][0].get("delta", {})
+                        content = delta.get("content", "")
+                        if content:
+                            yield content
+                    except json.JSONDecodeError:
+                        pass
     except urllib.error.URLError as e:
-        return f"{RED}[Connection error]{RESET} {e.reason}"
+        yield f"\n{RED}[Connection error]{RESET} {e.reason}"
     except Exception as e:
-        return f"{RED}[Error]{RESET} {e}"
+        yield f"\n{RED}[Error]{RESET} {e}"
 
 
 def wrap_text(text: str, width: int = 80) -> str:
@@ -170,16 +182,15 @@ def main():
         # ── Send message ──────────────────────────────────────────────────
         messages.append({"role": "user", "content": user_input})
 
-        print(f"{DIM}Thinking...{RESET}", end="\r", flush=True)
+        print(f"{CYAN}{BOLD}Assistant ❯{RESET} ", end="", flush=True)
 
-        reply = chat_completion(
+        reply = ""
+        for chunk in chat_completion_stream(
             args.url, messages, max_tokens, temperature, args.model
-        )
-
-        # Clear "Thinking..." and print reply
-        print(" " * 20, end="\r")
-        wrapped = wrap_text(reply, width=term_width - 4)
-        print(f"{CYAN}{BOLD}Assistant ❯{RESET} {wrapped}\n")
+        ):
+            print(chunk, end="", flush=True)
+            reply += chunk
+        print("\n")
 
         messages.append({"role": "assistant", "content": reply})
 
