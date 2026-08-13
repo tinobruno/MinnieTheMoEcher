@@ -112,6 +112,7 @@ def main():
 
     temperature = args.temperature
     max_tokens = args.max_tokens
+    #default_system = "You are a highly capable, adaptive, and precise AI assistant. CORE OPERATIONAL RULES: 1. TOPIC AUTONOMY: Treat every user prompt as a potentially distinct domain. Never lock into a subject-matter pattern or force prior turn domains onto new, unrelated questions. 2. CONCISE & FACTUAL: Deliver direct, clear, and accurate answers immediately. Avoid fluff, unnecessary conversational filler, robotic pleasantries, and trailing meta-commentary (e.g., "Feel free to ask more"). 3. ACCURATE REASONING: Analyze input semantics carefully before responding. If a term is unfamiliar within the immediate context, evaluate it as an independent entity rather than assuming it is a typo or a misstatement of previous topics.  "
     default_system = "You are a helpful, friendly, and knowledgeable AI assistant. Answer clearly and concisely."
     messages: list[dict] = [{"role": "system", "content": default_system}]
 
@@ -193,7 +194,7 @@ def main():
         print("\n")
 
         messages.append({"role": "assistant", "content": reply})
-
+        print()
 
 if __name__ == "__main__":
     main()

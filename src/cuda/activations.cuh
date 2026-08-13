@@ -183,3 +183,38 @@ void mla_attention_cuda(
     float scale,
     cudaStream_t stream = 0);
 
+// ── Compressor Kernels ─────────────────────────────────────────────────────
+
+// BF16 matrix-vector product: out[N] = W[N,K] @ x[K] (row-major W)
+// Used for compressor projections (wkv, wgate) which are BF16, not FP8
+void gemv_bf16_cuda(
+    float* out,                    // [N] F32 output (for accumulation precision)
+    const __nv_bfloat16* W,        // [N, K] BF16 weight matrix (row-major)
+    const __nv_bfloat16* x,        // [K] BF16 input vector
+    int N, int K,
+    cudaStream_t stream = 0);
+
+// Softmax-gated weighted sum for KV compression (non-overlapping)
+// Computes: out[d] = sum_i( kv[i][d] * softmax(score[i][d]) ) for d in [0, dim)
+// kv:    [window, dim] F32 — accumulated KV entries in the compression window
+// score: [window, dim] F32 — gate scores (with APE already added)
+// out:   [dim] F32 — compressed KV entry
+void compressor_pool_cuda(
+    float* out,                    // [dim]
+    const float* kv,               // [window, dim]
+    const float* score,            // [window, dim]
+    int window,                    // compression window size (ratio or 2*ratio for overlap)
+    int dim,                       // output dimension (head_dim for non-overlap, coff*head_dim)
+    cudaStream_t stream = 0);
+
+// Combine raw sliding-window KV and compressed KV into a contiguous buffer
+// for attention. Copies raw_kv[raw_len, head_dim] then comp_kv[comp_len, head_dim]
+void combine_kv_cuda(
+    __nv_bfloat16* out,            // [raw_len + comp_len, head_dim]
+    const __nv_bfloat16* raw_kv,   // [raw_len, head_dim]
+    int raw_len,
+    const __nv_bfloat16* comp_kv,  // [comp_len, head_dim]
+    int comp_len,
+    int head_dim,
+    cudaStream_t stream = 0);
+

@@ -653,23 +653,51 @@ __global__ void hc_split_sinkhorn_kernel(
     // Post: indices [hc, 2*hc)
     for (int i = 0; i < hc; i++) {
         float v = mixes[hc + i] * scale[1] + base[hc + i];
-        post[i] = 1.0f / (1.0f + expf(-v)) + eps;
+        post[i] = 2.0f / (1.0f + expf(-v));
     }
 
     // Comb: indices [2*hc, (2+hc)*hc)
-    for (int i = 0; i < hc * hc; i++) {
-        float v = mixes[2 * hc + i] * scale[2] + base[2 * hc + i];
-        comb[i] = 1.0f / (1.0f + expf(-v)) + eps;
+    // Python: comb = torch.softmax(comb_logits, dim=-1) + eps
+    for (int r = 0; r < hc; r++) {
+        // Find max for numerical stability in Softmax
+        float max_val = -1e38f;
+        for (int c = 0; c < hc; c++) {
+            float v = mixes[2 * hc + r * hc + c] * scale[2] + base[2 * hc + r * hc + c];
+            max_val = fmaxf(max_val, v);
+            comb[r * hc + c] = v; // Temporarily store logits
+        }
+
+        float row_sum = 0.0f;
+        for (int c = 0; c < hc; c++) {
+            float e = expf(comb[r * hc + c] - max_val);
+            comb[r * hc + c] = e;
+            row_sum += e;
+        }
+
+        // Softmax + eps
+        for (int c = 0; c < hc; c++) {
+            comb[r * hc + c] = (comb[r * hc + c] / row_sum) + eps;
+        }
     }
 
-    // Sinkhorn normalization on comb[hc, hc]
-    for (int iter = 0; iter < sinkhorn_iters; iter++) {
+    // Python: comb = comb / (comb.sum(dim=-2, keepdim=True) + eps) (Column normalize)
+    for (int c = 0; c < hc; c++) {
+        float col_sum = 0.0f;
+        for (int r = 0; r < hc; r++)
+            col_sum += comb[r * hc + c];
+        float inv = 1.0f / (col_sum + eps);
+        for (int r = 0; r < hc; r++)
+            comb[r * hc + c] *= inv;
+    }
+
+    // Python Sinkhorn loop:
+    for (int iter = 0; iter < sinkhorn_iters - 1; iter++) {
         // Row normalization
         for (int r = 0; r < hc; r++) {
             float row_sum = 0.0f;
             for (int c = 0; c < hc; c++)
                 row_sum += comb[r * hc + c];
-            float inv = 1.0f / (row_sum + 1e-12f);
+            float inv = 1.0f / (row_sum + eps);
             for (int c = 0; c < hc; c++)
                 comb[r * hc + c] *= inv;
         }
@@ -678,7 +706,7 @@ __global__ void hc_split_sinkhorn_kernel(
             float col_sum = 0.0f;
             for (int r = 0; r < hc; r++)
                 col_sum += comb[r * hc + c];
-            float inv = 1.0f / (col_sum + 1e-12f);
+            float inv = 1.0f / (col_sum + eps);
             for (int r = 0; r < hc; r++)
                 comb[r * hc + c] *= inv;
         }
@@ -801,17 +829,15 @@ __global__ void mla_attention_kernel(
     }
     __syncthreads();
 
-    // Add attn_sink
-    if (tid == 0) {
-        scores[0] += attn_sink[h];
-    }
-    __syncthreads();
-
     // 2. Softmax
     // Find max score
     float local_max = -1e38f;
     for (int t = tid; t < cache_len; t += n_threads) {
         local_max = fmaxf(local_max, scores[t]);
+    }
+    // Include sink in max calculation
+    if (tid == 0) {
+        local_max = fmaxf(local_max, attn_sink[h]);
     }
     // Block-wide max reduction
     __shared__ float s_max[32];
@@ -836,6 +862,10 @@ __global__ void mla_attention_kernel(
         float e = expf(scores[t] - block_max);
         scores[t] = e;
         local_sum += e;
+    }
+    // Include sink in sum calculation
+    if (tid == 0) {
+        local_sum += expf(attn_sink[h] - block_max);
     }
     // Block-wide sum reduction
     __shared__ float s_sum[32];
@@ -878,3 +908,144 @@ void mla_attention_cuda(
         q, kv, attn_sink, out, cache_len, head_dim, scale
     );
 }
+
+// ════════════════════════════════════════════════════════════════════════════════
+//  Compressor Kernels
+// ════════════════════════════════════════════════════════════════════════════════
+
+// BF16 GEMV: out[row] = dot(W[row, :], x[:]) for each row
+// Each block handles one row. Threads cooperatively reduce across K.
+__global__ void gemv_bf16_kernel(
+    float* __restrict__ out,
+    const __nv_bfloat16* __restrict__ W,
+    const __nv_bfloat16* __restrict__ x,
+    int N, int K)
+{
+    int row = blockIdx.x;
+    if (row >= N) return;
+
+    extern __shared__ float sdata_gemv[];
+
+    int tid = threadIdx.x;
+    float sum = 0.0f;
+    const __nv_bfloat16* w_row = W + (size_t)row * K;
+    for (int i = tid; i < K; i += blockDim.x) {
+        sum += bf16_to_float(w_row[i]) * bf16_to_float(x[i]);
+    }
+
+    // Warp reduction
+    for (int offset = 16; offset > 0; offset >>= 1)
+        sum += __shfl_down_sync(0xFFFFFFFF, sum, offset);
+
+    int lane = tid & 31;
+    int warp = tid >> 5;
+    if (lane == 0) sdata_gemv[warp] = sum;
+    __syncthreads();
+
+    // Final reduction across warps
+    int n_warps = (blockDim.x + 31) / 32;
+    if (tid < n_warps) sum = sdata_gemv[tid];
+    else sum = 0.0f;
+    for (int offset = 16; offset > 0; offset >>= 1)
+        sum += __shfl_down_sync(0xFFFFFFFF, sum, offset);
+
+    if (tid == 0) out[row] = sum;
+}
+
+void gemv_bf16_cuda(
+    float* out,
+    const __nv_bfloat16* W,
+    const __nv_bfloat16* x,
+    int N, int K,
+    cudaStream_t stream)
+{
+    int n_threads = 256;
+    int n_warps = (n_threads + 31) / 32;
+    size_t smem = n_warps * sizeof(float);
+    gemv_bf16_kernel<<<N, n_threads, smem, stream>>>(out, W, x, N, K);
+}
+
+
+// Softmax-gated pooling: each thread handles one output dimension.
+// For each dimension d:
+//   1. Find max of score[i][d] across i in [0, window)
+//   2. Compute softmax weights = exp(score[i][d] - max) / sum
+//   3. out[d] = sum_i(kv[i][d] * weight_i)
+__global__ void compressor_pool_kernel(
+    float* __restrict__ out,
+    const float* __restrict__ kv,
+    const float* __restrict__ score,
+    int window, int dim)
+{
+    int d = blockIdx.x * blockDim.x + threadIdx.x;
+    if (d >= dim) return;
+
+    // Find max for numerical stability
+    float max_score = -1e30f;
+    for (int i = 0; i < window; i++) {
+        float s = score[i * dim + d];
+        if (s > max_score) max_score = s;
+    }
+
+    // Compute softmax and weighted sum in one pass
+    float sum_exp = 0.0f;
+    float weighted_sum = 0.0f;
+    for (int i = 0; i < window; i++) {
+        float w = expf(score[i * dim + d] - max_score);
+        sum_exp += w;
+        weighted_sum += w * kv[i * dim + d];
+    }
+
+    out[d] = weighted_sum / (sum_exp + 1e-10f);
+}
+
+void compressor_pool_cuda(
+    float* out,
+    const float* kv,
+    const float* score,
+    int window, int dim,
+    cudaStream_t stream)
+{
+    int threads = 256;
+    int blocks = (dim + threads - 1) / threads;
+    compressor_pool_kernel<<<blocks, threads, 0, stream>>>(out, kv, score, window, dim);
+}
+
+
+// Combine raw and compressed KV caches into a contiguous buffer
+__global__ void combine_kv_kernel(
+    __nv_bfloat16* __restrict__ out,
+    const __nv_bfloat16* __restrict__ raw_kv,
+    int raw_len,
+    const __nv_bfloat16* __restrict__ comp_kv,
+    int comp_len,
+    int head_dim)
+{
+    int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    int total = (raw_len + comp_len) * head_dim;
+    if (idx >= total) return;
+
+    int entry = idx / head_dim;
+    int d = idx % head_dim;
+    if (entry < raw_len) {
+        out[idx] = raw_kv[entry * head_dim + d];
+    } else {
+        out[idx] = comp_kv[(entry - raw_len) * head_dim + d];
+    }
+}
+
+void combine_kv_cuda(
+    __nv_bfloat16* out,
+    const __nv_bfloat16* raw_kv,
+    int raw_len,
+    const __nv_bfloat16* comp_kv,
+    int comp_len,
+    int head_dim,
+    cudaStream_t stream)
+{
+    int total = (raw_len + comp_len) * head_dim;
+    int threads = 256;
+    int blocks = (total + threads - 1) / threads;
+    combine_kv_kernel<<<blocks, threads, 0, stream>>>(out, raw_kv, raw_len, comp_kv, comp_len, head_dim);
+}
+

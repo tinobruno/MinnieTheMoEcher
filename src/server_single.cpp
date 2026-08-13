@@ -26,6 +26,7 @@
 #include <cstdlib>
 #include <cstring>
 #include <cmath>
+#include <limits>
 #include <cstdarg>
 #include <cassert>
 #include <string>
@@ -76,7 +77,7 @@ using json = nlohmann::json;
 } while(0)
 
 static constexpr int PAGE_SIZE = 4096;
-static constexpr int MAX_SEQ_LEN = 4096;
+static constexpr int MAX_SEQ_LEN = 65536;
 
 // ════════════════════════════════════════════════════════════════════════════════
 //  Logging
@@ -138,6 +139,7 @@ struct ModelConfig {
     int rope_beta_slow = 1;
     int original_seq_len = 65536;
     int sliding_window = 128;
+    int window_size = 128;              // raw attention window per layer (paper: 128)
     std::string scoring_func = "sqrtsoftplus";
     float routed_scaling_factor = 1.5f;
     float swiglu_limit = 10.0f;
@@ -148,6 +150,13 @@ struct ModelConfig {
     int eos_token_id = 1;
     float compress_rope_theta = 160000.0f;
     std::string expert_dtype = "fp4";
+    std::vector<int> compress_ratios;  // per-layer compression ratios
+    int max_compressed_entries = 0;    // max compressed KV entries per layer
+
+    int layer_compress_ratio(int layer_id) const {
+        if (layer_id < (int)compress_ratios.size()) return compress_ratios[layer_id];
+        return 0;
+    }
 
     void from_json(const json& j) {
         auto get = [&](auto& field, const char* key) {
@@ -174,6 +183,9 @@ struct ModelConfig {
         get(rope_beta_slow, "rope_beta_slow");
         get(original_seq_len, "original_seq_len");
         get(sliding_window, "sliding_window");
+        get(window_size, "window_size");
+        // If window_size not in manifest, use sliding_window as fallback
+        if (!j.contains("window_size")) window_size = sliding_window;
         get(scoring_func, "scoring_func");
         get(routed_scaling_factor, "routed_scaling_factor");
         get(swiglu_limit, "swiglu_limit");
@@ -184,6 +196,18 @@ struct ModelConfig {
         get(eos_token_id, "eos_token_id");
         get(compress_rope_theta, "compress_rope_theta");
         get(expert_dtype, "expert_dtype");
+        if (j.contains("compress_ratios") && j["compress_ratios"].is_array()) {
+            compress_ratios = j["compress_ratios"].get<std::vector<int>>();
+        }
+        // Compute max compressed entries: sliding_window / min_ratio
+        // This determines the size of the compressed KV cache per layer
+        max_compressed_entries = 0;
+        for (int r : compress_ratios) {
+            if (r > 0) {
+                int entries = sliding_window / r;
+                if (entries > max_compressed_entries) max_compressed_entries = entries;
+            }
+        }
     }
 };
 
@@ -294,7 +318,7 @@ private:
     std::vector<std::pair<std::string, int>> special_tokens_;
 
     // Byte <-> unicode mapping (GPT-2 BPE uses unicode chars for bytes)
-    char byte_to_char_[256];
+    uint32_t byte_to_char_[256];  // Maps byte value -> unicode codepoint
     std::unordered_map<char32_t, uint8_t> char_to_byte_;
 
     void build_byte_mapping() {
@@ -304,10 +328,10 @@ private:
         for (int b = 0; b < 256; b++) {
             // Printable ASCII + extended range map to themselves
             if ((b >= 33 && b <= 126) || (b >= 161 && b <= 172) || (b >= 174 && b <= 255)) {
-                byte_to_char_[b] = (char)b;
+                byte_to_char_[b] = (uint32_t)b;
             } else {
                 // Non-printable bytes map to unicode starting at U+0100
-                byte_to_char_[b] = (char)(256 + n);
+                byte_to_char_[b] = 256 + n;
                 n++;
             }
         }
@@ -316,14 +340,17 @@ private:
     std::string bytes_to_unicode(const std::string& bytes) const {
         std::string result;
         for (unsigned char b : bytes) {
-            // Encode each byte as its unicode character representation
-            unsigned char c = byte_to_char_[b];
-            if (c < 128) {
-                result += (char)c;
+            uint32_t cp = byte_to_char_[b];
+            // UTF-8 encode the codepoint
+            if (cp < 0x80) {
+                result += (char)cp;
+            } else if (cp < 0x800) {
+                result += (char)(0xC0 | (cp >> 6));
+                result += (char)(0x80 | (cp & 0x3F));
             } else {
-                // UTF-8 encode
-                result += (char)(0xC0 | (c >> 6));
-                result += (char)(0x80 | (c & 0x3F));
+                result += (char)(0xE0 | (cp >> 12));
+                result += (char)(0x80 | ((cp >> 6) & 0x3F));
+                result += (char)(0x80 | (cp & 0x3F));
             }
         }
         return result;
@@ -363,7 +390,7 @@ private:
                 // This is a remapped non-printable byte
                 // Find which byte maps to this codepoint
                 for (int b = 0; b < 256; b++) {
-                    if ((unsigned char)byte_to_char_[b] == (unsigned char)codepoint) {
+                    if (byte_to_char_[b] == codepoint) {
                         result += (char)b;
                         break;
                     }
@@ -432,11 +459,16 @@ private:
         // Convert to unicode representation
         std::string unicode_text = bytes_to_unicode(text);
 
-        // Simple word-level split (split on spaces, keeping space with following word)
+        // Simple word-level split (split on Ġ = space in unicode BPE, keeping Ġ with following word)
+        // After bytes_to_unicode, space (0x20) becomes Ġ (U+0120) = UTF-8 0xC4 0xA0
         std::vector<std::string> words;
         std::string current;
         for (size_t i = 0; i < unicode_text.size(); i++) {
-            if (unicode_text[i] == ' ' && !current.empty()) {
+            // Check for Ġ (UTF-8: 0xC4 0xA0) — the unicode representation of space
+            if (i + 1 < unicode_text.size() &&
+                (unsigned char)unicode_text[i] == 0xC4 &&
+                (unsigned char)unicode_text[i+1] == 0xA0 &&
+                !current.empty()) {
                 words.push_back(current);
                 current.clear();
             }
@@ -484,7 +516,19 @@ private:
                 } else {
                     // Fallback: encode as individual bytes
                     for (unsigned char b : tok) {
-                        std::string byte_tok(1, byte_to_char_[b]);
+                        // UTF-8 encode the codepoint for this byte
+                        uint32_t cp = byte_to_char_[b];
+                        std::string byte_tok;
+                        if (cp < 0x80) {
+                            byte_tok += (char)cp;
+                        } else if (cp < 0x800) {
+                            byte_tok += (char)(0xC0 | (cp >> 6));
+                            byte_tok += (char)(0x80 | (cp & 0x3F));
+                        } else {
+                            byte_tok += (char)(0xE0 | (cp >> 12));
+                            byte_tok += (char)(0x80 | ((cp >> 6) & 0x3F));
+                            byte_tok += (char)(0x80 | (cp & 0x3F));
+                        }
                         auto bit = token_to_id_.find(byte_tok);
                         if (bit != token_to_id_.end()) {
                             ids.push_back(bit->second);
@@ -731,6 +775,20 @@ public:
         GPUTensor attn_sink;           // [n_heads] F32
         GPUTensor ffn_norm_w;          // [hidden]
 
+        // Compressor weights (for layers with compress_ratio > 0)
+        GPUTensor comp_wkv;       // [coff*head_dim, hidden_size] BF16
+        GPUTensor comp_wgate;     // [coff*head_dim, hidden_size] BF16
+        GPUTensor comp_ape;       // [ratio, coff*head_dim] F32
+        GPUTensor comp_norm;      // [head_dim] BF16
+
+        // Compressed KV cache (for layers with compress_ratio > 0)
+        GPUTensor comp_kv_cache;  // [max_compressed_entries, head_dim] BF16
+        int comp_kv_count = 0;    // number of compressed entries written so far
+
+        // Compressor state buffers (GPU, F32) for incremental decode compression
+        GPUTensor comp_kv_state;     // [coff * ratio, coff * head_dim] F32
+        GPUTensor comp_score_state;  // [coff * ratio, coff * head_dim] F32
+
         // Gate
         GPUTensor gate_w;              // [n_experts, hidden] BF16
         GPUTensor gate_bias;           // [n_experts] F32 (null for hash layers)
@@ -760,7 +818,8 @@ public:
     GPUTensor hc_head_scale_;
 
     // RoPE frequency tables
-    GPUTensor rope_freqs_;         // [MAX_SEQ_LEN, rope_dim/2, 2] F32
+    GPUTensor rope_freqs_;              // [MAX_SEQ_LEN, rope_dim/2, 2] F32 — non-compressed layers
+    GPUTensor rope_freqs_compressed_;   // [MAX_SEQ_LEN, rope_dim/2, 2] F32 — compressed layers
 
     // Expert layout info (from manifest)
     struct ExpertPartInfo {
@@ -797,6 +856,12 @@ public:
     GPUTensor buf_hc_comb_;      // [hc_mult*hc_mult] F32
     GPUTensor buf_hc_mixes_;     // [(2+hc)*hc] F32
     GPUTensor buf_hc_input_;     // [hc_mult*hidden_size] F32 — flattened HC state
+
+    // Compressor working buffers
+    GPUTensor buf_comp_proj_;    // F32 working buffer for compressor projections
+    GPUTensor buf_comp_out_;     // F32 working buffer for compressor pooling output
+    GPUTensor buf_comp_bf16_;    // BF16 working buffer for compressed entry (head_dim)
+    GPUTensor buf_combined_kv_;  // BF16 buffer for combined raw+compressed KV
 
     // Dequant buffer — large enough for the biggest weight matrix
     static constexpr size_t DEQUANT_BUF_SIZE = 64 * 1024 * 1024;  // 64 MB
@@ -882,15 +947,37 @@ public:
         // Allocate working buffers
         alloc_buffers();
 
-        // Precompute RoPE frequencies
+        // Precompute RoPE frequencies — two tables for non-compressed vs compressed layers
+        // DS4 reference: non-compressed layers use base freq without YaRN interpolation;
+        // compressed layers use compress_rope_theta (160000) with full YaRN.
         int rope_dim = cfg_.qk_rope_head_dim;
-        rope_freqs_.alloc(MAX_SEQ_LEN * (rope_dim / 2) * 2 * sizeof(float));
+        size_t freq_bytes = MAX_SEQ_LEN * (rope_dim / 2) * 2 * sizeof(float);
+
+        // Non-compressed layers: base=10000, NO YaRN (original_seq_len=0 disables it)
+        rope_freqs_.alloc(freq_bytes);
         precompute_freqs_cuda(rope_freqs_.f32(), MAX_SEQ_LEN, rope_dim,
-                              cfg_.rope_theta, cfg_.rope_factor,
+                              cfg_.rope_theta, 1.0f,
+                              0, cfg_.rope_beta_fast,
+                              cfg_.rope_beta_slow, main_stream_);
+
+        // Compressed layers: base=160000, with YaRN (factor=16)
+        rope_freqs_compressed_.alloc(freq_bytes);
+        precompute_freqs_cuda(rope_freqs_compressed_.f32(), MAX_SEQ_LEN, rope_dim,
+                              cfg_.compress_rope_theta, cfg_.rope_factor,
                               cfg_.original_seq_len, cfg_.rope_beta_fast,
                               cfg_.rope_beta_slow, main_stream_);
         CUDA_CHECK(cudaStreamSynchronize(main_stream_));
+        LOG_INFO("RoPE: non-compressed base=%.0f (no YaRN), compressed base=%.0f (YaRN factor=%.0f)",
+                 cfg_.rope_theta, cfg_.compress_rope_theta, cfg_.rope_factor);
 
+        if (!cfg_.compress_ratios.empty()) {
+            LOG_INFO("Compress ratios loaded: %zu layers", cfg_.compress_ratios.size());
+            LOG_INFO("  Layer 0: ratio=%d", cfg_.layer_compress_ratio(0));
+            LOG_INFO("  Layer 2: ratio=%d", cfg_.layer_compress_ratio(2));
+            LOG_INFO("  Layer 3: ratio=%d", cfg_.layer_compress_ratio(3));
+        } else {
+            LOG_INFO("No compress_ratios found, using full window for all layers");
+        }
         LOG_INFO("Model loaded successfully");
         return true;
     }
@@ -916,6 +1003,15 @@ public:
         LOG_INFO("%s", s.c_str());
     }
 
+    // Debug flag — reset before each generate() call
+    bool dbg_first_token_ = true;
+    int dbg_hc_pre_call_ = 0;
+    bool dbg_head_ = true;
+    int dbg_sample_count_ = 0;
+
+    // Persistent RNG for sampling (seeded once)
+    std::mt19937 rng_{std::random_device{}()};
+
     void forward_token(int token_id, int position) {
         int dim = cfg_.hidden_size;
         int n_heads = cfg_.num_attention_heads;
@@ -927,8 +1023,6 @@ public:
         int window = cfg_.sliding_window;
         int hc = cfg_.hc_mult;
 
-        static bool first_token = true;
-
         // 1. Embedding lookup
         int32_t tid_host = token_id;
         CUDA_CHECK(cudaMemcpyAsync(buf_input_ids_.i32(), &tid_host, sizeof(int32_t),
@@ -936,7 +1030,7 @@ public:
         embedding_cuda(buf_hidden_.bf16(), embed_weight_.bf16(),
                        buf_input_ids_.i32(), 1, dim, main_stream_);
 
-        if (first_token) {
+        if (dbg_first_token_) {
             LOG_INFO("DEBUG: token_id=%d position=%d", token_id, position);
             dump_bf16("embed", buf_hidden_.bf16(), dim);
         }
@@ -961,25 +1055,69 @@ public:
         // 4. Head HC: reduce [hc, dim] -> [dim]
         hc_head_reduce();
 
-        if (first_token) dump_bf16("after_hc_head", buf_hidden_.bf16(), dim);
+        if (dbg_first_token_) dump_bf16("after_hc_head", buf_hidden_.bf16(), dim);
 
         // 5. Final norm
         rms_norm_cuda(buf_hidden_.bf16(), buf_hidden_.bf16(),
                       norm_weight_.bf16(), dim, cfg_.rms_norm_eps, main_stream_);
 
-        if (first_token) dump_bf16("after_final_norm", buf_hidden_.bf16(), dim);
+        if (dbg_first_token_) dump_bf16("after_final_norm", buf_hidden_.bf16(), dim);
 
         // 6. Logits: hidden @ head_weight.T -> [vocab_size]
         compute_logits();
 
-        first_token = false;
+        dbg_first_token_ = false;
     }
 
     // ── Generate tokens ─────────────────────────────────────────────────────
 
     std::string generate(const std::string& prompt, int max_tokens = 512,
                          float temperature = 0.0f,
-                         std::function<void(const std::string&)> on_token = nullptr) {
+                         std::function<void(const std::string&)> on_token = nullptr,
+                         float repetition_penalty = 1.1f) {
+        // Reset debug flags for this request
+        dbg_first_token_ = true;
+        dbg_hc_pre_call_ = 0;
+        dbg_head_ = true;
+        dbg_sample_count_ = 0;
+
+        // Reset KV caches for all layers (critical: stale cache = garbled output)
+        for (int l = 0; l < cfg_.num_hidden_layers; l++) {
+            CUDA_CHECK(cudaMemset(layers_[l].kv_cache.data, 0,
+                                   layers_[l].kv_cache.size_bytes));
+            // Reset compressor state for compressed layers
+            int ratio = cfg_.layer_compress_ratio(l);
+            if (ratio > 0) {
+                layers_[l].comp_kv_count = 0;
+                if (layers_[l].comp_kv_cache.data)
+                    CUDA_CHECK(cudaMemset(layers_[l].comp_kv_cache.data, 0,
+                                           layers_[l].comp_kv_cache.size_bytes));
+                if (layers_[l].comp_kv_state.data)
+                    CUDA_CHECK(cudaMemset(layers_[l].comp_kv_state.data, 0,
+                                           layers_[l].comp_kv_state.size_bytes));
+                if (layers_[l].comp_score_state.data) {
+                    int coff = (ratio == 4) ? 2 : 1;
+                    int state_rows = coff * ratio;
+                    int state_cols = coff * cfg_.head_dim;
+                    std::vector<float> neg_inf(state_rows * state_cols,
+                                               -std::numeric_limits<float>::infinity());
+                    CUDA_CHECK(cudaMemcpy(layers_[l].comp_score_state.data, neg_inf.data(),
+                                           neg_inf.size() * sizeof(float), cudaMemcpyHostToDevice));
+                }
+            }
+        }
+
+        // Reset HC (Hierarchical Compressor) routing state.
+        // This is critical: stale HC state from a previous request causes
+        // the expert routing to be biased by the old conversation, leading
+        // to garbled output on subsequent turns.
+        if (buf_hc_state_.data) {
+            CUDA_CHECK(cudaMemset(buf_hc_state_.data, 0, buf_hc_state_.size_bytes));
+        }
+
+        // Store repetition_penalty for use in sample_token
+        current_rep_penalty_ = repetition_penalty;
+
         // Tokenize
         std::vector<int> input_ids = tokenizer_.encode(prompt);
         LOG_INFO("Prompt tokens: %zu", input_ids.size());
@@ -1002,21 +1140,95 @@ public:
             forward_token(input_ids[i], (int)i);
         }
 
-        std::vector<int> history = input_ids;
+        // Repetition history: only generated tokens (not prompt tokens).
+        // Seeding with prompt tokens was tried but it incorrectly penalizes
+        // tokens from the user's current query (e.g., "Amiga").
+        std::vector<int> history;
 
         // Decode: generate tokens one by one
         int position = (int)input_ids.size();
         std::string token_buffer;
-        for (int t = 0; t < max_tokens; t++) {
-            // Sample from logits
-            int next_token = sample_token(temperature, history);
+        std::string generated_text;  // Track full output for sentence-boundary stopping
+        std::string finish_reason = "stop";
 
-            if (next_token == cfg_.eos_token_id) break;
+        // Think-block filtering state
+        // DeepSeek V4 generates <think>...</think> before the actual response
+        bool in_think_block = false;
+        bool think_block_ended = false;
+        std::string think_detect_buffer;
+        // Get token IDs for think tags
+        int think_start_id = tokenizer_.get_token_id("<think>");
+        int think_end_id = tokenizer_.get_token_id("</think>");
+        // Also check with special token format
+        if (think_start_id < 0) think_start_id = tokenizer_.get_token_id("\xef\xbd\x9c" "think" "\xef\xbd\x9c");
+        if (think_end_id < 0) think_end_id = tokenizer_.get_token_id("\xef\xbd\x9c" "/think" "\xef\xbd\x9c");
+
+        // Additional EOS tokens for DeepSeek V4
+        int eos2_id = tokenizer_.get_token_id(
+            "<\xef\xbd\x9c" "end\xe2\x96\x81of\xe2\x96\x81sentence" "\xef\xbd\x9c>");
+
+        LOG_INFO("Think tokens: start=%d end=%d, EOS=%d eos2=%d",
+                 think_start_id, think_end_id, cfg_.eos_token_id, eos2_id);
+
+        // Track how many content tokens (non-think) we've generated
+        int content_tokens_generated = 0;
+
+        for (int t = 0; t < max_tokens; t++) {
+            // Sample from logits, suppressing EOS for the first few tokens
+            int next_token = sample_token(temperature, history, content_tokens_generated);
+
+            // Check all EOS conditions
+            if (next_token == cfg_.eos_token_id ||
+                (eos2_id >= 0 && next_token == eos2_id)) {
+                LOG_INFO("EOS hit: token=%d (cfg_eos=%d, eos2=%d) at step %d/%d",
+                         next_token, cfg_.eos_token_id, eos2_id, t, max_tokens);
+                break;
+            }
+
             output_ids.push_back(next_token);
             history.push_back(next_token);
+            content_tokens_generated++;
+
+            // Handle think block filtering
+            if (think_start_id >= 0 && next_token == think_start_id) {
+                in_think_block = true;
+                // Forward the token but don't emit it
+                forward_token(next_token, position);
+                position++;
+                continue;
+            }
+            if (think_end_id >= 0 && next_token == think_end_id) {
+                in_think_block = false;
+                think_block_ended = true;
+                // Forward the token but don't emit it
+                forward_token(next_token, position);
+                position++;
+                continue;
+            }
+            if (in_think_block) {
+                // Inside think block — forward but don't emit
+                forward_token(next_token, position);
+                position++;
+                continue;
+            }
 
             std::string token_text = tokenizer_.decode({next_token});
+
+            // If we just exited a think block, skip leading newlines
+            if (think_block_ended && !token_text.empty()) {
+                size_t start = token_text.find_first_not_of("\n\r");
+                if (start == std::string::npos) {
+                    // All whitespace, skip
+                    forward_token(next_token, position);
+                    position++;
+                    continue;
+                }
+                if (start > 0) token_text = token_text.substr(start);
+                think_block_ended = false;
+            }
+
             token_buffer += token_text;
+            generated_text += token_text;
 
             // Check if token_buffer ends with a complete UTF-8 character.
             bool is_complete = true;
@@ -1055,6 +1267,33 @@ public:
             // Forward the new token
             forward_token(next_token, position);
             position++;
+
+            // Graceful sentence-boundary stopping:
+            // When we're within 80% of max_tokens and just completed a sentence,
+            // stop early to avoid truncating mid-thought.
+            if (content_tokens_generated >= (max_tokens * 4 / 5)) {
+                // Check if the generated text ends at a sentence boundary
+                if (!generated_text.empty()) {
+                    char last_char = generated_text.back();
+                    // Also check for sentence-ending after whitespace
+                    size_t last_non_ws = generated_text.find_last_not_of(" \t\n\r");
+                    if (last_non_ws != std::string::npos) {
+                        last_char = generated_text[last_non_ws];
+                    }
+                    if (last_char == '.' || last_char == '!' || last_char == '?' ||
+                        last_char == '\n') {
+                        LOG_INFO("Graceful stop at sentence boundary (token %d/%d)",
+                                 content_tokens_generated, max_tokens);
+                        finish_reason = "stop";
+                        break;
+                    }
+                }
+            }
+        }
+
+        // Check if we hit max_tokens
+        if ((int)output_ids.size() >= max_tokens) {
+            finish_reason = "length";
         }
 
         // Flush anything remaining in the buffer
@@ -1072,8 +1311,33 @@ public:
             printf("\n");
         }
 
-        return tokenizer_.decode(output_ids);
+        // Decode only non-think output tokens for the result
+        // Filter think tokens from output_ids
+        std::vector<int> visible_ids;
+        bool skip = false;
+        for (int id : output_ids) {
+            if (think_start_id >= 0 && id == think_start_id) { skip = true; continue; }
+            if (think_end_id >= 0 && id == think_end_id) { skip = false; continue; }
+            if (!skip) visible_ids.push_back(id);
+        }
+        std::string result = tokenizer_.decode(visible_ids);
+        // Trim leading whitespace from result (after think block)
+        size_t first_non_ws = result.find_first_not_of("\n\r ");
+        if (first_non_ws != std::string::npos && first_non_ws > 0) {
+            result = result.substr(first_non_ws);
+        }
+
+        prompt_token_count_ = (int)input_ids.size();
+        completion_token_count_ = (int)output_ids.size();
+        last_finish_reason_ = finish_reason;
+
+        return result;
     }
+
+    // Per-request stats (set by generate())
+    int prompt_token_count_ = 0;
+    int completion_token_count_ = 0;
+    std::string last_finish_reason_ = "stop";
 
 private:
     // ── Dense tensor loading ────────────────────────────────────────────────
@@ -1141,6 +1405,36 @@ private:
             load_tensor(lw.attn_norm_w, prefix + ".attn_norm.weight");
             load_tensor(lw.attn_sink, prefix + ".attn.attn_sink");
             load_tensor(lw.ffn_norm_w, prefix + ".ffn_norm.weight");
+
+            // Compressor weights (for layers with compress_ratio > 0)
+            int ratio = cfg_.layer_compress_ratio(l);
+            if (ratio > 0) {
+                load_tensor(lw.comp_wkv, prefix + ".attn.compressor.wkv.weight");
+                load_tensor(lw.comp_wgate, prefix + ".attn.compressor.wgate.weight");
+                load_tensor(lw.comp_ape, prefix + ".attn.compressor.ape");
+                load_tensor(lw.comp_norm, prefix + ".attn.compressor.norm.weight");
+
+                // Allocate compressed KV cache
+                int max_comp = cfg_.sliding_window / ratio;
+                lw.comp_kv_cache.alloc((size_t)max_comp * cfg_.head_dim * sizeof(__nv_bfloat16));
+                CUDA_CHECK(cudaMemset(lw.comp_kv_cache.data, 0, lw.comp_kv_cache.size_bytes));
+                lw.comp_kv_count = 0;
+
+                // Allocate compressor state buffers
+                // coff = 1 + (ratio == 4 ? 1 : 0)  — overlap only for CSA (ratio=4)
+                int coff = (ratio == 4) ? 2 : 1;
+                int state_rows = coff * ratio;
+                int state_cols = coff * cfg_.head_dim;
+                lw.comp_kv_state.alloc((size_t)state_rows * state_cols * sizeof(float));
+                lw.comp_score_state.alloc((size_t)state_rows * state_cols * sizeof(float));
+                CUDA_CHECK(cudaMemset(lw.comp_kv_state.data, 0, lw.comp_kv_state.size_bytes));
+                // Initialize score_state to -inf so softmax ignores unfilled slots
+                std::vector<float> neg_inf(state_rows * state_cols, -std::numeric_limits<float>::infinity());
+                CUDA_CHECK(cudaMemcpy(lw.comp_score_state.data, neg_inf.data(),
+                                       neg_inf.size() * sizeof(float), cudaMemcpyHostToDevice));
+
+                LOG_INFO("  Layer %d: compressor loaded (ratio=%d, coff=%d, max_comp=%d)", l, ratio, coff, max_comp);
+            }
 
             // Gate
             load_tensor(lw.gate_w, prefix + ".ffn.gate.weight");
@@ -1219,6 +1513,16 @@ private:
         buf_hc_comb_.alloc(hc * hc * sizeof(float));
         buf_hc_mixes_.alloc((2 + hc) * hc * sizeof(float));
         buf_hc_input_.alloc((size_t)hc * dim * sizeof(float));
+
+        // Compressor working buffers
+        // Max projection output size: coff=2 for ratio=4, head_dim=512 -> 1024
+        int max_comp_dim = 2 * head_dim_val;  // coff=2
+        buf_comp_proj_.alloc(max_comp_dim * sizeof(float));  // for wkv or wgate output
+        buf_comp_out_.alloc(max_comp_dim * sizeof(float));   // for pooling output
+        buf_comp_bf16_.alloc(head_dim_val * sizeof(__nv_bfloat16));  // compressed entry in BF16
+        // Combined KV buffer: raw window + max compressed entries
+        int max_combined = cfg_.sliding_window + cfg_.max_compressed_entries;
+        buf_combined_kv_.alloc((size_t)max_combined * head_dim_val * sizeof(__nv_bfloat16));
     }
 
     // ── cuBLAS GEMM helper (BF16) ──────────────────────────────────────────
@@ -1275,6 +1579,150 @@ private:
         int K_packed = K_logical / 2;
         fp4_dequant_cuda(buf_dequant_.bf16(), weight, scale, N, K_packed, scale_cols, main_stream_);
         gemm_bf16(C, M, N, K_logical, A, buf_dequant_.bf16());
+    }
+
+    // ── KV Compressor Forward ───────────────────────────────────────────────
+    // Implements gated pooling compression for CSA (ratio=4, overlap) and
+    // HCA (ratio=128, non-overlap) layers following the DeepSeek V4 paper.
+    //
+    // Called once per token per compressed layer. Accumulates kv/score state
+    // and emits a compressed entry every `ratio` tokens.
+
+    void forward_compressor(int layer_id, int position) {
+        auto& lw = layers_[layer_id];
+        int ratio = cfg_.layer_compress_ratio(layer_id);
+        if (ratio <= 0) return;
+
+        int dim = cfg_.hidden_size;
+        int head_dim_val = cfg_.head_dim;
+        int rope_dim = cfg_.qk_rope_head_dim;
+        bool overlap = (ratio == 4);
+        int coff = overlap ? 2 : 1;
+        int proj_dim = coff * head_dim_val;  // output dim of wkv/wgate
+        int state_rows = coff * ratio;  // total rows in state: 4 for HCA, 8 for CSA
+
+        // 1. Project hidden state through compressor wkv: [proj_dim] = wkv @ hidden
+        gemv_bf16_cuda(buf_comp_proj_.f32(), lw.comp_wkv.bf16(),
+                       buf_hidden_.bf16(), proj_dim, dim, main_stream_);
+
+        // State index: cycles through all state_rows slots via modular arithmetic
+        // For CSA (coff=2, ratio=4): position % 8 cycles 0,1,2,3,4,5,6,7,0,...
+        //   Block N writes to the first half (0-3) or second half (4-7)
+        // For HCA (coff=1, ratio=128): position % 128 cycles 0,1,...,127,0,...
+        int state_idx = position % state_rows;
+
+        // Copy kv projection to state slot
+        CUDA_CHECK(cudaMemcpyAsync(
+            lw.comp_kv_state.f32() + (size_t)state_idx * proj_dim,
+            buf_comp_proj_.f32(), proj_dim * sizeof(float),
+            cudaMemcpyDeviceToDevice, main_stream_));
+
+        // 2. Project hidden state through compressor wgate: [proj_dim]
+        gemv_bf16_cuda(buf_comp_out_.f32(), lw.comp_wgate.bf16(),
+                       buf_hidden_.bf16(), proj_dim, dim, main_stream_);
+
+        // 3. Add APE bias to gate scores
+        // APE shape: [ratio, proj_dim], row = position % ratio
+        int ape_row = position % ratio;
+        CUDA_CHECK(cudaMemcpyAsync(
+            lw.comp_score_state.f32() + (size_t)state_idx * proj_dim,
+            buf_comp_out_.f32(), proj_dim * sizeof(float),
+            cudaMemcpyDeviceToDevice, main_stream_));
+
+        // Add APE bias: score_state[state_idx] += ape[ape_row]
+        float alpha_one = 1.0f;
+        float* score_ptr = lw.comp_score_state.f32() + (size_t)state_idx * proj_dim;
+        const float* ape_ptr = lw.comp_ape.f32() + (size_t)ape_row * proj_dim;
+        CUBLAS_CHECK(cublasSaxpy(cublas_handle_, proj_dim, &alpha_one,
+                                 ape_ptr, 1, score_ptr, 1));
+
+        // 4. Check if we have a complete block to compress
+        bool should_compress = ((position + 1) % ratio == 0);
+        if (!should_compress) return;
+
+        // 5. Perform softmax-gated pooling
+        if (overlap) {
+            // CSA overlap: the state naturally has data from two consecutive blocks
+            // thanks to modular cycling.
+            //
+            // At compression time (position 3, 7, 11, ...):
+            // - One half of state (rows 0-3 or rows 4-7) has the CURRENT block
+            // - The other half has the PREVIOUS block (or is empty/-inf for first block)
+            //
+            // Reference logic:
+            //   first_half  = state[:ratio, :head_dim]    (rows 0-3, first head_dim dims)
+            //   second_half = state[ratio:, head_dim:]    (rows 4-7, second head_dim dims)
+            //   pool_input  = cat(first_half, second_half) → [2*ratio, head_dim]
+            //   pool_score  = cat(score_first_half, score_second_half) → [2*ratio, head_dim]
+
+            // Use buf_dequant_ as temp workspace
+            float* tmp_kv = (float*)buf_dequant_.data;
+            float* tmp_score = tmp_kv + 2 * ratio * head_dim_val;
+
+            // First half: rows 0..ratio-1, take first head_dim dims
+            for (int i = 0; i < ratio; i++) {
+                CUDA_CHECK(cudaMemcpyAsync(
+                    tmp_kv + (size_t)i * head_dim_val,
+                    lw.comp_kv_state.f32() + (size_t)i * proj_dim,
+                    head_dim_val * sizeof(float), cudaMemcpyDeviceToDevice, main_stream_));
+                CUDA_CHECK(cudaMemcpyAsync(
+                    tmp_score + (size_t)i * head_dim_val,
+                    lw.comp_score_state.f32() + (size_t)i * proj_dim,
+                    head_dim_val * sizeof(float), cudaMemcpyDeviceToDevice, main_stream_));
+            }
+            // Second half: rows ratio..2*ratio-1, take second head_dim dims (offset by head_dim)
+            for (int i = 0; i < ratio; i++) {
+                CUDA_CHECK(cudaMemcpyAsync(
+                    tmp_kv + (size_t)(ratio + i) * head_dim_val,
+                    lw.comp_kv_state.f32() + (size_t)(ratio + i) * proj_dim + head_dim_val,
+                    head_dim_val * sizeof(float), cudaMemcpyDeviceToDevice, main_stream_));
+                CUDA_CHECK(cudaMemcpyAsync(
+                    tmp_score + (size_t)(ratio + i) * head_dim_val,
+                    lw.comp_score_state.f32() + (size_t)(ratio + i) * proj_dim + head_dim_val,
+                    head_dim_val * sizeof(float), cudaMemcpyDeviceToDevice, main_stream_));
+            }
+
+            // Pool: softmax over 2*ratio rows, weighted sum -> [head_dim]
+            compressor_pool_cuda(buf_comp_out_.f32(), tmp_kv, tmp_score,
+                                 2 * ratio, head_dim_val, main_stream_);
+
+            // No carry-over needed: state naturally cycles via position % (coff*ratio)
+        } else {
+            // HCA non-overlapping: pool over ratio rows
+            compressor_pool_cuda(buf_comp_out_.f32(),
+                                 lw.comp_kv_state.f32(),
+                                 lw.comp_score_state.f32(),
+                                 ratio, head_dim_val, main_stream_);
+
+            // Reset state for next block (HCA has no overlap, clean slate)
+            CUDA_CHECK(cudaMemsetAsync(lw.comp_kv_state.data, 0,
+                                       lw.comp_kv_state.size_bytes, main_stream_));
+            std::vector<float> neg_inf(ratio * head_dim_val, -std::numeric_limits<float>::infinity());
+            CUDA_CHECK(cudaMemcpyAsync(lw.comp_score_state.data, neg_inf.data(),
+                                       neg_inf.size() * sizeof(float), cudaMemcpyHostToDevice, main_stream_));
+        }
+
+        // 6. Convert pooled output to BF16 and apply RMSNorm
+        f32_to_bf16_cuda(buf_comp_bf16_.bf16(), buf_comp_out_.f32(),
+                         head_dim_val, main_stream_);
+        rms_norm_cuda(buf_comp_bf16_.bf16(), buf_comp_bf16_.bf16(),
+                      lw.comp_norm.bf16(), head_dim_val, cfg_.rms_norm_eps, main_stream_);
+
+        // 7. Apply RoPE to compressed entry using compressed-layer frequencies
+        int comp_pos = position;
+        rope_cuda(buf_comp_bf16_.bf16(), 1, head_dim_val, rope_dim,
+                  comp_pos, rope_freqs_compressed_.f32(), false, main_stream_);
+
+        // 8. Store in compressed KV cache
+        int comp_idx = lw.comp_kv_count;
+        int max_comp = cfg_.sliding_window / ratio;
+        if (comp_idx < max_comp) {
+            CUDA_CHECK(cudaMemcpyAsync(
+                lw.comp_kv_cache.bf16() + (size_t)comp_idx * head_dim_val,
+                buf_comp_bf16_.bf16(), head_dim_val * sizeof(__nv_bfloat16),
+                cudaMemcpyDeviceToDevice, main_stream_));
+            lw.comp_kv_count = comp_idx + 1;
+        }
     }
 
     // ── Forward one layer ───────────────────────────────────────────────────
@@ -1385,12 +1833,11 @@ private:
             CUDA_CHECK(cudaMemcpy(pre_host, buf_hc_pre_.f32(),
                                    hc * sizeof(float), cudaMemcpyDeviceToHost));
 
-            static int hc_pre_call = 0;
-            if (hc_pre_call < 2) {
+            if (dbg_hc_pre_call_ < 2) {
                 float post_host2[8], comb_host2[64];
                 CUDA_CHECK(cudaMemcpy(post_host2, buf_hc_post_.f32(), hc * sizeof(float), cudaMemcpyDeviceToHost));
                 CUDA_CHECK(cudaMemcpy(comb_host2, buf_hc_comb_.f32(), hc * hc * sizeof(float), cudaMemcpyDeviceToHost));
-                LOG_INFO("HC pre call #%d:", hc_pre_call);
+                LOG_INFO("HC pre call #%d:", dbg_hc_pre_call_);
                 for (int i = 0; i < hc; i++)
                     LOG_INFO("  pre[%d]=%.6f post[%d]=%.6f", i, pre_host[i], i, post_host2[i]);
                 for (int i = 0; i < hc; i++) {
@@ -1401,7 +1848,7 @@ private:
                     }
                     LOG_INFO("  comb[%d] = [%s]", i, s.c_str());
                 }
-                hc_pre_call++;
+                dbg_hc_pre_call_++;
             }
 
             // Zero output
@@ -1448,9 +1895,9 @@ private:
             CUDA_CHECK(cudaMemset(dst, 0, dim * sizeof(__nv_bfloat16)));
             weighted_add_cuda(dst, buf_hidden_.bf16(), post_host[i], dim, main_stream_);
 
-            // Add sum_j(comb[i][j] * residual[j])
+            // Add sum_j(comb[j][i] * residual[j]) - Transposed per reference
             for (int j = 0; j < hc; j++) {
-                float c = comb_host[i * hc + j];
+                float c = comb_host[j * hc + i];
                 if (fabsf(c) < 1e-10f) continue;
                 weighted_add_cuda(dst, buf_hc_residual_.bf16() + (size_t)j * dim,
                                   c, dim, main_stream_);
@@ -1504,8 +1951,7 @@ private:
             pre_host[i] = 1.0f / (1.0f + expf(-v)) + cfg_.hc_eps;
         }
 
-        static bool dbg_head = true;
-        if (dbg_head) {
+        if (dbg_head_) {
             LOG_INFO("HC head reduce: hc=%d", hc);
             for (int i = 0; i < hc; i++)
                 LOG_INFO("  mix[%d]=%.6f scale=%.6f base[%d]=%.6f -> pre[%d]=%.6f",
@@ -1519,7 +1965,7 @@ private:
                 for (int i = 0; i < dim; i++) { float v2 = __bfloat162float(tmp[i]); norm += v2*v2; }
                 LOG_INFO("  hc_state[%d] norm=%.6f", h, sqrtf(norm));
             }
-            dbg_head = false;
+            dbg_head_ = false;
         }
 
         // Weighted sum
@@ -1544,6 +1990,12 @@ private:
         int o_groups = cfg_.o_groups;
         int window = cfg_.sliding_window;
         bool dbg = (layer_id == 0 && position == 0);
+
+        // Select per-layer RoPE frequencies based on compress_ratio
+        bool is_compressed = (layer_id < (int)cfg_.compress_ratios.size() &&
+                             cfg_.compress_ratios[layer_id] > 0);
+        float* layer_rope_freqs = is_compressed ? rope_freqs_compressed_.f32()
+                                                : rope_freqs_.f32();
 
         // ── Q projection (low-rank) ─────────────────────────────────────────
         // q_raw = wq_a(x) -> [q_lora_rank]
@@ -1570,7 +2022,7 @@ private:
         
         // Apply RoPE to last rope_dim elements of each Q head
         rope_cuda(buf_q_.bf16(), n_heads, head_dim_val, rope_dim,
-                  position, rope_freqs_.f32(), false, main_stream_);
+                  position, layer_rope_freqs, false, main_stream_);
         
         // ── KV projection ───────────────────────────────────────────────────
         // kv = wkv(x) -> [head_dim]
@@ -1585,7 +2037,7 @@ private:
         
         // Apply RoPE to KV
         rope_cuda(buf_kv_.bf16(), 1, head_dim_val, rope_dim,
-                  position, rope_freqs_.f32(), false, main_stream_);
+                  position, layer_rope_freqs, false, main_stream_);
         
         // Store KV in cache at position % window
         int cache_pos = position % window;
@@ -1595,23 +2047,103 @@ private:
             cudaMemcpyDeviceToDevice, main_stream_));
                 if (dbg) dump_bf16("kv_after_norm_rope", buf_kv_.bf16(), head_dim_val);
 
+        // ── Run compressor to accumulate/emit compressed KV entries ──────────
+        // This must happen AFTER we've stored the raw KV but BEFORE attention,
+        // because compressed layers attend to both raw and compressed entries.
+        int ratio = cfg_.layer_compress_ratio(layer_id);
+        if (ratio > 0) {
+            forward_compressor(layer_id, position);
+        }
+
         // ── Attention computation ───────────────────────────────────────────
         // For each head: score = q_head @ kv_cache.T / sqrt(head_dim)
         // Then softmax and weighted sum
 
-        int cache_len = std::min(position + 1, window);
-
-        
+        // YaRN mscale correction for attention softmax scale.
         float scale = 1.0f / sqrtf((float)head_dim_val);
+        if (cfg_.rope_factor > 1.0f) {
+            float mscale = 0.1f * logf((float)cfg_.rope_factor) + 1.0f;
+            scale *= mscale * mscale;
+        }
+
+        const __nv_bfloat16* attn_kv_ptr;
+        int attn_cache_len;
+
+        if (ratio > 0 && lw.comp_kv_count > 0 && position + 1 > window) {
+            // Compressed layer: attend to raw sliding window + compressed entries
+            int raw_entries = std::min(position + 1, window);
+            int comp_entries = lw.comp_kv_count;
+
+            // Build combined KV buffer: [raw_entries | comp_entries]
+            // Raw entries start from the oldest in the circular buffer
+            int raw_start = 0;
+            if (position + 1 > window) {
+                // Circular buffer wraps: entries are not contiguous
+                // Copy in order: from (cache_pos+1)%window to end, then from 0 to cache_pos
+                int after_pos = (cache_pos + 1) % window;
+                int tail = window - after_pos;
+                CUDA_CHECK(cudaMemcpyAsync(
+                    buf_combined_kv_.bf16(),
+                    lw.kv_cache.bf16() + (size_t)after_pos * head_dim_val,
+                    tail * head_dim_val * sizeof(__nv_bfloat16),
+                    cudaMemcpyDeviceToDevice, main_stream_));
+                CUDA_CHECK(cudaMemcpyAsync(
+                    buf_combined_kv_.bf16() + (size_t)tail * head_dim_val,
+                    lw.kv_cache.bf16(),
+                    (size_t)after_pos * head_dim_val * sizeof(__nv_bfloat16),
+                    cudaMemcpyDeviceToDevice, main_stream_));
+            } else {
+                // Not wrapped: entries are contiguous from 0
+                CUDA_CHECK(cudaMemcpyAsync(
+                    buf_combined_kv_.bf16(),
+                    lw.kv_cache.bf16(),
+                    raw_entries * head_dim_val * sizeof(__nv_bfloat16),
+                    cudaMemcpyDeviceToDevice, main_stream_));
+            }
+            // Append compressed entries
+            CUDA_CHECK(cudaMemcpyAsync(
+                buf_combined_kv_.bf16() + (size_t)raw_entries * head_dim_val,
+                lw.comp_kv_cache.bf16(),
+                comp_entries * head_dim_val * sizeof(__nv_bfloat16),
+                cudaMemcpyDeviceToDevice, main_stream_));
+
+            attn_kv_ptr = buf_combined_kv_.bf16();
+            attn_cache_len = raw_entries + comp_entries;
+        } else {
+            // Non-compressed layer or no compressed entries yet: use raw cache
+            int total_entries = std::min(position + 1, window);
+            int kv_start = 0;
+            if (position + 1 > window) {
+                // Circular buffer: need to linearize
+                int after_pos = (cache_pos + 1) % window;
+                int tail = window - after_pos;
+                CUDA_CHECK(cudaMemcpyAsync(
+                    buf_combined_kv_.bf16(),
+                    lw.kv_cache.bf16() + (size_t)after_pos * head_dim_val,
+                    tail * head_dim_val * sizeof(__nv_bfloat16),
+                    cudaMemcpyDeviceToDevice, main_stream_));
+                CUDA_CHECK(cudaMemcpyAsync(
+                    buf_combined_kv_.bf16() + (size_t)tail * head_dim_val,
+                    lw.kv_cache.bf16(),
+                    (size_t)after_pos * head_dim_val * sizeof(__nv_bfloat16),
+                    cudaMemcpyDeviceToDevice, main_stream_));
+                attn_kv_ptr = buf_combined_kv_.bf16();
+            } else {
+                attn_kv_ptr = lw.kv_cache.bf16();
+            }
+            attn_cache_len = total_entries;
+        }
+
         mla_attention_cuda(
-            buf_q_.bf16(), lw.kv_cache.bf16(), lw.attn_sink.f32(),
-            buf_attn_out_.bf16(), n_heads, cache_len, head_dim_val, scale, main_stream_
+            buf_q_.bf16(), attn_kv_ptr, lw.attn_sink.f32(),
+            buf_attn_out_.bf16(), n_heads, attn_cache_len, head_dim_val, scale, main_stream_
         );
-        // Inverse RoPE on attention output: K=V in DeepSeek V4, so the value
-        // picked up RoPE rotation. Undo it with inverse rotation (-sin) before
-        // the grouped output projection.
+        // Inverse RoPE on attention output: the absorbed KV contains RoPE in 
+        // the rope dimensions. When computing the value weighted sum, these  
+        // rotations are position-mixed. We undo the query position's rotation 
+        // before the output projection to align with what the model expects.
         rope_cuda(buf_attn_out_.bf16(), n_heads, head_dim_val, rope_dim,
-                  position, rope_freqs_.f32(), true, main_stream_);
+                  position, layer_rope_freqs, true, main_stream_);
 
         // ── Output projection (grouped low-rank MLA) ─────────────────────
         // Attention output: [n_heads * head_dim] = [32768]
@@ -1842,15 +2374,34 @@ private:
 
     // ── Sample from logits ──────────────────────────────────────────────────
 
-    int sample_token(float temperature, const std::vector<int>& history) {
+    float current_rep_penalty_ = 1.1f;  // Set per-request by generate()
+
+    int sample_token(float temperature, const std::vector<int>& history, int step = 0) {
         int vocab = cfg_.vocab_size;
         std::vector<float> logits(vocab);
         CUDA_CHECK(cudaStreamSynchronize(main_stream_));
         CUDA_CHECK(cudaMemcpy(logits.data(), buf_logits_.f32(),
                                vocab * sizeof(float), cudaMemcpyDeviceToHost));
 
-        // Repetition penalty (disabled for now to test degradation)
-        float rep_penalty = 1.0f;
+        // EOS suppression: prevent premature termination for the first N tokens.
+        // The model sometimes produces competitive EOS logits early in generation,
+        // especially in multi-turn conversations. Suppress EOS until we have
+        // enough content tokens to form a meaningful response.
+        static constexpr int MIN_TOKENS_BEFORE_EOS = 20;
+        if (step < MIN_TOKENS_BEFORE_EOS) {
+            if (cfg_.eos_token_id >= 0 && cfg_.eos_token_id < vocab) {
+                logits[cfg_.eos_token_id] = -1e9f;
+            }
+            // Also suppress the EOS string token if different
+            int eos2 = tokenizer_.get_token_id(
+                "<\xef\xbd\x9c" "end\xe2\x96\x81of\xe2\x96\x81sentence" "\xef\xbd\x9c>");
+            if (eos2 >= 0 && eos2 < vocab && eos2 != cfg_.eos_token_id) {
+                logits[eos2] = -1e9f;
+            }
+        }
+
+        // Repetition penalty — penalizes already-seen tokens
+        float rep_penalty = current_rep_penalty_;
         std::unordered_set<int> seen_tokens;
         for (int token : history) {
             seen_tokens.insert(token);
@@ -1863,8 +2414,7 @@ private:
         }
 
         // Debug: print top-5 logits on first decode
-        static int dbg_count = 0;
-        if (dbg_count < 3) {
+        if (dbg_sample_count_ < 3) {
             std::vector<std::pair<float, int>> scored;
             for (int i = 0; i < vocab; i++) scored.push_back({logits[i], i});
             std::partial_sort(scored.begin(), scored.begin() + 5, scored.end(),
@@ -1873,7 +2423,7 @@ private:
             for (int i = 0; i < 5; i++) {
                 LOG_INFO("    [%d] token=%d logit=%.4f", i, scored[i].second, scored[i].first);
             }
-            dbg_count++;
+            dbg_sample_count_++;
         }
 
         if (temperature <= 0.0f) {
@@ -1881,33 +2431,61 @@ private:
             return (int)(std::max_element(logits.begin(), logits.end()) - logits.begin());
         }
 
-        // Temperature sampling
+        // Dynamic temperature cooling: use lower temperature for the first few
+        // tokens to make topic selection more deterministic. This prevents the
+        // model from picking context-bleed tokens (e.g., "I see the confusion")
+        // when the conversation history contains unrelated topics.
+        static constexpr int COOLDOWN_TOKENS = 5;
+        float effective_temp = temperature;
+        if (step < COOLDOWN_TOKENS) {
+            effective_temp = std::max(0.2f, temperature * 0.5f);
+        }
+
+        // Temperature scaling
         float max_logit = *std::max_element(logits.begin(), logits.end());
+        std::vector<float> probs(vocab);
         float sum_exp = 0;
-        for (auto& l : logits) {
-            l = expf((l - max_logit) / temperature);
-            sum_exp += l;
+        for (int i = 0; i < vocab; i++) {
+            probs[i] = expf((logits[i] - max_logit) / effective_temp);
+            sum_exp += probs[i];
         }
-        for (auto& l : logits) l /= sum_exp;
+        for (auto& p : probs) p /= sum_exp;
 
-        // Top-p (nucleus) sampling
-        float top_p = 0.9f;
-        std::vector<std::pair<float, int>> probs;
-        for (int i = 0; i < vocab; i++) probs.push_back({logits[i], i});
-        std::sort(probs.begin(), probs.end(), [](auto& a, auto& b) { return a.first > b.first; });
-
-        float cumsum = 0.0f;
-        std::vector<float> filtered_probs(vocab, 0.0f);
+        // Min-p filtering: discard tokens with probability < min_p * max_prob
+        // This prevents low-probability tokens (like context-bleed from history)
+        // from being sampled. Higher values = more focused sampling.
+        float min_p = 0.1f;
+        float max_prob = *std::max_element(probs.begin(), probs.end());
+        float min_p_threshold = min_p * max_prob;
         for (auto& p : probs) {
-            filtered_probs[p.second] = p.first;
-            cumsum += p.first;
-            if (cumsum > top_p) break;
+            if (p < min_p_threshold) p = 0.0f;
         }
 
-        std::random_device rd;
-        std::mt19937 gen(rd());
-        std::discrete_distribution<int> dist(filtered_probs.begin(), filtered_probs.end());
-        return dist(gen);
+        // Top-p (nucleus) sampling with top-k safety net
+        float top_p = 0.85f;
+        int top_k = 40;
+        std::vector<std::pair<float, int>> sorted_probs;
+        for (int i = 0; i < vocab; i++) {
+            if (probs[i] > 0.0f) sorted_probs.push_back({probs[i], i});
+        }
+        std::sort(sorted_probs.begin(), sorted_probs.end(),
+                  [](auto& a, auto& b) { return a.first > b.first; });
+
+        // Build filtered distribution (top-k AND top-p)
+        std::vector<float> final_probs(vocab, 0.0f);
+        float cumsum = 0.0f;
+        int kept = 0;
+        for (auto& sp : sorted_probs) {
+            if (kept >= top_k) break;  // top-k cutoff
+            final_probs[sp.second] = sp.first;
+            cumsum += sp.first;
+            kept++;
+            if (cumsum > top_p) break;  // top-p cutoff
+        }
+
+        // Use persistent RNG (seeded once per engine instance)
+        std::discrete_distribution<int> dist(final_probs.begin(), final_probs.end());
+        return dist(rng_);
     }
 };
 
@@ -1916,27 +2494,38 @@ private:
 // ════════════════════════════════════════════════════════════════════════════════
 
 static std::string apply_chat_template(const json& messages, const BPETokenizer& tok) {
-    // DeepSeek V4 chat format:
-    // <｜begin▁of▁sentence｜><｜User｜>message<｜Assistant｜>
-    // Note: uses < > (U+003C/003E) not 〈 〉 (U+3008/3009), with fullwidth ｜ (U+FF5C)
-    std::string result;
-    // BOS token: <｜begin▁of▁sentence｜>
-    result += "<\xef\xbd\x9c" "begin\xe2\x96\x81of\xe2\x96\x81sentence" "\xef\xbd\x9c>";
+    // DeepSeek V4 chat format (from official encoding_dsv4.py, thinking_mode="chat"):
+    // <｜begin▁of▁sentence｜>{system_content}
+    // <｜User｜>{user_content}<｜Assistant｜></think>{assistant_content}<｜end▁of▁sentence｜>
+    // <｜User｜>{user_content}<｜Assistant｜></think>
+    //
+    // Key: </think> after <｜Assistant｜> signals "chat mode" — skip thinking, answer directly.
+    // Without this token, the model enters an ambiguous state and produces premature EOS.
+    static const std::string BOS = "<\xef\xbd\x9c" "begin\xe2\x96\x81of\xe2\x96\x81sentence" "\xef\xbd\x9c>";
+    static const std::string EOS = "<\xef\xbd\x9c" "end\xe2\x96\x81of\xe2\x96\x81sentence" "\xef\xbd\x9c>";
+    static const std::string USER = "<\xef\xbd\x9c" "User" "\xef\xbd\x9c>";
+    static const std::string ASSISTANT = "<\xef\xbd\x9c" "Assistant" "\xef\xbd\x9c>";
+    static const std::string THINK_END = "</think>";
 
-    for (auto& msg : messages) {
-        std::string role = msg["role"].get<std::string>();
-        std::string content = msg["content"].get<std::string>();
+    std::string result;
+    result += BOS;
+
+    for (size_t i = 0; i < messages.size(); i++) {
+        std::string role = messages[i]["role"].get<std::string>();
+        std::string content = messages[i]["content"].get<std::string>();
 
         if (role == "system") {
-            result += "<\xef\xbd\x9c" "begin\xe2\x96\x81sys" "\xef\xbd\x9c>";
+            // System message: raw content, no wrapper tokens (per official encoding)
             result += content;
-            result += "<\xef\xbd\x9c" "end\xe2\x96\x81sys" "\xef\xbd\x9c>";
         } else if (role == "user") {
-            result += "<\xef\xbd\x9c" "User" "\xef\xbd\x9c>";
+            result += USER;
             result += content;
         } else if (role == "assistant") {
-            result += "<\xef\xbd\x9c" "Assistant" "\xef\xbd\x9c>";
+            // In chat mode: <｜Assistant｜></think>{content}<｜end▁of▁sentence｜>
+            result += ASSISTANT;
+            result += THINK_END;
             result += content;
+            result += EOS;
         }
     }
 
@@ -1944,7 +2533,8 @@ static std::string apply_chat_template(const json& messages, const BPETokenizer&
     if (!messages.empty()) {
         std::string last_role = messages.back()["role"].get<std::string>();
         if (last_role == "user") {
-            result += "<\xef\xbd\x9c" "Assistant" "\xef\xbd\x9c>";
+            result += ASSISTANT;
+            result += THINK_END;  // Signal chat mode: skip thinking, answer directly
         }
     }
 
@@ -1956,6 +2546,7 @@ static std::string apply_chat_template(const json& messages, const BPETokenizer&
 // ════════════════════════════════════════════════════════════════════════════════
 
 static std::mutex g_engine_mutex;  // serialize inference requests
+static int g_request_counter = 0;  // for unique request IDs
 
 static void run_server(MoecherEngine& engine, int port) {
     httplib::Server svr;
@@ -1993,20 +2584,24 @@ static void run_server(MoecherEngine& engine, int port) {
             float temperature = request.value("temperature", 0.0f);
             int max_tokens = request.value("max_tokens", 512);
             bool stream = request.value("stream", false);
+            float repetition_penalty = request.value("repetition_penalty", 1.1f);
 
             // Apply chat template
             std::string prompt = apply_chat_template(messages, engine.tokenizer_);
+            LOG_INFO("PROMPT (len=%zu): [%s]", prompt.size(),
+                     prompt.substr(0, std::min(prompt.size(), (size_t)500)).c_str());
 
-            
+            std::string req_id = "chatcmpl-moecher-" + std::to_string(++g_request_counter);
+
             if (stream) {
                 // SSE streaming
                 res.set_chunked_content_provider(
                     "text/event-stream",
-                    [&engine, prompt, max_tokens, temperature](size_t offset, httplib::DataSink &sink) {
+                    [&engine, prompt, max_tokens, temperature, req_id, repetition_penalty](size_t offset, httplib::DataSink &sink) {
                         std::lock_guard<std::mutex> lock(g_engine_mutex);
                         
                         json chunk = {
-                            {"id", "chatcmpl-moecher"},
+                            {"id", req_id},
                             {"object", "chat.completion.chunk"},
                             {"created", std::chrono::system_clock::to_time_t(std::chrono::system_clock::now())},
                             {"model", "deepseek-v4-flash"},
@@ -2023,17 +2618,17 @@ static void run_server(MoecherEngine& engine, int port) {
                             chunk["choices"][0]["delta"] = {{"content", text}};
                             std::string sse_chunk = "data: " + chunk.dump(-1, ' ', false, json::error_handler_t::replace) + "\n\n";
                             sink.write(sse_chunk.data(), sse_chunk.size());
-                        });
+                        }, repetition_penalty);
 
                         json finish = {
-                            {"id", "chatcmpl-moecher"},
+                            {"id", req_id},
                             {"object", "chat.completion.chunk"},
                             {"created", std::chrono::system_clock::to_time_t(std::chrono::system_clock::now())},
                             {"model", "deepseek-v4-flash"},
                             {"choices", {{
                                 {"index", 0},
                                 {"delta", json::object()},
-                                {"finish_reason", "stop"}
+                                {"finish_reason", engine.last_finish_reason_}
                             }}}
                         };
                         sse = "data: " + finish.dump(-1, ' ', false, json::error_handler_t::replace) + "\n\n";
@@ -2047,19 +2642,24 @@ static void run_server(MoecherEngine& engine, int port) {
                 std::string response_text;
                 {
                     std::lock_guard<std::mutex> lock(g_engine_mutex);
-                    response_text = engine.generate(prompt, max_tokens, temperature);
+                    response_text = engine.generate(prompt, max_tokens, temperature, nullptr, repetition_penalty);
                 }
                 
                 json response = {
-                    {"id", "chatcmpl-moecher"},
+                    {"id", req_id},
                     {"object", "chat.completion"},
                     {"created", std::chrono::system_clock::to_time_t(std::chrono::system_clock::now())},
                     {"model", "deepseek-v4-flash"},
                     {"choices", {{
                         {"index", 0},
                         {"message", {{"role", "assistant"}, {"content", response_text}}},
-                        {"finish_reason", "stop"}
-                    }}}
+                        {"finish_reason", engine.last_finish_reason_}
+                    }}},
+                    {"usage", {
+                        {"prompt_tokens", engine.prompt_token_count_},
+                        {"completion_tokens", engine.completion_token_count_},
+                        {"total_tokens", engine.prompt_token_count_ + engine.completion_token_count_}
+                    }}
                 };
                 res.set_content(response.dump(-1, ' ', false, json::error_handler_t::replace), "application/json");
             }
