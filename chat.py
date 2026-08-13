@@ -16,6 +16,7 @@ import urllib.error
 import readline  # enables arrow-key history in input()
 import textwrap
 import os
+import time
 
 # ── ANSI colours ─────────────────────────────────────────────────────────────
 
@@ -186,12 +187,18 @@ def main():
         print(f"{CYAN}{BOLD}Assistant ❯{RESET} ", end="", flush=True)
 
         reply = ""
+        token_count = 0
+        start_time = time.time()
         for chunk in chat_completion_stream(
             args.url, messages, max_tokens, temperature, args.model
         ):
             print(chunk, end="", flush=True)
             reply += chunk
-        print("\n")
+            token_count += 1
+            
+        elapsed = time.time() - start_time
+        tps = token_count / elapsed if elapsed > 0 else 0
+        print(f"\n{DIM}[{token_count} tokens in {elapsed:.2f}s, {tps:.2f} tok/s]{RESET}\n")
 
         messages.append({"role": "assistant", "content": reply})
         print()

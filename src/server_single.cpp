@@ -586,11 +586,19 @@ public:
     int n_experts_ = 0;
     int expert_fd_ = -1;
 
-    // LRU cache
+    // L1 LRU cache (VRAM)
     int cache_capacity_ = 0;
     void* cache_pool_gpu_ = nullptr;
+    std::vector<ExpertCacheEntry> cache_slots_;
+    std::unordered_map<int64_t, int> key_to_slot_;  // (layer*n_experts+expert) -> L1 slot index
 
-    // Ring buffer for staging
+    // L2 LRU cache (DRAM)
+    int dram_cache_capacity_ = 0;
+    void* dram_cache_pool_ = nullptr;
+    std::vector<ExpertCacheEntry> dram_cache_slots_;
+    std::unordered_map<int64_t, int> dram_key_to_slot_; // (layer*n_experts+expert) -> L2 slot index
+
+    // Ring buffer for staging (used when bypassing DRAM cache)
     static constexpr int NUM_STAGING_BUFFERS = 32;
     struct StagingBuffer {
         void* ptr = nullptr;
@@ -599,13 +607,11 @@ public:
     std::vector<StagingBuffer> staging_ring_;
     int staging_idx_ = 0;
 
-    std::vector<ExpertCacheEntry> cache_slots_;
-    std::unordered_map<int64_t, int> key_to_slot_;  // (layer*n_experts+expert) -> slot index
     int64_t access_counter_ = 0;
     std::mutex cache_mutex_;
 
     bool init(const std::string& expert_bin_path, int block_size,
-              int n_layers, int n_experts, size_t cache_budget_bytes) {
+              int n_layers, int n_experts, size_t cache_budget_bytes, size_t dram_budget_bytes) {
         expert_block_size_ = block_size;
         n_layers_ = n_layers;
         n_experts_ = n_experts;
@@ -622,10 +628,28 @@ public:
 
         cache_capacity_ = (int)(cache_budget_bytes / block_size);
         if (cache_capacity_ < 64) cache_capacity_ = 64;
-        LOG_INFO("Expert cache: %d slots (%.1f GB)", cache_capacity_,
+        LOG_INFO("Expert L1 cache: %d slots (%.1f GB)", cache_capacity_,
                  (double)cache_capacity_ * block_size / 1e9);
 
         CUDA_CHECK(cudaMalloc(&cache_pool_gpu_, (size_t)cache_capacity_ * block_size));
+
+        cache_slots_.resize(cache_capacity_);
+        for (int i = 0; i < cache_capacity_; i++) {
+            cache_slots_[i].slot_index = i;
+            cache_slots_[i].gpu_data = (char*)cache_pool_gpu_ + (size_t)i * block_size;
+        }
+
+        dram_cache_capacity_ = (int)(dram_budget_bytes / block_size);
+        if (dram_cache_capacity_ > 0) {
+            LOG_INFO("Expert L2 cache: %d slots (%.1f GB)", dram_cache_capacity_,
+                     (double)dram_cache_capacity_ * block_size / 1e9);
+            CUDA_CHECK(cudaMallocHost(&dram_cache_pool_, (size_t)dram_cache_capacity_ * block_size));
+            dram_cache_slots_.resize(dram_cache_capacity_);
+            for (int i = 0; i < dram_cache_capacity_; i++) {
+                dram_cache_slots_[i].slot_index = i;
+                dram_cache_slots_[i].gpu_data = (char*)dram_cache_pool_ + (size_t)i * block_size;
+            }
+        }
 
         // Initialize staging ring buffer
         staging_ring_.resize(NUM_STAGING_BUFFERS);
@@ -640,12 +664,6 @@ public:
             }
         }
 
-        cache_slots_.resize(cache_capacity_);
-        for (int i = 0; i < cache_capacity_; i++) {
-            cache_slots_[i].slot_index = i;
-            cache_slots_[i].gpu_data = (char*)cache_pool_gpu_ + (size_t)i * block_size;
-        }
-
         return true;
     }
 
@@ -655,14 +673,21 @@ public:
         std::unique_lock<std::mutex> lock(cache_mutex_);
         access_counter_++;
 
+        // Check L1 (VRAM)
         auto it = key_to_slot_.find(key);
         if (it != key_to_slot_.end()) {
             cache_slots_[it->second].last_used = access_counter_;
             void* ptr = cache_slots_[it->second].gpu_data;
+            // Also update L2 last_used if it exists in L2, so it doesn't get evicted randomly
+            auto it2 = dram_key_to_slot_.find(key);
+            if (it2 != dram_key_to_slot_.end()) {
+                dram_cache_slots_[it2->second].last_used = access_counter_;
+            }
             lock.unlock();
             return ptr;
         }
 
+        // Need an L1 slot
         int evict_slot = -1;
         int64_t oldest = INT64_MAX;
         for (int i = 0; i < cache_capacity_; i++) {
@@ -678,51 +703,106 @@ public:
 
         auto& slot = cache_slots_[evict_slot];
         if (slot.layer_id >= 0) {
-            if (g_log_experts) {
-                LOG_INFO("[ExpertCache] Evicted L%d E%d -> Loaded L%d E%d", 
-                         slot.layer_id, slot.expert_id, layer_id, expert_id);
-            }
             int64_t old_key = (int64_t)slot.layer_id * n_experts_ + slot.expert_id;
             key_to_slot_.erase(old_key);
-        } else {
-            if (g_log_experts) {
-                LOG_INFO("[ExpertCache] Loaded L%d E%d into free slot %d", layer_id, expert_id, evict_slot);
-            }
         }
-
+        
         slot.layer_id = layer_id;
         slot.expert_id = expert_id;
         slot.last_used = access_counter_;
         key_to_slot_[key] = evict_slot;
 
-        int stage_idx = staging_idx_;
-        staging_idx_ = (staging_idx_ + 1) % NUM_STAGING_BUFFERS;
+        // Check L2 (DRAM)
+        void* host_src_ptr = nullptr;
+        int stage_idx = -1;
+
+        if (dram_cache_capacity_ > 0) {
+            auto it2 = dram_key_to_slot_.find(key);
+            if (it2 != dram_key_to_slot_.end()) {
+                // L2 Hit
+                dram_cache_slots_[it2->second].last_used = access_counter_;
+                host_src_ptr = dram_cache_slots_[it2->second].gpu_data;
+                
+                if (g_log_experts) {
+                    LOG_INFO("[ExpertCache] L2 Hit: L%d E%d -> L1 slot %d", layer_id, expert_id, evict_slot);
+                }
+            } else {
+                // L2 Miss - we must load into L2 first, then L1
+                int evict_dram = -1;
+                int64_t oldest_dram = INT64_MAX;
+                for (int i = 0; i < dram_cache_capacity_; i++) {
+                    if (dram_cache_slots_[i].layer_id < 0) {
+                        evict_dram = i;
+                        break;
+                    }
+                    if (dram_cache_slots_[i].last_used < oldest_dram) {
+                        oldest_dram = dram_cache_slots_[i].last_used;
+                        evict_dram = i;
+                    }
+                }
+                
+                auto& d_slot = dram_cache_slots_[evict_dram];
+                if (d_slot.layer_id >= 0) {
+                    int64_t old_key = (int64_t)d_slot.layer_id * n_experts_ + d_slot.expert_id;
+                    dram_key_to_slot_.erase(old_key);
+                }
+                
+                d_slot.layer_id = layer_id;
+                d_slot.expert_id = expert_id;
+                d_slot.last_used = access_counter_;
+                dram_key_to_slot_[key] = evict_dram;
+                
+                host_src_ptr = d_slot.gpu_data;
+                
+                if (g_log_experts) {
+                    LOG_INFO("[ExpertCache] L2 Miss (SSD read): L%d E%d -> L2 slot %d -> L1 slot %d", 
+                             layer_id, expert_id, evict_dram, evict_slot);
+                }
+                
+                // Read from disk into L2 directly
+                int64_t file_offset = (int64_t)key * expert_block_size_;
+                ssize_t bytes_read = pread(expert_fd_, host_src_ptr, expert_block_size_, file_offset);
+                if (bytes_read != expert_block_size_) {
+                    LOG_ERROR("Expert read failed: layer=%d expert=%d offset=%ld got=%ld",
+                              layer_id, expert_id, file_offset, bytes_read);
+                    lock.unlock();
+                    return nullptr;
+                }
+            }
+        } else {
+            // No L2 cache, fallback to staging buffer
+            stage_idx = staging_idx_;
+            staging_idx_ = (staging_idx_ + 1) % NUM_STAGING_BUFFERS;
+            
+            if (g_log_experts) {
+                LOG_INFO("[ExpertCache] L1 Miss (SSD read, No L2): L%d E%d -> L1 slot %d", 
+                         layer_id, expert_id, evict_slot);
+            }
+        }
+
         lock.unlock();
 
-        // Wait for the staging buffer to be free
-        auto& stage = staging_ring_[stage_idx];
-        CUDA_CHECK(cudaEventSynchronize(stage.event));
-
-        int64_t file_offset = (int64_t)key * expert_block_size_;
-        ssize_t bytes_read = pread(expert_fd_, stage.ptr, expert_block_size_, file_offset);
-        if (bytes_read != expert_block_size_) {
-            LOG_ERROR("Expert read failed: layer=%d expert=%d offset=%ld got=%ld",
-                      layer_id, expert_id, file_offset, bytes_read);
-            return nullptr;
+        if (stage_idx >= 0) {
+            auto& stage = staging_ring_[stage_idx];
+            CUDA_CHECK(cudaEventSynchronize(stage.event));
+            
+            int64_t file_offset = (int64_t)key * expert_block_size_;
+            ssize_t bytes_read = pread(expert_fd_, stage.ptr, expert_block_size_, file_offset);
+            if (bytes_read != expert_block_size_) {
+                LOG_ERROR("Expert read failed: layer=%d expert=%d offset=%ld got=%ld",
+                          layer_id, expert_id, file_offset, bytes_read);
+                return nullptr;
+            }
+            host_src_ptr = stage.ptr;
+            CUDA_CHECK(cudaMemcpyAsync(slot.gpu_data, host_src_ptr, expert_block_size_,
+                                        cudaMemcpyHostToDevice, stream));
+            CUDA_CHECK(cudaEventRecord(stage.event, stream));
+        } else {
+            // Memory in host_src_ptr (L2) is already populated, async copy to L1
+            // Since L2 is just pinned host memory, we can copy from it directly safely.
+            CUDA_CHECK(cudaMemcpyAsync(slot.gpu_data, host_src_ptr, expert_block_size_,
+                                        cudaMemcpyHostToDevice, stream));
         }
-
-        // Output to console if enabled:
-        if (g_log_experts) {
-            printf("\033[36m[CACHE] %s Layer %d Expert %d\033[0m\n", 
-                   (evict_slot >= 0 && slot.layer_id >= 0) ? "Evicted & Loaded" : "Loaded", 
-                   layer_id, expert_id);
-        }
-
-        CUDA_CHECK(cudaMemcpyAsync(slot.gpu_data, stage.ptr, expert_block_size_,
-                                    cudaMemcpyHostToDevice, stream));
-        
-        // Record event on the stream so we know when the memcpy finishes
-        CUDA_CHECK(cudaEventRecord(stage.event, stream));
 
         return slot.gpu_data;
     }
@@ -730,6 +810,7 @@ public:
     void cleanup() {
         if (expert_fd_ >= 0) close(expert_fd_);
         if (cache_pool_gpu_) cudaFree(cache_pool_gpu_);
+        if (dram_cache_pool_) cudaFreeHost(dram_cache_pool_);
         for (auto& stage : staging_ring_) {
             if (stage.event) cudaEventDestroy(stage.event);
             if (stage.ptr) cudaFreeHost(stage.ptr);
@@ -868,7 +949,7 @@ public:
 
     // ── Load model from manifest ────────────────────────────────────────────
 
-    bool load(const std::string& manifest_path, float max_vram_gb = 0.0f) {
+    bool load(const std::string& manifest_path, float max_vram_gb = 0.0f, float dram_cache_gb = 0.0f) {
         LOG_INFO("Loading manifest: %s", manifest_path.c_str());
 
         std::ifstream f(manifest_path);
@@ -939,10 +1020,12 @@ public:
             }
         }
         
-        LOG_INFO("Expert cache budget: %.1f GB", cache_budget / 1e9);
+        size_t dram_cache_budget = (size_t)(dram_cache_gb * 1024.0 * 1024.0 * 1024.0);
+        LOG_INFO("Expert L1 (VRAM) cache budget: %.1f GB", cache_budget / 1e9);
+        LOG_INFO("Expert L2 (DRAM) cache budget: %.1f GB", dram_cache_budget / 1e9);
         if (!expert_loader_.init(expert_path, expert_block_size,
                                   expert_n_layers, expert_n_experts,
-                                  cache_budget)) return false;
+                                  cache_budget, dram_cache_budget)) return false;
 
         // Allocate working buffers
         alloc_buffers();
@@ -2680,6 +2763,7 @@ int main(int argc, char** argv) {
     std::string manifest_path = "moecher_manifest.json";
     int port = 8001;
     float max_vram_gb = 0.0f;
+    float dram_cache_gb = 0.0f;
     std::string log_path = "moecher.log";
 
     for (int i = 1; i < argc; i++) {
@@ -2691,6 +2775,8 @@ int main(int argc, char** argv) {
             log_path = argv[++i];
         } else if (std::string(argv[i]) == "--max-vram" && i + 1 < argc) {
             max_vram_gb = std::stof(argv[++i]);
+        } else if (std::string(argv[i]) == "--dram-cache-gb" && i + 1 < argc) {
+            dram_cache_gb = std::stof(argv[++i]);
         } else if (std::string(argv[i]) == "--log-experts") {
             g_log_experts = true;
         } else if (std::string(argv[i]) == "--no-log-tokens") {
@@ -2703,7 +2789,7 @@ int main(int argc, char** argv) {
     LOG_INFO("═══ moecher starting ═══");
 
     MoecherEngine engine;
-    if (!engine.load(manifest_path, max_vram_gb)) {
+    if (!engine.load(manifest_path, max_vram_gb, dram_cache_gb)) {
         LOG_ERROR("Failed to load model");
         return 1;
     }
