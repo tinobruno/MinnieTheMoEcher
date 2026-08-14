@@ -667,6 +667,24 @@ public:
         return true;
     }
 
+    void* try_get_expert_cached(int layer_id, int expert_id) {
+        int64_t key = (int64_t)layer_id * n_experts_ + expert_id;
+        std::lock_guard<std::mutex> lock(cache_mutex_);
+        
+        auto it = key_to_slot_.find(key);
+        if (it != key_to_slot_.end()) {
+            access_counter_++;
+            cache_slots_[it->second].last_used = access_counter_;
+            void* ptr = cache_slots_[it->second].gpu_data;
+            auto it2 = dram_key_to_slot_.find(key);
+            if (it2 != dram_key_to_slot_.end()) {
+                dram_cache_slots_[it2->second].last_used = access_counter_;
+            }
+            return ptr;
+        }
+        return nullptr;
+    }
+
     void* get_expert(int layer_id, int expert_id, cudaStream_t stream) {
         int64_t key = (int64_t)layer_id * n_experts_ + expert_id;
         
@@ -830,8 +848,12 @@ public:
     
     // Thread pool for loading experts (max 16 concurrent reads)
     std::unique_ptr<ThreadPool> expert_pool_;
+    bool dbg_first_token_ = false;
 
     cudaStream_t main_stream_;
+    cudaStream_t expert_streams_[32];
+    cudaEvent_t expert_events_[32];
+
     cublasHandle_t cublas_handle_ = nullptr;
     ExpertLoader expert_loader_;
 
@@ -908,6 +930,8 @@ public:
         int nbytes;
         std::string dtype;
         std::vector<int> shape;
+        int offset_data;
+        int offset_scales;
     };
     std::map<std::string, ExpertPartInfo> expert_parts_;
 
@@ -949,7 +973,7 @@ public:
 
     // ── Load model from manifest ────────────────────────────────────────────
 
-    bool load(const std::string& manifest_path, float max_vram_gb = 0.0f, float dram_cache_gb = 0.0f) {
+    bool load(const std::string& manifest_path, float max_vram_gb = 0.0f, float dram_cache_gb = 0.0f, const std::string& expert_dtype_override = "") {
         LOG_INFO("Loading manifest: %s", manifest_path.c_str());
 
         std::ifstream f(manifest_path);
@@ -959,9 +983,12 @@ public:
 
         // Parse config
         cfg_.from_json(manifest["model_config"]);
-        LOG_INFO("Model: %d layers, %d experts, %d active, hidden=%d",
+        if (!expert_dtype_override.empty()) {
+            cfg_.expert_dtype = expert_dtype_override;
+        }
+        LOG_INFO("Model: %d layers, %d experts, %d active, hidden=%d, dtype=%s",
                  cfg_.num_hidden_layers, cfg_.n_routed_experts,
-                 cfg_.num_experts_per_tok, cfg_.hidden_size);
+                 cfg_.num_experts_per_tok, cfg_.hidden_size, cfg_.expert_dtype.c_str());
 
         // Load tokenizer
         std::string tok_path = manifest["tokenizer"]["tokenizer_json"].get<std::string>();
@@ -969,6 +996,10 @@ public:
 
         // Init CUDA
         CUDA_CHECK(cudaStreamCreate(&main_stream_));
+        for (int i = 0; i < 32; i++) {
+            CUDA_CHECK(cudaStreamCreate(&expert_streams_[i]));
+            CUDA_CHECK(cudaEventCreate(&expert_events_[i]));
+        }
         CUBLAS_CHECK(cublasCreate(&cublas_handle_));
         CUBLAS_CHECK(cublasSetStream(cublas_handle_, main_stream_));
         cublasSetMathMode(cublas_handle_, CUBLAS_DEFAULT_MATH);
@@ -1566,6 +1597,7 @@ private:
         int head_dim_val = cfg_.head_dim;
         int hc = cfg_.hc_mult;
         int moe_inter = cfg_.moe_intermediate_size;
+        int top_k = cfg_.num_experts_per_tok;
 
         buf_hidden_.alloc(dim * sizeof(__nv_bfloat16));
         buf_hidden2_.alloc(dim * sizeof(__nv_bfloat16));
@@ -1577,9 +1609,9 @@ private:
             (size_t)cfg_.o_lora_rank * cfg_.o_groups,
             (size_t)n_heads * head_dim_val
         }) * sizeof(__nv_bfloat16));
-        buf_gate_.alloc(moe_inter * sizeof(__nv_bfloat16));
-        buf_up_.alloc(moe_inter * sizeof(__nv_bfloat16));
-        buf_down_.alloc(dim * sizeof(__nv_bfloat16));
+        buf_gate_.alloc((size_t)top_k * moe_inter * sizeof(__nv_bfloat16));
+        buf_up_.alloc((size_t)top_k * moe_inter * sizeof(__nv_bfloat16));
+        buf_down_.alloc((size_t)top_k * dim * sizeof(__nv_bfloat16));
         buf_expert_out_.alloc(dim * sizeof(__nv_bfloat16));
         buf_moe_accum_.alloc(dim * sizeof(__nv_bfloat16));
         buf_dequant_.alloc(128 * 1024 * 1024);  // 128 MB for largest dequant
@@ -1644,10 +1676,15 @@ private:
         const uint8_t* scale,        // [ceil(N/128), ceil(K/128)] E8M0
         int block_size = 128)
     {
-        // Dequantize weight to BF16 in buf_dequant_
-        fp8_dequant_cuda(buf_dequant_.bf16(), weight, scale, N, K, block_size, main_stream_);
-        // GEMM with dequantized weight
-        gemm_bf16(C, M, N, K, A, buf_dequant_.bf16());
+        if (M == 1) {
+            // Fused gemv for decoding
+            gemv_fp8_cuda(C, A, weight, scale, N, K, block_size, main_stream_);
+        } else {
+            // Dequantize weight to BF16 in buf_dequant_
+            fp8_dequant_cuda(buf_dequant_.bf16(), weight, scale, N, K, block_size, main_stream_);
+            // GEMM with dequantized weight
+            gemm_bf16(C, M, N, K, A, buf_dequant_.bf16());
+        }
     }
 
     // ── Dequant + GEMM for FP4 experts ──────────────────────────────────────
@@ -1662,6 +1699,25 @@ private:
         int K_packed = K_logical / 2;
         fp4_dequant_cuda(buf_dequant_.bf16(), weight, scale, N, K_packed, scale_cols, main_stream_);
         gemm_bf16(C, M, N, K_logical, A, buf_dequant_.bf16());
+    }
+
+    void gemm_int2_dequant(
+        __nv_bfloat16* C, int M, int N, int K_logical,
+        const __nv_bfloat16* A,
+        const uint8_t* weight,       // [N, K_logical/4] packed INT2
+        const __nv_bfloat16* scale_min, // [N, K_logical/block_size, 2] BF16
+        int block_size, cudaStream_t stream)
+    {
+        int K_packed = K_logical / 4;
+        if (M == 1) {
+            // Fused gemv for decoding
+            gemv_int2_cuda(C, A, weight, scale_min, N, K_packed, block_size, stream);
+        } else {
+            // Prefill: dequantize then gemm
+            for (int m = 0; m < M; m++) {
+                gemv_int2_cuda(C + m * N, A + m * K_logical, weight, scale_min, N, K_packed, block_size, stream);
+            }
+        }
     }
 
     // ── KV Compressor Forward ───────────────────────────────────────────────
@@ -1861,34 +1917,13 @@ private:
         bf16_to_f32_cuda(buf_hc_input_.f32(), buf_hc_state_.bf16(), hc_dim, main_stream_);
 
         // Compute RMS of flattened state for normalization
-        // rsqrt = rsqrt(mean(x^2) + eps)
-        // This is done as part of the linear projection
+        // This is done on the GPU to avoid sync overhead!
+        rms_norm_f32_cuda(buf_hc_input_.f32(), hc_dim, cfg_.hc_eps, main_stream_);
 
         // mixes = linear(x_flat, hc_fn) * rsqrt
-        // hc_fn: [mix_size, hc_dim] F32
-        // x_flat: [1, hc_dim] F32
-        // mixes: [1, mix_size] F32
-
         // We need F32 GEMM here. Use cuBLAS with F32.
         {
             float alpha = 1.0f, beta = 0.0f;
-
-            // First compute rsqrt of RMS
-            // For simplicity, compute on CPU (small data transfer)
-            std::vector<float> x_flat(hc_dim);
-            CUDA_CHECK(cudaMemcpy(x_flat.data(), buf_hc_input_.f32(),
-                                   hc_dim * sizeof(float), cudaMemcpyDeviceToHost));
-
-            float sum_sq = 0;
-            for (int i = 0; i < hc_dim; i++) sum_sq += x_flat[i] * x_flat[i];
-            float rsqrt_val = 1.0f / sqrtf(sum_sq / hc_dim + cfg_.hc_eps);
-
-            // Scale x by rsqrt
-            for (auto& v : x_flat) v *= rsqrt_val;
-            CUDA_CHECK(cudaMemcpy(buf_hc_input_.f32(), x_flat.data(),
-                                   hc_dim * sizeof(float), cudaMemcpyHostToDevice));
-
-            // mixes = x_scaled @ hc_fn.T
             CUBLAS_CHECK(cublasGemmEx(
                 cublas_handle_,
                 CUBLAS_OP_T, CUBLAS_OP_N,
@@ -1907,42 +1942,11 @@ private:
             buf_hc_pre_.f32(), buf_hc_post_.f32(), buf_hc_comb_.f32(),
             buf_hc_mixes_.f32(), hc_scale.f32(), hc_base.f32(),
             hc, cfg_.hc_sinkhorn_iters, cfg_.hc_eps, main_stream_);
-        CUDA_CHECK(cudaStreamSynchronize(main_stream_));
 
         // Compute weighted sum: y = sum(pre[i] * hc_state[i]) for i in 0..hc-1
         // Result in buf_hidden_
-        {
-            float pre_host[8];
-            CUDA_CHECK(cudaMemcpy(pre_host, buf_hc_pre_.f32(),
-                                   hc * sizeof(float), cudaMemcpyDeviceToHost));
-
-            if (dbg_hc_pre_call_ < 2) {
-                float post_host2[8], comb_host2[64];
-                CUDA_CHECK(cudaMemcpy(post_host2, buf_hc_post_.f32(), hc * sizeof(float), cudaMemcpyDeviceToHost));
-                CUDA_CHECK(cudaMemcpy(comb_host2, buf_hc_comb_.f32(), hc * hc * sizeof(float), cudaMemcpyDeviceToHost));
-                LOG_INFO("HC pre call #%d:", dbg_hc_pre_call_);
-                for (int i = 0; i < hc; i++)
-                    LOG_INFO("  pre[%d]=%.6f post[%d]=%.6f", i, pre_host[i], i, post_host2[i]);
-                for (int i = 0; i < hc; i++) {
-                    std::string s;
-                    for (int j = 0; j < hc; j++) {
-                        char buf[32]; snprintf(buf, sizeof(buf), "%.4f ", comb_host2[i*hc+j]);
-                        s += buf;
-                    }
-                    LOG_INFO("  comb[%d] = [%s]", i, s.c_str());
-                }
-                dbg_hc_pre_call_++;
-            }
-
-            // Zero output
-            CUDA_CHECK(cudaMemset(buf_hidden_.data, 0, cfg_.hidden_size * sizeof(__nv_bfloat16)));
-
-            for (int h = 0; h < hc; h++) {
-                weighted_add_cuda(buf_hidden_.bf16(),
-                                  buf_hc_state_.bf16() + (size_t)h * cfg_.hidden_size,
-                                  pre_host[h], cfg_.hidden_size, main_stream_);
-            }
-        }
+        hc_pre_weighted_add_cuda(buf_hidden_.bf16(), buf_hc_state_.bf16(),
+                                 buf_hc_pre_.f32(), dim, hc, main_stream_);
 
         // Save residual (the full HC state before sublayer) — it's already in buf_hc_state_
         // buf_hidden2_ will hold the sublayer output after attention/FFN
@@ -1958,34 +1962,15 @@ private:
         // buf_hc_state_ contains residual [hc, dim]
         // New hc_state[i] = post[i] * sublayer_out + sum_j(comb[i][j] * residual[j])
 
-        CUDA_CHECK(cudaStreamSynchronize(main_stream_));
-
-        float post_host[8], comb_host[64];
-        CUDA_CHECK(cudaMemcpy(post_host, buf_hc_post_.f32(),
-                               hc * sizeof(float), cudaMemcpyDeviceToHost));
-        CUDA_CHECK(cudaMemcpy(comb_host, buf_hc_comb_.f32(),
-                               hc * hc * sizeof(float), cudaMemcpyDeviceToHost));
-
         // Save current hc_state to persistent temp buffer
         CUDA_CHECK(cudaMemcpyAsync(buf_hc_residual_.data, buf_hc_state_.data,
                                     (size_t)hc * dim * sizeof(__nv_bfloat16),
                                     cudaMemcpyDeviceToDevice, main_stream_));
 
-        for (int i = 0; i < hc; i++) {
-            // Start with post[i] * sublayer_out
-            __nv_bfloat16* dst = buf_hc_state_.bf16() + (size_t)i * dim;
-            // Scale buf_hidden_ by post[i] and write to dst
-            CUDA_CHECK(cudaMemset(dst, 0, dim * sizeof(__nv_bfloat16)));
-            weighted_add_cuda(dst, buf_hidden_.bf16(), post_host[i], dim, main_stream_);
-
-            // Add sum_j(comb[j][i] * residual[j]) - Transposed per reference
-            for (int j = 0; j < hc; j++) {
-                float c = comb_host[j * hc + i];
-                if (fabsf(c) < 1e-10f) continue;
-                weighted_add_cuda(dst, buf_hc_residual_.bf16() + (size_t)j * dim,
-                                  c, dim, main_stream_);
-            }
-        }
+        // Use fused GPU kernel for post update
+        hc_post_update_cuda(buf_hc_state_.bf16(), buf_hidden_.bf16(), buf_hc_residual_.bf16(),
+                            buf_hc_post_.f32(), buf_hc_comb_.f32(),
+                            dim, hc, main_stream_);
     }
 
     // ── HC head: reduce [hc, dim] -> [dim] for final logits ─────────────────
@@ -1999,15 +1984,7 @@ private:
         bf16_to_f32_cuda(buf_hc_input_.f32(), buf_hc_state_.bf16(), hc_dim, main_stream_);
 
         // Compute rsqrt
-        std::vector<float> x_flat(hc_dim);
-        CUDA_CHECK(cudaMemcpy(x_flat.data(), buf_hc_input_.f32(),
-                               hc_dim * sizeof(float), cudaMemcpyDeviceToHost));
-        float sum_sq = 0;
-        for (int i = 0; i < hc_dim; i++) sum_sq += x_flat[i] * x_flat[i];
-        float rsqrt_val = 1.0f / sqrtf(sum_sq / hc_dim + cfg_.rms_norm_eps);
-        for (auto& v : x_flat) v *= rsqrt_val;
-        CUDA_CHECK(cudaMemcpy(buf_hc_input_.f32(), x_flat.data(),
-                               hc_dim * sizeof(float), cudaMemcpyHostToDevice));
+        rms_norm_f32_cuda(buf_hc_input_.f32(), hc_dim, cfg_.rms_norm_eps, main_stream_);
 
         // mixes = x @ hc_head_fn.T  -> [hc]
         float alpha = 1.0f, beta = 0.0f;
@@ -2022,42 +1999,11 @@ private:
             buf_hc_mixes_.f32(), CUDA_R_32F, hc,
             CUBLAS_COMPUTE_32F, CUBLAS_GEMM_DEFAULT));
 
+        // Use fused GPU kernel for head reduce
         // pre = sigmoid(mix * scale + base) + eps
-        float mixes_host[8], scale_host[8], base_host[8];
-        CUDA_CHECK(cudaMemcpy(mixes_host, buf_hc_mixes_.f32(), hc * sizeof(float), cudaMemcpyDeviceToHost));
-        CUDA_CHECK(cudaMemcpy(scale_host, hc_head_scale_.f32(), sizeof(float), cudaMemcpyDeviceToHost));
-        CUDA_CHECK(cudaMemcpy(base_host, hc_head_base_.f32(), hc * sizeof(float), cudaMemcpyDeviceToHost));
-
-        float pre_host[8];
-        for (int i = 0; i < hc; i++) {
-            float v = mixes_host[i] * scale_host[0] + base_host[i];
-            pre_host[i] = 1.0f / (1.0f + expf(-v)) + cfg_.hc_eps;
-        }
-
-        if (dbg_head_) {
-            LOG_INFO("HC head reduce: hc=%d", hc);
-            for (int i = 0; i < hc; i++)
-                LOG_INFO("  mix[%d]=%.6f scale=%.6f base[%d]=%.6f -> pre[%d]=%.6f",
-                         i, mixes_host[i], scale_host[0], i, base_host[i], i, pre_host[i]);
-            // Also dump norms of each hc_state copy
-            std::vector<__nv_bfloat16> tmp(dim);
-            for (int h = 0; h < hc; h++) {
-                CUDA_CHECK(cudaMemcpy(tmp.data(), buf_hc_state_.bf16() + (size_t)h * dim,
-                                       dim * sizeof(__nv_bfloat16), cudaMemcpyDeviceToHost));
-                float norm = 0;
-                for (int i = 0; i < dim; i++) { float v2 = __bfloat162float(tmp[i]); norm += v2*v2; }
-                LOG_INFO("  hc_state[%d] norm=%.6f", h, sqrtf(norm));
-            }
-            dbg_head_ = false;
-        }
-
-        // Weighted sum
-        CUDA_CHECK(cudaMemset(buf_hidden_.data, 0, dim * sizeof(__nv_bfloat16)));
-        for (int h = 0; h < hc; h++) {
-            weighted_add_cuda(buf_hidden_.bf16(),
-                              buf_hc_state_.bf16() + (size_t)h * dim,
-                              pre_host[h], dim, main_stream_);
-        }
+        hc_head_reduce_cuda(buf_hidden_.bf16(), buf_hc_state_.bf16(),
+                            buf_hc_mixes_.f32(), hc_head_scale_.f32(), hc_head_base_.f32(),
+                            dim, hc, main_stream_);
     }
 
     // ── Attention forward ───────────────────────────────────────────────────
@@ -2246,15 +2192,13 @@ private:
         //   lora_g = [1, o_lora]
         // Output goes into buf_lora_ [o_groups * o_lora]
         
-        // Dequantize wo_a weight fully first
-        fp8_dequant_cuda(buf_dequant_.bf16(), lw.wo_a_w.u8(), lw.wo_a_s.u8(),
-                         o_groups * o_lora, hpg_dim, 128, main_stream_);
-
         for (int g = 0; g < o_groups; g++) {
             const __nv_bfloat16* A_g = buf_attn_out_.bf16() + (size_t)g * hpg_dim;
-            const __nv_bfloat16* B_g = buf_dequant_.bf16() + (size_t)g * o_lora * hpg_dim;
             __nv_bfloat16* C_g = buf_lora_.bf16() + (size_t)g * o_lora;
-            gemm_bf16(C_g, 1, o_lora, hpg_dim, A_g, B_g);
+            int offset = g * o_lora * hpg_dim;
+            int scale_offset = (g * o_lora / 128) * (hpg_dim / 128);
+            gemv_fp8_cuda(C_g, A_g, lw.wo_a_w.u8() + offset, lw.wo_a_s.u8() + scale_offset,
+                          o_lora, hpg_dim, 128, main_stream_);
         }
                 if (dbg) {
             dump_bf16("attn_out_raw", buf_attn_out_.bf16(), n_heads * head_dim_val);
@@ -2309,12 +2253,16 @@ private:
 
             // Apply sqrtsoftplus (or whatever activation the model uses)
             sqrtsoftplus_cuda(buf_scores_f32_.f32(), buf_scores_f32_.f32(), n_experts, main_stream_);
+
+            auto t_start_sync = std::chrono::high_resolution_clock::now();
             CUDA_CHECK(cudaStreamSynchronize(main_stream_));
+            auto t_end_sync = std::chrono::high_resolution_clock::now();
 
             // Copy scores to CPU for top-k selection
             std::vector<float> scores(n_experts);
             CUDA_CHECK(cudaMemcpy(scores.data(), buf_scores_f32_.f32(),
                                    n_experts * sizeof(float), cudaMemcpyDeviceToHost));
+            auto t_end_cpy = std::chrono::high_resolution_clock::now();
 
             // Top-k on CPU
             std::vector<int> indices(n_experts);
@@ -2331,32 +2279,53 @@ private:
             // Normalize and scale
             for (int k = 0; k < top_k; k++)
                 expert_weights[k] = expert_weights[k] / weight_sum * cfg_.routed_scaling_factor;
+
+            auto t_end_sort = std::chrono::high_resolution_clock::now();
+            if (!dbg_first_token_) LOG_INFO("L%d Sync: %ldus, Cpy: %ldus, Sort: %ldus", layer_id, std::chrono::duration_cast<std::chrono::microseconds>(t_end_sync - t_start_sync).count(), std::chrono::duration_cast<std::chrono::microseconds>(t_end_cpy - t_end_sync).count(), std::chrono::duration_cast<std::chrono::microseconds>(t_end_sort - t_end_cpy).count());
         }
 
         // ── Zero accumulator ────────────────────────────────────────────────
         CUDA_CHECK(cudaMemset(buf_moe_accum_.data, 0, dim * sizeof(__nv_bfloat16)));
 
         // ── Execute routed experts ──────────────────────────────────────────
+        void* cached_blocks[32] = {nullptr};
         std::future<void*> expert_futures[32];
         for (int k = 0; k < top_k; k++) {
             int eid = expert_ids[k];
             if (eid < 0) continue;
 
-            expert_futures[k] = expert_pool_->enqueue([this, layer_id, eid]() {
-                return expert_loader_.get_expert(layer_id, eid, main_stream_);
-            });
+            cached_blocks[k] = expert_loader_.try_get_expert_cached(layer_id, eid);
+            if (!cached_blocks[k]) {
+                expert_futures[k] = expert_pool_->enqueue([this, layer_id, eid]() {
+                    return expert_loader_.get_expert(layer_id, eid, main_stream_);
+                });
+            }
         }
 
         for (int k = 0; k < top_k; k++) {
             int eid = expert_ids[k];
-            float weight = expert_weights[k];
             if (eid < 0) continue;
 
-            void* expert_block = expert_futures[k].get();
+            void* expert_block = cached_blocks[k];
+            if (!expert_block) {
+                expert_block = expert_futures[k].get();
+            }
             if (!expert_block) { LOG_ERROR("Failed to load expert L%d E%d", layer_id, eid); continue; }
 
             // Run SwiGLU: out = w2(silu(w1(x)) * w3(x))
-            execute_expert_swiglu(expert_block, weight);
+            execute_expert_swiglu(expert_block, expert_weights[k], k);
+        }
+
+        for (int k = 0; k < top_k; k++) {
+            CUDA_CHECK(cudaEventRecord(expert_events_[k], expert_streams_[k]));
+            CUDA_CHECK(cudaStreamWaitEvent(main_stream_, expert_events_[k], 0));
+        }
+
+        for (int k = 0; k < top_k; k++) {
+            float weight = expert_weights[k];
+            __nv_bfloat16* my_down = buf_down_.bf16() + k * cfg_.hidden_size;
+            weighted_add_cuda(buf_moe_accum_.bf16(), my_down,
+                              weight, cfg_.hidden_size, main_stream_);
         }
 
         // ── Execute shared expert ───────────────────────────────────────────
@@ -2420,21 +2389,18 @@ private:
         int w1_scale_cols = w1s_info.shape.size() > 1 ? w1s_info.shape[1] : 1;
         int w2_scale_cols = w2s_info.shape.size() > 1 ? w2s_info.shape[1] : 1;
 
-        // gate = w1(x): [1, dim] x [moe_inter, dim].T -> [1, moe_inter]
-        gemm_fp4_dequant(buf_gate_.bf16(), 1, moe_inter, dim,
-                         buf_hidden_.bf16(), w1_data, w1_scale, w1_scale_cols);
-
-        // up = w3(x)
-        gemm_fp4_dequant(buf_up_.bf16(), 1, moe_inter, dim,
-                         buf_hidden_.bf16(), w3_data, w3_scale, w1_scale_cols);
-
-        // SiLU(gate) * up with clamping
-        silu_mul_cuda(buf_gate_.bf16(), buf_gate_.bf16(), buf_up_.bf16(),
-                      moe_inter, cfg_.swiglu_limit, main_stream_);
-
-        // down = w2(h): [1, moe_inter] x [dim, moe_inter].T -> [1, dim]
-        gemm_fp4_dequant(buf_down_.bf16(), 1, dim, moe_inter,
-                         buf_gate_.bf16(), w2_data, w2_scale, w2_scale_cols);
+        if (cfg_.expert_dtype == "int2") {
+            int block_size = 256; // Wait, cfg_.expert_int2_block_size doesn't exist? I'll just use 256
+            gemm_int2_dequant(buf_gate_.bf16(), 1, moe_inter, dim, buf_hidden_.bf16(), w1_data, (__nv_bfloat16*)w1_scale, block_size);
+            gemm_int2_dequant(buf_up_.bf16(), 1, moe_inter, dim, buf_hidden_.bf16(), w3_data, (__nv_bfloat16*)w3_scale, block_size);
+            silu_mul_cuda(buf_gate_.bf16(), buf_gate_.bf16(), buf_up_.bf16(), moe_inter, cfg_.swiglu_limit, main_stream_);
+            gemm_int2_dequant(buf_down_.bf16(), 1, dim, moe_inter, buf_gate_.bf16(), w2_data, (__nv_bfloat16*)w2_scale, block_size);
+        } else {
+            gemm_fp4_dequant(buf_gate_.bf16(), 1, moe_inter, dim, buf_hidden_.bf16(), w1_data, w1_scale, w1_scale_cols);
+            gemm_fp4_dequant(buf_up_.bf16(), 1, moe_inter, dim, buf_hidden_.bf16(), w3_data, w3_scale, w1_scale_cols);
+            silu_mul_cuda(buf_gate_.bf16(), buf_gate_.bf16(), buf_up_.bf16(), moe_inter, cfg_.swiglu_limit, main_stream_);
+            gemm_fp4_dequant(buf_down_.bf16(), 1, dim, moe_inter, buf_gate_.bf16(), w2_data, w2_scale, w2_scale_cols);
+        }
 
         // Accumulate with routing weight
         weighted_add_cuda(buf_moe_accum_.bf16(), buf_down_.bf16(),
@@ -2712,7 +2678,12 @@ static void run_server(MoecherEngine& engine, int port) {
                                 {"index", 0},
                                 {"delta", json::object()},
                                 {"finish_reason", engine.last_finish_reason_}
-                            }}}
+                            }}},
+                            {"usage", {
+                                {"prompt_tokens", engine.prompt_token_count_},
+                                {"completion_tokens", engine.completion_token_count_},
+                                {"total_tokens", engine.prompt_token_count_ + engine.completion_token_count_}
+                            }}
                         };
                         sse = "data: " + finish.dump(-1, ' ', false, json::error_handler_t::replace) + "\n\n";
                         sink.write(sse.data(), sse.size());
@@ -2765,6 +2736,7 @@ int main(int argc, char** argv) {
     float max_vram_gb = 0.0f;
     float dram_cache_gb = 0.0f;
     std::string log_path = "moecher.log";
+    std::string expert_dtype_override = "";
 
     for (int i = 1; i < argc; i++) {
         if (std::string(argv[i]) == "--manifest" && i + 1 < argc) {
@@ -2777,6 +2749,8 @@ int main(int argc, char** argv) {
             max_vram_gb = std::stof(argv[++i]);
         } else if (std::string(argv[i]) == "--dram-cache-gb" && i + 1 < argc) {
             dram_cache_gb = std::stof(argv[++i]);
+        } else if (std::string(argv[i]) == "--expert-dtype" && i + 1 < argc) {
+            expert_dtype_override = argv[++i];
         } else if (std::string(argv[i]) == "--log-experts") {
             g_log_experts = true;
         } else if (std::string(argv[i]) == "--no-log-tokens") {
@@ -2789,7 +2763,7 @@ int main(int argc, char** argv) {
     LOG_INFO("═══ moecher starting ═══");
 
     MoecherEngine engine;
-    if (!engine.load(manifest_path, max_vram_gb, dram_cache_gb)) {
+    if (!engine.load(manifest_path, max_vram_gb, dram_cache_gb, expert_dtype_override)) {
         LOG_ERROR("Failed to load model");
         return 1;
     }

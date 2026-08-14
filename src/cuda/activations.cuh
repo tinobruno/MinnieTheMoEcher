@@ -24,6 +24,8 @@ void rms_norm_cuda_batched(
     float eps,
     cudaStream_t stream = 0);
 
+void rms_norm_f32_cuda(float* x, int dim, float eps, cudaStream_t stream = 0);
+
 // Unweighted batched: x * rsqrt(mean(x^2) + eps) per row (no learnable weight)
 // Used for per-head Q normalization (DeepseekV4UnweightedRMSNorm)
 void rms_norm_unweighted_batched_cuda(
@@ -69,6 +71,16 @@ void fp8_dequant_cuda(
     int block_size,                // 128 for this model
     cudaStream_t stream = 0);
 
+void gemv_fp8_cuda(
+    __nv_bfloat16* out,
+    const __nv_bfloat16* vec,
+    const uint8_t* weight,
+    const uint8_t* scale,
+    int rows, int cols,
+    int block_size,
+    cudaStream_t stream = 0);
+
+
 // ── FP4 dequantization ────────────────────────────────────────────────────────
 // Dequantize FP4 (packed as I8, 2 values per byte) to BF16 using E8M0 scales
 // weight: [rows, cols_packed] in I8 (cols_packed = logical_cols / 2)
@@ -81,6 +93,32 @@ void fp4_dequant_cuda(
     int rows, int cols_packed,     // cols_packed = logical_cols/2
     int scale_cols,                // number of scale columns
     cudaStream_t stream = 0);
+
+// ── INT2 asymmetric dequantization ────────────────────────────────────────────
+// weight: [rows, cols_packed] in I8 (cols_packed = logical_cols / 4)
+// scale_min: [rows, logical_cols/64, 2] in BF16 (scale then min contiguous per block)
+// out:    [rows, logical_cols] in BF16
+void int2_dequant_cuda(
+    __nv_bfloat16* out,
+    const uint8_t* weight,
+    const __nv_bfloat16* scale_min,
+    int rows, int cols_packed,
+    int block_size,
+    cudaStream_t stream = 0);
+
+void gemv_int2_cuda(
+    __nv_bfloat16* out,
+    const __nv_bfloat16* vec,
+    const uint8_t* weight,
+    const __nv_bfloat16* scale_min,
+    int rows, int cols_packed,
+    int block_size,
+    cudaStream_t stream = 0);
+void gemm_int2_cuda(__nv_bfloat16* out, const __nv_bfloat16* A,
+                    const uint8_t* weight, const __nv_bfloat16* scale_min,
+                    int M, int N, int K_packed, int block_size,
+                    cudaStream_t stream = 0);
+
 
 // ── Embedding lookup ───────────────────────────────────────────────────────────
 void embedding_cuda(
@@ -218,3 +256,24 @@ void combine_kv_cuda(
     int head_dim,
     cudaStream_t stream = 0);
 
+
+void gemv_bf16_out_bf16_cuda(
+    __nv_bfloat16* out,
+    const __nv_bfloat16* W,
+    const __nv_bfloat16* x,
+    int N, int K,
+    cudaStream_t stream);
+
+void hc_pre_weighted_add_cuda(
+    __nv_bfloat16* hidden, const __nv_bfloat16* hc_state, const float* pre_weights,
+    int dim, int hc, cudaStream_t stream = 0);
+
+void hc_post_update_cuda(
+    __nv_bfloat16* hc_state, const __nv_bfloat16* hidden, const __nv_bfloat16* hc_residual,
+    const float* post_weights, const float* comb_weights,
+    int dim, int hc, cudaStream_t stream = 0);
+
+void hc_head_reduce_cuda(
+    __nv_bfloat16* hidden, const __nv_bfloat16* hc_state,
+    const float* mixes, const float* scale, const float* base,
+    int dim, int hc, cudaStream_t stream = 0);

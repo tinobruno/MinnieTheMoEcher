@@ -639,77 +639,108 @@ __global__ void hc_split_sinkhorn_kernel(
     const float* __restrict__ base, // [(2+hc_mult)*hc_mult]
     int hc_mult, int sinkhorn_iters, float eps)
 {
-    // mixes layout: [pre(hc), post(hc), comb(hc*hc)]
+    int tid = threadIdx.x;
     int hc = hc_mult;
-    int mix_size = (2 + hc) * hc;  // 24 for hc=4
-
-    // Apply sigmoid(mix * scale + base) for each section
-    // Pre: indices [0, hc)
-    for (int i = 0; i < hc; i++) {
-        float v = mixes[i] * scale[0] + base[i];
-        pre[i] = 1.0f / (1.0f + expf(-v)) + eps;
+    
+    // Pre
+    if (tid < hc) {
+        float v = mixes[tid] * scale[0] + base[tid];
+        pre[tid] = 1.0f / (1.0f + expf(-v)) + eps;
     }
-
-    // Post: indices [hc, 2*hc)
-    for (int i = 0; i < hc; i++) {
+    // Post
+    if (tid >= hc && tid < 2*hc) {
+        int i = tid - hc;
         float v = mixes[hc + i] * scale[1] + base[hc + i];
         post[i] = 2.0f / (1.0f + expf(-v));
     }
 
-    // Comb: indices [2*hc, (2+hc)*hc)
-    // Python: comb = torch.softmax(comb_logits, dim=-1) + eps
-    for (int r = 0; r < hc; r++) {
-        // Find max for numerical stability in Softmax
+    __shared__ float s_comb[64]; // max hc=8
+    __shared__ float s_row_sum[8];
+    __shared__ float s_col_sum[8];
+
+    // Comb logits
+    if (tid < hc * hc) {
+        int r = tid / hc;
+        int c = tid % hc;
+        float v = mixes[2 * hc + r * hc + c] * scale[2] + base[2 * hc + r * hc + c];
+        s_comb[r * hc + c] = v;
+    }
+    __syncthreads();
+
+    // Row max & softmax
+    if (tid < hc) {
+        int r = tid;
         float max_val = -1e38f;
         for (int c = 0; c < hc; c++) {
-            float v = mixes[2 * hc + r * hc + c] * scale[2] + base[2 * hc + r * hc + c];
-            max_val = fmaxf(max_val, v);
-            comb[r * hc + c] = v; // Temporarily store logits
+            max_val = fmaxf(max_val, s_comb[r * hc + c]);
         }
-
         float row_sum = 0.0f;
         for (int c = 0; c < hc; c++) {
-            float e = expf(comb[r * hc + c] - max_val);
-            comb[r * hc + c] = e;
+            float e = expf(s_comb[r * hc + c] - max_val);
+            s_comb[r * hc + c] = e;
             row_sum += e;
         }
-
-        // Softmax + eps
         for (int c = 0; c < hc; c++) {
-            comb[r * hc + c] = (comb[r * hc + c] / row_sum) + eps;
+            s_comb[r * hc + c] = (s_comb[r * hc + c] / row_sum) + eps;
         }
     }
+    __syncthreads();
 
-    // Python: comb = comb / (comb.sum(dim=-2, keepdim=True) + eps) (Column normalize)
-    for (int c = 0; c < hc; c++) {
+    // Col normalize
+    if (tid < hc) {
+        int c = tid;
         float col_sum = 0.0f;
-        for (int r = 0; r < hc; r++)
-            col_sum += comb[r * hc + c];
+        for (int r = 0; r < hc; r++) {
+            col_sum += s_comb[r * hc + c];
+        }
         float inv = 1.0f / (col_sum + eps);
-        for (int r = 0; r < hc; r++)
-            comb[r * hc + c] *= inv;
+        for (int r = 0; r < hc; r++) {
+            s_comb[r * hc + c] *= inv;
+        }
+    }
+    __syncthreads();
+
+    // Sinkhorn loop
+    for (int iter = 0; iter < sinkhorn_iters - 1; iter++) {
+        // Row norm
+        if (tid < hc) {
+            int r = tid;
+            float row_sum = 0.0f;
+            for (int c = 0; c < hc; c++) {
+                row_sum += s_comb[r * hc + c];
+            }
+            float inv = 1.0f / (row_sum + eps);
+            s_row_sum[r] = inv;
+        }
+        __syncthreads();
+        if (tid < hc * hc) {
+            int r = tid / hc;
+            int c = tid % hc;
+            s_comb[r * hc + c] *= s_row_sum[r];
+        }
+        __syncthreads();
+
+        // Col norm
+        if (tid < hc) {
+            int c = tid;
+            float col_sum = 0.0f;
+            for (int r = 0; r < hc; r++) {
+                col_sum += s_comb[r * hc + c];
+            }
+            float inv = 1.0f / (col_sum + eps);
+            s_col_sum[c] = inv;
+        }
+        __syncthreads();
+        if (tid < hc * hc) {
+            int r = tid / hc;
+            int c = tid % hc;
+            s_comb[r * hc + c] *= s_col_sum[c];
+        }
+        __syncthreads();
     }
 
-    // Python Sinkhorn loop:
-    for (int iter = 0; iter < sinkhorn_iters - 1; iter++) {
-        // Row normalization
-        for (int r = 0; r < hc; r++) {
-            float row_sum = 0.0f;
-            for (int c = 0; c < hc; c++)
-                row_sum += comb[r * hc + c];
-            float inv = 1.0f / (row_sum + eps);
-            for (int c = 0; c < hc; c++)
-                comb[r * hc + c] *= inv;
-        }
-        // Column normalization
-        for (int c = 0; c < hc; c++) {
-            float col_sum = 0.0f;
-            for (int r = 0; r < hc; r++)
-                col_sum += comb[r * hc + c];
-            float inv = 1.0f / (col_sum + eps);
-            for (int r = 0; r < hc; r++)
-                comb[r * hc + c] *= inv;
-        }
+    if (tid < hc * hc) {
+        comb[tid] = s_comb[tid];
     }
 }
 
@@ -718,7 +749,7 @@ void hc_split_sinkhorn_cuda(float* pre, float* post, float* comb,
                              const float* base, int hc_mult,
                              int sinkhorn_iters, float eps,
                              cudaStream_t stream) {
-    hc_split_sinkhorn_kernel<<<1, 1, 0, stream>>>(
+    hc_split_sinkhorn_kernel<<<1, 32, 0, stream>>>(
         pre, post, comb, mixes, scale, base, hc_mult, sinkhorn_iters, eps);
 }
 
@@ -1049,3 +1080,342 @@ void combine_kv_cuda(
     combine_kv_kernel<<<blocks, threads, 0, stream>>>(out, raw_kv, raw_len, comp_kv, comp_len, head_dim);
 }
 
+// FP8 GEMV Kernel
+__device__ inline float fp8_e4m3_to_float_v2(uint8_t val) {
+    if (val == 0) return 0.0f;
+    uint32_t sign = (val & 0x80) << 24;
+    uint32_t exp  = (val & 0x78) >> 3;
+    uint32_t mant = (val & 0x07);
+    uint32_t f_exp = exp + 127 - 7;
+    uint32_t f_mant = mant << 20;
+    uint32_t res = sign | (f_exp << 23) | f_mant;
+    return *((float*)&res);
+}
+
+__device__ inline float e8m0_to_float_v2(uint8_t val) {
+    uint32_t res = (val + 127 - 127) << 23;
+    return *((float*)&res);
+}
+
+__global__ void gemv_fp8_kernel(
+    __nv_bfloat16* __restrict__ out,
+    const __nv_bfloat16* __restrict__ vec,
+    const uint8_t* __restrict__ weight,
+    const uint8_t* __restrict__ scale,
+    int N, int K, int block_size)
+{
+    int row = blockIdx.x;
+    if (row >= N) return;
+    int tid = threadIdx.x;
+    float sum = 0.0f;
+    int scale_cols = (K + block_size - 1) / block_size;
+    int br = row / block_size;
+
+    // Process 8 elements at a time
+    const uint2* w_vec8 = reinterpret_cast<const uint2*>(&weight[row * K]);
+    const uint4* a_vec4 = reinterpret_cast<const uint4*>(vec); // uint4 = 16 bytes = 8 bfloat16
+
+    for (int chunk = tid; chunk < K / 8; chunk += blockDim.x) {
+        int logical_col = chunk * 8;
+        int bc = logical_col / block_size;
+        float s_val = e8m0_to_float_v2(scale[br * scale_cols + bc]);
+
+        uint2 w8 = w_vec8[chunk];
+        uint4 a8 = a_vec4[chunk];
+        uint32_t w_arr[2] = {w8.x, w8.y};
+        uint32_t a_arr[4] = {a8.x, a8.y, a8.z, a8.w};
+
+        #pragma unroll
+        for (int i = 0; i < 2; i++) {
+            uint32_t w_chunk = w_arr[i];
+            #pragma unroll
+            for (int j = 0; j < 4; j++) {
+                uint8_t b = (w_chunk >> (j * 8)) & 0xFF;
+                float w_f = fp8_e4m3_to_float_v2(b) * s_val;
+                int a_idx = i * 2 + (j / 2);
+                uint32_t a_val = a_arr[a_idx];
+                __nv_bfloat162 bf2 = *reinterpret_cast<__nv_bfloat162*>(&a_val);
+                float2 f2 = __bfloat1622float2(bf2);
+                if ((j % 2) == 0) sum += w_f * f2.x;
+                else sum += w_f * f2.y;
+            }
+        }
+    }
+    // Warp reduce
+    #pragma unroll
+    for (int offset = 16; offset > 0; offset /= 2)
+        sum += __shfl_down_sync(0xffffffff, sum, offset);
+    
+    // Shared memory for block reduce
+    __shared__ float s_sum[32];
+    int lane = tid % 32;
+    int warp = tid / 32;
+    if (lane == 0) s_sum[warp] = sum;
+    __syncthreads();
+    
+    sum = (tid < (blockDim.x / 32)) ? s_sum[lane] : 0.0f;
+    if (warp == 0) {
+        #pragma unroll
+        for (int offset = 16; offset > 0; offset /= 2)
+            sum += __shfl_down_sync(0xffffffff, sum, offset);
+        if (tid == 0) out[row] = __float2bfloat16(sum);
+    }
+}
+void gemv_fp8_cuda(__nv_bfloat16* out, const __nv_bfloat16* vec,
+                   const uint8_t* weight, const uint8_t* scale,
+                   int N, int K, int block_size, cudaStream_t stream) {
+    int threads = 128;
+    gemv_fp8_kernel<<<N, threads, 0, stream>>>(out, vec, weight, scale, N, K, block_size);
+}
+
+__global__ void gemv_int2_kernel(
+    __nv_bfloat16* __restrict__ out,
+    const __nv_bfloat16* __restrict__ vec,
+    const uint8_t* __restrict__ weight,
+    const __nv_bfloat16* __restrict__ scale_min,
+    int N, int K_packed, int block_size)
+{
+    int start_row = blockIdx.x * 4;
+    int tid = threadIdx.x;
+    int blocks = (K_packed * 4) / block_size;
+
+    for (int r = 0; r < 4; r++) {
+        int row = start_row + r;
+        if (row >= N) break;
+
+        const __nv_bfloat16* row_scales = scale_min + (row * blocks);
+        const __nv_bfloat16* row_mins = scale_min + (N * blocks) + (row * blocks);
+
+        __shared__ __nv_bfloat16 s_scale[128];
+        __shared__ __nv_bfloat16 s_min[128];
+        if (tid < blocks) {
+            s_scale[tid] = row_scales[tid];
+            s_min[tid] = row_mins[tid];
+        }
+        __syncthreads();
+
+        float sum = 0.0f;
+        const uint32_t* w_vec32 = reinterpret_cast<const uint32_t*>(&weight[row * K_packed]);
+        const uint4* a_vec4 = reinterpret_cast<const uint4*>(vec);
+
+        for (int chunk_idx = tid; chunk_idx < K_packed / 4; chunk_idx += blockDim.x) {
+            int logical_col = chunk_idx * 16;
+            int bc = logical_col / block_size;
+
+            float s = __bfloat162float(s_scale[bc]);
+            float m = __bfloat162float(s_min[bc]);
+
+            uint32_t chunk = w_vec32[chunk_idx];
+            uint4 a0 = a_vec4[chunk_idx * 2];
+            uint4 a1 = a_vec4[chunk_idx * 2 + 1];
+            uint32_t a_arr[8] = {a0.x, a0.y, a0.z, a0.w, a1.x, a1.y, a1.z, a1.w};
+            
+            float sum_w = 0.0f;
+            float sum_a = 0.0f;
+
+            #pragma unroll
+            for (int j = 0; j < 8; j++) {
+                uint32_t a_val = a_arr[j];
+                __nv_bfloat162 bf2 = *reinterpret_cast<__nv_bfloat162*>(&a_val);
+                float2 f2 = __bfloat1622float2(bf2);
+
+                int byte_idx = j / 2;
+                int nibble_idx = j % 2;
+                uint8_t b = (chunk >> (byte_idx * 8)) & 0xFF;
+
+                float v0, v1;
+                if (nibble_idx == 0) {
+                    v0 = (float)(b & 0x03);
+                    v1 = (float)((b >> 2) & 0x03);
+                } else {
+                    v0 = (float)((b >> 4) & 0x03);
+                    v1 = (float)((b >> 6) & 0x03);
+                }
+                sum_w += v0 * f2.x + v1 * f2.y;
+                sum_a += f2.x + f2.y;
+            }
+            sum += sum_w * s + sum_a * m;
+        }
+        // Warp reduce
+        #pragma unroll
+        for (int offset = 16; offset > 0; offset /= 2)
+            sum += __shfl_down_sync(0xffffffff, sum, offset);
+        
+        __shared__ float s_sum[32];
+        int lane = tid % 32;
+        int warp = tid / 32;
+        if (lane == 0) s_sum[warp] = sum;
+        __syncthreads();
+        
+        sum = (tid < (blockDim.x / 32)) ? s_sum[lane] : 0.0f;
+        if (warp == 0) {
+            #pragma unroll
+            for (int offset = 16; offset > 0; offset /= 2)
+                sum += __shfl_down_sync(0xffffffff, sum, offset);
+        }
+        if (tid == 0) out[row] = __float2bfloat16(sum);
+        __syncthreads();
+    }
+}
+void gemv_int2_cuda(__nv_bfloat16* out, const __nv_bfloat16* vec,
+                    const uint8_t* weight, const __nv_bfloat16* scale_min,
+                    int N, int K_packed, int block_size, cudaStream_t stream) {
+    int max_chunks = K_packed / 4;
+    int threads = max_chunks < 128 ? max_chunks : 128; // fallback limit
+    int blocks_x = (N + 3) / 4;
+
+    gemv_int2_kernel<<<blocks_x, threads, 0, stream>>>(out, vec, weight, scale_min, N, K_packed, block_size);
+}
+
+// ── HC Pre Weighted Add Kernel ──────────────────────────────────────────────────
+__global__ void hc_pre_weighted_add_kernel(
+    __nv_bfloat16* __restrict__ hidden,
+    const __nv_bfloat16* __restrict__ hc_state,
+    const float* __restrict__ pre_weights,
+    int dim, int hc)
+{
+    int tid = blockIdx.x * blockDim.x + threadIdx.x;
+    if (tid >= dim) return;
+
+    float sum = 0.0f;
+    for (int h = 0; h < hc; h++) {
+        float w = pre_weights[h];
+        if (fabsf(w) >= 1e-10f) {
+            float val = __bfloat162float(hc_state[h * dim + tid]);
+            sum += w * val;
+        }
+    }
+    hidden[tid] = __float2bfloat16(sum);
+}
+
+void hc_pre_weighted_add_cuda(
+    __nv_bfloat16* hidden, const __nv_bfloat16* hc_state, const float* pre_weights,
+    int dim, int hc, cudaStream_t stream)
+{
+    int threads = 256;
+    int blocks = (dim + threads - 1) / threads;
+    hc_pre_weighted_add_kernel<<<blocks, threads, 0, stream>>>(hidden, hc_state, pre_weights, dim, hc);
+}
+
+// ── HC Post Update Kernel ───────────────────────────────────────────────────────
+__global__ void hc_post_update_kernel(
+    __nv_bfloat16* __restrict__ hc_state,
+    const __nv_bfloat16* __restrict__ hidden,
+    const __nv_bfloat16* __restrict__ hc_residual,
+    const float* __restrict__ post_weights,
+    const float* __restrict__ comb_weights,
+    int dim, int hc)
+{
+    int tid = blockIdx.x * blockDim.x + threadIdx.x;
+    int h = blockIdx.y; // Which HC head we are computing
+    if (tid >= dim || h >= hc) return;
+
+    // Start with post[h] * hidden
+    float p_w = post_weights[h];
+    float sum = p_w * __bfloat162float(hidden[tid]);
+
+    // Add sum_j(comb[j * hc + h] * residual[j])
+    for (int j = 0; j < hc; j++) {
+        float c_w = comb_weights[j * hc + h];
+        if (fabsf(c_w) >= 1e-10f) {
+            float r_val = __bfloat162float(hc_residual[j * dim + tid]);
+            sum += c_w * r_val;
+        }
+    }
+    
+    hc_state[h * dim + tid] = __float2bfloat16(sum);
+}
+
+void hc_post_update_cuda(
+    __nv_bfloat16* hc_state, const __nv_bfloat16* hidden, const __nv_bfloat16* hc_residual,
+    const float* post_weights, const float* comb_weights,
+    int dim, int hc, cudaStream_t stream)
+{
+    int threads = 256;
+    int blocks_x = (dim + threads - 1) / threads;
+    dim3 blocks(blocks_x, hc);
+    hc_post_update_kernel<<<blocks, threads, 0, stream>>>(
+        hc_state, hidden, hc_residual, post_weights, comb_weights, dim, hc);
+}
+
+// ── HC Head Reduce Kernel ───────────────────────────────────────────────────────
+__global__ void hc_head_reduce_kernel(
+    __nv_bfloat16* __restrict__ hidden,
+    const __nv_bfloat16* __restrict__ hc_state,
+    const float* __restrict__ mixes,
+    const float* __restrict__ scale,
+    const float* __restrict__ base,
+    int dim, int hc)
+{
+    int tid = blockIdx.x * blockDim.x + threadIdx.x;
+    if (tid >= dim) return;
+
+    float s = scale[0];
+    float sum = 0.0f;
+    for (int h = 0; h < hc; h++) {
+        float mix = mixes[h];
+        float b = base[h];
+        // sigmoid(mix * s + b) + eps
+        float arg = mix * s + b;
+        float w = 1.0f / (1.0f + expf(-arg)) + 1e-6f;
+        
+        float val = __bfloat162float(hc_state[h * dim + tid]);
+        sum += w * val;
+    }
+    hidden[tid] = __float2bfloat16(sum);
+}
+
+void hc_head_reduce_cuda(
+    __nv_bfloat16* hidden, const __nv_bfloat16* hc_state,
+    const float* mixes, const float* scale, const float* base,
+    int dim, int hc, cudaStream_t stream)
+{
+    int threads = 256;
+    int blocks = (dim + threads - 1) / threads;
+    hc_head_reduce_kernel<<<blocks, threads, 0, stream>>>(
+        hidden, hc_state, mixes, scale, base, dim, hc);
+}
+#include <cuda_runtime.h>
+#include <stdio.h>
+
+__global__ void rms_norm_f32_kernel(float* x, int dim, float eps) {
+    extern __shared__ float sdata[];
+    int tid = threadIdx.x;
+    int lane = tid & 31;
+    int warp = tid >> 5;
+
+    float sum_sq = 0.0f;
+    for (int i = tid; i < dim; i += blockDim.x) {
+        float v = x[i];
+        sum_sq += v * v;
+    }
+
+    for (int offset = 16; offset > 0; offset >>= 1) {
+        sum_sq += __shfl_down_sync(0xFFFFFFFF, sum_sq, offset);
+    }
+
+    if (lane == 0) sdata[warp] = sum_sq;
+    __syncthreads();
+
+    if (warp == 0) {
+        sum_sq = (tid < (blockDim.x / 32)) ? sdata[lane] : 0.0f;
+        for (int offset = 16; offset > 0; offset >>= 1) {
+            sum_sq += __shfl_down_sync(0xFFFFFFFF, sum_sq, offset);
+        }
+        if (tid == 0) {
+            sdata[0] = rsqrtf(sum_sq / dim + eps);
+        }
+    }
+    __syncthreads();
+
+    float rsqrt_val = sdata[0];
+    for (int i = tid; i < dim; i += blockDim.x) {
+        x[i] *= rsqrt_val;
+    }
+}
+
+void rms_norm_f32_cuda(float* x, int dim, float eps, cudaStream_t stream) {
+    int threads = min(dim, 1024);
+    int smem = (threads / 32) * sizeof(float);
+    rms_norm_f32_kernel<<<1, threads, smem, stream>>>(x, dim, eps);
+}

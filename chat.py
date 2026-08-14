@@ -71,10 +71,14 @@ def chat_completion_stream(url: str, messages: list, max_tokens: int,
                         break
                     try:
                         chunk = json.loads(line)
-                        delta = chunk["choices"][0].get("delta", {})
-                        content = delta.get("content", "")
-                        if content:
-                            yield content
+                        if "usage" in chunk:
+                            yield {"usage": chunk["usage"]}
+                        
+                        if "choices" in chunk and len(chunk["choices"]) > 0:
+                            delta = chunk["choices"][0].get("delta", {})
+                            content = delta.get("content", "")
+                            if content:
+                                yield content
                     except json.JSONDecodeError:
                         pass
     except urllib.error.URLError as e:
@@ -188,17 +192,38 @@ def main():
 
         reply = ""
         token_count = 0
+        prompt_tokens = 0
         start_time = time.time()
-        for chunk in chat_completion_stream(
-            args.url, messages, max_tokens, temperature, args.model
-        ):
-            print(chunk, end="", flush=True)
-            reply += chunk
-            token_count += 1
+        first_token_time = None
+
+        try:
+            for chunk in chat_completion_stream(
+                args.url, messages, max_tokens, temperature, args.model
+            ):
+                if isinstance(chunk, dict) and "usage" in chunk:
+                    prompt_tokens = chunk["usage"].get("prompt_tokens", 0)
+                    continue
+
+                if first_token_time is None:
+                    first_token_time = time.time()
+                
+                print(chunk, end="", flush=True)
+                reply += chunk
+                token_count += 1
+        except Exception as e:
+            pass
             
-        elapsed = time.time() - start_time
-        tps = token_count / elapsed if elapsed > 0 else 0
-        print(f"\n{DIM}[{token_count} tokens in {elapsed:.2f}s, {tps:.2f} tok/s]{RESET}\n")
+        end_time = time.time()
+        ttft = (first_token_time - start_time) if first_token_time else 0.0
+        decode_time = (end_time - first_token_time) if first_token_time else 0.0
+        
+        # Prefill speed is measured for all prompt tokens in TTFT
+        prefill_tps = prompt_tokens / ttft if ttft > 0 else 0.0
+        
+        # Decode speed is measured for all tokens after the first one
+        decode_tps = (token_count - 1) / decode_time if decode_time > 0 and token_count > 1 else 0.0
+        
+        print(f"\n{DIM}[TTFT: {ttft:.2f}s ({prefill_tps:.2f} tok/s) | Decode: {token_count} tokens in {decode_time:.2f}s, {decode_tps:.2f} tok/s]{RESET}\n")
 
         messages.append({"role": "assistant", "content": reply})
         print()
