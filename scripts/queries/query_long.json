@@ -1,0 +1,14 @@
+{
+    "model": "deepseek-v4-flash",
+    "messages": [
+        {
+            "role": "system",
+            "content": "You are a helpful assistant. Please tell me a long story about a very brave knight who fights dragons and saves princesses. The story should be at least 300 words long and contain lots of vivid imagery and details about the dragon's scales, the knight's sword, and the princess's tower."
+        },
+        {
+            "role": "user",
+            "content": "What is the weather in Tokyo?"
+        }
+    ],
+    "stream": false
+}

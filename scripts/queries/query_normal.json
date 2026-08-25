@@ -1,0 +1,14 @@
+{
+    "model": "deepseek-v4-flash",
+    "messages": [
+        {
+            "role": "system",
+            "content": "You are a helpful assistant."
+        },
+        {
+            "role": "user",
+            "content": "What is 2+2?"
+        }
+    ],
+    "stream": false
+}
