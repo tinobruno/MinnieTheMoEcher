@@ -1,11 +1,36 @@
-# Build directory
+# Build directory & CMake artifacts
 build/
+build_baseline/
+CMakeFiles/
+CMakeCache.txt
+cmake_install.cmake
+CPackConfig.cmake
+CPackSourceConfig.cmake
+Makefile
+_deps/
+*.a
+*.o
+*.so
+moecher
 
-# Large model binaries
+# Large model binaries & manifests
 *.bin
+*.dat
+*.patch
+*.diff
+bin_bck/
+manifest_bck/
+offload/
+scratch/
+dump*
 
-# Log files
+# Log files & debug dumps
 *.log
+logs/
+debug/
+src_backups/
+*.out
+*.txt
 
 # Python
 __pycache__/

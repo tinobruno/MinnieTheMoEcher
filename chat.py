@@ -17,6 +17,43 @@ import readline  # enables arrow-key history in input()
 import textwrap
 import os
 import time
+from html.parser import HTMLParser
+
+# ── URL Fetching & Parsing ───────────────────────────────────────────────────
+
+class TextExtractor(HTMLParser):
+    def __init__(self):
+        super().__init__()
+        self.text = []
+        self.in_script_or_style = False
+
+    def handle_starttag(self, tag, attrs):
+        if tag in ('script', 'style'):
+            self.in_script_or_style = True
+
+    def handle_endtag(self, tag):
+        if tag in ('script', 'style'):
+            self.in_script_or_style = False
+
+    def handle_data(self, data):
+        if not self.in_script_or_style and data.strip():
+            self.text.append(data.strip())
+
+    def get_text(self):
+        return ' '.join(self.text)
+
+def fetch_and_parse_url(url: str) -> str:
+    try:
+        req = urllib.request.Request(url, headers={'User-Agent': 'Mozilla/5.0'})
+        with urllib.request.urlopen(req, timeout=10) as response:
+            html = response.read().decode('utf-8', errors='ignore')
+            parser = TextExtractor()
+            parser.feed(html)
+            text = parser.get_text()
+            # truncate to avoid blowing up context limits
+            return text[:4000] if len(text) > 4000 else text
+    except Exception as e:
+        return f"Error fetching URL: {str(e)}"
 
 # ── ANSI colours ─────────────────────────────────────────────────────────────
 
@@ -28,6 +65,7 @@ GREEN     = "\033[32m"
 YELLOW    = "\033[33m"
 MAGENTA   = "\033[35m"
 RED       = "\033[31m"
+WHITE     = "\033[97m"
 RESET     = "\033[0m"
 
 BANNER = f"""
@@ -36,24 +74,38 @@ BANNER = f"""
 ║      DeepSeek V4-Flash • bare-metal engine       ║
 ╚══════════════════════════════════════════════════╝{RESET}
 {DIM}Type your message and press Enter. Commands:{RESET}
-  {YELLOW}/clear{RESET}    — reset conversation
-  {YELLOW}/system{RESET}   — set system prompt
-  {YELLOW}/temp N{RESET}   — change temperature (current: {{temp}})
-  {YELLOW}/tokens N{RESET} — change max tokens  (current: {{max_tokens}})
-  {YELLOW}/quit{RESET}     — exit
+  {YELLOW}/clear{RESET}       — reset conversation
+  {YELLOW}/system{RESET}      — set system prompt
+  {YELLOW}/temp N{RESET}      — change temperature (current: {{temp}})
+  {YELLOW}/tokens N{RESET}    — change max tokens  (current: {{max_tokens}})
+  {YELLOW}/budget N{RESET}    — change thinking budget (current: {{budget}})
+  {YELLOW}/reasoning X{RESET} — set reasoning effort (current: {{reasoning}})
+  {YELLOW}/quit{RESET}        — exit
 """
 
 
 def chat_completion_stream(url: str, messages: list, max_tokens: int,
-                           temperature: float, model: str = "deepseek-v4-flash"):
+                           temperature: float, model: str = "deepseek-v4-flash", tools: list = None,
+                           thinking: str = "enabled", reasoning_effort: str = "high",
+                           thinking_budget: int = 4096):
     """Send a chat completion request and yield assistant reply chunks."""
-    payload = json.dumps({
+    payload_dict = {
         "model": model,
         "messages": messages,
         "max_tokens": max_tokens,
         "temperature": temperature,
-        "stream": True
-    }).encode("utf-8")
+        "stream": True,
+        "thinking": {
+            "type": thinking,
+            "budget_tokens": thinking_budget
+        },
+        "max_thinking_tokens": thinking_budget,
+        "reasoning_effort": reasoning_effort
+    }
+    #if tools:
+    #    payload_dict["tools"] = tools
+    
+    payload = json.dumps(payload_dict).encode("utf-8")
 
     req = urllib.request.Request(
         f"{url}/v1/chat/completions",
@@ -71,6 +123,9 @@ def chat_completion_stream(url: str, messages: list, max_tokens: int,
                         break
                     try:
                         chunk = json.loads(line)
+                        with open("chat_response.log", "a", encoding="utf-8") as f:
+                            json.dump(chunk, f, indent=2, ensure_ascii=False)
+                            f.write("\n")
                         if "usage" in chunk:
                             yield {"usage": chunk["usage"]}
                         
@@ -79,6 +134,14 @@ def chat_completion_stream(url: str, messages: list, max_tokens: int,
                             content = delta.get("content", "")
                             if content:
                                 yield content
+
+                            reasoning = delta.get("reasoning_content", "")
+                            if reasoning:
+                                yield {"type": "reasoning", "content": reasoning}
+                                
+                            tool_calls = delta.get("tool_calls")
+                            if tool_calls:
+                                yield {"type": "tool_calls", "tool_calls": tool_calls}
                     except json.JSONDecodeError:
                         pass
     except urllib.error.URLError as e:
@@ -109,17 +172,43 @@ def main():
                         help="Base URL of the Moecher API (default: http://localhost:8001)")
     parser.add_argument("--max-tokens", type=int, default=512,
                         help="Max tokens per response (default: 512)")
-    parser.add_argument("--temperature", type=float, default=0.6,
-                        help="Sampling temperature (default: 0.6)")
+    parser.add_argument("--temperature", type=float, default=1.0,
+                        help="Sampling temperature (default: 1.0)")
     parser.add_argument("--model", default="deepseek-v4-flash",
                         help="Model name (default: deepseek-v4-flash)")
+    parser.add_argument("--show-reasoning", action="store_true",
+                        help="Show the model's reasoning process in gray")
+    parser.add_argument("--thinking", choices=["enabled", "disabled"], default="enabled",
+                        help="Enable or disable the thinking block (default: enabled)")
+    parser.add_argument("--reasoning-effort", choices=["low", "medium", "high", "xhigh", "max"], default="high",
+                        help="Reasoning effort level (default: high)")
+    parser.add_argument("--thinking-budget", type=int, default=4096,
+                        help="Thinking token budget (default: 4096)")
     args = parser.parse_args()
 
     temperature = args.temperature
     max_tokens = args.max_tokens
-    #default_system = "You are a highly capable, adaptive, and precise AI assistant. CORE OPERATIONAL RULES: 1. TOPIC AUTONOMY: Treat every user prompt as a potentially distinct domain. Never lock into a subject-matter pattern or force prior turn domains onto new, unrelated questions. 2. CONCISE & FACTUAL: Deliver direct, clear, and accurate answers immediately. Avoid fluff, unnecessary conversational filler, robotic pleasantries, and trailing meta-commentary (e.g., "Feel free to ask more"). 3. ACCURATE REASONING: Analyze input semantics carefully before responding. If a term is unfamiliar within the immediate context, evaluate it as an independent entity rather than assuming it is a typo or a misstatement of previous topics.  "
-    default_system = "You are a helpful, friendly, and knowledgeable AI assistant. Answer clearly and concisely."
+    thinking = args.thinking
+    reasoning_effort = args.reasoning_effort
+    thinking_budget = args.thinking_budget
+    default_system = "You are a helpful assistant"
+
     messages: list[dict] = [{"role": "system", "content": default_system}]
+
+    tools = [{
+        "type": "function",
+        "function": {
+            "name": "fetch_url",
+            "description": "Fetch and parse text content from a URL.",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "url": {"type": "string", "description": "The URL to fetch."}
+                },
+                "required": ["url"]
+            }
+        }
+    }]
 
     # Try to get terminal width
     try:
@@ -127,7 +216,7 @@ def main():
     except OSError:
         term_width = 80
 
-    print(BANNER.format(temp=temperature, max_tokens=max_tokens))
+    print(BANNER.format(temp=temperature, max_tokens=max_tokens, reasoning=reasoning_effort, budget=thinking_budget))
 
     # Quick connectivity check
     print(f"{DIM}Connecting to {args.url} ...{RESET}", end=" ", flush=True)
@@ -178,8 +267,23 @@ def main():
                 except ValueError:
                     print(f"{RED}Invalid token count{RESET}\n")
                 continue
+            elif (cmd[0] in ("/budget", "/thinking-budget")) and len(cmd) > 1:
+                try:
+                    thinking_budget = int(cmd[1])
+                    print(f"{YELLOW}Thinking budget set to {thinking_budget}{RESET}\n")
+                except ValueError:
+                    print(f"{RED}Invalid budget value{RESET}\n")
+                continue
+            elif cmd[0] == "/reasoning" and len(cmd) > 1:
+                level = cmd[1].lower()
+                if level in ["low", "medium", "high", "xhigh", "max"]:
+                    reasoning_effort = level
+                    print(f"{YELLOW}Reasoning effort set to {reasoning_effort}{RESET}\n")
+                else:
+                    print(f"{RED}Invalid reasoning effort. Use: low, medium, high, xhigh, max{RESET}\n")
+                continue
             elif cmd[0] == "/help":
-                print(BANNER.format(temp=temperature, max_tokens=max_tokens))
+                print(BANNER.format(temp=temperature, max_tokens=max_tokens, reasoning=reasoning_effort, budget=thinking_budget))
                 continue
             else:
                 print(f"{RED}Unknown command. Type /help for options.{RESET}\n")
@@ -188,44 +292,141 @@ def main():
         # ── Send message ──────────────────────────────────────────────────
         messages.append({"role": "user", "content": user_input})
 
-        print(f"{CYAN}{BOLD}Assistant ❯{RESET} ", end="", flush=True)
+        while True:
+            print(f"{CYAN}{BOLD}Assistant ❯{RESET} ", end="", flush=True)
 
-        reply = ""
-        token_count = 0
-        prompt_tokens = 0
-        start_time = time.time()
-        first_token_time = None
+            reply = ""
+            reasoning_text = ""
+            tool_calls = []
+            token_count = 0
+            prompt_tokens = 0
+            start_time = time.time()
+            first_token_time = None
+            was_reasoning = False
 
-        try:
-            for chunk in chat_completion_stream(
-                args.url, messages, max_tokens, temperature, args.model
-            ):
-                if isinstance(chunk, dict) and "usage" in chunk:
-                    prompt_tokens = chunk["usage"].get("prompt_tokens", 0)
-                    continue
+            try:
+                for chunk in chat_completion_stream(
+                    args.url, messages, max_tokens, temperature, args.model, tools=tools,
+                    thinking=thinking, reasoning_effort=reasoning_effort,
+                    thinking_budget=thinking_budget
+                ):
+                    is_reasoning = False
+                    if isinstance(chunk, dict):
+                        if "usage" in chunk:
+                            prompt_tokens = chunk["usage"].get("prompt_tokens", 0)
+                            if "completion_tokens" in chunk["usage"]:
+                                token_count = chunk["usage"]["completion_tokens"]
+                            continue
+                        elif chunk.get("type") == "reasoning":
+                            is_reasoning = True
+                        elif chunk.get("type") == "tool_calls":
+                            # Server sent structured tool_calls (not used in streaming currently)
+                            continue
 
-                if first_token_time is None:
-                    first_token_time = time.time()
+                    if first_token_time is None:
+                        first_token_time = time.time()
+
+                    token_count += 1
+
+                    if is_reasoning:
+                        was_reasoning = True
+                        if args.show_reasoning:
+                            print(f"{DIM}{chunk['content']}{RESET}", end="", flush=True)
+                        reasoning_text += chunk["content"]
+                        continue
+
+                    if was_reasoning:
+                        if args.show_reasoning:
+                            print()
+                        was_reasoning = False
+
+                    chunk_str = chunk if isinstance(chunk, str) else chunk.get("content", "")
+                    
+                    # Prevent printing <tool_call> to the user
+                    if "<tool_call>" in reply + chunk_str:
+                        pass # Hide tool call XML from user
+                    else:
+                        print(f"{WHITE}{chunk_str}{RESET}", end="", flush=True)
+                    reply += chunk_str
+            except Exception as e:
+                pass
                 
-                print(chunk, end="", flush=True)
-                reply += chunk
-                token_count += 1
-        except Exception as e:
-            pass
+            end_time = time.time()
+            ttft = (first_token_time - start_time) if first_token_time else 0.0
+            decode_time = (end_time - first_token_time) if first_token_time else 0.0
             
-        end_time = time.time()
-        ttft = (first_token_time - start_time) if first_token_time else 0.0
-        decode_time = (end_time - first_token_time) if first_token_time else 0.0
-        
-        # Prefill speed is measured for all prompt tokens in TTFT
-        prefill_tps = prompt_tokens / ttft if ttft > 0 else 0.0
-        
-        # Decode speed is measured for all tokens after the first one
-        decode_tps = (token_count - 1) / decode_time if decode_time > 0 and token_count > 1 else 0.0
-        
-        print(f"\n{DIM}[TTFT: {ttft:.2f}s ({prefill_tps:.2f} tok/s) | Decode: {token_count} tokens in {decode_time:.2f}s, {decode_tps:.2f} tok/s]{RESET}\n")
+            prefill_tps = prompt_tokens / ttft if ttft > 0 else 0.0
+            decode_tps = (token_count - 1) / decode_time if decode_time > 0 and token_count > 1 else 0.0
+            
+            print(f"\n{DIM}[TTFT: {ttft:.2f}s ({prefill_tps:.2f} tok/s) | Decode: {token_count} tokens in {decode_time:.2f}s, {decode_tps:.2f} tok/s]{RESET}\n")
 
-        messages.append({"role": "assistant", "content": reply})
+            # Extract <tool_call> from reply or reasoning_text if present
+            import re
+            
+            def extract_and_remove_tool(text):
+                tc = None
+                if text and "<tool_call>" in text:
+                    match = re.search(r'<tool_call>\s*(.*?)\s*</tool_call>', text, re.DOTALL)
+                    if match:
+                        try:
+                            tc_data = json.loads(match.group(1))
+                            tc = {
+                                "id": "call_" + str(int(time.time())),
+                                "type": "function",
+                                "function": {
+                                    "name": tc_data.get("name", ""),
+                                    "arguments": json.dumps(tc_data.get("arguments", {}))
+                                }
+                            }
+                            text = text[:match.start()] + text[match.end():]
+                        except Exception as e:
+                            print(f"{RED}Failed to parse tool call JSON: {e}{RESET}")
+                return text, tc
+
+            reply, tc1 = extract_and_remove_tool(reply)
+            reasoning_text, tc2 = extract_and_remove_tool(reasoning_text)
+            
+            if tc1: tool_calls.append(tc1)
+            if tc2: tool_calls.append(tc2)
+
+            # Save assistant reply
+            assistant_msg = {"role": "assistant"}
+            if reply: assistant_msg["content"] = reply
+            if reasoning_text: assistant_msg["reasoning_content"] = reasoning_text
+            if tool_calls: assistant_msg["tool_calls"] = tool_calls
+            messages.append(assistant_msg)
+            
+            # Execute tool calls if any
+            if tool_calls:
+                for tc in tool_calls:
+                    if tc["function"]["name"] == "fetch_url":
+                        try:
+                            args_json = tc["function"]["arguments"]
+                            url = json.loads(args_json).get("url")
+                            if not url: raise ValueError("No URL provided")
+                            
+                            print(f"{MAGENTA}{BOLD}[System] Fetching URL: {url} ...{RESET}")
+                            content = fetch_and_parse_url(url)
+                            print(f"{DIM}[System] Retrieved {len(content)} characters. Sending back to model...{RESET}\n")
+                            
+                            messages.append({
+                                "role": "tool",
+                                "tool_call_id": tc["id"],
+                                "name": "fetch_url",
+                                "content": content
+                            })
+                        except Exception as e:
+                            print(f"{RED}[System] Tool execution error: {e}{RESET}")
+                            messages.append({
+                                "role": "tool",
+                                "tool_call_id": tc["id"],
+                                "name": "fetch_url",
+                                "content": f"Error executing tool: {e}"
+                            })
+                # Loop continues, assistant generates again
+            else:
+                break # No tool call, wait for next user input
+                
         print()
 
 if __name__ == "__main__":

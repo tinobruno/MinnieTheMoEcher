@@ -1,0 +1,7 @@
+import urllib.request
+import json
+prompt = "Hello! " * 45 + "What is 2+2?"
+messages = [{"role": "user", "content": prompt}]
+req = urllib.request.Request("http://127.0.0.1:8001/v1/chat/completions", method="POST", headers={"Content-Type": "application/json"})
+payload = json.dumps({"model": "deepseek-v4-flash", "messages": messages, "max_tokens": 5, "temperature": 0.0, "stream": False}).encode("utf-8")
+urllib.request.urlopen(req, data=payload)
