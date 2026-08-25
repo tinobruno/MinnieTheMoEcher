@@ -1165,6 +1165,8 @@ public:
         // Compressed KV cache (for layers with compress_ratio > 0)
         GPUTensor comp_kv_cache;  // [max_compressed_entries, head_dim] BF16
         int comp_kv_count = 0;    // number of compressed entries written so far
+        GPUTensor d_comp_kv_count;   // [1] int32_t on GPU for graph/device kernels
+        GPUTensor d_attn_cache_len;  // [1] int32_t on GPU for dynamic MLA attention
 
         // Compressor state buffers (GPU, F32) for incremental decode compression
         GPUTensor comp_kv_state;     // [coff * ratio, coff * head_dim] F32
@@ -1181,11 +1183,6 @@ public:
         GPUTensor shared_w1_w, shared_w1_s;
         GPUTensor shared_w2_w, shared_w2_s;
         GPUTensor shared_w3_w, shared_w3_s;
-
-        // Shared expert (FP4 4-bit dynamic VRAM quantization)
-        GPUTensor shared_fp4_w1_w, shared_fp4_w1_s;
-        GPUTensor shared_fp4_w2_w, shared_fp4_w2_s;
-        GPUTensor shared_fp4_w3_w, shared_fp4_w3_s;
 
         // HC (Hyper-Connection) parameters
         GPUTensor hc_attn_fn;     // [(2+hc)*hc, hc*hidden] F32
@@ -1242,8 +1239,8 @@ public:
     GPUTensor buf_topk_vals_;    // [top_k] F32
     GPUTensor buf_topk_idx_;     // [top_k] I32
     GPUTensor buf_input_ids_;    // [MAX_SEQ_LEN] I32
-    GPUTensor buf_hc_state_;     // [hc_mult, hidden_size] BF16 — HC hidden state
-    GPUTensor buf_hc_residual_;  // [hc_mult, hidden_size] BF16 — temp for hc_post
+    GPUTensor buf_hc_state_;      // [hc_mult, hidden_size] BF16 — active HC hidden state
+    GPUTensor buf_hc_after_attn_; // [hc_mult, hidden_size] BF16 — intermediate HC state after attention
     GPUTensor buf_hc_pre_;       // [hc_mult] F32
     GPUTensor buf_hc_post_;      // [hc_mult] F32
     GPUTensor buf_hc_comb_;      // [hc_mult*hc_mult] F32
@@ -1255,6 +1252,20 @@ public:
     GPUTensor buf_comp_out_;     // F32 working buffer for compressor pooling output
     GPUTensor buf_comp_bf16_;    // BF16 working buffer for compressed entry (head_dim)
     GPUTensor buf_combined_kv_;  // BF16 buffer for combined raw+compressed KV
+
+    // Device-driven inputs for CUDA Graph
+    GPUTensor buf_input_token_;  // [1] int32_t on GPU
+    GPUTensor buf_input_pos_;    // [1] int32_t on GPU
+    cudaGraph_t graph_ = nullptr;
+    cudaGraphExec_t graph_exec_ = nullptr;
+    bool graph_captured_ = false;
+
+    // Imatrix calibration accumulators
+    bool collect_imatrix_ = false;
+    GPUTensor d_gate_accum_;
+    GPUTensor d_down_accum_;
+    GPUTensor d_expert_counts_;
+
     // Pre-allocated host buffers (zero runtime heap allocations)
     std::vector<float> router_probs_host_;
     std::vector<float> router_selection_host_;
@@ -1262,16 +1273,15 @@ public:
     std::vector<float> logits_host_;
     std::vector<float> probs_host_;
     __nv_bfloat16* logits_bf16_host_ = nullptr;
-    GPUTensor buf_sampler_scratch_;
-    GPUTensor buf_sampled_token_d_;
-    GPUTensor buf_seen_tokens_d_;
-    int32_t* h_sampled_token_ = nullptr;
-    std::vector<int32_t> seen_tokens_host_;
 
     ~MoecherEngine() {
-        if (h_sampled_token_) {
-            cudaFreeHost(h_sampled_token_);
-            h_sampled_token_ = nullptr;
+        if (graph_exec_) {
+            cudaGraphExecDestroy(graph_exec_);
+            graph_exec_ = nullptr;
+        }
+        if (graph_) {
+            cudaGraphDestroy(graph_);
+            graph_ = nullptr;
         }
         if (logits_bf16_host_) {
             cudaFreeHost(logits_bf16_host_);
@@ -1294,19 +1304,10 @@ public:
     // Dequant buffer — large enough for the biggest weight matrix
     static constexpr size_t DEQUANT_BUF_SIZE = 64 * 1024 * 1024;  // 64 MB
 
-    std::string shared_expert_dtype_ = "q4_k";
-    bool shared_fp4_enabled_ = true;
-
     // ── Load model from manifest ────────────────────────────────────────────
 
-    bool load(const std::string& manifest_path, float max_vram_gb = 0.0f, float dram_cache_gb = 0.0f,
-              const std::string& expert_dtype_override = "", const std::string& shared_expert_dtype = "q4_k") {
+    bool load(const std::string& manifest_path, float max_vram_gb = 0.0f, float dram_cache_gb = 0.0f, const std::string& expert_dtype_override = "") {
         LOG_INFO("Loading manifest: %s", manifest_path.c_str());
-
-        shared_expert_dtype_ = shared_expert_dtype;
-        shared_fp4_enabled_ = (shared_expert_dtype_ == "q4_k" || shared_expert_dtype_ == "fp4");
-        LOG_INFO("Shared expert format: %s (FP4 dynamic VRAM quantization: %s)",
-                 shared_expert_dtype_.c_str(), shared_fp4_enabled_ ? "enabled" : "disabled");
 
         std::ifstream f(manifest_path);
         if (!f.is_open()) { LOG_ERROR("Cannot open manifest"); return false; }
@@ -1404,7 +1405,7 @@ public:
         expert_loader_.preload_all();
 
         // Precompute RoPE frequencies — two tables for non-compressed vs compressed layers
-        // DS4 reference: non-compressed layers use base freq without YaRN interpolation;
+        // DeepSeek-V4 reference: non-compressed layers use base freq without YaRN interpolation;
         // compressed layers use compress_rope_theta (160000) with full YaRN.
         int rope_dim = cfg_.qk_rope_head_dim;
         size_t freq_bytes = MAX_SEQ_LEN * (rope_dim / 2) * 2 * sizeof(float);
@@ -1434,52 +1435,86 @@ public:
         } else {
             LOG_INFO("No compress_ratios found, using full window for all layers");
         }
+
+        init_cuda_graph();
+
         LOG_INFO("Model loaded successfully");
         return true;
+    }
+
+    void init_cuda_graph() {
+        if (!expert_loader_.all_resident(cfg_.num_hidden_layers)) {
+            LOG_INFO("Offload mode active (partial VRAM). Skipping CUDA Graph capture; using eager decode.");
+            graph_captured_ = false;
+            return;
+        }
+        LOG_INFO("Warming up and capturing CUDA Graph for decode acceleration...");
+        int dummy_tok = 0;
+        int dummy_pos = 0;
+        CUDA_CHECK(cudaMemcpy(buf_input_token_.i32(), &dummy_tok, sizeof(int32_t), cudaMemcpyHostToDevice));
+        CUDA_CHECK(cudaMemcpy(buf_input_pos_.i32(), &dummy_pos, sizeof(int32_t), cudaMemcpyHostToDevice));
+
+        // 3 warmup iterations
+        for (int i = 0; i < 3; i++) {
+            forward_token_eager(dummy_tok, dummy_pos);
+        }
+        CUDA_CHECK(cudaStreamSynchronize(main_stream_));
+
+        CUDA_CHECK(cudaMemcpy(buf_input_token_.i32(), &dummy_tok, sizeof(int32_t), cudaMemcpyHostToDevice));
+        CUDA_CHECK(cudaMemcpy(buf_input_pos_.i32(), &dummy_pos, sizeof(int32_t), cudaMemcpyHostToDevice));
+        CUDA_CHECK(cudaStreamSynchronize(main_stream_));
+
+        // Capture forward graph
+        cudaError_t cap_err = cudaStreamBeginCapture(main_stream_, cudaStreamCaptureModeGlobal);
+        if (cap_err != cudaSuccess) {
+            LOG_WARN("cudaStreamBeginCapture failed: %s. Falling back to eager mode.", cudaGetErrorString(cap_err));
+            graph_captured_ = false;
+            return;
+        }
+
+        forward_token_device_body(dummy_tok, dummy_pos);
+
+        cudaError_t end_err = cudaStreamEndCapture(main_stream_, &graph_);
+        if (end_err != cudaSuccess) {
+            LOG_WARN("cudaStreamEndCapture failed: %s. Falling back to eager mode.", cudaGetErrorString(end_err));
+            graph_captured_ = false;
+            return;
+        }
+
+        cudaError_t inst_err = cudaGraphInstantiate(&graph_exec_, graph_, nullptr, nullptr, 0);
+        if (inst_err != cudaSuccess) {
+            LOG_WARN("cudaGraphInstantiate failed: %s. Falling back to eager mode.", cudaGetErrorString(inst_err));
+            graph_captured_ = false;
+            return;
+        }
+
+        graph_captured_ = true;
+        LOG_INFO("CUDA Graph instantiated successfully! Decode speed accelerated.");
     }
 
     // ── Forward pass for a single token (decode mode) ───────────────────────
     // Returns logits on GPU [vocab_size] in F32
 
-    void dump_bf16(const char* label, __nv_bfloat16* gpu_ptr, int count, int show = 8) {
-        std::vector<__nv_bfloat16> buf(count);
-        CUDA_CHECK(cudaStreamSynchronize(main_stream_));
-        CUDA_CHECK(cudaMemcpy(buf.data(), gpu_ptr, count * sizeof(__nv_bfloat16), cudaMemcpyDeviceToHost));
-        std::string s = "  " + std::string(label) + ": [";
-        for (int i = 0; i < std::min(show, count); i++) {
-            char tmp[32]; snprintf(tmp, sizeof(tmp), "%.6f", __bfloat162float(buf[i]));
-            if (i > 0) s += ", ";
-            s += tmp;
-        }
-        s += "]";
-        float norm = 0;
-        for (int i = 0; i < count; i++) { float v = __bfloat162float(buf[i]); norm += v*v; }
-        char tmp[64]; snprintf(tmp, sizeof(tmp), " norm=%.6f", sqrtf(norm));
-        s += tmp;
-        LOG_INFO("%s", s.c_str());
-    }
-
     // Persistent RNG for sampling (seeded once)
     std::mt19937 rng_{std::random_device{}()};
 
     void forward_token(int token_id, int position) {
-        int dim = cfg_.hidden_size;
-        int n_heads = cfg_.num_attention_heads;
-        int head_dim_val = cfg_.head_dim;
-        int rope_dim = cfg_.qk_rope_head_dim;
-        int q_lora = cfg_.q_lora_rank;
-        int o_lora = cfg_.o_lora_rank;
-        int o_groups = cfg_.o_groups;
-        int window = cfg_.sliding_window;
-        int hc = cfg_.hc_mult;
-        // 1 & 2. Embedding lookup and broadcast to HC copies: [1, dim] -> [hc, dim]
-        embedding_broadcast_cuda(buf_hidden_.bf16(), buf_hc_state_.bf16(),
-                                 embed_weight_.bf16(), token_id, dim, hc, main_stream_);
+        forward_token_eager(token_id, position);
+    }
 
-        if (dbg_first_token_) {
-            LOG_INFO("DEBUG: token_id=%d position=%d", token_id, position);
-            dump_bf16("embed", buf_hidden_.bf16(), dim);
-        }
+    void forward_token_eager(int token_id, int position) {
+        CUDA_CHECK(cudaMemcpy(buf_input_token_.i32(), &token_id, sizeof(int32_t), cudaMemcpyHostToDevice));
+        CUDA_CHECK(cudaMemcpy(buf_input_pos_.i32(), &position, sizeof(int32_t), cudaMemcpyHostToDevice));
+        forward_token_device_body(token_id, position);
+    }
+
+    void forward_token_device_body(int token_id, int position) {
+        int dim = cfg_.hidden_size;
+        int hc = cfg_.hc_mult;
+
+        // 1 & 2. Embedding lookup and broadcast to HC copies: [1, dim] -> [hc, dim]
+        embedding_broadcast_device_id_cuda(buf_hidden_.bf16(), buf_hc_state_.bf16(),
+                                           embed_weight_.bf16(), buf_input_token_.i32(), dim, hc, main_stream_);
 
         // 3. Process each layer
         for (int layer = 0; layer < cfg_.num_hidden_layers; layer++) {
@@ -1489,18 +1524,12 @@ public:
         // 4. Head HC: reduce [hc, dim] -> [dim]
         hc_head_reduce();
 
-        if (dbg_first_token_) dump_bf16("after_hc_head", buf_hidden_.bf16(), dim);
-
         // 5. Final norm
         rms_norm_cuda(buf_hidden_.bf16(), buf_hidden_.bf16(),
                       norm_weight_.bf16(), dim, cfg_.rms_norm_eps, main_stream_);
 
-        if (dbg_first_token_) dump_bf16("after_final_norm", buf_hidden_.bf16(), dim);
-
         // 6. Logits: hidden @ head_weight.T -> [vocab_size]
         compute_logits();
-
-        dbg_first_token_ = false;
     }
 
     // ── Generate tokens ─────────────────────────────────────────────────────
@@ -1510,9 +1539,12 @@ public:
                          std::function<bool(const std::string&,bool)> on_token = nullptr,
                          float repetition_penalty = 1.0f,
                          bool enable_thinking = true,
-                         int max_thinking_tokens = 2048) {
+                         int max_thinking_tokens = 2048,
+                         float top_p = 0.95f,
+                         float min_p = 0.0f,
+                         int top_k = 1024) {
         // Reset debug flags for this request
-        dbg_first_token_ = true;
+        dbg_first_token_ = false;
         dbg_hc_pre_call_ = 0;
         dbg_head_ = true;
         dbg_sample_count_ = 0;
@@ -1521,6 +1553,8 @@ public:
         for (int l = 0; l < cfg_.num_hidden_layers; l++) {
             CUDA_CHECK(cudaMemset(layers_[l].kv_cache.data, 0,
                                    layers_[l].kv_cache.size_bytes));
+            CUDA_CHECK(cudaMemset(layers_[l].d_comp_kv_count.data, 0, sizeof(int32_t)));
+            CUDA_CHECK(cudaMemset(layers_[l].d_attn_cache_len.data, 0, sizeof(int32_t)));
             // Reset compressor state for compressed layers
             int ratio = cfg_.layer_compress_ratio(l);
             if (ratio > 0) {
@@ -1550,10 +1584,13 @@ public:
         if (buf_hc_state_.data) {
             CUDA_CHECK(cudaMemset(buf_hc_state_.data, 0, buf_hc_state_.size_bytes));
         }
+        if (buf_hc_after_attn_.data) {
+            CUDA_CHECK(cudaMemset(buf_hc_after_attn_.data, 0, buf_hc_after_attn_.size_bytes));
+        }
 
         // Prefill prompt
         for (size_t i = 0; i < prompt.size(); i++) {
-            forward_token(prompt[i], (int)i);
+            forward_token_eager(prompt[i], (int)i);
         }
 
         // Token generation loop
@@ -1593,6 +1630,8 @@ public:
         int content_tokens_generated = 0;
         int thinking_tokens_generated = 0;
 
+        std::string last_think_token_str;
+
         for (int t = 0; content_tokens_generated < max_tokens; t++) {
             if (g_stop_requested.load()) {
                 LOG_WARN("Generation stopped by client stop request at step %d", t);
@@ -1600,23 +1639,51 @@ public:
                 break;
             }
 
-            // Check if thinking budget is reached while inside thinking block
+            // Graceful sentence boundary transition when thinking budget is reached
             if (in_think_block && max_thinking_tokens > 0 && thinking_tokens_generated >= max_thinking_tokens) {
-                LOG_WARN("Thinking budget reached (%d/%d tokens). Forcing </think> transition.",
-                         thinking_tokens_generated, max_thinking_tokens);
-                in_think_block = false;
-                think_block_ended = true;
-                if (think_end_id >= 0) {
-                    forward_token(think_end_id, position);
-                    position++;
-                    output_ids.push_back(think_end_id);
-                    history.push_back(think_end_id);
+                int grace_limit = max_thinking_tokens + 255;
+                bool is_clean_boundary = false;
+                if (!last_think_token_str.empty()) {
+                    char last_char = last_think_token_str.back();
+                    if (last_char == '\n' || last_char == '.' || last_char == ':') {
+                        is_clean_boundary = true;
+                    }
                 }
-                continue;
+                if (is_clean_boundary || thinking_tokens_generated >= grace_limit) {
+                    LOG_WARN("Thinking budget reached (%d/%d tokens, clean_boundary=%d). Closing </think> and starting content.",
+                             thinking_tokens_generated, max_thinking_tokens, is_clean_boundary ? 1 : 0);
+
+                    // 1. Inject </think> to close thinking block
+                    in_think_block = false;
+                    think_block_ended = true;
+                    if (think_end_id >= 0) {
+                        forward_token(think_end_id, position);
+                        position++;
+                        output_ids.push_back(think_end_id);
+                        history.push_back(think_end_id);
+                    }
+
+                    // 2. Inject and stream "Allright, here is the solution:\n\n" as the beginning of CONTENT
+                    std::vector<int> transition_tokens = tokenizer_.encode("Allright, here is the solution:\n\n");
+                    for (int tok_id : transition_tokens) {
+                        forward_token(tok_id, position);
+                        position++;
+                        output_ids.push_back(tok_id);
+                        history.push_back(tok_id);
+                        content_tokens_generated++;
+                        std::string tok_str = tokenizer_.decode({tok_id});
+                        generated_text += tok_str;
+                        if (on_token) {
+                            on_token(tok_str, false); // Streamed directly as content
+                        }
+                    }
+                    continue;
+                }
             }
 
             // Sample from logits
-            int next_token = sample_token(temperature, history, content_tokens_generated, in_think_block);
+            int next_token = sample_token(temperature, history, content_tokens_generated, in_think_block,
+                                          top_k, top_p, min_p);
             
             // If EOS is sampled while inside think block, transition to </think> and continue
             if (in_think_block && (next_token == cfg_.eos_token_id || (eos2_id >= 0 && next_token == eos2_id))) {
@@ -1681,18 +1748,10 @@ public:
             }
 
             std::string token_text = tokenizer_.decode({next_token});
-
-            // If we just exited a think block and this token is purely whitespace/newlines, skip it cleanly
-            if (think_block_ended && !token_text.empty()) {
-                size_t start = token_text.find_first_not_of("\n\r \t");
-                if (start == std::string::npos) {
-                    // Pure whitespace token, skip
-                    forward_token(next_token, position);
-                    position++;
-                    continue;
-                }
-                think_block_ended = false;
+            if (in_think_block) {
+                last_think_token_str = token_text;
             }
+
 
             token_buffer += token_text;
             generated_text += token_text;
@@ -1798,11 +1857,6 @@ public:
             if (!skip) visible_ids.push_back(id);
         }
         std::string result = tokenizer_.decode(visible_ids);
-        // Trim leading whitespace from result (after think block)
-        size_t first_non_ws = result.find_first_not_of("\n\r ");
-        if (first_non_ws != std::string::npos && first_non_ws > 0) {
-            result = result.substr(first_non_ws);
-        }
 
         prompt_token_count_ = (int)prompt.size();
         completion_token_count_ = (int)output_ids.size();
@@ -1865,6 +1919,10 @@ private:
         layers_.resize(cfg_.num_hidden_layers);
         for (int l = 0; l < cfg_.num_hidden_layers; l++) {
             auto& lw = layers_[l];
+            lw.d_comp_kv_count.alloc(sizeof(int32_t));
+            lw.d_attn_cache_len.alloc(sizeof(int32_t));
+            CUDA_CHECK(cudaMemset(lw.d_comp_kv_count.data, 0, sizeof(int32_t)));
+            CUDA_CHECK(cudaMemset(lw.d_attn_cache_len.data, 0, sizeof(int32_t)));
             std::string prefix = "layers." + std::to_string(l);
 
             load_tensor(lw.wq_a_w, prefix + ".attn.wq_a.weight");
@@ -1932,48 +1990,13 @@ private:
                 }
             }
 
-            // Shared expert (FP8 baseline on disk)
+            // Shared expert (FP8)
             load_tensor(lw.shared_w1_w, prefix + ".ffn.shared_experts.w1.weight");
             load_tensor(lw.shared_w1_s, prefix + ".ffn.shared_experts.w1.scale");
             load_tensor(lw.shared_w2_w, prefix + ".ffn.shared_experts.w2.weight");
             load_tensor(lw.shared_w2_s, prefix + ".ffn.shared_experts.w2.scale");
             load_tensor(lw.shared_w3_w, prefix + ".ffn.shared_experts.w3.weight");
             load_tensor(lw.shared_w3_s, prefix + ".ffn.shared_experts.w3.scale");
-
-            if (shared_fp4_enabled_) {
-                int moe_inter = cfg_.moe_intermediate_size;
-                int dim = cfg_.hidden_size;
-
-                // Quantize w1: [2048, 4096]
-                lw.shared_fp4_w1_w.alloc((size_t)moe_inter * (dim / 2));
-                lw.shared_fp4_w1_s.alloc((size_t)moe_inter * (dim / 32));
-                quantize_fp8_to_fp4_cuda(
-                    lw.shared_fp4_w1_w.u8(), lw.shared_fp4_w1_s.u8(),
-                    lw.shared_w1_w.u8(), lw.shared_w1_s.u8(),
-                    moe_inter, dim, 128, main_stream_);
-                lw.shared_w1_w.free();
-                lw.shared_w1_s.free();
-
-                // Quantize w3: [2048, 4096]
-                lw.shared_fp4_w3_w.alloc((size_t)moe_inter * (dim / 2));
-                lw.shared_fp4_w3_s.alloc((size_t)moe_inter * (dim / 32));
-                quantize_fp8_to_fp4_cuda(
-                    lw.shared_fp4_w3_w.u8(), lw.shared_fp4_w3_s.u8(),
-                    lw.shared_w3_w.u8(), lw.shared_w3_s.u8(),
-                    moe_inter, dim, 128, main_stream_);
-                lw.shared_w3_w.free();
-                lw.shared_w3_s.free();
-
-                // Quantize w2: [4096, 2048]
-                lw.shared_fp4_w2_w.alloc((size_t)dim * (moe_inter / 2));
-                lw.shared_fp4_w2_s.alloc((size_t)dim * (moe_inter / 32));
-                quantize_fp8_to_fp4_cuda(
-                    lw.shared_fp4_w2_w.u8(), lw.shared_fp4_w2_s.u8(),
-                    lw.shared_w2_w.u8(), lw.shared_w2_s.u8(),
-                    dim, moe_inter, 128, main_stream_);
-                lw.shared_w2_w.free();
-                lw.shared_w2_s.free();
-            }
 
             // HC parameters
             load_tensor(lw.hc_attn_fn, prefix + ".hc_attn_fn");
@@ -2030,8 +2053,10 @@ private:
         buf_topk_vals_.alloc(cfg_.num_experts_per_tok * sizeof(float));
         buf_topk_idx_.alloc(cfg_.num_experts_per_tok * sizeof(int32_t));
         buf_input_ids_.alloc(sizeof(int32_t));
+        buf_input_token_.alloc(sizeof(int32_t));
+        buf_input_pos_.alloc(sizeof(int32_t));
         buf_hc_state_.alloc((size_t)hc * dim * sizeof(__nv_bfloat16));
-        buf_hc_residual_.alloc((size_t)hc * dim * sizeof(__nv_bfloat16));  // persistent temp for hc_post
+        buf_hc_after_attn_.alloc((size_t)hc * dim * sizeof(__nv_bfloat16));  // static intermediate after attention
         buf_hc_pre_.alloc(hc * sizeof(float));
         buf_hc_post_.alloc(hc * sizeof(float));
         buf_hc_comb_.alloc(hc * hc * sizeof(float));
@@ -2057,12 +2082,6 @@ private:
 
         if (logits_bf16_host_) cudaFreeHost(logits_bf16_host_);
         CUDA_CHECK(cudaMallocHost(&logits_bf16_host_, cfg_.vocab_size * sizeof(__nv_bfloat16)));
-
-        buf_sampler_scratch_.alloc(512 * sizeof(float));
-        buf_sampled_token_d_.alloc(sizeof(int32_t));
-        buf_seen_tokens_d_.alloc((size_t)MAX_SEQ_LEN * sizeof(int32_t));
-        if (h_sampled_token_) cudaFreeHost(h_sampled_token_);
-        CUDA_CHECK(cudaMallocHost(&h_sampled_token_, sizeof(int32_t)));
     }
 
     // ── cuBLAS GEMM helper (BF16) ──────────────────────────────────────────
@@ -2205,10 +2224,11 @@ private:
                        buf_hidden_.bf16(), proj_dim, dim, main_stream_);
 
         // State index: cycles through all state_rows slots via modular arithmetic
-        // For CSA (coff=2, ratio=4): position % 8 cycles 0,1,2,3,4,5,6,7,0,...
-        //   Block N writes to the first half (0-3) or second half (4-7)
-        // For HCA (coff=1, ratio=128): position % 128 cycles 0,1,...,127,0,...
-        int state_idx = position % state_rows;
+        // State index:
+        // For CSA (ratio=4, overlap): always write into second half (rows 4..7)
+        // For HCA (ratio=128, non-overlap): write into rows 0..127
+        int pos_mod = position % ratio;
+        int state_idx = overlap ? (ratio + pos_mod) : pos_mod;
 
         // Copy kv projection to state slot
         CUDA_CHECK(cudaMemcpyAsync(
@@ -2220,18 +2240,16 @@ private:
         gemv_bf16_cuda(buf_comp_out_.f32(), lw.comp_wgate.bf16(),
                        buf_hidden_.bf16(), proj_dim, dim, main_stream_);
 
-        // 3. Add APE bias to gate scores
-        // APE shape: [ratio, proj_dim], row = position % ratio
-        int ape_row = position % ratio;
+        // 3. Add APE bias to gate scores: row = position % ratio
         CUDA_CHECK(cudaMemcpyAsync(
             lw.comp_score_state.f32() + (size_t)state_idx * proj_dim,
             buf_comp_out_.f32(), proj_dim * sizeof(float),
             cudaMemcpyDeviceToDevice, main_stream_));
 
-        // Add APE bias: score_state[state_idx] += ape[ape_row]
+        // Add APE bias: score_state[state_idx] += ape[pos_mod]
         float alpha_one = 1.0f;
         float* score_ptr = lw.comp_score_state.f32() + (size_t)state_idx * proj_dim;
-        const float* ape_ptr = lw.comp_ape.f32() + (size_t)ape_row * proj_dim;
+        const float* ape_ptr = lw.comp_ape.f32() + (size_t)pos_mod * proj_dim;
         CUBLAS_CHECK(cublasSaxpy(cublas_handle_, proj_dim, &alpha_one,
                                  ape_ptr, 1, score_ptr, 1));
 
@@ -2241,12 +2259,9 @@ private:
 
         // 5. Perform softmax-gated pooling
         if (overlap) {
-            // CSA overlap: the state naturally has data from two consecutive blocks
-            // thanks to modular cycling.
-            //
-            // At compression time (position 3, 7, 11, ...):
-            // - One half of state (rows 0-3 or rows 4-7) has the CURRENT block
-            // - The other half has the PREVIOUS block (or is empty/-inf for first block)
+            // CSA overlap:
+            // Rows 0..ratio-1 (first half) contain previous block
+            // Rows ratio..2*ratio-1 (second half) contain current block
             //
             // Reference logic:
             //   first_half  = state[:ratio, :head_dim]    (rows 0-3, first head_dim dims)
@@ -2285,30 +2300,40 @@ private:
             compressor_pool_cuda(buf_comp_out_.f32(), tmp_kv, tmp_score,
                                  2 * ratio, head_dim_val, main_stream_);
 
-            // No carry-over needed: state naturally cycles via position % (coff*ratio)
+            // Shift second half (rows 4..7) into first half (rows 0..3) for next block
+            size_t half_bytes = (size_t)ratio * proj_dim * sizeof(float);
+            CUDA_CHECK(cudaMemcpyAsync(
+                lw.comp_kv_state.f32(),
+                lw.comp_kv_state.f32() + (size_t)ratio * proj_dim,
+                half_bytes, cudaMemcpyDeviceToDevice, main_stream_));
+            CUDA_CHECK(cudaMemcpyAsync(
+                lw.comp_score_state.f32(),
+                lw.comp_score_state.f32() + (size_t)ratio * proj_dim,
+                half_bytes, cudaMemcpyDeviceToDevice, main_stream_));
+            CUDA_CHECK(cudaMemcpyAsync(
+                lw.comp_kv_state.f32() + (size_t)ratio * proj_dim,
+                lw.comp_kv_state.f32(),
+                half_bytes, cudaMemcpyDeviceToDevice, main_stream_));
+            CUDA_CHECK(cudaMemcpyAsync(
+                lw.comp_score_state.f32() + (size_t)ratio * proj_dim,
+                lw.comp_score_state.f32(),
+                half_bytes, cudaMemcpyDeviceToDevice, main_stream_));
         } else {
             // HCA non-overlapping: pool over ratio rows
             compressor_pool_cuda(buf_comp_out_.f32(),
                                  lw.comp_kv_state.f32(),
                                  lw.comp_score_state.f32(),
                                  ratio, head_dim_val, main_stream_);
-
-            // Reset state for next block (HCA has no overlap, clean slate)
-            CUDA_CHECK(cudaMemsetAsync(lw.comp_kv_state.data, 0,
-                                       lw.comp_kv_state.size_bytes, main_stream_));
-            std::vector<float> neg_inf(ratio * head_dim_val, -std::numeric_limits<float>::infinity());
-            CUDA_CHECK(cudaMemcpyAsync(lw.comp_score_state.data, neg_inf.data(),
-                                       neg_inf.size() * sizeof(float), cudaMemcpyHostToDevice, main_stream_));
         }
 
-        // 6. Convert pooled output to BF16 and apply RMSNorm
+        // 6. Apply RMSNorm in FP32 directly to pooled output, then convert to BF16
+        rms_norm_weighted_f32_cuda(buf_comp_out_.f32(), buf_comp_out_.f32(),
+                                   lw.comp_norm.bf16(), head_dim_val, cfg_.rms_norm_eps, main_stream_);
         f32_to_bf16_cuda(buf_comp_bf16_.bf16(), buf_comp_out_.f32(),
                          head_dim_val, main_stream_);
-        rms_norm_cuda(buf_comp_bf16_.bf16(), buf_comp_bf16_.bf16(),
-                      lw.comp_norm.bf16(), head_dim_val, cfg_.rms_norm_eps, main_stream_);
 
         // 7. Apply RoPE to compressed entry using compressed-layer frequencies
-        int comp_pos = position;
+        int comp_pos = position + 1 - ratio;
         rope_cuda(buf_comp_bf16_.bf16(), 1, head_dim_val, rope_dim,
                   comp_pos, rope_freqs_compressed_.f32(), false, main_stream_);
 
@@ -2321,6 +2346,10 @@ private:
                 buf_comp_bf16_.bf16(), head_dim_val * sizeof(__nv_bfloat16),
                 cudaMemcpyDeviceToDevice, main_stream_));
             lw.comp_kv_count = comp_idx + 1;
+            int count_val = lw.comp_kv_count;
+            CUDA_CHECK(cudaMemcpy(
+                lw.d_comp_kv_count.i32(), &count_val, sizeof(int32_t),
+                cudaMemcpyHostToDevice));
         }
     }
 
@@ -2329,29 +2358,23 @@ private:
     void forward_layer(int layer_id, int token_id, int position) {
         auto& lw = layers_[layer_id];
         int dim = cfg_.hidden_size;
-        int hc = cfg_.hc_mult;
-        bool dbg = (layer_id == 0 && position == 0);
 
-        // ── HC pre for attention ──
-        hc_pre(lw.hc_attn_fn, lw.hc_attn_scale, lw.hc_attn_base);
-        if (dbg) dump_bf16("L0 hc_pre_attn", buf_hidden_.bf16(), dim);
+        // ── HC pre for attention: reads buf_hc_state_ ──
+        hc_pre(buf_hc_state_, lw.hc_attn_fn, lw.hc_attn_scale, lw.hc_attn_base);
 
         // ── Attention norm ──
         rms_norm_cuda(buf_hidden_.bf16(), buf_hidden_.bf16(),
                       lw.attn_norm_w.bf16(), dim, cfg_.rms_norm_eps, main_stream_);
-        if (dbg) dump_bf16("L0 attn_normed", buf_hidden_.bf16(), dim);
         CUDA_CHECK(cudaEventRecord(main_event_, main_stream_));
 
         // ── Attention ──
         forward_attention(layer_id, position);
-        if (dbg) dump_bf16("L0 attn_out", buf_hidden_.bf16(), dim);
 
-        // ── HC post for attention ──
-        hc_post();
-        if (dbg) dump_bf16("L0 hc_post_attn[0]", buf_hc_state_.bf16(), dim);
+        // ── HC post for attention: reads buf_hc_state_, writes to buf_hc_after_attn_ ──
+        hc_post(buf_hc_after_attn_, buf_hc_state_);
 
-        // ── HC pre for FFN ──
-        hc_pre(lw.hc_ffn_fn, lw.hc_ffn_scale, lw.hc_ffn_base);
+        // ── HC pre for FFN: reads buf_hc_after_attn_ ──
+        hc_pre(buf_hc_after_attn_, lw.hc_ffn_fn, lw.hc_ffn_scale, lw.hc_ffn_base);
 
         // ── FFN norm ──
         rms_norm_cuda(buf_hidden_.bf16(), buf_hidden_.bf16(),
@@ -2360,23 +2383,21 @@ private:
 
         // ── MoE FFN ──
         forward_moe(layer_id, token_id);
-        if (dbg) dump_bf16("L0 moe_out", buf_hidden_.bf16(), dim);
 
-        // ── HC post for FFN ──
-        hc_post();
-        if (dbg) dump_bf16("L0 hc_post_ffn[0]", buf_hc_state_.bf16(), dim);
+        // ── HC post for FFN: reads buf_hc_after_attn_, writes to buf_hc_state_ ──
+        hc_post(buf_hc_state_, buf_hc_after_attn_);
     }
 
     // ── HC pre: reduce [hc, dim] -> [dim] ───────────────────────────────────
 
-    void hc_pre(GPUTensor& hc_fn, GPUTensor& hc_scale, GPUTensor& hc_base) {
+    void hc_pre(GPUTensor& in_hc, GPUTensor& hc_fn, GPUTensor& hc_scale, GPUTensor& hc_base) {
         int dim = cfg_.hidden_size;
         int hc = cfg_.hc_mult;
         int mix_size = (2 + hc) * hc;
         int hc_dim = hc * dim;
 
         // Compute mixes from normalized hc_state directly in a single fused pass
-        gemv_hc_pre_norm_cuda(buf_hc_mixes_.f32(), buf_hc_state_.bf16(), hc_fn.f32(),
+        gemv_hc_pre_norm_cuda(buf_hc_mixes_.f32(), in_hc.bf16(), hc_fn.f32(),
                               mix_size, hc_dim, cfg_.hc_eps, main_stream_);
 
         // Split mixes into pre, post, comb via Sinkhorn
@@ -2385,28 +2406,21 @@ private:
             buf_hc_mixes_.f32(), hc_scale.f32(), hc_base.f32(),
             hc, cfg_.hc_sinkhorn_iters, cfg_.hc_eps, main_stream_);
 
-        // Compute weighted sum: y = sum(pre[i] * hc_state[i]) for i in 0..hc-1
+        // Compute weighted sum: y = sum(pre[i] * in_hc[i]) for i in 0..hc-1
         // Result in buf_hidden_
-        hc_pre_weighted_add_cuda(buf_hidden_.bf16(), buf_hc_state_.bf16(),
+        hc_pre_weighted_add_cuda(buf_hidden_.bf16(), in_hc.bf16(),
                                  buf_hc_pre_.f32(), dim, hc, main_stream_);
-
-        // Save residual (the full HC state before sublayer) — it's already in buf_hc_state_
-        // buf_hidden2_ will hold the sublayer output after attention/FFN
     }
 
-    // ── HC post: expand [dim] -> [hc, dim] ──────────────────────────────────
+    // ── HC post: expand [dim] -> [hc, dim] (static: reads in_hc, writes out_hc) ──
 
-    void hc_post() {
+    void hc_post(GPUTensor& out_hc, GPUTensor& in_hc) {
         int dim = cfg_.hidden_size;
         int hc = cfg_.hc_mult;
 
-        // Ping-pong: read from buf_hc_state_, write new updated state to buf_hc_residual_
-        hc_post_update_cuda(buf_hc_residual_.bf16(), buf_hidden_.bf16(), buf_hc_state_.bf16(),
+        hc_post_update_cuda(out_hc.bf16(), buf_hidden_.bf16(), in_hc.bf16(),
                             buf_hc_post_.f32(), buf_hc_comb_.f32(),
                             dim, hc, main_stream_);
-
-        // Swap tensors (host pointer swap, zero GPU memory copy overhead)
-        std::swap(buf_hc_state_, buf_hc_residual_);
     }
 
     // ── HC head: reduce [hc, dim] -> [dim] for final logits ─────────────────
@@ -2448,18 +2462,17 @@ private:
                                                 : rope_freqs_.f32();
 
         // ── Q projection & KV projection (executed concurrently) ───────────
-        int cache_pos = position % window;
-        __nv_bfloat16* kv_dst = lw.kv_cache.bf16() + (size_t)cache_pos * head_dim_val;
-
         // KV projection on side_stream_ (must wait for attn_norm to finish on main_stream_)
         CUDA_CHECK(cudaStreamWaitEvent(side_stream_, main_event_, 0));
         gemm_fp8_dequant(buf_kv_.bf16(), 1, head_dim_val, dim,
                          buf_hidden_.bf16(),
                          lw.wkv_w.u8(), lw.wkv_s.u8(), 128, side_stream_);
-        rms_norm_cuda(kv_dst, buf_kv_.bf16(),
+        rms_norm_cuda(buf_kv_.bf16(), buf_kv_.bf16(),
                       lw.kv_norm_w.bf16(), head_dim_val, cfg_.rms_norm_eps, side_stream_);
-        rope_cuda(kv_dst, 1, head_dim_val, rope_dim,
-                  position, layer_rope_freqs, false, side_stream_);
+        rope_device_pos_cuda(buf_kv_.bf16(), 1, head_dim_val, rope_dim,
+                             buf_input_pos_.i32(), layer_rope_freqs, false, side_stream_);
+        store_kv_device_pos_cuda(lw.kv_cache.bf16(), buf_kv_.bf16(),
+                                 buf_input_pos_.i32(), window, head_dim_val, side_stream_);
         CUDA_CHECK(cudaEventRecord(side_event_, side_stream_));
 
         // Q projection on main_stream_
@@ -2467,12 +2480,10 @@ private:
         gemm_fp8_dequant(buf_lora_.bf16(), 1, q_lora, dim,
                          buf_hidden_.bf16(),
                          lw.wq_a_w.u8(), lw.wq_a_s.u8(), 128, main_stream_);
-        if (dbg) dump_bf16("wq_a_out", buf_lora_.bf16(), q_lora);
 
         // q_normed = q_norm(q_raw)
         rms_norm_cuda(buf_lora_.bf16(), buf_lora_.bf16(),
                       lw.q_norm_w.bf16(), q_lora, cfg_.rms_norm_eps, main_stream_);
-        if (dbg) dump_bf16("q_normed", buf_lora_.bf16(), q_lora);
 
         // q = wq_b(q_normed) -> [n_heads * head_dim]
         gemm_fp8_dequant(buf_q_.bf16(), 1, n_heads * head_dim_val, q_lora,
@@ -2485,109 +2496,41 @@ private:
                                          main_stream_);
         
         // Apply RoPE to last rope_dim elements of each Q head
-        rope_cuda(buf_q_.bf16(), n_heads, head_dim_val, rope_dim,
-                  position, layer_rope_freqs, false, main_stream_);
+        rope_device_pos_cuda(buf_q_.bf16(), n_heads, head_dim_val, rope_dim,
+                             buf_input_pos_.i32(), layer_rope_freqs, false, main_stream_);
 
         // Synchronize main_stream_ with side_stream_ before compressor and attention
         CUDA_CHECK(cudaStreamWaitEvent(main_stream_, side_event_, 0));
-        if (dbg) {
-            dump_bf16("wkv_out", buf_kv_.bf16(), head_dim_val);
-            dump_bf16("kv_after_norm_rope", kv_dst, head_dim_val);
-        }
 
         // ── Run compressor to accumulate/emit compressed KV entries ──────────
-        // This must happen AFTER we've stored the raw KV but BEFORE attention,
-        // because compressed layers attend to both raw and compressed entries.
         int ratio = cfg_.layer_compress_ratio(layer_id);
         if (ratio > 0) {
             forward_compressor(layer_id, position);
         }
 
         // ── Attention computation ───────────────────────────────────────────
-        // For each head: score = q_head @ kv_cache.T / sqrt(head_dim)
-        // Then softmax and weighted sum
-
-        // Attention softmax scale = 1.0 / sqrt(head_dim) matching ds4_cuda.cu
         float scale = 1.0f / sqrtf((float)head_dim_val);
 
-        const __nv_bfloat16* attn_kv_ptr;
-        int attn_cache_len;
+        // Prepare combined raw and compressed KV buffer directly on GPU
+        prepare_combined_kv_cuda(
+            buf_combined_kv_.bf16(),
+            lw.d_attn_cache_len.i32(),
+            lw.kv_cache.bf16(),
+            lw.comp_kv_cache.bf16(),
+            buf_input_pos_.i32(),
+            lw.d_comp_kv_count.i32(),
+            window, head_dim_val, ratio,
+            main_stream_);
 
-        if (ratio > 0 && lw.comp_kv_count > 0 && position + 1 > window) {
-            // Compressed layer: attend to raw sliding window + compressed entries
-            int raw_entries = std::min(position + 1, window);
-            int comp_entries = lw.comp_kv_count;
-
-            // Build combined KV buffer: [raw_entries | comp_entries]
-            // Raw entries start from the oldest in the circular buffer
-            int raw_start = 0;
-            if (position + 1 > window) {
-                // Circular buffer wraps: entries are not contiguous
-                // Copy in order: from (cache_pos+1)%window to end, then from 0 to cache_pos
-                int after_pos = (cache_pos + 1) % window;
-                int tail = window - after_pos;
-                CUDA_CHECK(cudaMemcpyAsync(
-                    buf_combined_kv_.bf16(),
-                    lw.kv_cache.bf16() + (size_t)after_pos * head_dim_val,
-                    tail * head_dim_val * sizeof(__nv_bfloat16),
-                    cudaMemcpyDeviceToDevice, main_stream_));
-                CUDA_CHECK(cudaMemcpyAsync(
-                    buf_combined_kv_.bf16() + (size_t)tail * head_dim_val,
-                    lw.kv_cache.bf16(),
-                    (size_t)after_pos * head_dim_val * sizeof(__nv_bfloat16),
-                    cudaMemcpyDeviceToDevice, main_stream_));
-            } else {
-                // Not wrapped: entries are contiguous from 0
-                CUDA_CHECK(cudaMemcpyAsync(
-                    buf_combined_kv_.bf16(),
-                    lw.kv_cache.bf16(),
-                    raw_entries * head_dim_val * sizeof(__nv_bfloat16),
-                    cudaMemcpyDeviceToDevice, main_stream_));
-            }
-            // Append compressed entries
-            CUDA_CHECK(cudaMemcpyAsync(
-                buf_combined_kv_.bf16() + (size_t)raw_entries * head_dim_val,
-                lw.comp_kv_cache.bf16(),
-                comp_entries * head_dim_val * sizeof(__nv_bfloat16),
-                cudaMemcpyDeviceToDevice, main_stream_));
-
-            attn_kv_ptr = buf_combined_kv_.bf16();
-            attn_cache_len = raw_entries + comp_entries;
-        } else {
-            // Non-compressed layer or no compressed entries yet: use raw cache
-            int total_entries = std::min(position + 1, window);
-            int kv_start = 0;
-            if (position + 1 > window) {
-                // Circular buffer: need to linearize
-                int after_pos = (cache_pos + 1) % window;
-                int tail = window - after_pos;
-                CUDA_CHECK(cudaMemcpyAsync(
-                    buf_combined_kv_.bf16(),
-                    lw.kv_cache.bf16() + (size_t)after_pos * head_dim_val,
-                    tail * head_dim_val * sizeof(__nv_bfloat16),
-                    cudaMemcpyDeviceToDevice, main_stream_));
-                CUDA_CHECK(cudaMemcpyAsync(
-                    buf_combined_kv_.bf16() + (size_t)tail * head_dim_val,
-                    lw.kv_cache.bf16(),
-                    (size_t)after_pos * head_dim_val * sizeof(__nv_bfloat16),
-                    cudaMemcpyDeviceToDevice, main_stream_));
-                attn_kv_ptr = buf_combined_kv_.bf16();
-            } else {
-                attn_kv_ptr = lw.kv_cache.bf16();
-            }
-            attn_cache_len = total_entries;
-        }
-
-        mla_attention_cuda(
-            buf_q_.bf16(), attn_kv_ptr, lw.attn_sink.f32(),
-            buf_attn_out_.bf16(), n_heads, attn_cache_len, head_dim_val, scale, main_stream_
+        int max_combined = window + cfg_.max_compressed_entries;
+        mla_attention_device_len_cuda(
+            buf_q_.bf16(), buf_combined_kv_.bf16(), lw.attn_sink.f32(),
+            buf_attn_out_.bf16(), lw.d_attn_cache_len.i32(), max_combined, head_dim_val, scale, main_stream_
         );
-        // Inverse RoPE on attention output: the absorbed KV contains RoPE in 
-        // the rope dimensions. When computing the value weighted sum, these  
-        // rotations are position-mixed. We undo the query position's rotation 
-        // before the output projection to align with what the model expects.
-        rope_cuda(buf_attn_out_.bf16(), n_heads, head_dim_val, rope_dim,
-                  position, layer_rope_freqs, true, main_stream_);
+
+        // Inverse RoPE on attention output
+        rope_device_pos_cuda(buf_attn_out_.bf16(), n_heads, head_dim_val, rope_dim,
+                             buf_input_pos_.i32(), layer_rope_freqs, true, main_stream_);
 
         // ── Output projection (grouped low-rank MLA) ─────────────────────
         // Attention output: [n_heads * head_dim] = [32768]
@@ -2610,16 +2553,11 @@ private:
         gemv_fp8_grouped_cuda(buf_lora_.bf16(), buf_attn_out_.bf16(),
                               lw.wo_a_w.u8(), lw.wo_a_s.u8(),
                               o_lora, hpg_dim, o_groups, 128, main_stream_);
-                if (dbg) {
-            dump_bf16("attn_out_raw", buf_attn_out_.bf16(), n_heads * head_dim_val);
-            dump_bf16("wo_a_result", buf_lora_.bf16(), o_groups * o_lora);
-        }
 
         // wo_b: [dim, o_groups * o_lora] FP8 → output is [dim]
         gemm_fp8_dequant(buf_hidden_.bf16(), 1, dim, o_groups * o_lora,
                          buf_lora_.bf16(),
-                         lw.wo_b_w.u8(), lw.wo_b_s.u8());
-                if (dbg) dump_bf16("wo_b_result", buf_hidden_.bf16(), dim);
+                         lw.wo_b_w.u8(), lw.wo_b_s.u8(), 128, main_stream_);
     }
 
     // ── MoE forward ─────────────────────────────────────────────────────────
@@ -2634,9 +2572,9 @@ private:
         // ── Routing ─────────────────────────────────────────────────────────
         if (layer_id < cfg_.n_hash_layers) {
             // Hash layers 0..2: lookup tid2eid table with constant weight (routed_scaling_factor / top_k)
-            moe_route_hash_cuda(buf_topk_idx_.i32(), buf_topk_vals_.f32(),
-                                lw.tid2eid.i64(), token_id, top_k,
-                                cfg_.routed_scaling_factor, main_stream_);
+            moe_route_hash_device_id_cuda(buf_topk_idx_.i32(), buf_topk_vals_.f32(),
+                                          lw.tid2eid.i64(), buf_input_token_.i32(), top_k,
+                                          cfg_.routed_scaling_factor, main_stream_);
         } else {
             // Score-based layers 3..42: gate_w -> fused (bias + SqrtSoftplus + top-6 routing)
             gemm_bf16(buf_scores_bf16_.bf16(), 1, n_experts, dim,
@@ -2645,6 +2583,17 @@ private:
             moe_route_top6_from_bf16_cuda(buf_topk_idx_.i32(), buf_topk_vals_.f32(),
                                           buf_scores_bf16_.bf16(), lw.gate_bias.f32(),
                                           n_experts, top_k, cfg_.routed_scaling_factor, main_stream_);
+        }
+
+        // 3b. Collect imatrix activations during calibration pass
+        if (collect_imatrix_) {
+            float* g_accum = (float*)d_gate_accum_.data + (size_t)layer_id * n_experts * dim;
+            float* d_accum = (float*)d_down_accum_.data + (size_t)layer_id * n_experts * moe_inter;
+            uint32_t* e_cnt = (uint32_t*)d_expert_counts_.data + (size_t)layer_id * n_experts;
+            accumulate_expert_imatrix_cuda(
+                g_accum, d_accum, e_cnt,
+                buf_hidden_.bf16(), buf_topk_idx_.i32(),
+                1, top_k, n_experts, dim, moe_inter, main_stream_);
         }
 
         // 4. Populate active expert pointers
@@ -2702,52 +2651,49 @@ private:
                                   top_k * sizeof(void*), cudaMemcpyHostToDevice));
         }
 
-        // 5. Launch 6 routed experts on main_stream_
+        // 5. Launch 6 routed experts
         auto& w1_info = expert_parts_["w1.weight"];
         auto& w3_info = expert_parts_["w3.weight"];
         auto& w2_info = expert_parts_["w2.weight"];
 
-        gemv_iq2_xxs_moe_swiglu_fused_cuda(
-            buf_gate_.bf16(), buf_hidden_.bf16(),
-            (const void* const*)buf_active_expert_ptrs_.data,
-            w1_info.offset_in_block, w3_info.offset_in_block,
-            moe_inter, dim, cfg_.swiglu_limit, main_stream_);
+        if (cfg_.expert_dtype == "iq2_xxs") {
+            gemv_iq2_xxs_moe_swiglu_fused_cuda(
+                buf_gate_.bf16(), buf_hidden_.bf16(),
+                (const void* const*)buf_active_expert_ptrs_.data,
+                w1_info.offset_in_block, w3_info.offset_in_block,
+                moe_inter, dim, cfg_.swiglu_limit, main_stream_);
 
-        gemv_q2_k_moe_cuda(
-            buf_down_.bf16(), buf_gate_.bf16(),
-            (const void* const*)buf_active_expert_ptrs_.data,
-            w2_info.offset_in_block,
-            dim, moe_inter, main_stream_);
+            gemv_q2_k_moe_cuda(
+                buf_down_.bf16(), buf_gate_.bf16(),
+                (const void* const*)buf_active_expert_ptrs_.data,
+                w2_info.offset_in_block,
+                dim, moe_inter, main_stream_);
+        } else {
+            for (int k = 0; k < top_k; k++) {
+                void* ptr = active_expert_ptrs_host_[k];
+                if (ptr) {
+                    execute_expert_swiglu(ptr, 1.0f, k);
+                }
+            }
+        }
 
         // 5. Shared expert executed concurrently on side_stream_ (must wait for ffn_norm to finish on main_stream_)
         CUDA_CHECK(cudaStreamWaitEvent(side_stream_, main_event_, 0));
         __nv_bfloat16* shared_gate = buf_gate_.bf16() + top_k * moe_inter;
+        __nv_bfloat16* shared_up   = buf_up_.bf16()   + top_k * moe_inter;
         __nv_bfloat16* shared_down = buf_down_.bf16() + top_k * dim;
 
-        if (shared_fp4_enabled_) {
-            gemv_fp4_swiglu_fused_cuda(
-                shared_gate, buf_hidden_.bf16(),
-                lw.shared_fp4_w1_w.u8(), lw.shared_fp4_w1_s.u8(),
-                lw.shared_fp4_w3_w.u8(), lw.shared_fp4_w3_s.u8(),
-                moe_inter, dim, cfg_.swiglu_limit, side_stream_);
-
-            gemv_fp4_cuda(
-                shared_down, shared_gate,
-                lw.shared_fp4_w2_w.u8(), lw.shared_fp4_w2_s.u8(),
-                dim, moe_inter, side_stream_);
-        } else {
-            gemv_fp8_swiglu_fused_cuda(
-                shared_gate, buf_hidden_.bf16(),
-                lw.shared_w1_w.u8(), lw.shared_w1_s.u8(),
-                lw.shared_w3_w.u8(), lw.shared_w3_s.u8(),
-                moe_inter, dim, 128, cfg_.swiglu_limit, side_stream_);
-
-            gemv_fp8_cuda(
-                shared_down, shared_gate,
-                lw.shared_w2_w.u8(), lw.shared_w2_s.u8(),
-                dim, moe_inter, 128, side_stream_);
-        }
-
+        gemm_fp8_dequant(shared_gate, 1, moe_inter, dim,
+                         buf_hidden_.bf16(),
+                         lw.shared_w1_w.u8(), lw.shared_w1_s.u8(), 128, side_stream_);
+        gemm_fp8_dequant(shared_up, 1, moe_inter, dim,
+                         buf_hidden_.bf16(),
+                         lw.shared_w3_w.u8(), lw.shared_w3_s.u8(), 128, side_stream_);
+        silu_mul_cuda(shared_gate, shared_gate, shared_up,
+                      moe_inter, cfg_.swiglu_limit, side_stream_);
+        gemm_fp8_dequant(shared_down, 1, dim, moe_inter,
+                         shared_gate,
+                         lw.shared_w2_w.u8(), lw.shared_w2_s.u8(), 128, side_stream_);
         CUDA_CHECK(cudaEventRecord(side_event_, side_stream_));
 
         // Wait for shared expert on side_stream_ before accumulating
@@ -2773,7 +2719,7 @@ private:
         uint8_t* w3_data = block + w3_info.offset_in_block;
         uint8_t* w2_data = block + w2_info.offset_in_block;
 
-        cudaStream_t stream = expert_streams_[k];
+        cudaStream_t stream = main_stream_;
         __nv_bfloat16* my_gate = buf_gate_.bf16() + k * moe_inter;
         __nv_bfloat16* my_up   = buf_up_.bf16()   + k * moe_inter;
         __nv_bfloat16* my_down = buf_down_.bf16() + k * dim;
@@ -2826,71 +2772,232 @@ private:
 
     float current_rep_penalty_ = 1.0f;  // Set per-request by generate()
 
-    int sample_token(float temperature, const std::vector<int>& history, int step = 0, bool is_reasoning = true) {
+    int sample_token(float temperature, const std::vector<int>& history, int step = 0, bool is_reasoning = true,
+                     int top_k = 1024, float top_p = 0.95f, float min_p = 0.0f) {
         int vocab = cfg_.vocab_size;
-
-        // Repetition penalty — penalizes already-seen tokens directly on GPU
-        // When in thinking mode and no explicit penalty is set, default to 1.10f to prevent degenerate loops (e.g. repeated "(…)")
-        float rep_penalty = current_rep_penalty_;
-        if (rep_penalty <= 1.0f && is_reasoning) {
-            rep_penalty = 1.10f;
-        }
-        if (rep_penalty != 1.0f && !history.empty()) {
-            seen_tokens_host_.clear();
-            int start_idx = std::max(0, (int)history.size() - 256);
-            std::unordered_set<int> seen_set(history.begin() + start_idx, history.end());
-            for (int tok : seen_set) {
-                if (tok >= 0 && tok < vocab) {
-                    seen_tokens_host_.push_back(tok);
-                }
-            }
-            if (!seen_tokens_host_.empty()) {
-                CUDA_CHECK(cudaMemcpyAsync(
-                    buf_seen_tokens_d_.data,
-                    seen_tokens_host_.data(),
-                    seen_tokens_host_.size() * sizeof(int32_t),
-                    cudaMemcpyHostToDevice,
-                    main_stream_));
-                apply_repetition_penalty_cuda(
-                    buf_logits_.f32(),
-                    (const int32_t*)buf_seen_tokens_d_.data,
-                    (int)seen_tokens_host_.size(),
-                    vocab,
-                    rep_penalty,
-                    main_stream_);
-            }
-        }
-
-        // Generate uniform random float on host [0, 1)
-        float random_val = 0.0f;
-        if (temperature > 0.0f) {
-            std::uniform_real_distribution<float> dist(0.0f, 1.0f);
-            random_val = dist(rng_);
-        }
-
-        float min_p = 0.05f;
-
-        // Launch GPU parallel Min-P reduction & sampling kernel
-        gpu_sample_min_p_cuda(
-            buf_logits_.f32(),
-            vocab,
-            temperature,
-            min_p,
-            random_val,
-            (int32_t*)buf_sampled_token_d_.data,
-            buf_sampler_scratch_.f32(),
-            main_stream_);
-
-        // Copy single 4-byte token ID back to host
-        CUDA_CHECK(cudaMemcpyAsync(
-            h_sampled_token_,
-            buf_sampled_token_d_.data,
-            sizeof(int32_t),
-            cudaMemcpyDeviceToHost,
-            main_stream_));
+        float* logits = logits_host_.data();
+        CUDA_CHECK(cudaMemcpyAsync(logits, buf_logits_.f32(),
+                                   vocab * sizeof(float), cudaMemcpyDeviceToHost, main_stream_));
         CUDA_CHECK(cudaStreamSynchronize(main_stream_));
 
-        return *h_sampled_token_;
+        if (temperature <= 0.0f) {
+            int best = 0;
+            float max_logit = -1e38f;
+            for (int i = 0; i < vocab; i++) {
+                if (logits[i] > max_logit) {
+                    max_logit = logits[i];
+                    best = i;
+                }
+            }
+            return best;
+        }
+
+        if (top_p <= 0.0f || top_p > 1.0f) top_p = 1.0f;
+        if (min_p < 0.0f) min_p = 0.0f;
+        if (top_k <= 0) top_k = 1024;
+        if (top_k > vocab) top_k = vocab;
+
+        // Top-K insertion sort for Top-P / Min-P sampling
+        std::vector<int> ids(top_k);
+        std::vector<float> vals(top_k);
+        int n = 0;
+
+        for (int i = 0; i < vocab; i++) {
+            float v = logits[i];
+            if (!std::isfinite(v)) continue;
+            if (n == top_k && v <= vals[n - 1]) continue;
+            int j = (n < top_k) ? n++ : n - 1;
+            while (j > 0 && vals[j - 1] < v) {
+                vals[j] = vals[j - 1];
+                ids[j] = ids[j - 1];
+                j--;
+            }
+            vals[j] = v;
+            ids[j] = i;
+        }
+
+        if (n == 0) return 0;
+
+        std::vector<float> probs(n);
+        const float max_logit = vals[0];
+        float sum = 0.0f;
+        for (int i = 0; i < n; i++) {
+            probs[i] = expf((vals[i] - max_logit) / temperature);
+            sum += probs[i];
+        }
+
+        if (sum <= 0.0f || !std::isfinite(sum)) return ids[0];
+
+        // Min-P filter relative to top candidate probability (probs[0] / sum)
+        const float min_prob = (probs[0] / sum) * min_p;
+        float filtered_sum = 0.0f;
+        int filtered = 0;
+        for (int i = 0; i < n; i++) {
+            float p = probs[i] / sum;
+            if (i > 0 && p < min_prob) break;
+            filtered_sum += probs[i];
+            filtered++;
+            if (filtered_sum / sum >= top_p) break;
+        }
+
+        if (filtered <= 0) return ids[0];
+
+        // Sample from distribution
+        std::uniform_real_distribution<float> dist(0.0f, filtered_sum);
+        float r = dist(rng_);
+        for (int i = 0; i < filtered; i++) {
+            r -= probs[i];
+            if (r <= 0.0f) return ids[i];
+        }
+        return ids[filtered - 1];
+    }
+
+public:
+    bool collect_imatrix(const std::string& dataset_path, const std::string& out_dat_path, int max_tokens = -1) {
+        LOG_INFO("════ Starting Importance Matrix Calibration ════");
+        LOG_INFO("Calibration dataset: %s", dataset_path.c_str());
+        LOG_INFO("Output .dat path:    %s", out_dat_path.c_str());
+
+        std::ifstream file(dataset_path);
+        if (!file.is_open()) {
+            LOG_ERROR("Cannot open calibration dataset: %s", dataset_path.c_str());
+            return false;
+        }
+        std::stringstream buffer;
+        buffer << file.rdbuf();
+        std::string raw_text = buffer.str();
+        file.close();
+
+        LOG_INFO("Dataset text loaded (%zu bytes). Tokenizing...", raw_text.size());
+        std::vector<int> tokens = tokenizer_.encode(raw_text);
+        if (tokens.empty()) {
+            LOG_ERROR("Tokenization produced 0 tokens");
+            return false;
+        }
+
+        if (max_tokens > 0 && (int)tokens.size() > max_tokens) {
+            tokens.resize(max_tokens);
+        }
+        size_t total_tokens = tokens.size();
+        LOG_INFO("Total calibration tokens to stream: %zu", total_tokens);
+
+        int n_layers = cfg_.num_hidden_layers;
+        int n_experts = cfg_.n_routed_experts;
+        int dim = cfg_.hidden_size;
+        int moe_inter = cfg_.moe_intermediate_size;
+
+        size_t gate_bytes = (size_t)n_layers * n_experts * dim * sizeof(float);
+        size_t down_bytes = (size_t)n_layers * n_experts * moe_inter * sizeof(float);
+        size_t counts_bytes = (size_t)n_layers * n_experts * sizeof(uint32_t);
+
+        d_gate_accum_.alloc(gate_bytes);
+        d_down_accum_.alloc(down_bytes);
+        d_expert_counts_.alloc(counts_bytes);
+
+        CUDA_CHECK(cudaMemset(d_gate_accum_.data, 0, gate_bytes));
+        CUDA_CHECK(cudaMemset(d_down_accum_.data, 0, down_bytes));
+        CUDA_CHECK(cudaMemset(d_expert_counts_.data, 0, counts_bytes));
+
+        collect_imatrix_ = true;
+        auto start_time = std::chrono::steady_clock::now();
+
+        // Reset HC and cache state
+        if (buf_hc_state_.data) CUDA_CHECK(cudaMemset(buf_hc_state_.data, 0, buf_hc_state_.size_bytes));
+        if (buf_hc_after_attn_.data) CUDA_CHECK(cudaMemset(buf_hc_after_attn_.data, 0, buf_hc_after_attn_.size_bytes));
+
+        LOG_INFO("Streaming %zu tokens through all %d transformer layers on GPU...", total_tokens, n_layers);
+        for (size_t i = 0; i < total_tokens; i++) {
+            forward_token_eager(tokens[i], (int)(i % MAX_SEQ_LEN));
+
+            if ((i + 1) % 1000 == 0 || i + 1 == total_tokens) {
+                auto now = std::chrono::steady_clock::now();
+                double elapsed = std::chrono::duration<double>(now - start_time).count();
+                double tps = (i + 1) / (elapsed > 0.0 ? elapsed : 1.0);
+                double pct = ((i + 1) * 100.0) / total_tokens;
+                printf("\r[Calibrating Experts] %zu/%zu tokens (%.1f%%) | %.1f tok/s | Elapsed: %.1fs",
+                       i + 1, total_tokens, pct, tps, elapsed);
+                fflush(stdout);
+            }
+        }
+        printf("\n");
+        CUDA_CHECK(cudaStreamSynchronize(main_stream_));
+        collect_imatrix_ = false;
+
+        LOG_INFO("Copying activation statistics to host...");
+        std::vector<float> h_gate(n_layers * n_experts * dim);
+        std::vector<float> h_down(n_layers * n_experts * moe_inter);
+        std::vector<uint32_t> h_counts(n_layers * n_experts);
+
+        CUDA_CHECK(cudaMemcpy(h_gate.data(), d_gate_accum_.data, gate_bytes, cudaMemcpyDeviceToHost));
+        CUDA_CHECK(cudaMemcpy(h_down.data(), d_down_accum_.data, down_bytes, cudaMemcpyDeviceToHost));
+        CUDA_CHECK(cudaMemcpy(h_counts.data(), d_expert_counts_.data, counts_bytes, cudaMemcpyDeviceToHost));
+
+        LOG_INFO("Normalizing per-expert activations and writing %s...", out_dat_path.c_str());
+        std::ofstream out(out_dat_path, std::ios::binary);
+        if (!out.is_open()) {
+            LOG_ERROR("Cannot open output imatrix file: %s", out_dat_path.c_str());
+            return false;
+        }
+
+        int32_t num_entries = n_layers * 3;
+        out.write((const char*)&num_entries, sizeof(num_entries));
+
+        for (int L = 0; L < n_layers; L++) {
+            std::vector<double> layer_gate_sum(dim, 0.0);
+            std::vector<double> layer_down_sum(moe_inter, 0.0);
+            uint64_t total_layer_calls = 0;
+
+            for (int e = 0; e < n_experts; e++) {
+                uint32_t count = h_counts[L * n_experts + e];
+                total_layer_calls += count;
+                float* g_ptr = &h_gate[(L * n_experts + e) * dim];
+                float* d_ptr = &h_down[(L * n_experts + e) * moe_inter];
+                for (int j = 0; j < dim; j++) layer_gate_sum[j] += g_ptr[j];
+                for (int j = 0; j < moe_inter; j++) layer_down_sum[j] += d_ptr[j];
+            }
+
+            double total_denom = std::max(1.0, (double)total_layer_calls);
+            std::vector<float> avg_gate(dim);
+            std::vector<float> avg_down(moe_inter);
+            for (int j = 0; j < dim; j++) avg_gate[j] = std::max(1e-4f, (float)(layer_gate_sum[j] / total_denom));
+            for (int j = 0; j < moe_inter; j++) avg_down[j] = std::max(1e-4f, (float)(layer_down_sum[j] / total_denom));
+
+            for (int e = 0; e < n_experts; e++) {
+                uint32_t count = h_counts[L * n_experts + e];
+                float* g_ptr = &h_gate[(L * n_experts + e) * dim];
+                float* d_ptr = &h_down[(L * n_experts + e) * moe_inter];
+                if (count >= 10) {
+                    float inv_cnt = 1.0f / (float)count;
+                    for (int j = 0; j < dim; j++) g_ptr[j] = std::max(1e-4f, g_ptr[j] * inv_cnt);
+                    for (int j = 0; j < moe_inter; j++) d_ptr[j] = std::max(1e-4f, d_ptr[j] * inv_cnt);
+                } else {
+                    for (int j = 0; j < dim; j++) g_ptr[j] = avg_gate[j];
+                    for (int j = 0; j < moe_inter; j++) d_ptr[j] = avg_down[j];
+                }
+            }
+
+            auto write_entry = [&](const std::string& name, const float* data, int32_t nval) {
+                int32_t name_len = (int32_t)name.size();
+                int32_t ncall = (int32_t)total_tokens;
+                out.write((const char*)&name_len, sizeof(name_len));
+                out.write(name.data(), name_len);
+                out.write((const char*)&ncall, sizeof(ncall));
+                out.write((const char*)&nval, sizeof(nval));
+                out.write((const char*)data, nval * sizeof(float));
+            };
+
+            std::string gate_name = "blk." + std::to_string(L) + ".ffn_gate_exps.weight";
+            std::string up_name   = "blk." + std::to_string(L) + ".ffn_up_exps.weight";
+            std::string down_name = "blk." + std::to_string(L) + ".ffn_down_exps.weight";
+
+            write_entry(gate_name, &h_gate[L * n_experts * dim], n_experts * dim);
+            write_entry(up_name,   &h_gate[L * n_experts * dim], n_experts * dim);
+            write_entry(down_name, &h_down[L * n_experts * moe_inter], n_experts * moe_inter);
+        }
+
+        out.close();
+        LOG_INFO("════ Importance matrix calibration complete: %s ════", out_dat_path.c_str());
+        return true;
     }
 };
 
@@ -2898,15 +3005,10 @@ private:
 //  Chat Template
 // ════════════════════════════════════════════════════════════════════════════════
 
-static const std::string DS4_REASONING_EFFORT_HIGH_PREFIX =
+static const std::string DEEPSEEK_V4_REASONING_EFFORT_MAX_PREFIX =
     "Reasoning Effort: Absolute maximum with no shortcuts permitted.\n"
     "You MUST be very thorough in your thinking and comprehensively decompose the problem to resolve the root cause, rigorously stress-testing your logic against all potential paths, edge cases, and adversarial scenarios.\n"
     "Explicitly write out your entire deliberation process, documenting every intermediate step, considered alternative, and rejected hypothesis to ensure absolutely no assumption is left unchecked.\n\n";
-
-static const std::string DS4_REASONING_EFFORT_MAX_PREFIX =
-    "Reasoning Effort: Beyond maximum — exhaustive, relentless, and uncompromising.\n"
-    "You MUST reason with the utmost depth and rigor, leaving absolutely nothing to chance: exhaustively decompose the problem into its most fundamental components, trace every causal chain to its root, and resolve the underlying cause rather than any surface symptom.\n"
-    "Do not stop reasoning until you have independently verified the solution from multiple angles and are certain that no assumption remains unchecked and no error remains undiscovered.\n\n";
 
 static std::vector<int> apply_chat_template(const json& messages, const BPETokenizer& tok, bool enable_thinking = true, const std::string& reasoning_effort = "high") {
     int BOS = tok.get_token_id("<｜begin of sentence｜>");
@@ -2932,14 +3034,9 @@ static std::vector<int> apply_chat_template(const json& messages, const BPEToken
     std::vector<int> result;
     result.push_back(BOS);
 
-    if (enable_thinking) {
-        if (reasoning_effort == "max") {
-            auto prefix_enc = tok.encode(DS4_REASONING_EFFORT_MAX_PREFIX);
-            result.insert(result.end(), prefix_enc.begin(), prefix_enc.end());
-        } else if (reasoning_effort == "high") {
-            auto prefix_enc = tok.encode(DS4_REASONING_EFFORT_HIGH_PREFIX);
-            result.insert(result.end(), prefix_enc.begin(), prefix_enc.end());
-        }
+    if (enable_thinking && reasoning_effort == "max") {
+        auto prefix_enc = tok.encode(DEEPSEEK_V4_REASONING_EFFORT_MAX_PREFIX);
+        result.insert(result.end(), prefix_enc.begin(), prefix_enc.end());
     }
     for (size_t i = 0; i < messages.size(); i++) {
         std::string role = messages[i]["role"].get<std::string>();
@@ -2958,7 +3055,7 @@ static std::vector<int> apply_chat_template(const json& messages, const BPEToken
             result.push_back(THINK_END);
             auto enc = tok.encode(content);
             result.insert(result.end(), enc.begin(), enc.end());
-            result.push_back(BOS); // <｜end▁of▁sentence｜>
+            result.push_back(EOS); // <｜end▁of▁sentence｜>
         }
     }
 
@@ -3048,6 +3145,9 @@ static void run_server(MoecherEngine& engine, int port, int default_thinking_bud
 
             auto& messages = request["messages"];
             float temperature = request.value("temperature", 1.0f);
+            float top_p = request.value("top_p", 0.95f);
+            float min_p = request.value("min_p", 0.0f);
+            int top_k = request.value("top_k", 1024);
             int max_tokens = request.value("max_tokens", 512);
             bool stream = request.value("stream", false);
             float repetition_penalty = request.value("repetition_penalty", 1.0f);
@@ -3096,7 +3196,7 @@ static void run_server(MoecherEngine& engine, int port, int default_thinking_bud
                 // SSE streaming
                 res.set_chunked_content_provider(
                     "text/event-stream",
-                    [&engine, prompt, max_tokens, temperature, req_id, repetition_penalty, enable_thinking, max_thinking_tokens](size_t offset, httplib::DataSink &sink) {
+                    [&engine, prompt, max_tokens, temperature, req_id, repetition_penalty, enable_thinking, max_thinking_tokens, top_p, min_p, top_k](size_t offset, httplib::DataSink &sink) {
                         if (offset > 0) return false;
                         std::lock_guard<std::mutex> lock(g_engine_mutex);
 
@@ -3133,7 +3233,7 @@ static void run_server(MoecherEngine& engine, int port, int default_thinking_bud
                             std::string sse_chunk = "data: " + delta_chunk.dump(-1, ' ', false, json::error_handler_t::replace) + "\n\n";
                             bool ok = sink.write(sse_chunk.data(), sse_chunk.size());
                             return ok && !g_stop_requested.load();
-                        }, repetition_penalty, enable_thinking, max_thinking_tokens);
+                        }, repetition_penalty, enable_thinking, max_thinking_tokens, top_p, min_p, top_k);
 
                         std::string final_finish_reason = engine.last_finish_reason_.empty() ? "stop" : engine.last_finish_reason_;
 
@@ -3164,7 +3264,7 @@ static void run_server(MoecherEngine& engine, int port, int default_thinking_bud
                 std::string response_text;
                 {
                     std::lock_guard<std::mutex> lock(g_engine_mutex);
-                    response_text = engine.generate(prompt, max_tokens, temperature, nullptr, repetition_penalty, enable_thinking, max_thinking_tokens);
+                    response_text = engine.generate(prompt, max_tokens, temperature, nullptr, repetition_penalty, enable_thinking, max_thinking_tokens, top_p, min_p, top_k);
                 }
                 
                 json response = {
@@ -3221,8 +3321,10 @@ int main(int argc, char** argv) {
     float dram_cache_gb = 0.0f;
     std::string log_path = "moecher.log";
     std::string expert_dtype_override = "";
-    std::string shared_expert_dtype = "q4_k";
     int default_thinking_budget = 4096;
+    std::string imatrix_dataset = "";
+    std::string imatrix_out = "";
+    int imatrix_max_tokens = -1;
 
     for (int i = 1; i < argc; i++) {
         if ((std::string(argv[i]) == "--manifest" || std::string(argv[i]) == "-m") && i + 1 < argc) {
@@ -3237,10 +3339,14 @@ int main(int argc, char** argv) {
             dram_cache_gb = std::stof(argv[++i]);
         } else if (std::string(argv[i]) == "--expert-dtype" && i + 1 < argc) {
             expert_dtype_override = argv[++i];
-        } else if ((std::string(argv[i]) == "--shared-expert-dtype" || std::string(argv[i]) == "--shared-expert-format" || std::string(argv[i]) == "--quantize-shared") && i + 1 < argc) {
-            shared_expert_dtype = argv[++i];
         } else if ((std::string(argv[i]) == "--thinking-budget" || std::string(argv[i]) == "--budget" || std::string(argv[i]) == "--max-thinking-tokens") && i + 1 < argc) {
             default_thinking_budget = std::stoi(argv[++i]);
+        } else if (std::string(argv[i]) == "--imatrix-dataset" && i + 1 < argc) {
+            imatrix_dataset = argv[++i];
+        } else if (std::string(argv[i]) == "--imatrix-out" && i + 1 < argc) {
+            imatrix_out = argv[++i];
+        } else if (std::string(argv[i]) == "--imatrix-max-tokens" && i + 1 < argc) {
+            imatrix_max_tokens = std::stoi(argv[++i]);
         } else if (std::string(argv[i]) == "--log-experts") {
             g_log_experts = true;
         } else if (std::string(argv[i]) == "--no-log-tokens") {
@@ -3258,9 +3364,14 @@ int main(int argc, char** argv) {
     LOG_INFO("Default thinking token budget: %d", default_thinking_budget);
 
     MoecherEngine engine;
-    if (!engine.load(manifest_path, max_vram_gb, dram_cache_gb, expert_dtype_override, shared_expert_dtype)) {
+    if (!engine.load(manifest_path, max_vram_gb, dram_cache_gb, expert_dtype_override)) {
         LOG_ERROR("Failed to load model");
         return 1;
+    }
+
+    if (!imatrix_dataset.empty() && !imatrix_out.empty()) {
+        bool ok = engine.collect_imatrix(imatrix_dataset, imatrix_out, imatrix_max_tokens);
+        return ok ? 0 : 1;
     }
 
     run_server(engine, port, default_thinking_budget);

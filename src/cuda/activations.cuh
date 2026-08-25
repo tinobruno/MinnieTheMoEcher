@@ -27,6 +27,13 @@ void rms_norm_cuda_batched(
 
 void rms_norm_f32_cuda(float* x, int dim, float eps, cudaStream_t stream = 0);
 
+void rms_norm_weighted_f32_cuda(
+    float* out,
+    const float* x,
+    const __nv_bfloat16* weight,
+    int dim, float eps,
+    cudaStream_t stream = 0);
+
 // Unweighted batched: x * rsqrt(mean(x^2) + eps) per row (no learnable weight)
 // Used for per-head Q normalization (DeepseekV4UnweightedRMSNorm)
 void rms_norm_unweighted_batched_cuda(
@@ -99,7 +106,7 @@ void gemv_hc_pre_norm_cuda(
     cudaStream_t stream = 0);
 
 
-// ── FP4 dequantization & GEMV ───────────────────────────────────────────────────
+// ── FP4 dequantization ────────────────────────────────────────────────────────
 // Dequantize FP4 (packed as I8, 2 values per byte) to BF16 using E8M0 scales
 // weight: [rows, cols_packed] in I8 (cols_packed = logical_cols / 2)
 // scale:  [rows, logical_cols/32] in F8_E8M0  (one scale per 32 fp4 values)
@@ -110,34 +117,6 @@ void fp4_dequant_cuda(
     const uint8_t* scale,          // E8M0 scales
     int rows, int cols_packed,     // cols_packed = logical_cols/2
     int scale_cols,                // number of scale columns
-    cudaStream_t stream = 0);
-
-void quantize_fp8_to_fp4_cuda(
-    uint8_t* fp4_weight,
-    uint8_t* fp4_scale,
-    const uint8_t* fp8_weight,
-    const uint8_t* fp8_scale,
-    int rows, int logical_cols,
-    int fp8_block_size = 128,
-    cudaStream_t stream = 0);
-
-void gemv_fp4_cuda(
-    __nv_bfloat16* out,
-    const __nv_bfloat16* vec,
-    const uint8_t* weight,
-    const uint8_t* scale,
-    int N, int K,
-    cudaStream_t stream = 0);
-
-void gemv_fp4_swiglu_fused_cuda(
-    __nv_bfloat16* out,
-    const __nv_bfloat16* vec,
-    const uint8_t* w1_weight,
-    const uint8_t* w1_scale,
-    const uint8_t* w3_weight,
-    const uint8_t* w3_scale,
-    int N, int K,
-    float swiglu_limit = 0.0f,
     cudaStream_t stream = 0);
 
 // ── INT2 asymmetric dequantization ────────────────────────────────────────────
@@ -399,17 +378,6 @@ void gemv_iq2_xxs_moe_swiglu_fused_cuda(
     int N, int K, float swiglu_limit,
     cudaStream_t stream = 0);
 
-void gemv_fp8_swiglu_fused_cuda(
-    __nv_bfloat16* out,
-    const __nv_bfloat16* vec,
-    const uint8_t* w1_weight,
-    const uint8_t* w1_scale,
-    const uint8_t* w3_weight,
-    const uint8_t* w3_scale,
-    int N, int K, int block_size,
-    float swiglu_limit,
-    cudaStream_t stream = 0);
-
 void gemv_q2_k_moe_cuda(
     __nv_bfloat16* down_buf,
     const __nv_bfloat16* gate_buf,
@@ -430,6 +398,13 @@ void moe_route_hash_cuda(
     float* topk_weights,
     const int64_t* tid2eid_table,
     int token_id, int top_k, float routed_scaling_factor,
+    cudaStream_t stream = 0);
+
+void moe_route_hash_device_id_cuda(
+    int32_t* topk_ids,
+    float* topk_weights,
+    const int64_t* tid2eid_table,
+    const int32_t* d_token_id, int top_k, float routed_scaling_factor,
     cudaStream_t stream = 0);
 
 void moe_route_top6_from_bf16_cuda(
@@ -461,21 +436,53 @@ void fused_moe_accum_6_cuda(
     float w0, float w1, float w2, float w3, float w4, float w5,
     int dim, cudaStream_t stream = 0);
 
-void apply_repetition_penalty_cuda(
-    float* logits,
-    const int32_t* seen_tokens,
-    int num_seen,
-    int vocab_size,
-    float rep_penalty,
+// Device-driven kernels for CUDA Graph capture
+void embedding_broadcast_device_id_cuda(
+    __nv_bfloat16* hidden, __nv_bfloat16* hc_state,
+    const __nv_bfloat16* table, const int32_t* d_token_id, int dim, int hc,
     cudaStream_t stream = 0);
 
-void gpu_sample_min_p_cuda(
-    const float* logits,
-    int vocab_size,
-    float temperature,
-    float min_p,
-    float random_val,
-    int32_t* out_token,
-    float* scratch_block_data,
+void rope_device_pos_cuda(
+    __nv_bfloat16* x, int n_vectors, int head_dim, int rope_dim,
+    const int32_t* d_position, const float* freq_table, bool inverse,
+    cudaStream_t stream = 0);
+
+void store_kv_device_pos_cuda(
+    __nv_bfloat16* kv_cache, const __nv_bfloat16* kv_val,
+    const int32_t* d_position, int window, int head_dim,
+    cudaStream_t stream = 0);
+
+void prepare_combined_kv_cuda(
+    __nv_bfloat16* combined_kv,
+    int32_t* d_cache_len,
+    const __nv_bfloat16* raw_kv_cache,
+    const __nv_bfloat16* comp_kv_cache,
+    const int32_t* d_position,
+    const int32_t* d_comp_count,
+    int window, int head_dim, int ratio,
+    cudaStream_t stream = 0);
+
+void mla_attention_device_len_cuda(
+    const __nv_bfloat16* q,
+    const __nv_bfloat16* kv,
+    const float* attn_sink,
+    __nv_bfloat16* out,
+    const int32_t* d_cache_len,
+    int max_cache_len,
+    int head_dim,
+    float scale,
+    cudaStream_t stream = 0);
+
+void accumulate_expert_imatrix_cuda(
+    float* gate_accum,             // [n_experts, hidden_dim]
+    float* down_accum,             // [n_experts, moe_intermediate]
+    uint32_t* expert_counts,       // [n_experts]
+    const __nv_bfloat16* h_norm,   // [num_tokens, hidden_dim]
+    const int32_t* topk_indices,   // [num_tokens, top_k]
+    int num_tokens,
+    int top_k,
+    int n_experts,
+    int hidden_dim,
+    int moe_intermediate,
     cudaStream_t stream = 0);
 
