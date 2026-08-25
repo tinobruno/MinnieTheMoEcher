@@ -50,24 +50,19 @@ FetchContent_MakeAvailable(httplib nlohmann_json)
 # ── Find CUDA libraries ────────────────────────────────────────────────────────
 find_package(CUDAToolkit REQUIRED)
 
-# ── CUDA kernels library ───────────────────────────────────────────────────────
-add_library(moecher_cuda STATIC
-    src/cuda/activations.cu
-)
-target_include_directories(moecher_cuda PUBLIC src/cuda)
-set_target_properties(moecher_cuda PROPERTIES
-    CUDA_SEPARABLE_COMPILATION ON
-    POSITION_INDEPENDENT_CODE ON
-)
-
 # ── Main executable ────────────────────────────────────────────────────────────
 add_executable(moecher
     src/server_single.cpp
+    src/cuda/activations.cu
+)
+
+set_target_properties(moecher PROPERTIES
+    CUDA_SEPARABLE_COMPILATION OFF
+    POSITION_INDEPENDENT_CODE ON
 )
 
 if(WIN32)
     target_link_libraries(moecher PRIVATE
-        moecher_cuda
         CUDA::cublas
         CUDA::cudart
         httplib::httplib
@@ -77,7 +72,6 @@ if(WIN32)
     )
 else()
     target_link_libraries(moecher PRIVATE
-        moecher_cuda
         CUDA::cublas
         CUDA::cudart
         httplib::httplib
