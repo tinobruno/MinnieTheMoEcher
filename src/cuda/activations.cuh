@@ -2,6 +2,7 @@
 // activations.cuh — CUDA kernel declarations for moecher
 
 #include <cuda_runtime.h>
+#include <cuda_fp16.h>
 #include <cuda_bf16.h>
 #include <cstdint>
 
@@ -80,6 +81,23 @@ void gemv_fp8_cuda(
     int block_size,
     cudaStream_t stream = 0);
 
+void gemv_fp8_grouped_cuda(
+    __nv_bfloat16* out,
+    const __nv_bfloat16* vec,
+    const uint8_t* weight,
+    const uint8_t* scale,
+    int rows, int cols,
+    int groups, int block_size,
+    cudaStream_t stream = 0);
+
+void gemv_hc_pre_norm_cuda(
+    float* mixes,
+    const __nv_bfloat16* hc_state,
+    const float* hc_fn,
+    int mix_size, int hc_dim,
+    float eps,
+    cudaStream_t stream = 0);
+
 
 // ── FP4 dequantization ────────────────────────────────────────────────────────
 // Dequantize FP4 (packed as I8, 2 values per byte) to BF16 using E8M0 scales
@@ -119,6 +137,51 @@ void gemm_int2_cuda(__nv_bfloat16* out, const __nv_bfloat16* A,
                     int M, int N, int K_packed, int block_size,
                     cudaStream_t stream = 0);
 
+// ── IQ2_XXS quantization ──────────────────────────────────────────────────────
+#define QK_IQ2_XXS 256
+
+struct __align__(2) block_iq2_xxs {
+    half d;              // 16-bit scale
+    uint16_t qs[32];     // 32 x 16-bit = 64 bytes (256 weights)
+};
+static_assert(sizeof(block_iq2_xxs) == 66, "wrong iq2_xxs block size");
+
+void iq2_xxs_dequant_cuda(
+    __nv_bfloat16* out,
+    const block_iq2_xxs* weight,
+    int rows, int cols,
+    cudaStream_t stream = 0);
+
+void gemv_iq2_xxs_cuda(
+    __nv_bfloat16* out,
+    const __nv_bfloat16* vec,
+    const block_iq2_xxs* weight,
+    int rows, int cols,
+    cudaStream_t stream = 0);
+
+// ── Q2_K quantization ─────────────────────────────────────────────────────────
+#define QK_K 256
+
+struct __align__(4) block_q2_K {
+    uint8_t scales[16];  // 16 x 8-bit scales (scale and min for 16 sub-blocks of 16 weights)
+    uint8_t qs[64];      // 64 x 8-bit = 256 2-bit quants
+    half d;              // super-block scale
+    half dmin;           // super-block min
+};
+static_assert(sizeof(block_q2_K) == 84, "wrong q2_K block size");
+
+void q2_k_dequant_cuda(
+    __nv_bfloat16* out,
+    const block_q2_K* weight,
+    int rows, int cols,
+    cudaStream_t stream = 0);
+
+void gemv_q2_k_cuda(
+    __nv_bfloat16* out,
+    const __nv_bfloat16* vec,
+    const block_q2_K* weight,
+    int rows, int cols,
+    cudaStream_t stream = 0);
 
 // ── Embedding lookup ───────────────────────────────────────────────────────────
 void embedding_cuda(
@@ -126,6 +189,13 @@ void embedding_cuda(
     const __nv_bfloat16* table,    // [vocab_size, dim]
     const int32_t* ids,            // [seq_len]
     int seq_len, int dim,
+    cudaStream_t stream = 0);
+
+void embedding_broadcast_cuda(
+    __nv_bfloat16* hidden,         // [dim]
+    __nv_bfloat16* hc_state,       // [hc, dim]
+    const __nv_bfloat16* table,    // [vocab_size, dim]
+    int token_id, int dim, int hc,
     cudaStream_t stream = 0);
 
 // ── Softmax ────────────────────────────────────────────────────────────────────
@@ -277,3 +347,77 @@ void hc_head_reduce_cuda(
     __nv_bfloat16* hidden, const __nv_bfloat16* hc_state,
     const float* mixes, const float* scale, const float* base,
     int dim, int hc, cudaStream_t stream = 0);
+
+void gemv_iq2_xxs_swiglu_fused_cuda(
+    __nv_bfloat16* out,
+    const __nv_bfloat16* vec,
+    const block_iq2_xxs* w1,
+    const block_iq2_xxs* w3,
+    int N, int K, float swiglu_limit,
+    cudaStream_t stream = 0);
+
+void populate_active_expert_ptrs_cuda(
+    const void** active_ptrs,
+    const int32_t* topk_ids,
+    const void* const* flat_expert_ptrs,
+    int layer_id, int n_experts, int top_k,
+    cudaStream_t stream = 0);
+
+void gemv_iq2_xxs_moe_swiglu_fused_cuda(
+    __nv_bfloat16* gate_buf,
+    const __nv_bfloat16* vec,
+    const void* const* active_expert_ptrs,
+    int w1_offset, int w3_offset,
+    int N, int K, float swiglu_limit,
+    cudaStream_t stream = 0);
+
+void gemv_q2_k_moe_cuda(
+    __nv_bfloat16* down_buf,
+    const __nv_bfloat16* gate_buf,
+    const void* const* active_expert_ptrs,
+    int w2_offset,
+    int N, int K,
+    cudaStream_t stream = 0);
+
+void moe_route_top6_cuda(
+    int32_t* topk_ids,
+    float* topk_weights,
+    const float* scores_f32,
+    int n_experts, int top_k, float routed_scaling_factor,
+    cudaStream_t stream = 0);
+
+void moe_route_hash_cuda(
+    int32_t* topk_ids,
+    float* topk_weights,
+    const int64_t* tid2eid_table,
+    int token_id, int top_k, float routed_scaling_factor,
+    cudaStream_t stream = 0);
+
+void moe_route_top6_from_bf16_cuda(
+    int32_t* topk_ids,
+    float* topk_weights,
+    const __nv_bfloat16* scores_bf16,
+    const float* gate_bias,
+    int n_experts, int top_k, float routed_scaling_factor,
+    cudaStream_t stream = 0);
+
+void gemv_f32_cuda(
+    float* out,
+    const float* vec,
+    const float* matrix,
+    int M, int K,
+    cudaStream_t stream = 0);
+
+void fused_moe_accum_dynamic_cuda(
+    __nv_bfloat16* accum,
+    const __nv_bfloat16* down_buf,
+    const float* topk_weights,
+    const __nv_bfloat16* shared_down,
+    int dim,
+    cudaStream_t stream = 0);
+
+void fused_moe_accum_6_cuda(
+    __nv_bfloat16* accum,
+    const __nv_bfloat16* down_ptrs,
+    float w0, float w1, float w2, float w3, float w4, float w5,
+    int dim, cudaStream_t stream = 0);

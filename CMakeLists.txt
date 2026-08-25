@@ -4,9 +4,11 @@ project(moecher LANGUAGES CXX CUDA)
 set(CMAKE_CXX_STANDARD 17)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
 set(CMAKE_CUDA_STANDARD 17)
+set(CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} -O3 -march=native -funroll-loops")
+set(CMAKE_CUDA_FLAGS "${CMAKE_CUDA_FLAGS} -O3")
 
-# CUDA architecture: sm_86 (3090/Ampere) with PTX for forward compat
-set(CMAKE_CUDA_ARCHITECTURES "86")
+# CUDA architecture: sm_89 (Ada/Blackwell Workstation) & sm_90 (Hopper/Blackwell)
+set(CMAKE_CUDA_ARCHITECTURES "89;90")
 
 # ── Fetch header-only dependencies ──────────────────────────────────────────────
 include(FetchContent)
