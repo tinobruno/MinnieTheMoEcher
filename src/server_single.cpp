@@ -7,19 +7,7 @@
 //   - BPE tokenizer from HuggingFace tokenizer.json
 //   - Full DeepSeek V4-Flash forward pass: MLA + MoE + HC residuals
 
-#ifndef _GNU_SOURCE
-#define _GNU_SOURCE  // for O_DIRECT
-#endif
-#include <fcntl.h>
-#include <unistd.h>
-#include <sys/mman.h>
-#include <sys/stat.h>
-#include <stdlib.h>
-#include <map>
-#include <vector>
-#include <future>
-#include <mutex>
-#include <memory>
+#include "platform/platform_io.hpp"
 #include "thread_pool.h"
 
 #include <cstdio>
@@ -720,7 +708,7 @@ public:
     int expert_block_size_ = 0;
     int n_layers_ = 0;
     int n_experts_ = 0;
-    int expert_fd_ = -1;
+    moecher::platform::DirectFileHandle expert_file_;
 
     // L1 LRU cache (VRAM)
     int cache_capacity_ = 0;
@@ -753,12 +741,7 @@ public:
         n_layers_ = n_layers;
         n_experts_ = n_experts;
 
-        expert_fd_ = open(expert_bin_path.c_str(), O_RDONLY | O_DIRECT);
-        if (expert_fd_ < 0) {
-            LOG_WARN("O_DIRECT not supported, falling back to buffered IO");
-            expert_fd_ = open(expert_bin_path.c_str(), O_RDONLY);
-        }
-        if (expert_fd_ < 0) {
+        if (!expert_file_.open_read(expert_bin_path, true)) {
             LOG_ERROR("Cannot open expert bin: %s", expert_bin_path.c_str());
             return false;
         }
@@ -790,18 +773,14 @@ public:
 
         // Initialize staging ring buffer
         staging_ring_.resize(NUM_STAGING_BUFFERS);
-        for (int i = 0; i < NUM_STAGING_BUFFERS; i++) {
-            CUDA_CHECK(cudaMallocHost(&staging_ring_[i].ptr, block_size));
-            CUDA_CHECK(cudaEventCreateWithFlags(&staging_ring_[i].event, cudaEventDisableTiming));
-            // Record immediately so first wait passes
-            CUDA_CHECK(cudaEventRecord(staging_ring_[i].event, 0));
-            
-            if ((uintptr_t)staging_ring_[i].ptr % PAGE_SIZE != 0) {
-                LOG_WARN("Staging buffer %d is not page-aligned!", i);
-            }
+        for (auto& s : staging_ring_) {
+            CUDA_CHECK(cudaMallocHost(&s.ptr, block_size));
+            CUDA_CHECK(cudaEventCreateWithFlags(&s.event, cudaEventDisableTiming));
         }
 
         flat_vram_ptrs_.assign((size_t)n_layers * n_experts, nullptr);
+        flat_vram_ptrs_gpu_.alloc((size_t)n_layers * n_experts * sizeof(void*));
+        CUDA_CHECK(cudaMemset(flat_vram_ptrs_gpu_.data, 0, (size_t)n_layers * n_experts * sizeof(void*)));
         return true;
     }
 
@@ -831,38 +810,33 @@ public:
     }
 
     void* get_expert(int layer_id, int expert_id, cudaStream_t stream) {
-        int64_t key = (int64_t)layer_id * n_experts_ + expert_id;
-        
+        return get_expert_async(layer_id, expert_id, stream);
+    }
+
+    void* get_expert_async(int layer_id, int expert_id, cudaStream_t stream) {
         std::unique_lock<std::mutex> lock(cache_mutex_);
         access_counter_++;
 
-        // Check L1 (VRAM)
+        int64_t key = (int64_t)layer_id * n_experts_ + expert_id;
+
+        // 1. Check L1 Cache (VRAM)
         auto it = key_to_slot_.find(key);
         if (it != key_to_slot_.end()) {
-            cache_slots_[it->second].last_used = access_counter_;
-            void* ptr = cache_slots_[it->second].gpu_data;
-            if (key >= 0 && key < (int64_t)flat_vram_ptrs_.size()) {
-                flat_vram_ptrs_[key] = ptr;
-            }
-            // Also update L2 last_used if it exists in L2, so it doesn't get evicted randomly
-            auto it2 = dram_key_to_slot_.find(key);
-            if (it2 != dram_key_to_slot_.end()) {
-                dram_cache_slots_[it2->second].last_used = access_counter_;
-            }
-            lock.unlock();
-            return ptr;
+            auto& slot = cache_slots_[it->second];
+            slot.last_used = access_counter_;
+            return slot.gpu_data;
         }
 
-        // Need an L1 slot
+        // L1 Miss: find eviction candidate in L1
         int evict_slot = -1;
-        int64_t oldest = INT64_MAX;
+        int64_t oldest_time = INT64_MAX;
         for (int i = 0; i < cache_capacity_; i++) {
             if (cache_slots_[i].layer_id < 0) {
                 evict_slot = i;
                 break;
             }
-            if (cache_slots_[i].last_used < oldest) {
-                oldest = cache_slots_[i].last_used;
+            if (cache_slots_[i].last_used < oldest_time) {
+                oldest_time = cache_slots_[i].last_used;
                 evict_slot = i;
             }
         }
@@ -871,61 +845,56 @@ public:
         if (slot.layer_id >= 0) {
             int64_t old_key = (int64_t)slot.layer_id * n_experts_ + slot.expert_id;
             key_to_slot_.erase(old_key);
-            if (old_key >= 0 && old_key < (int64_t)flat_vram_ptrs_.size()) {
-                flat_vram_ptrs_[old_key] = nullptr;
-            }
+            flat_vram_ptrs_[old_key] = nullptr;
         }
-        
+
         slot.layer_id = layer_id;
         slot.expert_id = expert_id;
         slot.last_used = access_counter_;
         key_to_slot_[key] = evict_slot;
-        if (key >= 0 && key < (int64_t)flat_vram_ptrs_.size()) {
-            flat_vram_ptrs_[key] = slot.gpu_data;
-        }
+        flat_vram_ptrs_[key] = slot.gpu_data;
 
-        // Check L2 (DRAM)
         void* host_src_ptr = nullptr;
         int stage_idx = -1;
 
+        // 2. Check L2 Cache (DRAM) if available
         if (dram_cache_capacity_ > 0) {
-            auto it2 = dram_key_to_slot_.find(key);
-            if (it2 != dram_key_to_slot_.end()) {
-                // L2 Hit
-                dram_cache_slots_[it2->second].last_used = access_counter_;
-                host_src_ptr = dram_cache_slots_[it2->second].gpu_data;
-                
+            auto dram_it = dram_key_to_slot_.find(key);
+            if (dram_it != dram_key_to_slot_.end()) {
+                // L2 Hit!
+                auto& dram_slot = dram_cache_slots_[dram_it->second];
+                dram_slot.last_used = access_counter_;
+                host_src_ptr = dram_slot.gpu_data;
                 if (g_log_experts) {
                     LOG_INFO("[ExpertCache] L2 Hit: L%d E%d -> L1 slot %d", layer_id, expert_id, evict_slot);
                 }
             } else {
-                // L2 Miss - we must load into L2 first, then L1
+                // L2 Miss: Find L2 eviction candidate and read from disk directly into L2
                 int evict_dram = -1;
-                int64_t oldest_dram = INT64_MAX;
+                int64_t oldest_dram_time = INT64_MAX;
                 for (int i = 0; i < dram_cache_capacity_; i++) {
                     if (dram_cache_slots_[i].layer_id < 0) {
                         evict_dram = i;
                         break;
                     }
-                    if (dram_cache_slots_[i].last_used < oldest_dram) {
-                        oldest_dram = dram_cache_slots_[i].last_used;
+                    if (dram_cache_slots_[i].last_used < oldest_dram_time) {
+                        oldest_dram_time = dram_cache_slots_[i].last_used;
                         evict_dram = i;
                     }
                 }
-                
-                auto& d_slot = dram_cache_slots_[evict_dram];
-                if (d_slot.layer_id >= 0) {
-                    int64_t old_key = (int64_t)d_slot.layer_id * n_experts_ + d_slot.expert_id;
-                    dram_key_to_slot_.erase(old_key);
+
+                auto& dram_slot = dram_cache_slots_[evict_dram];
+                if (dram_slot.layer_id >= 0) {
+                    int64_t old_dram_key = (int64_t)dram_slot.layer_id * n_experts_ + dram_slot.expert_id;
+                    dram_key_to_slot_.erase(old_dram_key);
                 }
-                
-                d_slot.layer_id = layer_id;
-                d_slot.expert_id = expert_id;
-                d_slot.last_used = access_counter_;
+
+                dram_slot.layer_id = layer_id;
+                dram_slot.expert_id = expert_id;
+                dram_slot.last_used = access_counter_;
                 dram_key_to_slot_[key] = evict_dram;
-                
-                host_src_ptr = d_slot.gpu_data;
-                
+
+                host_src_ptr = dram_slot.gpu_data;
                 if (g_log_experts) {
                     LOG_INFO("[ExpertCache] L2 Miss (SSD read): L%d E%d -> L2 slot %d -> L1 slot %d", 
                              layer_id, expert_id, evict_dram, evict_slot);
@@ -933,10 +902,10 @@ public:
                 
                 // Read from disk into L2 directly
                 int64_t file_offset = (int64_t)key * expert_block_size_;
-                ssize_t bytes_read = pread(expert_fd_, host_src_ptr, expert_block_size_, file_offset);
+                int64_t bytes_read = expert_file_.pread_exact(host_src_ptr, expert_block_size_, file_offset);
                 if (bytes_read != expert_block_size_) {
                     LOG_ERROR("Expert read failed: layer=%d expert=%d offset=%ld got=%ld",
-                              layer_id, expert_id, file_offset, bytes_read);
+                              layer_id, expert_id, file_offset, (long)bytes_read);
                     lock.unlock();
                     return nullptr;
                 }
@@ -959,10 +928,10 @@ public:
             CUDA_CHECK(cudaEventSynchronize(stage.event));
             
             int64_t file_offset = (int64_t)key * expert_block_size_;
-            ssize_t bytes_read = pread(expert_fd_, stage.ptr, expert_block_size_, file_offset);
+            int64_t bytes_read = expert_file_.pread_exact(stage.ptr, expert_block_size_, file_offset);
             if (bytes_read != expert_block_size_) {
                 LOG_ERROR("Expert read failed: layer=%d expert=%d offset=%ld got=%ld",
-                          layer_id, expert_id, file_offset, bytes_read);
+                          layer_id, expert_id, file_offset, (long)bytes_read);
                 return nullptr;
             }
             host_src_ptr = stage.ptr;
@@ -971,7 +940,6 @@ public:
             CUDA_CHECK(cudaEventRecord(stage.event, stream));
         } else {
             // Memory in host_src_ptr (L2) is already populated, async copy to L1
-            // Since L2 is just pinned host memory, we can copy from it directly safely.
             CUDA_CHECK(cudaMemcpyAsync(slot.gpu_data, host_src_ptr, expert_block_size_,
                                         cudaMemcpyHostToDevice, stream));
         }
@@ -1006,7 +974,7 @@ public:
                     int e = i % n_experts_;
                     int64_t file_offset = (int64_t)i * expert_block_size_;
 
-                    ssize_t bytes_read = pread(expert_fd_, stage_ptr, expert_block_size_, file_offset);
+                    int64_t bytes_read = expert_file_.pread_exact(stage_ptr, expert_block_size_, file_offset);
                     if (bytes_read == expert_block_size_) {
                         void* dst = cache_slots_[i].gpu_data;
                         cache_slots_[i].layer_id = l;
@@ -1056,7 +1024,7 @@ public:
                             int e = expert_global_idx % n_experts_;
                             int64_t file_offset = (int64_t)expert_global_idx * expert_block_size_;
                             void* dst = dram_cache_slots_[i].gpu_data;
-                            ssize_t bytes_read = pread(expert_fd_, dst, expert_block_size_, file_offset);
+                            int64_t bytes_read = expert_file_.pread_exact(dst, expert_block_size_, file_offset);
                             if (bytes_read == expert_block_size_) {
                                 dram_cache_slots_[i].layer_id = l;
                                 dram_cache_slots_[i].expert_id = e;
@@ -1095,7 +1063,7 @@ public:
     }
 
     void cleanup() {
-        if (expert_fd_ >= 0) close(expert_fd_);
+        expert_file_.close();
         if (cache_pool_gpu_) cudaFree(cache_pool_gpu_);
         if (dram_cache_pool_) cudaFreeHost(dram_cache_pool_);
         flat_vram_ptrs_gpu_.free();
@@ -1877,16 +1845,12 @@ private:
                             const json& tensor_map) {
         LOG_INFO("Loading dense tensors from %s", dense_path.c_str());
 
-        int fd = open(dense_path.c_str(), O_RDONLY);
-        if (fd < 0) { LOG_ERROR("Cannot open dense bin"); return false; }
-
-        struct stat st;
-        fstat(fd, &st);
-        size_t file_size = st.st_size;
-
-        // mmap the entire dense bin for easy access
-        void* mapped = mmap(nullptr, file_size, PROT_READ, MAP_PRIVATE, fd, 0);
-        if (mapped == MAP_FAILED) { LOG_ERROR("mmap failed"); close(fd); return false; }
+        moecher::platform::MemoryMappedFile dense_mmap;
+        if (!dense_mmap.open_read(dense_path)) {
+            LOG_ERROR("Cannot open or mmap dense bin: %s", dense_path.c_str());
+            return false;
+        }
+        void* mapped = dense_mmap.data();
 
         auto load_tensor = [&](GPUTensor& gpu, const std::string& name) -> bool {
             if (!tensor_map.contains(name)) {
@@ -2015,8 +1979,7 @@ private:
             }
         }
 
-        munmap(mapped, file_size);
-        close(fd);
+        dense_mmap.close();
         LOG_INFO("Dense tensors loaded");
         return true;
     }

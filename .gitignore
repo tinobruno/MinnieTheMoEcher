@@ -32,6 +32,8 @@ src_backups/
 *.out
 *.txt
 
-# Python
+# Python & Distribution
 __pycache__/
 *.pyc
+dist*/
+*.zip

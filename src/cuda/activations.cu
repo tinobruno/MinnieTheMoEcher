@@ -5,6 +5,7 @@
 
 #include "activations.cuh"
 #include <cuda_bf16.h>
+#include <cuda_bf16.hpp>
 #include <cuda_fp16.h>
 #include <cmath>
 #include <cfloat>
@@ -20,6 +21,17 @@ __device__ __forceinline__ float bf16_to_float(__nv_bfloat16 v) {
 
 __device__ __forceinline__ __nv_bfloat16 float_to_bf16(float v) {
     return __float2bfloat16(v);
+}
+
+__device__ __forceinline__ float2 to_float2_bf162(const __nv_bfloat162& v) {
+    return make_float2(__bfloat162float(v.x), __bfloat162float(v.y));
+}
+
+__device__ __forceinline__ __nv_bfloat162 to_bf162_float2(const float2& v) {
+    __nv_bfloat162 t;
+    t.x = __float2bfloat16(v.x);
+    t.y = __float2bfloat16(v.y);
+    return t;
 }
 
 // E8M0 (unsigned exponent only) -> float multiplier
@@ -1166,10 +1178,10 @@ __global__ void gemv_fp8_kernel(
         uint2 w8 = w_vec8[chunk];
         uint4 a8 = a_vec4[chunk];
 
-        float2 f0 = __bfloat1622float2(*reinterpret_cast<const __nv_bfloat162*>(&a8.x));
-        float2 f1 = __bfloat1622float2(*reinterpret_cast<const __nv_bfloat162*>(&a8.y));
-        float2 f2 = __bfloat1622float2(*reinterpret_cast<const __nv_bfloat162*>(&a8.z));
-        float2 f3 = __bfloat1622float2(*reinterpret_cast<const __nv_bfloat162*>(&a8.w));
+        float2 f0 = to_float2_bf162(*reinterpret_cast<const __nv_bfloat162*>(&a8.x));
+        float2 f1 = to_float2_bf162(*reinterpret_cast<const __nv_bfloat162*>(&a8.y));
+        float2 f2 = to_float2_bf162(*reinterpret_cast<const __nv_bfloat162*>(&a8.z));
+        float2 f3 = to_float2_bf162(*reinterpret_cast<const __nv_bfloat162*>(&a8.w));
 
         float chunk_sum = 0.0f;
         chunk_sum += fp8_e4m3_to_float_v2((w8.x) & 0xFF) * f0.x;
@@ -1244,10 +1256,10 @@ __global__ void gemv_fp8_grouped_kernel(
         uint2 w8 = w_vec8[chunk];
         uint4 a8 = a_vec4[chunk];
 
-        float2 f0 = __bfloat1622float2(*reinterpret_cast<const __nv_bfloat162*>(&a8.x));
-        float2 f1 = __bfloat1622float2(*reinterpret_cast<const __nv_bfloat162*>(&a8.y));
-        float2 f2 = __bfloat1622float2(*reinterpret_cast<const __nv_bfloat162*>(&a8.z));
-        float2 f3 = __bfloat1622float2(*reinterpret_cast<const __nv_bfloat162*>(&a8.w));
+        float2 f0 = to_float2_bf162(*reinterpret_cast<const __nv_bfloat162*>(&a8.x));
+        float2 f1 = to_float2_bf162(*reinterpret_cast<const __nv_bfloat162*>(&a8.y));
+        float2 f2 = to_float2_bf162(*reinterpret_cast<const __nv_bfloat162*>(&a8.z));
+        float2 f3 = to_float2_bf162(*reinterpret_cast<const __nv_bfloat162*>(&a8.w));
 
         float chunk_sum = 0.0f;
         chunk_sum += fp8_e4m3_to_float_v2((w8.x) & 0xFF) * f0.x;
@@ -1309,10 +1321,10 @@ __global__ void gemv_hc_pre_norm_kernel(
     int n_vec8 = hc_dim / 8;
     for (int i = tid; i < n_vec8; i += blockDim.x) {
         uint4 u = hc_vec8[i];
-        float2 f0 = __bfloat1622float2(*reinterpret_cast<const __nv_bfloat162*>(&u.x));
-        float2 f1 = __bfloat1622float2(*reinterpret_cast<const __nv_bfloat162*>(&u.y));
-        float2 f2 = __bfloat1622float2(*reinterpret_cast<const __nv_bfloat162*>(&u.z));
-        float2 f3 = __bfloat1622float2(*reinterpret_cast<const __nv_bfloat162*>(&u.w));
+        float2 f0 = to_float2_bf162(*reinterpret_cast<const __nv_bfloat162*>(&u.x));
+        float2 f1 = to_float2_bf162(*reinterpret_cast<const __nv_bfloat162*>(&u.y));
+        float2 f2 = to_float2_bf162(*reinterpret_cast<const __nv_bfloat162*>(&u.z));
+        float2 f3 = to_float2_bf162(*reinterpret_cast<const __nv_bfloat162*>(&u.w));
         sum_sq += f0.x * f0.x + f0.y * f0.y + f1.x * f1.x + f1.y * f1.y +
                   f2.x * f2.x + f2.y * f2.y + f3.x * f3.x + f3.y * f3.y;
     }
@@ -1344,8 +1356,8 @@ __global__ void gemv_hc_pre_norm_kernel(
     for (int i = tid; i < n_vec4; i += blockDim.x) {
         float4 fn4 = fn_vec4[i];
         uint2 u = hc_vec4[i];
-        float2 f0 = __bfloat1622float2(*reinterpret_cast<const __nv_bfloat162*>(&u.x));
-        float2 f1 = __bfloat1622float2(*reinterpret_cast<const __nv_bfloat162*>(&u.y));
+        float2 f0 = to_float2_bf162(*reinterpret_cast<const __nv_bfloat162*>(&u.x));
+        float2 f1 = to_float2_bf162(*reinterpret_cast<const __nv_bfloat162*>(&u.y));
         sum += fn4.x * (f0.x * rsqrt_val) + fn4.y * (f0.y * rsqrt_val) +
                fn4.z * (f1.x * rsqrt_val) + fn4.w * (f1.y * rsqrt_val);
     }
@@ -1423,7 +1435,7 @@ __global__ void gemv_int2_kernel(
             for (int j = 0; j < 8; j++) {
                 uint32_t a_val = a_arr[j];
                 __nv_bfloat162 bf2 = *reinterpret_cast<__nv_bfloat162*>(&a_val);
-                float2 f2 = __bfloat1622float2(bf2);
+                float2 f2 = to_float2_bf162(bf2);
 
                 int byte_idx = j / 2;
                 int nibble_idx = j % 2;
@@ -1804,39 +1816,39 @@ __global__ void hc_pre_weighted_add_kernel(
         uint4 u2 = s2_ptr[idx];
         uint4 u3 = s3_ptr[idx];
 
-        float2 f0_0 = __bfloat1622float2(*reinterpret_cast<const __nv_bfloat162*>(&u0.x));
-        float2 f0_1 = __bfloat1622float2(*reinterpret_cast<const __nv_bfloat162*>(&u0.y));
-        float2 f0_2 = __bfloat1622float2(*reinterpret_cast<const __nv_bfloat162*>(&u0.z));
-        float2 f0_3 = __bfloat1622float2(*reinterpret_cast<const __nv_bfloat162*>(&u0.w));
+        float2 f0_0 = to_float2_bf162(*reinterpret_cast<const __nv_bfloat162*>(&u0.x));
+        float2 f0_1 = to_float2_bf162(*reinterpret_cast<const __nv_bfloat162*>(&u0.y));
+        float2 f0_2 = to_float2_bf162(*reinterpret_cast<const __nv_bfloat162*>(&u0.z));
+        float2 f0_3 = to_float2_bf162(*reinterpret_cast<const __nv_bfloat162*>(&u0.w));
 
-        float2 f1_0 = __bfloat1622float2(*reinterpret_cast<const __nv_bfloat162*>(&u1.x));
-        float2 f1_1 = __bfloat1622float2(*reinterpret_cast<const __nv_bfloat162*>(&u1.y));
-        float2 f1_2 = __bfloat1622float2(*reinterpret_cast<const __nv_bfloat162*>(&u1.z));
-        float2 f1_3 = __bfloat1622float2(*reinterpret_cast<const __nv_bfloat162*>(&u1.w));
+        float2 f1_0 = to_float2_bf162(*reinterpret_cast<const __nv_bfloat162*>(&u1.x));
+        float2 f1_1 = to_float2_bf162(*reinterpret_cast<const __nv_bfloat162*>(&u1.y));
+        float2 f1_2 = to_float2_bf162(*reinterpret_cast<const __nv_bfloat162*>(&u1.z));
+        float2 f1_3 = to_float2_bf162(*reinterpret_cast<const __nv_bfloat162*>(&u1.w));
 
-        float2 f2_0 = __bfloat1622float2(*reinterpret_cast<const __nv_bfloat162*>(&u2.x));
-        float2 f2_1 = __bfloat1622float2(*reinterpret_cast<const __nv_bfloat162*>(&u2.y));
-        float2 f2_2 = __bfloat1622float2(*reinterpret_cast<const __nv_bfloat162*>(&u2.z));
-        float2 f2_3 = __bfloat1622float2(*reinterpret_cast<const __nv_bfloat162*>(&u2.w));
+        float2 f2_0 = to_float2_bf162(*reinterpret_cast<const __nv_bfloat162*>(&u2.x));
+        float2 f2_1 = to_float2_bf162(*reinterpret_cast<const __nv_bfloat162*>(&u2.y));
+        float2 f2_2 = to_float2_bf162(*reinterpret_cast<const __nv_bfloat162*>(&u2.z));
+        float2 f2_3 = to_float2_bf162(*reinterpret_cast<const __nv_bfloat162*>(&u2.w));
 
-        float2 f3_0 = __bfloat1622float2(*reinterpret_cast<const __nv_bfloat162*>(&u3.x));
-        float2 f3_1 = __bfloat1622float2(*reinterpret_cast<const __nv_bfloat162*>(&u3.y));
-        float2 f3_2 = __bfloat1622float2(*reinterpret_cast<const __nv_bfloat162*>(&u3.z));
-        float2 f3_3 = __bfloat1622float2(*reinterpret_cast<const __nv_bfloat162*>(&u3.w));
+        float2 f3_0 = to_float2_bf162(*reinterpret_cast<const __nv_bfloat162*>(&u3.x));
+        float2 f3_1 = to_float2_bf162(*reinterpret_cast<const __nv_bfloat162*>(&u3.y));
+        float2 f3_2 = to_float2_bf162(*reinterpret_cast<const __nv_bfloat162*>(&u3.z));
+        float2 f3_3 = to_float2_bf162(*reinterpret_cast<const __nv_bfloat162*>(&u3.w));
 
-        __nv_bfloat162 res0 = __float22bfloat162_rn(make_float2(
+        __nv_bfloat162 res0 = to_bf162_float2(make_float2(
             w0 * f0_0.x + w1 * f1_0.x + w2 * f2_0.x + w3 * f3_0.x,
             w0 * f0_0.y + w1 * f1_0.y + w2 * f2_0.y + w3 * f3_0.y
         ));
-        __nv_bfloat162 res1 = __float22bfloat162_rn(make_float2(
+        __nv_bfloat162 res1 = to_bf162_float2(make_float2(
             w0 * f0_1.x + w1 * f1_1.x + w2 * f2_1.x + w3 * f3_1.x,
             w0 * f0_1.y + w1 * f1_1.y + w2 * f2_1.y + w3 * f3_1.y
         ));
-        __nv_bfloat162 res2 = __float22bfloat162_rn(make_float2(
+        __nv_bfloat162 res2 = to_bf162_float2(make_float2(
             w0 * f0_2.x + w1 * f1_2.x + w2 * f2_2.x + w3 * f3_2.x,
             w0 * f0_2.y + w1 * f1_2.y + w2 * f2_2.y + w3 * f3_2.y
         ));
-        __nv_bfloat162 res3 = __float22bfloat162_rn(make_float2(
+        __nv_bfloat162 res3 = to_bf162_float2(make_float2(
             w0 * f0_3.x + w1 * f1_3.x + w2 * f2_3.x + w3 * f3_3.x,
             w0 * f0_3.y + w1 * f1_3.y + w2 * f2_3.y + w3 * f3_3.y
         ));
@@ -1889,58 +1901,58 @@ __global__ void hc_post_update_kernel(
         uint4 ur2 = reinterpret_cast<const uint4*>(hc_residual + 2 * dim)[idx];
         uint4 ur3 = reinterpret_cast<const uint4*>(hc_residual + 3 * dim)[idx];
 
-        float2 fh_0 = __bfloat1622float2(*reinterpret_cast<const __nv_bfloat162*>(&uh.x));
-        float2 fh_1 = __bfloat1622float2(*reinterpret_cast<const __nv_bfloat162*>(&uh.y));
-        float2 fh_2 = __bfloat1622float2(*reinterpret_cast<const __nv_bfloat162*>(&uh.z));
-        float2 fh_3 = __bfloat1622float2(*reinterpret_cast<const __nv_bfloat162*>(&uh.w));
+        float2 fh_0 = to_float2_bf162(*reinterpret_cast<const __nv_bfloat162*>(&uh.x));
+        float2 fh_1 = to_float2_bf162(*reinterpret_cast<const __nv_bfloat162*>(&uh.y));
+        float2 fh_2 = to_float2_bf162(*reinterpret_cast<const __nv_bfloat162*>(&uh.z));
+        float2 fh_3 = to_float2_bf162(*reinterpret_cast<const __nv_bfloat162*>(&uh.w));
 
-        float2 fr0_0 = __bfloat1622float2(*reinterpret_cast<const __nv_bfloat162*>(&ur0.x));
-        float2 fr0_1 = __bfloat1622float2(*reinterpret_cast<const __nv_bfloat162*>(&ur0.y));
-        float2 fr0_2 = __bfloat1622float2(*reinterpret_cast<const __nv_bfloat162*>(&ur0.z));
-        float2 fr0_3 = __bfloat1622float2(*reinterpret_cast<const __nv_bfloat162*>(&ur0.w));
+        float2 fr0_0 = to_float2_bf162(*reinterpret_cast<const __nv_bfloat162*>(&ur0.x));
+        float2 fr0_1 = to_float2_bf162(*reinterpret_cast<const __nv_bfloat162*>(&ur0.y));
+        float2 fr0_2 = to_float2_bf162(*reinterpret_cast<const __nv_bfloat162*>(&ur0.z));
+        float2 fr0_3 = to_float2_bf162(*reinterpret_cast<const __nv_bfloat162*>(&ur0.w));
 
-        float2 fr1_0 = __bfloat1622float2(*reinterpret_cast<const __nv_bfloat162*>(&ur1.x));
-        float2 fr1_1 = __bfloat1622float2(*reinterpret_cast<const __nv_bfloat162*>(&ur1.y));
-        float2 fr1_2 = __bfloat1622float2(*reinterpret_cast<const __nv_bfloat162*>(&ur1.z));
-        float2 fr1_3 = __bfloat1622float2(*reinterpret_cast<const __nv_bfloat162*>(&ur1.w));
+        float2 fr1_0 = to_float2_bf162(*reinterpret_cast<const __nv_bfloat162*>(&ur1.x));
+        float2 fr1_1 = to_float2_bf162(*reinterpret_cast<const __nv_bfloat162*>(&ur1.y));
+        float2 fr1_2 = to_float2_bf162(*reinterpret_cast<const __nv_bfloat162*>(&ur1.z));
+        float2 fr1_3 = to_float2_bf162(*reinterpret_cast<const __nv_bfloat162*>(&ur1.w));
 
-        float2 fr2_0 = __bfloat1622float2(*reinterpret_cast<const __nv_bfloat162*>(&ur2.x));
-        float2 fr2_1 = __bfloat1622float2(*reinterpret_cast<const __nv_bfloat162*>(&ur2.y));
-        float2 fr2_2 = __bfloat1622float2(*reinterpret_cast<const __nv_bfloat162*>(&ur2.z));
-        float2 fr2_3 = __bfloat1622float2(*reinterpret_cast<const __nv_bfloat162*>(&ur2.w));
+        float2 fr2_0 = to_float2_bf162(*reinterpret_cast<const __nv_bfloat162*>(&ur2.x));
+        float2 fr2_1 = to_float2_bf162(*reinterpret_cast<const __nv_bfloat162*>(&ur2.y));
+        float2 fr2_2 = to_float2_bf162(*reinterpret_cast<const __nv_bfloat162*>(&ur2.z));
+        float2 fr2_3 = to_float2_bf162(*reinterpret_cast<const __nv_bfloat162*>(&ur2.w));
 
-        float2 fr3_0 = __bfloat1622float2(*reinterpret_cast<const __nv_bfloat162*>(&ur3.x));
-        float2 fr3_1 = __bfloat1622float2(*reinterpret_cast<const __nv_bfloat162*>(&ur3.y));
-        float2 fr3_2 = __bfloat1622float2(*reinterpret_cast<const __nv_bfloat162*>(&ur3.z));
-        float2 fr3_3 = __bfloat1622float2(*reinterpret_cast<const __nv_bfloat162*>(&ur3.w));
+        float2 fr3_0 = to_float2_bf162(*reinterpret_cast<const __nv_bfloat162*>(&ur3.x));
+        float2 fr3_1 = to_float2_bf162(*reinterpret_cast<const __nv_bfloat162*>(&ur3.y));
+        float2 fr3_2 = to_float2_bf162(*reinterpret_cast<const __nv_bfloat162*>(&ur3.z));
+        float2 fr3_3 = to_float2_bf162(*reinterpret_cast<const __nv_bfloat162*>(&ur3.w));
 
         // Row 0
         uint4 out0;
-        *reinterpret_cast<__nv_bfloat162*>(&out0.x) = __float22bfloat162_rn(make_float2(p0 * fh_0.x + c00 * fr0_0.x + c10 * fr1_0.x + c20 * fr2_0.x + c30 * fr3_0.x, p0 * fh_0.y + c00 * fr0_0.y + c10 * fr1_0.y + c20 * fr2_0.y + c30 * fr3_0.y));
-        *reinterpret_cast<__nv_bfloat162*>(&out0.y) = __float22bfloat162_rn(make_float2(p0 * fh_1.x + c00 * fr0_1.x + c10 * fr1_1.x + c20 * fr2_1.x + c30 * fr3_1.x, p0 * fh_1.y + c00 * fr0_1.y + c10 * fr1_1.y + c20 * fr2_1.y + c30 * fr3_1.y));
-        *reinterpret_cast<__nv_bfloat162*>(&out0.z) = __float22bfloat162_rn(make_float2(p0 * fh_2.x + c00 * fr0_2.x + c10 * fr1_2.x + c20 * fr2_2.x + c30 * fr3_2.x, p0 * fh_2.y + c00 * fr0_2.y + c10 * fr1_2.y + c20 * fr2_2.y + c30 * fr3_2.y));
-        *reinterpret_cast<__nv_bfloat162*>(&out0.w) = __float22bfloat162_rn(make_float2(p0 * fh_3.x + c00 * fr0_3.x + c10 * fr1_3.x + c20 * fr2_3.x + c30 * fr3_3.x, p0 * fh_3.y + c00 * fr0_3.y + c10 * fr1_3.y + c20 * fr2_3.y + c30 * fr3_3.y));
+        *reinterpret_cast<__nv_bfloat162*>(&out0.x) = to_bf162_float2(make_float2(p0 * fh_0.x + c00 * fr0_0.x + c10 * fr1_0.x + c20 * fr2_0.x + c30 * fr3_0.x, p0 * fh_0.y + c00 * fr0_0.y + c10 * fr1_0.y + c20 * fr2_0.y + c30 * fr3_0.y));
+        *reinterpret_cast<__nv_bfloat162*>(&out0.y) = to_bf162_float2(make_float2(p0 * fh_1.x + c00 * fr0_1.x + c10 * fr1_1.x + c20 * fr2_1.x + c30 * fr3_1.x, p0 * fh_1.y + c00 * fr0_1.y + c10 * fr1_1.y + c20 * fr2_1.y + c30 * fr3_1.y));
+        *reinterpret_cast<__nv_bfloat162*>(&out0.z) = to_bf162_float2(make_float2(p0 * fh_2.x + c00 * fr0_2.x + c10 * fr1_2.x + c20 * fr2_2.x + c30 * fr3_2.x, p0 * fh_2.y + c00 * fr0_2.y + c10 * fr1_2.y + c20 * fr2_2.y + c30 * fr3_2.y));
+        *reinterpret_cast<__nv_bfloat162*>(&out0.w) = to_bf162_float2(make_float2(p0 * fh_3.x + c00 * fr0_3.x + c10 * fr1_3.x + c20 * fr2_3.x + c30 * fr3_3.x, p0 * fh_3.y + c00 * fr0_3.y + c10 * fr1_3.y + c20 * fr2_3.y + c30 * fr3_3.y));
 
         // Row 1
         uint4 out1;
-        *reinterpret_cast<__nv_bfloat162*>(&out1.x) = __float22bfloat162_rn(make_float2(p1 * fh_0.x + c01 * fr0_0.x + c11 * fr1_0.x + c21 * fr2_0.x + c31 * fr3_0.x, p1 * fh_0.y + c01 * fr0_0.y + c11 * fr1_0.y + c21 * fr2_0.y + c31 * fr3_0.y));
-        *reinterpret_cast<__nv_bfloat162*>(&out1.y) = __float22bfloat162_rn(make_float2(p1 * fh_1.x + c01 * fr0_1.x + c11 * fr1_1.x + c21 * fr2_1.x + c31 * fr3_1.x, p1 * fh_1.y + c01 * fr0_1.y + c11 * fr1_1.y + c21 * fr2_1.y + c31 * fr3_1.y));
-        *reinterpret_cast<__nv_bfloat162*>(&out1.z) = __float22bfloat162_rn(make_float2(p1 * fh_2.x + c01 * fr0_2.x + c11 * fr1_2.x + c21 * fr2_2.x + c31 * fr3_2.x, p1 * fh_2.y + c01 * fr0_2.y + c11 * fr1_2.y + c21 * fr2_2.y + c31 * fr3_2.y));
-        *reinterpret_cast<__nv_bfloat162*>(&out1.w) = __float22bfloat162_rn(make_float2(p1 * fh_3.x + c01 * fr0_3.x + c11 * fr1_3.x + c21 * fr2_3.x + c31 * fr3_3.x, p1 * fh_3.y + c01 * fr0_3.y + c11 * fr1_3.y + c21 * fr2_3.y + c31 * fr3_3.y));
+        *reinterpret_cast<__nv_bfloat162*>(&out1.x) = to_bf162_float2(make_float2(p1 * fh_0.x + c01 * fr0_0.x + c11 * fr1_0.x + c21 * fr2_0.x + c31 * fr3_0.x, p1 * fh_0.y + c01 * fr0_0.y + c11 * fr1_0.y + c21 * fr2_0.y + c31 * fr3_0.y));
+        *reinterpret_cast<__nv_bfloat162*>(&out1.y) = to_bf162_float2(make_float2(p1 * fh_1.x + c01 * fr0_1.x + c11 * fr1_1.x + c21 * fr2_1.x + c31 * fr3_1.x, p1 * fh_1.y + c01 * fr0_1.y + c11 * fr1_1.y + c21 * fr2_1.y + c31 * fr3_1.y));
+        *reinterpret_cast<__nv_bfloat162*>(&out1.z) = to_bf162_float2(make_float2(p1 * fh_2.x + c01 * fr0_2.x + c11 * fr1_2.x + c21 * fr2_2.x + c31 * fr3_2.x, p1 * fh_2.y + c01 * fr0_2.y + c11 * fr1_2.y + c21 * fr2_2.y + c31 * fr3_2.y));
+        *reinterpret_cast<__nv_bfloat162*>(&out1.w) = to_bf162_float2(make_float2(p1 * fh_3.x + c01 * fr0_3.x + c11 * fr1_3.x + c21 * fr2_3.x + c31 * fr3_3.x, p1 * fh_3.y + c01 * fr0_3.y + c11 * fr1_3.y + c21 * fr2_3.y + c31 * fr3_3.y));
 
         // Row 2
         uint4 out2;
-        *reinterpret_cast<__nv_bfloat162*>(&out2.x) = __float22bfloat162_rn(make_float2(p2 * fh_0.x + c02 * fr0_0.x + c12 * fr1_0.x + c22 * fr2_0.x + c32 * fr3_0.x, p2 * fh_0.y + c02 * fr0_0.y + c12 * fr1_0.y + c22 * fr2_0.y + c32 * fr3_0.y));
-        *reinterpret_cast<__nv_bfloat162*>(&out2.y) = __float22bfloat162_rn(make_float2(p2 * fh_1.x + c02 * fr0_1.x + c12 * fr1_1.x + c22 * fr2_1.x + c32 * fr3_1.x, p2 * fh_1.y + c02 * fr0_1.y + c12 * fr1_1.y + c22 * fr2_1.y + c32 * fr3_1.y));
-        *reinterpret_cast<__nv_bfloat162*>(&out2.z) = __float22bfloat162_rn(make_float2(p2 * fh_2.x + c02 * fr0_2.x + c12 * fr1_2.x + c22 * fr2_2.x + c32 * fr3_2.x, p2 * fh_2.y + c02 * fr0_2.y + c12 * fr1_2.y + c22 * fr2_2.y + c32 * fr3_2.y));
-        *reinterpret_cast<__nv_bfloat162*>(&out2.w) = __float22bfloat162_rn(make_float2(p2 * fh_3.x + c02 * fr0_3.x + c12 * fr1_3.x + c22 * fr2_3.x + c32 * fr3_3.x, p2 * fh_3.y + c02 * fr0_3.y + c12 * fr1_3.y + c22 * fr2_3.y + c32 * fr3_3.y));
+        *reinterpret_cast<__nv_bfloat162*>(&out2.x) = to_bf162_float2(make_float2(p2 * fh_0.x + c02 * fr0_0.x + c12 * fr1_0.x + c22 * fr2_0.x + c32 * fr3_0.x, p2 * fh_0.y + c02 * fr0_0.y + c12 * fr1_0.y + c22 * fr2_0.y + c32 * fr3_0.y));
+        *reinterpret_cast<__nv_bfloat162*>(&out2.y) = to_bf162_float2(make_float2(p2 * fh_1.x + c02 * fr0_1.x + c12 * fr1_1.x + c22 * fr2_1.x + c32 * fr3_1.x, p2 * fh_1.y + c02 * fr0_1.y + c12 * fr1_1.y + c22 * fr2_1.y + c32 * fr3_1.y));
+        *reinterpret_cast<__nv_bfloat162*>(&out2.z) = to_bf162_float2(make_float2(p2 * fh_2.x + c02 * fr0_2.x + c12 * fr1_2.x + c22 * fr2_2.x + c32 * fr3_2.x, p2 * fh_2.y + c02 * fr0_2.y + c12 * fr1_2.y + c22 * fr2_2.y + c32 * fr3_2.y));
+        *reinterpret_cast<__nv_bfloat162*>(&out2.w) = to_bf162_float2(make_float2(p2 * fh_3.x + c02 * fr0_3.x + c12 * fr1_3.x + c22 * fr2_3.x + c32 * fr3_3.x, p2 * fh_3.y + c02 * fr0_3.y + c12 * fr1_3.y + c22 * fr2_3.y + c32 * fr3_3.y));
 
         // Row 3
         uint4 out3;
-        *reinterpret_cast<__nv_bfloat162*>(&out3.x) = __float22bfloat162_rn(make_float2(p3 * fh_0.x + c03 * fr0_0.x + c13 * fr1_0.x + c23 * fr2_0.x + c33 * fr3_0.x, p3 * fh_0.y + c03 * fr0_0.y + c13 * fr1_0.y + c23 * fr2_0.y + c33 * fr3_0.y));
-        *reinterpret_cast<__nv_bfloat162*>(&out3.y) = __float22bfloat162_rn(make_float2(p3 * fh_1.x + c03 * fr0_1.x + c13 * fr1_1.x + c23 * fr2_1.x + c33 * fr3_1.x, p3 * fh_1.y + c03 * fr0_1.y + c13 * fr1_1.y + c23 * fr2_1.y + c33 * fr3_1.y));
-        *reinterpret_cast<__nv_bfloat162*>(&out3.z) = __float22bfloat162_rn(make_float2(p3 * fh_2.x + c03 * fr0_2.x + c13 * fr1_2.x + c23 * fr2_2.x + c33 * fr3_2.x, p3 * fh_2.y + c03 * fr0_2.y + c13 * fr1_2.y + c23 * fr2_2.y + c33 * fr3_2.y));
-        *reinterpret_cast<__nv_bfloat162*>(&out3.w) = __float22bfloat162_rn(make_float2(p3 * fh_3.x + c03 * fr0_3.x + c13 * fr1_3.x + c23 * fr2_3.x + c33 * fr3_3.x, p3 * fh_3.y + c03 * fr0_3.y + c13 * fr1_3.y + c23 * fr2_3.y + c33 * fr3_3.y));
+        *reinterpret_cast<__nv_bfloat162*>(&out3.x) = to_bf162_float2(make_float2(p3 * fh_0.x + c03 * fr0_0.x + c13 * fr1_0.x + c23 * fr2_0.x + c33 * fr3_0.x, p3 * fh_0.y + c03 * fr0_0.y + c13 * fr1_0.y + c23 * fr2_0.y + c33 * fr3_0.y));
+        *reinterpret_cast<__nv_bfloat162*>(&out3.y) = to_bf162_float2(make_float2(p3 * fh_1.x + c03 * fr0_1.x + c13 * fr1_1.x + c23 * fr2_1.x + c33 * fr3_1.x, p3 * fh_1.y + c03 * fr0_1.y + c13 * fr1_1.y + c23 * fr2_1.y + c33 * fr3_1.y));
+        *reinterpret_cast<__nv_bfloat162*>(&out3.z) = to_bf162_float2(make_float2(p3 * fh_2.x + c03 * fr0_2.x + c13 * fr1_2.x + c23 * fr2_2.x + c33 * fr3_2.x, p3 * fh_2.y + c03 * fr0_2.y + c13 * fr1_2.y + c23 * fr2_2.y + c33 * fr3_2.y));
+        *reinterpret_cast<__nv_bfloat162*>(&out3.w) = to_bf162_float2(make_float2(p3 * fh_3.x + c03 * fr0_3.x + c13 * fr1_3.x + c23 * fr2_3.x + c33 * fr3_3.x, p3 * fh_3.y + c03 * fr0_3.y + c13 * fr1_3.y + c23 * fr2_3.y + c33 * fr3_3.y));
 
         reinterpret_cast<uint4*>(hc_state + 0 * dim)[idx] = out0;
         reinterpret_cast<uint4*>(hc_state + 1 * dim)[idx] = out1;

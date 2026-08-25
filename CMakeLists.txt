@@ -4,11 +4,19 @@ project(moecher LANGUAGES CXX CUDA)
 set(CMAKE_CXX_STANDARD 17)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
 set(CMAKE_CUDA_STANDARD 17)
-set(CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} -O3 -march=native -funroll-loops")
-set(CMAKE_CUDA_FLAGS "${CMAKE_CUDA_FLAGS} -O3")
+if(MSVC)
+    add_compile_definitions(NOMINMAX WIN32_LEAN_AND_MEAN _CRT_SECURE_NO_WARNINGS)
+    set(CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} /O2 /arch:AVX2 /utf-8 /EHsc /fp:fast")
+    set(CMAKE_CUDA_FLAGS "${CMAKE_CUDA_FLAGS} -Xcompiler=/utf-8,/EHsc")
+else()
+    set(CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} -O3 -march=native -funroll-loops")
+    set(CMAKE_CUDA_FLAGS "${CMAKE_CUDA_FLAGS} -O3")
+endif()
 
-# CUDA architecture: sm_89 (Ada/Blackwell Workstation) & sm_90 (Hopper/Blackwell)
-set(CMAKE_CUDA_ARCHITECTURES "89;90")
+# CUDA architectures: sm_86 (RTX 3090), sm_89 (Ada/4090/6000), sm_90 (Hopper/Blackwell)
+if(NOT DEFINED CMAKE_CUDA_ARCHITECTURES)
+    set(CMAKE_CUDA_ARCHITECTURES "86;89;90")
+endif()
 
 # ── Fetch header-only dependencies ──────────────────────────────────────────────
 include(FetchContent)
@@ -49,14 +57,26 @@ add_executable(moecher
     src/server_single.cpp
 )
 
-target_link_libraries(moecher PRIVATE
-    moecher_cuda
-    CUDA::cublas
-    CUDA::cudart
-    httplib::httplib
-    nlohmann_json::nlohmann_json
-    pthread
-)
+if(WIN32)
+    target_link_libraries(moecher PRIVATE
+        moecher_cuda
+        CUDA::cublas
+        CUDA::cudart
+        httplib::httplib
+        nlohmann_json::nlohmann_json
+        ws2_32
+        crypt32
+    )
+else()
+    target_link_libraries(moecher PRIVATE
+        moecher_cuda
+        CUDA::cublas
+        CUDA::cudart
+        httplib::httplib
+        nlohmann_json::nlohmann_json
+        pthread
+    )
+endif()
 
 target_include_directories(moecher PRIVATE
     src/cuda
