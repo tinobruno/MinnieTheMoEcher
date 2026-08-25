@@ -30,6 +30,7 @@ def package_windows(output_dir="dist_windows", make_zip=False):
         "CMakeLists.txt",
         "moecher_manifest_iq2.json",
         "moecher_manifest.json",
+        "tokenizer.json",
         "README.md",
         "README-Windows.md",
         "README-3090.md",

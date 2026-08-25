@@ -90,10 +90,10 @@
     "eos_token_id": 1,
     "user_token": "<\uff5cUser\uff5c>",
     "assistant_token": "<\uff5cAssistant\uff5c>",
-    "tokenizer_json": "/home/tinobruno/.cache/huggingface/hub/models--deepseek-ai--DeepSeek-V4-Flash-0731/snapshots/7872f01b1d1fe23eabc4c98b48bffcef5a386062/tokenizer.json"
+    "tokenizer_json": "tokenizer.json"
   },
-  "dense_bin": "/home/tinobruno/minniethemoecher/attention_dense_layers.bin",
-  "expert_bin": "/home/tinobruno/minniethemoecher/moe_experts_iq2.bin",
+  "dense_bin": "attention_dense_layers.bin",
+  "expert_bin": "moe_experts_iq2.bin",
   "dense_tensors": {
     "embed.weight": {
       "offset": 0,

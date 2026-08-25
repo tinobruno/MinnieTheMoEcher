@@ -306,8 +306,24 @@ static inline uint64_t joyai_consume_letters(const char* s, uint64_t len, uint64
 class BPETokenizer {
 public:
     bool load(const std::string& path) {
-        std::ifstream f(path);
-        if (!f.is_open()) { LOG_ERROR("Cannot open tokenizer: %s", path.c_str()); return false; }
+        std::string resolved_path = path;
+        std::ifstream f(resolved_path);
+        if (!f.is_open()) {
+            // Try basename
+            size_t last_slash = path.find_last_of("/\\");
+            if (last_slash != std::string::npos) {
+                resolved_path = path.substr(last_slash + 1);
+                f.open(resolved_path);
+            }
+        }
+        if (!f.is_open()) {
+            resolved_path = "tokenizer.json";
+            f.open(resolved_path);
+        }
+        if (!f.is_open()) {
+            LOG_ERROR("Cannot open tokenizer: %s (or fallback tokenizer.json)", path.c_str());
+            return false;
+        }
         json tok;
         try { f >> tok; } catch (const std::exception& e) {
             LOG_ERROR("JSON parse error in tokenizer: %s", e.what()); return false;
@@ -1316,8 +1332,22 @@ public:
         LOG_INFO("VRAM: %.1f GB free / %.1f GB total",
                  vram_free / (1024.0 * 1024.0 * 1024.0), vram_total / (1024.0 * 1024.0 * 1024.0));
 
+        auto resolve_file = [](const std::string& path, const std::string& fallback) -> std::string {
+            std::ifstream test(path);
+            if (test.good()) return path;
+            std::ifstream test_fb(fallback);
+            if (test_fb.good()) return fallback;
+            size_t last_slash = path.find_last_of("/\\");
+            if (last_slash != std::string::npos) {
+                std::string bname = path.substr(last_slash + 1);
+                std::ifstream test_bn(bname);
+                if (test_bn.good()) return bname;
+            }
+            return path;
+        };
+
         // Load dense tensors from attention_dense_layers.bin
-        std::string dense_path = manifest["dense_bin"].get<std::string>();
+        std::string dense_path = resolve_file(manifest["dense_bin"].get<std::string>(), "attention_dense_layers.bin");
         if (!load_dense_tensors(dense_path, manifest["dense_tensors"])) return false;
 
         // Load expert layout info
@@ -1336,7 +1366,7 @@ public:
         }
 
         // Init expert loader with O_DIRECT
-        std::string expert_path = manifest["expert_bin"].get<std::string>();
+        std::string expert_path = resolve_file(manifest["expert_bin"].get<std::string>(), "moe_experts_iq2.bin");
 
         // Allocate working buffers first
         alloc_buffers();
