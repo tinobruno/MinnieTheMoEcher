@@ -1,4 +1,12 @@
 cmake_minimum_required(VERSION 3.22)
+
+# Allow newer MSVC compiler versions with CUDA
+if(NOT DEFINED CMAKE_CUDA_FLAGS)
+    set(CMAKE_CUDA_FLAGS "--allow-unsupported-compiler")
+else()
+    set(CMAKE_CUDA_FLAGS "${CMAKE_CUDA_FLAGS} --allow-unsupported-compiler")
+endif()
+
 project(moecher LANGUAGES CXX CUDA)
 
 set(CMAKE_CXX_STANDARD 17)
@@ -7,7 +15,7 @@ set(CMAKE_CUDA_STANDARD 17)
 if(MSVC)
     add_compile_definitions(NOMINMAX WIN32_LEAN_AND_MEAN _CRT_SECURE_NO_WARNINGS)
     set(CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} /O2 /arch:AVX2 /utf-8 /EHsc /fp:fast")
-    set(CMAKE_CUDA_FLAGS "${CMAKE_CUDA_FLAGS} -Xcompiler=/utf-8,/EHsc")
+    set(CMAKE_CUDA_FLAGS "${CMAKE_CUDA_FLAGS} -Xcompiler=/utf-8,/EHsc --allow-unsupported-compiler")
 else()
     set(CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} -O3 -march=native -funroll-loops")
     set(CMAKE_CUDA_FLAGS "${CMAKE_CUDA_FLAGS} -O3")

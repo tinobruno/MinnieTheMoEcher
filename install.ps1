@@ -97,7 +97,10 @@ if (!(Test-Path $buildDir)) {
 }
 
 Write-Host "  Running CMake configure..." -ForegroundColor Cyan
-& $cmakePath -B build -A x64 -DCMAKE_BUILD_TYPE=Release
+if (Test-Path "build\CMakeCache.txt") {
+    Remove-Item "build\CMakeCache.txt" -Force
+}
+& $cmakePath -B build -A x64 -DCMAKE_CUDA_FLAGS="--allow-unsupported-compiler" -DCMAKE_BUILD_TYPE=Release
 
 if ($LASTEXITCODE -ne 0) {
     Write-Host "  [ERROR] CMake configuration failed!" -ForegroundColor Red
