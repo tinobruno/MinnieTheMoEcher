@@ -173,7 +173,7 @@ public:
         close();
 
 #if defined(_WIN32) || defined(_WIN64)
-        DWORD flags = FILE_ATTRIBUTE_READONLY | FILE_FLAG_SEQUENTIAL_SCAN;
+        DWORD flags = FILE_ATTRIBUTE_READONLY | FILE_FLAG_OVERLAPPED;
         if (use_direct_io) {
             flags |= FILE_FLAG_NO_BUFFERING;
         }
@@ -183,7 +183,7 @@ public:
 
         if (handle_ == INVALID_HANDLE_VALUE && use_direct_io) {
             // Fallback to standard buffered read if NO_BUFFERING fails
-            flags = FILE_ATTRIBUTE_READONLY | FILE_FLAG_SEQUENTIAL_SCAN;
+            flags = FILE_ATTRIBUTE_READONLY | FILE_FLAG_OVERLAPPED;
             handle_ = CreateFileA(path.c_str(), GENERIC_READ, FILE_SHARE_READ,
                                   NULL, OPEN_EXISTING, flags, NULL);
             use_direct_io = false;
@@ -218,14 +218,23 @@ public:
         OVERLAPPED ov = {0};
         ov.Offset = static_cast<DWORD>(offset & 0xFFFFFFFF);
         ov.OffsetHigh = static_cast<DWORD>((offset >> 32) & 0xFFFFFFFF);
+        ov.hEvent = CreateEventA(NULL, TRUE, FALSE, NULL);
 
         DWORD bytes_read = 0;
-        if (!ReadFile(handle_, dst, static_cast<DWORD>(count), &bytes_read, &ov)) {
+        BOOL ok = ReadFile(handle_, dst, static_cast<DWORD>(count), &bytes_read, &ov);
+        if (!ok) {
             DWORD err = GetLastError();
-            if (err != ERROR_HANDLE_EOF) {
+            if (err == ERROR_IO_PENDING) {
+                if (!GetOverlappedResult(handle_, &ov, &bytes_read, TRUE)) {
+                    if (ov.hEvent) CloseHandle(ov.hEvent);
+                    return -1;
+                }
+            } else if (err != ERROR_HANDLE_EOF) {
+                if (ov.hEvent) CloseHandle(ov.hEvent);
                 return -1;
             }
         }
+        if (ov.hEvent) CloseHandle(ov.hEvent);
         return static_cast<int64_t>(bytes_read);
 #else
         if (fd_ < 0) return -1;

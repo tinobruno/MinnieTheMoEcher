@@ -306,20 +306,8 @@ static inline uint64_t joyai_consume_letters(const char* s, uint64_t len, uint64
 class BPETokenizer {
 public:
     bool load(const std::string& path) {
-        std::string resolved_path = path;
-        std::ifstream f(resolved_path);
-        if (!f.is_open()) {
-            // Try basename (strip directory prefix from path)
-            size_t last_slash = path.find_last_of("/\\");
-            if (last_slash != std::string::npos) {
-                resolved_path = path.substr(last_slash + 1);
-                f.open(resolved_path);
-            }
-        }
-        if (!f.is_open()) {
-            LOG_ERROR("Cannot open tokenizer: %s", path.c_str());
-            return false;
-        }
+        std::ifstream f(path);
+        if (!f.is_open()) { LOG_ERROR("Cannot open tokenizer: %s", path.c_str()); return false; }
         json tok;
         try { f >> tok; } catch (const std::exception& e) {
             LOG_ERROR("JSON parse error in tokenizer: %s", e.what()); return false;
@@ -868,6 +856,7 @@ public:
 
         void* host_src_ptr = nullptr;
         int stage_idx = -1;
+        bool needs_disk_read = false;
 
         // 2. Check L2 Cache (DRAM) if available
         if (dram_cache_capacity_ > 0) {
@@ -907,25 +896,17 @@ public:
                 dram_key_to_slot_[key] = evict_dram;
 
                 host_src_ptr = dram_slot.gpu_data;
+                needs_disk_read = true;
                 if (g_log_experts) {
                     LOG_INFO("[ExpertCache] L2 Miss (SSD read): L%d E%d -> L2 slot %d -> L1 slot %d", 
                              layer_id, expert_id, evict_dram, evict_slot);
-                }
-                
-                // Read from disk into L2 directly
-                int64_t file_offset = (int64_t)key * expert_block_size_;
-                int64_t bytes_read = expert_file_.pread_exact(host_src_ptr, expert_block_size_, file_offset);
-                if (bytes_read != expert_block_size_) {
-                    LOG_ERROR("Expert read failed: layer=%d expert=%d offset=%ld got=%ld",
-                              layer_id, expert_id, file_offset, (long)bytes_read);
-                    lock.unlock();
-                    return nullptr;
                 }
             }
         } else {
             // No L2 cache, fallback to staging buffer
             stage_idx = staging_idx_;
             staging_idx_ = (staging_idx_ + 1) % NUM_STAGING_BUFFERS;
+            needs_disk_read = true;
             
             if (g_log_experts) {
                 LOG_INFO("[ExpertCache] L1 Miss (SSD read, No L2): L%d E%d -> L1 slot %d", 
@@ -951,6 +932,15 @@ public:
                                         cudaMemcpyHostToDevice, stream));
             CUDA_CHECK(cudaEventRecord(stage.event, stream));
         } else {
+            if (needs_disk_read) {
+                int64_t file_offset = (int64_t)key * expert_block_size_;
+                int64_t bytes_read = expert_file_.pread_exact(host_src_ptr, expert_block_size_, file_offset);
+                if (bytes_read != expert_block_size_) {
+                    LOG_ERROR("Expert read failed: layer=%d expert=%d offset=%ld got=%ld",
+                              layer_id, expert_id, file_offset, (long)bytes_read);
+                    return nullptr;
+                }
+            }
             // Memory in host_src_ptr (L2) is already populated, async copy to L1
             CUDA_CHECK(cudaMemcpyAsync(slot.gpu_data, host_src_ptr, expert_block_size_,
                                         cudaMemcpyHostToDevice, stream));
@@ -1328,20 +1318,8 @@ public:
         LOG_INFO("VRAM: %.1f GB free / %.1f GB total",
                  vram_free / (1024.0 * 1024.0 * 1024.0), vram_total / (1024.0 * 1024.0 * 1024.0));
 
-        auto resolve_file = [](const std::string& path) -> std::string {
-            std::ifstream test(path);
-            if (test.good()) return path;
-            size_t last_slash = path.find_last_of("/\\");
-            if (last_slash != std::string::npos) {
-                std::string bname = path.substr(last_slash + 1);
-                std::ifstream test_bn(bname);
-                if (test_bn.good()) return bname;
-            }
-            return path;
-        };
-
-        // Load dense tensors
-        std::string dense_path = resolve_file(manifest["dense_bin"].get<std::string>());
+        // Load dense tensors from attention_dense_layers.bin
+        std::string dense_path = manifest["dense_bin"].get<std::string>();
         if (!load_dense_tensors(dense_path, manifest["dense_tensors"])) return false;
 
         // Load expert layout info
@@ -1360,7 +1338,7 @@ public:
         }
 
         // Init expert loader with O_DIRECT
-        std::string expert_path = resolve_file(manifest["expert_bin"].get<std::string>());
+        std::string expert_path = manifest["expert_bin"].get<std::string>();
 
         // Allocate working buffers first
         alloc_buffers();
