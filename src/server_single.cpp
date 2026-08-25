@@ -44,6 +44,7 @@
 #include <mutex>
 #include <memory>
 #include <random>
+#include <atomic>
 
 #include <cuda_runtime.h>
 #include <cuda_bf16.h>
@@ -92,10 +93,11 @@ bool g_log_experts = false;
 bool g_log_tokens = true;
 bool g_quiet = false;
 bool g_server_ready = false;
+static std::atomic<bool> g_stop_requested{false};
 
 
 static void log_msg(const char* level, const char* fmt, ...) {
-    if (g_quiet && g_server_ready && strcmp(level, "INFO") == 0) {
+    if (g_quiet && g_server_ready && (strcmp(level, "INFO") == 0 || strcmp(level, "WARN") == 0)) {
         return;
     }
     std::lock_guard<std::mutex> lock(g_log_mutex);
@@ -148,6 +150,7 @@ struct ModelConfig {
     int original_seq_len = 65536;
     int sliding_window = 128;
     int window_size = 128;              // raw attention window per layer (paper: 128)
+    int max_seq_len = 32768;           // max sequence context length
     std::string scoring_func = "sqrtsoftplus";
     float routed_scaling_factor = 1.5f;
     float swiglu_limit = 10.0f;
@@ -192,6 +195,8 @@ struct ModelConfig {
         get(original_seq_len, "original_seq_len");
         get(sliding_window, "sliding_window");
         get(window_size, "window_size");
+        get(max_seq_len, "max_seq_len");
+        get(max_seq_len, "max_position_embeddings");
         // If window_size not in manifest, use sliding_window as fallback
         if (!j.contains("window_size")) window_size = sliding_window;
         get(scoring_func, "scoring_func");
@@ -207,12 +212,12 @@ struct ModelConfig {
         if (j.contains("compress_ratios") && j["compress_ratios"].is_array()) {
             compress_ratios = j["compress_ratios"].get<std::vector<int>>();
         }
-        // Compute max compressed entries: sliding_window / min_ratio
-        // This determines the size of the compressed KV cache per layer
+        // Compute max compressed entries: max_seq_len / min_ratio
+        // This determines the size of the compressed KV cache per layer across the full context
         max_compressed_entries = 0;
         for (int r : compress_ratios) {
             if (r > 0) {
-                int entries = sliding_window / r;
+                int entries = max_seq_len / r + 2;
                 if (entries > max_compressed_entries) max_compressed_entries = entries;
             }
         }
@@ -1177,6 +1182,11 @@ public:
         GPUTensor shared_w2_w, shared_w2_s;
         GPUTensor shared_w3_w, shared_w3_s;
 
+        // Shared expert (FP4 4-bit dynamic VRAM quantization)
+        GPUTensor shared_fp4_w1_w, shared_fp4_w1_s;
+        GPUTensor shared_fp4_w2_w, shared_fp4_w2_s;
+        GPUTensor shared_fp4_w3_w, shared_fp4_w3_s;
+
         // HC (Hyper-Connection) parameters
         GPUTensor hc_attn_fn;     // [(2+hc)*hc, hc*hidden] F32
         GPUTensor hc_attn_base;   // [(2+hc)*hc] F32
@@ -1252,8 +1262,17 @@ public:
     std::vector<float> logits_host_;
     std::vector<float> probs_host_;
     __nv_bfloat16* logits_bf16_host_ = nullptr;
+    GPUTensor buf_sampler_scratch_;
+    GPUTensor buf_sampled_token_d_;
+    GPUTensor buf_seen_tokens_d_;
+    int32_t* h_sampled_token_ = nullptr;
+    std::vector<int32_t> seen_tokens_host_;
 
     ~MoecherEngine() {
+        if (h_sampled_token_) {
+            cudaFreeHost(h_sampled_token_);
+            h_sampled_token_ = nullptr;
+        }
         if (logits_bf16_host_) {
             cudaFreeHost(logits_bf16_host_);
             logits_bf16_host_ = nullptr;
@@ -1275,10 +1294,19 @@ public:
     // Dequant buffer — large enough for the biggest weight matrix
     static constexpr size_t DEQUANT_BUF_SIZE = 64 * 1024 * 1024;  // 64 MB
 
+    std::string shared_expert_dtype_ = "q4_k";
+    bool shared_fp4_enabled_ = true;
+
     // ── Load model from manifest ────────────────────────────────────────────
 
-    bool load(const std::string& manifest_path, float max_vram_gb = 0.0f, float dram_cache_gb = 0.0f, const std::string& expert_dtype_override = "") {
+    bool load(const std::string& manifest_path, float max_vram_gb = 0.0f, float dram_cache_gb = 0.0f,
+              const std::string& expert_dtype_override = "", const std::string& shared_expert_dtype = "q4_k") {
         LOG_INFO("Loading manifest: %s", manifest_path.c_str());
+
+        shared_expert_dtype_ = shared_expert_dtype;
+        shared_fp4_enabled_ = (shared_expert_dtype_ == "q4_k" || shared_expert_dtype_ == "fp4");
+        LOG_INFO("Shared expert format: %s (FP4 dynamic VRAM quantization: %s)",
+                 shared_expert_dtype_.c_str(), shared_fp4_enabled_ ? "enabled" : "disabled");
 
         std::ifstream f(manifest_path);
         if (!f.is_open()) { LOG_ERROR("Cannot open manifest"); return false; }
@@ -1478,10 +1506,11 @@ public:
     // ── Generate tokens ─────────────────────────────────────────────────────
 
     std::string generate(const std::vector<int>& prompt, int max_tokens = 512,
-                         float temperature = 0.0f,
-                         std::function<void(const std::string&,bool)> on_token = nullptr,
+                         float temperature = 1.0f,
+                         std::function<bool(const std::string&,bool)> on_token = nullptr,
                          float repetition_penalty = 1.0f,
-                         bool enable_thinking = true) {
+                         bool enable_thinking = true,
+                         int max_thinking_tokens = 2048) {
         // Reset debug flags for this request
         dbg_first_token_ = true;
         dbg_hc_pre_call_ = 0;
@@ -1522,97 +1551,115 @@ public:
             CUDA_CHECK(cudaMemset(buf_hc_state_.data, 0, buf_hc_state_.size_bytes));
         }
 
-        // Store repetition_penalty for use in sample_token
-        current_rep_penalty_ = repetition_penalty;
-
-        // Tokenize
-        std::vector<int> input_ids = prompt;//tokenizer_.encode(prompt);
-        LOG_INFO("Prompt tokens: %zu", input_ids.size());
-        // Log first 10 token IDs for debugging
-        std::string ids_str;
-        for (size_t i = 0; i < std::min(input_ids.size(), (size_t)10); i++) {
-            if (i > 0) ids_str += ", ";
-            ids_str += std::to_string(input_ids[i]);
-        }
-        LOG_INFO("First tokens: [%s]", ids_str.c_str());
-
-        if (g_log_tokens) {
-            printf("\n");
+        // Prefill prompt
+        for (size_t i = 0; i < prompt.size(); i++) {
+            forward_token(prompt[i], (int)i);
         }
 
+        // Token generation loop
         std::vector<int> output_ids;
-
-        // Prefill: process all prompt tokens
-        for (size_t i = 0; i < input_ids.size(); i++) {
-            forward_token(input_ids[i], (int)i);
-        }
-
-        // Repetition history: only generated tokens (not prompt tokens).
-        // Seeding with prompt tokens was tried but it incorrectly penalizes
-        // tokens from the user's current query (e.g., "Amiga").
-        std::vector<int> history;
-
-        // Decode: generate tokens one by one
-        int position = (int)input_ids.size();
+        std::vector<int> history(prompt.begin(), prompt.end());
+        int position = (int)prompt.size();
+        std::string generated_text;
         std::string token_buffer;
-        std::string generated_text;  // Track full output for sentence-boundary stopping
-        std::string finish_reason = "stop";
 
-        // Think-block filtering state
-        // DeepSeek V4 generates <think>...</think> before the actual response
-        bool in_think_block = enable_thinking;
-        bool think_block_ended = false;
-        std::string think_detect_buffer;
-        // Get token IDs for think tags
+        // Think token IDs
         int think_start_id = tokenizer_.get_token_id("<think>");
         int think_end_id = tokenizer_.get_token_id("</think>");
-        // Also check with special token format
-        //if (think_start_id < 0) think_start_id = tokenizer_.get_token_id("\xef\xbd\x9c" "think" "\xef\xbd\x9c");
-        //if (think_end_id < 0) think_end_id = tokenizer_.get_token_id("\xef\xbd\x9c" "/think" "\xef\xbd\x9c");
+        if (think_start_id < 0) think_start_id = 128821;
+        if (think_end_id < 0) think_end_id = 128822;
 
+        int eos2_id = tokenizer_.get_token_id("<|end_of_sentence|>");
+        if (eos2_id < 0) eos2_id = tokenizer_.get_token_id("<｜end of sentence｜>");
 
-        // Additional EOS tokens for DeepSeek V4
-        int eos2_id = tokenizer_.get_token_id(
-            "<\xef\xbd\x9c" "end\xe2\x96\x81of\xe2\x96\x81sentence" "\xef\xbd\x9c>");
+        int user_id = tokenizer_.get_token_id("<｜User｜>");
+        if (user_id < 0) user_id = 128803;
+        int asst_id = tokenizer_.get_token_id("<｜Assistant｜>");
+        if (asst_id < 0) asst_id = 128804;
 
-        LOG_WARN("Think tokens: start=%d end=%d, EOS=%d eos2=%d",
-                 think_start_id, think_end_id, cfg_.eos_token_id, eos2_id);
+        LOG_WARN("Think tokens: start=%d end=%d, EOS=%d eos2=%d user=%d asst=%d, think_budget=%d",
+                 think_start_id, think_end_id, cfg_.eos_token_id, eos2_id, user_id, asst_id, max_thinking_tokens);
 
-        // Track how many content tokens (non-think) we've generated
+        // Track whether we are inside a <think> block
+        // DeepSeek V3/V4 thinking mode: the chat template appends <think> to the prompt,
+        // so the model starts generation INSIDE the think block.
+        bool in_think_block = enable_thinking;
+        bool think_block_ended = false;
+        std::string finish_reason = "length";
+
+        // Set per-request repetition penalty
+        current_rep_penalty_ = repetition_penalty;
+
         int content_tokens_generated = 0;
-
-        //force and inject think start
-      //  in_think_block = true ;
-
-       // forward_token(think_start_id, position);
-      //  position++;    
+        int thinking_tokens_generated = 0;
 
         for (int t = 0; content_tokens_generated < max_tokens; t++) {
-            // Sample from logits, suppressing EOS for the first few tokens
-            int next_token = sample_token(temperature, history, content_tokens_generated,in_think_block);
-            // Check all EOS conditions
-            if (next_token == cfg_.eos_token_id ||
-                (eos2_id >= 0 && next_token == eos2_id)) {
-                LOG_WARN("EOS hit: token=%d (cfg_eos=%d, eos2=%d) at step %d/%d",
-                         next_token, cfg_.eos_token_id, eos2_id, t, max_tokens);
-                if (!in_think_block) break;
-                forward_token(think_end_id, position);
-                position++;
+            if (g_stop_requested.load()) {
+                LOG_WARN("Generation stopped by client stop request at step %d", t);
+                finish_reason = "stop";
+                break;
+            }
+
+            // Check if thinking budget is reached while inside thinking block
+            if (in_think_block && max_thinking_tokens > 0 && thinking_tokens_generated >= max_thinking_tokens) {
+                LOG_WARN("Thinking budget reached (%d/%d tokens). Forcing </think> transition.",
+                         thinking_tokens_generated, max_thinking_tokens);
                 in_think_block = false;
+                think_block_ended = true;
+                if (think_end_id >= 0) {
+                    forward_token(think_end_id, position);
+                    position++;
+                    output_ids.push_back(think_end_id);
+                    history.push_back(think_end_id);
+                }
                 continue;
+            }
+
+            // Sample from logits
+            int next_token = sample_token(temperature, history, content_tokens_generated, in_think_block);
+            
+            // If EOS is sampled while inside think block, transition to </think> and continue
+            if (in_think_block && (next_token == cfg_.eos_token_id || (eos2_id >= 0 && next_token == eos2_id))) {
+                LOG_WARN("EOS sampled during thinking at step %d (%d thinking tokens). Transitioning to </think> and starting content.",
+                         t, thinking_tokens_generated);
+                in_think_block = false;
+                think_block_ended = true;
+                if (think_end_id >= 0) {
+                    forward_token(think_end_id, position);
+                    position++;
+                    output_ids.push_back(think_end_id);
+                    history.push_back(think_end_id);
+                }
+                continue;
+            }
+
+            // Check all EOS and stop conditions in content mode
+            if (next_token == cfg_.eos_token_id || (eos2_id >= 0 && next_token == eos2_id)) {
+                LOG_WARN("Stop token hit: token=%d (cfg_eos=%d, eos2=%d) at step %d (content: %d/%d, think: %d/%d)",
+                         next_token, cfg_.eos_token_id, eos2_id, t,
+                         content_tokens_generated, max_tokens,
+                         thinking_tokens_generated, max_thinking_tokens);
+                finish_reason = "stop";
+                break;
+            }
+
+            if (!enable_thinking && (next_token == think_start_id || next_token == think_end_id)) {
+                LOG_WARN("Thinking control token hit in no-think mode: token=%d", next_token);
+                finish_reason = "stop";
+                break;
             }
 
             output_ids.push_back(next_token);
             history.push_back(next_token);
-            if (!in_think_block) content_tokens_generated++;
-
            
             // Handle think block filtering
             if (think_start_id >= 0 && next_token == think_start_id) {
-                in_think_block = true;
-                think_block_ended = false;
+                if (!think_block_ended) {
+                    in_think_block = true;
+                    think_block_ended = false;
+                }
+               
                 // Forward the token but don't emit it
-                LOG_WARN("think_start_id hit");
                 forward_token(next_token, position);
                 position++;
                 continue;
@@ -1620,7 +1667,6 @@ public:
             if (think_end_id >= 0 && next_token == think_end_id) {
                 in_think_block = false;
                 think_block_ended = true;
-                LOG_WARN("think_end_id hit");   
 
                 // Forward the token but don't emit it
                 forward_token(next_token, position);
@@ -1628,18 +1674,23 @@ public:
                 continue;
             }
 
+            if (in_think_block) {
+                thinking_tokens_generated++;
+            } else {
+                content_tokens_generated++;
+            }
+
             std::string token_text = tokenizer_.decode({next_token});
 
-            // If we just exited a think block, skip leading newlines
+            // If we just exited a think block and this token is purely whitespace/newlines, skip it cleanly
             if (think_block_ended && !token_text.empty()) {
-                size_t start = token_text.find_first_not_of("\n\r");
+                size_t start = token_text.find_first_not_of("\n\r \t");
                 if (start == std::string::npos) {
-                    // All whitespace, skip
+                    // Pure whitespace token, skip
                     forward_token(next_token, position);
                     position++;
                     continue;
                 }
-                if (start > 0) token_text = token_text.substr(start);
                 think_block_ended = false;
             }
 
@@ -1677,7 +1728,12 @@ public:
                     }
                 }
                 if (on_token) {
-                    on_token(token_buffer, in_think_block);
+                    if (!on_token(token_buffer, in_think_block)) {
+                        LOG_WARN("Generation aborted by token callback at step %d", t);
+                        finish_reason = "stop";
+                        token_buffer.clear();
+                        break;
+                    }
                 }
                 token_buffer.clear();
             }
@@ -1748,7 +1804,7 @@ public:
             result = result.substr(first_non_ws);
         }
 
-        prompt_token_count_ = (int)input_ids.size();
+        prompt_token_count_ = (int)prompt.size();
         completion_token_count_ = (int)output_ids.size();
         last_finish_reason_ = finish_reason;
 
@@ -1835,8 +1891,8 @@ private:
                 load_tensor(lw.comp_ape, prefix + ".attn.compressor.ape");
                 load_tensor(lw.comp_norm, prefix + ".attn.compressor.norm.weight");
 
-                // Allocate compressed KV cache
-                int max_comp = cfg_.sliding_window / ratio;
+                // Allocate compressed KV cache for the full context window
+                int max_comp = cfg_.max_seq_len / ratio + 2;
                 lw.comp_kv_cache.alloc((size_t)max_comp * cfg_.head_dim * sizeof(__nv_bfloat16));
                 CUDA_CHECK(cudaMemset(lw.comp_kv_cache.data, 0, lw.comp_kv_cache.size_bytes));
                 lw.comp_kv_count = 0;
@@ -1876,13 +1932,48 @@ private:
                 }
             }
 
-            // Shared expert (FP8)
+            // Shared expert (FP8 baseline on disk)
             load_tensor(lw.shared_w1_w, prefix + ".ffn.shared_experts.w1.weight");
             load_tensor(lw.shared_w1_s, prefix + ".ffn.shared_experts.w1.scale");
             load_tensor(lw.shared_w2_w, prefix + ".ffn.shared_experts.w2.weight");
             load_tensor(lw.shared_w2_s, prefix + ".ffn.shared_experts.w2.scale");
             load_tensor(lw.shared_w3_w, prefix + ".ffn.shared_experts.w3.weight");
             load_tensor(lw.shared_w3_s, prefix + ".ffn.shared_experts.w3.scale");
+
+            if (shared_fp4_enabled_) {
+                int moe_inter = cfg_.moe_intermediate_size;
+                int dim = cfg_.hidden_size;
+
+                // Quantize w1: [2048, 4096]
+                lw.shared_fp4_w1_w.alloc((size_t)moe_inter * (dim / 2));
+                lw.shared_fp4_w1_s.alloc((size_t)moe_inter * (dim / 32));
+                quantize_fp8_to_fp4_cuda(
+                    lw.shared_fp4_w1_w.u8(), lw.shared_fp4_w1_s.u8(),
+                    lw.shared_w1_w.u8(), lw.shared_w1_s.u8(),
+                    moe_inter, dim, 128, main_stream_);
+                lw.shared_w1_w.free();
+                lw.shared_w1_s.free();
+
+                // Quantize w3: [2048, 4096]
+                lw.shared_fp4_w3_w.alloc((size_t)moe_inter * (dim / 2));
+                lw.shared_fp4_w3_s.alloc((size_t)moe_inter * (dim / 32));
+                quantize_fp8_to_fp4_cuda(
+                    lw.shared_fp4_w3_w.u8(), lw.shared_fp4_w3_s.u8(),
+                    lw.shared_w3_w.u8(), lw.shared_w3_s.u8(),
+                    moe_inter, dim, 128, main_stream_);
+                lw.shared_w3_w.free();
+                lw.shared_w3_s.free();
+
+                // Quantize w2: [4096, 2048]
+                lw.shared_fp4_w2_w.alloc((size_t)dim * (moe_inter / 2));
+                lw.shared_fp4_w2_s.alloc((size_t)dim * (moe_inter / 32));
+                quantize_fp8_to_fp4_cuda(
+                    lw.shared_fp4_w2_w.u8(), lw.shared_fp4_w2_s.u8(),
+                    lw.shared_w2_w.u8(), lw.shared_w2_s.u8(),
+                    dim, moe_inter, 128, main_stream_);
+                lw.shared_w2_w.free();
+                lw.shared_w2_s.free();
+            }
 
             // HC parameters
             load_tensor(lw.hc_attn_fn, prefix + ".hc_attn_fn");
@@ -1966,6 +2057,12 @@ private:
 
         if (logits_bf16_host_) cudaFreeHost(logits_bf16_host_);
         CUDA_CHECK(cudaMallocHost(&logits_bf16_host_, cfg_.vocab_size * sizeof(__nv_bfloat16)));
+
+        buf_sampler_scratch_.alloc(512 * sizeof(float));
+        buf_sampled_token_d_.alloc(sizeof(int32_t));
+        buf_seen_tokens_d_.alloc((size_t)MAX_SEQ_LEN * sizeof(int32_t));
+        if (h_sampled_token_) cudaFreeHost(h_sampled_token_);
+        CUDA_CHECK(cudaMallocHost(&h_sampled_token_, sizeof(int32_t)));
     }
 
     // ── cuBLAS GEMM helper (BF16) ──────────────────────────────────────────
@@ -2217,7 +2314,7 @@ private:
 
         // 8. Store in compressed KV cache
         int comp_idx = lw.comp_kv_count;
-        int max_comp = cfg_.sliding_window / ratio;
+        int max_comp = cfg_.max_seq_len / ratio + 2;
         if (comp_idx < max_comp) {
             CUDA_CHECK(cudaMemcpyAsync(
                 lw.comp_kv_cache.bf16() + (size_t)comp_idx * head_dim_val,
@@ -2410,12 +2507,8 @@ private:
         // For each head: score = q_head @ kv_cache.T / sqrt(head_dim)
         // Then softmax and weighted sum
 
-        // YaRN mscale correction for attention softmax scale.
+        // Attention softmax scale = 1.0 / sqrt(head_dim) matching ds4_cuda.cu
         float scale = 1.0f / sqrtf((float)head_dim_val);
-        if (cfg_.rope_factor > 1.0f) {
-            float mscale = 0.1f * logf((float)cfg_.rope_factor) + 1.0f;
-            scale *= mscale * mscale;
-        }
 
         const __nv_bfloat16* attn_kv_ptr;
         int attn_cache_len;
@@ -2629,20 +2722,32 @@ private:
         // 5. Shared expert executed concurrently on side_stream_ (must wait for ffn_norm to finish on main_stream_)
         CUDA_CHECK(cudaStreamWaitEvent(side_stream_, main_event_, 0));
         __nv_bfloat16* shared_gate = buf_gate_.bf16() + top_k * moe_inter;
-        __nv_bfloat16* shared_up   = buf_up_.bf16()   + top_k * moe_inter;
         __nv_bfloat16* shared_down = buf_down_.bf16() + top_k * dim;
 
-        gemm_fp8_dequant(shared_gate, 1, moe_inter, dim,
-                         buf_hidden_.bf16(),
-                         lw.shared_w1_w.u8(), lw.shared_w1_s.u8(), 128, side_stream_);
-        gemm_fp8_dequant(shared_up, 1, moe_inter, dim,
-                         buf_hidden_.bf16(),
-                         lw.shared_w3_w.u8(), lw.shared_w3_s.u8(), 128, side_stream_);
-        silu_mul_cuda(shared_gate, shared_gate, shared_up,
-                      moe_inter, cfg_.swiglu_limit, side_stream_);
-        gemm_fp8_dequant(shared_down, 1, dim, moe_inter,
-                         shared_gate,
-                         lw.shared_w2_w.u8(), lw.shared_w2_s.u8(), 128, side_stream_);
+        if (shared_fp4_enabled_) {
+            gemv_fp4_swiglu_fused_cuda(
+                shared_gate, buf_hidden_.bf16(),
+                lw.shared_fp4_w1_w.u8(), lw.shared_fp4_w1_s.u8(),
+                lw.shared_fp4_w3_w.u8(), lw.shared_fp4_w3_s.u8(),
+                moe_inter, dim, cfg_.swiglu_limit, side_stream_);
+
+            gemv_fp4_cuda(
+                shared_down, shared_gate,
+                lw.shared_fp4_w2_w.u8(), lw.shared_fp4_w2_s.u8(),
+                dim, moe_inter, side_stream_);
+        } else {
+            gemv_fp8_swiglu_fused_cuda(
+                shared_gate, buf_hidden_.bf16(),
+                lw.shared_w1_w.u8(), lw.shared_w1_s.u8(),
+                lw.shared_w3_w.u8(), lw.shared_w3_s.u8(),
+                moe_inter, dim, 128, cfg_.swiglu_limit, side_stream_);
+
+            gemv_fp8_cuda(
+                shared_down, shared_gate,
+                lw.shared_w2_w.u8(), lw.shared_w2_s.u8(),
+                dim, moe_inter, 128, side_stream_);
+        }
+
         CUDA_CHECK(cudaEventRecord(side_event_, side_stream_));
 
         // Wait for shared expert on side_stream_ before accumulating
@@ -2723,106 +2828,69 @@ private:
 
     int sample_token(float temperature, const std::vector<int>& history, int step = 0, bool is_reasoning = true) {
         int vocab = cfg_.vocab_size;
-        float* logits = logits_host_.data();
-        CUDA_CHECK(cudaMemcpyAsync(logits, buf_logits_.f32(),
-                                   vocab * sizeof(float), cudaMemcpyDeviceToHost, main_stream_));
+
+        // Repetition penalty — penalizes already-seen tokens directly on GPU
+        // When in thinking mode and no explicit penalty is set, default to 1.10f to prevent degenerate loops (e.g. repeated "(…)")
+        float rep_penalty = current_rep_penalty_;
+        if (rep_penalty <= 1.0f && is_reasoning) {
+            rep_penalty = 1.10f;
+        }
+        if (rep_penalty != 1.0f && !history.empty()) {
+            seen_tokens_host_.clear();
+            int start_idx = std::max(0, (int)history.size() - 256);
+            std::unordered_set<int> seen_set(history.begin() + start_idx, history.end());
+            for (int tok : seen_set) {
+                if (tok >= 0 && tok < vocab) {
+                    seen_tokens_host_.push_back(tok);
+                }
+            }
+            if (!seen_tokens_host_.empty()) {
+                CUDA_CHECK(cudaMemcpyAsync(
+                    buf_seen_tokens_d_.data,
+                    seen_tokens_host_.data(),
+                    seen_tokens_host_.size() * sizeof(int32_t),
+                    cudaMemcpyHostToDevice,
+                    main_stream_));
+                apply_repetition_penalty_cuda(
+                    buf_logits_.f32(),
+                    (const int32_t*)buf_seen_tokens_d_.data,
+                    (int)seen_tokens_host_.size(),
+                    vocab,
+                    rep_penalty,
+                    main_stream_);
+            }
+        }
+
+        // Generate uniform random float on host [0, 1)
+        float random_val = 0.0f;
+        if (temperature > 0.0f) {
+            std::uniform_real_distribution<float> dist(0.0f, 1.0f);
+            random_val = dist(rng_);
+        }
+
+        float min_p = 0.05f;
+
+        // Launch GPU parallel Min-P reduction & sampling kernel
+        gpu_sample_min_p_cuda(
+            buf_logits_.f32(),
+            vocab,
+            temperature,
+            min_p,
+            random_val,
+            (int32_t*)buf_sampled_token_d_.data,
+            buf_sampler_scratch_.f32(),
+            main_stream_);
+
+        // Copy single 4-byte token ID back to host
+        CUDA_CHECK(cudaMemcpyAsync(
+            h_sampled_token_,
+            buf_sampled_token_d_.data,
+            sizeof(int32_t),
+            cudaMemcpyDeviceToHost,
+            main_stream_));
         CUDA_CHECK(cudaStreamSynchronize(main_stream_));
 
-        // Suppress EOS for the first 2 tokens to avoid empty answers
-        if (step < 2) {
-            if (cfg_.eos_token_id >= 0 && cfg_.eos_token_id < vocab) {
-                logits[cfg_.eos_token_id] = -1e9f;
-            }
-        }
-
-        // Repetition penalty — penalizes already-seen tokens
-        float rep_penalty = current_rep_penalty_;
-        std::unordered_set<int> seen_tokens;
-        for (int token : history) {
-            seen_tokens.insert(token);
-        }
-        for (int token : seen_tokens) {
-            if (token >= 0 && token < vocab) {
-                if (logits[token] > 0) logits[token] /= rep_penalty;
-                else logits[token] *= rep_penalty;
-            }
-        }
-
-        // Debug: print top-5 logits on first decode
-        if (dbg_sample_count_ < 3) {
-            std::vector<std::pair<float, int>> scored;
-            for (int i = 0; i < vocab; i++) scored.push_back({logits[i], i});
-            std::partial_sort(scored.begin(), scored.begin() + 5, scored.end(),
-                             [](auto& a, auto& b) { return a.first > b.first; });
-            LOG_INFO("  Top-5 logits:");
-            for (int i = 0; i < 5; i++) {
-                LOG_INFO("    [%d] token=%d logit=%.4f", i, scored[i].second, scored[i].first);
-            }
-            dbg_sample_count_++;
-        }
-
-        static constexpr int COOLDOWN_TOKENS = 5;
-        float effective_temp = temperature;
-        if (is_reasoning && step < COOLDOWN_TOKENS) {
-            effective_temp = std::max(temperature, temperature * 0.5f);
-        }
-
-        int best_id = 0;
-        float max_logit = logits[0];
-        for (int i = 1; i < vocab; i++) {
-            if (logits[i] > max_logit) {
-                max_logit = logits[i];
-                best_id = i;
-            }
-        }
-
-        if (temperature <= 0.0f) {
-            return best_id;
-        }
-
-        // Exact Min-p filtering in log-space: prob >= min_p * max_prob <=> logit >= max_logit + temp * ln(min_p)
-        float min_p = 0.1f;
-        float logit_cutoff = max_logit + effective_temp * -2.302585093f;
-        float inv_temp = 1.0f / effective_temp;
-
-        // Collect candidates passing min-p (typically only 5 to 50 tokens out of 129k)
-        std::vector<std::pair<float, int>> candidates;
-        candidates.reserve(64);
-        for (int i = 0; i < vocab; i++) {
-            if (logits[i] >= logit_cutoff) {
-                float prob = expf((logits[i] - max_logit) * inv_temp);
-                candidates.push_back({prob, i});
-            }
-        }
-        if (candidates.empty()) {
-            return best_id;
-        }
-
-        int top_k = 40;
-        int k_keep = std::min((int)candidates.size(), top_k);
-        std::partial_sort(candidates.begin(), candidates.begin() + k_keep, candidates.end(),
-                          [](auto& a, auto& b) { return a.first > b.first; });
-
-        float top_p = 0.95f;
-        float total_prob = 0.0f;
-        for (auto& c : candidates) total_prob += c.first;
-        float norm_p = 1.0f / total_prob;
-
-        std::vector<float> sample_weights;
-        std::vector<int> sample_indices;
-        sample_weights.reserve(k_keep);
-        sample_indices.reserve(k_keep);
-
-        float cumsum = 0.0f;
-        for (int i = 0; i < k_keep; i++) {
-            sample_weights.push_back(candidates[i].first);
-            sample_indices.push_back(candidates[i].second);
-            cumsum += candidates[i].first * norm_p;
-            if (cumsum > top_p) break;
-        }
-
-        std::discrete_distribution<int> dist(sample_weights.begin(), sample_weights.end());
-        return sample_indices[dist(rng_)];
+        return *h_sampled_token_;
     }
 };
 
@@ -2830,34 +2898,49 @@ private:
 //  Chat Template
 // ════════════════════════════════════════════════════════════════════════════════
 
-static std::vector<int> apply_chat_template(const json& messages, const BPETokenizer& tok, bool enable_thinking = true) {
-    // DeepSeek V4 chat format (from official encoding_dsv4.py, thinking_mode="chat"):
-    // <｜begin▁of▁sentence｜>{system_content}
-    // <｜User｜>{user_content}<｜Assistant｜></think>{assistant_content}<｜end▁of▁sentence｜>
-    // <｜User｜>{user_content}<｜Assistant｜></think>
-    //
-    // Key: </think> after <｜Assistant｜> signals "chat mode" — skip thinking, answer directly.
-    // Without this token, the model enters an ambiguous state and produces premature EOS.
+static const std::string DS4_REASONING_EFFORT_HIGH_PREFIX =
+    "Reasoning Effort: Absolute maximum with no shortcuts permitted.\n"
+    "You MUST be very thorough in your thinking and comprehensively decompose the problem to resolve the root cause, rigorously stress-testing your logic against all potential paths, edge cases, and adversarial scenarios.\n"
+    "Explicitly write out your entire deliberation process, documenting every intermediate step, considered alternative, and rejected hypothesis to ensure absolutely no assumption is left unchecked.\n\n";
 
+static const std::string DS4_REASONING_EFFORT_MAX_PREFIX =
+    "Reasoning Effort: Beyond maximum — exhaustive, relentless, and uncompromising.\n"
+    "You MUST reason with the utmost depth and rigor, leaving absolutely nothing to chance: exhaustively decompose the problem into its most fundamental components, trace every causal chain to its root, and resolve the underlying cause rather than any surface symptom.\n"
+    "Do not stop reasoning until you have independently verified the solution from multiple angles and are certain that no assumption remains unchecked and no error remains undiscovered.\n\n";
 
-    static const int BOS = 0;
-    static const int EOS = 1;
-    static const int USER = 128803;
-    static const int ASSISTANT = 128804;
-    static const int THINK_BEGIN = 128821;
-    static const int THINK_END = 128822;
+static std::vector<int> apply_chat_template(const json& messages, const BPETokenizer& tok, bool enable_thinking = true, const std::string& reasoning_effort = "high") {
+    int BOS = tok.get_token_id("<｜begin of sentence｜>");
+    if (BOS < 0) BOS = tok.get_token_id("<｜begin\xe2\x96\x81of\xe2\x96\x81sentence｜>");
+    if (BOS < 0) BOS = 0;
 
-    /*static const std::string BOS = "<\xef\xbd\x9c" "begin\xe2\x96\x81of\xe2\x96\x81sentence" "\xef\xbd\x9c>";
-    static const std::string EOS = "<\xef\xbd\x9c" "end\xe2\x96\x81of\xe2\x96\x81sentence" "\xef\xbd\x9c>";
-    static const std::string USER = "<\xef\xbd\x9c" "User" "\xef\xbd\x9c>";
-    static const std::string ASSISTANT = "<\xef\xbd\x9c" "Assistant" "\xef\xbd\x9c>";
-    static const std::string THINK_BEGIN = "<think>";
-    static const std::string THINK_END = "</think>";
-*/
+    int EOS = tok.get_token_id("<｜end of sentence｜>");
+    if (EOS < 0) EOS = tok.get_token_id("<｜end\xe2\x96\x81of\xe2\x96\x81sentence｜>");
+    if (EOS < 1) EOS = 1;
+
+    int USER = tok.get_token_id("<｜User｜>");
+    if (USER < 0) USER = 128803;
+
+    int ASSISTANT = tok.get_token_id("<｜Assistant｜>");
+    if (ASSISTANT < 0) ASSISTANT = 128804;
+
+    int THINK_BEGIN = tok.get_token_id("<think>");
+    if (THINK_BEGIN < 0) THINK_BEGIN = 128821;
+
+    int THINK_END = tok.get_token_id("</think>");
+    if (THINK_END < 0) THINK_END = 128822;
 
     std::vector<int> result;
     result.push_back(BOS);
 
+    if (enable_thinking) {
+        if (reasoning_effort == "max") {
+            auto prefix_enc = tok.encode(DS4_REASONING_EFFORT_MAX_PREFIX);
+            result.insert(result.end(), prefix_enc.begin(), prefix_enc.end());
+        } else if (reasoning_effort == "high") {
+            auto prefix_enc = tok.encode(DS4_REASONING_EFFORT_HIGH_PREFIX);
+            result.insert(result.end(), prefix_enc.begin(), prefix_enc.end());
+        }
+    }
     for (size_t i = 0; i < messages.size(); i++) {
         std::string role = messages[i]["role"].get<std::string>();
         std::string content = messages[i]["content"].get<std::string>();
@@ -2872,21 +2955,10 @@ static std::vector<int> apply_chat_template(const json& messages, const BPEToken
             result.insert(result.end(), enc.begin(), enc.end());
         } else if (role == "assistant") {
             result.push_back(ASSISTANT);
-            if (messages[i].contains("reasoning_content") && !messages[i]["reasoning_content"].is_null()) {
-                string past_thoughts = messages[i]["reasoning_content"].get<std::string>();
-                if (!past_thoughts.empty()) {
-                    result.push_back(THINK_BEGIN);
-                    auto enc = tok.encode(past_thoughts);
-                    result.insert(result.end(), enc.begin(), enc.end());
-                    result.push_back(THINK_END);
-                }
-            } else {
-                 result.push_back(THINK_END);
-            }
-           
+            result.push_back(THINK_END);
             auto enc = tok.encode(content);
             result.insert(result.end(), enc.begin(), enc.end());
-            result.push_back(EOS);
+            result.push_back(BOS); // <｜end▁of▁sentence｜>
         }
     }
 
@@ -2900,7 +2972,6 @@ static std::vector<int> apply_chat_template(const json& messages, const BPEToken
             } else {
                 result.push_back(THINK_END);
             }
-      
         }
     }
 
@@ -2914,7 +2985,7 @@ static std::vector<int> apply_chat_template(const json& messages, const BPEToken
 static std::mutex g_engine_mutex;  // serialize inference requests
 static int g_request_counter = 0;  // for unique request IDs
 
-static void run_server(MoecherEngine& engine, int port) {
+static void run_server(MoecherEngine& engine, int port, int default_thinking_budget = 4096) {
     httplib::Server svr;
 
     // CORS headers and OPTIONS preflight
@@ -2948,7 +3019,8 @@ static void run_server(MoecherEngine& engine, int port) {
 
     // Chat completions
     svr.Post("/v1/chat/completions",
-        [&engine](const httplib::Request& req, httplib::Response& res) {
+        [&engine, default_thinking_budget](const httplib::Request& req, httplib::Response& res) {
+            g_stop_requested.store(false);
             auto start = std::chrono::steady_clock::now();
 
             json request;
@@ -2961,26 +3033,61 @@ static void run_server(MoecherEngine& engine, int port) {
 
             // Log request
             LOG_INFO("REQUEST: %s", req.body.c_str());
+            {
+                static std::mutex s_log_mutex;
+                std::lock_guard<std::mutex> log_lock(s_log_mutex);
+                std::ofstream log_file("client_request.log", std::ios::app);
+                if (log_file.is_open()) {
+                    auto now = std::chrono::system_clock::now();
+                    std::time_t t = std::chrono::system_clock::to_time_t(now);
+                    char time_buf[64];
+                    std::strftime(time_buf, sizeof(time_buf), "%Y-%m-%d %H:%M:%S", std::localtime(&t));
+                    log_file << "[" << time_buf << "] " << req.body << std::endl;
+                }
+            }
 
             auto& messages = request["messages"];
-            float temperature = request.value("temperature", 0.0f);
+            float temperature = request.value("temperature", 1.0f);
             int max_tokens = request.value("max_tokens", 512);
             bool stream = request.value("stream", false);
             float repetition_penalty = request.value("repetition_penalty", 1.0f);
-
+            std::string reasoning_effort = request.value("reasoning_effort", "high");
             bool enable_thinking = true;
-            if (request.contains("thinking") && request["thinking"].contains("type")) {
-                if (request["thinking"]["type"] == "disabled") {
+            int max_thinking_tokens = default_thinking_budget;
+
+            if (reasoning_effort == "none") {
+                enable_thinking = false;
+                max_thinking_tokens = 0;
+            }
+
+            if (request.contains("thinking") && request["thinking"].is_object()) {
+                if (request["thinking"].contains("type") && request["thinking"]["type"] == "disabled") {
                     enable_thinking = false;
+                    max_thinking_tokens = 0;
+                }
+                if (enable_thinking && request["thinking"].contains("budget_tokens") && request["thinking"]["budget_tokens"].is_number_integer()) {
+                    max_thinking_tokens = request["thinking"]["budget_tokens"].get<int>();
+                    if (max_thinking_tokens <= 0) enable_thinking = false;
                 }
             }
-            std::string reasoning_effort = request.value("reasoning_effort", "high");
-            LOG_INFO("Reasoning effort: %s, Thinking: %s", reasoning_effort.c_str(), enable_thinking ? "enabled" : "disabled");
+            if (enable_thinking && request.contains("max_thinking_tokens") && request["max_thinking_tokens"].is_number_integer()) {
+                max_thinking_tokens = request["max_thinking_tokens"].get<int>();
+                if (max_thinking_tokens <= 0) enable_thinking = false;
+            }
+            if (enable_thinking && request.contains("thinking_budget") && request["thinking_budget"].is_number_integer()) {
+                max_thinking_tokens = request["thinking_budget"].get<int>();
+                if (max_thinking_tokens <= 0) enable_thinking = false;
+            }
+
+            if (!enable_thinking) {
+                max_thinking_tokens = 0;
+            }
+
+            LOG_INFO("Reasoning effort: %s, Thinking: %s, Thinking budget: %d",
+                     reasoning_effort.c_str(), enable_thinking ? "enabled" : "disabled", max_thinking_tokens);
 
             // Apply chat template
-           // std::string prompt = apply_chat_template(messages, engine.tokenizer_);
-            std::vector<int> prompt = apply_chat_template(messages, engine.tokenizer_, enable_thinking);
-            //engine.tokenizer_.encode(prompt);
+            std::vector<int> prompt = apply_chat_template(messages, engine.tokenizer_, enable_thinking, reasoning_effort);
             LOG_INFO("PROMPT (len=%zu)", prompt.size());
 
             std::string req_id = "chatcmpl-moecher-" + std::to_string(++g_request_counter);
@@ -2989,12 +3096,10 @@ static void run_server(MoecherEngine& engine, int port) {
                 // SSE streaming
                 res.set_chunked_content_provider(
                     "text/event-stream",
-                    [&engine, prompt, max_tokens, temperature, req_id, repetition_penalty, enable_thinking](size_t offset, httplib::DataSink &sink) {
+                    [&engine, prompt, max_tokens, temperature, req_id, repetition_penalty, enable_thinking, max_thinking_tokens](size_t offset, httplib::DataSink &sink) {
                         if (offset > 0) return false;
                         std::lock_guard<std::mutex> lock(g_engine_mutex);
 
-                    
-                        
                         json initial_chunk = {
                             {"id", req_id},
                             {"object", "chat.completion.chunk"},
@@ -3009,8 +3114,9 @@ static void run_server(MoecherEngine& engine, int port) {
                         std::string sse = "data: " + initial_chunk.dump(-1, ' ', false, json::error_handler_t::replace) + "\n\n";
                         sink.write(sse.data(), sse.size());
                         
-                        engine.generate(prompt, max_tokens, temperature, [&](const std::string& text, bool is_reasoning) {
-                            if (text.empty()) return; // Skip empty tokens
+                        engine.generate(prompt, max_tokens, temperature, [&](const std::string& text, bool is_reasoning) -> bool {
+                            if (g_stop_requested.load()) return false;
+                            if (text.empty()) return true; // Skip empty tokens
           
                             json delta_chunk = {
                                 {"id", req_id},
@@ -3025,8 +3131,9 @@ static void run_server(MoecherEngine& engine, int port) {
                             };
 
                             std::string sse_chunk = "data: " + delta_chunk.dump(-1, ' ', false, json::error_handler_t::replace) + "\n\n";
-                            sink.write(sse_chunk.data(), sse_chunk.size());
-                        }, repetition_penalty, enable_thinking);
+                            bool ok = sink.write(sse_chunk.data(), sse_chunk.size());
+                            return ok && !g_stop_requested.load();
+                        }, repetition_penalty, enable_thinking, max_thinking_tokens);
 
                         std::string final_finish_reason = engine.last_finish_reason_.empty() ? "stop" : engine.last_finish_reason_;
 
@@ -3057,7 +3164,7 @@ static void run_server(MoecherEngine& engine, int port) {
                 std::string response_text;
                 {
                     std::lock_guard<std::mutex> lock(g_engine_mutex);
-                    response_text = engine.generate(prompt, max_tokens, temperature, nullptr, repetition_penalty);
+                    response_text = engine.generate(prompt, max_tokens, temperature, nullptr, repetition_penalty, enable_thinking, max_thinking_tokens);
                 }
                 
                 json response = {
@@ -3083,6 +3190,20 @@ static void run_server(MoecherEngine& engine, int port) {
             LOG_INFO("RESPONSE (%.0fms)", elapsed_ms);
         });
 
+    // Stop / abort generation endpoints
+    svr.Post("/v1/chat/stop", [](const httplib::Request&, httplib::Response& res) {
+        LOG_WARN("Received stop request on /v1/chat/stop");
+        g_stop_requested.store(true);
+        json body = {{"status", "ok"}, {"message", "Generation stopping"}};
+        res.set_content(body.dump(), "application/json");
+    });
+    svr.Post("/v1/stop", [](const httplib::Request&, httplib::Response& res) {
+        LOG_WARN("Received stop request on /v1/stop");
+        g_stop_requested.store(true);
+        json body = {{"status", "ok"}, {"message", "Generation stopping"}};
+        res.set_content(body.dump(), "application/json");
+    });
+
     LOG_INFO("Server listening on port %d", port);
     LOG_INFO("version 2.03");
     g_server_ready = true;
@@ -3100,6 +3221,8 @@ int main(int argc, char** argv) {
     float dram_cache_gb = 0.0f;
     std::string log_path = "moecher.log";
     std::string expert_dtype_override = "";
+    std::string shared_expert_dtype = "q4_k";
+    int default_thinking_budget = 4096;
 
     for (int i = 1; i < argc; i++) {
         if ((std::string(argv[i]) == "--manifest" || std::string(argv[i]) == "-m") && i + 1 < argc) {
@@ -3114,6 +3237,10 @@ int main(int argc, char** argv) {
             dram_cache_gb = std::stof(argv[++i]);
         } else if (std::string(argv[i]) == "--expert-dtype" && i + 1 < argc) {
             expert_dtype_override = argv[++i];
+        } else if ((std::string(argv[i]) == "--shared-expert-dtype" || std::string(argv[i]) == "--shared-expert-format" || std::string(argv[i]) == "--quantize-shared") && i + 1 < argc) {
+            shared_expert_dtype = argv[++i];
+        } else if ((std::string(argv[i]) == "--thinking-budget" || std::string(argv[i]) == "--budget" || std::string(argv[i]) == "--max-thinking-tokens") && i + 1 < argc) {
+            default_thinking_budget = std::stoi(argv[++i]);
         } else if (std::string(argv[i]) == "--log-experts") {
             g_log_experts = true;
         } else if (std::string(argv[i]) == "--no-log-tokens") {
@@ -3127,14 +3254,15 @@ int main(int argc, char** argv) {
     // Open log file
     g_log_file.open(log_path, std::ios::app);
     LOG_INFO("═══ moecher starting ═══");
-    LOG_INFO("═══ v2.02 ═══");
+    LOG_INFO("═══ v2.05 ═══");
+    LOG_INFO("Default thinking token budget: %d", default_thinking_budget);
 
     MoecherEngine engine;
-    if (!engine.load(manifest_path, max_vram_gb, dram_cache_gb, expert_dtype_override)) {
+    if (!engine.load(manifest_path, max_vram_gb, dram_cache_gb, expert_dtype_override, shared_expert_dtype)) {
         LOG_ERROR("Failed to load model");
         return 1;
     }
 
-    run_server(engine, port);
+    run_server(engine, port, default_thinking_budget);
     return 0;
 }

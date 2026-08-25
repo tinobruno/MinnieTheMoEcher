@@ -99,7 +99,7 @@ void gemv_hc_pre_norm_cuda(
     cudaStream_t stream = 0);
 
 
-// ── FP4 dequantization ────────────────────────────────────────────────────────
+// ── FP4 dequantization & GEMV ───────────────────────────────────────────────────
 // Dequantize FP4 (packed as I8, 2 values per byte) to BF16 using E8M0 scales
 // weight: [rows, cols_packed] in I8 (cols_packed = logical_cols / 2)
 // scale:  [rows, logical_cols/32] in F8_E8M0  (one scale per 32 fp4 values)
@@ -110,6 +110,34 @@ void fp4_dequant_cuda(
     const uint8_t* scale,          // E8M0 scales
     int rows, int cols_packed,     // cols_packed = logical_cols/2
     int scale_cols,                // number of scale columns
+    cudaStream_t stream = 0);
+
+void quantize_fp8_to_fp4_cuda(
+    uint8_t* fp4_weight,
+    uint8_t* fp4_scale,
+    const uint8_t* fp8_weight,
+    const uint8_t* fp8_scale,
+    int rows, int logical_cols,
+    int fp8_block_size = 128,
+    cudaStream_t stream = 0);
+
+void gemv_fp4_cuda(
+    __nv_bfloat16* out,
+    const __nv_bfloat16* vec,
+    const uint8_t* weight,
+    const uint8_t* scale,
+    int N, int K,
+    cudaStream_t stream = 0);
+
+void gemv_fp4_swiglu_fused_cuda(
+    __nv_bfloat16* out,
+    const __nv_bfloat16* vec,
+    const uint8_t* w1_weight,
+    const uint8_t* w1_scale,
+    const uint8_t* w3_weight,
+    const uint8_t* w3_scale,
+    int N, int K,
+    float swiglu_limit = 0.0f,
     cudaStream_t stream = 0);
 
 // ── INT2 asymmetric dequantization ────────────────────────────────────────────
@@ -371,6 +399,17 @@ void gemv_iq2_xxs_moe_swiglu_fused_cuda(
     int N, int K, float swiglu_limit,
     cudaStream_t stream = 0);
 
+void gemv_fp8_swiglu_fused_cuda(
+    __nv_bfloat16* out,
+    const __nv_bfloat16* vec,
+    const uint8_t* w1_weight,
+    const uint8_t* w1_scale,
+    const uint8_t* w3_weight,
+    const uint8_t* w3_scale,
+    int N, int K, int block_size,
+    float swiglu_limit,
+    cudaStream_t stream = 0);
+
 void gemv_q2_k_moe_cuda(
     __nv_bfloat16* down_buf,
     const __nv_bfloat16* gate_buf,
@@ -421,3 +460,22 @@ void fused_moe_accum_6_cuda(
     const __nv_bfloat16* down_ptrs,
     float w0, float w1, float w2, float w3, float w4, float w5,
     int dim, cudaStream_t stream = 0);
+
+void apply_repetition_penalty_cuda(
+    float* logits,
+    const int32_t* seen_tokens,
+    int num_seen,
+    int vocab_size,
+    float rep_penalty,
+    cudaStream_t stream = 0);
+
+void gpu_sample_min_p_cuda(
+    const float* logits,
+    int vocab_size,
+    float temperature,
+    float min_p,
+    float random_val,
+    int32_t* out_token,
+    float* scratch_block_data,
+    cudaStream_t stream = 0);
+
