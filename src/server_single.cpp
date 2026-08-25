@@ -763,11 +763,28 @@ public:
         if (dram_cache_capacity_ > 0) {
             LOG_INFO("Expert L2 cache: %d slots (%.1f GB)", dram_cache_capacity_,
                      (double)dram_cache_capacity_ * block_size / (1024.0 * 1024.0 * 1024.0));
-            CUDA_CHECK(cudaMallocHost(&dram_cache_pool_, (size_t)dram_cache_capacity_ * block_size));
-            dram_cache_slots_.resize(dram_cache_capacity_);
-            for (int i = 0; i < dram_cache_capacity_; i++) {
-                dram_cache_slots_[i].slot_index = i;
-                dram_cache_slots_[i].gpu_data = (char*)dram_cache_pool_ + (size_t)i * block_size;
+            size_t total_dram_bytes = (size_t)dram_cache_capacity_ * block_size;
+            cudaError_t err = cudaMallocHost(&dram_cache_pool_, total_dram_bytes);
+            if (err != cudaSuccess) {
+                cudaGetLastError(); // Clear error state
+                LOG_WARN("cudaMallocHost could not allocate %.1f GB pinned memory (Windows WDDM limit). Falling back to page-aligned system RAM.",
+                         (double)total_dram_bytes / (1024.0 * 1024.0 * 1024.0));
+#if defined(_WIN32) || defined(_WIN64)
+                dram_cache_pool_ = VirtualAlloc(NULL, total_dram_bytes, MEM_COMMIT | MEM_RESERVE, PAGE_READWRITE);
+#else
+                dram_cache_pool_ = aligned_alloc(4096, total_dram_bytes);
+#endif
+                if (!dram_cache_pool_) {
+                    LOG_ERROR("System RAM allocation also failed. Disabling L2 DRAM cache.");
+                    dram_cache_capacity_ = 0;
+                }
+            }
+            if (dram_cache_capacity_ > 0 && dram_cache_pool_) {
+                dram_cache_slots_.resize(dram_cache_capacity_);
+                for (int i = 0; i < dram_cache_capacity_; i++) {
+                    dram_cache_slots_[i].slot_index = i;
+                    dram_cache_slots_[i].gpu_data = (char*)dram_cache_pool_ + (size_t)i * block_size;
+                }
             }
         }
 
@@ -1067,7 +1084,17 @@ public:
     void cleanup() {
         expert_file_.close();
         if (cache_pool_gpu_) cudaFree(cache_pool_gpu_);
-        if (dram_cache_pool_) cudaFreeHost(dram_cache_pool_);
+        if (dram_cache_pool_) {
+            if (cudaFreeHost(dram_cache_pool_) != cudaSuccess) {
+                cudaGetLastError();
+#if defined(_WIN32) || defined(_WIN64)
+                VirtualFree(dram_cache_pool_, 0, MEM_RELEASE);
+#else
+                free(dram_cache_pool_);
+#endif
+            }
+            dram_cache_pool_ = nullptr;
+        }
         flat_vram_ptrs_gpu_.free();
         for (auto& stage : staging_ring_) {
             if (stage.event) cudaEventDestroy(stage.event);

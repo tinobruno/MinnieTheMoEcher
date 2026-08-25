@@ -215,10 +215,16 @@ public:
 #if defined(_WIN32) || defined(_WIN64)
         if (handle_ == INVALID_HANDLE_VALUE) return -1;
 
+        static thread_local HANDLE tl_event = NULL;
+        if (!tl_event) {
+            tl_event = CreateEventA(NULL, TRUE, FALSE, NULL);
+        }
+
         OVERLAPPED ov = {0};
         ov.Offset = static_cast<DWORD>(offset & 0xFFFFFFFF);
         ov.OffsetHigh = static_cast<DWORD>((offset >> 32) & 0xFFFFFFFF);
-        ov.hEvent = CreateEventA(NULL, TRUE, FALSE, NULL);
+        ov.hEvent = tl_event;
+        ResetEvent(tl_event);
 
         DWORD bytes_read = 0;
         BOOL ok = ReadFile(handle_, dst, static_cast<DWORD>(count), &bytes_read, &ov);
@@ -226,15 +232,12 @@ public:
             DWORD err = GetLastError();
             if (err == ERROR_IO_PENDING) {
                 if (!GetOverlappedResult(handle_, &ov, &bytes_read, TRUE)) {
-                    if (ov.hEvent) CloseHandle(ov.hEvent);
                     return -1;
                 }
             } else if (err != ERROR_HANDLE_EOF) {
-                if (ov.hEvent) CloseHandle(ov.hEvent);
                 return -1;
             }
         }
-        if (ov.hEvent) CloseHandle(ov.hEvent);
         return static_cast<int64_t>(bytes_read);
 #else
         if (fd_ < 0) return -1;
