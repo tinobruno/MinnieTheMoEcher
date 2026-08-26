@@ -50,10 +50,15 @@ FetchContent_MakeAvailable(httplib nlohmann_json)
 find_package(CUDAToolkit REQUIRED)
 
 # ── Main executable ────────────────────────────────────────────────────────────
-add_executable(moecher
+set(MOECHER_SOURCES
     src/server_single.cpp
     src/cuda/activations.cu
 )
+if(WIN32)
+    list(APPEND MOECHER_SOURCES src/moecher.rc)
+endif()
+
+add_executable(moecher ${MOECHER_SOURCES})
 
 set_target_properties(moecher PROPERTIES
     CUDA_SEPARABLE_COMPILATION OFF

@@ -26,6 +26,7 @@ Compression=none
 SolidCompression=no
 PrivilegesRequired=lowest
 PrivilegesRequiredOverridesAllowed=dialog
+SetupIconFile=D:\dev\minniemoe\MinnieTheMoEcher\graphics\moecher.ico
 UninstallDisplayIcon={app}\{#MyAppExeName}
 DisableWelcomePage=no
 DisableDirPage=no
