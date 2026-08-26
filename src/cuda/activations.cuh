@@ -163,6 +163,12 @@ void gemv_int4_cuda(
     int N, int K,
     cudaStream_t stream = 0);
 
+void vector_add_bf16_cuda(
+    __nv_bfloat16* a,
+    const __nv_bfloat16* b,
+    int n,
+    cudaStream_t stream = 0);
+
 // ── IQ2_XXS quantization ──────────────────────────────────────────────────────
 #define QK_IQ2_XXS 256
 

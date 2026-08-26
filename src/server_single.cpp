@@ -1502,8 +1502,8 @@ public:
     }
 
     void init_cuda_graph() {
-        if (!expert_loader_.all_resident(cfg_.num_hidden_layers)) {
-            LOG_INFO("Offload mode active (partial VRAM). Skipping CUDA Graph capture; using eager decode.");
+        if (cfg_.architecture == ModelArch::QWEN || !expert_loader_.all_resident(cfg_.num_hidden_layers)) {
+            LOG_INFO("Running in eager mode for decode verification.");
             graph_captured_ = false;
             return;
         }
@@ -2342,7 +2342,11 @@ private:
         buf_comp_proj_.alloc(max_comp_dim * sizeof(float));  // for wkv or wgate output
         buf_comp_out_.alloc(max_comp_dim * sizeof(float));   // for pooling output
         buf_comp_bf16_.alloc(head_dim_val * sizeof(__nv_bfloat16));  // compressed entry in BF16
+
         // Combined KV buffer: raw window + max compressed entries
+        int max_combined = (cfg_.sliding_window > 0 ? cfg_.sliding_window : 64) + cfg_.max_compressed_entries;
+        buf_combined_kv_.alloc((size_t)max_combined * head_dim_val * sizeof(__nv_bfloat16));
+
         router_indices_host_.resize(cfg_.n_routed_experts);
         logits_host_.resize(cfg_.vocab_size);
         probs_host_.resize(cfg_.vocab_size);
@@ -2692,12 +2696,7 @@ private:
         }
 
         // 6. Residual connection: buf_hidden_ += buf_hidden2_
-        {
-            float alpha = 1.0f;
-            cublasAxpyEx(cublas_handle_, dim, &alpha, CUDA_R_32F,
-                         buf_hidden2_.data, CUDA_R_16BF, 1,
-                         buf_hidden_.data, CUDA_R_16BF, 1, CUDA_R_32F);
-        }
+        vector_add_bf16_cuda(buf_hidden_.bf16(), buf_hidden2_.bf16(), dim, main_stream_);
 
         // 7. FFN Pre-RMSNorm: buf_hidden_ -> buf_hidden2_
         rms_norm_one_centered_cuda(buf_hidden2_.bf16(), buf_hidden_.bf16(),
@@ -2714,12 +2713,7 @@ private:
         matmul_proj(buf_hidden2_, buf_gate_, lw.w_down, lw.w_down_scale, dim, inter_size);
 
         // 11. Residual connection: buf_hidden_ += buf_hidden2_
-        {
-            float alpha = 1.0f;
-            cublasAxpyEx(cublas_handle_, dim, &alpha, CUDA_R_32F,
-                         buf_hidden2_.data, CUDA_R_16BF, 1,
-                         buf_hidden_.data, CUDA_R_16BF, 1, CUDA_R_32F);
-        }
+        vector_add_bf16_cuda(buf_hidden_.bf16(), buf_hidden2_.bf16(), dim, main_stream_);
     }
 
     // ── Forward one layer ───────────────────────────────────────────────────
@@ -3136,10 +3130,8 @@ private:
         int dim = cfg_.hidden_size;
         int vocab = cfg_.vocab_size;
 
-        // logits = hidden @ head_weight.T -> [vocab]
-        gemm_bf16(buf_dequant_.bf16(), 1, vocab, dim,
-                  buf_hidden_.bf16(), head_weight_.bf16());
-        bf16_to_f32_cuda(buf_logits_.f32(), buf_dequant_.bf16(), vocab, main_stream_);
+        // Fast CUDA graph compatible matrix-vector multiplication directly to float32 logits
+        gemv_bf16_cuda(buf_logits_.f32(), head_weight_.bf16(), buf_hidden_.bf16(), vocab, dim, main_stream_);
     }
 
     // ── Sample from logits ──────────────────────────────────────────────────
@@ -3729,6 +3721,10 @@ static void run_server(MoecherEngine& engine, int port, int default_thinking_bud
 // ════════════════════════════════════════════════════════════════════════════════
 
 int main(int argc, char** argv) {
+#if defined(_WIN32) || defined(_WIN64)
+    SetPriorityClass(GetCurrentProcess(), HIGH_PRIORITY_CLASS);
+    SetThreadPriority(GetCurrentThread(), THREAD_PRIORITY_HIGHEST);
+#endif
     std::string manifest_path = "moecher_manifest.json";
     int port = 8001;
     float max_vram_gb = 0.0f;

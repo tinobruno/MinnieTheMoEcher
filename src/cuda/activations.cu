@@ -606,6 +606,12 @@ void add_cuda(__nv_bfloat16* out, const __nv_bfloat16* a,
     add_kernel<<<blocks, threads, 0, stream>>>(out, a, b, n);
 }
 
+void vector_add_bf16_cuda(__nv_bfloat16* a, const __nv_bfloat16* b, int n, cudaStream_t stream) {
+    int threads = 256;
+    int blocks = (n + threads - 1) / threads;
+    add_kernel<<<blocks, threads, 0, stream>>>(a, a, b, n);
+}
+
 __global__ void add_f32_sigmoid_kernel(
     float* __restrict__ out,
     const float* __restrict__ a,

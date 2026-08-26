@@ -12,6 +12,7 @@ _deps/
 *.o
 *.so
 moecher
+*.exe
 
 # Large model binaries & manifests
 *.bin

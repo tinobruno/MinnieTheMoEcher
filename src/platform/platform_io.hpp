@@ -218,6 +218,7 @@ public:
         static thread_local HANDLE tl_event = NULL;
         if (!tl_event) {
             tl_event = CreateEventA(NULL, TRUE, FALSE, NULL);
+            if (!tl_event) return -1;
         }
 
         OVERLAPPED ov = {0};
@@ -227,17 +228,21 @@ public:
         ResetEvent(tl_event);
 
         DWORD bytes_read = 0;
-        BOOL ok = ReadFile(handle_, dst, static_cast<DWORD>(count), &bytes_read, &ov);
+        BOOL ok = ReadFile(handle_, dst, static_cast<DWORD>(count), NULL, &ov);
         if (!ok) {
             DWORD err = GetLastError();
-            if (err == ERROR_IO_PENDING) {
-                if (!GetOverlappedResult(handle_, &ov, &bytes_read, TRUE)) {
-                    return -1;
-                }
-            } else if (err != ERROR_HANDLE_EOF) {
+            if (err != ERROR_IO_PENDING) {
+                if (err == ERROR_HANDLE_EOF) return 0;
                 return -1;
             }
         }
+
+        if (!GetOverlappedResult(handle_, &ov, &bytes_read, TRUE)) {
+            DWORD err = GetLastError();
+            if (err == ERROR_HANDLE_EOF) return 0;
+            return -1;
+        }
+
         return static_cast<int64_t>(bytes_read);
 #else
         if (fd_ < 0) return -1;

@@ -1,10 +1,14 @@
 cmake_minimum_required(VERSION 3.22)
 
+# Set CUDA architectures before project() initializes the CUDA toolchain
+# sm_86 (Ampere/3090), sm_89 (Ada/4090/6000), sm_90 (Hopper), sm_100;sm_120 (Blackwell)
+if(NOT DEFINED CMAKE_CUDA_ARCHITECTURES)
+    set(CMAKE_CUDA_ARCHITECTURES "86;89;90;100;120")
+endif()
+
 # Allow newer MSVC compiler versions with CUDA
 if(NOT DEFINED CMAKE_CUDA_FLAGS)
     set(CMAKE_CUDA_FLAGS "--allow-unsupported-compiler")
-else()
-    set(CMAKE_CUDA_FLAGS "${CMAKE_CUDA_FLAGS} --allow-unsupported-compiler")
 endif()
 
 project(moecher LANGUAGES CXX CUDA)
@@ -14,16 +18,11 @@ set(CMAKE_CXX_STANDARD_REQUIRED ON)
 set(CMAKE_CUDA_STANDARD 17)
 if(MSVC)
     add_compile_definitions(NOMINMAX WIN32_LEAN_AND_MEAN _CRT_SECURE_NO_WARNINGS)
-    set(CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} /O2 /arch:AVX2 /utf-8 /EHsc /fp:fast")
-    set(CMAKE_CUDA_FLAGS "${CMAKE_CUDA_FLAGS} -O3 --use_fast_math -Xcompiler=/utf-8,/EHsc,/O2 --allow-unsupported-compiler")
+    set(CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} /O2 /arch:AVX2 /utf-8 /EHsc")
+    set(CMAKE_CUDA_FLAGS "${CMAKE_CUDA_FLAGS} -O3 -Xcompiler=/utf-8,/EHsc,/O2 --allow-unsupported-compiler")
 else()
     set(CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} -O3 -march=native -funroll-loops")
     set(CMAKE_CUDA_FLAGS "${CMAKE_CUDA_FLAGS} -O3")
-endif()
-
-# CUDA architectures: sm_86 (RTX 3090), sm_89 (Ada/4090/6000), sm_90 (Hopper/Blackwell)
-if(NOT DEFINED CMAKE_CUDA_ARCHITECTURES)
-    set(CMAKE_CUDA_ARCHITECTURES "86;89;90")
 endif()
 
 # ── Fetch header-only dependencies ──────────────────────────────────────────────
