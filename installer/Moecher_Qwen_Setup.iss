@@ -43,6 +43,9 @@ Source: "C:\Program Files\NVIDIA GPU Computing Toolkit\CUDA\v13.3\bin\x64\cublas
 Source: "D:\dev\minniemoe\MinnieTheMoEcher\installer\start_qwen_server.bat"; DestDir: "{app}"; Flags: ignoreversion
 Source: "D:\dev\minniemoe\MinnieTheMoEcher\installer\test_qwen.bat"; DestDir: "{app}"; Flags: ignoreversion
 
+; Web UI Assets
+Source: "D:\dev\minniemoe\MinnieTheMoEcher\web\*"; DestDir: "{app}\web"; Flags: ignoreversion recursesubdirs createallsubdirs
+
 ; Model Assets (Qwen 3.8 27B INT4 block-32)
 Source: "D:\dev\minniemoe\MinnieTheMoEcher\models\qwen3_8_27b_q4\moecher_manifest_qwen_q4.json"; DestDir: "{app}\models\qwen3_8_27b_q4"; Flags: ignoreversion
 Source: "D:\dev\minniemoe\MinnieTheMoEcher\models\qwen3_8_27b_q4\tokenizer.json"; DestDir: "{app}\models\qwen3_8_27b_q4"; Flags: ignoreversion

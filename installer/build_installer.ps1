@@ -33,7 +33,8 @@ $RequiredFiles = @(
     "installer\test_qwen.bat",
     "models\qwen3_8_27b_q4\moecher_manifest_qwen_q4.json",
     "models\qwen3_8_27b_q4\tokenizer.json",
-    "models\qwen3_8_27b_q4\attention_dense_layers_q4.bin"
+    "models\qwen3_8_27b_q4\attention_dense_layers_q4.bin",
+    "web\index.html"
 )
 
 foreach ($file in $RequiredFiles) {

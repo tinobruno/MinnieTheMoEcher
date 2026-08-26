@@ -3507,15 +3507,22 @@ static void run_server(MoecherEngine& engine, int port, int default_thinking_bud
     svr.set_mount_point("/", "./web");
     svr.set_mount_point("/", "../web");
 
-    // Health check
-    svr.Get("/v1/models", [](const httplib::Request&, httplib::Response& res) {
+    // Health & status check
+    svr.Get("/health", [](const httplib::Request&, httplib::Response& res) {
+        res.set_content("{\"status\":\"ok\",\"engine\":\"moecher\",\"version\":\"2.05\"}", "application/json");
+    });
+
+    svr.Get("/v1/models", [&engine](const httplib::Request&, httplib::Response& res) {
+        std::string model_id = (engine.cfg_.architecture == ModelArch::QWEN) ? "qwen3.8-27b-q4" : "deepseek-v4-flash";
         json body = {
             {"object", "list"},
-            {"data", {{
-                {"id", "deepseek-v4-flash"},
-                {"object", "model"},
-                {"owned_by", "moecher"}
-            }}}
+            {"data", {
+                {
+                    {"id", model_id},
+                    {"object", "model"},
+                    {"owned_by", "moecher"}
+                }
+            }}
         };
         res.set_content(body.dump(), "application/json");
     });
