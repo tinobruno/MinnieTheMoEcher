@@ -18,6 +18,7 @@ moecher
 *.dat
 *.patch
 *.diff
+models/
 bin_bck/
 manifest_bck/
 offload/

@@ -115,12 +115,17 @@ static void log_msg(const char* level, const char* fmt, ...) {
 //  Model Config (from manifest)
 // ════════════════════════════════════════════════════════════════════════════════
 
+enum class ModelArch { DEEPSEEK_V4, QWEN };
+
 struct ModelConfig {
+    ModelArch architecture = ModelArch::DEEPSEEK_V4;
     int vocab_size = 129280;
     int hidden_size = 4096;
     int num_hidden_layers = 43;
     int num_attention_heads = 64;
+    int num_key_value_heads = 8;
     int head_dim = 512;
+    int intermediate_size = 13824;
     int qk_rope_head_dim = 64;
     int q_lora_rank = 1024;
     int o_lora_rank = 1024;
@@ -159,13 +164,23 @@ struct ModelConfig {
 
     void from_json(const json& j) {
         auto get = [&](auto& field, const char* key) {
-            if (j.contains(key)) j.at(key).get_to(field);
+            if (j.contains(key) && !j.at(key).is_null()) j.at(key).get_to(field);
         };
+        if (j.contains("architecture")) {
+            std::string arch_str = j["architecture"].get<std::string>();
+            if (arch_str == "qwen2" || arch_str == "qwen" || arch_str == "qwen3" || arch_str == "llama") {
+                architecture = ModelArch::QWEN;
+            } else {
+                architecture = ModelArch::DEEPSEEK_V4;
+            }
+        }
         get(vocab_size, "vocab_size");
         get(hidden_size, "hidden_size");
         get(num_hidden_layers, "num_hidden_layers");
         get(num_attention_heads, "num_attention_heads");
+        get(num_key_value_heads, "num_key_value_heads");
         get(head_dim, "head_dim");
+        get(intermediate_size, "intermediate_size");
         get(qk_rope_head_dim, "qk_rope_head_dim");
         get(q_lora_rank, "q_lora_rank");
         get(o_lora_rank, "o_lora_rank");
@@ -1191,6 +1206,33 @@ public:
 
         // KV cache (sliding window)
         GPUTensor kv_cache;       // [window_size, head_dim] BF16
+
+        // Standard GQA & Dense SwiGLU (Qwen / Llama)
+        bool is_linear_attn = false;
+        GPUTensor w_q, w_q_scale;           // [n_heads * head_dim * 2, hidden]
+        GPUTensor w_k, w_k_scale;           // [n_kv_heads * head_dim, hidden]
+        GPUTensor w_v, w_v_scale;           // [n_kv_heads * head_dim, hidden]
+        GPUTensor w_o, w_o_scale;           // [hidden, n_heads * head_dim]
+        GPUTensor gqa_q_norm_w;  // [head_dim] BF16
+        GPUTensor gqa_k_norm_w;  // [head_dim] BF16
+        GPUTensor w_gate, w_gate_scale;        // [intermediate_size, hidden]
+        GPUTensor w_up, w_up_scale;          // [intermediate_size, hidden]
+        GPUTensor w_down, w_down_scale;        // [hidden, intermediate_size]
+        GPUTensor k_cache_gqa;   // [max_seq_len, n_kv_heads, head_dim] BF16
+        GPUTensor v_cache_gqa;   // [max_seq_len, n_kv_heads, head_dim] BF16
+
+        // Qwen 3.8 Linear Attention (Gated DeltaNet)
+        GPUTensor w_in_qkv, w_in_qkv_scale;       // [10240, 5120]
+        GPUTensor w_in_z, w_in_z_scale;         // [6144, 5120]
+        GPUTensor w_in_a;         // [48, 5120] BF16
+        GPUTensor w_in_b;         // [48, 5120] BF16
+        GPUTensor conv1d_w;       // [10240, 1, 4] BF16
+        GPUTensor A_log;          // [48] BF16
+        GPUTensor dt_bias;        // [48] BF16
+        GPUTensor linear_norm_w;  // [128] BF16
+        GPUTensor linear_out_proj, linear_out_proj_scale;// [5120, 6144]
+        GPUTensor ssm_state;      // [48, 128, 128] F32
+        GPUTensor conv_state;     // [10240, 4] BF16
     };
     std::vector<LayerWeights> layers_;
 
@@ -1235,6 +1277,8 @@ public:
     GPUTensor buf_scores_bf16_;  // [n_experts] BF16
     GPUTensor buf_topk_vals_;    // [top_k] F32
     GPUTensor buf_topk_idx_;     // [top_k] I32
+    GPUTensor buf_linear_a_;     // [48] BF16 for Qwen 3.8 DeltaNet decay A
+    GPUTensor buf_linear_b_;     // [48] BF16 for Qwen 3.8 DeltaNet decay B
     GPUTensor buf_input_ids_;    // [MAX_SEQ_LEN] I32
     GPUTensor buf_hc_state_;      // [hc_mult, hidden_size] BF16 — active HC hidden state
     GPUTensor buf_hc_after_attn_; // [hc_mult, hidden_size] BF16 — intermediate HC state after attention
@@ -1320,9 +1364,16 @@ public:
                  cfg_.num_hidden_layers, cfg_.n_routed_experts,
                  cfg_.num_experts_per_tok, cfg_.hidden_size, cfg_.expert_dtype.c_str());
 
+        std::filesystem::path manifest_p(manifest_path);
+        std::filesystem::path base_dir = manifest_p.parent_path();
+
         // Load tokenizer
         std::string tok_path = manifest["tokenizer"]["tokenizer_json"].get<std::string>();
-        if (!tokenizer_.load(tok_path)) return false;
+        std::string tok_full = (base_dir / tok_path).string();
+        if (!tokenizer_.load(tok_full) && !tokenizer_.load(tok_path)) {
+            LOG_ERROR("Failed to load tokenizer from %s or %s", tok_full.c_str(), tok_path.c_str());
+            return false;
+        }
 
         // Init CUDA
         CUDA_CHECK(cudaStreamCreate(&main_stream_));
@@ -1347,7 +1398,12 @@ public:
 
         // Load dense tensors from attention_dense_layers.bin
         std::string dense_path = manifest["dense_bin"].get<std::string>();
-        if (!load_dense_tensors(dense_path, manifest["dense_tensors"])) return false;
+        std::string dense_full = (base_dir / dense_path).string();
+        if (!load_dense_tensors(dense_full, manifest["dense_tensors"]) &&
+            !load_dense_tensors(dense_path, manifest["dense_tensors"])) {
+            LOG_ERROR("Failed to load dense tensors from %s", dense_full.c_str());
+            return false;
+        }
 
         // Load expert layout info
         auto& el = manifest["expert_layout"];
@@ -1366,6 +1422,7 @@ public:
 
         // Init expert loader with O_DIRECT
         std::string expert_path = manifest["expert_bin"].get<std::string>();
+        std::string expert_full = expert_path.empty() ? "" : (base_dir / expert_path).string();
 
         // Allocate working buffers first
         alloc_buffers();
@@ -1394,12 +1451,17 @@ public:
         size_t dram_cache_budget = (size_t)(dram_cache_gb * 1024.0 * 1024.0 * 1024.0);
         LOG_INFO("Expert L1 (VRAM) cache budget: %.1f GB", cache_budget / (1024.0 * 1024.0 * 1024.0));
         LOG_INFO("Expert L2 (DRAM) cache budget: %.1f GB", dram_cache_budget / (1024.0 * 1024.0 * 1024.0));
-        if (!expert_loader_.init(expert_path, expert_block_size,
-                                  expert_n_layers, expert_n_experts,
-                                  cache_budget, dram_cache_budget)) return false;
+        
+        if (cfg_.n_routed_experts > 0 && !expert_full.empty()) {
+            if (!expert_loader_.init(expert_full, expert_block_size,
+                                      expert_n_layers, expert_n_experts,
+                                      cache_budget, dram_cache_budget)) return false;
 
-        // Preload experts into VRAM
-        expert_loader_.preload_all();
+            // Preload experts into VRAM
+            expert_loader_.preload_all();
+        } else {
+            LOG_INFO("Dense architecture active (0 routed experts). Bypassing expert cache.");
+        }
 
         // Precompute RoPE frequencies — two tables for non-compressed vs compressed layers
         // DeepSeek-V4 reference: non-compressed layers use base freq without YaRN interpolation;
@@ -1509,6 +1571,29 @@ public:
         int dim = cfg_.hidden_size;
         int hc = cfg_.hc_mult;
 
+        if (cfg_.architecture == ModelArch::QWEN) {
+            // 1. Standard Embedding lookup
+            embedding_cuda(buf_hidden_.bf16(), embed_weight_.bf16(), buf_input_token_.i32(), 1, dim, main_stream_);
+
+            // 2. Process each layer
+            for (int layer = 0; layer < cfg_.num_hidden_layers; layer++) {
+                forward_layer_qwen(layer, position);
+            }
+
+            // 3. Final norm
+            if (cfg_.architecture == ModelArch::QWEN) {
+                rms_norm_one_centered_cuda(buf_hidden_.bf16(), buf_hidden_.bf16(),
+                                           norm_weight_.bf16(), dim, cfg_.rms_norm_eps, main_stream_);
+            } else {
+                rms_norm_cuda(buf_hidden_.bf16(), buf_hidden_.bf16(),
+                              norm_weight_.bf16(), dim, cfg_.rms_norm_eps, main_stream_);
+            }
+
+            // 4. Logits: hidden @ head_weight.T -> [vocab_size]
+            compute_logits();
+            return;
+        }
+
         // 1 & 2. Embedding lookup and broadcast to HC copies: [1, dim] -> [hc, dim]
         embedding_broadcast_device_id_cuda(buf_hidden_.bf16(), buf_hc_state_.bf16(),
                                            embed_weight_.bf16(), buf_input_token_.i32(), dim, hc, main_stream_);
@@ -1548,10 +1633,26 @@ public:
 
         // Reset KV caches for all layers (critical: stale cache = garbled output)
         for (int l = 0; l < cfg_.num_hidden_layers; l++) {
-            CUDA_CHECK(cudaMemset(layers_[l].kv_cache.data, 0,
-                                   layers_[l].kv_cache.size_bytes));
-            CUDA_CHECK(cudaMemset(layers_[l].d_comp_kv_count.data, 0, sizeof(int32_t)));
-            CUDA_CHECK(cudaMemset(layers_[l].d_attn_cache_len.data, 0, sizeof(int32_t)));
+            if (layers_[l].kv_cache.data) {
+                CUDA_CHECK(cudaMemset(layers_[l].kv_cache.data, 0,
+                                       layers_[l].kv_cache.size_bytes));
+            }
+            if (layers_[l].k_cache_gqa.data) {
+                CUDA_CHECK(cudaMemset(layers_[l].k_cache_gqa.data, 0, layers_[l].k_cache_gqa.size_bytes));
+                CUDA_CHECK(cudaMemset(layers_[l].v_cache_gqa.data, 0, layers_[l].v_cache_gqa.size_bytes));
+            }
+            if (layers_[l].ssm_state.data) {
+                CUDA_CHECK(cudaMemset(layers_[l].ssm_state.data, 0, layers_[l].ssm_state.size_bytes));
+            }
+            if (layers_[l].conv_state.data) {
+                CUDA_CHECK(cudaMemset(layers_[l].conv_state.data, 0, layers_[l].conv_state.size_bytes));
+            }
+            if (layers_[l].d_comp_kv_count.data) {
+                CUDA_CHECK(cudaMemset(layers_[l].d_comp_kv_count.data, 0, sizeof(int32_t)));
+            }
+            if (layers_[l].d_attn_cache_len.data) {
+                CUDA_CHECK(cudaMemset(layers_[l].d_attn_cache_len.data, 0, sizeof(int32_t)));
+            }
             // Reset compressor state for compressed layers
             int ratio = cfg_.layer_compress_ratio(l);
             if (ratio > 0) {
@@ -1605,6 +1706,8 @@ public:
 
         int eos2_id = tokenizer_.get_token_id("<|end_of_sentence|>");
         if (eos2_id < 0) eos2_id = tokenizer_.get_token_id("<｜end of sentence｜>");
+        int im_end_id = tokenizer_.get_token_id("<|im_end|>");
+        if (im_end_id >= 0 && eos2_id < 0) eos2_id = im_end_id;
 
         int user_id = tokenizer_.get_token_id("<｜User｜>");
         if (user_id < 0) user_id = 128803;
@@ -1883,7 +1986,6 @@ private:
 
         auto load_tensor = [&](GPUTensor& gpu, const std::string& name) -> bool {
             if (!tensor_map.contains(name)) {
-                LOG_WARN("Tensor not found in manifest: %s", name.c_str());
                 return false;
             }
             auto& info = tensor_map[name];
@@ -1898,15 +2000,60 @@ private:
             return true;
         };
 
-        // Load global tensors
-        load_tensor(embed_weight_, "embed.weight");
-        load_tensor(head_weight_, "head.weight");
-        load_tensor(norm_weight_, "norm.weight");
+        auto load_quant_tensor = [&](GPUTensor& gpu_w, GPUTensor& gpu_s, const std::string& name) -> bool {
+            if (!tensor_map.contains(name)) {
+                return false;
+            }
+            auto& info = tensor_map[name];
+            int64_t offset = info["offset"].get<int64_t>();
+            int64_t nbytes = info["nbytes"].get<int64_t>();
+            gpu_w.dtype = info["dtype"].get<std::string>();
+            gpu_w.shape.clear();
+            for (auto& s : info["shape"]) gpu_w.shape.push_back(s.get<int>());
+            gpu_w.alloc(nbytes);
+            CUDA_CHECK(cudaMemcpy(gpu_w.data, (char*)mapped + offset, nbytes, cudaMemcpyHostToDevice));
 
-        // Head HC
-        load_tensor(hc_head_fn_, "hc_head_fn");
-        load_tensor(hc_head_base_, "hc_head_base");
-        load_tensor(hc_head_scale_, "hc_head_scale");
+            if (gpu_w.dtype == "int4" && info.contains("scale_offset")) {
+                int64_t scale_offset = info["scale_offset"].get<int64_t>();
+                int64_t scale_nbytes = info["scale_nbytes"].get<int64_t>();
+                gpu_s.dtype = info.value("scale_dtype", "bfloat16");
+                gpu_s.alloc(scale_nbytes);
+                CUDA_CHECK(cudaMemcpy(gpu_s.data, (char*)mapped + scale_offset, scale_nbytes, cudaMemcpyHostToDevice));
+            }
+            return true;
+        };
+
+        // Load global tensors
+        if (!load_tensor(embed_weight_, "embed.weight")) {
+            if (!load_tensor(embed_weight_, "model.embed_tokens.weight")) {
+                load_tensor(embed_weight_, "model.language_model.embed_tokens.weight");
+            }
+        }
+        if (!load_tensor(head_weight_, "head.weight")) {
+            if (!load_tensor(head_weight_, "lm_head.weight")) {
+                if (!load_tensor(head_weight_, "model.language_model.lm_head.weight")) {
+                    // Tie embeddings if lm_head is shared
+                    if (embed_weight_.data) {
+                        head_weight_.dtype = embed_weight_.dtype;
+                        head_weight_.shape = embed_weight_.shape;
+                        head_weight_.alloc(embed_weight_.size_bytes);
+                        CUDA_CHECK(cudaMemcpy(head_weight_.data, embed_weight_.data, embed_weight_.size_bytes, cudaMemcpyDeviceToDevice));
+                    }
+                }
+            }
+        }
+        if (!load_tensor(norm_weight_, "norm.weight")) {
+            if (!load_tensor(norm_weight_, "model.norm.weight")) {
+                load_tensor(norm_weight_, "model.language_model.norm.weight");
+            }
+        }
+
+        if (cfg_.architecture == ModelArch::DEEPSEEK_V4) {
+            // Head HC
+            load_tensor(hc_head_fn_, "hc_head_fn");
+            load_tensor(hc_head_base_, "hc_head_base");
+            load_tensor(hc_head_scale_, "hc_head_scale");
+        }
 
         // Load per-layer tensors
         layers_.resize(cfg_.num_hidden_layers);
@@ -1916,6 +2063,126 @@ private:
             lw.d_attn_cache_len.alloc(sizeof(int32_t));
             CUDA_CHECK(cudaMemset(lw.d_comp_kv_count.data, 0, sizeof(int32_t)));
             CUDA_CHECK(cudaMemset(lw.d_attn_cache_len.data, 0, sizeof(int32_t)));
+
+            if (cfg_.architecture == ModelArch::QWEN) {
+                std::string hf_prefix = "model.layers." + std::to_string(l);
+                std::string lm_prefix = "model.language_model.layers." + std::to_string(l);
+                std::string alt_prefix = "layers." + std::to_string(l);
+
+                // RMSNorms
+                if (!load_tensor(lw.attn_norm_w, lm_prefix + ".input_layernorm.weight")) {
+                    if (!load_tensor(lw.attn_norm_w, hf_prefix + ".input_layernorm.weight")) {
+                        load_tensor(lw.attn_norm_w, alt_prefix + ".attn_norm.weight");
+                    }
+                }
+                if (!load_tensor(lw.ffn_norm_w, lm_prefix + ".post_attention_layernorm.weight")) {
+                    if (!load_tensor(lw.ffn_norm_w, hf_prefix + ".post_attention_layernorm.weight")) {
+                        load_tensor(lw.ffn_norm_w, alt_prefix + ".ffn_norm.weight");
+                    }
+                }
+
+                // Check for Linear Attention (Gated DeltaNet) vs Full GQA Attention
+                if (load_quant_tensor(lw.w_in_qkv, lw.w_in_qkv_scale, lm_prefix + ".linear_attn.in_proj_qkv.weight") ||
+                    load_quant_tensor(lw.w_in_qkv, lw.w_in_qkv_scale, hf_prefix + ".linear_attn.in_proj_qkv.weight")) {
+                    lw.is_linear_attn = true;
+                    if (!load_quant_tensor(lw.w_in_z, lw.w_in_z_scale, lm_prefix + ".linear_attn.in_proj_z.weight")) {
+                        load_quant_tensor(lw.w_in_z, lw.w_in_z_scale, hf_prefix + ".linear_attn.in_proj_z.weight");
+                    }
+                    if (!load_tensor(lw.w_in_a, lm_prefix + ".linear_attn.in_proj_a.weight")) {
+                        load_tensor(lw.w_in_a, hf_prefix + ".linear_attn.in_proj_a.weight");
+                    }
+                    if (!load_tensor(lw.w_in_b, lm_prefix + ".linear_attn.in_proj_b.weight")) {
+                        load_tensor(lw.w_in_b, hf_prefix + ".linear_attn.in_proj_b.weight");
+                    }
+                    if (!load_tensor(lw.conv1d_w, lm_prefix + ".linear_attn.conv1d.weight")) {
+                        load_tensor(lw.conv1d_w, hf_prefix + ".linear_attn.conv1d.weight");
+                    }
+                    if (!load_tensor(lw.A_log, lm_prefix + ".linear_attn.A_log")) {
+                        load_tensor(lw.A_log, hf_prefix + ".linear_attn.A_log");
+                    }
+                    if (!load_tensor(lw.dt_bias, lm_prefix + ".linear_attn.dt_bias")) {
+                        load_tensor(lw.dt_bias, hf_prefix + ".linear_attn.dt_bias");
+                    }
+                    if (!load_tensor(lw.linear_norm_w, lm_prefix + ".linear_attn.norm.weight")) {
+                        load_tensor(lw.linear_norm_w, hf_prefix + ".linear_attn.norm.weight");
+                    }
+                    if (!load_quant_tensor(lw.linear_out_proj, lw.linear_out_proj_scale, lm_prefix + ".linear_attn.out_proj.weight")) {
+                        load_quant_tensor(lw.linear_out_proj, lw.linear_out_proj_scale, hf_prefix + ".linear_attn.out_proj.weight");
+                    }
+
+                    // Allocate linear attention recurrent states:
+                    // SSM state: [48, 128, 128] F32 = 3 MB
+                    lw.ssm_state.alloc(48 * 128 * 128 * sizeof(float));
+                    CUDA_CHECK(cudaMemset(lw.ssm_state.data, 0, lw.ssm_state.size_bytes));
+                    // Conv state: [10240, 4] BF16 = 80 KB
+                    lw.conv_state.alloc(10240 * 4 * sizeof(__nv_bfloat16));
+                    CUDA_CHECK(cudaMemset(lw.conv_state.data, 0, lw.conv_state.size_bytes));
+                } else {
+                    // Full GQA Projections
+                    lw.is_linear_attn = false;
+                    if (!load_quant_tensor(lw.w_q, lw.w_q_scale, lm_prefix + ".self_attn.q_proj.weight")) {
+                        if (!load_quant_tensor(lw.w_q, lw.w_q_scale, hf_prefix + ".self_attn.q_proj.weight")) {
+                            load_quant_tensor(lw.w_q, lw.w_q_scale, alt_prefix + ".attn.q.weight");
+                        }
+                    }
+                    if (!load_quant_tensor(lw.w_k, lw.w_k_scale, lm_prefix + ".self_attn.k_proj.weight")) {
+                        if (!load_quant_tensor(lw.w_k, lw.w_k_scale, hf_prefix + ".self_attn.k_proj.weight")) {
+                            load_quant_tensor(lw.w_k, lw.w_k_scale, alt_prefix + ".attn.k.weight");
+                        }
+                    }
+                    if (!load_quant_tensor(lw.w_v, lw.w_v_scale, lm_prefix + ".self_attn.v_proj.weight")) {
+                        if (!load_quant_tensor(lw.w_v, lw.w_v_scale, hf_prefix + ".self_attn.v_proj.weight")) {
+                            load_quant_tensor(lw.w_v, lw.w_v_scale, alt_prefix + ".attn.v.weight");
+                        }
+                    }
+                    if (!load_quant_tensor(lw.w_o, lw.w_o_scale, lm_prefix + ".self_attn.o_proj.weight")) {
+                        if (!load_quant_tensor(lw.w_o, lw.w_o_scale, hf_prefix + ".self_attn.o_proj.weight")) {
+                            load_quant_tensor(lw.w_o, lw.w_o_scale, alt_prefix + ".attn.o.weight");
+                        }
+                    }
+                    if (!load_tensor(lw.gqa_q_norm_w, lm_prefix + ".self_attn.q_norm.weight")) {
+                        load_tensor(lw.gqa_q_norm_w, hf_prefix + ".self_attn.q_norm.weight");
+                    }
+                    if (!load_tensor(lw.gqa_k_norm_w, lm_prefix + ".self_attn.k_norm.weight")) {
+                        load_tensor(lw.gqa_k_norm_w, hf_prefix + ".self_attn.k_norm.weight");
+                    }
+
+                    // Allocate GQA KV cache
+                    int max_seq = cfg_.max_seq_len > 0 ? cfg_.max_seq_len : 32768;
+                    int n_kv = cfg_.num_key_value_heads > 0 ? cfg_.num_key_value_heads : 4;
+                    int h_dim = cfg_.head_dim > 0 ? cfg_.head_dim : 256;
+                    lw.k_cache_gqa.alloc((size_t)max_seq * n_kv * h_dim * sizeof(__nv_bfloat16));
+                    lw.v_cache_gqa.alloc((size_t)max_seq * n_kv * h_dim * sizeof(__nv_bfloat16));
+                    CUDA_CHECK(cudaMemset(lw.k_cache_gqa.data, 0, lw.k_cache_gqa.size_bytes));
+                    CUDA_CHECK(cudaMemset(lw.v_cache_gqa.data, 0, lw.v_cache_gqa.size_bytes));
+                }
+
+                // SwiGLU FFN Projections
+                if (!load_quant_tensor(lw.w_gate, lw.w_gate_scale, lm_prefix + ".mlp.gate_proj.weight")) {
+                    if (!load_quant_tensor(lw.w_gate, lw.w_gate_scale, hf_prefix + ".mlp.gate_proj.weight")) {
+                        load_quant_tensor(lw.w_gate, lw.w_gate_scale, alt_prefix + ".ffn.gate.weight");
+                    }
+                }
+                if (!load_quant_tensor(lw.w_up, lw.w_up_scale, lm_prefix + ".mlp.up_proj.weight")) {
+                    if (!load_quant_tensor(lw.w_up, lw.w_up_scale, hf_prefix + ".mlp.up_proj.weight")) {
+                        load_quant_tensor(lw.w_up, lw.w_up_scale, alt_prefix + ".ffn.up.weight");
+                    }
+                }
+                if (!load_quant_tensor(lw.w_down, lw.w_down_scale, lm_prefix + ".mlp.down_proj.weight")) {
+                    if (!load_quant_tensor(lw.w_down, lw.w_down_scale, hf_prefix + ".mlp.down_proj.weight")) {
+                        load_quant_tensor(lw.w_down, lw.w_down_scale, alt_prefix + ".ffn.down.weight");
+                    }
+                }
+
+                if ((l + 1) % 10 == 0 || l == cfg_.num_hidden_layers - 1) {
+                    LOG_INFO("  Loaded Qwen layer %d/%d (%s%s)",
+                             l + 1, cfg_.num_hidden_layers,
+                             lw.is_linear_attn ? "Linear Attention DeltaNet" : "Full GQA Attention",
+                             lw.w_gate.dtype == "int4" ? " [INT4]" : "");
+                }
+                continue;
+            }
+
             std::string prefix = "layers." + std::to_string(l);
 
             load_tensor(lw.wq_a_w, prefix + ".attn.wq_a.weight");
@@ -2023,27 +2290,40 @@ private:
         int moe_inter = cfg_.moe_intermediate_size;
         int top_k = cfg_.num_experts_per_tok;
 
+        size_t max_inter = std::max({
+            (size_t)(top_k + 1) * moe_inter,
+            (size_t)cfg_.intermediate_size,
+            (size_t)17408
+        });
+        size_t max_q_dim = std::max({
+            (size_t)n_heads * head_dim_val,
+            (size_t)12288,
+            (size_t)dim
+        });
+
         buf_hidden_.alloc(dim * sizeof(__nv_bfloat16));
         buf_hidden2_.alloc(dim * sizeof(__nv_bfloat16));
-        buf_q_.alloc((size_t)n_heads * head_dim_val * sizeof(__nv_bfloat16));
+        buf_q_.alloc(max_q_dim * sizeof(__nv_bfloat16));
         buf_kv_.alloc(head_dim_val * sizeof(__nv_bfloat16));
-        buf_attn_out_.alloc((size_t)n_heads * head_dim_val * sizeof(__nv_bfloat16));
+        buf_attn_out_.alloc(max_q_dim * sizeof(__nv_bfloat16));
         buf_lora_.alloc(std::max({
             (size_t)cfg_.q_lora_rank,
             (size_t)cfg_.o_lora_rank * cfg_.o_groups,
             (size_t)n_heads * head_dim_val
         }) * sizeof(__nv_bfloat16));
-        buf_gate_.alloc((size_t)(top_k + 1) * moe_inter * sizeof(__nv_bfloat16));
-        buf_up_.alloc((size_t)(top_k + 1) * moe_inter * sizeof(__nv_bfloat16));
-        buf_down_.alloc((size_t)(top_k + 1) * dim * sizeof(__nv_bfloat16));
+        buf_gate_.alloc(max_inter * sizeof(__nv_bfloat16));
+        buf_up_.alloc(max_inter * sizeof(__nv_bfloat16));
+        buf_down_.alloc(max_inter * sizeof(__nv_bfloat16));
         buf_expert_out_.alloc(dim * sizeof(__nv_bfloat16));
         buf_moe_accum_.alloc(dim * sizeof(__nv_bfloat16));
         buf_dequant_.alloc(128 * 1024 * 1024);  // 128 MB for largest dequant
         buf_logits_.alloc((size_t)cfg_.vocab_size * sizeof(float));
-        buf_scores_f32_.alloc(cfg_.n_routed_experts * sizeof(float));
-        buf_scores_bf16_.alloc(cfg_.n_routed_experts * sizeof(__nv_bfloat16));
-        buf_topk_vals_.alloc(cfg_.num_experts_per_tok * sizeof(float));
-        buf_topk_idx_.alloc(cfg_.num_experts_per_tok * sizeof(int32_t));
+        buf_scores_f32_.alloc(std::max(cfg_.n_routed_experts, 64) * sizeof(float));
+        buf_scores_bf16_.alloc(std::max(cfg_.n_routed_experts, 64) * sizeof(__nv_bfloat16));
+        buf_topk_vals_.alloc(std::max(cfg_.num_experts_per_tok, 64) * sizeof(float));
+        buf_topk_idx_.alloc(std::max(cfg_.num_experts_per_tok, 64) * sizeof(int32_t));
+        buf_linear_a_.alloc(64 * sizeof(__nv_bfloat16));
+        buf_linear_b_.alloc(64 * sizeof(__nv_bfloat16));
         buf_input_ids_.alloc(sizeof(int32_t));
         buf_input_token_.alloc(sizeof(int32_t));
         buf_input_pos_.alloc(sizeof(int32_t));
@@ -2063,11 +2343,6 @@ private:
         buf_comp_out_.alloc(max_comp_dim * sizeof(float));   // for pooling output
         buf_comp_bf16_.alloc(head_dim_val * sizeof(__nv_bfloat16));  // compressed entry in BF16
         // Combined KV buffer: raw window + max compressed entries
-        int max_combined = cfg_.sliding_window + cfg_.max_compressed_entries;
-        buf_combined_kv_.alloc((size_t)max_combined * head_dim_val * sizeof(__nv_bfloat16));
-
-        router_probs_host_.resize(cfg_.n_routed_experts);
-        router_selection_host_.resize(cfg_.n_routed_experts);
         router_indices_host_.resize(cfg_.n_routed_experts);
         logits_host_.resize(cfg_.vocab_size);
         probs_host_.resize(cfg_.vocab_size);
@@ -2345,9 +2620,116 @@ private:
         }
     }
 
+    // ── Forward one layer (Qwen / Llama GQA + SwiGLU) ───────────────────────
+
+    void forward_layer_qwen(int layer_id, int position) {
+        auto& lw = layers_[layer_id];
+        int dim = cfg_.hidden_size;
+        int n_q_heads = cfg_.num_attention_heads;
+        int n_kv_heads = cfg_.num_key_value_heads;
+        int head_dim = cfg_.head_dim;
+        int inter_size = cfg_.intermediate_size > 0 ? cfg_.intermediate_size : cfg_.moe_intermediate_size;
+
+        auto matmul_proj = [&](GPUTensor& out, GPUTensor& in_vec, GPUTensor& weight, GPUTensor& scale, int N, int K) {
+            if (weight.dtype == "int4") {
+                gemv_int4_cuda(out.bf16(), in_vec.bf16(), (const uint8_t*)weight.data, scale.bf16(), N, K, main_stream_);
+            } else {
+                gemm_bf16(out.bf16(), 1, N, K, in_vec.bf16(), weight.bf16());
+            }
+        };
+
+        // 1. Attention Pre-RMSNorm: buf_hidden_ -> buf_hidden2_
+        rms_norm_one_centered_cuda(buf_hidden2_.bf16(), buf_hidden_.bf16(),
+                                   lw.attn_norm_w.bf16(), dim, cfg_.rms_norm_eps, main_stream_);
+
+        if (lw.is_linear_attn) {
+            // Qwen 3.8 Gated DeltaNet Linear Attention
+            // 2. Projections: in_proj_qkv (10240), in_proj_z (6144), in_proj_a (48), in_proj_b (48)
+            matmul_proj(buf_q_, buf_hidden2_, lw.w_in_qkv, lw.w_in_qkv_scale, 10240, dim);
+            matmul_proj(buf_up_, buf_hidden2_, lw.w_in_z, lw.w_in_z_scale, 6144, dim);
+            gemm_bf16(buf_linear_a_.bf16(), 1, 48, dim, buf_hidden2_.bf16(), lw.w_in_a.bf16());
+            gemm_bf16(buf_linear_b_.bf16(), 1, 48, dim, buf_hidden2_.bf16(), lw.w_in_b.bf16());
+
+            // 3. Fused 1D Causal Conv + Recurrent SSM Decode Step
+            deltanet_linear_attention_decode_cuda(
+                buf_attn_out_.bf16(),
+                buf_q_.bf16(),
+                buf_up_.bf16(),
+                buf_linear_a_.bf16(),
+                buf_linear_b_.bf16(),
+                lw.conv1d_w.bf16(),
+                lw.conv_state.bf16(),
+                lw.A_log.bf16(),
+                lw.dt_bias.bf16(),
+                lw.linear_norm_w.bf16(),
+                lw.ssm_state.f32(),
+                16, 48, 128, main_stream_);
+
+            // 4. Output Projection: buf_attn_out_ (6144) -> buf_hidden2_ (5120)
+            matmul_proj(buf_hidden2_, buf_attn_out_, lw.linear_out_proj, lw.linear_out_proj_scale, dim, 6144);
+        } else {
+            // Standard Full GQA Attention (Gated)
+            // 2. Q projection (2 * n_q_heads * head_dim), K projection, V projection
+            matmul_proj(buf_q_, buf_hidden2_, lw.w_q, lw.w_q_scale, 2 * n_q_heads * head_dim, dim);
+            matmul_proj(buf_gate_, buf_hidden2_, lw.w_k, lw.w_k_scale, n_kv_heads * head_dim, dim);
+            matmul_proj(buf_up_, buf_hidden2_, lw.w_v, lw.w_v_scale, n_kv_heads * head_dim, dim);
+
+            // 3 & 4. QK Norm + RoPE + GQA Decode + Sigmoid Gate
+            qwen_gqa_decode_gated_cuda(
+                buf_attn_out_.bf16(),
+                buf_q_.bf16(),
+                buf_gate_.bf16(),
+                buf_up_.bf16(),
+                lw.gqa_q_norm_w.bf16(),
+                lw.gqa_k_norm_w.bf16(),
+                lw.k_cache_gqa.bf16(),
+                lw.v_cache_gqa.bf16(),
+                n_q_heads, n_kv_heads, head_dim, position, cfg_.max_seq_len,
+                cfg_.rope_theta, cfg_.rms_norm_eps, main_stream_);
+
+            // 5. Output Projection: buf_attn_out_ -> buf_hidden2_
+            matmul_proj(buf_hidden2_, buf_attn_out_, lw.w_o, lw.w_o_scale, dim, n_q_heads * head_dim);
+        }
+
+        // 6. Residual connection: buf_hidden_ += buf_hidden2_
+        {
+            float alpha = 1.0f;
+            cublasAxpyEx(cublas_handle_, dim, &alpha, CUDA_R_32F,
+                         buf_hidden2_.data, CUDA_R_16BF, 1,
+                         buf_hidden_.data, CUDA_R_16BF, 1, CUDA_R_32F);
+        }
+
+        // 7. FFN Pre-RMSNorm: buf_hidden_ -> buf_hidden2_
+        rms_norm_one_centered_cuda(buf_hidden2_.bf16(), buf_hidden_.bf16(),
+                                   lw.ffn_norm_w.bf16(), dim, cfg_.rms_norm_eps, main_stream_);
+
+        // 8. Gate & Up projections for SwiGLU
+        matmul_proj(buf_gate_, buf_hidden2_, lw.w_gate, lw.w_gate_scale, inter_size, dim);
+        matmul_proj(buf_up_, buf_hidden2_, lw.w_up, lw.w_up_scale, inter_size, dim);
+
+        // 9. Fused SiLU(Gate) * Up
+        silu_mul_cuda(buf_gate_.bf16(), buf_gate_.bf16(), buf_up_.bf16(), inter_size, 0.0f, main_stream_);
+
+        // 10. Down projection: buf_gate_ -> buf_hidden2_
+        matmul_proj(buf_hidden2_, buf_gate_, lw.w_down, lw.w_down_scale, dim, inter_size);
+
+        // 11. Residual connection: buf_hidden_ += buf_hidden2_
+        {
+            float alpha = 1.0f;
+            cublasAxpyEx(cublas_handle_, dim, &alpha, CUDA_R_32F,
+                         buf_hidden2_.data, CUDA_R_16BF, 1,
+                         buf_hidden_.data, CUDA_R_16BF, 1, CUDA_R_32F);
+        }
+    }
+
     // ── Forward one layer ───────────────────────────────────────────────────
 
     void forward_layer(int layer_id, int token_id, int position) {
+        if (cfg_.architecture == ModelArch::QWEN) {
+            forward_layer_qwen(layer_id, position);
+            return;
+        }
+
         auto& lw = layers_[layer_id];
         int dim = cfg_.hidden_size;
 
@@ -3003,6 +3385,46 @@ static const std::string DEEPSEEK_V4_REASONING_EFFORT_MAX_PREFIX =
     "Explicitly write out your entire deliberation process, documenting every intermediate step, considered alternative, and rejected hypothesis to ensure absolutely no assumption is left unchecked.\n\n";
 
 static std::vector<int> apply_chat_template(const json& messages, const BPETokenizer& tok, bool enable_thinking = true, const std::string& reasoning_effort = "high") {
+    int IM_START = tok.get_token_id("<|im_start|>");
+    int IM_END = tok.get_token_id("<|im_end|>");
+    if (IM_START >= 0 && IM_END >= 0) {
+        // ChatML template (Qwen / Llama / SmolLM)
+        std::vector<int> result;
+        bool has_system = (!messages.empty() && messages[0]["role"].get<std::string>() == "system");
+        if (!has_system && enable_thinking) {
+            std::string sys_prompt = "Reasoning effort is set to xhigh. Please think carefully through the task, validate key assumptions, consider plausible alternatives, and prioritize correctness, consistency, and clarity in the final answer.";
+            result.push_back(IM_START);
+            auto sys_role = tok.encode("system\n" + sys_prompt);
+            result.insert(result.end(), sys_role.begin(), sys_role.end());
+            result.push_back(IM_END);
+            auto nl_enc = tok.encode("\n");
+            result.insert(result.end(), nl_enc.begin(), nl_enc.end());
+        }
+        for (size_t i = 0; i < messages.size(); i++) {
+            std::string role = messages[i]["role"].get<std::string>();
+            std::string content = messages[i]["content"].get<std::string>();
+
+            result.push_back(IM_START);
+            auto role_enc = tok.encode(role + "\n");
+            result.insert(result.end(), role_enc.begin(), role_enc.end());
+            auto content_enc = tok.encode(content);
+            result.insert(result.end(), content_enc.begin(), content_enc.end());
+            result.push_back(IM_END);
+            auto nl_enc = tok.encode("\n");
+            result.insert(result.end(), nl_enc.begin(), nl_enc.end());
+        }
+        if (!messages.empty() && messages.back()["role"].get<std::string>() == "user") {
+            result.push_back(IM_START);
+            auto asst_enc = tok.encode("assistant\n");
+            result.insert(result.end(), asst_enc.begin(), asst_enc.end());
+            if (enable_thinking) {
+                auto think_enc = tok.encode("<think>\n");
+                result.insert(result.end(), think_enc.begin(), think_enc.end());
+            }
+        }
+        return result;
+    }
+
     int BOS = tok.get_token_id("<｜begin of sentence｜>");
     if (BOS < 0) BOS = tok.get_token_id("<｜begin\xe2\x96\x81of\xe2\x96\x81sentence｜>");
     if (BOS < 0) BOS = 0;

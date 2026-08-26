@@ -17,6 +17,15 @@ void rms_norm_cuda(
     float eps,
     cudaStream_t stream = 0);
 
+// Qwen 3.5 unit-offset: out[i] = (1.0f + weight[i]) * x[i] * rsqrt(mean(x^2) + eps)
+void rms_norm_one_centered_cuda(
+    __nv_bfloat16* out,            // [dim]
+    const __nv_bfloat16* x,        // [dim]
+    const __nv_bfloat16* weight,   // [dim]
+    int dim,
+    float eps,
+    cudaStream_t stream = 0);
+
 // Batched: process multiple rows
 void rms_norm_cuda_batched(
     __nv_bfloat16* out,            // [n, dim]
@@ -144,6 +153,15 @@ void gemm_int2_cuda(__nv_bfloat16* out, const __nv_bfloat16* A,
                     const uint8_t* weight, const __nv_bfloat16* scale_min,
                     int M, int N, int K_packed, int block_size,
                     cudaStream_t stream = 0);
+
+// ── INT4 symmetric block quantization (Block Size = 32) ───────────────────────
+void gemv_int4_cuda(
+    __nv_bfloat16* out,
+    const __nv_bfloat16* vec,
+    const uint8_t* weight,
+    const __nv_bfloat16* scale,
+    int N, int K,
+    cudaStream_t stream = 0);
 
 // ── IQ2_XXS quantization ──────────────────────────────────────────────────────
 #define QK_IQ2_XXS 256
@@ -486,4 +504,67 @@ void accumulate_expert_imatrix_cuda(
     int hidden_dim,
     int moe_intermediate,
     cudaStream_t stream = 0);
+
+// ── Standard GQA & RoPE for Qwen / Llama ───────────────────────────────────────
+void rope_standard_cuda(
+    __nv_bfloat16* q,
+    __nv_bfloat16* k,
+    int n_q_heads,
+    int n_kv_heads,
+    int head_dim,
+    int pos,
+    float rope_theta = 1000000.0f,
+    cudaStream_t stream = 0);
+
+void gqa_attention_decode_cuda(
+    __nv_bfloat16* out,
+    const __nv_bfloat16* q,
+    __nv_bfloat16* k_cache,
+    __nv_bfloat16* v_cache,
+    const __nv_bfloat16* new_k,
+    const __nv_bfloat16* new_v,
+    int n_q_heads,
+    int n_kv_heads,
+    int head_dim,
+    int pos,
+    int max_seq_len,
+    cudaStream_t stream = 0);
+
+// ── Qwen 3.8 Gated GQA Attention Decode (with QK Norm + Gate) ────────────────
+void qwen_gqa_decode_gated_cuda(
+    __nv_bfloat16* out,             // [n_q_heads * head_dim] (6144)
+    const __nv_bfloat16* q_and_gate,// [2 * n_q_heads * head_dim] (12288)
+    __nv_bfloat16* k,               // [n_kv_heads * head_dim]
+    const __nv_bfloat16* v,         // [n_kv_heads * head_dim]
+    const __nv_bfloat16* q_norm_w,  // [head_dim]
+    const __nv_bfloat16* k_norm_w,  // [head_dim]
+    __nv_bfloat16* k_cache,
+    __nv_bfloat16* v_cache,
+    int n_q_heads,
+    int n_kv_heads,
+    int head_dim,
+    int pos,
+    int max_seq_len,
+    float rope_theta = 1000000.0f,
+    float eps = 1e-6f,
+    cudaStream_t stream = 0);
+
+// ── Qwen 3.8 Gated DeltaNet Linear Attention Decode ───────────────────────────
+void deltanet_linear_attention_decode_cuda(
+    __nv_bfloat16* out,             // [6144] (48 heads * 128)
+    const __nv_bfloat16* in_qkv,    // [10240] (Q: 2048, K: 2048, V: 6144)
+    const __nv_bfloat16* in_z,      // [6144]
+    const __nv_bfloat16* in_a,      // [48]
+    const __nv_bfloat16* in_b,      // [48]
+    const __nv_bfloat16* conv1d_w,  // [10240, 4]
+    __nv_bfloat16* conv_state,      // [10240, 4]
+    const __nv_bfloat16* A_log,     // [48]
+    const __nv_bfloat16* dt_bias,   // [48]
+    const __nv_bfloat16* norm_w,    // [128]
+    float* ssm_state,               // [48, 128, 128]
+    int num_k_heads = 16,
+    int num_v_heads = 48,
+    int head_dim = 128,
+    cudaStream_t stream = 0);
+
 
