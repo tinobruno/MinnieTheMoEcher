@@ -1,11 +1,11 @@
 # ─────────────────────────────────────────────────────────────────────────────
-#  build_installer.ps1 — Build Spanned Moecher Windows Setup Package
+#  build_installer.ps1 — Build Lightweight Moecher Windows Online Installer
 # ─────────────────────────────────────────────────────────────────────────────
 
 $ErrorActionPreference = "Stop"
 
 Write-Host "════════════════════════════════════════════════════════════════" -ForegroundColor Cyan
-Write-Host "  Building Moecher Windows Setup Package (Spanned .bin Slices)" -ForegroundColor Cyan
+Write-Host "  Building Lightweight Moecher Windows Installer" -ForegroundColor Cyan
 Write-Host "════════════════════════════════════════════════════════════════" -ForegroundColor Cyan
 
 # 1. Locate Inno Setup Compiler (ISCC.exe)
@@ -28,14 +28,13 @@ $RequiredFiles = @(
     "build\Release\moecher.exe",
     "installer\Moecher_Setup.iss",
     "installer\start_qwen_server.bat",
+    "installer\start_deepseek_server.bat",
     "installer\test_qwen.bat",
+    "installer\download_model.ps1",
     "graphics\moecher.ico",
     "graphics\installer_wizard.bmp",
     "graphics\installer_small.bmp",
-    "web\index.html",
-    "models\qwen3_8_27b_q4\moecher_manifest_qwen_q4.json",
-    "models\qwen3_8_27b_q4\tokenizer.json",
-    "models\qwen3_8_27b_q4\attention_dense_layers_q4.bin"
+    "web\index.html"
 )
 
 foreach ($file in $RequiredFiles) {
@@ -53,7 +52,7 @@ if (Test-Path $DistDir) {
 }
 
 # 4. Compile Inno Setup package
-Write-Host "Compiling Inno Setup package (packaging ~18.7 GB into .bin slices)..." -ForegroundColor Cyan
+Write-Host "Compiling Inno Setup package..." -ForegroundColor Cyan
 $IssScript = "D:\dev\minniemoe\MinnieTheMoEcher\installer\Moecher_Setup.iss"
 
 & $IsccExe $IssScript
@@ -62,7 +61,12 @@ if ($LASTEXITCODE -ne 0) {
     Write-Error "Installer compilation failed with exit code $LASTEXITCODE"
 }
 
-Write-Host "════════════════════════════════════════════════════════════════" -ForegroundColor Green
-Write-Host "  Moecher Spanned Setup Package Created Successfully!" -ForegroundColor Green
-Write-Host "  Destination: $DistDir" -ForegroundColor Green
-Write-Host "════════════════════════════════════════════════════════════════" -ForegroundColor Green
+$setupExe = "$DistDir\Moecher-Setup.exe"
+if (Test-Path $setupExe) {
+    $setupItem = Get-Item $setupExe
+    $setupMB = [math]::Round($setupItem.Length / 1MB, 2)
+    Write-Host "════════════════════════════════════════════════════════════════" -ForegroundColor Green
+    Write-Host "  Moecher Installer Created Successfully!" -ForegroundColor Green
+    Write-Host "  Installer Path: $setupExe ($setupMB MB)" -ForegroundColor Green
+    Write-Host "════════════════════════════════════════════════════════════════" -ForegroundColor Green
+}
