@@ -134,15 +134,15 @@ begin
     // Trigger model download if selected
     if WizardIsComponentSelected('dl_qwen') and WizardIsComponentSelected('dl_deepseek') then
     begin
-      Exec('powershell.exe', '-ExecutionPolicy Bypass -File "' + AppDir + '\download_model.ps1" -Model both', AppDir, SW_SHOWNORMAL, ewWaitUntilTerminated, ResultCode);
+      Exec('powershell.exe', '-ExecutionPolicy Bypass -File "' + AppDir + '\download_model.ps1" -Model both -DestDir "' + AppDir + '\models"', AppDir, SW_SHOWNORMAL, ewWaitUntilTerminated, ResultCode);
     end
     else if WizardIsComponentSelected('dl_qwen') then
     begin
-      Exec('powershell.exe', '-ExecutionPolicy Bypass -File "' + AppDir + '\download_model.ps1" -Model qwen', AppDir, SW_SHOWNORMAL, ewWaitUntilTerminated, ResultCode);
+      Exec('powershell.exe', '-ExecutionPolicy Bypass -File "' + AppDir + '\download_model.ps1" -Model qwen -DestDir "' + AppDir + '\models"', AppDir, SW_SHOWNORMAL, ewWaitUntilTerminated, ResultCode);
     end
     else if WizardIsComponentSelected('dl_deepseek') then
     begin
-      Exec('powershell.exe', '-ExecutionPolicy Bypass -File "' + AppDir + '\download_model.ps1" -Model deepseek', AppDir, SW_SHOWNORMAL, ewWaitUntilTerminated, ResultCode);
+      Exec('powershell.exe', '-ExecutionPolicy Bypass -File "' + AppDir + '\download_model.ps1" -Model deepseek -DestDir "' + AppDir + '\models"', AppDir, SW_SHOWNORMAL, ewWaitUntilTerminated, ResultCode);
     end;
   end;
 end;

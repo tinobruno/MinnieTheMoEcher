@@ -7,16 +7,31 @@ param (
     [ValidateSet("qwen", "deepseek", "both")]
     [string]$Model,
 
-    [string]$DestDir = "$PSScriptRoot\models",
+    [string]$DestDir = "",
     [string]$Username = "TinoBruno"
 )
 
 $ErrorActionPreference = "Stop"
 
+# Determine robust absolute destination directory
+if (-not $DestDir -or $DestDir.Trim() -eq "") {
+    $scriptDir = $PSScriptRoot
+    if (-not $scriptDir -and $MyInvocation.MyCommand.Path) {
+        $scriptDir = Split-Path -Parent $MyInvocation.MyCommand.Path
+    }
+    if (-not $scriptDir) {
+        $scriptDir = (Get-Location).Path
+    }
+    $DestDir = Join-Path $scriptDir "models"
+}
+
+# Resolve to full absolute path to avoid any drive-root relative paths
+$DestDir = [System.IO.Path]::GetFullPath($DestDir)
+
 $ModelConfigs = @{
     "qwen" = @{
         "Repo"  = "$Username/moecher-qwen-3.8-27b-q4"
-        "Dir"   = "$DestDir\qwen3_8_27b_q4"
+        "Dir"   = (Join-Path $DestDir "qwen3_8_27b_q4")
         "Files" = @(
             "moecher_manifest.json",
             "tokenizer.json",
@@ -25,7 +40,7 @@ $ModelConfigs = @{
     }
     "deepseek" = @{
         "Repo"  = "$Username/moecher-deepseek-v4-flash-iq2"
-        "Dir"   = "$DestDir\deepseek_v4_flash_iq2"
+        "Dir"   = (Join-Path $DestDir "deepseek_v4_flash_iq2")
         "Files" = @(
             "moecher_manifest.json",
             "tokenizer.json",
@@ -83,7 +98,7 @@ foreach ($t in $targets) {
     $cfg = $ModelConfigs[$t]
     Write-Host "════════════════════════════════════════════════════════════════" -ForegroundColor Cyan
     Write-Host "  Downloading Model: $($cfg.Repo)" -ForegroundColor Cyan
-    Write-Host "  Destination: $($cfg.Dir)" -ForegroundColor Cyan
+    Write-Host "  Destination Folder: $($cfg.Dir)" -ForegroundColor Cyan
     Write-Host "════════════════════════════════════════════════════════════════" -ForegroundColor Cyan
 
     foreach ($f in $cfg.Files) {
