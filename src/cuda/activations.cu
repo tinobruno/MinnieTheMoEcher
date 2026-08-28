@@ -3054,6 +3054,146 @@ void gemv_q2_k_moe_cuda(
         w2_offset, N, K);
 }
 
+// ── Fused All-6-Experts Q2_K MoE Down-Projection + Direct Shared Expert Accumulator ──
+__global__ void gemv_q2_k_moe_accum_fused_kernel(
+    __nv_bfloat16* __restrict__ out_hidden,           // [N]
+    const __nv_bfloat16* __restrict__ gate_buf,       // [6 * K]
+    const float* __restrict__ topk_weights,           // [6]
+    const __nv_bfloat16* __restrict__ shared_down,    // [N]
+    const void* const* __restrict__ active_expert_ptrs,
+    const int32_t* __restrict__ topk_ids,
+    const void* const* __restrict__ flat_expert_ptrs,
+    int layer_id, int n_experts,
+    int w2_offset,
+    int N, int K)
+{
+    __shared__ __align__(16) __nv_bfloat16 s_gate[6][256];
+    __shared__ float s_expert_out[6];
+
+    int row = blockIdx.x; // 1 row per block, N blocks total
+    if (row >= N) return;
+
+    int k = threadIdx.y;    // warp index = expert index (0..5)
+    int lane = threadIdx.x; // lane in warp (0..31)
+
+    const __nv_bfloat16* k_gate = gate_buf + (size_t)k * K;
+
+    // Prefetch first 256 elements of k_gate into s_gate[k]
+    cp_async_16_bytes((uint4*)s_gate[k] + lane, (const uint4*)k_gate + lane);
+    cp_async_commit_group();
+    cp_async_wait_all();
+    __syncwarp();
+
+    const void* p = nullptr;
+    if (flat_expert_ptrs && topk_ids) {
+        int eid = topk_ids[k];
+        if (eid >= 0 && eid < n_experts) {
+            p = flat_expert_ptrs[layer_id * n_experts + eid];
+        }
+    } else if (active_expert_ptrs) {
+        p = active_expert_ptrs[k];
+    }
+
+    float sum = 0.0f;
+    if (p) {
+        const uint8_t* block = (const uint8_t*)p;
+        const block_q2_K* w2 = (const block_q2_K*)(block + w2_offset);
+
+        int n_blocks = K / 256;
+        const block_q2_K* row_w2 = w2 + row * n_blocks;
+        int lane_half = lane >> 4;
+
+        for (int b = 0; b < n_blocks; b++) {
+            if (b > 0) {
+                // Asynchronously load tile b into s_gate[k]
+                cp_async_16_bytes((uint4*)s_gate[k] + lane,
+                                  (const uint4*)(k_gate + (b << 8)) + lane);
+                cp_async_commit_group();
+                cp_async_wait_all();
+                __syncwarp();
+            }
+
+            const block_q2_K* blk = &row_w2[b];
+            float d = (lane == 0) ? __half2float(blk->d) : 0.0f;
+            float min = (lane == 0) ? __half2float(blk->dmin) : 0.0f;
+            d = __shfl_sync(0xffffffff, d, 0);
+            min = __shfl_sync(0xffffffff, min, 0);
+
+            uint8_t sc_val = (lane < 16) ? blk->scales[lane] : 0;
+
+            uint8_t q0 = blk->qs[lane];
+            uint8_t q1 = blk->qs[32 + lane];
+
+            #pragma unroll 4
+            for (int iter = 0; iter < 4; iter++) {
+                uint8_t q = (q0 >> (iter * 2)) & 0x03;
+                uint8_t sc = (uint8_t)__shfl_sync(0xffffffff, sc_val, (iter * 2) + lane_half);
+                float dl = d * (float)(sc & 0x0F);
+                float ml = min * (float)(sc >> 4);
+                float w = dl * (float)q - ml;
+
+                int col_in_block = (iter << 5) + lane;
+                float a = __bfloat162float(s_gate[k][col_in_block]);
+                sum += w * a;
+            }
+
+            #pragma unroll 4
+            for (int iter = 0; iter < 4; iter++) {
+                uint8_t q = (q1 >> (iter * 2)) & 0x03;
+                uint8_t sc = (uint8_t)__shfl_sync(0xffffffff, sc_val, 8 + (iter * 2) + lane_half);
+                float dl = d * (float)(sc & 0x0F);
+                float ml = min * (float)(sc >> 4);
+                float w = dl * (float)q - ml;
+
+                int col_in_block = 128 + (iter << 5) + lane;
+                float a = __bfloat162float(s_gate[k][col_in_block]);
+                sum += w * a;
+            }
+        }
+
+        #pragma unroll
+        for (int offset = 16; offset > 0; offset /= 2) {
+            sum += __shfl_down_sync(0xffffffff, sum, offset);
+        }
+    }
+
+    if (lane == 0) {
+        float w = topk_weights ? topk_weights[k] : 1.0f;
+        s_expert_out[k] = sum * w;
+    }
+    __syncthreads();
+
+    if (threadIdx.y == 0 && threadIdx.x == 0) {
+        float total = shared_down ? __bfloat162float(shared_down[row]) : 0.0f;
+        #pragma unroll
+        for (int i = 0; i < 6; i++) {
+            total += s_expert_out[i];
+        }
+        out_hidden[row] = __float2bfloat16(total);
+    }
+}
+
+void gemv_q2_k_moe_accum_fused_cuda(
+    __nv_bfloat16* out_hidden,
+    const __nv_bfloat16* gate_buf,
+    const float* topk_weights,
+    const __nv_bfloat16* shared_down,
+    const void* const* active_expert_ptrs,
+    int w2_offset,
+    int N, int K,
+    const int32_t* topk_ids,
+    const void* const* flat_expert_ptrs,
+    int layer_id, int n_experts,
+    cudaStream_t stream)
+{
+    dim3 threads(32, 6);
+    dim3 blocks(N);
+    gemv_q2_k_moe_accum_fused_kernel<<<blocks, threads, 0, stream>>>(
+        out_hidden, gate_buf, topk_weights, shared_down, active_expert_ptrs,
+        topk_ids, flat_expert_ptrs, layer_id, n_experts,
+        w2_offset, N, K);
+}
+
 // ════════════════════════════════════════════════════════════════════════════════
 //  Device-Driven Kernels for CUDA Graph Capture
 // ════════════════════════════════════════════════════════════════════════════════

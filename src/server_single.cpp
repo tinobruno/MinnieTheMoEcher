@@ -3225,34 +3225,6 @@ private:
                                        top_k * sizeof(void*), cudaMemcpyHostToDevice, main_stream_));
         }
 
-        // 5. Launch 6 routed experts
-        auto& w1_info = expert_parts_["w1.weight"];
-        auto& w3_info = expert_parts_["w3.weight"];
-        auto& w2_info = expert_parts_["w2.weight"];
-
-        if (cfg_.expert_dtype == "iq2_xxs") {
-            gemv_iq2_xxs_moe_swiglu_fused_cuda(
-                buf_gate_.bf16(), buf_hidden_.bf16(),
-                (const void* const*)buf_active_expert_ptrs_.data,
-                w1_info.offset_in_block, w3_info.offset_in_block,
-                moe_inter, dim, cfg_.swiglu_limit,
-                buf_topk_idx_.i32(), flat_ptrs, layer_id, n_experts, main_stream_);
-
-            gemv_q2_k_moe_cuda(
-                buf_down_.bf16(), buf_gate_.bf16(),
-                (const void* const*)buf_active_expert_ptrs_.data,
-                w2_info.offset_in_block,
-                dim, moe_inter,
-                buf_topk_idx_.i32(), flat_ptrs, layer_id, n_experts, main_stream_);
-        } else {
-            for (int k = 0; k < top_k; k++) {
-                void* ptr = active_expert_ptrs_host_[k];
-                if (ptr) {
-                    execute_expert_swiglu(ptr, 1.0f, k);
-                }
-            }
-        }
-
         // 5. Shared expert executed concurrently on side_stream_ (must wait for ffn_norm to finish on main_stream_)
         CUDA_CHECK(cudaStreamWaitEvent(side_stream_, main_event_, 0));
         __nv_bfloat16* shared_gate = buf_gate_.bf16() + top_k * moe_inter;
@@ -3280,12 +3252,41 @@ private:
         }
         CUDA_CHECK(cudaEventRecord(side_event_, side_stream_));
 
-        // Wait for shared expert on side_stream_ before accumulating
-        CUDA_CHECK(cudaStreamWaitEvent(main_stream_, side_event_, 0));
+        // 6. Launch 6 routed experts with fused SwiGLU & fused down-projection accumulator
+        auto& w1_info = expert_parts_["w1.weight"];
+        auto& w3_info = expert_parts_["w3.weight"];
+        auto& w2_info = expert_parts_["w2.weight"];
 
-        // 6. Fused 6-way dynamic accumulation + shared expert directly into buf_hidden_
-        fused_moe_accum_dynamic_cuda(buf_hidden_.bf16(), buf_down_.bf16(),
-                                     buf_topk_vals_.f32(), shared_down, dim, main_stream_);
+        if (cfg_.expert_dtype == "iq2_xxs") {
+            gemv_iq2_xxs_moe_swiglu_fused_cuda(
+                buf_gate_.bf16(), buf_hidden_.bf16(),
+                (const void* const*)buf_active_expert_ptrs_.data,
+                w1_info.offset_in_block, w3_info.offset_in_block,
+                moe_inter, dim, cfg_.swiglu_limit,
+                buf_topk_idx_.i32(), flat_ptrs, layer_id, n_experts, main_stream_);
+
+            // Wait for shared expert on side_stream_ before fused down-projection & accumulation
+            CUDA_CHECK(cudaStreamWaitEvent(main_stream_, side_event_, 0));
+
+            // Direct fused all-6-experts Q2_K down projection + shared expert accumulation into buf_hidden_
+            gemv_q2_k_moe_accum_fused_cuda(
+                buf_hidden_.bf16(), buf_gate_.bf16(),
+                buf_topk_vals_.f32(), shared_down,
+                (const void* const*)buf_active_expert_ptrs_.data,
+                w2_info.offset_in_block,
+                dim, moe_inter,
+                buf_topk_idx_.i32(), flat_ptrs, layer_id, n_experts, main_stream_);
+        } else {
+            for (int k = 0; k < top_k; k++) {
+                void* ptr = active_expert_ptrs_host_[k];
+                if (ptr) {
+                    execute_expert_swiglu(ptr, 1.0f, k);
+                }
+            }
+            CUDA_CHECK(cudaStreamWaitEvent(main_stream_, side_event_, 0));
+            fused_moe_accum_dynamic_cuda(buf_hidden_.bf16(), buf_down_.bf16(),
+                                         buf_topk_vals_.f32(), shared_down, dim, main_stream_);
+        }
     }
 
     // ── Execute a single expert SwiGLU ──────────────────────────────────────
