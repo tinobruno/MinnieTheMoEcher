@@ -1,10 +1,10 @@
-# ─────────────────────────────────────────────────────────────────────────────
-#  download_model.ps1 — Moecher On-Demand Model Downloader
-# ─────────────────────────────────────────────────────────────────────────────
+# -----------------------------------------------------------------------------
+#  download_model.ps1 - Moecher On-Demand Model Downloader
+# -----------------------------------------------------------------------------
 
 param (
     [Parameter(Mandatory=$true)]
-    [ValidateSet("qwen", "deepseek", "both")]
+    [ValidateSet("qwen", "deepseek", "deepseek_q4", "both")]
     [string]$Model,
 
     [string]$DestDir = "",
@@ -12,6 +12,7 @@ param (
 )
 
 $ErrorActionPreference = "Stop"
+[Console]::OutputEncoding = [System.Text.Encoding]::UTF8
 
 # Determine robust absolute destination directory
 if (-not $DestDir -or $DestDir.Trim() -eq "") {
@@ -48,6 +49,16 @@ $ModelConfigs = @{
             "moe_experts_iq2.bin"
         )
     }
+    "deepseek_q4" = @{
+        "Repo"  = "$Username/moecher-deepseek-v4-flash-q4"
+        "Dir"   = (Join-Path $DestDir "deepseek_v4_flash_q4")
+        "Files" = @(
+            "moecher_manifest.json",
+            "tokenizer.json",
+            "attention_dense_layers_q4.bin",
+            "moe_experts_iq2.bin"
+        )
+    }
 }
 
 function Download-HuggingFaceFile {
@@ -65,13 +76,16 @@ function Download-HuggingFaceFile {
     }
 
     if (Test-Path $outFile) {
-        Write-Host "  [EXISTS] $FileName already present. Skipping." -ForegroundColor Green
-        return
+        $localSize = (Get-Item $outFile).Length
+        if ($localSize -gt 0) {
+            Write-Host "  [SKIP] $FileName already exists ($([math]::Round($localSize / 1MB, 1)) MB)." -ForegroundColor Yellow
+            return
+        }
     }
 
-    Write-Host "  Downloading: $FileName from https://huggingface.co/$RepoId ..." -ForegroundColor Cyan
+    $tempFile = "$outFile.downloading"
+    Write-Host "Downloading: $FileName from https://huggingface.co/$RepoId ..." -ForegroundColor Cyan
 
-    $tempFile = "$outFile.download"
     $curlExe = Get-Command "curl.exe" -ErrorAction SilentlyContinue
 
     if ($curlExe) {
@@ -96,10 +110,10 @@ $targets = if ($Model -eq "both") { @("qwen", "deepseek") } else { @($Model) }
 
 foreach ($t in $targets) {
     $cfg = $ModelConfigs[$t]
-    Write-Host "════════════════════════════════════════════════════════════════" -ForegroundColor Cyan
+    Write-Host "================================================================" -ForegroundColor Cyan
     Write-Host "  Downloading Model: $($cfg.Repo)" -ForegroundColor Cyan
     Write-Host "  Destination Folder: $($cfg.Dir)" -ForegroundColor Cyan
-    Write-Host "════════════════════════════════════════════════════════════════" -ForegroundColor Cyan
+    Write-Host "================================================================" -ForegroundColor Cyan
 
     foreach ($f in $cfg.Files) {
         Download-HuggingFaceFile -RepoId $cfg.Repo -FileName $f -TargetFolder $cfg.Dir

@@ -1,5 +1,6 @@
 @echo off
 setlocal
+chcp 65001 >nul
 cd /d "%~dp0"
 echo ===============================================================================
 echo   Starting Moecher Server with DeepSeek V4 Flash IQ2

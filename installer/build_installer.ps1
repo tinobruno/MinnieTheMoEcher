@@ -1,12 +1,13 @@
-# ─────────────────────────────────────────────────────────────────────────────
-#  build_installer.ps1 — Build Lightweight Moecher Windows Online Installer
-# ─────────────────────────────────────────────────────────────────────────────
+# -----------------------------------------------------------------------------
+#  build_installer.ps1 - Build Lightweight Moecher Windows Online Installer
+# -----------------------------------------------------------------------------
 
 $ErrorActionPreference = "Stop"
+[Console]::OutputEncoding = [System.Text.Encoding]::UTF8
 
-Write-Host "════════════════════════════════════════════════════════════════" -ForegroundColor Cyan
+Write-Host "================================================================" -ForegroundColor Cyan
 Write-Host "  Building Lightweight Moecher Windows Installer" -ForegroundColor Cyan
-Write-Host "════════════════════════════════════════════════════════════════" -ForegroundColor Cyan
+Write-Host "================================================================" -ForegroundColor Cyan
 
 # 1. Locate Inno Setup Compiler (ISCC.exe)
 $IsccPaths = @(
@@ -65,8 +66,8 @@ $setupExe = "$DistDir\Moecher-Setup.exe"
 if (Test-Path $setupExe) {
     $setupItem = Get-Item $setupExe
     $setupMB = [math]::Round($setupItem.Length / 1MB, 2)
-    Write-Host "════════════════════════════════════════════════════════════════" -ForegroundColor Green
+    Write-Host "================================================================" -ForegroundColor Green
     Write-Host "  Moecher Installer Created Successfully!" -ForegroundColor Green
     Write-Host "  Installer Path: $setupExe ($setupMB MB)" -ForegroundColor Green
-    Write-Host "════════════════════════════════════════════════════════════════" -ForegroundColor Green
+    Write-Host "================================================================" -ForegroundColor Green
 }

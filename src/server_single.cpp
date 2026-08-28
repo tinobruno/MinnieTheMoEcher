@@ -2109,15 +2109,19 @@ private:
                 return false;
             }
             auto& info = tensor_map[name];
+            std::string dtype = info.value("dtype", "");
+            if (dtype != "int4") {
+                return false;
+            }
             int64_t offset = info["offset"].get<int64_t>();
             int64_t nbytes = info["nbytes"].get<int64_t>();
-            gpu_w.dtype = info["dtype"].get<std::string>();
+            gpu_w.dtype = dtype;
             gpu_w.shape.clear();
             for (auto& s : info["shape"]) gpu_w.shape.push_back(s.get<int>());
             gpu_w.alloc(nbytes);
             CUDA_CHECK(cudaMemcpy(gpu_w.data, (char*)mapped + offset, nbytes, cudaMemcpyHostToDevice));
 
-            if (gpu_w.dtype == "int4" && info.contains("scale_offset")) {
+            if (info.contains("scale_offset")) {
                 int64_t scale_offset = info["scale_offset"].get<int64_t>();
                 int64_t scale_nbytes = info["scale_nbytes"].get<int64_t>();
                 gpu_s.dtype = info.value("scale_dtype", "bfloat16");
@@ -2289,16 +2293,26 @@ private:
 
             std::string prefix = "layers." + std::to_string(l);
 
-            load_tensor(lw.wq_a_w, prefix + ".attn.wq_a.weight");
-            load_tensor(lw.wq_a_s, prefix + ".attn.wq_a.scale");
-            load_tensor(lw.wq_b_w, prefix + ".attn.wq_b.weight");
-            load_tensor(lw.wq_b_s, prefix + ".attn.wq_b.scale");
-            load_tensor(lw.wkv_w, prefix + ".attn.wkv.weight");
-            load_tensor(lw.wkv_s, prefix + ".attn.wkv.scale");
-            load_tensor(lw.wo_a_w, prefix + ".attn.wo_a.weight");
-            load_tensor(lw.wo_a_s, prefix + ".attn.wo_a.scale");
-            load_tensor(lw.wo_b_w, prefix + ".attn.wo_b.weight");
-            load_tensor(lw.wo_b_s, prefix + ".attn.wo_b.scale");
+            if (!load_quant_tensor(lw.wq_a_w, lw.wq_a_s, prefix + ".attn.wq_a.weight")) {
+                load_tensor(lw.wq_a_w, prefix + ".attn.wq_a.weight");
+                load_tensor(lw.wq_a_s, prefix + ".attn.wq_a.scale");
+            }
+            if (!load_quant_tensor(lw.wq_b_w, lw.wq_b_s, prefix + ".attn.wq_b.weight")) {
+                load_tensor(lw.wq_b_w, prefix + ".attn.wq_b.weight");
+                load_tensor(lw.wq_b_s, prefix + ".attn.wq_b.scale");
+            }
+            if (!load_quant_tensor(lw.wkv_w, lw.wkv_s, prefix + ".attn.wkv.weight")) {
+                load_tensor(lw.wkv_w, prefix + ".attn.wkv.weight");
+                load_tensor(lw.wkv_s, prefix + ".attn.wkv.scale");
+            }
+            if (!load_quant_tensor(lw.wo_a_w, lw.wo_a_s, prefix + ".attn.wo_a.weight")) {
+                load_tensor(lw.wo_a_w, prefix + ".attn.wo_a.weight");
+                load_tensor(lw.wo_a_s, prefix + ".attn.wo_a.scale");
+            }
+            if (!load_quant_tensor(lw.wo_b_w, lw.wo_b_s, prefix + ".attn.wo_b.weight")) {
+                load_tensor(lw.wo_b_w, prefix + ".attn.wo_b.weight");
+                load_tensor(lw.wo_b_s, prefix + ".attn.wo_b.scale");
+            }
             load_tensor(lw.q_norm_w, prefix + ".attn.q_norm.weight");
             load_tensor(lw.kv_norm_w, prefix + ".attn.kv_norm.weight");
             load_tensor(lw.attn_norm_w, prefix + ".attn_norm.weight");
@@ -2354,13 +2368,19 @@ private:
                 }
             }
 
-            // Shared expert (FP8)
-            load_tensor(lw.shared_w1_w, prefix + ".ffn.shared_experts.w1.weight");
-            load_tensor(lw.shared_w1_s, prefix + ".ffn.shared_experts.w1.scale");
-            load_tensor(lw.shared_w2_w, prefix + ".ffn.shared_experts.w2.weight");
-            load_tensor(lw.shared_w2_s, prefix + ".ffn.shared_experts.w2.scale");
-            load_tensor(lw.shared_w3_w, prefix + ".ffn.shared_experts.w3.weight");
-            load_tensor(lw.shared_w3_s, prefix + ".ffn.shared_experts.w3.scale");
+            // Shared expert (FP8 or INT4)
+            if (!load_quant_tensor(lw.shared_w1_w, lw.shared_w1_s, prefix + ".ffn.shared_experts.w1.weight")) {
+                load_tensor(lw.shared_w1_w, prefix + ".ffn.shared_experts.w1.weight");
+                load_tensor(lw.shared_w1_s, prefix + ".ffn.shared_experts.w1.scale");
+            }
+            if (!load_quant_tensor(lw.shared_w2_w, lw.shared_w2_s, prefix + ".ffn.shared_experts.w2.weight")) {
+                load_tensor(lw.shared_w2_w, prefix + ".ffn.shared_experts.w2.weight");
+                load_tensor(lw.shared_w2_s, prefix + ".ffn.shared_experts.w2.scale");
+            }
+            if (!load_quant_tensor(lw.shared_w3_w, lw.shared_w3_s, prefix + ".ffn.shared_experts.w3.weight")) {
+                load_tensor(lw.shared_w3_w, prefix + ".ffn.shared_experts.w3.weight");
+                load_tensor(lw.shared_w3_s, prefix + ".ffn.shared_experts.w3.scale");
+            }
 
             // HC parameters
             load_tensor(lw.hc_attn_fn, prefix + ".hc_attn_fn");
@@ -2942,9 +2962,13 @@ private:
         // ── Q projection & KV projection (executed concurrently) ───────────
         // KV projection on side_stream_ (must wait for attn_norm to finish on main_stream_)
         CUDA_CHECK(cudaStreamWaitEvent(side_stream_, main_event_, 0));
-        gemm_fp8_dequant(buf_kv_.bf16(), 1, head_dim_val, dim,
-                         buf_hidden_.bf16(),
-                         lw.wkv_w.u8(), lw.wkv_s.u8(), 128, side_stream_);
+        if (lw.wkv_w.dtype == "int4") {
+            gemv_int4_cuda(buf_kv_.bf16(), buf_hidden_.bf16(), (const uint8_t*)lw.wkv_w.data, lw.wkv_s.bf16(), head_dim_val, dim, side_stream_);
+        } else {
+            gemm_fp8_dequant(buf_kv_.bf16(), 1, head_dim_val, dim,
+                             buf_hidden_.bf16(),
+                             lw.wkv_w.u8(), lw.wkv_s.u8(), 128, side_stream_);
+        }
         rms_norm_cuda(buf_kv_.bf16(), buf_kv_.bf16(),
                       lw.kv_norm_w.bf16(), head_dim_val, cfg_.rms_norm_eps, side_stream_);
         rope_device_pos_cuda(buf_kv_.bf16(), 1, head_dim_val, rope_dim,
@@ -2955,18 +2979,26 @@ private:
 
         // Q projection on main_stream_
         // q_raw = wq_a(x) -> [q_lora_rank]
-        gemm_fp8_dequant(buf_lora_.bf16(), 1, q_lora, dim,
-                         buf_hidden_.bf16(),
-                         lw.wq_a_w.u8(), lw.wq_a_s.u8(), 128, main_stream_);
+        if (lw.wq_a_w.dtype == "int4") {
+            gemv_int4_cuda(buf_lora_.bf16(), buf_hidden_.bf16(), (const uint8_t*)lw.wq_a_w.data, lw.wq_a_s.bf16(), q_lora, dim, main_stream_);
+        } else {
+            gemm_fp8_dequant(buf_lora_.bf16(), 1, q_lora, dim,
+                             buf_hidden_.bf16(),
+                             lw.wq_a_w.u8(), lw.wq_a_s.u8(), 128, main_stream_);
+        }
 
         // q_normed = q_norm(q_raw)
         rms_norm_cuda(buf_lora_.bf16(), buf_lora_.bf16(),
                       lw.q_norm_w.bf16(), q_lora, cfg_.rms_norm_eps, main_stream_);
 
         // q = wq_b(q_normed) -> [n_heads * head_dim]
-        gemm_fp8_dequant(buf_q_.bf16(), 1, n_heads * head_dim_val, q_lora,
-                         buf_lora_.bf16(),
-                         lw.wq_b_w.u8(), lw.wq_b_s.u8(), 128, main_stream_);
+        if (lw.wq_b_w.dtype == "int4") {
+            gemv_int4_cuda(buf_q_.bf16(), buf_lora_.bf16(), (const uint8_t*)lw.wq_b_w.data, lw.wq_b_s.bf16(), n_heads * head_dim_val, q_lora, main_stream_);
+        } else {
+            gemm_fp8_dequant(buf_q_.bf16(), 1, n_heads * head_dim_val, q_lora,
+                             buf_lora_.bf16(),
+                             lw.wq_b_w.u8(), lw.wq_b_s.u8(), 128, main_stream_);
+        }
         
         // Per-head Q normalization (DeepseekV4UnweightedRMSNorm)
         rms_norm_unweighted_batched_cuda(buf_q_.bf16(), buf_q_.bf16(),
@@ -3021,21 +3053,28 @@ private:
         int hpg_dim = heads_per_group * head_dim_val;  // 8 * 512 = 4096
         
         // Apply wo_a per group (block-diagonal GEMM)
-        // For each group g:
-        //   lora_g = attn_out_g @ wo_a_g.T  where
-        //   attn_out_g = buf_attn_out_[g * hpg_dim : (g+1) * hpg_dim]  — [1, hpg_dim]
-        //   wo_a_g = wo_a[g * o_lora : (g+1) * o_lora, :]  — [o_lora, hpg_dim]
-        //   lora_g = [1, o_lora]
-        // Output goes into buf_lora_ [o_groups * o_lora]
-        
-        gemv_fp8_grouped_cuda(buf_lora_.bf16(), buf_attn_out_.bf16(),
-                              lw.wo_a_w.u8(), lw.wo_a_s.u8(),
-                              o_lora, hpg_dim, o_groups, 128, main_stream_);
+        if (lw.wo_a_w.dtype == "int4") {
+            for (int g = 0; g < o_groups; g++) {
+                const uint8_t* w_g = (const uint8_t*)lw.wo_a_w.data + (size_t)g * o_lora * (hpg_dim / 2);
+                const __nv_bfloat16* s_g = lw.wo_a_s.bf16() + (size_t)g * o_lora * (hpg_dim / 32);
+                const __nv_bfloat16* a_g = buf_attn_out_.bf16() + (size_t)g * hpg_dim;
+                __nv_bfloat16* out_g = buf_lora_.bf16() + (size_t)g * o_lora;
+                gemv_int4_cuda(out_g, a_g, w_g, s_g, o_lora, hpg_dim, main_stream_);
+            }
+        } else {
+            gemv_fp8_grouped_cuda(buf_lora_.bf16(), buf_attn_out_.bf16(),
+                                  lw.wo_a_w.u8(), lw.wo_a_s.u8(),
+                                  o_lora, hpg_dim, o_groups, 128, main_stream_);
+        }
 
-        // wo_b: [dim, o_groups * o_lora] FP8 → output is [dim]
-        gemm_fp8_dequant(buf_hidden_.bf16(), 1, dim, o_groups * o_lora,
-                         buf_lora_.bf16(),
-                         lw.wo_b_w.u8(), lw.wo_b_s.u8(), 128, main_stream_);
+        // wo_b: [dim, o_groups * o_lora] FP8/INT4 → output is [dim]
+        if (lw.wo_b_w.dtype == "int4") {
+            gemv_int4_cuda(buf_hidden_.bf16(), buf_lora_.bf16(), (const uint8_t*)lw.wo_b_w.data, lw.wo_b_s.bf16(), dim, o_groups * o_lora, main_stream_);
+        } else {
+            gemm_fp8_dequant(buf_hidden_.bf16(), 1, dim, o_groups * o_lora,
+                             buf_lora_.bf16(),
+                             lw.wo_b_w.u8(), lw.wo_b_s.u8(), 128, main_stream_);
+        }
     }
 
     // ── MoE forward ─────────────────────────────────────────────────────────
@@ -3158,17 +3197,25 @@ private:
         __nv_bfloat16* shared_up   = buf_up_.bf16()   + top_k * moe_inter;
         __nv_bfloat16* shared_down = buf_down_.bf16() + top_k * dim;
 
-        gemm_fp8_dequant(shared_gate, 1, moe_inter, dim,
-                         buf_hidden_.bf16(),
-                         lw.shared_w1_w.u8(), lw.shared_w1_s.u8(), 128, side_stream_);
-        gemm_fp8_dequant(shared_up, 1, moe_inter, dim,
-                         buf_hidden_.bf16(),
-                         lw.shared_w3_w.u8(), lw.shared_w3_s.u8(), 128, side_stream_);
-        silu_mul_cuda(shared_gate, shared_gate, shared_up,
-                      moe_inter, cfg_.swiglu_limit, side_stream_);
-        gemm_fp8_dequant(shared_down, 1, dim, moe_inter,
-                         shared_gate,
-                         lw.shared_w2_w.u8(), lw.shared_w2_s.u8(), 128, side_stream_);
+        if (lw.shared_w1_w.dtype == "int4") {
+            gemv_int4_cuda(shared_gate, buf_hidden_.bf16(), (const uint8_t*)lw.shared_w1_w.data, lw.shared_w1_s.bf16(), moe_inter, dim, side_stream_);
+            gemv_int4_cuda(shared_up, buf_hidden_.bf16(), (const uint8_t*)lw.shared_w3_w.data, lw.shared_w3_s.bf16(), moe_inter, dim, side_stream_);
+            silu_mul_cuda(shared_gate, shared_gate, shared_up,
+                          moe_inter, cfg_.swiglu_limit, side_stream_);
+            gemv_int4_cuda(shared_down, shared_gate, (const uint8_t*)lw.shared_w2_w.data, lw.shared_w2_s.bf16(), dim, moe_inter, side_stream_);
+        } else {
+            gemm_fp8_dequant(shared_gate, 1, moe_inter, dim,
+                             buf_hidden_.bf16(),
+                             lw.shared_w1_w.u8(), lw.shared_w1_s.u8(), 128, side_stream_);
+            gemm_fp8_dequant(shared_up, 1, moe_inter, dim,
+                             buf_hidden_.bf16(),
+                             lw.shared_w3_w.u8(), lw.shared_w3_s.u8(), 128, side_stream_);
+            silu_mul_cuda(shared_gate, shared_gate, shared_up,
+                          moe_inter, cfg_.swiglu_limit, side_stream_);
+            gemm_fp8_dequant(shared_down, 1, dim, moe_inter,
+                             shared_gate,
+                             lw.shared_w2_w.u8(), lw.shared_w2_s.u8(), 128, side_stream_);
+        }
         CUDA_CHECK(cudaEventRecord(side_event_, side_stream_));
 
         // Wait for shared expert on side_stream_ before accumulating
@@ -3268,7 +3315,7 @@ private:
 
 public:
     bool collect_imatrix(const std::string& dataset_path, const std::string& out_dat_path, int max_tokens = -1) {
-        LOG_INFO("════ Starting Importance Matrix Calibration ════");
+        LOG_INFO("=== Starting Importance Matrix Calibration ===");
         LOG_INFO("Calibration dataset: %s", dataset_path.c_str());
         LOG_INFO("Output .dat path:    %s", out_dat_path.c_str());
 
@@ -3410,7 +3457,7 @@ public:
         }
 
         out.close();
-        LOG_INFO("════ Importance matrix calibration complete: %s ════", out_dat_path.c_str());
+        LOG_INFO("=== Importance matrix calibration complete: %s ===", out_dat_path.c_str());
         return true;
     }
 };
@@ -3779,6 +3826,8 @@ int main(int argc, char** argv) {
 #if defined(_WIN32) || defined(_WIN64)
     SetPriorityClass(GetCurrentProcess(), HIGH_PRIORITY_CLASS);
     SetThreadPriority(GetCurrentThread(), THREAD_PRIORITY_HIGHEST);
+    SetConsoleOutputCP(CP_UTF8);
+    SetConsoleCP(CP_UTF8);
 #endif
     std::string manifest_path = "moecher_manifest.json";
     int port = 8001;
@@ -3824,8 +3873,8 @@ int main(int argc, char** argv) {
 
     // Open log file
     g_log_file.open(log_path, std::ios::app);
-    LOG_INFO("═══ moecher starting ═══");
-    LOG_INFO("═══ v2.05 ═══");
+    LOG_INFO("=== moecher starting ===");
+    LOG_INFO("=== v2.05 ===");
     LOG_INFO("Default thinking token budget: %d", default_thinking_budget);
 
     MoecherEngine engine;

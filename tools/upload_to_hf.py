@@ -29,6 +29,12 @@ REPOS = {
         "repo_id": f"{DEFAULT_USERNAME}/moecher-deepseek-v4-flash-iq2",
         "folder_path": os.path.join("models", "deepseek_v4_flash_iq2"),
         "license": "mit"
+    },
+    "deepseek_q4": {
+        "name": "DeepSeek V4 Flash Q4 - 8GB GPU Mode (~78.8 GB)",
+        "repo_id": f"{DEFAULT_USERNAME}/moecher-deepseek-v4-flash-q4",
+        "folder_path": os.path.join("models", "deepseek_v4_flash_q4"),
+        "license": "mit"
     }
 }
 
@@ -74,7 +80,7 @@ def upload_model(target, token=None):
 
 def main():
     parser = argparse.ArgumentParser(description="Upload Moecher models to Hugging Face Hub")
-    parser.add_argument("model", choices=["qwen", "deepseek", "all"], default=None, nargs="?",
+    parser.add_argument("model", choices=["qwen", "deepseek", "deepseek_q4", "all"], default=None, nargs="?",
                         help="Which model repository to upload")
     parser.add_argument("--token", default=None, help="Hugging Face Write Access Token (starts with hf_...)")
     parser.add_argument("--user", default=DEFAULT_USERNAME, help=f"Hugging Face username (default: {DEFAULT_USERNAME})")
@@ -90,15 +96,18 @@ def main():
     if not selected_model:
         print("\nSelect what to upload:")
         print("  [1] Qwen 3.8 27B INT4 (~18.7 GB)")
-        print("  [2] DeepSeek V4 Flash IQ2 (~81.4 GB)")
-        print("  [3] Both Models")
-        choice = input("\nEnter choice (1, 2, or 3) [default: 1]: ").strip()
-        if choice == "2":
+        print("  [2] DeepSeek V4 Flash IQ2 - Standard (~81.4 GB)")
+        print("  [3] DeepSeek V4 Flash Q4 - 8GB GPU Mode (~78.8 GB)")
+        print("  [4] All Models")
+        choice = input("\nEnter choice (1, 2, 3, or 4) [default: 3]: ").strip()
+        if choice == "1":
+            selected_model = "qwen"
+        elif choice == "2":
             selected_model = "deepseek"
-        elif choice == "3":
+        elif choice == "4":
             selected_model = "all"
         else:
-            selected_model = "qwen"
+            selected_model = "deepseek_q4"
 
     token = args.token or os.environ.get("HF_TOKEN")
     if not token:
@@ -121,8 +130,8 @@ def main():
             REPOS[k]["repo_id"] = f"{args.user}/{repo_name}"
 
     if selected_model == "all":
-        upload_model("qwen", token=token)
-        upload_model("deepseek", token=token)
+        for k in REPOS:
+            upload_model(k, token=token)
     else:
         upload_model(selected_model, token=token)
 

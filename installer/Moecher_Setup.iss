@@ -38,7 +38,8 @@ Name: "custom"; Description: "Custom Installation"; Flags: iscustom
 [Components]
 Name: "core"; Description: "Moecher Engine Core & Web UI (~40 MB)"; Types: full custom; Flags: fixed
 Name: "dl_qwen"; Description: "Download Qwen 3.8 27B INT4 (~18.7 GB) from Hugging Face"; Types: full custom
-Name: "dl_deepseek"; Description: "Download DeepSeek V4 Flash IQ2 (~81.4 GB) from Hugging Face"; Types: custom
+Name: "dl_deepseek"; Description: "Download DeepSeek V4 Flash IQ2 - Standard (~81.4 GB) from Hugging Face"; Types: custom
+Name: "dl_deepseek_q4"; Description: "Download DeepSeek V4 Flash Q4 - 8GB GPU Mode (~78.8 GB) from Hugging Face"; Types: custom
 
 [Tasks]
 Name: "desktopicon"; Description: "{cm:CreateDesktopIcon}"; GroupDescription: "{cm:AdditionalIcons}"; Flags: unchecked
@@ -52,6 +53,7 @@ Source: "C:\Program Files\NVIDIA GPU Computing Toolkit\CUDA\v13.3\bin\x64\cublas
 ; Launchers, Scripts, Icons & Web UI
 Source: "D:\dev\minniemoe\MinnieTheMoEcher\installer\start_qwen_server.bat"; DestDir: "{app}"; Flags: ignoreversion; Components: core
 Source: "D:\dev\minniemoe\MinnieTheMoEcher\installer\start_deepseek_server.bat"; DestDir: "{app}"; Flags: ignoreversion; Components: core
+Source: "D:\dev\minniemoe\MinnieTheMoEcher\installer\start_deepseek_q4_server.bat"; DestDir: "{app}"; Flags: ignoreversion; Components: core
 Source: "D:\dev\minniemoe\MinnieTheMoEcher\installer\test_qwen.bat"; DestDir: "{app}"; Flags: ignoreversion; Components: core
 Source: "D:\dev\minniemoe\MinnieTheMoEcher\installer\download_model.ps1"; DestDir: "{app}"; Flags: ignoreversion; Components: core
 Source: "D:\dev\minniemoe\MinnieTheMoEcher\graphics\moecher.ico"; DestDir: "{app}"; Flags: ignoreversion; Components: core
@@ -60,13 +62,15 @@ Source: "D:\dev\minniemoe\MinnieTheMoEcher\web\*"; DestDir: "{app}\web"; Flags: 
 [Icons]
 ; Start Menu Shortcuts
 Name: "{group}\Moecher (Qwen 3.8 27B)"; Filename: "{app}\start_qwen_server.bat"; WorkingDir: "{app}"; IconFilename: "{app}\moecher.ico"
-Name: "{group}\Moecher (DeepSeek V4 Flash)"; Filename: "{app}\start_deepseek_server.bat"; WorkingDir: "{app}"; IconFilename: "{app}\moecher.ico"
+Name: "{group}\Moecher (DeepSeek V4 Flash Standard)"; Filename: "{app}\start_deepseek_server.bat"; WorkingDir: "{app}"; IconFilename: "{app}\moecher.ico"
+Name: "{group}\Moecher (DeepSeek V4 Flash 8GB GPU)"; Filename: "{app}\start_deepseek_q4_server.bat"; WorkingDir: "{app}"; IconFilename: "{app}\moecher.ico"
 Name: "{group}\Test API"; Filename: "{app}\test_qwen.bat"; WorkingDir: "{app}"
 Name: "{group}\Uninstall Moecher"; Filename: "{uninstallexe}"
 
 ; Desktop Shortcuts
 Name: "{autodesktop}\Moecher (Qwen 3.8 27B)"; Filename: "{app}\start_qwen_server.bat"; WorkingDir: "{app}"; IconFilename: "{app}\moecher.ico"; Tasks: desktopicon
-Name: "{autodesktop}\Moecher (DeepSeek V4 Flash)"; Filename: "{app}\start_deepseek_server.bat"; WorkingDir: "{app}"; IconFilename: "{app}\moecher.ico"; Tasks: desktopicon
+Name: "{autodesktop}\Moecher (DeepSeek V4 Flash Standard)"; Filename: "{app}\start_deepseek_server.bat"; WorkingDir: "{app}"; IconFilename: "{app}\moecher.ico"; Tasks: desktopicon
+Name: "{autodesktop}\Moecher (DeepSeek V4 Flash 8GB GPU)"; Filename: "{app}\start_deepseek_q4_server.bat"; WorkingDir: "{app}"; IconFilename: "{app}\moecher.ico"; Tasks: desktopicon
 
 [Code]
 var
@@ -95,6 +99,7 @@ var
   DramCache: String;
   QwenBatContent: String;
   DeepSeekBatContent: String;
+  DeepSeekQ4BatContent: String;
   AppDir: String;
   ResultCode: Integer;
 begin
@@ -111,6 +116,7 @@ begin
     QwenBatContent :=
       '@echo off' + #13#10 +
       'setlocal' + #13#10 +
+      'chcp 65001 >nul' + #13#10 +
       'cd /d "%~dp0"' + #13#10 +
       'echo ===============================================================================' + #13#10 +
       'echo   Starting Moecher Server with Qwen 3.8 27B INT4' + #13#10 +
@@ -123,6 +129,7 @@ begin
     DeepSeekBatContent :=
       '@echo off' + #13#10 +
       'setlocal' + #13#10 +
+      'chcp 65001 >nul' + #13#10 +
       'cd /d "%~dp0"' + #13#10 +
       'echo ===============================================================================' + #13#10 +
       'echo   Starting Moecher Server with DeepSeek V4 Flash IQ2' + #13#10 +
@@ -130,6 +137,19 @@ begin
       'echo ===============================================================================' + #13#10 +
       'start "Moecher DeepSeek Server" /high moecher.exe --manifest models\deepseek_v4_flash_iq2\moecher_manifest.json --max-vram ' + MaxVram + ' --dram-cache-gb ' + DramCache + ' --quiet' + #13#10;
     SaveStringToFile(AppDir + '\start_deepseek_server.bat', DeepSeekBatContent, False);
+
+    // Customize start_deepseek_q4_server.bat
+    DeepSeekQ4BatContent :=
+      '@echo off' + #13#10 +
+      'setlocal' + #13#10 +
+      'chcp 65001 >nul' + #13#10 +
+      'cd /d "%~dp0"' + #13#10 +
+      'echo ===============================================================================' + #13#10 +
+      'echo   Starting Moecher Server with DeepSeek V4 Flash Q4 (8GB GPU Mode)' + #13#10 +
+      'echo   Web UI: http://localhost:8000' + #13#10 +
+      'echo ===============================================================================' + #13#10 +
+      'start "Moecher DeepSeek Q4 Server" /high moecher.exe --manifest models\deepseek_v4_flash_q4\moecher_manifest.json --max-vram ' + MaxVram + ' --dram-cache-gb ' + DramCache + ' --quiet' + #13#10;
+    SaveStringToFile(AppDir + '\start_deepseek_q4_server.bat', DeepSeekQ4BatContent, False);
     
     // Trigger model download if selected
     if WizardIsComponentSelected('dl_qwen') and WizardIsComponentSelected('dl_deepseek') then
@@ -143,6 +163,10 @@ begin
     else if WizardIsComponentSelected('dl_deepseek') then
     begin
       Exec('powershell.exe', '-ExecutionPolicy Bypass -File "' + AppDir + '\download_model.ps1" -Model deepseek -DestDir "' + AppDir + '\models"', AppDir, SW_SHOWNORMAL, ewWaitUntilTerminated, ResultCode);
+    end
+    else if WizardIsComponentSelected('dl_deepseek_q4') then
+    begin
+      Exec('powershell.exe', '-ExecutionPolicy Bypass -File "' + AppDir + '\download_model.ps1" -Model deepseek_q4 -DestDir "' + AppDir + '\models"', AppDir, SW_SHOWNORMAL, ewWaitUntilTerminated, ResultCode);
     end;
   end;
 end;
