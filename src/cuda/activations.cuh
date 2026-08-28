@@ -438,19 +438,6 @@ void gemv_q2_k_moe_cuda(
     int layer_id = 0, int n_experts = 256,
     cudaStream_t stream = 0);
 
-void gemv_q2_k_moe_accum_fused_cuda(
-    __nv_bfloat16* out_hidden,
-    const __nv_bfloat16* gate_buf,
-    const float* topk_weights,
-    const __nv_bfloat16* shared_down,
-    const void* const* active_expert_ptrs,
-    int w2_offset,
-    int N, int K,
-    const int32_t* topk_ids = nullptr,
-    const void* const* flat_expert_ptrs = nullptr,
-    int layer_id = 0, int n_experts = 256,
-    cudaStream_t stream = 0);
-
 void moe_route_top6_cuda(
     int32_t* topk_ids,
     float* topk_weights,
