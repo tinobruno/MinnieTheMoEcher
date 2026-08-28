@@ -1159,6 +1159,10 @@ public:
             }
         }
 
+        // Copy flat pointer table to GPU for GPU-native kernel execution
+        CUDA_CHECK(cudaMemcpy(flat_vram_ptrs_gpu_.data, flat_vram_ptrs_.data(),
+                               flat_vram_ptrs_.size() * sizeof(void*), cudaMemcpyHostToDevice));
+
         auto elapsed = std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now() - start).count();
         LOG_INFO("Preload completed in %.2f seconds", elapsed / 1000.0);
         return true;
