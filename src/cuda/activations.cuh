@@ -272,6 +272,12 @@ void topk_cuda(
     int n, int k,
     cudaStream_t stream = 0);
 
+void argmax_f32_cuda(
+    int32_t* out,
+    const float* logits,
+    int n,
+    cudaStream_t stream = 0);
+
 // ── sqrt(softplus(x)) scoring ──────────────────────────────────────────────────
 void sqrtsoftplus_cuda(
     float* out,                    // [n]
@@ -329,6 +335,13 @@ void mla_attention_cuda(
 // Used for compressor projections (wkv, wgate) which are BF16, not FP8
 void gemv_bf16_cuda(
     float* out,                    // [N] F32 output (for accumulation precision)
+    const __nv_bfloat16* W,        // [N, K] BF16 weight matrix (row-major)
+    const __nv_bfloat16* x,        // [K] BF16 input vector
+    int N, int K,
+    cudaStream_t stream = 0);
+
+void gemv_bf16_out_bf16_cuda(
+    __nv_bfloat16* out,            // [N] BF16 output
     const __nv_bfloat16* W,        // [N, K] BF16 weight matrix (row-major)
     const __nv_bfloat16* x,        // [K] BF16 input vector
     int N, int K,
@@ -401,6 +414,9 @@ void gemv_iq2_xxs_moe_swiglu_fused_cuda(
     const void* const* active_expert_ptrs,
     int w1_offset, int w3_offset,
     int N, int K, float swiglu_limit,
+    const int32_t* topk_ids = nullptr,
+    const void* const* flat_expert_ptrs = nullptr,
+    int layer_id = 0, int n_experts = 256,
     cudaStream_t stream = 0);
 
 void gemv_q2_k_moe_cuda(
@@ -409,6 +425,9 @@ void gemv_q2_k_moe_cuda(
     const void* const* active_expert_ptrs,
     int w2_offset,
     int N, int K,
+    const int32_t* topk_ids = nullptr,
+    const void* const* flat_expert_ptrs = nullptr,
+    int layer_id = 0, int n_experts = 256,
     cudaStream_t stream = 0);
 
 void moe_route_top6_cuda(

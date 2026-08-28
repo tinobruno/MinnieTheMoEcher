@@ -1061,42 +1061,50 @@ void mla_attention_cuda(
 // ════════════════════════════════════════════════════════════════════════════════
 
 // BF16 GEMV: out[row] = dot(W[row, :], x[:]) for each row
-// Each block handles one row. Threads cooperatively reduce across K.
-__global__ void gemv_bf16_kernel(
-    float* __restrict__ out,
+// 1 Warp (32 threads) per row using 128-bit (8 BF16) vectorized memory transactions
+template<typename TOut>
+__global__ void gemv_bf16_generic_kernel(
+    TOut* __restrict__ out,
     const __nv_bfloat16* __restrict__ W,
     const __nv_bfloat16* __restrict__ x,
     int N, int K)
 {
-    int row = blockIdx.x;
+    int row = blockIdx.x * blockDim.y + threadIdx.y;
     if (row >= N) return;
 
-    extern __shared__ float sdata_gemv[];
-
-    int tid = threadIdx.x;
+    int lane = threadIdx.x;
     float sum = 0.0f;
-    const __nv_bfloat16* w_row = W + (size_t)row * K;
-    for (int i = tid; i < K; i += blockDim.x) {
-        sum += bf16_to_float(w_row[i]) * bf16_to_float(x[i]);
+
+    const uint4* w_vec4 = reinterpret_cast<const uint4*>(W + (size_t)row * K);
+    const uint4* x_vec4 = reinterpret_cast<const uint4*>(x);
+
+    int n_chunks = K / 8;
+    for (int chunk = lane; chunk < n_chunks; chunk += 32) {
+        uint4 w4 = w_vec4[chunk];
+        uint4 x4 = x_vec4[chunk];
+
+        const __nv_bfloat162* w_pairs = reinterpret_cast<const __nv_bfloat162*>(&w4);
+        const __nv_bfloat162* x_pairs = reinterpret_cast<const __nv_bfloat162*>(&x4);
+
+        #pragma unroll
+        for (int p = 0; p < 4; p++) {
+            float2 wf = to_float2_bf162(w_pairs[p]);
+            float2 xf = to_float2_bf162(x_pairs[p]);
+            sum += wf.x * xf.x + wf.y * xf.y;
+        }
     }
 
-    // Warp reduction
-    for (int offset = 16; offset > 0; offset >>= 1)
-        sum += __shfl_down_sync(0xFFFFFFFF, sum, offset);
+    #pragma unroll
+    for (int offset = 16; offset > 0; offset /= 2)
+        sum += __shfl_down_sync(0xffffffff, sum, offset);
 
-    int lane = tid & 31;
-    int warp = tid >> 5;
-    if (lane == 0) sdata_gemv[warp] = sum;
-    __syncthreads();
-
-    // Final reduction across warps
-    int n_warps = (blockDim.x + 31) / 32;
-    if (tid < n_warps) sum = sdata_gemv[tid];
-    else sum = 0.0f;
-    for (int offset = 16; offset > 0; offset >>= 1)
-        sum += __shfl_down_sync(0xFFFFFFFF, sum, offset);
-
-    if (tid == 0) out[row] = sum;
+    if (lane == 0) {
+        if constexpr (std::is_same_v<TOut, __nv_bfloat16>) {
+            out[row] = __float2bfloat16(sum);
+        } else {
+            out[row] = sum;
+        }
+    }
 }
 
 void gemv_bf16_cuda(
@@ -1106,10 +1114,21 @@ void gemv_bf16_cuda(
     int N, int K,
     cudaStream_t stream)
 {
-    int n_threads = 256;
-    int n_warps = (n_threads + 31) / 32;
-    size_t smem = n_warps * sizeof(float);
-    gemv_bf16_kernel<<<N, n_threads, smem, stream>>>(out, W, x, N, K);
+    dim3 threads(32, 8);
+    dim3 blocks((N + 7) / 8);
+    gemv_bf16_generic_kernel<<<blocks, threads, 0, stream>>>(out, W, x, N, K);
+}
+
+void gemv_bf16_out_bf16_cuda(
+    __nv_bfloat16* out,
+    const __nv_bfloat16* W,
+    const __nv_bfloat16* x,
+    int N, int K,
+    cudaStream_t stream)
+{
+    dim3 threads(32, 8);
+    dim3 blocks((N + 7) / 8);
+    gemv_bf16_generic_kernel<<<blocks, threads, 0, stream>>>(out, W, x, N, K);
 }
 
 
@@ -1218,18 +1237,24 @@ __global__ void gemv_fp8_kernel(
     const uint8_t* __restrict__ scale,
     int N, int K, int block_size)
 {
-    int row = blockIdx.x;
+    __shared__ float s_fp8_lut[256];
+    int tid = threadIdx.y * 32 + threadIdx.x;
+    if (tid < 256) s_fp8_lut[tid] = fp8_e4m3_to_float_v2(tid);
+    __syncthreads();
+
+    int row = blockIdx.x * blockDim.y + threadIdx.y;
     if (row >= N) return;
-    int tid = threadIdx.x;
+
+    int lane = threadIdx.x;
     float sum = 0.0f;
     int scale_cols = (K + block_size - 1) / block_size;
     int br = row / block_size;
 
-    // Process 8 elements at a time
-    const uint2* w_vec8 = reinterpret_cast<const uint2*>(&weight[row * K]);
-    const uint4* a_vec4 = reinterpret_cast<const uint4*>(vec); // uint4 = 16 bytes = 8 bfloat16
+    const uint2* w_vec8 = reinterpret_cast<const uint2*>(&weight[(size_t)row * K]);
+    const uint4* a_vec4 = reinterpret_cast<const uint4*>(vec);
 
-    for (int chunk = tid; chunk < K / 8; chunk += blockDim.x) {
+    int n_chunks = K / 8;
+    for (int chunk = lane; chunk < n_chunks; chunk += 32) {
         int logical_col = chunk * 8;
         int bc = logical_col / block_size;
         float s_val = e8m0_to_float_v2(scale[br * scale_cols + bc]);
@@ -1243,43 +1268,33 @@ __global__ void gemv_fp8_kernel(
         float2 f3 = to_float2_bf162(*reinterpret_cast<const __nv_bfloat162*>(&a8.w));
 
         float chunk_sum = 0.0f;
-        chunk_sum += fp8_e4m3_to_float_v2((w8.x) & 0xFF) * f0.x;
-        chunk_sum += fp8_e4m3_to_float_v2((w8.x >> 8) & 0xFF) * f0.y;
-        chunk_sum += fp8_e4m3_to_float_v2((w8.x >> 16) & 0xFF) * f1.x;
-        chunk_sum += fp8_e4m3_to_float_v2((w8.x >> 24) & 0xFF) * f1.y;
+        chunk_sum += s_fp8_lut[(w8.x) & 0xFF] * f0.x;
+        chunk_sum += s_fp8_lut[(w8.x >> 8) & 0xFF] * f0.y;
+        chunk_sum += s_fp8_lut[(w8.x >> 16) & 0xFF] * f1.x;
+        chunk_sum += s_fp8_lut[(w8.x >> 24) & 0xFF] * f1.y;
 
-        chunk_sum += fp8_e4m3_to_float_v2((w8.y) & 0xFF) * f2.x;
-        chunk_sum += fp8_e4m3_to_float_v2((w8.y >> 8) & 0xFF) * f2.y;
-        chunk_sum += fp8_e4m3_to_float_v2((w8.y >> 16) & 0xFF) * f3.x;
-        chunk_sum += fp8_e4m3_to_float_v2((w8.y >> 24) & 0xFF) * f3.y;
+        chunk_sum += s_fp8_lut[(w8.y) & 0xFF] * f2.x;
+        chunk_sum += s_fp8_lut[(w8.y >> 8) & 0xFF] * f2.y;
+        chunk_sum += s_fp8_lut[(w8.y >> 16) & 0xFF] * f3.x;
+        chunk_sum += s_fp8_lut[(w8.y >> 24) & 0xFF] * f3.y;
 
         sum += chunk_sum * s_val;
     }
-    // Warp reduce
     #pragma unroll
     for (int offset = 16; offset > 0; offset /= 2)
         sum += __shfl_down_sync(0xffffffff, sum, offset);
-    
-    // Shared memory for block reduce
-    __shared__ float s_sum[32];
-    int lane = tid % 32;
-    int warp = tid / 32;
-    if (lane == 0) s_sum[warp] = sum;
-    __syncthreads();
-    
-    sum = (tid < (blockDim.x / 32)) ? s_sum[lane] : 0.0f;
-    if (warp == 0) {
-        #pragma unroll
-        for (int offset = 16; offset > 0; offset /= 2)
-            sum += __shfl_down_sync(0xffffffff, sum, offset);
-        if (tid == 0) out[row] = __float2bfloat16(sum);
+
+    if (lane == 0) {
+        out[row] = __float2bfloat16(sum);
     }
 }
+
 void gemv_fp8_cuda(__nv_bfloat16* out, const __nv_bfloat16* vec,
                    const uint8_t* weight, const uint8_t* scale,
                    int N, int K, int block_size, cudaStream_t stream) {
-    int threads = 128;
-    gemv_fp8_kernel<<<N, threads, 0, stream>>>(out, vec, weight, scale, N, K, block_size);
+    dim3 threads(32, 8);
+    dim3 blocks((N + 7) / 8);
+    gemv_fp8_kernel<<<blocks, threads, 0, stream>>>(out, vec, weight, scale, N, K, block_size);
 }
 
 __global__ void gemv_fp8_grouped_kernel(
@@ -1289,11 +1304,16 @@ __global__ void gemv_fp8_grouped_kernel(
     const uint8_t* __restrict__ scale,
     int N, int K, int groups, int block_size)
 {
+    __shared__ float s_fp8_lut[256];
+    int tid = threadIdx.y * 32 + threadIdx.x;
+    if (tid < 256) s_fp8_lut[tid] = fp8_e4m3_to_float_v2(tid);
+    __syncthreads();
+
     int group = blockIdx.y;
-    int row = blockIdx.x;
+    int row = blockIdx.x * blockDim.y + threadIdx.y;
     if (group >= groups || row >= N) return;
 
-    int tid = threadIdx.x;
+    int lane = threadIdx.x;
     float sum = 0.0f;
     int scale_cols = (K + block_size - 1) / block_size;
     int scale_rows_per_group = (N + block_size - 1) / block_size;
@@ -1304,10 +1324,11 @@ __global__ void gemv_fp8_grouped_kernel(
     const __nv_bfloat16* g_vec = vec + (size_t)group * K;
     __nv_bfloat16* g_out = out + (size_t)group * N;
 
-    const uint2* w_vec8 = reinterpret_cast<const uint2*>(&g_weight[row * K]);
+    const uint2* w_vec8 = reinterpret_cast<const uint2*>(&g_weight[(size_t)row * K]);
     const uint4* a_vec4 = reinterpret_cast<const uint4*>(g_vec);
 
-    for (int chunk = tid; chunk < K / 8; chunk += blockDim.x) {
+    int n_chunks = K / 8;
+    for (int chunk = lane; chunk < n_chunks; chunk += 32) {
         int logical_col = chunk * 8;
         int bc = logical_col / block_size;
         float s_val = e8m0_to_float_v2(g_scale[br * scale_cols + bc]);
@@ -1321,15 +1342,15 @@ __global__ void gemv_fp8_grouped_kernel(
         float2 f3 = to_float2_bf162(*reinterpret_cast<const __nv_bfloat162*>(&a8.w));
 
         float chunk_sum = 0.0f;
-        chunk_sum += fp8_e4m3_to_float_v2((w8.x) & 0xFF) * f0.x;
-        chunk_sum += fp8_e4m3_to_float_v2((w8.x >> 8) & 0xFF) * f0.y;
-        chunk_sum += fp8_e4m3_to_float_v2((w8.x >> 16) & 0xFF) * f1.x;
-        chunk_sum += fp8_e4m3_to_float_v2((w8.x >> 24) & 0xFF) * f1.y;
+        chunk_sum += s_fp8_lut[(w8.x) & 0xFF] * f0.x;
+        chunk_sum += s_fp8_lut[(w8.x >> 8) & 0xFF] * f0.y;
+        chunk_sum += s_fp8_lut[(w8.x >> 16) & 0xFF] * f1.x;
+        chunk_sum += s_fp8_lut[(w8.x >> 24) & 0xFF] * f1.y;
 
-        chunk_sum += fp8_e4m3_to_float_v2((w8.y) & 0xFF) * f2.x;
-        chunk_sum += fp8_e4m3_to_float_v2((w8.y >> 8) & 0xFF) * f2.y;
-        chunk_sum += fp8_e4m3_to_float_v2((w8.y >> 16) & 0xFF) * f3.x;
-        chunk_sum += fp8_e4m3_to_float_v2((w8.y >> 24) & 0xFF) * f3.y;
+        chunk_sum += s_fp8_lut[(w8.y) & 0xFF] * f2.x;
+        chunk_sum += s_fp8_lut[(w8.y >> 8) & 0xFF] * f2.y;
+        chunk_sum += s_fp8_lut[(w8.y >> 16) & 0xFF] * f3.x;
+        chunk_sum += s_fp8_lut[(w8.y >> 24) & 0xFF] * f3.y;
 
         sum += chunk_sum * s_val;
     }
@@ -1338,29 +1359,21 @@ __global__ void gemv_fp8_grouped_kernel(
     for (int offset = 16; offset > 0; offset /= 2)
         sum += __shfl_down_sync(0xffffffff, sum, offset);
 
-    __shared__ float s_sum[32];
-    int lane = tid % 32;
-    int warp = tid / 32;
-    if (lane == 0) s_sum[warp] = sum;
-    __syncthreads();
-
-    sum = (tid < (blockDim.x / 32)) ? s_sum[lane] : 0.0f;
-    if (warp == 0) {
-        #pragma unroll
-        for (int offset = 16; offset > 0; offset /= 2)
-            sum += __shfl_down_sync(0xffffffff, sum, offset);
-        if (tid == 0) g_out[row] = __float2bfloat16(sum);
+    if (lane == 0) {
+        g_out[row] = __float2bfloat16(sum);
     }
 }
 
 void gemv_fp8_grouped_cuda(
     __nv_bfloat16* out, const __nv_bfloat16* vec,
     const uint8_t* weight, const uint8_t* scale,
-    int N, int K, int groups, int block_size, cudaStream_t stream)
+    int N, int K, int groups, int block_size,
+    cudaStream_t stream)
 {
-    int threads = 128;
-    dim3 blocks(N, groups);
-    gemv_fp8_grouped_kernel<<<blocks, threads, 0, stream>>>(out, vec, weight, scale, N, K, groups, block_size);
+    dim3 threads(32, 8);
+    dim3 blocks((N + 7) / 8, groups);
+    gemv_fp8_grouped_kernel<<<blocks, threads, 0, stream>>>(
+        out, vec, weight, scale, N, K, groups, block_size);
 }
 
 __global__ void gemv_hc_pre_norm_kernel(
@@ -2670,14 +2683,33 @@ __global__ void gemv_iq2_xxs_moe_swiglu_fused_kernel(
     __nv_bfloat16* __restrict__ gate_buf, // [6 * moe_inter]
     const __nv_bfloat16* __restrict__ vec,
     const void* const* __restrict__ active_expert_ptrs,
+    const int32_t* __restrict__ topk_ids,
+    const void* const* __restrict__ flat_expert_ptrs,
+    int layer_id, int n_experts,
     int w1_offset, int w3_offset,
     int N, int K, float swiglu_limit)
 {
+    __shared__ uint64_t s_grid[256];
+    __shared__ uint8_t s_signs[128];
+
+    int tid = threadIdx.y * 32 + threadIdx.x;
+    s_grid[tid] = c_iq2xxs_grid[tid];
+    if (tid < 128) s_signs[tid] = c_ksigns_iq2xs[tid];
+    __syncthreads();
+
     int k = blockIdx.y;
     int row = blockIdx.x * blockDim.y + threadIdx.y;
     if (row >= N || k >= 6) return;
 
-    const void* p = active_expert_ptrs ? active_expert_ptrs[k] : nullptr;
+    const void* p = nullptr;
+    if (flat_expert_ptrs && topk_ids) {
+        int eid = topk_ids[k];
+        if (eid >= 0 && eid < n_experts) {
+            p = flat_expert_ptrs[layer_id * n_experts + eid];
+        }
+    } else if (active_expert_ptrs) {
+        p = active_expert_ptrs[k];
+    }
     if (!p) return;
 
     const uint8_t* block = (const uint8_t*)p;
@@ -2699,8 +2731,11 @@ __global__ void gemv_iq2_xxs_moe_swiglu_fused_kernel(
     for (int b = 0; b < n_blocks; b++) {
         const block_iq2_xxs* blk1 = &row_w1[b];
         const block_iq2_xxs* blk3 = &row_w3[b];
-        float d1 = __half2float(blk1->d);
-        float d3 = __half2float(blk3->d);
+
+        float d1 = (lane == 0) ? __half2float(blk1->d) : 0.0f;
+        float d3 = (lane == 0) ? __half2float(blk3->d) : 0.0f;
+        d1 = __shfl_sync(0xffffffff, d1, 0);
+        d3 = __shfl_sync(0xffffffff, d3, 0);
 
         const uint16_t* qs1 = blk1->qs;
         const uint16_t* qs3 = blk3->qs;
@@ -2708,26 +2743,33 @@ __global__ void gemv_iq2_xxs_moe_swiglu_fused_kernel(
         #pragma unroll 4
         for (int ib32 = 0; ib32 < 8; ib32++) {
             int q_off = ib32 * 4;
-            uint32_t aux0_1 = (uint32_t)qs1[q_off + 0] | ((uint32_t)qs1[q_off + 1] << 16);
-            uint32_t aux1_1 = (uint32_t)qs1[q_off + 2] | ((uint32_t)qs1[q_off + 3] << 16);
-            float db1 = d1 * (0.5f + (aux1_1 >> 28)) * 0.25f;
+            uint32_t aux0_1 = 0, aux1_1 = 0, aux0_3 = 0, aux1_3 = 0;
+            if (lane == 0) {
+                aux0_1 = (uint32_t)qs1[q_off + 0] | ((uint32_t)qs1[q_off + 1] << 16);
+                aux1_1 = (uint32_t)qs1[q_off + 2] | ((uint32_t)qs1[q_off + 3] << 16);
+                aux0_3 = (uint32_t)qs3[q_off + 0] | ((uint32_t)qs3[q_off + 1] << 16);
+                aux1_3 = (uint32_t)qs3[q_off + 2] | ((uint32_t)qs3[q_off + 3] << 16);
+            }
+            aux0_1 = __shfl_sync(0xffffffff, aux0_1, 0);
+            aux1_1 = __shfl_sync(0xffffffff, aux1_1, 0);
+            aux0_3 = __shfl_sync(0xffffffff, aux0_3, 0);
+            aux1_3 = __shfl_sync(0xffffffff, aux1_3, 0);
 
-            uint32_t aux0_3 = (uint32_t)qs3[q_off + 0] | ((uint32_t)qs3[q_off + 1] << 16);
-            uint32_t aux1_3 = (uint32_t)qs3[q_off + 2] | ((uint32_t)qs3[q_off + 3] << 16);
+            float db1 = d1 * (0.5f + (aux1_1 >> 28)) * 0.25f;
             float db3 = d3 * (0.5f + (aux1_3 >> 28)) * 0.25f;
 
             uint8_t g_idx1 = (aux0_1 >> (8 * l)) & 0xFF;
             uint8_t s_idx1 = (aux1_1 >> (7 * l)) & 0x7F;
-            uint64_t g_val1 = c_iq2xxs_grid[g_idx1];
-            uint8_t s_val1 = c_ksigns_iq2xs[s_idx1];
+            uint64_t g_val1 = s_grid[g_idx1];
+            uint8_t s_val1 = s_signs[s_idx1];
             uint8_t byte1 = (g_val1 >> (8 * j)) & 0xFF;
             float sign1 = (s_val1 & kmask) ? -1.0f : 1.0f;
             float weight1 = db1 * (float)byte1 * sign1;
 
             uint8_t g_idx3 = (aux0_3 >> (8 * l)) & 0xFF;
             uint8_t s_idx3 = (aux1_3 >> (7 * l)) & 0x7F;
-            uint64_t g_val3 = c_iq2xxs_grid[g_idx3];
-            uint8_t s_val3 = c_ksigns_iq2xs[s_idx3];
+            uint64_t g_val3 = s_grid[g_idx3];
+            uint8_t s_val3 = s_signs[s_idx3];
             uint8_t byte3 = (g_val3 >> (8 * j)) & 0xFF;
             float sign3 = (s_val3 & kmask) ? -1.0f : 1.0f;
             float weight3 = db3 * (float)byte3 * sign3;
@@ -2763,12 +2805,16 @@ void gemv_iq2_xxs_moe_swiglu_fused_cuda(
     const void* const* active_expert_ptrs,
     int w1_offset, int w3_offset,
     int N, int K, float swiglu_limit,
+    const int32_t* topk_ids,
+    const void* const* flat_expert_ptrs,
+    int layer_id, int n_experts,
     cudaStream_t stream)
 {
     dim3 threads(32, 8);
     dim3 blocks((N + 7) / 8, 6);
     gemv_iq2_xxs_moe_swiglu_fused_kernel<<<blocks, threads, 0, stream>>>(
         gate_buf, vec, active_expert_ptrs,
+        topk_ids, flat_expert_ptrs, layer_id, n_experts,
         w1_offset, w3_offset, N, K, swiglu_limit);
 }
 
@@ -2777,6 +2823,9 @@ __global__ void gemv_q2_k_moe_kernel(
     __nv_bfloat16* __restrict__ down_buf, // [6 * dim]
     const __nv_bfloat16* __restrict__ gate_buf, // [6 * moe_inter]
     const void* const* __restrict__ active_expert_ptrs,
+    const int32_t* __restrict__ topk_ids,
+    const void* const* __restrict__ flat_expert_ptrs,
+    int layer_id, int n_experts,
     int w2_offset,
     int N, int K)
 {
@@ -2784,7 +2833,15 @@ __global__ void gemv_q2_k_moe_kernel(
     int row = blockIdx.x * blockDim.y + threadIdx.y;
     if (row >= N || k >= 6) return;
 
-    const void* p = active_expert_ptrs ? active_expert_ptrs[k] : nullptr;
+    const void* p = nullptr;
+    if (flat_expert_ptrs && topk_ids) {
+        int eid = topk_ids[k];
+        if (eid >= 0 && eid < n_experts) {
+            p = flat_expert_ptrs[layer_id * n_experts + eid];
+        }
+    } else if (active_expert_ptrs) {
+        p = active_expert_ptrs[k];
+    }
     if (!p) return;
 
     const uint8_t* block = (const uint8_t*)p;
@@ -2795,27 +2852,43 @@ __global__ void gemv_q2_k_moe_kernel(
     const block_q2_K* row_w2 = w2 + row * n_blocks;
     const __nv_bfloat16* k_gate = gate_buf + (size_t)k * K;
 
+    int lane_half = lane >> 4;
     float sum = 0.0f;
 
     for (int b = 0; b < n_blocks; b++) {
         const block_q2_K* blk = &row_w2[b];
-        float d = __half2float(blk->d);
-        float min = __half2float(blk->dmin);
+        float d = (lane == 0) ? __half2float(blk->d) : 0.0f;
+        float min = (lane == 0) ? __half2float(blk->dmin) : 0.0f;
+        d = __shfl_sync(0xffffffff, d, 0);
+        min = __shfl_sync(0xffffffff, min, 0);
+
+        uint8_t sc_val = (lane < 16) ? blk->scales[lane] : 0;
+
+        uint8_t q0 = blk->qs[lane];
+        uint8_t q1 = blk->qs[32 + lane];
 
         #pragma unroll 4
-        for (int iter = 0; iter < 8; iter++) {
-            int idx = (iter << 5) + lane;
-            int group = idx >> 4;
-            int l = idx & 15;
-            int q_base = ((group >> 3) << 5) + ((group & 1) << 4);
-            int shift = ((group >> 1) & 3) << 1;
-            uint8_t q = (blk->qs[q_base + l] >> shift) & 0x03;
-            uint8_t sc = blk->scales[group];
+        for (int iter = 0; iter < 4; iter++) {
+            uint8_t q = (q0 >> (iter * 2)) & 0x03;
+            uint8_t sc = (uint8_t)__shfl_sync(0xffffffff, sc_val, (iter * 2) + lane_half);
             float dl = d * (float)(sc & 0x0F);
             float ml = min * (float)(sc >> 4);
             float w = dl * (float)q - ml;
 
-            int col_idx = (b << 8) + idx;
+            int col_idx = (b << 8) + (iter << 5) + lane;
+            float a = __bfloat162float(k_gate[col_idx]);
+            sum += w * a;
+        }
+
+        #pragma unroll 4
+        for (int iter = 0; iter < 4; iter++) {
+            uint8_t q = (q1 >> (iter * 2)) & 0x03;
+            uint8_t sc = (uint8_t)__shfl_sync(0xffffffff, sc_val, 8 + (iter * 2) + lane_half);
+            float dl = d * (float)(sc & 0x0F);
+            float ml = min * (float)(sc >> 4);
+            float w = dl * (float)q - ml;
+
+            int col_idx = (b << 8) + 128 + (iter << 5) + lane;
             float a = __bfloat162float(k_gate[col_idx]);
             sum += w * a;
         }
@@ -2837,12 +2910,16 @@ void gemv_q2_k_moe_cuda(
     const void* const* active_expert_ptrs,
     int w2_offset,
     int N, int K,
+    const int32_t* topk_ids,
+    const void* const* flat_expert_ptrs,
+    int layer_id, int n_experts,
     cudaStream_t stream)
 {
     dim3 threads(32, 8);
     dim3 blocks((N + 7) / 8, 6);
     gemv_q2_k_moe_kernel<<<blocks, threads, 0, stream>>>(
         down_buf, gate_buf, active_expert_ptrs,
+        topk_ids, flat_expert_ptrs, layer_id, n_experts,
         w2_offset, N, K);
 }
 
@@ -3146,6 +3223,7 @@ void mla_attention_device_len_cuda(
     mla_attention_device_len_kernel<<<n_heads, n_threads, smem_bytes, stream>>>(
         q, kv, attn_sink, out, d_cache_len, max_cache_len, head_dim, scale);
 }
+
 
 __global__ void accumulate_expert_imatrix_kernel(
     float* __restrict__ gate_accum,
@@ -3627,3 +3705,128 @@ void qwen_gqa_decode_gated_cuda(
         out, q_and_gate, q_norm_w, k_cache, v_cache, n_q_heads, n_kv_heads, head_dim, pos, rope_theta, eps);
 }
 
+// ── 2-Stage Parallel Grid ArgMax across all GPU SMs ────────────────────────
+__global__ void argmax_f32_stage1_kernel(
+    float* __restrict__ block_maxes,
+    int32_t* __restrict__ block_indices,
+    const float* __restrict__ logits,
+    int n)
+{
+    __shared__ float s_max[32];
+    __shared__ int32_t s_idx[32];
+
+    int tid = threadIdx.x;
+    int gid = blockIdx.x * blockDim.x + threadIdx.x;
+    int stride = gridDim.x * blockDim.x;
+
+    float max_val = -1e38f;
+    int32_t max_idx = 0;
+
+    for (int i = gid; i < n; i += stride) {
+        float v = logits[i];
+        if (v > max_val) {
+            max_val = v;
+            max_idx = (int32_t)i;
+        }
+    }
+
+    // Warp reduce
+    #pragma unroll
+    for (int offset = 16; offset > 0; offset /= 2) {
+        float other_val = __shfl_down_sync(0xffffffff, max_val, offset);
+        int32_t other_idx = __shfl_down_sync(0xffffffff, max_idx, offset);
+        if (other_val > max_val) {
+            max_val = other_val;
+            max_idx = other_idx;
+        }
+    }
+
+    int lane = tid & 31;
+    int warp = tid >> 5;
+    if (lane == 0) {
+        s_max[warp] = max_val;
+        s_idx[warp] = max_idx;
+    }
+    __syncthreads();
+
+    if (warp == 0) {
+        int n_warps = blockDim.x / 32;
+        max_val = (lane < n_warps) ? s_max[lane] : -1e38f;
+        max_idx = (lane < n_warps) ? s_idx[lane] : 0;
+        #pragma unroll
+        for (int offset = 16; offset > 0; offset /= 2) {
+            float other_val = __shfl_down_sync(0xffffffff, max_val, offset);
+            int32_t other_idx = __shfl_down_sync(0xffffffff, max_idx, offset);
+            if (other_val > max_val) {
+                max_val = other_val;
+                max_idx = other_idx;
+            }
+        }
+        if (lane == 0) {
+            block_maxes[blockIdx.x] = max_val;
+            block_indices[blockIdx.x] = max_idx;
+        }
+    }
+}
+
+__global__ void argmax_f32_stage2_kernel(
+    int32_t* __restrict__ out,
+    const float* __restrict__ block_maxes,
+    const int32_t* __restrict__ block_indices,
+    int n_blocks)
+{
+    __shared__ float s_max[32];
+    __shared__ int32_t s_idx[32];
+
+    int tid = threadIdx.x;
+    float max_val = (tid < n_blocks) ? block_maxes[tid] : -1e38f;
+    int32_t max_idx = (tid < n_blocks) ? block_indices[tid] : 0;
+
+    #pragma unroll
+    for (int offset = 16; offset > 0; offset /= 2) {
+        float other_val = __shfl_down_sync(0xffffffff, max_val, offset);
+        int32_t other_idx = __shfl_down_sync(0xffffffff, max_idx, offset);
+        if (other_val > max_val) {
+            max_val = other_val;
+            max_idx = other_idx;
+        }
+    }
+
+    int lane = tid & 31;
+    int warp = tid >> 5;
+    if (lane == 0) {
+        s_max[warp] = max_val;
+        s_idx[warp] = max_idx;
+    }
+    __syncthreads();
+
+    if (warp == 0) {
+        int n_warps = (blockDim.x + 31) / 32;
+        max_val = (lane < n_warps) ? s_max[lane] : -1e38f;
+        max_idx = (lane < n_warps) ? s_idx[lane] : 0;
+        #pragma unroll
+        for (int offset = 16; offset > 0; offset /= 2) {
+            float other_val = __shfl_down_sync(0xffffffff, max_val, offset);
+            int32_t other_idx = __shfl_down_sync(0xffffffff, max_idx, offset);
+            if (other_val > max_val) {
+                max_val = other_val;
+                max_idx = other_idx;
+            }
+        }
+        if (lane == 0) {
+            *out = max_idx;
+        }
+    }
+}
+
+void argmax_f32_cuda(int32_t* out, const float* logits, int n, cudaStream_t stream) {
+    static float* s_d_block_maxes = nullptr;
+    static int32_t* s_d_block_indices = nullptr;
+    static const int N_BLOCKS = 128;
+    if (!s_d_block_maxes) {
+        cudaMalloc(&s_d_block_maxes, N_BLOCKS * sizeof(float));
+        cudaMalloc(&s_d_block_indices, N_BLOCKS * sizeof(int32_t));
+    }
+    argmax_f32_stage1_kernel<<<N_BLOCKS, 256, 0, stream>>>(s_d_block_maxes, s_d_block_indices, logits, n);
+    argmax_f32_stage2_kernel<<<1, 128, 0, stream>>>(out, s_d_block_maxes, s_d_block_indices, N_BLOCKS);
+}

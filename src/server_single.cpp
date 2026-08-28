@@ -1294,9 +1294,10 @@ public:
     GPUTensor buf_comp_bf16_;    // BF16 working buffer for compressed entry (head_dim)
     GPUTensor buf_combined_kv_;  // BF16 buffer for combined raw+compressed KV
 
-    // Device-driven inputs for CUDA Graph
+    // Device-driven inputs for CUDA Graph & Device ArgMax
     GPUTensor buf_input_token_;  // [1] int32_t on GPU
     GPUTensor buf_input_pos_;    // [1] int32_t on GPU
+    GPUTensor buf_argmax_out_;   // [1] int32_t on GPU for 4-byte sampling
     cudaGraph_t graph_ = nullptr;
     cudaGraphExec_t graph_exec_ = nullptr;
     bool graph_captured_ = false;
@@ -1391,10 +1392,10 @@ public:
         expert_pool_ = std::make_unique<ThreadPool>(16);
 
         // Determine available VRAM for expert cache
-        size_t vram_free, vram_total;
-        CUDA_CHECK(cudaMemGetInfo(&vram_free, &vram_total));
+        size_t initial_vram_free, vram_total;
+        CUDA_CHECK(cudaMemGetInfo(&initial_vram_free, &vram_total));
         LOG_INFO("VRAM: %.1f GB free / %.1f GB total",
-                 vram_free / (1024.0 * 1024.0 * 1024.0), vram_total / (1024.0 * 1024.0 * 1024.0));
+                 initial_vram_free / (1024.0 * 1024.0 * 1024.0), vram_total / (1024.0 * 1024.0 * 1024.0));
 
         // Load dense tensors from attention_dense_layers.bin
         std::string dense_path = manifest["dense_bin"].get<std::string>();
@@ -1409,6 +1410,9 @@ public:
         auto& el = manifest["expert_layout"];
         int expert_block_size = el["block_size"].get<int>();
         int expert_n_layers = el["n_layers"].get<int>();
+        if (expert_n_layers > cfg_.num_hidden_layers && cfg_.num_hidden_layers > 0) {
+            expert_n_layers = cfg_.num_hidden_layers;
+        }
         int expert_n_experts = el["n_experts"].get<int>();
 
         for (auto& [part_name, part_info] : el["parts"].items()) {
@@ -1428,15 +1432,16 @@ public:
         alloc_buffers();
 
         // Reserve VRAM: rest goes to expert cache
-        CUDA_CHECK(cudaMemGetInfo(&vram_free, &vram_total));
+        size_t vram_free_after_dense;
+        CUDA_CHECK(cudaMemGetInfo(&vram_free_after_dense, &vram_total));
         size_t total_experts_bytes = (size_t)expert_n_layers * expert_n_experts * expert_block_size;
-        size_t cache_budget = vram_free > (1ULL * 1024 * 1024 * 1024) ? (vram_free - 1ULL * 1024 * 1024 * 1024) : vram_free;
+        size_t cache_budget = vram_free_after_dense > (1ULL * 1024 * 1024 * 1024) ? (vram_free_after_dense - 1ULL * 1024 * 1024 * 1024) : vram_free_after_dense;
         
         if (max_vram_gb > 0.0f) {
             size_t max_vram_bytes = (size_t)(max_vram_gb * 1024.0 * 1024.0 * 1024.0);
-            size_t used_vram = vram_total - vram_free;
-            if (max_vram_bytes > used_vram + 1ULL * 1024 * 1024 * 1024) {
-                size_t user_budget = max_vram_bytes - used_vram - 1ULL * 1024 * 1024 * 1024;
+            size_t process_dense_usage = (initial_vram_free > vram_free_after_dense) ? (initial_vram_free - vram_free_after_dense) : 0;
+            if (max_vram_bytes > process_dense_usage + 1ULL * 1024 * 1024 * 1024) {
+                size_t user_budget = max_vram_bytes - process_dense_usage - 1ULL * 1024 * 1024 * 1024;
                 if (user_budget < cache_budget) {
                     cache_budget = user_budget;
                 }
@@ -1558,7 +1563,13 @@ public:
     std::mt19937 rng_{std::random_device{}()};
 
     void forward_token(int token_id, int position) {
-        forward_token_eager(token_id, position);
+        if (graph_captured_) {
+            CUDA_CHECK(cudaMemcpyAsync(buf_input_token_.i32(), &token_id, sizeof(int32_t), cudaMemcpyHostToDevice, main_stream_));
+            CUDA_CHECK(cudaMemcpyAsync(buf_input_pos_.i32(), &position, sizeof(int32_t), cudaMemcpyHostToDevice, main_stream_));
+            CUDA_CHECK(cudaGraphLaunch(graph_exec_, main_stream_));
+        } else {
+            forward_token_eager(token_id, position);
+        }
     }
 
     void forward_token_eager(int token_id, int position) {
@@ -2347,6 +2358,8 @@ private:
         int max_combined = (cfg_.sliding_window > 0 ? cfg_.sliding_window : 64) + cfg_.max_compressed_entries;
         buf_combined_kv_.alloc((size_t)max_combined * head_dim_val * sizeof(__nv_bfloat16));
 
+        buf_argmax_out_.alloc(sizeof(int32_t));
+
         router_indices_host_.resize(cfg_.n_routed_experts);
         logits_host_.resize(cfg_.vocab_size);
         probs_host_.resize(cfg_.vocab_size);
@@ -2365,6 +2378,10 @@ private:
         const __nv_bfloat16* B,  // [N, K] — stored as weight[out, in]
         float alpha = 1.0f, float beta = 0.0f)
     {
+        if (M == 1) {
+            gemv_bf16_out_bf16_cuda(C, B, A, N, K, main_stream_);
+            return;
+        }
         // In column-major: A_col = K x M, B_col = K x N
         // cuBLAS: C_col = B_col.T @ A_col = N x K @ K x M = N x M
         // Which is C_row = M x N ✓
@@ -2965,13 +2982,9 @@ private:
         }
 
         // 4. Populate active expert pointers
+        const void* const* flat_ptrs = nullptr;
         if (expert_loader_.all_resident(cfg_.num_hidden_layers)) {
-            // 0-latency GPU-native fast path for full VRAM
-            populate_active_expert_ptrs_cuda(
-                (const void**)buf_active_expert_ptrs_.data,
-                buf_topk_idx_.i32(),
-                expert_loader_.flat_vram_ptrs_gpu(),
-                layer_id, n_experts, top_k, main_stream_);
+            flat_ptrs = expert_loader_.flat_vram_ptrs_gpu();
         } else {
             // Dynamic fetch path for offload / 24GB VRAM
             CUDA_CHECK(cudaMemcpyAsync(topk_ids_host_, buf_topk_idx_.i32(),
@@ -3029,13 +3042,15 @@ private:
                 buf_gate_.bf16(), buf_hidden_.bf16(),
                 (const void* const*)buf_active_expert_ptrs_.data,
                 w1_info.offset_in_block, w3_info.offset_in_block,
-                moe_inter, dim, cfg_.swiglu_limit, main_stream_);
+                moe_inter, dim, cfg_.swiglu_limit,
+                buf_topk_idx_.i32(), flat_ptrs, layer_id, n_experts, main_stream_);
 
             gemv_q2_k_moe_cuda(
                 buf_down_.bf16(), buf_gate_.bf16(),
                 (const void* const*)buf_active_expert_ptrs_.data,
                 w2_info.offset_in_block,
-                dim, moe_inter, main_stream_);
+                dim, moe_inter,
+                buf_topk_idx_.i32(), flat_ptrs, layer_id, n_experts, main_stream_);
         } else {
             for (int k = 0; k < top_k; k++) {
                 void* ptr = active_expert_ptrs_host_[k];
@@ -3132,6 +3147,7 @@ private:
 
         // Fast CUDA graph compatible matrix-vector multiplication directly to float32 logits
         gemv_bf16_cuda(buf_logits_.f32(), head_weight_.bf16(), buf_hidden_.bf16(), vocab, dim, main_stream_);
+        argmax_f32_cuda(buf_argmax_out_.i32(), buf_logits_.f32(), vocab, main_stream_);
     }
 
     // ── Sample from logits ──────────────────────────────────────────────────
@@ -3141,22 +3157,18 @@ private:
     int sample_token(float temperature, const std::vector<int>& history, int step = 0, bool is_reasoning = true,
                      int top_k = 1024, float top_p = 0.95f, float min_p = 0.0f) {
         int vocab = cfg_.vocab_size;
+
+        if (temperature <= 0.0f) {
+            int best = 0;
+            CUDA_CHECK(cudaMemcpyAsync(&best, buf_argmax_out_.i32(), sizeof(int32_t), cudaMemcpyDeviceToHost, main_stream_));
+            CUDA_CHECK(cudaStreamSynchronize(main_stream_));
+            return best;
+        }
+
         float* logits = logits_host_.data();
         CUDA_CHECK(cudaMemcpyAsync(logits, buf_logits_.f32(),
                                    vocab * sizeof(float), cudaMemcpyDeviceToHost, main_stream_));
         CUDA_CHECK(cudaStreamSynchronize(main_stream_));
-
-        if (temperature <= 0.0f) {
-            int best = 0;
-            float max_logit = -1e38f;
-            for (int i = 0; i < vocab; i++) {
-                if (logits[i] > max_logit) {
-                    max_logit = logits[i];
-                    best = i;
-                }
-            }
-            return best;
-        }
 
         if (top_p <= 0.0f || top_p > 1.0f) top_p = 1.0f;
         if (min_p < 0.0f) min_p = 0.0f;
