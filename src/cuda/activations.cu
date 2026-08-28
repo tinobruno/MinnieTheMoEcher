@@ -2678,6 +2678,28 @@ void populate_active_expert_ptrs_cuda(
         active_ptrs, topk_ids, flat_expert_ptrs, layer_id, n_experts, top_k);
 }
 
+// ── Hardware Asynchronous Copy (cp.async) Primitives ──────────────────────────
+__device__ __forceinline__ void cp_async_16_bytes(void* smem_dst, const void* gmem_src) {
+#if defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 800)
+    uint32_t smem_addr = __cvta_generic_to_shared(smem_dst);
+    asm volatile("cp.async.ca.shared.global [%0], [%1], 16;\n" : : "r"(smem_addr), "l"(gmem_src));
+#else
+    *(uint4*)smem_dst = *(const uint4*)gmem_src;
+#endif
+}
+
+__device__ __forceinline__ void cp_async_commit_group() {
+#if defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 800)
+    asm volatile("cp.async.commit_group;\n" ::);
+#endif
+}
+
+__device__ __forceinline__ void cp_async_wait_all() {
+#if defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 800)
+    asm volatile("cp.async.wait_group 0;\n" ::);
+#endif
+}
+
 // ── Batched All-6-Experts IQ2_XXS SwiGLU Fused Kernel ────────────────────────
 __global__ void gemv_iq2_xxs_moe_swiglu_fused_kernel(
     __nv_bfloat16* __restrict__ gate_buf, // [6 * moe_inter]
@@ -2691,10 +2713,18 @@ __global__ void gemv_iq2_xxs_moe_swiglu_fused_kernel(
 {
     __shared__ uint64_t s_grid[256];
     __shared__ uint8_t s_signs[128];
+    __shared__ __nv_bfloat16 s_vec[2][256]; // Double-buffered vector cache (1 KB)
 
     int tid = threadIdx.y * 32 + threadIdx.x;
     s_grid[tid] = c_iq2xxs_grid[tid];
     if (tid < 128) s_signs[tid] = c_ksigns_iq2xs[tid];
+
+    // Pipeline prologue: prefetch first 256 elements of vec into s_vec[0]
+    if (tid < 32) {
+        cp_async_16_bytes((uint4*)s_vec[0] + tid, (const uint4*)vec + tid);
+    }
+    cp_async_commit_group();
+    cp_async_wait_all();
     __syncthreads();
 
     int k = blockIdx.y;
@@ -2729,6 +2759,16 @@ __global__ void gemv_iq2_xxs_moe_swiglu_fused_kernel(
     float sum3 = 0.0f;
 
     for (int b = 0; b < n_blocks; b++) {
+        int curr_stage = b & 1;
+        int next_stage = (b + 1) & 1;
+
+        // Asynchronously prefetch next tile of vec during computation
+        if (b + 1 < n_blocks && tid < 32) {
+            cp_async_16_bytes((uint4*)s_vec[next_stage] + tid,
+                              (const uint4*)(vec + ((b + 1) << 8)) + tid);
+            cp_async_commit_group();
+        }
+
         const block_iq2_xxs* blk1 = &row_w1[b];
         const block_iq2_xxs* blk3 = &row_w3[b];
 
@@ -2737,23 +2777,30 @@ __global__ void gemv_iq2_xxs_moe_swiglu_fused_kernel(
         d1 = __shfl_sync(0xffffffff, d1, 0);
         d3 = __shfl_sync(0xffffffff, d3, 0);
 
-        const uint16_t* qs1 = blk1->qs;
-        const uint16_t* qs3 = blk3->qs;
+        // Coalesced 32-thread register load for entire 32-element qs arrays
+        uint16_t q1_lane = blk1->qs[lane];
+        uint16_t q3_lane = blk3->qs[lane];
 
         #pragma unroll 4
         for (int ib32 = 0; ib32 < 8; ib32++) {
             int q_off = ib32 * 4;
-            uint32_t aux0_1 = 0, aux1_1 = 0, aux0_3 = 0, aux1_3 = 0;
-            if (lane == 0) {
-                aux0_1 = (uint32_t)qs1[q_off + 0] | ((uint32_t)qs1[q_off + 1] << 16);
-                aux1_1 = (uint32_t)qs1[q_off + 2] | ((uint32_t)qs1[q_off + 3] << 16);
-                aux0_3 = (uint32_t)qs3[q_off + 0] | ((uint32_t)qs3[q_off + 1] << 16);
-                aux1_3 = (uint32_t)qs3[q_off + 2] | ((uint32_t)qs3[q_off + 3] << 16);
-            }
-            aux0_1 = __shfl_sync(0xffffffff, aux0_1, 0);
-            aux1_1 = __shfl_sync(0xffffffff, aux1_1, 0);
-            aux0_3 = __shfl_sync(0xffffffff, aux0_3, 0);
-            aux1_3 = __shfl_sync(0xffffffff, aux1_3, 0);
+            uint32_t aux0_1, aux1_1, aux0_3, aux1_3;
+
+            // Broadcast aux descriptors from lane registers via shuffle
+            uint16_t q1_0 = __shfl_sync(0xffffffff, q1_lane, q_off + 0);
+            uint16_t q1_1 = __shfl_sync(0xffffffff, q1_lane, q_off + 1);
+            uint16_t q1_2 = __shfl_sync(0xffffffff, q1_lane, q_off + 2);
+            uint16_t q1_3 = __shfl_sync(0xffffffff, q1_lane, q_off + 3);
+
+            uint16_t q3_0 = __shfl_sync(0xffffffff, q3_lane, q_off + 0);
+            uint16_t q3_1 = __shfl_sync(0xffffffff, q3_lane, q_off + 1);
+            uint16_t q3_2 = __shfl_sync(0xffffffff, q3_lane, q_off + 2);
+            uint16_t q3_3 = __shfl_sync(0xffffffff, q3_lane, q_off + 3);
+
+            aux0_1 = (uint32_t)q1_0 | ((uint32_t)q1_1 << 16);
+            aux1_1 = (uint32_t)q1_2 | ((uint32_t)q1_3 << 16);
+            aux0_3 = (uint32_t)q3_0 | ((uint32_t)q3_1 << 16);
+            aux1_3 = (uint32_t)q3_2 | ((uint32_t)q3_3 << 16);
 
             float db1 = d1 * (0.5f + (aux1_1 >> 28)) * 0.25f;
             float db3 = d3 * (0.5f + (aux1_3 >> 28)) * 0.25f;
@@ -2774,10 +2821,15 @@ __global__ void gemv_iq2_xxs_moe_swiglu_fused_kernel(
             float sign3 = (s_val3 & kmask) ? -1.0f : 1.0f;
             float weight3 = db3 * (float)byte3 * sign3;
 
-            int col_idx = (b << 8) + (ib32 << 5) + lane;
-            float a = __bfloat162float(vec[col_idx]);
+            int col_in_block = (ib32 << 5) + lane;
+            float a = __bfloat162float(s_vec[curr_stage][col_in_block]);
             sum1 += weight1 * a;
             sum3 += weight3 * a;
+        }
+
+        if (b + 1 < n_blocks) {
+            cp_async_wait_all();
+            __syncthreads();
         }
     }
 
@@ -2829,7 +2881,20 @@ __global__ void gemv_q2_k_moe_kernel(
     int w2_offset,
     int N, int K)
 {
+    __shared__ __nv_bfloat16 s_gate[2][256]; // Double-buffered gate/up input cache (1 KB)
+
+    int tid = threadIdx.y * 32 + threadIdx.x;
     int k = blockIdx.y;
+    const __nv_bfloat16* k_gate = gate_buf + (size_t)k * K;
+
+    // Pipeline prologue: prefetch first 256 elements of k_gate into s_gate[0]
+    if (tid < 32) {
+        cp_async_16_bytes((uint4*)s_gate[0] + tid, (const uint4*)k_gate + tid);
+    }
+    cp_async_commit_group();
+    cp_async_wait_all();
+    __syncthreads();
+
     int row = blockIdx.x * blockDim.y + threadIdx.y;
     if (row >= N || k >= 6) return;
 
@@ -2850,12 +2915,21 @@ __global__ void gemv_q2_k_moe_kernel(
     int lane = threadIdx.x;
     int n_blocks = K / 256;
     const block_q2_K* row_w2 = w2 + row * n_blocks;
-    const __nv_bfloat16* k_gate = gate_buf + (size_t)k * K;
 
     int lane_half = lane >> 4;
     float sum = 0.0f;
 
     for (int b = 0; b < n_blocks; b++) {
+        int curr_stage = b & 1;
+        int next_stage = (b + 1) & 1;
+
+        // Asynchronously prefetch next tile of gate input
+        if (b + 1 < n_blocks && tid < 32) {
+            cp_async_16_bytes((uint4*)s_gate[next_stage] + tid,
+                              (const uint4*)(k_gate + ((b + 1) << 8)) + tid);
+            cp_async_commit_group();
+        }
+
         const block_q2_K* blk = &row_w2[b];
         float d = (lane == 0) ? __half2float(blk->d) : 0.0f;
         float min = (lane == 0) ? __half2float(blk->dmin) : 0.0f;
@@ -2875,8 +2949,8 @@ __global__ void gemv_q2_k_moe_kernel(
             float ml = min * (float)(sc >> 4);
             float w = dl * (float)q - ml;
 
-            int col_idx = (b << 8) + (iter << 5) + lane;
-            float a = __bfloat162float(k_gate[col_idx]);
+            int col_in_block = (iter << 5) + lane;
+            float a = __bfloat162float(s_gate[curr_stage][col_in_block]);
             sum += w * a;
         }
 
@@ -2888,9 +2962,14 @@ __global__ void gemv_q2_k_moe_kernel(
             float ml = min * (float)(sc >> 4);
             float w = dl * (float)q - ml;
 
-            int col_idx = (b << 8) + 128 + (iter << 5) + lane;
-            float a = __bfloat162float(k_gate[col_idx]);
+            int col_in_block = 128 + (iter << 5) + lane;
+            float a = __bfloat162float(s_gate[curr_stage][col_in_block]);
             sum += w * a;
+        }
+
+        if (b + 1 < n_blocks) {
+            cp_async_wait_all();
+            __syncthreads();
         }
     }
 
