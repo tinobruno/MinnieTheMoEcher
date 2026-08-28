@@ -278,6 +278,14 @@ void argmax_f32_cuda(
     int n,
     cudaStream_t stream = 0);
 
+void sample_multinomial_f32_cuda(
+    int32_t* out,
+    float* logits,
+    int n,
+    float temperature,
+    float rand_val,
+    cudaStream_t stream = 0);
+
 // ── sqrt(softplus(x)) scoring ──────────────────────────────────────────────────
 void sqrtsoftplus_cuda(
     float* out,                    // [n]

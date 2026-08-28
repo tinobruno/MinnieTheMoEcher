@@ -1829,6 +1829,10 @@ public:
 
             output_ids.push_back(next_token);
             history.push_back(next_token);
+
+            // Pipeline: Launch GPU forward pass for next token immediately so GPU runs concurrently with CPU text decoding
+            forward_token(next_token, position);
+            position++;
            
             // Handle think block filtering
             if (think_start_id >= 0 && next_token == think_start_id) {
@@ -1836,19 +1840,11 @@ public:
                     in_think_block = true;
                     think_block_ended = false;
                 }
-               
-                // Forward the token but don't emit it
-                forward_token(next_token, position);
-                position++;
                 continue;
             }
             if (think_end_id >= 0 && next_token == think_end_id) {
                 in_think_block = false;
                 think_block_ended = true;
-
-                // Forward the token but don't emit it
-                forward_token(next_token, position);
-                position++;
                 continue;
             }
 
@@ -1862,7 +1858,6 @@ public:
             if (in_think_block) {
                 last_think_token_str = token_text;
             }
-
 
             token_buffer += token_text;
             generated_text += token_text;
@@ -1907,10 +1902,6 @@ public:
                 }
                 token_buffer.clear();
             }
-
-            // Forward the new token
-            forward_token(next_token, position);
-            position++;
 
             // Graceful sentence-boundary stopping:
             // When we're within 80% of max_tokens and just completed a sentence,
@@ -3165,69 +3156,13 @@ private:
             return best;
         }
 
-        float* logits = logits_host_.data();
-        CUDA_CHECK(cudaMemcpyAsync(logits, buf_logits_.f32(),
-                                   vocab * sizeof(float), cudaMemcpyDeviceToHost, main_stream_));
-        CUDA_CHECK(cudaStreamSynchronize(main_stream_));
-
-        if (top_p <= 0.0f || top_p > 1.0f) top_p = 1.0f;
-        if (min_p < 0.0f) min_p = 0.0f;
-        if (top_k <= 0) top_k = 1024;
-        if (top_k > vocab) top_k = vocab;
-
-        // Top-K insertion sort for Top-P / Min-P sampling
-        std::vector<int> ids(top_k);
-        std::vector<float> vals(top_k);
-        int n = 0;
-
-        for (int i = 0; i < vocab; i++) {
-            float v = logits[i];
-            if (!std::isfinite(v)) continue;
-            if (n == top_k && v <= vals[n - 1]) continue;
-            int j = (n < top_k) ? n++ : n - 1;
-            while (j > 0 && vals[j - 1] < v) {
-                vals[j] = vals[j - 1];
-                ids[j] = ids[j - 1];
-                j--;
-            }
-            vals[j] = v;
-            ids[j] = i;
-        }
-
-        if (n == 0) return 0;
-
-        std::vector<float> probs(n);
-        const float max_logit = vals[0];
-        float sum = 0.0f;
-        for (int i = 0; i < n; i++) {
-            probs[i] = expf((vals[i] - max_logit) / temperature);
-            sum += probs[i];
-        }
-
-        if (sum <= 0.0f || !std::isfinite(sum)) return ids[0];
-
-        // Min-P filter relative to top candidate probability (probs[0] / sum)
-        const float min_prob = (probs[0] / sum) * min_p;
-        float filtered_sum = 0.0f;
-        int filtered = 0;
-        for (int i = 0; i < n; i++) {
-            float p = probs[i] / sum;
-            if (i > 0 && p < min_prob) break;
-            filtered_sum += probs[i];
-            filtered++;
-            if (filtered_sum / sum >= top_p) break;
-        }
-
-        if (filtered <= 0) return ids[0];
-
-        // Sample from distribution
-        std::uniform_real_distribution<float> dist(0.0f, filtered_sum);
+        std::uniform_real_distribution<float> dist(0.0f, 1.0f);
         float r = dist(rng_);
-        for (int i = 0; i < filtered; i++) {
-            r -= probs[i];
-            if (r <= 0.0f) return ids[i];
-        }
-        return ids[filtered - 1];
+        sample_multinomial_f32_cuda(buf_argmax_out_.i32(), buf_logits_.f32(), vocab, temperature, r, main_stream_);
+        int sampled = 0;
+        CUDA_CHECK(cudaMemcpyAsync(&sampled, buf_argmax_out_.i32(), sizeof(int32_t), cudaMemcpyDeviceToHost, main_stream_));
+        CUDA_CHECK(cudaStreamSynchronize(main_stream_));
+        return sampled;
     }
 
 public:

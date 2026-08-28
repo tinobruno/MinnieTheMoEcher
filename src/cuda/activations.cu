@@ -3830,3 +3830,122 @@ void argmax_f32_cuda(int32_t* out, const float* logits, int n, cudaStream_t stre
     argmax_f32_stage1_kernel<<<N_BLOCKS, 256, 0, stream>>>(s_d_block_maxes, s_d_block_indices, logits, n);
     argmax_f32_stage2_kernel<<<1, 128, 0, stream>>>(out, s_d_block_maxes, s_d_block_indices, N_BLOCKS);
 }
+
+// ── GPU-Native Multinomial Softmax Sampling ─────────────────────────────────
+__global__ void logits_exp_sum_stage1_kernel(
+    float* __restrict__ block_sums,
+    float* __restrict__ logits,
+    int n,
+    float inv_temp,
+    const float* __restrict__ block_maxes,
+    int n_blocks)
+{
+    __shared__ float s_sum[32];
+    int tid = threadIdx.x;
+    int gid = blockIdx.x * blockDim.x + threadIdx.x;
+    int stride = gridDim.x * blockDim.x;
+
+    float max_v = block_maxes ? block_maxes[0] : 0.0f;
+    float sum = 0.0f;
+
+    for (int i = gid; i < n; i += stride) {
+        float v = logits[i];
+        float e = expf((v - max_v) * inv_temp);
+        logits[i] = e;
+        sum += e;
+    }
+
+    #pragma unroll
+    for (int offset = 16; offset > 0; offset /= 2)
+        sum += __shfl_down_sync(0xffffffff, sum, offset);
+
+    int lane = tid & 31;
+    int warp = tid >> 5;
+    if (lane == 0) s_sum[warp] = sum;
+    __syncthreads();
+
+    if (warp == 0) {
+        int n_warps = blockDim.x / 32;
+        sum = (lane < n_warps) ? s_sum[lane] : 0.0f;
+        #pragma unroll
+        for (int offset = 16; offset > 0; offset /= 2)
+            sum += __shfl_down_sync(0xffffffff, sum, offset);
+        if (lane == 0) block_sums[blockIdx.x] = sum;
+    }
+}
+
+__global__ void logits_sample_stage2_kernel(
+    int32_t* __restrict__ out,
+    const float* __restrict__ logits,
+    const float* __restrict__ block_sums,
+    int n,
+    int n_blocks,
+    float rand_val)
+{
+    __shared__ float s_sum[32];
+    int tid = threadIdx.x;
+    float total_sum = (tid < n_blocks) ? block_sums[tid] : 0.0f;
+
+    #pragma unroll
+    for (int offset = 16; offset > 0; offset /= 2)
+        total_sum += __shfl_down_sync(0xffffffff, total_sum, offset);
+
+    int lane = tid & 31;
+    int warp = tid >> 5;
+    if (lane == 0) s_sum[warp] = total_sum;
+    __syncthreads();
+
+    if (warp == 0) {
+        int n_warps = (blockDim.x + 31) / 32;
+        total_sum = (lane < n_warps) ? s_sum[lane] : 0.0f;
+        #pragma unroll
+        for (int offset = 16; offset > 0; offset /= 2)
+            total_sum += __shfl_down_sync(0xffffffff, total_sum, offset);
+        if (lane == 0) s_sum[0] = total_sum;
+    }
+    __syncthreads();
+
+    total_sum = s_sum[0];
+    if (total_sum <= 0.0f) {
+        if (tid == 0) *out = 0;
+        return;
+    }
+
+    if (tid == 0) {
+        float target = rand_val * total_sum;
+        float cum = 0.0f;
+        int sampled_id = 0;
+        for (int i = 0; i < n; i++) {
+            cum += logits[i];
+            if (cum >= target) {
+                sampled_id = i;
+                break;
+            }
+        }
+        *out = sampled_id;
+    }
+}
+
+void sample_multinomial_f32_cuda(
+    int32_t* out,
+    float* logits,
+    int n,
+    float temperature,
+    float rand_val,
+    cudaStream_t stream)
+{
+    static float* s_d_block_maxes = nullptr;
+    static int32_t* s_d_block_indices = nullptr;
+    static float* s_d_block_sums = nullptr;
+    static const int N_BLOCKS = 128;
+    if (!s_d_block_maxes) {
+        cudaMalloc(&s_d_block_maxes, N_BLOCKS * sizeof(float));
+        cudaMalloc(&s_d_block_indices, N_BLOCKS * sizeof(int32_t));
+        cudaMalloc(&s_d_block_sums, N_BLOCKS * sizeof(float));
+    }
+    argmax_f32_stage1_kernel<<<N_BLOCKS, 256, 0, stream>>>(s_d_block_maxes, s_d_block_indices, logits, n);
+
+    float inv_temp = 1.0f / fmaxf(temperature, 1e-4f);
+    logits_exp_sum_stage1_kernel<<<N_BLOCKS, 256, 0, stream>>>(s_d_block_sums, logits, n, inv_temp, s_d_block_maxes, N_BLOCKS);
+    logits_sample_stage2_kernel<<<1, 128, 0, stream>>>(out, logits, s_d_block_sums, n, N_BLOCKS, rand_val);
+}
