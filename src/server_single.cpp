@@ -737,6 +737,7 @@ public:
     void* dram_cache_pool_ = nullptr;
     std::vector<ExpertCacheEntry> dram_cache_slots_;
     std::unordered_map<int64_t, int> dram_key_to_slot_; // (layer*n_experts+expert) -> L2 slot index
+    std::vector<void*> flat_dram_ptrs_;                 // Lock-free flat array for 0-latency DRAM lookups
 
     // Ring buffer for staging (used when bypassing DRAM cache)
     static constexpr int NUM_STAGING_BUFFERS = 32;
@@ -749,6 +750,72 @@ public:
 
     int64_t access_counter_ = 0;
     std::mutex cache_mutex_;
+
+    int n_pinned_layers() const {
+        return (n_experts_ > 0) ? std::min(n_layers_, cache_capacity_ / n_experts_) : 0;
+    }
+
+    bool is_layer_pinned(int layer_id) const {
+        return layer_id < n_pinned_layers();
+    }
+
+    inline void* get_dram_or_disk_ptr(int layer_id, int expert_id) {
+        int64_t key = (int64_t)layer_id * n_experts_ + expert_id;
+        if (key >= 0 && key < (int64_t)flat_dram_ptrs_.size()) {
+            void* ptr = flat_dram_ptrs_[key];
+            if (ptr) return ptr;
+        }
+        return fetch_cold_expert_from_disk(layer_id, expert_id, key);
+    }
+
+    void* fetch_cold_expert_from_disk(int layer_id, int expert_id, int64_t key) {
+        std::unique_lock<std::mutex> lock(cache_mutex_);
+        if (dram_cache_capacity_ > 0) {
+            auto it = dram_key_to_slot_.find(key);
+            if (it != dram_key_to_slot_.end()) {
+                return dram_cache_slots_[it->second].gpu_data;
+            }
+            access_counter_++;
+            int evict_dram = 0;
+            int64_t oldest_dram = INT64_MAX;
+            for (int i = 0; i < dram_cache_capacity_; i++) {
+                if (dram_cache_slots_[i].layer_id < 0) {
+                    evict_dram = i;
+                    break;
+                }
+                if (dram_cache_slots_[i].last_used < oldest_dram) {
+                    oldest_dram = dram_cache_slots_[i].last_used;
+                    evict_dram = i;
+                }
+            }
+            auto& dslot = dram_cache_slots_[evict_dram];
+            if (dslot.layer_id >= 0) {
+                int64_t old_dram_key = (int64_t)dslot.layer_id * n_experts_ + dslot.expert_id;
+                dram_key_to_slot_.erase(old_dram_key);
+                if (old_dram_key >= 0 && old_dram_key < (int64_t)flat_dram_ptrs_.size()) {
+                    flat_dram_ptrs_[old_dram_key] = nullptr;
+                }
+            }
+            dslot.layer_id = layer_id;
+            dslot.expert_id = expert_id;
+            dslot.last_used = access_counter_;
+            dram_key_to_slot_[key] = evict_dram;
+
+            int64_t file_offset = (int64_t)key * expert_block_size_;
+            expert_file_.pread_exact(dslot.gpu_data, expert_block_size_, file_offset);
+            if (key >= 0 && key < (int64_t)flat_dram_ptrs_.size()) {
+                flat_dram_ptrs_[key] = dslot.gpu_data;
+            }
+            return dslot.gpu_data;
+        } else {
+            int stage_idx = staging_idx_;
+            staging_idx_ = (staging_idx_ + 1) % NUM_STAGING_BUFFERS;
+            auto& stage = staging_ring_[stage_idx];
+            int64_t file_offset = (int64_t)key * expert_block_size_;
+            expert_file_.pread_exact(stage.ptr, expert_block_size_, file_offset);
+            return stage.ptr;
+        }
+    }
 
     bool init(const std::string& expert_bin_path, int block_size,
               int n_layers, int n_experts, size_t cache_budget_bytes, size_t dram_budget_bytes) {
@@ -782,17 +849,28 @@ public:
             cudaError_t err = cudaMallocHost(&dram_cache_pool_, total_dram_bytes);
             if (err != cudaSuccess) {
                 cudaGetLastError(); // Clear error state
-                LOG_WARN("cudaMallocHost could not allocate %.1f GB pinned memory (Windows WDDM limit). Falling back to page-aligned system RAM.",
-                         (double)total_dram_bytes / (1024.0 * 1024.0 * 1024.0));
 #if defined(_WIN32) || defined(_WIN64)
                 dram_cache_pool_ = VirtualAlloc(NULL, total_dram_bytes, MEM_COMMIT | MEM_RESERVE, PAGE_READWRITE);
 #else
                 dram_cache_pool_ = aligned_alloc(4096, total_dram_bytes);
 #endif
-                if (!dram_cache_pool_) {
+                if (dram_cache_pool_) {
+                    cudaError_t reg_err = cudaHostRegister(dram_cache_pool_, total_dram_bytes, cudaHostRegisterDefault);
+                    if (reg_err != cudaSuccess) {
+                        cudaGetLastError();
+                        LOG_WARN("cudaHostRegister could not pin %.1f GB DRAM cache (OS locked memory limit / ulimit). DMA transfers will run with pageable fallback.",
+                                 (double)total_dram_bytes / (1024.0 * 1024.0 * 1024.0));
+                    } else {
+                        LOG_INFO("Pinned %.1f GB DRAM cache into physical RAM with cudaHostRegister",
+                                 (double)total_dram_bytes / (1024.0 * 1024.0 * 1024.0));
+                    }
+                } else {
                     LOG_ERROR("System RAM allocation also failed. Disabling L2 DRAM cache.");
                     dram_cache_capacity_ = 0;
                 }
+            } else {
+                LOG_INFO("Allocated %.1f GB pinned DRAM cache with cudaMallocHost",
+                         (double)total_dram_bytes / (1024.0 * 1024.0 * 1024.0));
             }
             if (dram_cache_capacity_ > 0 && dram_cache_pool_) {
                 dram_cache_slots_.resize(dram_cache_capacity_);
@@ -984,7 +1062,7 @@ public:
     bool preload_all(int n_threads = 16) {
         int total = n_layers_ * n_experts_;
         int to_load = std::min(total, cache_capacity_);
-        LOG_INFO("Preloading %d/%d experts into VRAM...", to_load, total);
+        LOG_INFO("Preloading %d/%d experts into VRAM L1 cache...", to_load, total);
         
         auto start = std::chrono::steady_clock::now();
         std::atomic<int> loaded{0};
@@ -1020,7 +1098,7 @@ public:
                     }
                     int done = ++loaded;
                     if (done % 1000 == 0 || done == to_load) {
-                        LOG_INFO("  Preloaded %d/%d experts...", done, to_load);
+                        LOG_INFO("  Preloaded %d/%d experts into VRAM...", done, to_load);
                     }
                 }
                 CUDA_CHECK(cudaStreamDestroy(stream));
@@ -1042,53 +1120,47 @@ public:
 
         if (dram_cache_capacity_ > 0) {
             int dram_to_load = std::min(total - to_load, dram_cache_capacity_);
-            if (dram_to_load > 0) {
-                LOG_INFO("Preloading %d/%d experts into DRAM L2 cache...", dram_to_load, dram_cache_capacity_);
-                std::vector<std::thread> dram_workers;
-                int dram_chunk = (dram_to_load + n_threads - 1) / n_threads;
-                for (int t = 0; t < n_threads; t++) {
-                    int start_i = t * dram_chunk;
-                    int end_i = std::min(start_i + dram_chunk, dram_to_load);
-                    if (start_i >= end_i) continue;
+            int start_layer = to_load / n_experts_;
+            int end_layer = (to_load + dram_to_load - 1) / n_experts_;
+            LOG_INFO("Preloading %d/%d experts into DRAM L2 cache (layers %d..%d)...",
+                     dram_to_load, dram_cache_capacity_, start_layer, end_layer);
+            std::vector<std::thread> dram_workers;
+            int dram_chunk = (dram_to_load + n_threads - 1) / n_threads;
+            for (int t = 0; t < n_threads; t++) {
+                int start_i = t * dram_chunk;
+                int end_i = std::min(start_i + dram_chunk, dram_to_load);
+                if (start_i >= end_i) continue;
 
-                    dram_workers.emplace_back([this, start_i, end_i, to_load]() {
-                        for (int i = start_i; i < end_i; i++) {
-                            int expert_global_idx = to_load + i;
-                            int l = expert_global_idx / n_experts_;
-                            int e = expert_global_idx % n_experts_;
-                            int64_t file_offset = (int64_t)expert_global_idx * expert_block_size_;
-                            void* dst = dram_cache_slots_[i].gpu_data;
-                            int64_t bytes_read = expert_file_.pread_exact(dst, expert_block_size_, file_offset);
-                            if (bytes_read == expert_block_size_) {
-                                dram_cache_slots_[i].layer_id = l;
-                                dram_cache_slots_[i].expert_id = e;
-                                dram_cache_slots_[i].last_used = 1;
-                            }
+                dram_workers.emplace_back([this, start_i, end_i, to_load]() {
+                    for (int i = start_i; i < end_i; i++) {
+                        int expert_global_idx = to_load + i;
+                        int l = expert_global_idx / n_experts_;
+                        int e = expert_global_idx % n_experts_;
+                        int64_t file_offset = (int64_t)expert_global_idx * expert_block_size_;
+                        void* dst = dram_cache_slots_[i].gpu_data;
+                        int64_t bytes_read = expert_file_.pread_exact(dst, expert_block_size_, file_offset);
+                        if (bytes_read == expert_block_size_) {
+                            dram_cache_slots_[i].layer_id = l;
+                            dram_cache_slots_[i].expert_id = e;
+                            dram_cache_slots_[i].last_used = 1;
                         }
-                    });
-                }
-                for (auto& w : dram_workers) {
-                    w.join();
-                }
-
-                for (int i = 0; i < dram_to_load; i++) {
-                    if (dram_cache_slots_[i].layer_id >= 0) {
-                        int64_t key = (int64_t)dram_cache_slots_[i].layer_id * n_experts_ + dram_cache_slots_[i].expert_id;
-                        dram_key_to_slot_[key] = i;
                     }
+                });
+            }
+            for (auto& w : dram_workers) {
+                w.join();
+            }
+
+            for (int i = 0; i < dram_to_load; i++) {
+                if (dram_cache_slots_[i].layer_id >= 0) {
+                    int64_t key = (int64_t)dram_cache_slots_[i].layer_id * n_experts_ + dram_cache_slots_[i].expert_id;
+                    dram_key_to_slot_[key] = i;
                 }
             }
         }
 
         auto elapsed = std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now() - start).count();
-        LOG_INFO("All %d experts preloaded in %.2f seconds (%.2f GB/s)",
-                 to_load, elapsed / 1000.0,
-                 ((double)to_load * expert_block_size_) / (elapsed / 1000.0 * 1024.0 * 1024.0 * 1024.0));
-
-        // Copy flat pointer table to GPU for GPU-native kernel execution
-        flat_vram_ptrs_gpu_.alloc(flat_vram_ptrs_.size() * sizeof(void*));
-        CUDA_CHECK(cudaMemcpy(flat_vram_ptrs_gpu_.data, flat_vram_ptrs_.data(),
-                               flat_vram_ptrs_.size() * sizeof(void*), cudaMemcpyHostToDevice));
+        LOG_INFO("Preload completed in %.2f seconds", elapsed / 1000.0);
         return true;
     }
 
@@ -1137,12 +1209,17 @@ public:
     bool dbg_head_ = true;
     int dbg_sample_count_ = 0;
 
-    cudaStream_t main_stream_;
-    cudaStream_t side_stream_;
-    cudaEvent_t side_event_;
-    cudaEvent_t main_event_;
-    cudaStream_t expert_streams_[32];
-    cudaEvent_t expert_events_[32];
+    cudaStream_t main_stream_ = nullptr;
+    cudaStream_t side_stream_ = nullptr;
+    cudaStream_t dma_stream_ = nullptr;
+    cudaEvent_t side_event_ = nullptr;
+    cudaEvent_t main_event_ = nullptr;
+    cudaEvent_t dma_event_ = nullptr;
+    cudaStream_t expert_streams_[32] = {nullptr};
+    cudaEvent_t expert_events_[32] = {nullptr};
+
+    void* streaming_slots_gpu_[2][32] = {{nullptr}};
+    int streaming_buf_idx_ = 0;
 
     cublasHandle_t cublas_handle_ = nullptr;
     ExpertLoader expert_loader_;
@@ -1337,9 +1414,25 @@ public:
             cudaEventDestroy(side_event_);
             side_event_ = nullptr;
         }
+        if (dma_event_) {
+            cudaEventDestroy(dma_event_);
+            dma_event_ = nullptr;
+        }
         if (side_stream_) {
             cudaStreamDestroy(side_stream_);
             side_stream_ = nullptr;
+        }
+        if (dma_stream_) {
+            cudaStreamDestroy(dma_stream_);
+            dma_stream_ = nullptr;
+        }
+        for (int b = 0; b < 2; b++) {
+            for (int k = 0; k < 32; k++) {
+                if (streaming_slots_gpu_[b][k]) {
+                    cudaFree(streaming_slots_gpu_[b][k]);
+                    streaming_slots_gpu_[b][k] = nullptr;
+                }
+            }
         }
     }
 
@@ -1379,8 +1472,10 @@ public:
         // Init CUDA
         CUDA_CHECK(cudaStreamCreate(&main_stream_));
         CUDA_CHECK(cudaStreamCreate(&side_stream_));
+        CUDA_CHECK(cudaStreamCreate(&dma_stream_));
         CUDA_CHECK(cudaEventCreateWithFlags(&side_event_, cudaEventDisableTiming));
         CUDA_CHECK(cudaEventCreateWithFlags(&main_event_, cudaEventDisableTiming));
+        CUDA_CHECK(cudaEventCreateWithFlags(&dma_event_, cudaEventDisableTiming));
         for (int i = 0; i < 32; i++) {
             CUDA_CHECK(cudaStreamCreate(&expert_streams_[i]));
             CUDA_CHECK(cudaEventCreate(&expert_events_[i]));
@@ -1461,6 +1556,13 @@ public:
             if (!expert_loader_.init(expert_full, expert_block_size,
                                       expert_n_layers, expert_n_experts,
                                       cache_budget, dram_cache_budget)) return false;
+
+            // Allocate double-buffered streaming slots in VRAM for offloading
+            for (int b = 0; b < 2; b++) {
+                for (int k = 0; k < 32; k++) {
+                    CUDA_CHECK(cudaMalloc(&streaming_slots_gpu_[b][k], expert_loader_.expert_block_size_));
+                }
+            }
 
             // Preload experts into VRAM
             expert_loader_.preload_all();
@@ -2977,7 +3079,6 @@ private:
         if (expert_loader_.all_resident(cfg_.num_hidden_layers)) {
             flat_ptrs = expert_loader_.flat_vram_ptrs_gpu();
         } else {
-            // Dynamic fetch path for offload / 24GB VRAM
             CUDA_CHECK(cudaMemcpyAsync(topk_ids_host_, buf_topk_idx_.i32(),
                                        top_k * sizeof(int32_t), cudaMemcpyDeviceToHost, main_stream_));
             CUDA_CHECK(cudaStreamSynchronize(main_stream_));
@@ -3019,8 +3120,8 @@ private:
                 }
             }
 
-            CUDA_CHECK(cudaMemcpy(buf_active_expert_ptrs_.data, active_expert_ptrs_host_,
-                                  top_k * sizeof(void*), cudaMemcpyHostToDevice));
+            CUDA_CHECK(cudaMemcpyAsync(buf_active_expert_ptrs_.data, active_expert_ptrs_host_,
+                                       top_k * sizeof(void*), cudaMemcpyHostToDevice, main_stream_));
         }
 
         // 5. Launch 6 routed experts
