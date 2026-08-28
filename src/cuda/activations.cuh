@@ -525,6 +525,21 @@ void mla_attention_device_len_cuda(
     float scale,
     cudaStream_t stream = 0);
 
+void mla_attention_fused_cuda(
+    const __nv_bfloat16* raw_q,
+    const __nv_bfloat16* kv,
+    const float* attn_sink,
+    __nv_bfloat16* out,
+    const int32_t* d_cache_len,
+    const int32_t* d_position,
+    const float* freq_table,
+    int max_cache_len,
+    int head_dim,
+    int rope_dim,
+    float scale,
+    float q_norm_eps,
+    cudaStream_t stream = 0);
+
 void accumulate_expert_imatrix_cuda(
     float* gate_accum,             // [n_experts, hidden_dim]
     float* down_accum,             // [n_experts, moe_intermediate]

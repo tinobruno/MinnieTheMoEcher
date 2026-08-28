@@ -3072,15 +3072,6 @@ private:
                              lw.wq_b_w.u8(), lw.wq_b_s.u8(), 128, main_stream_);
         }
         
-        // Per-head Q normalization (DeepseekV4UnweightedRMSNorm)
-        rms_norm_unweighted_batched_cuda(buf_q_.bf16(), buf_q_.bf16(),
-                                         n_heads, head_dim_val, cfg_.rms_norm_eps,
-                                         main_stream_);
-        
-        // Apply RoPE to last rope_dim elements of each Q head
-        rope_device_pos_cuda(buf_q_.bf16(), n_heads, head_dim_val, rope_dim,
-                             buf_input_pos_.i32(), layer_rope_freqs, false, main_stream_);
-
         // Synchronize main_stream_ with side_stream_ before compressor and attention
         CUDA_CHECK(cudaStreamWaitEvent(main_stream_, side_event_, 0));
 
@@ -3105,14 +3096,13 @@ private:
             main_stream_);
 
         int max_combined = window + cfg_.max_compressed_entries;
-        mla_attention_device_len_cuda(
+        // Fused Flash-MLA: Q-Norm + Forward RoPE + Attention Dot Products + Softmax + Value Reduction + Inverse RoPE
+        mla_attention_fused_cuda(
             buf_q_.bf16(), buf_combined_kv_.bf16(), lw.attn_sink.f32(),
-            buf_attn_out_.bf16(), lw.d_attn_cache_len.i32(), max_combined, head_dim_val, scale, main_stream_
+            buf_attn_out_.bf16(), lw.d_attn_cache_len.i32(), buf_input_pos_.i32(),
+            layer_rope_freqs, max_combined, head_dim_val, rope_dim, scale,
+            cfg_.rms_norm_eps, main_stream_
         );
-
-        // Inverse RoPE on attention output
-        rope_device_pos_cuda(buf_attn_out_.bf16(), n_heads, head_dim_val, rope_dim,
-                             buf_input_pos_.i32(), layer_rope_freqs, true, main_stream_);
 
         // ── Output projection (grouped low-rank MLA) ─────────────────────
         // Attention output: [n_heads * head_dim] = [32768]

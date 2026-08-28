@@ -3303,6 +3303,228 @@ void mla_attention_device_len_cuda(
         q, kv, attn_sink, out, d_cache_len, max_cache_len, head_dim, scale);
 }
 
+// ════════════════════════════════════════════════════════════════════════════════
+//  Fused Flash-MLA Attention Kernel
+//  Fuses:
+//   1. Raw Q Load + Unweighted RMSNorm (in SM shared memory)
+//   2. Forward RoPE (in SM shared memory)
+//   3. Q @ KV Attention Dot Products + Scaling
+//   4. Online Flash Softmax (Max + Exp + Sum Reductions + Attention Sink)
+//   5. Weighted Value Reduction (scores @ KV) into SM shared memory
+//   6. Inverse RoPE Rotation on output (in SM shared memory) + Output Store
+// ════════════════════════════════════════════════════════════════════════════════
+
+__global__ void mla_attention_fused_kernel(
+    const __nv_bfloat16* __restrict__ raw_q,
+    const __nv_bfloat16* __restrict__ kv,
+    const float* __restrict__ attn_sink,
+    __nv_bfloat16* __restrict__ out,
+    const int32_t* __restrict__ d_cache_len,
+    const int32_t* __restrict__ d_position,
+    const float* __restrict__ freq_table,
+    int max_cache_len,
+    int head_dim,
+    int rope_dim,
+    float scale,
+    float q_norm_eps)
+{
+    int h = blockIdx.x;
+    int tid = threadIdx.x;
+    int n_threads = blockDim.x;
+
+    extern __shared__ float s_mem[];
+    float* scores = s_mem;
+
+    __shared__ float s_q[512];
+    __shared__ float s_out[512];
+    __shared__ float s_red[32];
+
+    // ── Step 1: Load raw Q & compute unweighted RMSNorm in shared memory ──────
+    float local_sum_sq = 0.0f;
+    for (int d = tid; d < head_dim; d += n_threads) {
+        float val = bf16_to_float(raw_q[h * head_dim + d]);
+        s_q[d] = val;
+        local_sum_sq += val * val;
+    }
+
+    // Warp-level sum reduction for RMSNorm
+    float warp_sum_sq = local_sum_sq;
+    #pragma unroll
+    for (int offset = 16; offset > 0; offset /= 2) {
+        warp_sum_sq += __shfl_down_sync(0xffffffff, warp_sum_sq, offset);
+    }
+    int lane = tid & 31;
+    int warp = tid >> 5;
+    if (lane == 0) s_red[warp] = warp_sum_sq;
+    __syncthreads();
+
+    float block_sum_sq = (tid < (n_threads >> 5)) ? s_red[tid] : 0.0f;
+    #pragma unroll
+    for (int offset = 16; offset > 0; offset /= 2) {
+        block_sum_sq += __shfl_down_sync(0xffffffff, block_sum_sq, offset);
+    }
+    if (tid == 0) s_red[0] = rsqrtf(block_sum_sq / (float)head_dim + q_norm_eps);
+    __syncthreads();
+
+    float rsqrt_val = s_red[0];
+    for (int d = tid; d < head_dim; d += n_threads) {
+        s_q[d] *= rsqrt_val;
+    }
+    __syncthreads();
+
+    // ── Step 2: Apply forward RoPE rotation directly in s_q ───────────────────
+    int pos = (d_position != nullptr) ? *d_position : 0;
+    int half_rope = rope_dim / 2;
+    if (tid < half_rope) {
+        int pair_id = tid;
+        int base_idx = (head_dim - rope_dim) + 2 * pair_id;
+        float x0 = s_q[base_idx];
+        float x1 = s_q[base_idx + 1];
+
+        float cos_val = freq_table[pos * half_rope * 2 + pair_id * 2];
+        float sin_val = freq_table[pos * half_rope * 2 + pair_id * 2 + 1];
+
+        s_q[base_idx]     = x0 * cos_val - x1 * sin_val;
+        s_q[base_idx + 1] = x0 * sin_val + x1 * cos_val;
+    }
+    __syncthreads();
+
+    // ── Step 3: Attention scores Q @ KV.T ────────────────────────────────────
+    int cache_len = (d_cache_len != nullptr) ? *d_cache_len : max_cache_len;
+    if (cache_len > max_cache_len) cache_len = max_cache_len;
+    if (cache_len < 1) cache_len = 1;
+
+    for (int t = tid; t < cache_len; t += n_threads) {
+        const __nv_bfloat16* kv_t = kv + (size_t)t * head_dim;
+        float dot = 0.0f;
+        #pragma unroll 4
+        for (int d = 0; d < head_dim; d++) {
+            dot += s_q[d] * bf16_to_float(kv_t[d]);
+        }
+        scores[t] = dot * scale;
+    }
+    __syncthreads();
+
+    // ── Step 4: Online Softmax Max + Exp + Sum ───────────────────────────────
+    float local_max = -1e38f;
+    for (int t = tid; t < cache_len; t += n_threads) {
+        local_max = fmaxf(local_max, scores[t]);
+    }
+    if (attn_sink != nullptr) {
+        local_max = fmaxf(local_max, attn_sink[h]);
+    }
+
+    float warp_max = local_max;
+    #pragma unroll
+    for (int offset = 16; offset > 0; offset /= 2) {
+        warp_max = fmaxf(warp_max, __shfl_down_sync(0xffffffff, warp_max, offset));
+    }
+    if (lane == 0) s_red[warp] = warp_max;
+    __syncthreads();
+
+    float block_max = (tid < (n_threads >> 5)) ? s_red[tid] : -1e38f;
+    #pragma unroll
+    for (int offset = 16; offset > 0; offset /= 2) {
+        block_max = fmaxf(block_max, __shfl_down_sync(0xffffffff, block_max, offset));
+    }
+    if (tid == 0) s_red[0] = block_max;
+    __syncthreads();
+    block_max = s_red[0];
+
+    float local_sum = 0.0f;
+    for (int t = tid; t < cache_len; t += n_threads) {
+        float e = expf(scores[t] - block_max);
+        scores[t] = e;
+        local_sum += e;
+    }
+    if (tid == 0 && attn_sink != nullptr) {
+        local_sum += expf(attn_sink[h] - block_max);
+    }
+
+    float warp_sum = local_sum;
+    #pragma unroll
+    for (int offset = 16; offset > 0; offset /= 2) {
+        warp_sum += __shfl_down_sync(0xffffffff, warp_sum, offset);
+    }
+    if (lane == 0) s_red[warp] = warp_sum;
+    __syncthreads();
+
+    float block_sum = (tid < (n_threads >> 5)) ? s_red[tid] : 0.0f;
+    #pragma unroll
+    for (int offset = 16; offset > 0; offset /= 2) {
+        block_sum += __shfl_down_sync(0xffffffff, block_sum, offset);
+    }
+    if (tid == 0) s_red[0] = 1.0f / block_sum;
+    __syncthreads();
+    float inv_sum = s_red[0];
+
+    for (int t = tid; t < cache_len; t += n_threads) {
+        scores[t] *= inv_sum;
+    }
+    __syncthreads();
+
+    // ── Step 5: Weighted Value Reduction scores @ KV into s_out ──────────────
+    for (int d = tid; d < head_dim; d += n_threads) {
+        float v = 0.0f;
+        #pragma unroll 4
+        for (int t = 0; t < cache_len; t++) {
+            v += scores[t] * bf16_to_float(kv[(size_t)t * head_dim + d]);
+        }
+        s_out[d] = v;
+    }
+    __syncthreads();
+
+    // ── Step 6: Inverse RoPE Rotation & Output Store ─────────────────────────
+    if (tid < half_rope) {
+        int pair_id = tid;
+        int base_idx = (head_dim - rope_dim) + 2 * pair_id;
+        float y0 = s_out[base_idx];
+        float y1 = s_out[base_idx + 1];
+
+        float cos_val = freq_table[pos * half_rope * 2 + pair_id * 2];
+        float sin_val = -freq_table[pos * half_rope * 2 + pair_id * 2 + 1]; // negative for inverse
+
+        s_out[base_idx]     = y0 * cos_val - y1 * sin_val;
+        s_out[base_idx + 1] = y0 * sin_val + y1 * cos_val;
+    }
+    __syncthreads();
+
+    for (int d = tid; d < head_dim; d += n_threads) {
+        out[h * head_dim + d] = float_to_bf16(s_out[d]);
+    }
+}
+
+void mla_attention_fused_cuda(
+    const __nv_bfloat16* raw_q,
+    const __nv_bfloat16* kv,
+    const float* attn_sink,
+    __nv_bfloat16* out,
+    const int32_t* d_cache_len,
+    const int32_t* d_position,
+    const float* freq_table,
+    int max_cache_len,
+    int head_dim,
+    int rope_dim,
+    float scale,
+    float q_norm_eps,
+    cudaStream_t stream)
+{
+    int n_threads = 256;
+    size_t smem_bytes = max_cache_len * sizeof(float);
+    if (smem_bytes > 49152) {
+        static bool s_smem_fused_configured = false;
+        if (!s_smem_fused_configured) {
+            cudaFuncSetAttribute(mla_attention_fused_kernel, cudaFuncAttributeMaxDynamicSharedMemorySize, 98304);
+            s_smem_fused_configured = true;
+        }
+    }
+    int n_heads = 64;
+    mla_attention_fused_kernel<<<n_heads, n_threads, smem_bytes, stream>>>(
+        raw_q, kv, attn_sink, out,
+        d_cache_len, d_position, freq_table,
+        max_cache_len, head_dim, rope_dim, scale, q_norm_eps);
+}
+
 
 __global__ void accumulate_expert_imatrix_kernel(
     float* __restrict__ gate_accum,
