@@ -1488,6 +1488,19 @@ public:
         CUBLAS_CHECK(cublasSetStream(cublas_handle_, main_stream_));
         cublasSetMathMode(cublas_handle_, CUBLAS_DEFAULT_MATH);
 
+        // ── Hardware Persistent L2 Cache Configuration ────────────────────────────
+        cudaDeviceProp prop;
+        if (cudaGetDeviceProperties(&prop, 0) == cudaSuccess) {
+            size_t max_persisting_l2 = prop.persistingL2CacheMaxSize;
+            if (max_persisting_l2 > 0) {
+                size_t l2_limit = (max_persisting_l2 * 3) / 4; // Use 75% for persistent window
+                cudaDeviceSetLimit(cudaLimitPersistingL2CacheSize, l2_limit);
+                LOG_INFO("Hardware: %s (Compute %d.%d)", prop.name, prop.major, prop.minor);
+                LOG_INFO("Persistent L2 Cache configured: %.1f MB / %.1f MB",
+                         l2_limit / (1024.0 * 1024.0), max_persisting_l2 / (1024.0 * 1024.0));
+            }
+        }
+
         expert_pool_ = std::make_unique<ThreadPool>(16);
 
         // Determine available VRAM for expert cache
@@ -1606,10 +1619,54 @@ public:
             LOG_INFO("No compress_ratios found, using full window for all layers");
         }
 
+        apply_l2_cache_persistence();
         init_cuda_graph();
 
         LOG_INFO("Model loaded successfully");
         return true;
+    }
+
+    void apply_l2_cache_persistence() {
+        cudaDeviceProp prop;
+        if (cudaGetDeviceProperties(&prop, 0) != cudaSuccess || prop.persistingL2CacheMaxSize == 0) {
+            return;
+        }
+
+        auto pin_buffer = [this](void* ptr, size_t num_bytes) {
+            if (!ptr || num_bytes == 0) return;
+            cudaStreamAttrValue attr;
+            std::memset(&attr, 0, sizeof(attr));
+            attr.accessPolicyWindow.base_ptr = ptr;
+            attr.accessPolicyWindow.num_bytes = num_bytes;
+            attr.accessPolicyWindow.hitRatio = 1.0f;
+            attr.accessPolicyWindow.hitProp = cudaAccessPropertyPersisting;
+            attr.accessPolicyWindow.missProp = cudaAccessPropertyStreaming;
+
+            cudaStreamSetAttribute(main_stream_, cudaStreamAttributeAccessPolicyWindow, &attr);
+            cudaStreamSetAttribute(side_stream_, cudaStreamAttributeAccessPolicyWindow, &attr);
+        };
+
+        size_t total_pinned_bytes = 0;
+        for (auto& lw : layers_) {
+            pin_buffer(lw.kv_cache.data, lw.kv_cache.size_bytes);
+            pin_buffer(lw.comp_kv_cache.data, lw.comp_kv_cache.size_bytes);
+            pin_buffer(lw.attn_norm_w.data, lw.attn_norm_w.size_bytes);
+            pin_buffer(lw.ffn_norm_w.data, lw.ffn_norm_w.size_bytes);
+            pin_buffer(lw.q_norm_w.data, lw.q_norm_w.size_bytes);
+            pin_buffer(lw.kv_norm_w.data, lw.kv_norm_w.size_bytes);
+            pin_buffer(lw.attn_sink.data, lw.attn_sink.size_bytes);
+            pin_buffer(lw.gate_bias.data, lw.gate_bias.size_bytes);
+
+            total_pinned_bytes += lw.kv_cache.size_bytes + lw.comp_kv_cache.size_bytes +
+                                  lw.attn_norm_w.size_bytes + lw.ffn_norm_w.size_bytes +
+                                  lw.q_norm_w.size_bytes + lw.kv_norm_w.size_bytes +
+                                  lw.attn_sink.size_bytes + lw.gate_bias.size_bytes;
+        }
+        pin_buffer(norm_weight_.data, norm_weight_.size_bytes);
+        total_pinned_bytes += norm_weight_.size_bytes;
+
+        LOG_INFO("Pinned %.2f MB of active KV caches & norms into Persistent L2 Cache",
+                 total_pinned_bytes / (1024.0 * 1024.0));
     }
 
     void init_cuda_graph() {
