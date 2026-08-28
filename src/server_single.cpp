@@ -1632,8 +1632,13 @@ public:
             return;
         }
 
-        auto pin_buffer = [this](void* ptr, size_t num_bytes) {
-            if (!ptr || num_bytes == 0) return;
+        size_t l2_limit = (prop.persistingL2CacheMaxSize * 3) / 4;
+        size_t total_pinned_bytes = 0;
+
+        auto pin_buffer = [this, l2_limit, &total_pinned_bytes](void* ptr, size_t num_bytes) -> bool {
+            if (!ptr || num_bytes == 0) return false;
+            if (total_pinned_bytes + num_bytes > l2_limit) return false;
+
             cudaStreamAttrValue attr;
             std::memset(&attr, 0, sizeof(attr));
             attr.accessPolicyWindow.base_ptr = ptr;
@@ -1644,29 +1649,35 @@ public:
 
             cudaStreamSetAttribute(main_stream_, cudaStreamAttributeAccessPolicyWindow, &attr);
             cudaStreamSetAttribute(side_stream_, cudaStreamAttributeAccessPolicyWindow, &attr);
+            total_pinned_bytes += num_bytes;
+            return true;
         };
 
-        size_t total_pinned_bytes = 0;
+        // Priority 1: High-frequency normalization weights, attention sinks, router biases & norms
+        pin_buffer(norm_weight_.data, norm_weight_.size_bytes);
         for (auto& lw : layers_) {
-            pin_buffer(lw.kv_cache.data, lw.kv_cache.size_bytes);
-            pin_buffer(lw.comp_kv_cache.data, lw.comp_kv_cache.size_bytes);
             pin_buffer(lw.attn_norm_w.data, lw.attn_norm_w.size_bytes);
             pin_buffer(lw.ffn_norm_w.data, lw.ffn_norm_w.size_bytes);
             pin_buffer(lw.q_norm_w.data, lw.q_norm_w.size_bytes);
             pin_buffer(lw.kv_norm_w.data, lw.kv_norm_w.size_bytes);
             pin_buffer(lw.attn_sink.data, lw.attn_sink.size_bytes);
             pin_buffer(lw.gate_bias.data, lw.gate_bias.size_bytes);
-
-            total_pinned_bytes += lw.kv_cache.size_bytes + lw.comp_kv_cache.size_bytes +
-                                  lw.attn_norm_w.size_bytes + lw.ffn_norm_w.size_bytes +
-                                  lw.q_norm_w.size_bytes + lw.kv_norm_w.size_bytes +
-                                  lw.attn_sink.size_bytes + lw.gate_bias.size_bytes;
         }
-        pin_buffer(norm_weight_.data, norm_weight_.size_bytes);
-        total_pinned_bytes += norm_weight_.size_bytes;
 
-        LOG_INFO("Pinned %.2f MB of active KV caches & norms into Persistent L2 Cache",
-                 total_pinned_bytes / (1024.0 * 1024.0));
+        // Priority 2: Hot active sliding window KV caches (128 tokens per layer = 5.5 MB total across all 43 layers)
+        for (auto& lw : layers_) {
+            pin_buffer(lw.kv_cache.data, lw.kv_cache.size_bytes);
+        }
+
+        // Priority 3: Compressed KV caches (up to remaining persistent budget)
+        for (auto& lw : layers_) {
+            if (!pin_buffer(lw.comp_kv_cache.data, lw.comp_kv_cache.size_bytes)) {
+                break;
+            }
+        }
+
+        LOG_INFO("Persistent L2 Cache: Pinned %.2f MB / %.2f MB budget (zero thrashing)",
+                 total_pinned_bytes / (1024.0 * 1024.0), l2_limit / (1024.0 * 1024.0));
     }
 
     void init_cuda_graph() {
