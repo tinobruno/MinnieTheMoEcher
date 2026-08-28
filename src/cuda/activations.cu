@@ -1230,6 +1230,28 @@ __device__ inline float e8m0_to_float_v2(uint8_t val) {
     return __uint_as_float((uint32_t)val << 23);
 }
 
+// ── Hardware Asynchronous Copy (cp.async) Primitives ──────────────────────────
+__device__ __forceinline__ void cp_async_16_bytes(void* smem_dst, const void* gmem_src) {
+#if defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 800)
+    uint32_t smem_addr = __cvta_generic_to_shared(smem_dst);
+    asm volatile("cp.async.ca.shared.global [%0], [%1], 16;\n" : : "r"(smem_addr), "l"(gmem_src));
+#else
+    *(uint4*)smem_dst = *(const uint4*)gmem_src;
+#endif
+}
+
+__device__ __forceinline__ void cp_async_commit_group() {
+#if defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 800)
+    asm volatile("cp.async.commit_group;\n" ::);
+#endif
+}
+
+__device__ __forceinline__ void cp_async_wait_all() {
+#if defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 800)
+    asm volatile("cp.async.wait_group 0;\n" ::);
+#endif
+}
+
 __global__ void gemv_fp8_kernel(
     __nv_bfloat16* __restrict__ out,
     const __nv_bfloat16* __restrict__ vec,
@@ -1238,8 +1260,17 @@ __global__ void gemv_fp8_kernel(
     int N, int K, int block_size)
 {
     __shared__ float s_fp8_lut[256];
+    __shared__ __nv_bfloat16 s_vec[2][256]; // Double-buffered vector cache (1 KB)
+
     int tid = threadIdx.y * 32 + threadIdx.x;
     if (tid < 256) s_fp8_lut[tid] = fp8_e4m3_to_float_v2(tid);
+
+    // Pipeline prologue: prefetch first 256 elements of vec into s_vec[0]
+    if (tid < 32) {
+        cp_async_16_bytes((uint4*)s_vec[0] + tid, (const uint4*)vec + tid);
+    }
+    cp_async_commit_group();
+    cp_async_wait_all();
     __syncthreads();
 
     int row = blockIdx.x * blockDim.y + threadIdx.y;
@@ -1251,16 +1282,27 @@ __global__ void gemv_fp8_kernel(
     int br = row / block_size;
 
     const uint2* w_vec8 = reinterpret_cast<const uint2*>(&weight[(size_t)row * K]);
-    const uint4* a_vec4 = reinterpret_cast<const uint4*>(vec);
 
-    int n_chunks = K / 8;
-    for (int chunk = lane; chunk < n_chunks; chunk += 32) {
+    int n_tiles = K / 256;
+    for (int t = 0; t < n_tiles; t++) {
+        int curr_stage = t & 1;
+        int next_stage = (t + 1) & 1;
+
+        // Asynchronously prefetch next tile of input vector
+        if (t + 1 < n_tiles && tid < 32) {
+            cp_async_16_bytes((uint4*)s_vec[next_stage] + tid,
+                              (const uint4*)(vec + ((t + 1) << 8)) + tid);
+            cp_async_commit_group();
+        }
+
+        int chunk = (t << 5) + lane;
         int logical_col = chunk * 8;
         int bc = logical_col / block_size;
         float s_val = e8m0_to_float_v2(scale[br * scale_cols + bc]);
 
         uint2 w8 = w_vec8[chunk];
-        uint4 a8 = a_vec4[chunk];
+        const uint4* s_a_vec4 = reinterpret_cast<const uint4*>(s_vec[curr_stage]);
+        uint4 a8 = s_a_vec4[lane];
 
         float2 f0 = to_float2_bf162(*reinterpret_cast<const __nv_bfloat162*>(&a8.x));
         float2 f1 = to_float2_bf162(*reinterpret_cast<const __nv_bfloat162*>(&a8.y));
@@ -1279,7 +1321,13 @@ __global__ void gemv_fp8_kernel(
         chunk_sum += s_fp8_lut[(w8.y >> 24) & 0xFF] * f3.y;
 
         sum += chunk_sum * s_val;
+
+        if (t + 1 < n_tiles) {
+            cp_async_wait_all();
+            __syncthreads();
+        }
     }
+
     #pragma unroll
     for (int offset = 16; offset > 0; offset /= 2)
         sum += __shfl_down_sync(0xffffffff, sum, offset);
@@ -1305,11 +1353,22 @@ __global__ void gemv_fp8_grouped_kernel(
     int N, int K, int groups, int block_size)
 {
     __shared__ float s_fp8_lut[256];
+    __shared__ __nv_bfloat16 s_vec[2][256]; // Double-buffered vector cache (1 KB)
+
     int tid = threadIdx.y * 32 + threadIdx.x;
     if (tid < 256) s_fp8_lut[tid] = fp8_e4m3_to_float_v2(tid);
-    __syncthreads();
 
     int group = blockIdx.y;
+    const __nv_bfloat16* g_vec = vec + (size_t)group * K;
+
+    // Pipeline prologue: prefetch first 256 elements of g_vec into s_vec[0]
+    if (tid < 32) {
+        cp_async_16_bytes((uint4*)s_vec[0] + tid, (const uint4*)g_vec + tid);
+    }
+    cp_async_commit_group();
+    cp_async_wait_all();
+    __syncthreads();
+
     int row = blockIdx.x * blockDim.y + threadIdx.y;
     if (group >= groups || row >= N) return;
 
@@ -1321,20 +1380,30 @@ __global__ void gemv_fp8_grouped_kernel(
 
     const uint8_t* g_weight = weight + (size_t)group * N * K;
     const uint8_t* g_scale = scale + (size_t)group * scale_rows_per_group * scale_cols;
-    const __nv_bfloat16* g_vec = vec + (size_t)group * K;
     __nv_bfloat16* g_out = out + (size_t)group * N;
 
     const uint2* w_vec8 = reinterpret_cast<const uint2*>(&g_weight[(size_t)row * K]);
-    const uint4* a_vec4 = reinterpret_cast<const uint4*>(g_vec);
 
-    int n_chunks = K / 8;
-    for (int chunk = lane; chunk < n_chunks; chunk += 32) {
+    int n_tiles = K / 256;
+    for (int t = 0; t < n_tiles; t++) {
+        int curr_stage = t & 1;
+        int next_stage = (t + 1) & 1;
+
+        // Asynchronously prefetch next tile of input vector
+        if (t + 1 < n_tiles && tid < 32) {
+            cp_async_16_bytes((uint4*)s_vec[next_stage] + tid,
+                              (const uint4*)(g_vec + ((t + 1) << 8)) + tid);
+            cp_async_commit_group();
+        }
+
+        int chunk = (t << 5) + lane;
         int logical_col = chunk * 8;
         int bc = logical_col / block_size;
         float s_val = e8m0_to_float_v2(g_scale[br * scale_cols + bc]);
 
         uint2 w8 = w_vec8[chunk];
-        uint4 a8 = a_vec4[chunk];
+        const uint4* s_a_vec4 = reinterpret_cast<const uint4*>(s_vec[curr_stage]);
+        uint4 a8 = s_a_vec4[lane];
 
         float2 f0 = to_float2_bf162(*reinterpret_cast<const __nv_bfloat162*>(&a8.x));
         float2 f1 = to_float2_bf162(*reinterpret_cast<const __nv_bfloat162*>(&a8.y));
@@ -1353,6 +1422,11 @@ __global__ void gemv_fp8_grouped_kernel(
         chunk_sum += s_fp8_lut[(w8.y >> 24) & 0xFF] * f3.y;
 
         sum += chunk_sum * s_val;
+
+        if (t + 1 < n_tiles) {
+            cp_async_wait_all();
+            __syncthreads();
+        }
     }
 
     #pragma unroll
@@ -2676,28 +2750,6 @@ void populate_active_expert_ptrs_cuda(
 {
     populate_active_expert_ptrs_kernel<<<1, top_k, 0, stream>>>(
         active_ptrs, topk_ids, flat_expert_ptrs, layer_id, n_experts, top_k);
-}
-
-// ── Hardware Asynchronous Copy (cp.async) Primitives ──────────────────────────
-__device__ __forceinline__ void cp_async_16_bytes(void* smem_dst, const void* gmem_src) {
-#if defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 800)
-    uint32_t smem_addr = __cvta_generic_to_shared(smem_dst);
-    asm volatile("cp.async.ca.shared.global [%0], [%1], 16;\n" : : "r"(smem_addr), "l"(gmem_src));
-#else
-    *(uint4*)smem_dst = *(const uint4*)gmem_src;
-#endif
-}
-
-__device__ __forceinline__ void cp_async_commit_group() {
-#if defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 800)
-    asm volatile("cp.async.commit_group;\n" ::);
-#endif
-}
-
-__device__ __forceinline__ void cp_async_wait_all() {
-#if defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 800)
-    asm volatile("cp.async.wait_group 0;\n" ::);
-#endif
 }
 
 // ── Batched All-6-Experts IQ2_XXS SwiGLU Fused Kernel ────────────────────────
