@@ -108,12 +108,8 @@ void gemv_fp8_grouped_cuda(
     cudaStream_t stream = 0);
 
 void gemv_hc_pre_norm_cuda(
-    float* mixes,
-    const __nv_bfloat16* hc_state,
-    const float* hc_fn,
-    int mix_size, int hc_dim,
-    float eps,
-    cudaStream_t stream = 0);
+    float* mixes, const __nv_bfloat16* hc_state,
+    const float* hc_fn, int mix_size, int hc_dim, float eps, cudaStream_t stream = 0);
 
 
 // ── FP4 dequantization ────────────────────────────────────────────────────────
@@ -390,6 +386,10 @@ void gemv_bf16_out_bf16_cuda(
 void hc_pre_weighted_add_cuda(
     __nv_bfloat16* hidden, const __nv_bfloat16* hc_state, const float* pre_weights,
     int dim, int hc, cudaStream_t stream = 0);
+
+void hc_pre_weighted_add_norm_cuda(
+    __nv_bfloat16* out, const __nv_bfloat16* hc_state, const float* pre_weights,
+    const __nv_bfloat16* norm_weight, int dim, int hc, float eps, cudaStream_t stream = 0);
 
 void hc_post_update_cuda(
     __nv_bfloat16* hc_state, const __nv_bfloat16* hidden, const __nv_bfloat16* hc_residual,

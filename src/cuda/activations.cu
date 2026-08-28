@@ -1260,13 +1260,13 @@ __global__ void gemv_fp8_kernel(
     int N, int K, int block_size)
 {
     __shared__ float s_fp8_lut[256];
-    __shared__ __nv_bfloat16 s_vec[2][256]; // Double-buffered vector cache (1 KB)
+    __shared__ __nv_bfloat16 s_vec[2][512]; // Double-buffered 512-element vector cache (2 KB)
 
     int tid = threadIdx.y * 32 + threadIdx.x;
     if (tid < 256) s_fp8_lut[tid] = fp8_e4m3_to_float_v2(tid);
 
-    // Pipeline prologue: prefetch first 256 elements of vec into s_vec[0]
-    if (tid < 32) {
+    // Pipeline prologue: prefetch first 512 elements (1024 bytes) of vec into s_vec[0]
+    if (tid < 64) {
         cp_async_16_bytes((uint4*)s_vec[0] + tid, (const uint4*)vec + tid);
     }
     cp_async_commit_group();
@@ -1281,44 +1281,60 @@ __global__ void gemv_fp8_kernel(
     int scale_cols = (K + block_size - 1) / block_size;
     int br = row / block_size;
 
-    const uint2* w_vec8 = reinterpret_cast<const uint2*>(&weight[(size_t)row * K]);
+    const uint4* w_vec16 = reinterpret_cast<const uint4*>(&weight[(size_t)row * K]);
 
-    int n_tiles = K / 256;
+    int n_tiles = K / 512;
     for (int t = 0; t < n_tiles; t++) {
         int curr_stage = t & 1;
         int next_stage = (t + 1) & 1;
 
-        // Asynchronously prefetch next tile of input vector
-        if (t + 1 < n_tiles && tid < 32) {
+        // Asynchronously prefetch next 512 elements of input vector
+        if (t + 1 < n_tiles && tid < 64) {
             cp_async_16_bytes((uint4*)s_vec[next_stage] + tid,
-                              (const uint4*)(vec + ((t + 1) << 8)) + tid);
+                              (const uint4*)(vec + ((t + 1) << 9)) + tid);
             cp_async_commit_group();
         }
 
         int chunk = (t << 5) + lane;
-        int logical_col = chunk * 8;
+        int logical_col = chunk * 16;
         int bc = logical_col / block_size;
         float s_val = e8m0_to_float_v2(scale[br * scale_cols + bc]);
 
-        uint2 w8 = w_vec8[chunk];
+        uint4 w16 = w_vec16[chunk];
         const uint4* s_a_vec4 = reinterpret_cast<const uint4*>(s_vec[curr_stage]);
-        uint4 a8 = s_a_vec4[lane];
+        uint4 a8_0 = s_a_vec4[(lane << 1)];
+        uint4 a8_1 = s_a_vec4[(lane << 1) + 1];
 
-        float2 f0 = to_float2_bf162(*reinterpret_cast<const __nv_bfloat162*>(&a8.x));
-        float2 f1 = to_float2_bf162(*reinterpret_cast<const __nv_bfloat162*>(&a8.y));
-        float2 f2 = to_float2_bf162(*reinterpret_cast<const __nv_bfloat162*>(&a8.z));
-        float2 f3 = to_float2_bf162(*reinterpret_cast<const __nv_bfloat162*>(&a8.w));
+        float2 f0 = to_float2_bf162(*reinterpret_cast<const __nv_bfloat162*>(&a8_0.x));
+        float2 f1 = to_float2_bf162(*reinterpret_cast<const __nv_bfloat162*>(&a8_0.y));
+        float2 f2 = to_float2_bf162(*reinterpret_cast<const __nv_bfloat162*>(&a8_0.z));
+        float2 f3 = to_float2_bf162(*reinterpret_cast<const __nv_bfloat162*>(&a8_0.w));
+
+        float2 f4 = to_float2_bf162(*reinterpret_cast<const __nv_bfloat162*>(&a8_1.x));
+        float2 f5 = to_float2_bf162(*reinterpret_cast<const __nv_bfloat162*>(&a8_1.y));
+        float2 f6 = to_float2_bf162(*reinterpret_cast<const __nv_bfloat162*>(&a8_1.z));
+        float2 f7 = to_float2_bf162(*reinterpret_cast<const __nv_bfloat162*>(&a8_1.w));
 
         float chunk_sum = 0.0f;
-        chunk_sum += s_fp8_lut[(w8.x) & 0xFF] * f0.x;
-        chunk_sum += s_fp8_lut[(w8.x >> 8) & 0xFF] * f0.y;
-        chunk_sum += s_fp8_lut[(w8.x >> 16) & 0xFF] * f1.x;
-        chunk_sum += s_fp8_lut[(w8.x >> 24) & 0xFF] * f1.y;
+        chunk_sum += s_fp8_lut[(w16.x) & 0xFF] * f0.x;
+        chunk_sum += s_fp8_lut[(w16.x >> 8) & 0xFF] * f0.y;
+        chunk_sum += s_fp8_lut[(w16.x >> 16) & 0xFF] * f1.x;
+        chunk_sum += s_fp8_lut[(w16.x >> 24) & 0xFF] * f1.y;
 
-        chunk_sum += s_fp8_lut[(w8.y) & 0xFF] * f2.x;
-        chunk_sum += s_fp8_lut[(w8.y >> 8) & 0xFF] * f2.y;
-        chunk_sum += s_fp8_lut[(w8.y >> 16) & 0xFF] * f3.x;
-        chunk_sum += s_fp8_lut[(w8.y >> 24) & 0xFF] * f3.y;
+        chunk_sum += s_fp8_lut[(w16.y) & 0xFF] * f2.x;
+        chunk_sum += s_fp8_lut[(w16.y >> 8) & 0xFF] * f2.y;
+        chunk_sum += s_fp8_lut[(w16.y >> 16) & 0xFF] * f3.x;
+        chunk_sum += s_fp8_lut[(w16.y >> 24) & 0xFF] * f3.y;
+
+        chunk_sum += s_fp8_lut[(w16.z) & 0xFF] * f4.x;
+        chunk_sum += s_fp8_lut[(w16.z >> 8) & 0xFF] * f4.y;
+        chunk_sum += s_fp8_lut[(w16.z >> 16) & 0xFF] * f5.x;
+        chunk_sum += s_fp8_lut[(w16.z >> 24) & 0xFF] * f5.y;
+
+        chunk_sum += s_fp8_lut[(w16.w) & 0xFF] * f6.x;
+        chunk_sum += s_fp8_lut[(w16.w >> 8) & 0xFF] * f6.y;
+        chunk_sum += s_fp8_lut[(w16.w >> 16) & 0xFF] * f7.x;
+        chunk_sum += s_fp8_lut[(w16.w >> 24) & 0xFF] * f7.y;
 
         sum += chunk_sum * s_val;
 
@@ -1353,7 +1369,7 @@ __global__ void gemv_fp8_grouped_kernel(
     int N, int K, int groups, int block_size)
 {
     __shared__ float s_fp8_lut[256];
-    __shared__ __nv_bfloat16 s_vec[2][256]; // Double-buffered vector cache (1 KB)
+    __shared__ __nv_bfloat16 s_vec[2][512]; // Double-buffered 512-element vector cache (2 KB)
 
     int tid = threadIdx.y * 32 + threadIdx.x;
     if (tid < 256) s_fp8_lut[tid] = fp8_e4m3_to_float_v2(tid);
@@ -1361,8 +1377,8 @@ __global__ void gemv_fp8_grouped_kernel(
     int group = blockIdx.y;
     const __nv_bfloat16* g_vec = vec + (size_t)group * K;
 
-    // Pipeline prologue: prefetch first 256 elements of g_vec into s_vec[0]
-    if (tid < 32) {
+    // Pipeline prologue: prefetch first 512 elements of g_vec into s_vec[0]
+    if (tid < 64) {
         cp_async_16_bytes((uint4*)s_vec[0] + tid, (const uint4*)g_vec + tid);
     }
     cp_async_commit_group();
@@ -1382,44 +1398,60 @@ __global__ void gemv_fp8_grouped_kernel(
     const uint8_t* g_scale = scale + (size_t)group * scale_rows_per_group * scale_cols;
     __nv_bfloat16* g_out = out + (size_t)group * N;
 
-    const uint2* w_vec8 = reinterpret_cast<const uint2*>(&g_weight[(size_t)row * K]);
+    const uint4* w_vec16 = reinterpret_cast<const uint4*>(&g_weight[(size_t)row * K]);
 
-    int n_tiles = K / 256;
+    int n_tiles = K / 512;
     for (int t = 0; t < n_tiles; t++) {
         int curr_stage = t & 1;
         int next_stage = (t + 1) & 1;
 
-        // Asynchronously prefetch next tile of input vector
-        if (t + 1 < n_tiles && tid < 32) {
+        // Asynchronously prefetch next 512 elements of input vector
+        if (t + 1 < n_tiles && tid < 64) {
             cp_async_16_bytes((uint4*)s_vec[next_stage] + tid,
-                              (const uint4*)(g_vec + ((t + 1) << 8)) + tid);
+                              (const uint4*)(g_vec + ((t + 1) << 9)) + tid);
             cp_async_commit_group();
         }
 
         int chunk = (t << 5) + lane;
-        int logical_col = chunk * 8;
+        int logical_col = chunk * 16;
         int bc = logical_col / block_size;
         float s_val = e8m0_to_float_v2(g_scale[br * scale_cols + bc]);
 
-        uint2 w8 = w_vec8[chunk];
+        uint4 w16 = w_vec16[chunk];
         const uint4* s_a_vec4 = reinterpret_cast<const uint4*>(s_vec[curr_stage]);
-        uint4 a8 = s_a_vec4[lane];
+        uint4 a8_0 = s_a_vec4[(lane << 1)];
+        uint4 a8_1 = s_a_vec4[(lane << 1) + 1];
 
-        float2 f0 = to_float2_bf162(*reinterpret_cast<const __nv_bfloat162*>(&a8.x));
-        float2 f1 = to_float2_bf162(*reinterpret_cast<const __nv_bfloat162*>(&a8.y));
-        float2 f2 = to_float2_bf162(*reinterpret_cast<const __nv_bfloat162*>(&a8.z));
-        float2 f3 = to_float2_bf162(*reinterpret_cast<const __nv_bfloat162*>(&a8.w));
+        float2 f0 = to_float2_bf162(*reinterpret_cast<const __nv_bfloat162*>(&a8_0.x));
+        float2 f1 = to_float2_bf162(*reinterpret_cast<const __nv_bfloat162*>(&a8_0.y));
+        float2 f2 = to_float2_bf162(*reinterpret_cast<const __nv_bfloat162*>(&a8_0.z));
+        float2 f3 = to_float2_bf162(*reinterpret_cast<const __nv_bfloat162*>(&a8_0.w));
+
+        float2 f4 = to_float2_bf162(*reinterpret_cast<const __nv_bfloat162*>(&a8_1.x));
+        float2 f5 = to_float2_bf162(*reinterpret_cast<const __nv_bfloat162*>(&a8_1.y));
+        float2 f6 = to_float2_bf162(*reinterpret_cast<const __nv_bfloat162*>(&a8_1.z));
+        float2 f7 = to_float2_bf162(*reinterpret_cast<const __nv_bfloat162*>(&a8_1.w));
 
         float chunk_sum = 0.0f;
-        chunk_sum += s_fp8_lut[(w8.x) & 0xFF] * f0.x;
-        chunk_sum += s_fp8_lut[(w8.x >> 8) & 0xFF] * f0.y;
-        chunk_sum += s_fp8_lut[(w8.x >> 16) & 0xFF] * f1.x;
-        chunk_sum += s_fp8_lut[(w8.x >> 24) & 0xFF] * f1.y;
+        chunk_sum += s_fp8_lut[(w16.x) & 0xFF] * f0.x;
+        chunk_sum += s_fp8_lut[(w16.x >> 8) & 0xFF] * f0.y;
+        chunk_sum += s_fp8_lut[(w16.x >> 16) & 0xFF] * f1.x;
+        chunk_sum += s_fp8_lut[(w16.x >> 24) & 0xFF] * f1.y;
 
-        chunk_sum += s_fp8_lut[(w8.y) & 0xFF] * f2.x;
-        chunk_sum += s_fp8_lut[(w8.y >> 8) & 0xFF] * f2.y;
-        chunk_sum += s_fp8_lut[(w8.y >> 16) & 0xFF] * f3.x;
-        chunk_sum += s_fp8_lut[(w8.y >> 24) & 0xFF] * f3.y;
+        chunk_sum += s_fp8_lut[(w16.y) & 0xFF] * f2.x;
+        chunk_sum += s_fp8_lut[(w16.y >> 8) & 0xFF] * f2.y;
+        chunk_sum += s_fp8_lut[(w16.y >> 16) & 0xFF] * f3.x;
+        chunk_sum += s_fp8_lut[(w16.y >> 24) & 0xFF] * f3.y;
+
+        chunk_sum += s_fp8_lut[(w16.z) & 0xFF] * f4.x;
+        chunk_sum += s_fp8_lut[(w16.z >> 8) & 0xFF] * f4.y;
+        chunk_sum += s_fp8_lut[(w16.z >> 16) & 0xFF] * f5.x;
+        chunk_sum += s_fp8_lut[(w16.z >> 24) & 0xFF] * f5.y;
+
+        chunk_sum += s_fp8_lut[(w16.w) & 0xFF] * f6.x;
+        chunk_sum += s_fp8_lut[(w16.w >> 8) & 0xFF] * f6.y;
+        chunk_sum += s_fp8_lut[(w16.w >> 16) & 0xFF] * f7.x;
+        chunk_sum += s_fp8_lut[(w16.w >> 24) & 0xFF] * f7.y;
 
         sum += chunk_sum * s_val;
 
@@ -2104,6 +2136,91 @@ void hc_pre_weighted_add_cuda(
     hc_pre_weighted_add_kernel<<<blocks, threads, 0, stream>>>(hidden, hc_state, pre_weights, dim, hc);
 }
 
+// ── Fused HC Pre Weighted Add + RMSNorm Kernel ─────────────────────────────────
+__global__ void hc_pre_weighted_add_norm_kernel(
+    __nv_bfloat16* __restrict__ out,
+    const __nv_bfloat16* __restrict__ hc_state,
+    const float* __restrict__ pre_weights,
+    const __nv_bfloat16* __restrict__ norm_weight,
+    int dim, int hc, float eps)
+{
+    extern __shared__ float sdata[];
+
+    int tid = threadIdx.x;
+    int lane = tid & 31;
+    int warp = tid >> 5;
+
+    float w0 = pre_weights[0];
+    float w1 = pre_weights[1];
+    float w2 = pre_weights[2];
+    float w3 = pre_weights[3];
+
+    const __nv_bfloat16* s0 = hc_state + 0 * dim;
+    const __nv_bfloat16* s1 = hc_state + 1 * dim;
+    const __nv_bfloat16* s2 = hc_state + 2 * dim;
+    const __nv_bfloat16* s3 = hc_state + 3 * dim;
+
+    float reg_y[4];
+    int idx[4];
+    float sum_sq = 0.0f;
+
+    #pragma unroll
+    for (int k = 0; k < 4; k++) {
+        int i = tid + k * blockDim.x;
+        idx[k] = i;
+        if (i < dim) {
+            float f0 = __bfloat162float(s0[i]);
+            float f1 = __bfloat162float(s1[i]);
+            float f2 = __bfloat162float(s2[i]);
+            float f3 = __bfloat162float(s3[i]);
+            float y = w0 * f0 + w1 * f1 + w2 * f2 + w3 * f3;
+            reg_y[k] = y;
+            sum_sq += y * y;
+        } else {
+            reg_y[k] = 0.0f;
+        }
+    }
+
+    // Warp reduction
+    #pragma unroll
+    for (int offset = 16; offset > 0; offset >>= 1)
+        sum_sq += __shfl_down_sync(0xFFFFFFFF, sum_sq, offset);
+
+    if (lane == 0) sdata[warp] = sum_sq;
+    __syncthreads();
+
+    // Final reduction in first warp
+    if (warp == 0) {
+        sum_sq = (lane < (blockDim.x >> 5)) ? sdata[lane] : 0.0f;
+        #pragma unroll
+        for (int offset = 16; offset > 0; offset >>= 1)
+            sum_sq += __shfl_down_sync(0xFFFFFFFF, sum_sq, offset);
+        if (lane == 0) sdata[0] = sum_sq;
+    }
+    __syncthreads();
+
+    float rsqrt_val = rsqrtf(sdata[0] / (float)dim + eps);
+
+    #pragma unroll
+    for (int k = 0; k < 4; k++) {
+        int i = idx[k];
+        if (i < dim) {
+            float w = __bfloat162float(norm_weight[i]);
+            out[i] = __float2bfloat16(reg_y[k] * rsqrt_val * w);
+        }
+    }
+}
+
+void hc_pre_weighted_add_norm_cuda(
+    __nv_bfloat16* out, const __nv_bfloat16* hc_state, const float* pre_weights,
+    const __nv_bfloat16* norm_weight, int dim, int hc, float eps, cudaStream_t stream)
+{
+    int threads = min(1024, ((dim + 31) / 32) * 32);
+    int shared = (threads / 32) * sizeof(float);
+    hc_pre_weighted_add_norm_kernel<<<1, threads, shared, stream>>>(
+        out, hc_state, pre_weights, norm_weight, dim, hc, eps);
+}
+
 // ── HC Post Update Kernel (Optimized 1D grid) ──────────────────────────────────
 __global__ void hc_post_update_kernel(
     __nv_bfloat16* __restrict__ hc_state,
@@ -2766,6 +2883,8 @@ __global__ void gemv_iq2_xxs_moe_swiglu_fused_kernel(
     __shared__ uint64_t s_grid[256];
     __shared__ uint8_t s_signs[128];
     __shared__ __nv_bfloat16 s_vec[2][256]; // Double-buffered vector cache (1 KB)
+    __shared__ uint16_t s_qs1[8][32];      // Warp-shared qs1 cache (512 B)
+    __shared__ uint16_t s_qs3[8][32];      // Warp-shared qs3 cache (512 B)
 
     int tid = threadIdx.y * 32 + threadIdx.x;
     s_grid[tid] = c_iq2xxs_grid[tid];
@@ -2799,6 +2918,7 @@ __global__ void gemv_iq2_xxs_moe_swiglu_fused_kernel(
     const block_iq2_xxs* w3 = (const block_iq2_xxs*)(block + w3_offset);
 
     int lane = threadIdx.x;
+    int warp_id = threadIdx.y;
     int n_blocks = K / 256;
     const block_iq2_xxs* row_w1 = w1 + row * n_blocks;
     const block_iq2_xxs* row_w3 = w3 + row * n_blocks;
@@ -2829,30 +2949,20 @@ __global__ void gemv_iq2_xxs_moe_swiglu_fused_kernel(
         d1 = __shfl_sync(0xffffffff, d1, 0);
         d3 = __shfl_sync(0xffffffff, d3, 0);
 
-        // Coalesced 32-thread register load for entire 32-element qs arrays
-        uint16_t q1_lane = blk1->qs[lane];
-        uint16_t q3_lane = blk3->qs[lane];
+        // Coalesced warp write into shared memory for zero-shuffle broadcast
+        s_qs1[warp_id][lane] = blk1->qs[lane];
+        s_qs3[warp_id][lane] = blk3->qs[lane];
+        __syncwarp();
 
         #pragma unroll 4
         for (int ib32 = 0; ib32 < 8; ib32++) {
             int q_off = ib32 * 4;
-            uint32_t aux0_1, aux1_1, aux0_3, aux1_3;
 
-            // Broadcast aux descriptors from lane registers via shuffle
-            uint16_t q1_0 = __shfl_sync(0xffffffff, q1_lane, q_off + 0);
-            uint16_t q1_1 = __shfl_sync(0xffffffff, q1_lane, q_off + 1);
-            uint16_t q1_2 = __shfl_sync(0xffffffff, q1_lane, q_off + 2);
-            uint16_t q1_3 = __shfl_sync(0xffffffff, q1_lane, q_off + 3);
-
-            uint16_t q3_0 = __shfl_sync(0xffffffff, q3_lane, q_off + 0);
-            uint16_t q3_1 = __shfl_sync(0xffffffff, q3_lane, q_off + 1);
-            uint16_t q3_2 = __shfl_sync(0xffffffff, q3_lane, q_off + 2);
-            uint16_t q3_3 = __shfl_sync(0xffffffff, q3_lane, q_off + 3);
-
-            aux0_1 = (uint32_t)q1_0 | ((uint32_t)q1_1 << 16);
-            aux1_1 = (uint32_t)q1_2 | ((uint32_t)q1_3 << 16);
-            aux0_3 = (uint32_t)q3_0 | ((uint32_t)q3_1 << 16);
-            aux1_3 = (uint32_t)q3_2 | ((uint32_t)q3_3 << 16);
+            // Direct shared-memory broadcast loads (eliminates 8 __shfl_sync calls)
+            uint32_t aux0_1 = *reinterpret_cast<const uint32_t*>(&s_qs1[warp_id][q_off + 0]);
+            uint32_t aux1_1 = *reinterpret_cast<const uint32_t*>(&s_qs1[warp_id][q_off + 2]);
+            uint32_t aux0_3 = *reinterpret_cast<const uint32_t*>(&s_qs3[warp_id][q_off + 0]);
+            uint32_t aux1_3 = *reinterpret_cast<const uint32_t*>(&s_qs3[warp_id][q_off + 2]);
 
             float db1 = d1 * (0.5f + (aux1_1 >> 28)) * 0.25f;
             float db3 = d3 * (0.5f + (aux1_3 >> 28)) * 0.25f;
@@ -2934,6 +3044,7 @@ __global__ void gemv_q2_k_moe_kernel(
     int N, int K)
 {
     __shared__ __nv_bfloat16 s_gate[2][256]; // Double-buffered gate/up input cache (1 KB)
+    __shared__ uint8_t s_scales[8][16];      // Warp-shared scale cache (128 B)
 
     int tid = threadIdx.y * 32 + threadIdx.x;
     int k = blockIdx.y;
@@ -2965,6 +3076,7 @@ __global__ void gemv_q2_k_moe_kernel(
     const block_q2_K* w2 = (const block_q2_K*)(block + w2_offset);
 
     int lane = threadIdx.x;
+    int warp_id = threadIdx.y;
     int n_blocks = K / 256;
     const block_q2_K* row_w2 = w2 + row * n_blocks;
 
@@ -2988,7 +3100,10 @@ __global__ void gemv_q2_k_moe_kernel(
         d = __shfl_sync(0xffffffff, d, 0);
         min = __shfl_sync(0xffffffff, min, 0);
 
-        uint8_t sc_val = (lane < 16) ? blk->scales[lane] : 0;
+        if (lane < 16) {
+            s_scales[warp_id][lane] = blk->scales[lane];
+        }
+        __syncwarp();
 
         uint8_t q0 = blk->qs[lane];
         uint8_t q1 = blk->qs[32 + lane];
@@ -2996,7 +3111,7 @@ __global__ void gemv_q2_k_moe_kernel(
         #pragma unroll 4
         for (int iter = 0; iter < 4; iter++) {
             uint8_t q = (q0 >> (iter * 2)) & 0x03;
-            uint8_t sc = (uint8_t)__shfl_sync(0xffffffff, sc_val, (iter * 2) + lane_half);
+            uint8_t sc = s_scales[warp_id][(iter * 2) + lane_half];
             float dl = d * (float)(sc & 0x0F);
             float ml = min * (float)(sc >> 4);
             float w = dl * (float)q - ml;
@@ -3009,7 +3124,7 @@ __global__ void gemv_q2_k_moe_kernel(
         #pragma unroll 4
         for (int iter = 0; iter < 4; iter++) {
             uint8_t q = (q1 >> (iter * 2)) & 0x03;
-            uint8_t sc = (uint8_t)__shfl_sync(0xffffffff, sc_val, 8 + (iter * 2) + lane_half);
+            uint8_t sc = s_scales[warp_id][8 + (iter * 2) + lane_half];
             float dl = d * (float)(sc & 0x0F);
             float ml = min * (float)(sc >> 4);
             float w = dl * (float)q - ml;

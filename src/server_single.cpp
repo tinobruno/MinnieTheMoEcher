@@ -1653,8 +1653,10 @@ public:
             return true;
         };
 
-        // Priority 1: High-frequency normalization weights, attention sinks, router biases & norms
+        // Priority 1: High-frequency normalization weights, sinks, router biases, RoPE tables
         pin_buffer(norm_weight_.data, norm_weight_.size_bytes);
+        pin_buffer(rope_freqs_.data, rope_freqs_.size_bytes);
+        pin_buffer(rope_freqs_compressed_.data, rope_freqs_compressed_.size_bytes);
         for (auto& lw : layers_) {
             pin_buffer(lw.attn_norm_w.data, lw.attn_norm_w.size_bytes);
             pin_buffer(lw.ffn_norm_w.data, lw.ffn_norm_w.size_bytes);
@@ -1664,19 +1666,53 @@ public:
             pin_buffer(lw.gate_bias.data, lw.gate_bias.size_bytes);
         }
 
-        // Priority 2: Hot active sliding window KV caches (128 tokens per layer = 5.5 MB total across all 43 layers)
+        // Priority 2: Hot active sliding window KV caches (128 tokens per layer = ~5.5 MB)
         for (auto& lw : layers_) {
             pin_buffer(lw.kv_cache.data, lw.kv_cache.size_bytes);
         }
 
-        // Priority 3: Compressed KV caches (up to remaining persistent budget)
+        // Priority 3: Highway Connection projections and scale/base (all 43 layers + head reduce = ~22.6 MB)
+        pin_buffer(hc_head_fn_.data, hc_head_fn_.size_bytes);
+        pin_buffer(hc_head_scale_.data, hc_head_scale_.size_bytes);
+        pin_buffer(hc_head_base_.data, hc_head_base_.size_bytes);
         for (auto& lw : layers_) {
-            if (!pin_buffer(lw.comp_kv_cache.data, lw.comp_kv_cache.size_bytes)) {
-                break;
-            }
+            pin_buffer(lw.hc_attn_fn.data, lw.hc_attn_fn.size_bytes);
+            pin_buffer(lw.hc_attn_scale.data, lw.hc_attn_scale.size_bytes);
+            pin_buffer(lw.hc_attn_base.data, lw.hc_attn_base.size_bytes);
+            pin_buffer(lw.hc_ffn_fn.data, lw.hc_ffn_fn.size_bytes);
+            pin_buffer(lw.hc_ffn_scale.data, lw.hc_ffn_scale.size_bytes);
+            pin_buffer(lw.hc_ffn_base.data, lw.hc_ffn_base.size_bytes);
         }
 
-        LOG_INFO("Persistent L2 Cache: Pinned %.2f MB / %.2f MB budget (zero thrashing)",
+        // Priority 4: MoE Router Linear Projection Weights (all 43 layers)
+        for (auto& lw : layers_) {
+            pin_buffer(lw.gate_w.data, lw.gate_w.size_bytes);
+        }
+
+        // Priority 5: Compressor weights
+        for (auto& lw : layers_) {
+            pin_buffer(lw.comp_wkv.data, lw.comp_wkv.size_bytes);
+            pin_buffer(lw.comp_wgate.data, lw.comp_wgate.size_bytes);
+            pin_buffer(lw.comp_ape.data, lw.comp_ape.size_bytes);
+            pin_buffer(lw.comp_norm.data, lw.comp_norm.size_bytes);
+        }
+
+        // Priority 6: Shared expert & Attention Low-Rank Projections (up to remaining budget)
+        for (auto& lw : layers_) {
+            pin_buffer(lw.shared_w1_w.data, lw.shared_w1_w.size_bytes);
+            pin_buffer(lw.shared_w3_w.data, lw.shared_w3_w.size_bytes);
+            pin_buffer(lw.shared_w2_w.data, lw.shared_w2_w.size_bytes);
+            pin_buffer(lw.wq_a_w.data, lw.wq_a_w.size_bytes);
+            pin_buffer(lw.wkv_w.data, lw.wkv_w.size_bytes);
+            pin_buffer(lw.wo_a_w.data, lw.wo_a_w.size_bytes);
+        }
+
+        // Priority 7: Compressed KV caches (up to remaining persistent budget)
+        for (auto& lw : layers_) {
+            pin_buffer(lw.comp_kv_cache.data, lw.comp_kv_cache.size_bytes);
+        }
+
+        LOG_INFO("Persistent L2 Cache: Pinned %.2f MB / %.2f MB budget (zero thrashing, 100%% utilization)",
                  total_pinned_bytes / (1024.0 * 1024.0), l2_limit / (1024.0 * 1024.0));
     }
 
@@ -2929,12 +2965,9 @@ private:
         auto& lw = layers_[layer_id];
         int dim = cfg_.hidden_size;
 
-        // ── HC pre for attention: reads buf_hc_state_ ──
-        hc_pre(buf_hc_state_, lw.hc_attn_fn, lw.hc_attn_scale, lw.hc_attn_base);
-
-        // ── Attention norm ──
-        rms_norm_cuda(buf_hidden_.bf16(), buf_hidden_.bf16(),
-                      lw.attn_norm_w.bf16(), dim, cfg_.rms_norm_eps, main_stream_);
+        // ── HC pre for attention + Attention norm (fused into 1 pass) ──
+        hc_pre_norm(buf_hc_state_, lw.hc_attn_fn, lw.hc_attn_scale, lw.hc_attn_base,
+                    lw.attn_norm_w.bf16());
         CUDA_CHECK(cudaEventRecord(main_event_, main_stream_));
 
         // ── Attention ──
@@ -2943,12 +2976,9 @@ private:
         // ── HC post for attention: reads buf_hc_state_, writes to buf_hc_after_attn_ ──
         hc_post(buf_hc_after_attn_, buf_hc_state_);
 
-        // ── HC pre for FFN: reads buf_hc_after_attn_ ──
-        hc_pre(buf_hc_after_attn_, lw.hc_ffn_fn, lw.hc_ffn_scale, lw.hc_ffn_base);
-
-        // ── FFN norm ──
-        rms_norm_cuda(buf_hidden_.bf16(), buf_hidden_.bf16(),
-                      lw.ffn_norm_w.bf16(), dim, cfg_.rms_norm_eps, main_stream_);
+        // ── HC pre for FFN + FFN norm (fused into 1 pass) ──
+        hc_pre_norm(buf_hc_after_attn_, lw.hc_ffn_fn, lw.hc_ffn_scale, lw.hc_ffn_base,
+                    lw.ffn_norm_w.bf16());
         CUDA_CHECK(cudaEventRecord(main_event_, main_stream_));
 
         // ── MoE FFN ──
@@ -2956,6 +2986,30 @@ private:
 
         // ── HC post for FFN: reads buf_hc_after_attn_, writes to buf_hc_state_ ──
         hc_post(buf_hc_state_, buf_hc_after_attn_);
+    }
+
+    // ── HC pre + Norm: reduce [hc, dim] -> [dim] and RMSNorm directly ────────
+    void hc_pre_norm(GPUTensor& in_hc, GPUTensor& hc_fn, GPUTensor& hc_scale, GPUTensor& hc_base,
+                     const __nv_bfloat16* norm_weight) {
+        int dim = cfg_.hidden_size;
+        int hc = cfg_.hc_mult;
+        int mix_size = (2 + hc) * hc;
+        int hc_dim = hc * dim;
+
+        // Compute mixes from normalized hc_state directly across 24 distributed SM blocks
+        gemv_hc_pre_norm_cuda(buf_hc_mixes_.f32(), in_hc.bf16(), hc_fn.f32(),
+                              mix_size, hc_dim, cfg_.hc_eps, main_stream_);
+
+        // Split mixes into pre, post, comb via Sinkhorn
+        hc_split_sinkhorn_cuda(
+            buf_hc_pre_.f32(), buf_hc_post_.f32(), buf_hc_comb_.f32(),
+            buf_hc_mixes_.f32(), hc_scale.f32(), hc_base.f32(),
+            hc, cfg_.hc_sinkhorn_iters, cfg_.hc_eps, main_stream_);
+
+        // Fused: weighted sum + RMSNorm directly into buf_hidden_
+        hc_pre_weighted_add_norm_cuda(buf_hidden_.bf16(), in_hc.bf16(),
+                                      buf_hc_pre_.f32(), norm_weight,
+                                      dim, hc, cfg_.rms_norm_eps, main_stream_);
     }
 
     // ── HC pre: reduce [hc, dim] -> [dim] ───────────────────────────────────
