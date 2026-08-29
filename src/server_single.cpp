@@ -1717,7 +1717,7 @@ public:
     }
 
     void init_cuda_graph() {
-        if (cfg_.architecture == ModelArch::QWEN || !expert_loader_.all_resident(cfg_.num_hidden_layers)) {
+        if (cfg_.architecture != ModelArch::QWEN && !expert_loader_.all_resident(cfg_.num_hidden_layers)) {
             LOG_INFO("Running in eager mode for decode verification.");
             graph_captured_ = false;
             return;
@@ -2926,7 +2926,8 @@ private:
                 lw.gqa_k_norm_w.bf16(),
                 lw.k_cache_gqa.bf16(),
                 lw.v_cache_gqa.bf16(),
-                n_q_heads, n_kv_heads, head_dim, position, cfg_.max_seq_len,
+                n_q_heads, n_kv_heads, head_dim,
+                buf_input_pos_.i32(), position, cfg_.max_seq_len,
                 cfg_.rope_theta, cfg_.rms_norm_eps, main_stream_);
 
             // 5. Output Projection: buf_attn_out_ -> buf_hidden2_
@@ -2940,12 +2941,17 @@ private:
         rms_norm_one_centered_cuda(buf_hidden2_.bf16(), buf_hidden_.bf16(),
                                    lw.ffn_norm_w.bf16(), dim, cfg_.rms_norm_eps, main_stream_);
 
-        // 8. Gate & Up projections for SwiGLU
-        matmul_proj(buf_gate_, buf_hidden2_, lw.w_gate, lw.w_gate_scale, inter_size, dim);
-        matmul_proj(buf_up_, buf_hidden2_, lw.w_up, lw.w_up_scale, inter_size, dim);
-
-        // 9. Fused SiLU(Gate) * Up
-        silu_mul_cuda(buf_gate_.bf16(), buf_gate_.bf16(), buf_up_.bf16(), inter_size, 0.0f, main_stream_);
+        // 8 & 9. Gate & Up projections + Fused SiLU(Gate) * Up
+        if (lw.w_gate.dtype == "int4") {
+            gemv_int4_swiglu_fused_cuda(buf_gate_.bf16(), buf_hidden2_.bf16(),
+                                        (const uint8_t*)lw.w_gate.data, lw.w_gate_scale.bf16(),
+                                        (const uint8_t*)lw.w_up.data, lw.w_up_scale.bf16(),
+                                        inter_size, dim, cfg_.swiglu_limit, main_stream_);
+        } else {
+            matmul_proj(buf_gate_, buf_hidden2_, lw.w_gate, lw.w_gate_scale, inter_size, dim);
+            matmul_proj(buf_up_, buf_hidden2_, lw.w_up, lw.w_up_scale, inter_size, dim);
+            silu_mul_cuda(buf_gate_.bf16(), buf_gate_.bf16(), buf_up_.bf16(), inter_size, cfg_.swiglu_limit, main_stream_);
+        }
 
         // 10. Down projection: buf_gate_ -> buf_hidden2_
         matmul_proj(buf_hidden2_, buf_gate_, lw.w_down, lw.w_down_scale, dim, inter_size);

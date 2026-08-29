@@ -159,6 +159,16 @@ void gemv_int4_cuda(
     int N, int K,
     cudaStream_t stream = 0);
 
+void gemv_int4_swiglu_fused_cuda(
+    __nv_bfloat16* out,
+    const __nv_bfloat16* vec,
+    const uint8_t* gate_weight,
+    const __nv_bfloat16* gate_scale,
+    const uint8_t* up_weight,
+    const __nv_bfloat16* up_scale,
+    int N, int K, float swiglu_limit,
+    cudaStream_t stream = 0);
+
 void vector_add_bf16_cuda(
     __nv_bfloat16* a,
     const __nv_bfloat16* b,
@@ -591,7 +601,8 @@ void qwen_gqa_decode_gated_cuda(
     int n_q_heads,
     int n_kv_heads,
     int head_dim,
-    int pos,
+    const int32_t* d_pos,
+    int pos_scalar,
     int max_seq_len,
     float rope_theta = 1000000.0f,
     float eps = 1e-6f,
