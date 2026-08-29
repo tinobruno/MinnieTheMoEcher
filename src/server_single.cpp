@@ -3945,11 +3945,15 @@ static void run_server(MoecherEngine& engine, int port, int default_thinking_bud
 // ════════════════════════════════════════════════════════════════════════════════
 
 int main(int argc, char** argv) {
+    // Low-latency active spin-wait on CUDA stream completions (eliminates OS sleep latency)
+    cudaSetDeviceFlags(cudaDeviceScheduleSpin);
+
 #if defined(_WIN32) || defined(_WIN64)
     SetPriorityClass(GetCurrentProcess(), HIGH_PRIORITY_CLASS);
     SetThreadPriority(GetCurrentThread(), THREAD_PRIORITY_HIGHEST);
     SetConsoleOutputCP(CP_UTF8);
     SetConsoleCP(CP_UTF8);
+    timeBeginPeriod(1); // 1ms high-resolution timer period on Windows
 #endif
     std::string manifest_path = "moecher_manifest.json";
     int port = 8001;

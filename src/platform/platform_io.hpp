@@ -13,9 +13,12 @@
         #define NOMINMAX
     #endif
     #include <windows.h>
+    #include <mmsystem.h>
+    #include <timeapi.h>
     #include <intrin.h>
     #pragma comment(lib, "ws2_32.lib")
     #pragma comment(lib, "crypt32.lib")
+    #pragma comment(lib, "winmm.lib")
 #else
     #include <fcntl.h>
     #include <unistd.h>

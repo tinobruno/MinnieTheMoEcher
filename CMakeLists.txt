@@ -73,6 +73,7 @@ if(WIN32)
         nlohmann_json::nlohmann_json
         ws2_32
         crypt32
+        winmm
     )
 else()
     target_link_libraries(moecher PRIVATE
