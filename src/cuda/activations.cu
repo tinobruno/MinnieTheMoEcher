@@ -3845,7 +3845,6 @@ __global__ void accumulate_expert_imatrix_kernel(
     const __nv_bfloat16* token_norm = h_norm + (size_t)token_idx * hidden_dim;
     float* exp_gate = gate_accum + (size_t)expert_id * hidden_dim;
     float* exp_down = down_accum + (size_t)expert_id * moe_intermediate;
-
     // Gate & Up input channels accumulation: sum(x_j^2)
     for (int j = tid; j < hidden_dim; j += blockDim.x) {
         float x = __bfloat162float(token_norm[j]);
@@ -3861,6 +3860,286 @@ __global__ void accumulate_expert_imatrix_kernel(
         float d_sq = d * d;
         atomicAdd(&exp_down[j], d_sq);
     }
+}
+
+__global__ void qwen_gqa_write_kv_kernel(
+    __nv_bfloat16* __restrict__ k,
+    const __nv_bfloat16* __restrict__ v,
+    const __nv_bfloat16* __restrict__ k_norm_w,
+    __nv_bfloat16* __restrict__ k_cache,
+    __nv_bfloat16* __restrict__ v_cache,
+    int n_kv_heads,
+    int head_dim,
+    const int32_t* __restrict__ d_pos,
+    int pos_scalar,
+    int max_seq_len,
+    float rope_theta,
+    float eps)
+{
+    int kv_head = blockIdx.x;
+    if (kv_head >= n_kv_heads) return;
+
+    int pos = d_pos ? *d_pos : pos_scalar;
+    if (pos >= max_seq_len) return;
+
+    int tid = threadIdx.x;
+    __nv_bfloat16* k_vec = k + kv_head * head_dim;
+    const __nv_bfloat16* v_vec = v + kv_head * head_dim;
+
+    // 1. RMSNorm on K
+    __shared__ float s_k_sum;
+    if (tid == 0) s_k_sum = 0.0f;
+    __syncthreads();
+
+    float k_sq = 0.0f;
+    for (int i = tid; i < head_dim; i += blockDim.x) {
+        float val = __bfloat162float(k_vec[i]);
+        k_sq += val * val;
+    }
+    for (int offset = 16; offset > 0; offset /= 2) {
+        k_sq += __shfl_down_sync(0xFFFFFFFF, k_sq, offset);
+    }
+    if (tid % 32 == 0) atomicAdd(&s_k_sum, k_sq);
+    __syncthreads();
+
+    float k_rrms = rsqrtf(s_k_sum / (float)head_dim + eps);
+    for (int i = tid; i < head_dim; i += blockDim.x) {
+        float k_normed = __bfloat162float(k_vec[i]) * k_rrms * (1.0f + __bfloat162float(k_norm_w[i]));
+        k_vec[i] = __float2bfloat16(k_normed);
+    }
+    __syncthreads();
+
+    // 2. Apply partial RoPE to K (rotary_dim = 64)
+    int rotary_dim = 64;
+    int half_rotary = rotary_dim / 2; // 32
+    for (int i = tid; i < half_rotary; i += blockDim.x) {
+        float freq = 1.0f / powf(rope_theta, (float)(2 * i) / (float)rotary_dim);
+        float angle = (float)pos * freq;
+        float cos_a = cosf(angle);
+        float sin_a = sinf(angle);
+
+        float k0 = __bfloat162float(k_vec[i]);
+        float k1 = __bfloat162float(k_vec[i + half_rotary]);
+
+        k_vec[i] = __float2bfloat16(k0 * cos_a - k1 * sin_a);
+        k_vec[i + half_rotary] = __float2bfloat16(k0 * sin_a + k1 * cos_a);
+    }
+    __syncthreads();
+
+    // 3. Store into KV cache
+    size_t cache_offset = ((size_t)pos * n_kv_heads + kv_head) * head_dim;
+    for (int i = tid; i < head_dim; i += blockDim.x) {
+        k_cache[cache_offset + i] = k_vec[i];
+        v_cache[cache_offset + i] = v_vec[i];
+    }
+}
+
+__global__ void qwen_gqa_compute_attn_kernel(
+    __nv_bfloat16* __restrict__ out,
+    const __nv_bfloat16* __restrict__ q_and_gate,
+    const __nv_bfloat16* __restrict__ q_norm_w,
+    const __nv_bfloat16* __restrict__ k_cache,
+    const __nv_bfloat16* __restrict__ v_cache,
+    int n_q_heads,
+    int n_kv_heads,
+    int head_dim,
+    const int32_t* __restrict__ d_pos,
+    int pos_scalar,
+    int max_seq_len,
+    float rope_theta,
+    float eps)
+{
+    int q_head = blockIdx.x;
+    if (q_head >= n_q_heads) return;
+
+    int pos = d_pos ? *d_pos : pos_scalar;
+    if (pos >= max_seq_len) pos = max_seq_len - 1;
+
+    int tid = threadIdx.x;
+    int kv_head = q_head / (n_q_heads / n_kv_heads);
+
+    __shared__ float s_q[256];
+    __shared__ float s_q_sum;
+    __shared__ float s_tile_scores[128];
+    __shared__ float s_warp_reduce[4];
+    __shared__ float s_new_max;
+    __shared__ float s_alpha;
+
+    const __nv_bfloat16* q_in = q_and_gate + (size_t)q_head * (2 * head_dim);
+    const __nv_bfloat16* gate_in = q_in + head_dim;
+    __nv_bfloat16* out_vec = out + (size_t)q_head * head_dim;
+
+    // 1. RMSNorm on Q per head
+    if (tid == 0) s_q_sum = 0.0f;
+    __syncthreads();
+
+    float q_sq = 0.0f;
+    for (int i = tid; i < head_dim; i += blockDim.x) {
+        float val = __bfloat162float(q_in[i]);
+        s_q[i] = val;
+        q_sq += val * val;
+    }
+    for (int offset = 16; offset > 0; offset /= 2) {
+        q_sq += __shfl_down_sync(0xFFFFFFFF, q_sq, offset);
+    }
+    if (tid % 32 == 0) atomicAdd(&s_q_sum, q_sq);
+    __syncthreads();
+
+    float q_rrms = rsqrtf(s_q_sum / (float)head_dim + eps);
+    for (int i = tid; i < head_dim; i += blockDim.x) {
+        s_q[i] = s_q[i] * q_rrms * (1.0f + __bfloat162float(q_norm_w[i]));
+    }
+    __syncthreads();
+
+    // 2. Apply partial RoPE to Q (rotary_dim = 64)
+    int rotary_dim = 64;
+    int half_rotary = rotary_dim / 2;
+    for (int i = tid; i < half_rotary; i += blockDim.x) {
+        float freq = 1.0f / powf(rope_theta, (float)(2 * i) / (float)rotary_dim);
+        float angle = (float)pos * freq;
+        float cos_a = cosf(angle);
+        float sin_a = sinf(angle);
+
+        float q0 = s_q[i];
+        float q1 = s_q[i + half_rotary];
+
+        s_q[i] = q0 * cos_a - q1 * sin_a;
+        s_q[i + half_rotary] = q0 * sin_a + q1 * cos_a;
+    }
+    __syncthreads();
+
+    // 3. Online Softmax across sequence history [0..pos] in chunks of 128
+    float scale = 1.0f / sqrtf((float)head_dim);
+    float running_max = -1e38f;
+    float running_sum = 0.0f;
+    float acc0 = 0.0f;
+    float acc1 = 0.0f;
+    int dim0 = tid;
+    int dim1 = tid + 128;
+
+    int warp_id = tid >> 5;
+    int lane_id = tid & 31;
+
+    for (int t_block = 0; t_block <= pos; t_block += 128) {
+        int chunk_len = min(128, pos + 1 - t_block);
+
+        // A. Compute Q . K_t for token (t_block + tid)
+        float dot = -1e38f;
+        if (tid < chunk_len) {
+            int t = t_block + tid;
+            size_t k_offset = ((size_t)t * n_kv_heads + kv_head) * head_dim;
+            const __nv_bfloat16* k_ptr = k_cache + k_offset;
+            float d = 0.0f;
+            #pragma unroll 4
+            for (int i = 0; i < head_dim; i++) {
+                d += s_q[i] * __bfloat162float(k_ptr[i]);
+            }
+            dot = d * scale;
+        }
+        s_tile_scores[tid] = dot;
+        __syncthreads();
+
+        // B. Find chunk maximum
+        float thread_val = (tid < chunk_len) ? s_tile_scores[tid] : -1e38f;
+        float chunk_max = thread_val;
+        #pragma unroll
+        for (int offset = 16; offset > 0; offset /= 2) {
+            chunk_max = fmaxf(chunk_max, __shfl_down_sync(0xFFFFFFFF, chunk_max, offset));
+        }
+        if (lane_id == 0) s_warp_reduce[warp_id] = chunk_max;
+        __syncthreads();
+
+        if (tid == 0) {
+            float m = fmaxf(fmaxf(s_warp_reduce[0], s_warp_reduce[1]), fmaxf(s_warp_reduce[2], s_warp_reduce[3]));
+            float new_m = fmaxf(running_max, m);
+            float a = (running_max <= -1e37f) ? 0.0f : __expf(running_max - new_m);
+            s_new_max = new_m;
+            s_alpha = a;
+        }
+        __syncthreads();
+
+        float new_max = s_new_max;
+        float alpha = s_alpha;
+        running_max = new_max;
+        running_sum = running_sum * alpha;
+        acc0 = acc0 * alpha;
+        acc1 = acc1 * alpha;
+
+        // C. Convert tile scores to exp(score - new_max)
+        float exp_s = (tid < chunk_len) ? __expf(s_tile_scores[tid] - new_max) : 0.0f;
+        s_tile_scores[tid] = exp_s;
+        __syncthreads();
+
+        // D. Sum exp_s across tile
+        float sum_chunk = exp_s;
+        #pragma unroll
+        for (int offset = 16; offset > 0; offset /= 2) {
+            sum_chunk += __shfl_down_sync(0xFFFFFFFF, sum_chunk, offset);
+        }
+        if (lane_id == 0) s_warp_reduce[warp_id] = sum_chunk;
+        __syncthreads();
+        if (tid == 0) {
+            s_warp_reduce[0] += s_warp_reduce[1] + s_warp_reduce[2] + s_warp_reduce[3];
+        }
+        __syncthreads();
+        running_sum += s_warp_reduce[0];
+
+        // E. Accumulate V values for dim0 and dim1
+        for (int j = 0; j < chunk_len; j++) {
+            float weight = s_tile_scores[j];
+            int t = t_block + j;
+            size_t v_offset = ((size_t)t * n_kv_heads + kv_head) * head_dim;
+            if (dim0 < head_dim) {
+                acc0 += weight * __bfloat162float(v_cache[v_offset + dim0]);
+            }
+            if (dim1 < head_dim) {
+                acc1 += weight * __bfloat162float(v_cache[v_offset + dim1]);
+            }
+        }
+        __syncthreads();
+    }
+
+    // Final normalization and sigmoid gating
+    float inv_sum = 1.0f / (running_sum + 1e-8f);
+    if (dim0 < head_dim) {
+        float g0 = __bfloat162float(gate_in[dim0]);
+        float sig0 = 1.0f / (1.0f + __expf(-g0));
+        out_vec[dim0] = __float2bfloat16(acc0 * inv_sum * sig0);
+    }
+    if (dim1 < head_dim) {
+        float g1 = __bfloat162float(gate_in[dim1]);
+        float sig1 = 1.0f / (1.0f + __expf(-g1));
+        out_vec[dim1] = __float2bfloat16(acc1 * inv_sum * sig1);
+    }
+}
+
+void qwen_gqa_decode_gated_cuda(
+    __nv_bfloat16* out,
+    const __nv_bfloat16* q_and_gate,
+    __nv_bfloat16* k,
+    const __nv_bfloat16* v,
+    const __nv_bfloat16* q_norm_w,
+    const __nv_bfloat16* k_norm_w,
+    __nv_bfloat16* k_cache,
+    __nv_bfloat16* v_cache,
+    int n_q_heads,
+    int n_kv_heads,
+    int head_dim,
+    const int32_t* d_pos,
+    int pos_scalar,
+    int max_seq_len,
+    float rope_theta,
+    float eps,
+    cudaStream_t stream)
+{
+    int threads = 128;
+    // Step 1: Write KV to cache
+    qwen_gqa_write_kv_kernel<<<n_kv_heads, threads, 0, stream>>>(
+        k, v, k_norm_w, k_cache, v_cache, n_kv_heads, head_dim, d_pos, pos_scalar, max_seq_len, rope_theta, eps);
+
+    // Step 2: Compute Query Attention against cache and Gate via Online Softmax (0 dynamic smem needed)
+    qwen_gqa_compute_attn_kernel<<<n_q_heads, threads, 0, stream>>>(
+        out, q_and_gate, q_norm_w, k_cache, v_cache, n_q_heads, n_kv_heads, head_dim, d_pos, pos_scalar, max_seq_len, rope_theta, eps);
 }
 
 void accumulate_expert_imatrix_cuda(
@@ -4084,226 +4363,7 @@ void deltanet_linear_attention_decode_cuda(
 
 // ── Qwen 3.8 Gated GQA Attention Decode Kernels ───────────────────────────────
 
-__global__ void qwen_gqa_write_kv_kernel(
-    __nv_bfloat16* __restrict__ k,
-    const __nv_bfloat16* __restrict__ v,
-    const __nv_bfloat16* __restrict__ k_norm_w,
-    __nv_bfloat16* __restrict__ k_cache,
-    __nv_bfloat16* __restrict__ v_cache,
-    int n_kv_heads,
-    int head_dim,
-    const int32_t* __restrict__ d_pos,
-    int pos_scalar,
-    float rope_theta,
-    float eps)
-{
-    int kv_head = blockIdx.x;
-    if (kv_head >= n_kv_heads) return;
 
-    int pos = d_pos ? *d_pos : pos_scalar;
-
-    int tid = threadIdx.x;
-    __nv_bfloat16* k_vec = k + kv_head * head_dim;
-    const __nv_bfloat16* v_vec = v + kv_head * head_dim;
-
-    // 1. RMSNorm on K
-    __shared__ float s_k_sum;
-    if (tid == 0) s_k_sum = 0.0f;
-    __syncthreads();
-
-    float k_sq = 0.0f;
-    for (int i = tid; i < head_dim; i += blockDim.x) {
-        float val = __bfloat162float(k_vec[i]);
-        k_sq += val * val;
-    }
-    for (int offset = 16; offset > 0; offset /= 2) {
-        k_sq += __shfl_down_sync(0xFFFFFFFF, k_sq, offset);
-    }
-    if (tid % 32 == 0) atomicAdd(&s_k_sum, k_sq);
-    __syncthreads();
-
-    float k_rrms = rsqrtf(s_k_sum / (float)head_dim + eps);
-    for (int i = tid; i < head_dim; i += blockDim.x) {
-        float k_normed = __bfloat162float(k_vec[i]) * k_rrms * (1.0f + __bfloat162float(k_norm_w[i]));
-        k_vec[i] = __float2bfloat16(k_normed);
-    }
-    __syncthreads();
-
-    // 2. Apply partial RoPE to K (rotary_dim = 64)
-    int rotary_dim = 64;
-    int half_rotary = rotary_dim / 2; // 32
-    for (int i = tid; i < half_rotary; i += blockDim.x) {
-        float freq = 1.0f / powf(rope_theta, (float)(2 * i) / (float)rotary_dim);
-        float angle = (float)pos * freq;
-        float cos_a = cosf(angle);
-        float sin_a = sinf(angle);
-
-        float k0 = __bfloat162float(k_vec[i]);
-        float k1 = __bfloat162float(k_vec[i + half_rotary]);
-
-        k_vec[i] = __float2bfloat16(k0 * cos_a - k1 * sin_a);
-        k_vec[i + half_rotary] = __float2bfloat16(k0 * sin_a + k1 * cos_a);
-    }
-    __syncthreads();
-
-    // 3. Store into KV cache
-    size_t cache_offset = ((size_t)pos * n_kv_heads + kv_head) * head_dim;
-    for (int i = tid; i < head_dim; i += blockDim.x) {
-        k_cache[cache_offset + i] = k_vec[i];
-        v_cache[cache_offset + i] = v_vec[i];
-    }
-}
-
-__global__ void qwen_gqa_compute_attn_kernel(
-    __nv_bfloat16* __restrict__ out,
-    const __nv_bfloat16* __restrict__ q_and_gate,
-    const __nv_bfloat16* __restrict__ q_norm_w,
-    const __nv_bfloat16* __restrict__ k_cache,
-    const __nv_bfloat16* __restrict__ v_cache,
-    int n_q_heads,
-    int n_kv_heads,
-    int head_dim,
-    const int32_t* __restrict__ d_pos,
-    int pos_scalar,
-    float rope_theta,
-    float eps)
-{
-    int q_head = blockIdx.x;
-    if (q_head >= n_q_heads) return;
-
-    int pos = d_pos ? *d_pos : pos_scalar;
-
-    int tid = threadIdx.x;
-    int kv_head = q_head / (n_q_heads / n_kv_heads);
-
-    __shared__ float s_q[256];
-    __shared__ float s_q_sum;
-    __shared__ float s_max_val;
-    __shared__ float s_sum_exp;
-    extern __shared__ float s_scores[];
-
-    const __nv_bfloat16* q_in = q_and_gate + (size_t)q_head * (2 * head_dim);
-    const __nv_bfloat16* gate_in = q_in + head_dim;
-    __nv_bfloat16* out_vec = out + (size_t)q_head * head_dim;
-
-    // 1. RMSNorm on Q per head
-    if (tid == 0) s_q_sum = 0.0f;
-    __syncthreads();
-
-    float q_sq = 0.0f;
-    for (int i = tid; i < head_dim; i += blockDim.x) {
-        float val = __bfloat162float(q_in[i]);
-        s_q[i] = val;
-        q_sq += val * val;
-    }
-    for (int offset = 16; offset > 0; offset /= 2) {
-        q_sq += __shfl_down_sync(0xFFFFFFFF, q_sq, offset);
-    }
-    if (tid % 32 == 0) atomicAdd(&s_q_sum, q_sq);
-    __syncthreads();
-
-    float q_rrms = rsqrtf(s_q_sum / (float)head_dim + eps);
-    for (int i = tid; i < head_dim; i += blockDim.x) {
-        s_q[i] = s_q[i] * q_rrms * (1.0f + __bfloat162float(q_norm_w[i]));
-    }
-    __syncthreads();
-
-    // 2. Apply partial RoPE to Q (rotary_dim = 64)
-    int rotary_dim = 64;
-    int half_rotary = rotary_dim / 2;
-    for (int i = tid; i < half_rotary; i += blockDim.x) {
-        float freq = 1.0f / powf(rope_theta, (float)(2 * i) / (float)rotary_dim);
-        float angle = (float)pos * freq;
-        float cos_a = cosf(angle);
-        float sin_a = sinf(angle);
-
-        float q0 = s_q[i];
-        float q1 = s_q[i + half_rotary];
-
-        s_q[i] = q0 * cos_a - q1 * sin_a;
-        s_q[i + half_rotary] = q0 * sin_a + q1 * cos_a;
-    }
-    __syncthreads();
-
-    // 3. Compute attention scores over history [0..pos]
-    float scale = 1.0f / sqrtf((float)head_dim);
-
-    for (int t = tid; t <= pos; t += blockDim.x) {
-        size_t k_offset = ((size_t)t * n_kv_heads + kv_head) * head_dim;
-        float dot = 0.0f;
-        for (int i = 0; i < head_dim; i++) {
-            dot += s_q[i] * __bfloat162float(k_cache[k_offset + i]);
-        }
-        s_scores[t] = dot * scale;
-    }
-    __syncthreads();
-
-    // 4. Softmax over scores
-    if (tid == 0) {
-        float max_s = -1e38f;
-        for (int t = 0; t <= pos; t++) {
-            if (s_scores[t] > max_s) max_s = s_scores[t];
-        }
-        s_max_val = max_s;
-        float sum_e = 0.0f;
-        for (int t = 0; t <= pos; t++) {
-            float e = __expf(s_scores[t] - max_s);
-            s_scores[t] = e;
-            sum_e += e;
-        }
-        s_sum_exp = sum_e;
-    }
-    __syncthreads();
-
-    float inv_sum = 1.0f / (s_sum_exp + 1e-8f);
-    for (int t = tid; t <= pos; t += blockDim.x) {
-        s_scores[t] *= inv_sum;
-    }
-    __syncthreads();
-
-    // 5. Output = sum_t (score_t * v_cache_t) * sigmoid(gate)
-    for (int i = tid; i < head_dim; i += blockDim.x) {
-        float accum = 0.0f;
-        for (int t = 0; t <= pos; t++) {
-            size_t v_offset = ((size_t)t * n_kv_heads + kv_head) * head_dim;
-            accum += s_scores[t] * __bfloat162float(v_cache[v_offset + i]);
-        }
-        float g_val = __bfloat162float(gate_in[i]);
-        float sig_g = 1.0f / (1.0f + __expf(-g_val));
-        out_vec[i] = __float2bfloat16(accum * sig_g);
-    }
-}
-
-void qwen_gqa_decode_gated_cuda(
-    __nv_bfloat16* out,
-    const __nv_bfloat16* q_and_gate,
-    __nv_bfloat16* k,
-    const __nv_bfloat16* v,
-    const __nv_bfloat16* q_norm_w,
-    const __nv_bfloat16* k_norm_w,
-    __nv_bfloat16* k_cache,
-    __nv_bfloat16* v_cache,
-    int n_q_heads,
-    int n_kv_heads,
-    int head_dim,
-    const int32_t* d_pos,
-    int pos_scalar,
-    int max_seq_len,
-    float rope_theta,
-    float eps,
-    cudaStream_t stream)
-{
-    int threads = 128;
-    // Step 1: Write KV to cache
-    qwen_gqa_write_kv_kernel<<<n_kv_heads, threads, 0, stream>>>(
-        k, v, k_norm_w, k_cache, v_cache, n_kv_heads, head_dim, d_pos, pos_scalar, rope_theta, eps);
-
-    // Step 2: Compute Query Attention against cache and Gate
-    int smem_cap = max_seq_len > 0 ? (max_seq_len > 4096 ? 4096 : max_seq_len) : 4096;
-    size_t smem_size = smem_cap * sizeof(float);
-    qwen_gqa_compute_attn_kernel<<<n_q_heads, threads, smem_size, stream>>>(
-        out, q_and_gate, q_norm_w, k_cache, v_cache, n_q_heads, n_kv_heads, head_dim, d_pos, pos_scalar, rope_theta, eps);
-}
 
 // ── 2-Stage Parallel Grid ArgMax across all GPU SMs ────────────────────────
 __global__ void argmax_f32_stage1_kernel(
