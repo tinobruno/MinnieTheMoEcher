@@ -18,15 +18,15 @@ DefaultGroupName=Moecher
 AllowNoIcons=yes
 ArchitecturesAllowed=x64compatible
 ArchitecturesInstallIn64BitMode=x64compatible
-OutputDir=D:\dev\minniemoe\MinnieTheMoEcher\dist
+OutputDir=..\dist
 OutputBaseFilename=Moecher-Setup
 Compression=lzma2/ultra64
 SolidCompression=yes
 PrivilegesRequired=lowest
 PrivilegesRequiredOverridesAllowed=dialog
-SetupIconFile=D:\dev\minniemoe\MinnieTheMoEcher\graphics\moecher.ico
-WizardImageFile=D:\dev\minniemoe\MinnieTheMoEcher\graphics\installer_wizard.bmp
-WizardSmallImageFile=D:\dev\minniemoe\MinnieTheMoEcher\graphics\installer_small.bmp
+SetupIconFile=..\graphics\moecher.ico
+WizardImageFile=..\graphics\installer_wizard.bmp
+WizardSmallImageFile=..\graphics\installer_small.bmp
 UninstallDisplayIcon={app}\{#MyAppExeName}
 DisableWelcomePage=no
 DisableDirPage=no
@@ -46,18 +46,18 @@ Name: "desktopicon"; Description: "{cm:CreateDesktopIcon}"; GroupDescription: "{
 
 [Files]
 ; Core Binaries & CUDA 13 Runtime
-Source: "D:\dev\minniemoe\MinnieTheMoEcher\build\Release\moecher.exe"; DestDir: "{app}"; Flags: ignoreversion; Components: core
-Source: "C:\Program Files\NVIDIA GPU Computing Toolkit\CUDA\v13.3\bin\x64\cublas64_13.dll"; DestDir: "{app}"; Flags: ignoreversion skipifsourcedoesntexist; Components: core
-Source: "C:\Program Files\NVIDIA GPU Computing Toolkit\CUDA\v13.3\bin\x64\cublasLt64_13.dll"; DestDir: "{app}"; Flags: ignoreversion skipifsourcedoesntexist; Components: core
+Source: "..\moecher.exe"; DestDir: "{app}"; Flags: ignoreversion; Components: core
+Source: "C:\Program Files\NVIDIA GPU Computing Toolkit\CUDA\v13.3\bin\cublas64_13.dll"; DestDir: "{app}"; Flags: ignoreversion skipifsourcedoesntexist; Components: core
+Source: "C:\Program Files\NVIDIA GPU Computing Toolkit\CUDA\v13.3\bin\cublasLt64_13.dll"; DestDir: "{app}"; Flags: ignoreversion skipifsourcedoesntexist; Components: core
 
 ; Launchers, Scripts, Icons & Web UI
-Source: "D:\dev\minniemoe\MinnieTheMoEcher\installer\start_qwen_server.bat"; DestDir: "{app}"; Flags: ignoreversion; Components: core
-Source: "D:\dev\minniemoe\MinnieTheMoEcher\installer\start_deepseek_server.bat"; DestDir: "{app}"; Flags: ignoreversion; Components: core
-Source: "D:\dev\minniemoe\MinnieTheMoEcher\installer\start_deepseek_q4_server.bat"; DestDir: "{app}"; Flags: ignoreversion; Components: core
-Source: "D:\dev\minniemoe\MinnieTheMoEcher\installer\test_qwen.bat"; DestDir: "{app}"; Flags: ignoreversion; Components: core
-Source: "D:\dev\minniemoe\MinnieTheMoEcher\installer\download_model.ps1"; DestDir: "{app}"; Flags: ignoreversion; Components: core
-Source: "D:\dev\minniemoe\MinnieTheMoEcher\graphics\moecher.ico"; DestDir: "{app}"; Flags: ignoreversion; Components: core
-Source: "D:\dev\minniemoe\MinnieTheMoEcher\web\*"; DestDir: "{app}\web"; Flags: ignoreversion recursesubdirs createallsubdirs; Components: core
+Source: "..\installer\start_qwen_server.bat"; DestDir: "{app}"; Flags: ignoreversion; Components: core
+Source: "..\installer\start_deepseek_server.bat"; DestDir: "{app}"; Flags: ignoreversion; Components: core
+Source: "..\installer\start_deepseek_q4_server.bat"; DestDir: "{app}"; Flags: ignoreversion; Components: core
+Source: "..\installer\test_qwen.bat"; DestDir: "{app}"; Flags: ignoreversion; Components: core
+Source: "..\installer\download_model.ps1"; DestDir: "{app}"; Flags: ignoreversion; Components: core
+Source: "..\graphics\moecher.ico"; DestDir: "{app}"; Flags: ignoreversion; Components: core
+Source: "..\web\*"; DestDir: "{app}\web"; Flags: ignoreversion recursesubdirs createallsubdirs; Components: core
 
 [Icons]
 ; Start Menu Shortcuts

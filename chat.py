@@ -13,11 +13,24 @@ import json
 import sys
 import urllib.request
 import urllib.error
-import readline  # enables arrow-key history in input()
+try:
+    import readline  # enables arrow-key history in input()
+except ImportError:
+    try:
+        import pyreadline3 as readline
+    except ImportError:
+        pass
+
 import textwrap
 import os
 import time
 from html.parser import HTMLParser
+
+if sys.platform == "win32":
+    try:
+        sys.stdout.reconfigure(encoding="utf-8", errors="replace")
+    except Exception:
+        pass
 
 # ── URL Fetching & Parsing ───────────────────────────────────────────────────
 

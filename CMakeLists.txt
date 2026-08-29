@@ -1,7 +1,7 @@
-cmake_minimum_required(VERSION 3.22)
+cmake_minimum_required(VERSION 3.18)
 
 # Set CUDA architectures before project() initializes the CUDA toolchain
-# sm_86 (Ampere/3090), sm_89 (Ada/4090/6000), sm_90 (Hopper), sm_100;sm_120 (Blackwell)
+# sm_86 (Ampere/3090/Ada/Hopper/Blackwell forward-compatible)
 if(NOT DEFINED CMAKE_CUDA_ARCHITECTURES)
     set(CMAKE_CUDA_ARCHITECTURES "86;89;90;100;120")
 endif()

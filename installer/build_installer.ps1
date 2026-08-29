@@ -45,7 +45,8 @@ foreach ($file in $RequiredFiles) {
 }
 
 # 3. Clean and prepare dist output directory
-$DistDir = "D:\dev\minniemoe\MinnieTheMoEcher\dist"
+$RepoRoot = Resolve-Path "$PSScriptRoot\.."
+$DistDir = "$RepoRoot\dist"
 if (Test-Path $DistDir) {
     Remove-Item -Path "$DistDir\*" -Recurse -Force -ErrorAction SilentlyContinue
 } else {
@@ -54,7 +55,7 @@ if (Test-Path $DistDir) {
 
 # 4. Compile Inno Setup package
 Write-Host "Compiling Inno Setup package..." -ForegroundColor Cyan
-$IssScript = "D:\dev\minniemoe\MinnieTheMoEcher\installer\Moecher_Setup.iss"
+$IssScript = "$PSScriptRoot\Moecher_Setup.iss"
 
 & $IsccExe $IssScript
 
