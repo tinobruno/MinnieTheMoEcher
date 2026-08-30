@@ -3391,233 +3391,33 @@ void store_kv_device_pos_cuda(
         kv_cache, kv_val, d_position, window, head_dim);
 }
 
-__global__ void prepare_combined_kv_kernel(
-    __nv_bfloat16* __restrict__ combined_kv,
-    int32_t* __restrict__ d_cache_len,
-    const __nv_bfloat16* __restrict__ raw_kv_cache,
-    const __nv_bfloat16* __restrict__ comp_kv_cache,
-    const int32_t* __restrict__ d_position,
-    const int32_t* __restrict__ d_comp_count,
-    int window, int head_dim, int ratio)
-{
-    int position = *d_position;
-    int raw_entries = (position + 1 < window) ? (position + 1) : window;
-    int comp_entries = (ratio > 0 && d_comp_count != nullptr) ? *d_comp_count : 0;
-    
-    if (threadIdx.x == 0 && blockIdx.x == 0) {
-        *d_cache_len = raw_entries + comp_entries;
-    }
-
-    int cache_pos = position % window;
-    int tid = threadIdx.x + blockIdx.x * blockDim.x;
-    int total_raw_elements = raw_entries * head_dim;
-
-    if (position + 1 > window) {
-        int after_pos = (cache_pos + 1) % window;
-        int tail = window - after_pos;
-        int tail_elements = tail * head_dim;
-
-        for (int i = tid; i < total_raw_elements; i += blockDim.x * gridDim.x) {
-            if (i < tail_elements) {
-                combined_kv[i] = raw_kv_cache[(size_t)after_pos * head_dim + i];
-            } else {
-                int head_part_idx = i - tail_elements;
-                combined_kv[i] = raw_kv_cache[head_part_idx];
-            }
-        }
-    } else {
-        for (int i = tid; i < total_raw_elements; i += blockDim.x * gridDim.x) {
-            combined_kv[i] = raw_kv_cache[i];
-        }
-    }
-
-    if (comp_entries > 0 && comp_kv_cache != nullptr) {
-        int comp_elements = comp_entries * head_dim;
-        for (int i = tid; i < comp_elements; i += blockDim.x * gridDim.x) {
-            combined_kv[(size_t)total_raw_elements + i] = comp_kv_cache[i];
-        }
-    }
-}
-
-void prepare_combined_kv_cuda(
-    __nv_bfloat16* combined_kv,
-    int32_t* d_cache_len,
-    const __nv_bfloat16* raw_kv_cache,
-    const __nv_bfloat16* comp_kv_cache,
-    const int32_t* d_position,
-    const int32_t* d_comp_count,
-    int window, int head_dim, int ratio,
-    cudaStream_t stream)
-{
-    int threads = 256;
-    int blocks = 64;
-    prepare_combined_kv_kernel<<<blocks, threads, 0, stream>>>(
-        combined_kv, d_cache_len, raw_kv_cache, comp_kv_cache,
-        d_position, d_comp_count, window, head_dim, ratio);
-}
-
-__global__ void mla_attention_device_len_kernel(
-    const __nv_bfloat16* __restrict__ q,
-    const __nv_bfloat16* __restrict__ kv,
-    const float* __restrict__ attn_sink,
-    __nv_bfloat16* __restrict__ out,
-    const int32_t* __restrict__ d_cache_len,
-    int max_cache_len,
-    int head_dim,
-    float scale)
-{
-    int h = blockIdx.x;
-    int tid = threadIdx.x;
-    int n_threads = blockDim.x;
-
-    // Dynamically allocated shared memory for scores
-    extern __shared__ float s_mem[];
-    float* scores = s_mem;
-
-    // Load Q for this head into shared memory
-    __shared__ float s_q[512];
-    for (int d = tid; d < head_dim; d += n_threads) {
-        s_q[d] = __bfloat162float(q[h * head_dim + d]);
-    }
-    __syncthreads();
-
-    int cache_len = (d_cache_len != nullptr) ? *d_cache_len : max_cache_len;
-    if (cache_len > max_cache_len) cache_len = max_cache_len;
-    if (cache_len < 1) cache_len = 1;
-
-    // 1. Q @ KV.T
-    for (int t = tid; t < cache_len; t += n_threads) {
-        const __nv_bfloat16* kv_t = kv + (size_t)t * head_dim;
-        float dot = 0.0f;
-        #pragma unroll 4
-        for (int d = 0; d < head_dim; d++) {
-            dot += s_q[d] * __bfloat162float(kv_t[d]);
-        }
-        scores[t] = dot * scale;
-    }
-    __syncthreads();
-
-    // 2. Softmax
-    float local_max = -1e38f;
-    for (int t = tid; t < cache_len; t += n_threads) {
-        local_max = fmaxf(local_max, scores[t]);
-    }
-    if (attn_sink != nullptr) {
-        local_max = fmaxf(local_max, attn_sink[h]);
-    }
-
-    // Warp-level max reduction
-    float warp_max = local_max;
-    #pragma unroll
-    for (int offset = 16; offset > 0; offset /= 2)
-        warp_max = fmaxf(warp_max, __shfl_down_sync(0xffffffff, warp_max, offset));
-
-    __shared__ float s_red[32];
-    int lane = tid & 31;
-    int warp = tid >> 5;
-    if (lane == 0) s_red[warp] = warp_max;
-    __syncthreads();
-
-    float block_max = (tid < (n_threads >> 5)) ? s_red[tid] : -1e38f;
-    #pragma unroll
-    for (int offset = 16; offset > 0; offset /= 2)
-        block_max = fmaxf(block_max, __shfl_down_sync(0xffffffff, block_max, offset));
-    if (tid == 0) s_red[0] = block_max;
-    __syncthreads();
-    block_max = s_red[0];
-
-    // Exp and sum
-    float local_sum = 0.0f;
-    for (int t = tid; t < cache_len; t += n_threads) {
-        float e = expf(scores[t] - block_max);
-        scores[t] = e;
-        local_sum += e;
-    }
-    if (tid == 0 && attn_sink != nullptr) {
-        local_sum += expf(attn_sink[h] - block_max);
-    }
-
-    // Warp-level sum reduction
-    float warp_sum = local_sum;
-    #pragma unroll
-    for (int offset = 16; offset > 0; offset /= 2)
-        warp_sum += __shfl_down_sync(0xffffffff, warp_sum, offset);
-    if (lane == 0) s_red[warp] = warp_sum;
-    __syncthreads();
-
-    float block_sum = (tid < (n_threads >> 5)) ? s_red[tid] : 0.0f;
-    #pragma unroll
-    for (int offset = 16; offset > 0; offset /= 2)
-        block_sum += __shfl_down_sync(0xffffffff, block_sum, offset);
-    if (tid == 0) s_red[0] = block_sum;
-    __syncthreads();
-    float inv_sum = 1.0f / s_red[0];
-
-    // Pre-normalize scores in shared memory
-    for (int t = tid; t < cache_len; t += n_threads) {
-        scores[t] *= inv_sum;
-    }
-    __syncthreads();
-
-    // 3. Normalize and compute out = scores @ KV
-    for (int d = tid; d < head_dim; d += n_threads) {
-        float v = 0.0f;
-        for (int t = 0; t < cache_len; t++) {
-            v += scores[t] * __bfloat162float(kv[(size_t)t * head_dim + d]);
-        }
-        out[(size_t)h * head_dim + d] = __float2bfloat16(v);
-    }
-}
-
-void mla_attention_device_len_cuda(
-    const __nv_bfloat16* q,
-    const __nv_bfloat16* kv,
-    const float* attn_sink,
-    __nv_bfloat16* out,
-    const int32_t* d_cache_len,
-    int max_cache_len,
-    int head_dim,
-    float scale,
-    cudaStream_t stream)
-{
-    int n_threads = 256;
-    size_t smem_bytes = max_cache_len * sizeof(float);
-    if (smem_bytes > 49152) {
-        static bool s_smem_device_configured = false;
-        if (!s_smem_device_configured) {
-            cudaFuncSetAttribute(mla_attention_device_len_kernel, cudaFuncAttributeMaxDynamicSharedMemorySize, 98304);
-            s_smem_device_configured = true;
-        }
-    }
-    int n_heads = 64;
-    mla_attention_device_len_kernel<<<n_heads, n_threads, smem_bytes, stream>>>(
-        q, kv, attn_sink, out, d_cache_len, max_cache_len, head_dim, scale);
-}
-
 // ════════════════════════════════════════════════════════════════════════════════
-//  Fused Flash-MLA Attention Kernel
+//  Fused Direct-Addressing Flash-MLA Attention Kernel
 //  Fuses:
 //   1. Raw Q Load + Unweighted RMSNorm (in SM shared memory)
 //   2. Forward RoPE (in SM shared memory)
-//   3. Q @ KV Attention Dot Products + Scaling
+//   3. Direct Dual-Cache Q @ KV Attention Dot Products + Scaling (Zero-Copy)
 //   4. Online Flash Softmax (Max + Exp + Sum Reductions + Attention Sink)
-//   5. Weighted Value Reduction (scores @ KV) into SM shared memory
+//   5. Direct Dual-Cache Weighted Value Reduction (Zero-Copy) into SM shared memory
 //   6. Inverse RoPE Rotation on output (in SM shared memory) + Output Store
 // ════════════════════════════════════════════════════════════════════════════════
 
 __global__ void mla_attention_fused_kernel(
     const __nv_bfloat16* __restrict__ raw_q,
-    const __nv_bfloat16* __restrict__ kv,
+    const __nv_bfloat16* __restrict__ raw_kv,
+    const __nv_bfloat16* __restrict__ comp_kv,
     const float* __restrict__ attn_sink,
     __nv_bfloat16* __restrict__ out,
-    const int32_t* __restrict__ d_cache_len,
     const int32_t* __restrict__ d_position,
+    const int32_t* __restrict__ d_comp_count,
     const float* __restrict__ freq_table,
     int max_cache_len,
     int head_dim,
     int rope_dim,
     float scale,
-    float q_norm_eps)
+    float q_norm_eps,
+    const uint8_t* __restrict__ comp_mask,
+    int window)
 {
     int h = blockIdx.x;
     int tid = threadIdx.x;
@@ -3680,13 +3480,32 @@ __global__ void mla_attention_fused_kernel(
     }
     __syncthreads();
 
-    // ── Step 3: Attention scores Q @ KV.T ────────────────────────────────────
-    int cache_len = (d_cache_len != nullptr) ? *d_cache_len : max_cache_len;
+    // ── Step 3: Direct Dual-Cache Attention Scores (Q @ KV.T) ─────────────────
+    // Exact DwarfStar context partitioning:
+    // When pos < window (pos < 128): raw cache holds all tokens 0..pos. n_comp = 0.
+    // When pos >= window (pos >= 128): raw cache holds sliding window of last 128 tokens,
+    // and comp cache holds previous compressed history.
+    int n_raw = (pos + 1 < window) ? (pos + 1) : window;
+    int n_comp = (pos + 1 > window && d_comp_count != nullptr && comp_kv != nullptr) ? *d_comp_count : 0;
+    int cache_len = n_raw + n_comp;
     if (cache_len > max_cache_len) cache_len = max_cache_len;
     if (cache_len < 1) cache_len = 1;
 
+    int raw_start = (pos + 1 > window) ? ((pos + 1) % window) : 0;
+
     for (int t = tid; t < cache_len; t += n_threads) {
-        const __nv_bfloat16* kv_t = kv + (size_t)t * head_dim;
+        const __nv_bfloat16* kv_t = nullptr;
+        if (t < n_raw) {
+            int raw_slot = (raw_start + t) % window;
+            kv_t = raw_kv + (size_t)raw_slot * head_dim;
+        } else {
+            int comp_slot = t - n_raw;
+            if (comp_mask != nullptr && comp_mask[comp_slot] == 0) {
+                scores[t] = -1e38f;
+                continue;
+            }
+            kv_t = comp_kv + (size_t)comp_slot * head_dim;
+        }
         float dot = 0.0f;
         #pragma unroll 4
         for (int d = 0; d < head_dim; d++) {
@@ -3696,7 +3515,7 @@ __global__ void mla_attention_fused_kernel(
     }
     __syncthreads();
 
-    // ── Step 4: Online Softmax Max + Exp + Sum ───────────────────────────────
+    // ── Step 4: Online Flash Softmax Max + Exp + Sum ─────────────────────────
     float local_max = -1e38f;
     for (int t = tid; t < cache_len; t += n_threads) {
         local_max = fmaxf(local_max, scores[t]);
@@ -3754,12 +3573,17 @@ __global__ void mla_attention_fused_kernel(
     }
     __syncthreads();
 
-    // ── Step 5: Weighted Value Reduction scores @ KV into s_out ──────────────
+    // ── Step 5: Direct Value Reduction (scores @ KV) into s_out ──────────────
     for (int d = tid; d < head_dim; d += n_threads) {
         float v = 0.0f;
         #pragma unroll 4
-        for (int t = 0; t < cache_len; t++) {
-            v += scores[t] * bf16_to_float(kv[(size_t)t * head_dim + d]);
+        for (int t = 0; t < n_raw; t++) {
+            int raw_slot = (raw_start + t) % window;
+            v += scores[t] * bf16_to_float(raw_kv[(size_t)raw_slot * head_dim + d]);
+        }
+        #pragma unroll 4
+        for (int t = 0; t < n_comp; t++) {
+            v += scores[n_raw + t] * bf16_to_float(comp_kv[(size_t)t * head_dim + d]);
         }
         s_out[d] = v;
     }
@@ -3787,17 +3611,20 @@ __global__ void mla_attention_fused_kernel(
 
 void mla_attention_fused_cuda(
     const __nv_bfloat16* raw_q,
-    const __nv_bfloat16* kv,
+    const __nv_bfloat16* raw_kv,
+    const __nv_bfloat16* comp_kv,
     const float* attn_sink,
     __nv_bfloat16* out,
-    const int32_t* d_cache_len,
     const int32_t* d_position,
+    const int32_t* d_comp_count,
     const float* freq_table,
     int max_cache_len,
     int head_dim,
     int rope_dim,
     float scale,
     float q_norm_eps,
+    const uint8_t* comp_mask,
+    int window,
     cudaStream_t stream)
 {
     int n_threads = 256;
@@ -3811,9 +3638,471 @@ void mla_attention_fused_cuda(
     }
     int n_heads = 64;
     mla_attention_fused_kernel<<<n_heads, n_threads, smem_bytes, stream>>>(
-        raw_q, kv, attn_sink, out,
-        d_cache_len, d_position, freq_table,
-        max_cache_len, head_dim, rope_dim, scale, q_norm_eps);
+        raw_q, raw_kv, comp_kv, attn_sink, out,
+        d_position, d_comp_count, freq_table,
+        max_cache_len, head_dim, rope_dim, scale, q_norm_eps,
+        comp_mask, window);
+}
+
+// ════════════════════════════════════════════════════════════════════════════════
+//  Device-Driven KV Compressor Step Kernel for CUDA Graph Decode
+// ════════════════════════════════════════════════════════════════════════════════
+
+__global__ void compressor_device_step_kernel(
+    const int32_t* __restrict__ d_position,
+    int32_t* __restrict__ d_comp_count,
+    const float* __restrict__ proj_kv,
+    const float* __restrict__ proj_gate,
+    float* __restrict__ comp_kv_state,
+    float* __restrict__ comp_score_state,
+    const float* __restrict__ comp_ape,
+    const __nv_bfloat16* __restrict__ comp_norm,
+    __nv_bfloat16* __restrict__ comp_kv_cache,
+    const float* __restrict__ rope_freqs_compressed,
+    int ratio,
+    int head_dim,
+    int rope_dim,
+    float rms_norm_eps,
+    const float* __restrict__ idx_proj_kv,
+    const float* __restrict__ idx_proj_gate,
+    float* __restrict__ idx_kv_state,
+    float* __restrict__ idx_score_state,
+    const float* __restrict__ idx_ape,
+    const __nv_bfloat16* __restrict__ idx_norm,
+    __nv_bfloat16* __restrict__ idx_comp_kv_cache)
+{
+    int pos = *d_position;
+    int pos_mod = pos % ratio;
+    bool overlap = (ratio == 4);
+    int coff = overlap ? 2 : 1;
+    int proj_dim = coff * head_dim; // 1024 for CSA
+    int state_idx = overlap ? (ratio + pos_mod) : pos_mod;
+
+    // 1. Copy attention projection to state slot & add APE bias
+    for (int i = threadIdx.x; i < proj_dim; i += blockDim.x) {
+        comp_kv_state[(size_t)state_idx * proj_dim + i] = proj_kv[i];
+        comp_score_state[(size_t)state_idx * proj_dim + i] = proj_gate[i] + comp_ape[(size_t)pos_mod * proj_dim + i];
+    }
+
+    // 2. If ratio == 4, copy indexer projection to state slot & add APE bias
+    if (idx_proj_kv != nullptr) {
+        int idx_proj_dim = 256;
+        for (int i = threadIdx.x; i < idx_proj_dim; i += blockDim.x) {
+            idx_kv_state[(size_t)state_idx * idx_proj_dim + i] = idx_proj_kv[i];
+            idx_score_state[(size_t)state_idx * idx_proj_dim + i] = idx_proj_gate[i] + idx_ape[(size_t)pos_mod * idx_proj_dim + i];
+        }
+    }
+    __syncthreads();
+
+    // 3. Check if compression boundary is reached
+    bool should_compress = ((pos + 1) % ratio == 0);
+    if (!should_compress) return;
+
+    __shared__ float s_pooled[512];
+    __shared__ float s_normed[512];
+    __shared__ float s_sq_sum;
+
+    // 4. Attention Softmax-Gated Pooling
+    for (int j = threadIdx.x; j < head_dim; j += blockDim.x) {
+        float max_score = -1e38f;
+        if (overlap) {
+            for (int r = 0; r < ratio; r++) {
+                float sp = comp_score_state[(size_t)r * proj_dim + j];
+                float sc = comp_score_state[(size_t)(ratio + r) * proj_dim + head_dim + j];
+                if (sp > max_score) max_score = sp;
+                if (sc > max_score) max_score = sc;
+            }
+            float denom = 0.0f;
+            float sum = 0.0f;
+            for (int r = 0; r < ratio; r++) {
+                float wp = expf(comp_score_state[(size_t)r * proj_dim + j] - max_score);
+                float wc = expf(comp_score_state[(size_t)(ratio + r) * proj_dim + head_dim + j] - max_score);
+                denom += wp + wc;
+                sum += wp * comp_kv_state[(size_t)r * proj_dim + j] + wc * comp_kv_state[(size_t)(ratio + r) * proj_dim + head_dim + j];
+            }
+            s_pooled[j] = denom > 0.0f ? (sum / denom) : 0.0f;
+        } else {
+            for (int r = 0; r < ratio; r++) {
+                float s = comp_score_state[(size_t)r * proj_dim + j];
+                if (s > max_score) max_score = s;
+            }
+            float denom = 0.0f;
+            float sum = 0.0f;
+            for (int r = 0; r < ratio; r++) {
+                float w = expf(comp_score_state[(size_t)r * proj_dim + j] - max_score);
+                denom += w;
+                sum += w * comp_kv_state[(size_t)r * proj_dim + j];
+            }
+            s_pooled[j] = denom > 0.0f ? (sum / denom) : 0.0f;
+        }
+    }
+    __syncthreads();
+
+    // 5. Attention RMSNorm
+    float thread_sq = 0.0f;
+    for (int j = threadIdx.x; j < head_dim; j += blockDim.x) {
+        thread_sq += s_pooled[j] * s_pooled[j];
+    }
+    #pragma unroll
+    for (int offset = 16; offset > 0; offset /= 2) {
+        thread_sq += __shfl_down_sync(0xffffffff, thread_sq, offset);
+    }
+    __shared__ float s_warp_sq[8];
+    int lane = threadIdx.x & 31;
+    int warp = threadIdx.x >> 5;
+    if (lane == 0) s_warp_sq[warp] = thread_sq;
+    __syncthreads();
+    if (warp == 0) {
+        float val = (lane < (blockDim.x >> 5)) ? s_warp_sq[lane] : 0.0f;
+        #pragma unroll
+        for (int offset = 4; offset > 0; offset /= 2) {
+            val += __shfl_down_sync(0xffffffff, val, offset);
+        }
+        if (lane == 0) s_sq_sum = val;
+    }
+    __syncthreads();
+
+    float rms_scale = rsqrtf(s_sq_sum / (float)head_dim + rms_norm_eps);
+    for (int j = threadIdx.x; j < head_dim; j += blockDim.x) {
+        s_normed[j] = s_pooled[j] * rms_scale * bf16_to_float(comp_norm[j]);
+    }
+    __syncthreads();
+
+    // 6. Attention RoPE (applied to tail rope_dim = 64)
+    int comp_pos = pos + 1 - ratio;
+    int half_rope = rope_dim / 2;
+    if (threadIdx.x < half_rope) {
+        int pair_id = threadIdx.x;
+        int base_idx = (head_dim - rope_dim) + 2 * pair_id;
+        float x0 = s_normed[base_idx];
+        float x1 = s_normed[base_idx + 1];
+        float cos_val = rope_freqs_compressed[comp_pos * half_rope * 2 + pair_id * 2];
+        float sin_val = rope_freqs_compressed[comp_pos * half_rope * 2 + pair_id * 2 + 1];
+        s_normed[base_idx]     = x0 * cos_val - x1 * sin_val;
+        s_normed[base_idx + 1] = x0 * sin_val + x1 * cos_val;
+    }
+    __syncthreads();
+
+    // 7. Store Attention Compressed Entry & Shift State
+    int comp_idx = *d_comp_count;
+    for (int j = threadIdx.x; j < head_dim; j += blockDim.x) {
+        comp_kv_cache[(size_t)comp_idx * head_dim + j] = float_to_bf16(s_normed[j]);
+    }
+    if (overlap) {
+        int half_elements = ratio * proj_dim;
+        for (int i = threadIdx.x; i < half_elements; i += blockDim.x) {
+            comp_kv_state[i] = comp_kv_state[half_elements + i];
+            comp_score_state[i] = comp_score_state[half_elements + i];
+        }
+    }
+    __syncthreads();
+
+    // 8. If ratio == 4, Indexer Compressor Pooling, RMSNorm, RoPE, Store & Shift
+    if (idx_proj_kv != nullptr) {
+        int idx_head_dim = 128;
+        int idx_proj_dim = 256;
+        __shared__ float s_idx_pooled[128];
+        __shared__ float s_idx_normed[128];
+        __shared__ float s_idx_sq_sum;
+
+        if (threadIdx.x < idx_head_dim) {
+            int j = threadIdx.x;
+            float max_score = -1e38f;
+            for (int r = 0; r < ratio; r++) {
+                float sp = idx_score_state[(size_t)r * idx_proj_dim + j];
+                float sc = idx_score_state[(size_t)(ratio + r) * idx_proj_dim + idx_head_dim + j];
+                if (sp > max_score) max_score = sp;
+                if (sc > max_score) max_score = sc;
+            }
+            float denom = 0.0f;
+            float sum = 0.0f;
+            for (int r = 0; r < ratio; r++) {
+                float wp = expf(idx_score_state[(size_t)r * idx_proj_dim + j] - max_score);
+                float wc = expf(idx_score_state[(size_t)(ratio + r) * idx_proj_dim + idx_head_dim + j] - max_score);
+                denom += wp + wc;
+                sum += wp * idx_kv_state[(size_t)r * idx_proj_dim + j] + wc * idx_kv_state[(size_t)(ratio + r) * idx_proj_dim + idx_head_dim + j];
+            }
+            s_idx_pooled[j] = denom > 0.0f ? (sum / denom) : 0.0f;
+        }
+        __syncthreads();
+
+        float idx_thread_sq = 0.0f;
+        if (threadIdx.x < idx_head_dim) {
+            idx_thread_sq = s_idx_pooled[threadIdx.x] * s_idx_pooled[threadIdx.x];
+        }
+        #pragma unroll
+        for (int offset = 16; offset > 0; offset /= 2) {
+            idx_thread_sq += __shfl_down_sync(0xffffffff, idx_thread_sq, offset);
+        }
+        if (lane == 0) s_warp_sq[warp] = idx_thread_sq;
+        __syncthreads();
+        if (warp == 0) {
+            float val = (lane < (blockDim.x >> 5)) ? s_warp_sq[lane] : 0.0f;
+            #pragma unroll
+            for (int offset = 4; offset > 0; offset /= 2) {
+                val += __shfl_down_sync(0xffffffff, val, offset);
+            }
+            if (lane == 0) s_idx_sq_sum = val;
+        }
+        __syncthreads();
+
+        float idx_rms_scale = rsqrtf(s_idx_sq_sum / (float)idx_head_dim + rms_norm_eps);
+        if (threadIdx.x < idx_head_dim) {
+            int j = threadIdx.x;
+            s_idx_normed[j] = s_idx_pooled[j] * idx_rms_scale * bf16_to_float(idx_norm[j]);
+        }
+        __syncthreads();
+
+        if (threadIdx.x < half_rope) {
+            int pair_id = threadIdx.x;
+            int base_idx = (idx_head_dim - rope_dim) + 2 * pair_id;
+            float x0 = s_idx_normed[base_idx];
+            float x1 = s_idx_normed[base_idx + 1];
+            float cos_val = rope_freqs_compressed[comp_pos * half_rope * 2 + pair_id * 2];
+            float sin_val = rope_freqs_compressed[comp_pos * half_rope * 2 + pair_id * 2 + 1];
+            s_idx_normed[base_idx]     = x0 * cos_val - x1 * sin_val;
+            s_idx_normed[base_idx + 1] = x0 * sin_val + x1 * cos_val;
+        }
+        __syncthreads();
+
+        if (threadIdx.x < idx_head_dim) {
+            int j = threadIdx.x;
+            idx_comp_kv_cache[(size_t)comp_idx * idx_head_dim + j] = float_to_bf16(s_idx_normed[j]);
+        }
+        int idx_half_elements = ratio * idx_proj_dim;
+        for (int i = threadIdx.x; i < idx_half_elements; i += blockDim.x) {
+            idx_kv_state[i] = idx_kv_state[idx_half_elements + i];
+            idx_score_state[i] = idx_score_state[idx_half_elements + i];
+        }
+        __syncthreads();
+    }
+
+    // 9. Increment Device Compressed Entry Counter
+    if (threadIdx.x == 0) {
+        *d_comp_count += 1;
+    }
+}
+
+void compressor_device_step_cuda(
+    const int32_t* d_position,
+    int32_t* d_comp_count,
+    const float* proj_kv,
+    const float* proj_gate,
+    float* comp_kv_state,
+    float* comp_score_state,
+    const float* comp_ape,
+    const __nv_bfloat16* comp_norm,
+    __nv_bfloat16* comp_kv_cache,
+    const float* rope_freqs_compressed,
+    int ratio,
+    int head_dim,
+    int rope_dim,
+    float rms_norm_eps,
+    const float* idx_proj_kv,
+    const float* idx_proj_gate,
+    float* idx_kv_state,
+    float* idx_score_state,
+    const float* idx_ape,
+    const __nv_bfloat16* idx_norm,
+    __nv_bfloat16* idx_comp_kv_cache,
+    cudaStream_t stream)
+{
+    compressor_device_step_kernel<<<1, 256, 0, stream>>>(
+        d_position, d_comp_count,
+        proj_kv, proj_gate,
+        comp_kv_state, comp_score_state, comp_ape, comp_norm,
+        comp_kv_cache, rope_freqs_compressed,
+        ratio, head_dim, rope_dim, rms_norm_eps,
+        idx_proj_kv, idx_proj_gate,
+        idx_kv_state, idx_score_state, idx_ape, idx_norm,
+        idx_comp_kv_cache);
+}
+
+// ════════════════════════════════════════════════════════════════════════════════
+//  DeepSeek V4 Indexer Scoring and Top-K Selection (Device-Driven)
+// ════════════════════════════════════════════════════════════════════════════════
+
+__global__ void indexer_score_kernel(
+    float* __restrict__ out_scores,
+    const __nv_bfloat16* __restrict__ index_comp, // [max_comp, 128]
+    const __nv_bfloat16* __restrict__ q,          // [64, 128]
+    const float* __restrict__ weights,            // [64]
+    const int32_t* __restrict__ d_comp_count,
+    int max_comp)
+{
+    int n_comp = *d_comp_count;
+    int c = blockIdx.x;
+    if (c >= n_comp || c >= max_comp) return;
+    int tid = threadIdx.x;
+
+    const __nv_bfloat16* kv_c = index_comp + (size_t)c * 128;
+    __shared__ float s_kv[128];
+    if (tid < 128) {
+        s_kv[tid] = bf16_to_float(kv_c[tid]);
+    }
+    __syncthreads();
+
+    float local_total = 0.0f;
+    for (int h = tid; h < 64; h += blockDim.x) {
+        const __nv_bfloat16* q_h = q + (size_t)h * 128;
+        float dot = 0.0f;
+        #pragma unroll 4
+        for (int d = 0; d < 128; d++) {
+            dot += s_kv[d] * bf16_to_float(q_h[d]);
+        }
+        if (dot > 0.0f) {
+            local_total += dot * weights[h];
+        }
+    }
+
+    #pragma unroll
+    for (int offset = 16; offset > 0; offset /= 2) {
+        local_total += __shfl_down_sync(0xffffffff, local_total, offset);
+    }
+
+    __shared__ float s_warp_scores[8];
+    int lane = tid & 31;
+    int warp = tid >> 5;
+    if (lane == 0) {
+        s_warp_scores[warp] = local_total;
+    }
+    __syncthreads();
+
+    if (warp == 0) {
+        float val = (lane < (blockDim.x >> 5)) ? s_warp_scores[lane] : 0.0f;
+        #pragma unroll
+        for (int offset = 4; offset > 0; offset /= 2) {
+            val += __shfl_down_sync(0xffffffff, val, offset);
+        }
+        if (lane == 0) {
+            out_scores[c] = val;
+        }
+    }
+}
+
+__global__ void indexer_mask_topk_kernel(
+    uint8_t* __restrict__ out_mask,
+    const float* __restrict__ scores,
+    const int32_t* __restrict__ d_comp_count,
+    int max_comp,
+    int top_k)
+{
+    int n_comp = *d_comp_count;
+    if (n_comp <= 0) return;
+    int tid = threadIdx.x;
+    int n_threads = blockDim.x;
+
+    if (n_comp > max_comp) n_comp = max_comp;
+
+    // Fast path: all compressed entries fit in top_k
+    if (n_comp <= top_k) {
+        for (int i = tid; i < n_comp; i += n_threads) {
+            out_mask[i] = 1;
+        }
+        return;
+    }
+
+    // 1. Parallel reduction across all threads to find min_val and max_val of scores
+    float local_min = 1e38f;
+    float local_max = -1e38f;
+    for (int i = tid; i < n_comp; i += n_threads) {
+        float v = scores[i];
+        if (v < local_min) local_min = v;
+        if (v > local_max) local_max = v;
+    }
+
+    #pragma unroll
+    for (int offset = 16; offset > 0; offset /= 2) {
+        local_min = fminf(local_min, __shfl_down_sync(0xffffffff, local_min, offset));
+        local_max = fmaxf(local_max, __shfl_down_sync(0xffffffff, local_max, offset));
+    }
+
+    __shared__ float s_min[8];
+    __shared__ float s_max[8];
+    int lane = tid & 31;
+    int warp = tid >> 5;
+    if (lane == 0) {
+        s_min[warp] = local_min;
+        s_max[warp] = local_max;
+    }
+    __syncthreads();
+
+    if (warp == 0) {
+        int n_warps = n_threads >> 5;
+        local_min = (lane < n_warps) ? s_min[lane] : 1e38f;
+        local_max = (lane < n_warps) ? s_max[lane] : -1e38f;
+        #pragma unroll
+        for (int offset = 4; offset > 0; offset /= 2) {
+            local_min = fminf(local_min, __shfl_down_sync(0xffffffff, local_min, offset));
+            local_max = fmaxf(local_max, __shfl_down_sync(0xffffffff, local_max, offset));
+        }
+        if (lane == 0) {
+            s_min[0] = local_min;
+            s_max[0] = local_max;
+        }
+    }
+    __syncthreads();
+
+    float lo = s_min[0];
+    float hi = s_max[0];
+
+    // 2. Parallel Binary Search for threshold T across all 256 threads (12 iterations = <0.5 us)
+    __shared__ int s_count[8];
+    for (int iter = 0; iter < 12; iter++) {
+        float mid = 0.5f * (lo + hi);
+        int local_cnt = 0;
+        for (int i = tid; i < n_comp; i += n_threads) {
+            if (scores[i] >= mid) local_cnt++;
+        }
+
+        #pragma unroll
+        for (int offset = 16; offset > 0; offset /= 2) {
+            local_cnt += __shfl_down_sync(0xffffffff, local_cnt, offset);
+        }
+        if (lane == 0) s_count[warp] = local_cnt;
+        __syncthreads();
+
+        if (warp == 0) {
+            int n_warps = n_threads >> 5;
+            int total = (lane < n_warps) ? s_count[lane] : 0;
+            #pragma unroll
+            for (int offset = 4; offset > 0; offset /= 2) {
+                total += __shfl_down_sync(0xffffffff, total, offset);
+            }
+            if (lane == 0) s_count[0] = total;
+        }
+        __syncthreads();
+
+        if (s_count[0] >= top_k) {
+            lo = mid;
+        } else {
+            hi = mid;
+        }
+    }
+
+    // 3. Parallel write selection mask
+    float threshold = lo;
+    for (int i = tid; i < n_comp; i += n_threads) {
+        out_mask[i] = (scores[i] >= threshold) ? 1 : 0;
+    }
+}
+
+void indexer_score_and_mask_cuda(
+    uint8_t* out_mask,
+    float* out_scores,
+    const __nv_bfloat16* index_comp,
+    const __nv_bfloat16* q,
+    const float* weights,
+    const int32_t* d_comp_count,
+    int max_comp_entries,
+    int top_k,
+    cudaStream_t stream)
+{
+    indexer_score_kernel<<<max_comp_entries, 128, 0, stream>>>(
+        out_scores, index_comp, q, weights, d_comp_count, max_comp_entries);
+
+    indexer_mask_topk_kernel<<<1, 256, 0, stream>>>(
+        out_mask, out_scores, d_comp_count, max_comp_entries, top_k);
 }
 
 
@@ -4430,7 +4719,8 @@ __global__ void argmax_f32_stage1_kernel(
 }
 
 __global__ void argmax_f32_stage2_kernel(
-    int32_t* __restrict__ out,
+    int32_t* __restrict__ out_idx,
+    float* __restrict__ out_max,
     const float* __restrict__ block_maxes,
     const int32_t* __restrict__ block_indices,
     int n_blocks)
@@ -4474,7 +4764,8 @@ __global__ void argmax_f32_stage2_kernel(
             }
         }
         if (lane == 0) {
-            *out = max_idx;
+            if (out_idx != nullptr) *out_idx = max_idx;
+            if (out_max != nullptr) *out_max = max_val;
         }
     }
 }
@@ -4488,29 +4779,32 @@ void argmax_f32_cuda(int32_t* out, const float* logits, int n, cudaStream_t stre
         cudaMalloc(&s_d_block_indices, N_BLOCKS * sizeof(int32_t));
     }
     argmax_f32_stage1_kernel<<<N_BLOCKS, 256, 0, stream>>>(s_d_block_maxes, s_d_block_indices, logits, n);
-    argmax_f32_stage2_kernel<<<1, 128, 0, stream>>>(out, s_d_block_maxes, s_d_block_indices, N_BLOCKS);
+    argmax_f32_stage2_kernel<<<1, 128, 0, stream>>>(out, nullptr, s_d_block_maxes, s_d_block_indices, N_BLOCKS);
 }
 
-// ── GPU-Native Multinomial Softmax Sampling ─────────────────────────────────
+// ── GPU-Native Multinomial Softmax Sampling with Min-P Filtering ─────────────
 __global__ void logits_exp_sum_stage1_kernel(
     float* __restrict__ block_sums,
     float* __restrict__ logits,
     int n,
     float inv_temp,
-    const float* __restrict__ block_maxes,
-    int n_blocks)
+    const float* __restrict__ d_global_max,
+    float min_p)
 {
     __shared__ float s_sum[32];
     int tid = threadIdx.x;
     int gid = blockIdx.x * blockDim.x + threadIdx.x;
     int stride = gridDim.x * blockDim.x;
 
-    float max_v = block_maxes ? block_maxes[0] : 0.0f;
+    float max_v = (d_global_max != nullptr) ? *d_global_max : 0.0f;
     float sum = 0.0f;
 
     for (int i = gid; i < n; i += stride) {
         float v = logits[i];
         float e = expf((v - max_v) * inv_temp);
+        if (min_p > 0.0f && e < min_p) {
+            e = 0.0f;
+        }
         logits[i] = e;
         sum += e;
     }
@@ -4538,6 +4832,7 @@ __global__ void logits_sample_stage2_kernel(
     int32_t* __restrict__ out,
     const float* __restrict__ logits,
     const float* __restrict__ block_sums,
+    const int32_t* __restrict__ d_best_id,
     int n,
     int n_blocks,
     float rand_val)
@@ -4566,15 +4861,16 @@ __global__ void logits_sample_stage2_kernel(
     __syncthreads();
 
     total_sum = s_sum[0];
+    int best_id = (d_best_id != nullptr) ? *d_best_id : 0;
     if (total_sum <= 0.0f) {
-        if (tid == 0) *out = 0;
+        if (tid == 0) *out = best_id;
         return;
     }
 
     if (tid == 0) {
         float target = rand_val * total_sum;
         float cum = 0.0f;
-        int sampled_id = 0;
+        int sampled_id = best_id; // Default fallback to true argmax token
         for (int i = 0; i < n; i++) {
             cum += logits[i];
             if (cum >= target) {
@@ -4592,20 +4888,24 @@ void sample_multinomial_f32_cuda(
     int n,
     float temperature,
     float rand_val,
+    float min_p,
     cudaStream_t stream)
 {
     static float* s_d_block_maxes = nullptr;
     static int32_t* s_d_block_indices = nullptr;
     static float* s_d_block_sums = nullptr;
+    static float* s_d_global_max = nullptr;
     static const int N_BLOCKS = 128;
     if (!s_d_block_maxes) {
         cudaMalloc(&s_d_block_maxes, N_BLOCKS * sizeof(float));
         cudaMalloc(&s_d_block_indices, N_BLOCKS * sizeof(int32_t));
         cudaMalloc(&s_d_block_sums, N_BLOCKS * sizeof(float));
+        cudaMalloc(&s_d_global_max, sizeof(float));
     }
     argmax_f32_stage1_kernel<<<N_BLOCKS, 256, 0, stream>>>(s_d_block_maxes, s_d_block_indices, logits, n);
+    argmax_f32_stage2_kernel<<<1, 128, 0, stream>>>(out, s_d_global_max, s_d_block_maxes, s_d_block_indices, N_BLOCKS);
 
     float inv_temp = 1.0f / fmaxf(temperature, 1e-4f);
-    logits_exp_sum_stage1_kernel<<<N_BLOCKS, 256, 0, stream>>>(s_d_block_sums, logits, n, inv_temp, s_d_block_maxes, N_BLOCKS);
-    logits_sample_stage2_kernel<<<1, 128, 0, stream>>>(out, logits, s_d_block_sums, n, N_BLOCKS, rand_val);
+    logits_exp_sum_stage1_kernel<<<N_BLOCKS, 256, 0, stream>>>(s_d_block_sums, logits, n, inv_temp, s_d_global_max, min_p);
+    logits_sample_stage2_kernel<<<1, 128, 0, stream>>>(out, logits, s_d_block_sums, out, n, N_BLOCKS, rand_val);
 }

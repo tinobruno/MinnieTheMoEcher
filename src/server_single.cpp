@@ -1265,6 +1265,17 @@ public:
         GPUTensor comp_kv_state;     // [coff * ratio, coff * head_dim] F32
         GPUTensor comp_score_state;  // [coff * ratio, coff * head_dim] F32
 
+        // Indexer (for layers with compress_ratio == 4)
+        GPUTensor indexer_comp_wkv;
+        GPUTensor indexer_comp_wgate;
+        GPUTensor indexer_comp_ape;
+        GPUTensor indexer_comp_norm;
+        GPUTensor indexer_weights_proj;
+        GPUTensor indexer_wq_b_w, indexer_wq_b_s;
+        GPUTensor indexer_comp_kv_cache;  // [max_compressed_entries, 128] BF16
+        GPUTensor indexer_comp_kv_state;     // [2 * ratio, 2 * 128] F32
+        GPUTensor indexer_comp_score_state;  // [2 * ratio, 2 * 128] F32
+
         // Gate
         GPUTensor gate_w;              // [n_experts, hidden] BF16
         GPUTensor gate_bias;           // [n_experts] F32 (null for hash layers)
@@ -1373,7 +1384,13 @@ public:
     GPUTensor buf_comp_proj_;    // F32 working buffer for compressor projections
     GPUTensor buf_comp_out_;     // F32 working buffer for compressor pooling output
     GPUTensor buf_comp_bf16_;    // BF16 working buffer for compressed entry (head_dim)
-    GPUTensor buf_combined_kv_;  // BF16 buffer for combined raw+compressed KV
+    GPUTensor buf_indexer_q_;    // [64 * 128] BF16 for indexer query heads
+    GPUTensor buf_indexer_weights_bf16_; // [64] BF16
+    GPUTensor buf_indexer_weights_f32_;  // [64] F32
+    GPUTensor buf_indexer_scores_;       // [max_compressed_entries] F32
+    GPUTensor buf_indexer_mask_;         // [max_compressed_entries] uint8_t
+    GPUTensor buf_indexer_proj_kv_;      // [256] F32
+    GPUTensor buf_indexer_proj_gate_;    // [256] F32
 
     // Device-driven inputs for CUDA Graph & Device ArgMax
     GPUTensor buf_input_token_;  // [1] int32_t on GPU
@@ -1892,6 +1909,23 @@ public:
                                                -std::numeric_limits<float>::infinity());
                     CUDA_CHECK(cudaMemcpy(layers_[l].comp_score_state.data, neg_inf.data(),
                                            neg_inf.size() * sizeof(float), cudaMemcpyHostToDevice));
+                }
+                if (ratio == 4) {
+                    if (layers_[l].indexer_comp_kv_cache.data)
+                        CUDA_CHECK(cudaMemset(layers_[l].indexer_comp_kv_cache.data, 0,
+                                               layers_[l].indexer_comp_kv_cache.size_bytes));
+                    if (layers_[l].indexer_comp_kv_state.data)
+                        CUDA_CHECK(cudaMemset(layers_[l].indexer_comp_kv_state.data, 0,
+                                               layers_[l].indexer_comp_kv_state.size_bytes));
+                    if (layers_[l].indexer_comp_score_state.data) {
+                        int indexer_head_dim = 128;
+                        int indexer_proj_dim = 2 * indexer_head_dim;
+                        int indexer_state_rows = 2 * ratio;
+                        std::vector<float> neg_inf_idx(indexer_state_rows * indexer_proj_dim,
+                                                       -std::numeric_limits<float>::infinity());
+                        CUDA_CHECK(cudaMemcpy(layers_[l].indexer_comp_score_state.data, neg_inf_idx.data(),
+                                               neg_inf_idx.size() * sizeof(float), cudaMemcpyHostToDevice));
+                    }
                 }
             }
         }
@@ -2455,6 +2489,32 @@ private:
                                        neg_inf.size() * sizeof(float), cudaMemcpyHostToDevice));
 
                 LOG_INFO("  Layer %d: compressor loaded (ratio=%d, coff=%d, max_comp=%d)", l, ratio, coff, max_comp);
+
+                if (ratio == 4) {
+                    load_tensor(lw.indexer_comp_wkv, prefix + ".attn.indexer.compressor.wkv.weight");
+                    load_tensor(lw.indexer_comp_wgate, prefix + ".attn.indexer.compressor.wgate.weight");
+                    load_tensor(lw.indexer_comp_ape, prefix + ".attn.indexer.compressor.ape");
+                    load_tensor(lw.indexer_comp_norm, prefix + ".attn.indexer.compressor.norm.weight");
+                    load_tensor(lw.indexer_weights_proj, prefix + ".attn.indexer.weights_proj.weight");
+
+                    if (!load_quant_tensor(lw.indexer_wq_b_w, lw.indexer_wq_b_s, prefix + ".attn.indexer.wq_b.weight")) {
+                        load_tensor(lw.indexer_wq_b_w, prefix + ".attn.indexer.wq_b.weight");
+                        load_tensor(lw.indexer_wq_b_s, prefix + ".attn.indexer.wq_b.scale");
+                    }
+
+                    int indexer_head_dim = 128;
+                    lw.indexer_comp_kv_cache.alloc((size_t)max_comp * indexer_head_dim * sizeof(__nv_bfloat16));
+                    CUDA_CHECK(cudaMemset(lw.indexer_comp_kv_cache.data, 0, lw.indexer_comp_kv_cache.size_bytes));
+
+                    int indexer_proj_dim = 2 * indexer_head_dim;
+                    int indexer_state_rows = 2 * ratio;
+                    lw.indexer_comp_kv_state.alloc((size_t)indexer_state_rows * indexer_proj_dim * sizeof(float));
+                    lw.indexer_comp_score_state.alloc((size_t)indexer_state_rows * indexer_proj_dim * sizeof(float));
+                    CUDA_CHECK(cudaMemset(lw.indexer_comp_kv_state.data, 0, lw.indexer_comp_kv_state.size_bytes));
+                    std::vector<float> neg_inf_idx(indexer_state_rows * indexer_proj_dim, -std::numeric_limits<float>::infinity());
+                    CUDA_CHECK(cudaMemcpy(lw.indexer_comp_score_state.data, neg_inf_idx.data(),
+                                           neg_inf_idx.size() * sizeof(float), cudaMemcpyHostToDevice));
+                }
             }
 
             // Gate
@@ -2575,9 +2635,15 @@ private:
         buf_comp_out_.alloc(max_comp_dim * sizeof(float));   // for pooling output
         buf_comp_bf16_.alloc(head_dim_val * sizeof(__nv_bfloat16));  // compressed entry in BF16
 
-        // Combined KV buffer: raw window + max compressed entries
-        int max_combined = (cfg_.sliding_window > 0 ? cfg_.sliding_window : 64) + cfg_.max_compressed_entries;
-        buf_combined_kv_.alloc((size_t)max_combined * head_dim_val * sizeof(__nv_bfloat16));
+        // Indexer buffers
+        int max_comp_entries = cfg_.max_compressed_entries > 0 ? cfg_.max_compressed_entries : 2048;
+        buf_indexer_q_.alloc(64 * 128 * sizeof(__nv_bfloat16));
+        buf_indexer_weights_bf16_.alloc(64 * sizeof(__nv_bfloat16));
+        buf_indexer_weights_f32_.alloc(64 * sizeof(float));
+        buf_indexer_scores_.alloc(max_comp_entries * sizeof(float));
+        buf_indexer_mask_.alloc(max_comp_entries * sizeof(uint8_t));
+        buf_indexer_proj_kv_.alloc(256 * sizeof(float));
+        buf_indexer_proj_gate_.alloc(256 * sizeof(float));
 
         buf_argmax_out_.alloc(sizeof(int32_t));
 
@@ -2708,14 +2774,14 @@ private:
         }
     }
 
-    // ── KV Compressor Forward ───────────────────────────────────────────────
+    // ── KV Compressor Forward (Device-Driven for CUDA Graph) ────────────────
     // Implements gated pooling compression for CSA (ratio=4, overlap) and
-    // HCA (ratio=128, non-overlap) layers following the DeepSeek V4 paper.
+    // HCA (ratio=128, non-overlap) layers following DeepSeek V4 architecture.
     //
-    // Called once per token per compressed layer. Accumulates kv/score state
-    // and emits a compressed entry every `ratio` tokens.
+    // All state updates, pooling, RMSNorm, RoPE, and counter increments are
+    // executed inside GPU kernels, enabling full CUDA Graph capture and replay.
 
-    void forward_compressor(int layer_id, int position) {
+    void forward_compressor(int layer_id) {
         auto& lw = layers_[layer_id];
         int ratio = cfg_.layer_compress_ratio(layer_id);
         if (ratio <= 0) return;
@@ -2725,141 +2791,51 @@ private:
         int rope_dim = cfg_.qk_rope_head_dim;
         bool overlap = (ratio == 4);
         int coff = overlap ? 2 : 1;
-        int proj_dim = coff * head_dim_val;  // output dim of wkv/wgate
-        int state_rows = coff * ratio;  // total rows in state: 4 for HCA, 8 for CSA
+        int proj_dim = coff * head_dim_val; // 1024 for CSA
 
-        // 1. Project hidden state through compressor wkv: [proj_dim] = wkv @ hidden
+        // 1. Attention Compressor Projections: [proj_dim] = wkv @ hidden, wgate @ hidden
         gemv_bf16_cuda(buf_comp_proj_.f32(), lw.comp_wkv.bf16(),
                        buf_hidden_.bf16(), proj_dim, dim, main_stream_);
-
-        // State index: cycles through all state_rows slots via modular arithmetic
-        // State index:
-        // For CSA (ratio=4, overlap): always write into second half (rows 4..7)
-        // For HCA (ratio=128, non-overlap): write into rows 0..127
-        int pos_mod = position % ratio;
-        int state_idx = overlap ? (ratio + pos_mod) : pos_mod;
-
-        // Copy kv projection to state slot
-        CUDA_CHECK(cudaMemcpyAsync(
-            lw.comp_kv_state.f32() + (size_t)state_idx * proj_dim,
-            buf_comp_proj_.f32(), proj_dim * sizeof(float),
-            cudaMemcpyDeviceToDevice, main_stream_));
-
-        // 2. Project hidden state through compressor wgate: [proj_dim]
         gemv_bf16_cuda(buf_comp_out_.f32(), lw.comp_wgate.bf16(),
                        buf_hidden_.bf16(), proj_dim, dim, main_stream_);
 
-        // 3. Add APE bias to gate scores: row = position % ratio
-        CUDA_CHECK(cudaMemcpyAsync(
-            lw.comp_score_state.f32() + (size_t)state_idx * proj_dim,
-            buf_comp_out_.f32(), proj_dim * sizeof(float),
-            cudaMemcpyDeviceToDevice, main_stream_));
-
-        // Add APE bias: score_state[state_idx] += ape[pos_mod]
-        float alpha_one = 1.0f;
-        float* score_ptr = lw.comp_score_state.f32() + (size_t)state_idx * proj_dim;
-        const float* ape_ptr = lw.comp_ape.f32() + (size_t)pos_mod * proj_dim;
-        CUBLAS_CHECK(cublasSaxpy(cublas_handle_, proj_dim, &alpha_one,
-                                 ape_ptr, 1, score_ptr, 1));
-
-        // 4. Check if we have a complete block to compress
-        bool should_compress = ((position + 1) % ratio == 0);
-        if (!should_compress) return;
-
-        // 5. Perform softmax-gated pooling
-        if (overlap) {
-            // CSA overlap:
-            // Rows 0..ratio-1 (first half) contain previous block
-            // Rows ratio..2*ratio-1 (second half) contain current block
-            //
-            // Reference logic:
-            //   first_half  = state[:ratio, :head_dim]    (rows 0-3, first head_dim dims)
-            //   second_half = state[ratio:, head_dim:]    (rows 4-7, second head_dim dims)
-            //   pool_input  = cat(first_half, second_half) → [2*ratio, head_dim]
-            //   pool_score  = cat(score_first_half, score_second_half) → [2*ratio, head_dim]
-
-            // Use buf_dequant_ as temp workspace
-            float* tmp_kv = (float*)buf_dequant_.data;
-            float* tmp_score = tmp_kv + 2 * ratio * head_dim_val;
-
-            // First half: rows 0..ratio-1, take first head_dim dims
-            for (int i = 0; i < ratio; i++) {
-                CUDA_CHECK(cudaMemcpyAsync(
-                    tmp_kv + (size_t)i * head_dim_val,
-                    lw.comp_kv_state.f32() + (size_t)i * proj_dim,
-                    head_dim_val * sizeof(float), cudaMemcpyDeviceToDevice, main_stream_));
-                CUDA_CHECK(cudaMemcpyAsync(
-                    tmp_score + (size_t)i * head_dim_val,
-                    lw.comp_score_state.f32() + (size_t)i * proj_dim,
-                    head_dim_val * sizeof(float), cudaMemcpyDeviceToDevice, main_stream_));
-            }
-            // Second half: rows ratio..2*ratio-1, take second head_dim dims (offset by head_dim)
-            for (int i = 0; i < ratio; i++) {
-                CUDA_CHECK(cudaMemcpyAsync(
-                    tmp_kv + (size_t)(ratio + i) * head_dim_val,
-                    lw.comp_kv_state.f32() + (size_t)(ratio + i) * proj_dim + head_dim_val,
-                    head_dim_val * sizeof(float), cudaMemcpyDeviceToDevice, main_stream_));
-                CUDA_CHECK(cudaMemcpyAsync(
-                    tmp_score + (size_t)(ratio + i) * head_dim_val,
-                    lw.comp_score_state.f32() + (size_t)(ratio + i) * proj_dim + head_dim_val,
-                    head_dim_val * sizeof(float), cudaMemcpyDeviceToDevice, main_stream_));
-            }
-
-            // Pool: softmax over 2*ratio rows, weighted sum -> [head_dim]
-            compressor_pool_cuda(buf_comp_out_.f32(), tmp_kv, tmp_score,
-                                 2 * ratio, head_dim_val, main_stream_);
-
-            // Shift second half (rows 4..7) into first half (rows 0..3) for next block
-            size_t half_bytes = (size_t)ratio * proj_dim * sizeof(float);
-            CUDA_CHECK(cudaMemcpyAsync(
-                lw.comp_kv_state.f32(),
-                lw.comp_kv_state.f32() + (size_t)ratio * proj_dim,
-                half_bytes, cudaMemcpyDeviceToDevice, main_stream_));
-            CUDA_CHECK(cudaMemcpyAsync(
-                lw.comp_score_state.f32(),
-                lw.comp_score_state.f32() + (size_t)ratio * proj_dim,
-                half_bytes, cudaMemcpyDeviceToDevice, main_stream_));
-            CUDA_CHECK(cudaMemcpyAsync(
-                lw.comp_kv_state.f32() + (size_t)ratio * proj_dim,
-                lw.comp_kv_state.f32(),
-                half_bytes, cudaMemcpyDeviceToDevice, main_stream_));
-            CUDA_CHECK(cudaMemcpyAsync(
-                lw.comp_score_state.f32() + (size_t)ratio * proj_dim,
-                lw.comp_score_state.f32(),
-                half_bytes, cudaMemcpyDeviceToDevice, main_stream_));
-        } else {
-            // HCA non-overlapping: pool over ratio rows
-            compressor_pool_cuda(buf_comp_out_.f32(),
-                                 lw.comp_kv_state.f32(),
-                                 lw.comp_score_state.f32(),
-                                 ratio, head_dim_val, main_stream_);
+        // 2. Indexer Compressor Projections: [256] = indexer_comp_wkv @ hidden, indexer_comp_wgate @ hidden
+        const float* idx_proj_kv = nullptr;
+        const float* idx_proj_gate = nullptr;
+        if (ratio == 4 && lw.indexer_comp_wkv.data) {
+            int idx_proj_dim = 256;
+            gemv_bf16_cuda(buf_indexer_proj_kv_.f32(), lw.indexer_comp_wkv.bf16(),
+                           buf_hidden_.bf16(), idx_proj_dim, dim, main_stream_);
+            gemv_bf16_cuda(buf_indexer_proj_gate_.f32(), lw.indexer_comp_wgate.bf16(),
+                           buf_hidden_.bf16(), idx_proj_dim, dim, main_stream_);
+            idx_proj_kv = buf_indexer_proj_kv_.f32();
+            idx_proj_gate = buf_indexer_proj_gate_.f32();
         }
 
-        // 6. Apply RMSNorm in FP32 directly to pooled output, then convert to BF16
-        rms_norm_weighted_f32_cuda(buf_comp_out_.f32(), buf_comp_out_.f32(),
-                                   lw.comp_norm.bf16(), head_dim_val, cfg_.rms_norm_eps, main_stream_);
-        f32_to_bf16_cuda(buf_comp_bf16_.bf16(), buf_comp_out_.f32(),
-                         head_dim_val, main_stream_);
-
-        // 7. Apply RoPE to compressed entry using compressed-layer frequencies
-        int comp_pos = position + 1 - ratio;
-        rope_cuda(buf_comp_bf16_.bf16(), 1, head_dim_val, rope_dim,
-                  comp_pos, rope_freqs_compressed_.f32(), false, main_stream_);
-
-        // 8. Store in compressed KV cache
-        int comp_idx = lw.comp_kv_count;
-        int max_comp = cfg_.max_seq_len / ratio + 2;
-        if (comp_idx < max_comp) {
-            CUDA_CHECK(cudaMemcpyAsync(
-                lw.comp_kv_cache.bf16() + (size_t)comp_idx * head_dim_val,
-                buf_comp_bf16_.bf16(), head_dim_val * sizeof(__nv_bfloat16),
-                cudaMemcpyDeviceToDevice, main_stream_));
-            lw.comp_kv_count = comp_idx + 1;
-            int count_val = lw.comp_kv_count;
-            CUDA_CHECK(cudaMemcpy(
-                lw.d_comp_kv_count.i32(), &count_val, sizeof(int32_t),
-                cudaMemcpyHostToDevice));
-        }
+        // 3. Launch 100% device-driven compressor step kernel
+        compressor_device_step_cuda(
+            buf_input_pos_.i32(),
+            lw.d_comp_kv_count.i32(),
+            buf_comp_proj_.f32(),
+            buf_comp_out_.f32(),
+            lw.comp_kv_state.f32(),
+            lw.comp_score_state.f32(),
+            lw.comp_ape.f32(),
+            lw.comp_norm.bf16(),
+            lw.comp_kv_cache.bf16(),
+            rope_freqs_compressed_.f32(),
+            ratio,
+            head_dim_val,
+            rope_dim,
+            cfg_.rms_norm_eps,
+            idx_proj_kv,
+            idx_proj_gate,
+            lw.indexer_comp_kv_state.f32(),
+            lw.indexer_comp_score_state.f32(),
+            lw.indexer_comp_ape.f32(),
+            lw.indexer_comp_norm.bf16(),
+            lw.indexer_comp_kv_cache.bf16(),
+            main_stream_);
     }
 
     // ── Forward one layer (Qwen / Llama GQA + SwiGLU) ───────────────────────
@@ -3136,32 +3112,58 @@ private:
         CUDA_CHECK(cudaStreamWaitEvent(main_stream_, side_event_, 0));
 
         // ── Run compressor to accumulate/emit compressed KV entries ──────────
+        // ── Device-driven KV Compressor ──────────────────────────────────────
         int ratio = cfg_.layer_compress_ratio(layer_id);
         if (ratio > 0) {
-            forward_compressor(layer_id, position);
+            forward_compressor(layer_id);
+        }
+
+        // ── DeepSeek V4 Indexer (for CSA ratio=4 layers) ────────────────────
+        uint8_t* comp_mask_ptr = nullptr;
+        if (ratio == 4 && lw.indexer_wq_b_w.data) {
+            int idx_head_dim = 128;
+            int idx_heads = 64;
+            int idx_q_dim = idx_heads * idx_head_dim; // 8192
+
+            // 1. Indexer Q projection: q = indexer_wq_b @ qr_norm
+            gemm_fp8_dequant(buf_indexer_q_.bf16(), 1, idx_q_dim, q_lora,
+                             buf_lora_.bf16(),
+                             lw.indexer_wq_b_w.u8(), lw.indexer_wq_b_s.u8(), 128, main_stream_);
+
+            // 2. RoPE on Indexer Q
+            rope_device_pos_cuda(buf_indexer_q_.bf16(), idx_heads, idx_head_dim, rope_dim,
+                                 buf_input_pos_.i32(), layer_rope_freqs, false, main_stream_);
+
+            // 3. Weight projection: weights = indexer_weights_proj @ hidden
+            gemv_bf16_cuda(buf_indexer_weights_f32_.f32(), lw.indexer_weights_proj.bf16(),
+                           buf_hidden_.bf16(), idx_heads, dim, main_stream_);
+
+            // 4. Score compressed blocks & generate Top-K mask (100% device-driven)
+            int max_comp_entries = cfg_.max_compressed_entries > 0 ? cfg_.max_compressed_entries : 2048;
+            indexer_score_and_mask_cuda(
+                buf_indexer_mask_.u8(),
+                buf_indexer_scores_.f32(),
+                lw.indexer_comp_kv_cache.bf16(),
+                buf_indexer_q_.bf16(),
+                buf_indexer_weights_f32_.f32(),
+                lw.d_comp_kv_count.i32(),
+                max_comp_entries,
+                512,
+                main_stream_);
+
+            comp_mask_ptr = buf_indexer_mask_.u8();
         }
 
         // ── Attention computation ───────────────────────────────────────────
         float scale = 1.0f / sqrtf((float)head_dim_val);
-
-        // Prepare combined raw and compressed KV buffer directly on GPU
-        prepare_combined_kv_cuda(
-            buf_combined_kv_.bf16(),
-            lw.d_attn_cache_len.i32(),
-            lw.kv_cache.bf16(),
-            lw.comp_kv_cache.bf16(),
-            buf_input_pos_.i32(),
-            lw.d_comp_kv_count.i32(),
-            window, head_dim_val, ratio,
-            main_stream_);
-
         int max_combined = window + cfg_.max_compressed_entries;
-        // Fused Flash-MLA: Q-Norm + Forward RoPE + Attention Dot Products + Softmax + Value Reduction + Inverse RoPE
+
+        // Fused Direct-Addressing Flash-MLA: Q-Norm + Forward RoPE + Attention Dot Products + Softmax + Value Reduction + Inverse RoPE
         mla_attention_fused_cuda(
-            buf_q_.bf16(), buf_combined_kv_.bf16(), lw.attn_sink.f32(),
-            buf_attn_out_.bf16(), lw.d_attn_cache_len.i32(), buf_input_pos_.i32(),
+            buf_q_.bf16(), lw.kv_cache.bf16(), lw.comp_kv_cache.bf16(), lw.attn_sink.f32(),
+            buf_attn_out_.bf16(), buf_input_pos_.i32(), lw.d_comp_kv_count.i32(),
             layer_rope_freqs, max_combined, head_dim_val, rope_dim, scale,
-            cfg_.rms_norm_eps, main_stream_
+            cfg_.rms_norm_eps, comp_mask_ptr, window, main_stream_
         );
 
         // ── Output projection (grouped low-rank MLA) ─────────────────────
@@ -3428,7 +3430,7 @@ private:
 
         std::uniform_real_distribution<float> dist(0.0f, 1.0f);
         float r = dist(rng_);
-        sample_multinomial_f32_cuda(buf_argmax_out_.i32(), buf_logits_.f32(), vocab, temperature, r, main_stream_);
+        sample_multinomial_f32_cuda(buf_argmax_out_.i32(), buf_logits_.f32(), vocab, temperature, r, min_p, main_stream_);
         int sampled = 0;
         CUDA_CHECK(cudaMemcpyAsync(&sampled, buf_argmax_out_.i32(), sizeof(int32_t), cudaMemcpyDeviceToHost, main_stream_));
         CUDA_CHECK(cudaStreamSynchronize(main_stream_));

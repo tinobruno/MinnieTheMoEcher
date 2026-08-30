@@ -290,6 +290,7 @@ void sample_multinomial_f32_cuda(
     int n,
     float temperature,
     float rand_val,
+    float min_p = 0.05f,
     cudaStream_t stream = 0);
 
 // ── sqrt(softplus(x)) scoring ──────────────────────────────────────────────────
@@ -514,40 +515,58 @@ void store_kv_device_pos_cuda(
     const int32_t* d_position, int window, int head_dim,
     cudaStream_t stream = 0);
 
-void prepare_combined_kv_cuda(
-    __nv_bfloat16* combined_kv,
-    int32_t* d_cache_len,
-    const __nv_bfloat16* raw_kv_cache,
-    const __nv_bfloat16* comp_kv_cache,
-    const int32_t* d_position,
-    const int32_t* d_comp_count,
-    int window, int head_dim, int ratio,
-    cudaStream_t stream = 0);
-
-void mla_attention_device_len_cuda(
-    const __nv_bfloat16* q,
-    const __nv_bfloat16* kv,
-    const float* attn_sink,
-    __nv_bfloat16* out,
-    const int32_t* d_cache_len,
-    int max_cache_len,
-    int head_dim,
-    float scale,
-    cudaStream_t stream = 0);
-
 void mla_attention_fused_cuda(
     const __nv_bfloat16* raw_q,
-    const __nv_bfloat16* kv,
+    const __nv_bfloat16* raw_kv,
+    const __nv_bfloat16* comp_kv,
     const float* attn_sink,
     __nv_bfloat16* out,
-    const int32_t* d_cache_len,
     const int32_t* d_position,
+    const int32_t* d_comp_count,
     const float* freq_table,
     int max_cache_len,
     int head_dim,
     int rope_dim,
     float scale,
     float q_norm_eps,
+    const uint8_t* comp_mask = nullptr,
+    int window = 128,
+    cudaStream_t stream = 0);
+
+void compressor_device_step_cuda(
+    const int32_t* d_position,
+    int32_t* d_comp_count,
+    const float* proj_kv,
+    const float* proj_gate,
+    float* comp_kv_state,
+    float* comp_score_state,
+    const float* comp_ape,
+    const __nv_bfloat16* comp_norm,
+    __nv_bfloat16* comp_kv_cache,
+    const float* rope_freqs_compressed,
+    int ratio,
+    int head_dim,
+    int rope_dim,
+    float rms_norm_eps,
+    // Optional Indexer compressor parameters (for ratio == 4)
+    const float* idx_proj_kv = nullptr,
+    const float* idx_proj_gate = nullptr,
+    float* idx_kv_state = nullptr,
+    float* idx_score_state = nullptr,
+    const float* idx_ape = nullptr,
+    const __nv_bfloat16* idx_norm = nullptr,
+    __nv_bfloat16* idx_comp_kv_cache = nullptr,
+    cudaStream_t stream = 0);
+
+void indexer_score_and_mask_cuda(
+    uint8_t* out_mask,
+    float* out_scores,
+    const __nv_bfloat16* index_comp,
+    const __nv_bfloat16* q,
+    const float* weights,
+    const int32_t* d_comp_count,
+    int max_comp_entries,
+    int top_k = 512,
     cudaStream_t stream = 0);
 
 void accumulate_expert_imatrix_cuda(
