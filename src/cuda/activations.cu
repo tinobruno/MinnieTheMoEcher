@@ -3507,9 +3507,21 @@ __global__ void mla_attention_fused_kernel(
             kv_t = comp_kv + (size_t)comp_slot * head_dim;
         }
         float dot = 0.0f;
+        const uint4* kv_u4 = reinterpret_cast<const uint4*>(kv_t);
         #pragma unroll 4
-        for (int d = 0; d < head_dim; d++) {
-            dot += s_q[d] * bf16_to_float(kv_t[d]);
+        for (int chunk = 0; chunk < 64; chunk++) {
+            uint4 u = kv_u4[chunk];
+            const __nv_bfloat162* p = reinterpret_cast<const __nv_bfloat162*>(&u);
+            float2 f0 = to_float2_bf162(p[0]);
+            float2 f1 = to_float2_bf162(p[1]);
+            float2 f2 = to_float2_bf162(p[2]);
+            float2 f3 = to_float2_bf162(p[3]);
+
+            int bd = chunk * 8;
+            dot += s_q[bd + 0] * f0.x + s_q[bd + 1] * f0.y
+                 + s_q[bd + 2] * f1.x + s_q[bd + 3] * f1.y
+                 + s_q[bd + 4] * f2.x + s_q[bd + 5] * f2.y
+                 + s_q[bd + 6] * f3.x + s_q[bd + 7] * f3.y;
         }
         scores[t] = dot * scale;
     }
@@ -3573,20 +3585,28 @@ __global__ void mla_attention_fused_kernel(
     }
     __syncthreads();
 
-    // ── Step 5: Direct Value Reduction (scores @ KV) into s_out ──────────────
-    for (int d = tid; d < head_dim; d += n_threads) {
-        float v = 0.0f;
-        #pragma unroll 4
-        for (int t = 0; t < n_raw; t++) {
-            int raw_slot = (raw_start + t) % window;
-            v += scores[t] * bf16_to_float(raw_kv[(size_t)raw_slot * head_dim + d]);
-        }
-        #pragma unroll 4
-        for (int t = 0; t < n_comp; t++) {
-            v += scores[n_raw + t] * bf16_to_float(comp_kv[(size_t)t * head_dim + d]);
-        }
-        s_out[d] = v;
+    // ── Step 5: Direct 100% Coalesced Value Reduction (scores @ KV) ──────────
+    float sum0 = 0.0f;
+    float sum1 = 0.0f;
+    #pragma unroll 4
+    for (int t = 0; t < n_raw; t++) {
+        int raw_slot = (raw_start + t) % window;
+        float sc = scores[t];
+        const __nv_bfloat162* kv_pairs = reinterpret_cast<const __nv_bfloat162*>(raw_kv + (size_t)raw_slot * head_dim);
+        float2 kv_val = to_float2_bf162(kv_pairs[tid]);
+        sum0 += sc * kv_val.x;
+        sum1 += sc * kv_val.y;
     }
+    #pragma unroll 4
+    for (int t = 0; t < n_comp; t++) {
+        float sc = scores[n_raw + t];
+        const __nv_bfloat162* kv_pairs = reinterpret_cast<const __nv_bfloat162*>(comp_kv + (size_t)t * head_dim);
+        float2 kv_val = to_float2_bf162(kv_pairs[tid]);
+        sum0 += sc * kv_val.x;
+        sum1 += sc * kv_val.y;
+    }
+    s_out[tid * 2 + 0] = sum0;
+    s_out[tid * 2 + 1] = sum1;
     __syncthreads();
 
     // ── Step 6: Inverse RoPE Rotation & Output Store ─────────────────────────
@@ -3604,9 +3624,8 @@ __global__ void mla_attention_fused_kernel(
     }
     __syncthreads();
 
-    for (int d = tid; d < head_dim; d += n_threads) {
-        out[h * head_dim + d] = float_to_bf16(s_out[d]);
-    }
+    out[h * head_dim + tid * 2 + 0] = float_to_bf16(s_out[tid * 2 + 0]);
+    out[h * head_dim + tid * 2 + 1] = float_to_bf16(s_out[tid * 2 + 1]);
 }
 
 void mla_attention_fused_cuda(
