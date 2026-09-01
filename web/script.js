@@ -147,6 +147,7 @@ function clearChat() {
     chatInput.value = '';
     chatInput.style.height = 'auto';
     setGeneratingState(false);
+    updateChatbarPreviewButtonVisibility();
     chatInput.focus();
 }
 
@@ -365,6 +366,65 @@ function loadHtmlIntoPreview(htmlCode, autoSwitchTab = true) {
 
     if (autoSwitchTab) {
         switchPreviewTab('tab-preview');
+    }
+}
+
+// Check if an HTML snippet is present in the conversation
+function hasHtmlSnippet() {
+    const codeBlocks = document.querySelectorAll('#messages-container pre code');
+    for (let i = codeBlocks.length - 1; i >= 0; i--) {
+        const code = codeBlocks[i].textContent || '';
+        const lang = (codeBlocks[i].className || '').toLowerCase();
+        if (lang.includes('html') || lang.includes('svg') || lang.includes('xml') ||
+            code.includes('<!DOCTYPE') || code.includes('<!doctype') || code.includes('<html') || code.includes('<div') || 
+            code.includes('<svg') || code.includes('<script') || code.includes('<style') ||
+            code.includes('<canvas') || code.includes('<button') || code.includes('<body') || code.includes('<head')) {
+            return true;
+        }
+    }
+    if (currentHtmlCode && currentHtmlCode.trim().length > 0) {
+        return true;
+    }
+    return false;
+}
+
+// Find the most recent HTML / UI snippet across chat messages
+function getLatestHtmlCode() {
+    const codeBlocks = document.querySelectorAll('#messages-container pre code');
+    for (let i = codeBlocks.length - 1; i >= 0; i--) {
+        const code = codeBlocks[i].textContent || '';
+        const lang = (codeBlocks[i].className || '').toLowerCase();
+        if (lang.includes('html') || lang.includes('svg') || lang.includes('xml') ||
+            code.includes('<!DOCTYPE') || code.includes('<!doctype') || code.includes('<html') || code.includes('<div') || 
+            code.includes('<svg') || code.includes('<script') || code.includes('<style') ||
+            code.includes('<canvas') || code.includes('<button') || code.includes('<body') || code.includes('<head')) {
+            return code;
+        }
+    }
+    if (currentHtmlCode && currentHtmlCode.trim().length > 0) {
+        return currentHtmlCode;
+    }
+    return '';
+}
+
+// Update visibility of the chat bar preview button (only show when HTML exists in response)
+function updateChatbarPreviewButtonVisibility() {
+    const btn = document.getElementById('preview-btn-chatbar');
+    if (!btn) return;
+    if (hasHtmlSnippet()) {
+        btn.classList.remove('hidden');
+    } else {
+        btn.classList.add('hidden');
+    }
+}
+
+// Chatbar Preview Button Click Handler
+function previewLatestHtmlSnippet() {
+    const code = getLatestHtmlCode();
+    if (code && code.trim().length > 0) {
+        loadHtmlIntoPreview(code, true);
+    } else {
+        togglePreviewPanel(true);
     }
 }
 
@@ -946,6 +1006,7 @@ function renderMarkdownContent(rawText, containerElement) {
             containerElement.appendChild(banner);
         }
     }
+    updateChatbarPreviewButtonVisibility();
 }
 
 // ============================================================================
@@ -1180,6 +1241,8 @@ async function sendMessage() {
     } finally {
         currentAbortController = null;
         setGeneratingState(false);
+        // Refresh expert specialization profile after generation
+        fetchExpertProfile();
     }
 }
 
@@ -1206,6 +1269,183 @@ function appendMessage(role, text) {
     });
 }
 
+// ════════════════════════════════════════════════════════════════════════════════
+//  Expert Specialization & Analytics UI Handlers
+// ════════════════════════════════════════════════════════════════════════════════
+
+let currentExpertProfileData = null;
+let currentExpertFilter = 'all';
+
+async function fetchExpertProfile(event) {
+    if (event) {
+        event.stopPropagation();
+        event.preventDefault();
+    }
+    const apiUrl = `${getApiBase()}/v1/experts/profile`;
+    try {
+        const res = await fetch(apiUrl);
+        if (!res.ok) throw new Error(`HTTP error ${res.status}`);
+        const data = await res.json();
+        currentExpertProfileData = data;
+        renderExpertProfileUI(data, currentExpertFilter);
+    } catch (err) {
+        console.warn('Could not fetch expert profile:', err);
+    }
+}
+
+function getCategoryClass(category) {
+    switch (category) {
+        case 'Coding / Syntax': return 'cat-code';
+        case 'Math / Logic': return 'cat-math';
+        case 'Reasoning': return 'cat-reasoning';
+        case 'General Prose': return 'cat-prose';
+        case 'Format / Syntax': return 'cat-format';
+        case 'Multilingual': return 'cat-multi';
+        default: return 'cat-prose';
+    }
+}
+
+let currentFilterType = 'cat';
+
+function renderExpertProfileUI(data) {
+    const elTokens = document.getElementById('expert-tracked-tokens-val');
+    const elActive = document.getElementById('expert-active-count-val');
+    const elL1 = document.getElementById('res-l1-label');
+    const elL2 = document.getElementById('res-l2-label');
+    const elSSD = document.getElementById('res-ssd-label');
+    const listContainer = document.getElementById('expert-list-container');
+
+    if (data) {
+        if (elL1 && data.l1_resident !== undefined) elL1.textContent = `L1: ${data.l1_resident.toLocaleString()}`;
+        if (elL2 && data.l2_resident !== undefined) elL2.textContent = `L2: ${data.l2_resident.toLocaleString()}`;
+        if (elSSD && data.ssd_count !== undefined) elSSD.textContent = `SSD: ${data.ssd_count.toLocaleString()}`;
+    }
+
+    if (!data || !data.experts || data.experts.length === 0) {
+        if (elTokens) elTokens.textContent = '0 tokens';
+        if (elActive) elActive.textContent = '0 active';
+        if (listContainer) {
+            listContainer.innerHTML = `
+                <div class="expert-empty-hint">
+                    <span class="material-symbols-outlined">info</span>
+                    <span>No expert profile data loaded yet.</span>
+                </div>`;
+        }
+        return;
+    }
+
+    if (elTokens) elTokens.textContent = `${data.total_tokens.toLocaleString()} tokens`;
+    if (elActive) elActive.textContent = `${data.total_active_experts || data.experts.length} active`;
+
+    if (!listContainer) return;
+
+    let filtered = data.experts;
+    if (currentFilterType === 'tier' && currentExpertFilter !== 'all') {
+        filtered = data.experts.filter(e => (e.tier || 'l1') === currentExpertFilter);
+    } else if (currentFilterType === 'cat' && currentExpertFilter !== 'all') {
+        filtered = data.experts.filter(e => e.category === currentExpertFilter);
+    }
+
+    if (filtered.length === 0) {
+        listContainer.innerHTML = `
+            <div class="expert-empty-hint">
+                <span class="material-symbols-outlined">filter_alt_off</span>
+                <span>No active experts matching filter: <b>${currentExpertFilter}</b></span>
+            </div>`;
+        return;
+    }
+
+    // Render up to 60 top experts
+    const maxShow = Math.min(filtered.length, 60);
+    let html = '';
+
+    for (let i = 0; i < maxShow; i++) {
+        const exp = filtered[i];
+        const catClass = getCategoryClass(exp.category);
+        const hitPctClamped = Math.min(Math.max(exp.hit_pct, 0.5), 100);
+        const tierClass = exp.tier || 'l1';
+        const locLabel = exp.location || (tierClass === 'l1' ? 'L1 (VRAM)' : tierClass === 'l2' ? 'L2 (DRAM)' : 'SSD (Disk)');
+
+        let pillsHtml = '';
+        if (exp.top_tokens && exp.top_tokens.length > 0) {
+            pillsHtml = '<div class="token-pills-row">';
+            for (const t of exp.top_tokens.slice(0, 6)) {
+                const cleanTok = t.token.replace(/\n/g, '\\n').replace(/\t/g, '\\t');
+                const safeTok = cleanTok.replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;').replace(/"/g, '&quot;');
+                pillsHtml += `<span class="token-pill" title="Token: ${safeTok} (${t.count} hits)">${safeTok}</span>`;
+            }
+            pillsHtml += '</div>';
+        }
+
+        html += `
+            <div class="expert-card" data-cat="${exp.category}" data-tier="${tierClass}">
+                <div class="expert-card-top">
+                    <div class="expert-badge">
+                        <span class="expert-rank-num">#${exp.rank || (i + 1)}</span>
+                        <span class="layer-tag">L${exp.layer}</span>
+                        <span>·</span>
+                        <span>E${exp.expert_id}</span>
+                    </div>
+                    <div style="display:flex; gap:4px; align-items:center;">
+                        <span class="tier-badge ${tierClass}" title="Preload Residency: ${locLabel}">${locLabel}</span>
+                        <span class="cat-badge ${catClass}">${exp.category}</span>
+                    </div>
+                </div>
+                <div class="hit-bar-wrapper">
+                    <div class="hit-bar-labels">
+                        <span>Hit Rate: <b>${exp.hit_pct.toFixed(1)}%</b></span>
+                        <span class="hit-count">${exp.count.toLocaleString()} hits</span>
+                    </div>
+                    <div class="hit-bar-bg">
+                        <div class="hit-bar-fill" style="width: ${hitPctClamped}%;"></div>
+                    </div>
+                </div>
+                ${pillsHtml}
+            </div>
+        `;
+    }
+
+    listContainer.innerHTML = html;
+}
+
+function initExpertProfileUI() {
+    const filterContainer = document.getElementById('expert-category-filters');
+    if (filterContainer) {
+        filterContainer.addEventListener('click', (e) => {
+            const btn = e.target.closest('.cat-filter-btn');
+            if (!btn) return;
+
+            filterContainer.querySelectorAll('.cat-filter-btn').forEach(b => b.classList.remove('active'));
+            btn.classList.add('active');
+
+            currentFilterType = btn.getAttribute('data-filter-type') || 'cat';
+            currentExpertFilter = btn.getAttribute('data-filter') || btn.getAttribute('data-cat') || 'all';
+            if (currentExpertProfileData) {
+                renderExpertProfileUI(currentExpertProfileData);
+            }
+        });
+    }
+
+    // Initial fetch
+    fetchExpertProfile();
+}
+
+function downloadExpertProfileJson() {
+    if (!currentExpertProfileData) {
+        alert('No expert profile data loaded yet. Run inference with --track first.');
+        return;
+    }
+    const blob = new Blob([JSON.stringify(currentExpertProfileData, null, 2)], { type: 'application/json' });
+    const url = URL.createObjectURL(blob);
+    const a = document.createElement('a');
+    a.href = url;
+    a.download = `expert_profile_${Date.now()}.json`;
+    document.body.appendChild(a);
+    a.click();
+    document.body.removeChild(a);
+    URL.revokeObjectURL(url);
+}
+
 // Sidebar toggle
 const menuBtn = document.querySelector('.menu-btn');
 const sidebar = document.querySelector('.sidebar');
@@ -1218,4 +1458,5 @@ if (menuBtn && sidebar) {
 // Run initialization on DOM load
 document.addEventListener('DOMContentLoaded', () => {
     initPreviewPanel();
+    initExpertProfileUI();
 });

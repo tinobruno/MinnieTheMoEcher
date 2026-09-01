@@ -9,6 +9,7 @@
 
 #include "platform/platform_io.hpp"
 #include "thread_pool.h"
+#include "embedded_web.hpp"
 
 #include <cstdio>
 #include <cstdlib>
@@ -81,6 +82,8 @@ bool g_log_experts = false;
 bool g_log_tokens = true;
 bool g_quiet = false;
 bool g_server_ready = false;
+bool g_track_experts = false;
+bool g_track_reset = false;
 static std::atomic<bool> g_stop_requested{false};
 
 
@@ -735,9 +738,16 @@ public:
     // L2 LRU cache (DRAM)
     int dram_cache_capacity_ = 0;
     void* dram_cache_pool_ = nullptr;
+    bool dram_is_pinned_ = false;  // True if DRAM cache is pinned (cudaMallocHost or cudaHostRegister succeeded)
     std::vector<ExpertCacheEntry> dram_cache_slots_;
     std::unordered_map<int64_t, int> dram_key_to_slot_; // (layer*n_experts+expert) -> L2 slot index
     std::vector<void*> flat_dram_ptrs_;                 // Lock-free flat array for 0-latency DRAM lookups
+
+    // Pinned staging buffers for DMA when DRAM cache is unpinned
+    // cudaMemcpyAsync from pageable memory is SYNCHRONOUS — it blocks the stream.
+    // These pinned buffers enable: memcpy(DRAM→pinned) + cudaMemcpyAsync(pinned→VRAM) = true async DMA.
+    static constexpr int NUM_DMA_STAGING = 8;  // One per expert stream
+    void* dma_staging_[NUM_DMA_STAGING] = {nullptr};
 
     // Ring buffer for staging (used when bypassing DRAM cache)
     static constexpr int NUM_STAGING_BUFFERS = 32;
@@ -750,6 +760,10 @@ public:
 
     int64_t access_counter_ = 0;
     std::mutex cache_mutex_;
+
+    // L2 victim cache: writeback stream for async VRAM→DRAM demotion
+    cudaStream_t dram_writeback_stream_ = nullptr;
+    cudaEvent_t writeback_event_ = nullptr;  // Ensures writeback completes before slot reuse
 
     int n_pinned_layers() const {
         return (n_experts_ > 0) ? std::min(n_layers_, cache_capacity_ / n_experts_) : 0;
@@ -816,16 +830,84 @@ public:
             return stage.ptr;
         }
     }
+    // ── L2 Victim Cache: demote evicted L1 expert to L2 DRAM ──────────────
+    // Called under cache_mutex_. Queues async VRAM→DRAM copy on writeback stream.
+    // Throttled to MAX_DEMOTIONS_PER_TOKEN to avoid saturating PCIe with D2H traffic
+    // which competes with NVMe SSD reads on the same bus.
+    static constexpr int MAX_DEMOTIONS_PER_TOKEN = 16;
+    int demotions_this_token_ = 0;
+    int64_t demotion_token_id_ = -1;  // access_counter_ of current token
+
+    void demote_to_l2(int layer_id, int expert_id, int64_t key, void* vram_src) {
+        if (dram_cache_capacity_ <= 0 || !dram_writeback_stream_) return;
+
+        // Reset demotion counter on new token
+        if (access_counter_ != demotion_token_id_) {
+            demotion_token_id_ = access_counter_;
+            demotions_this_token_ = 0;
+        }
+
+        // Throttle: skip demotion if we've hit the per-token cap
+        if (demotions_this_token_ >= MAX_DEMOTIONS_PER_TOKEN) return;
+
+        // Skip if already in L2 (e.g. preloaded and never evicted)
+        if (dram_key_to_slot_.count(key)) return;
+
+        // Find LRU eviction candidate in L2
+        int evict_dram = -1;
+        int64_t oldest_d = INT64_MAX;
+        for (int i = 0; i < dram_cache_capacity_; i++) {
+            if (dram_cache_slots_[i].layer_id < 0) { evict_dram = i; break; }
+            if (dram_cache_slots_[i].last_used < oldest_d) {
+                oldest_d = dram_cache_slots_[i].last_used;
+                evict_dram = i;
+            }
+        }
+        if (evict_dram < 0) return;
+
+        auto& ds = dram_cache_slots_[evict_dram];
+        if (ds.layer_id >= 0) {
+            int64_t old_key = (int64_t)ds.layer_id * n_experts_ + ds.expert_id;
+            dram_key_to_slot_.erase(old_key);
+        }
+
+        ds.layer_id = layer_id;
+        ds.expert_id = expert_id;
+        ds.last_used = access_counter_;
+        dram_key_to_slot_[key] = evict_dram;
+
+        // Async copy VRAM → pinned DRAM (non-blocking, dedicated stream)
+        cudaMemcpyAsync(ds.gpu_data, vram_src, expert_block_size_,
+                        cudaMemcpyDeviceToHost, dram_writeback_stream_);
+        // Record event so L2 hit path can wait for writeback to complete
+        cudaEventRecord(writeback_event_, dram_writeback_stream_);
+        demotions_this_token_++;
+    }
+
+    // Call before submitting new H2D DMA to an evicted L1 slot.
+    // Makes the expert stream wait for any pending writeback to complete.
+    void wait_for_writeback(cudaStream_t expert_stream) {
+        if (dram_writeback_stream_ && writeback_event_) {
+            cudaStreamWaitEvent(expert_stream, writeback_event_, 0);
+        }
+    }
 
     bool init(const std::string& expert_bin_path, int block_size,
-              int n_layers, int n_experts, size_t cache_budget_bytes, size_t dram_budget_bytes) {
+              int n_layers, int n_experts, size_t cache_budget_bytes, size_t dram_budget_bytes,
+              bool use_buffered_io = false) {
         expert_block_size_ = block_size;
         n_layers_ = n_layers;
         n_experts_ = n_experts;
 
-        if (!expert_file_.open_read(expert_bin_path, true)) {
+        bool use_direct = !use_buffered_io;
+        if (!expert_file_.open_read(expert_bin_path, use_direct)) {
             LOG_ERROR("Cannot open expert bin: %s", expert_bin_path.c_str());
             return false;
+        }
+        if (use_buffered_io) {
+            LOG_INFO("Expert I/O: BUFFERED mode (OS file cache enabled — recommended for offloading)");
+        } else {
+            LOG_INFO("Expert I/O: DIRECT mode (FILE_FLAG_NO_BUFFERING / O_DIRECT)");
         }
 
         cache_capacity_ = (int)(cache_budget_bytes / block_size);
@@ -858,9 +940,11 @@ public:
                     cudaError_t reg_err = cudaHostRegister(dram_cache_pool_, total_dram_bytes, cudaHostRegisterDefault);
                     if (reg_err != cudaSuccess) {
                         cudaGetLastError();
-                        LOG_WARN("cudaHostRegister could not pin %.1f GB DRAM cache (OS locked memory limit / ulimit). DMA transfers will run with pageable fallback.",
+                        dram_is_pinned_ = false;
+                        LOG_WARN("cudaHostRegister could not pin %.1f GB DRAM cache. Using pinned staging buffers for async DMA.",
                                  (double)total_dram_bytes / (1024.0 * 1024.0 * 1024.0));
                     } else {
+                        dram_is_pinned_ = true;
                         LOG_INFO("Pinned %.1f GB DRAM cache into physical RAM with cudaHostRegister",
                                  (double)total_dram_bytes / (1024.0 * 1024.0 * 1024.0));
                     }
@@ -869,6 +953,7 @@ public:
                     dram_cache_capacity_ = 0;
                 }
             } else {
+                dram_is_pinned_ = true;
                 LOG_INFO("Allocated %.1f GB pinned DRAM cache with cudaMallocHost",
                          (double)total_dram_bytes / (1024.0 * 1024.0 * 1024.0));
             }
@@ -891,12 +976,56 @@ public:
         flat_vram_ptrs_.assign((size_t)n_layers * n_experts, nullptr);
         flat_vram_ptrs_gpu_.alloc((size_t)n_layers * n_experts * sizeof(void*));
         CUDA_CHECK(cudaMemset(flat_vram_ptrs_gpu_.data, 0, (size_t)n_layers * n_experts * sizeof(void*)));
+
+        // Create writeback stream for L2 victim cache demotion
+        if (dram_cache_capacity_ > 0) {
+            CUDA_CHECK(cudaStreamCreate(&dram_writeback_stream_));
+            CUDA_CHECK(cudaEventCreateWithFlags(&writeback_event_, cudaEventDisableTiming));
+            LOG_INFO("L2 victim cache enabled: evicted L1 experts will be demoted to L2 DRAM");
+        }
+
+        // Allocate pinned DMA staging buffers (used when DRAM cache is unpinned)
+        if (!dram_is_pinned_ && dram_cache_capacity_ > 0) {
+            LOG_INFO("Allocating %d pinned DMA staging buffers (%.1f MB each) for async DRAM→VRAM transfers",
+                     NUM_DMA_STAGING, (double)block_size / (1024.0 * 1024.0));
+            for (int i = 0; i < NUM_DMA_STAGING; i++) {
+                CUDA_CHECK(cudaMallocHost(&dma_staging_[i], block_size));
+            }
+        }
         return true;
     }
 
     bool all_resident(int active_layers = 0) const {
         int n_active = (active_layers > 0) ? active_layers : n_layers_;
         return cache_capacity_ >= n_active * n_experts_;
+    }
+
+    std::string get_expert_location(int layer_id, int expert_id) const {
+        if (all_resident(n_layers_)) {
+            return "L1 (VRAM)";
+        }
+        int64_t key = (int64_t)layer_id * n_experts_ + expert_id;
+        if (key >= 0 && key < (int64_t)flat_vram_ptrs_.size() && flat_vram_ptrs_[key] != nullptr) {
+            return "L1 (VRAM)";
+        }
+        if (key >= 0 && key < (int64_t)flat_dram_ptrs_.size() && flat_dram_ptrs_[key] != nullptr) {
+            return "L2 (DRAM)";
+        }
+        return "SSD (Disk)";
+    }
+
+    std::string get_expert_tier(int layer_id, int expert_id) const {
+        if (all_resident(n_layers_)) {
+            return "l1";
+        }
+        int64_t key = (int64_t)layer_id * n_experts_ + expert_id;
+        if (key >= 0 && key < (int64_t)flat_vram_ptrs_.size() && flat_vram_ptrs_[key] != nullptr) {
+            return "l1";
+        }
+        if (key >= 0 && key < (int64_t)flat_dram_ptrs_.size() && flat_dram_ptrs_[key] != nullptr) {
+            return "l2";
+        }
+        return "ssd";
     }
 
     inline void* try_get_expert_cached(int layer_id, int expert_id) {
@@ -956,6 +1085,8 @@ public:
             int64_t old_key = (int64_t)slot.layer_id * n_experts_ + slot.expert_id;
             key_to_slot_.erase(old_key);
             flat_vram_ptrs_[old_key] = nullptr;
+            // Demote evicted expert to L2 DRAM (victim cache)
+            demote_to_l2(slot.layer_id, slot.expert_id, old_key, slot.gpu_data);
         }
 
         slot.layer_id = layer_id;
@@ -980,36 +1111,14 @@ public:
                     LOG_INFO("[ExpertCache] L2 Hit: L%d E%d -> L1 slot %d", layer_id, expert_id, evict_slot);
                 }
             } else {
-                // L2 Miss: Find L2 eviction candidate and read from disk directly into L2
-                int evict_dram = -1;
-                int64_t oldest_dram_time = INT64_MAX;
-                for (int i = 0; i < dram_cache_capacity_; i++) {
-                    if (dram_cache_slots_[i].layer_id < 0) {
-                        evict_dram = i;
-                        break;
-                    }
-                    if (dram_cache_slots_[i].last_used < oldest_dram_time) {
-                        oldest_dram_time = dram_cache_slots_[i].last_used;
-                        evict_dram = i;
-                    }
-                }
-
-                auto& dram_slot = dram_cache_slots_[evict_dram];
-                if (dram_slot.layer_id >= 0) {
-                    int64_t old_dram_key = (int64_t)dram_slot.layer_id * n_experts_ + dram_slot.expert_id;
-                    dram_key_to_slot_.erase(old_dram_key);
-                }
-
-                dram_slot.layer_id = layer_id;
-                dram_slot.expert_id = expert_id;
-                dram_slot.last_used = access_counter_;
-                dram_key_to_slot_[key] = evict_dram;
-
-                host_src_ptr = dram_slot.gpu_data;
+                // L2 miss — use staging ring buffer for SSD read
+                // Do NOT evict L2 entries: L2 is a stable fast cache, not SSD staging
+                stage_idx = staging_idx_;
+                staging_idx_ = (staging_idx_ + 1) % NUM_STAGING_BUFFERS;
                 needs_disk_read = true;
                 if (g_log_experts) {
-                    LOG_INFO("[ExpertCache] L2 Miss (SSD read): L%d E%d -> L2 slot %d -> L1 slot %d", 
-                             layer_id, expert_id, evict_dram, evict_slot);
+                    LOG_INFO("[ExpertCache] L2 Miss (SSD read via staging): L%d E%d -> L1 slot %d", 
+                             layer_id, expert_id, evict_slot);
                 }
             }
         } else {
@@ -1027,6 +1136,7 @@ public:
         lock.unlock();
 
         if (stage_idx >= 0) {
+            // SSD path: 2.5ms SSD read provides enough time for writeback to complete
             auto& stage = staging_ring_[stage_idx];
             CUDA_CHECK(cudaEventSynchronize(stage.event));
             
@@ -1042,6 +1152,8 @@ public:
                                         cudaMemcpyHostToDevice, stream));
             CUDA_CHECK(cudaEventRecord(stage.event, stream));
         } else {
+            // L2 hit path: DMA is immediate, must wait for writeback to complete first
+            wait_for_writeback(stream);
             if (needs_disk_read) {
                 int64_t file_offset = (int64_t)key * expert_block_size_;
                 int64_t bytes_read = expert_file_.pread_exact(host_src_ptr, expert_block_size_, file_offset);
@@ -1059,7 +1171,169 @@ public:
         return slot.gpu_data;
     }
 
-    bool preload_all(int n_threads = 16) {
+    // ── Batch expert loading: resolve all experts in ONE lock, parallel I/O outside ──
+    // Returns the number of experts that needed DMA (non-cached).
+    // gpu_ptrs_out[k] is populated with the VRAM pointer for expert k.
+    // needs_dma_out[k] is true if expert k required a DMA transfer (not L1-cached).
+    int batch_get_experts(int layer_id, const int32_t* expert_ids, int count,
+                          void* gpu_ptrs_out[], bool needs_dma_out[],
+                          cudaStream_t* streams, ThreadPool* pool) {
+        struct BatchSlot {
+            int64_t key;
+            int l1_slot;           // L1 eviction slot index
+            void* gpu_dst;         // VRAM destination
+            void* host_src;        // DRAM source (L2 or staging)
+            int stage_idx;         // staging ring index (-1 if L2)
+            bool needs_disk;       // true if SSD read needed
+            bool l1_hit;           // true if already in L1
+        };
+
+        BatchSlot batch[32];
+        int n_uncached = 0;
+
+        // ── Phase 1: Single lock — resolve all experts, allocate L1/L2 slots ──
+        {
+            std::unique_lock<std::mutex> lock(cache_mutex_);
+            access_counter_++;
+
+            for (int k = 0; k < count; k++) {
+                int eid = expert_ids[k];
+                if (eid < 0 || eid >= n_experts_) {
+                    gpu_ptrs_out[k] = nullptr;
+                    needs_dma_out[k] = false;
+                    batch[k].l1_hit = true;
+                    continue;
+                }
+
+                int64_t key = (int64_t)layer_id * n_experts_ + eid;
+                batch[k].key = key;
+                batch[k].stage_idx = -1;
+                batch[k].needs_disk = false;
+                batch[k].l1_hit = false;
+
+                // Check L1 (VRAM)
+                auto it = key_to_slot_.find(key);
+                if (it != key_to_slot_.end()) {
+                    auto& slot = cache_slots_[it->second];
+                    slot.last_used = access_counter_;
+                    gpu_ptrs_out[k] = slot.gpu_data;
+                    needs_dma_out[k] = false;
+                    batch[k].l1_hit = true;
+                    continue;
+                }
+
+                // L1 miss — find eviction candidate
+                int evict_slot = -1;
+                int64_t oldest_time = INT64_MAX;
+                for (int i = 0; i < cache_capacity_; i++) {
+                    if (cache_slots_[i].layer_id < 0) {
+                        evict_slot = i;
+                        break;
+                    }
+                    if (cache_slots_[i].last_used < oldest_time) {
+                        oldest_time = cache_slots_[i].last_used;
+                        evict_slot = i;
+                    }
+                }
+
+                auto& slot = cache_slots_[evict_slot];
+                if (slot.layer_id >= 0) {
+                    int64_t old_key = (int64_t)slot.layer_id * n_experts_ + slot.expert_id;
+                    key_to_slot_.erase(old_key);
+                    flat_vram_ptrs_[old_key] = nullptr;
+                    // Demote evicted expert to L2 DRAM (victim cache)
+                    demote_to_l2(slot.layer_id, slot.expert_id, old_key, slot.gpu_data);
+                }
+
+                slot.layer_id = layer_id;
+                slot.expert_id = eid;
+                slot.last_used = access_counter_;
+                key_to_slot_[key] = evict_slot;
+                flat_vram_ptrs_[key] = slot.gpu_data;
+
+                batch[k].l1_slot = evict_slot;
+                batch[k].gpu_dst = slot.gpu_data;
+                gpu_ptrs_out[k] = slot.gpu_data;
+                needs_dma_out[k] = true;
+                n_uncached++;
+
+                // Check L2 (DRAM)
+                if (dram_cache_capacity_ > 0) {
+                    auto dram_it = dram_key_to_slot_.find(key);
+                    if (dram_it != dram_key_to_slot_.end()) {
+                        // L2 hit
+                        auto& dram_slot = dram_cache_slots_[dram_it->second];
+                        dram_slot.last_used = access_counter_;
+                        batch[k].host_src = dram_slot.gpu_data;
+                    } else {
+                        // L2 miss — use staging ring buffer for SSD read
+                        // Do NOT evict L2 entries: L2 is a stable fast cache, not SSD staging
+                        batch[k].stage_idx = staging_idx_;
+                        staging_idx_ = (staging_idx_ + 1) % NUM_STAGING_BUFFERS;
+                        batch[k].needs_disk = true;
+                    }
+                } else {
+                    // No L2 — use staging ring
+                    batch[k].stage_idx = staging_idx_;
+                    staging_idx_ = (staging_idx_ + 1) % NUM_STAGING_BUFFERS;
+                    batch[k].needs_disk = true;
+                }
+            }
+        }
+        // ── Mutex released ──
+
+        if (n_uncached == 0) return 0;
+
+        // ── Phase 2: Parallel I/O + DMA outside the lock ──
+        // Submit all SSD reads and DRAM→VRAM DMAs concurrently
+        std::future<bool> io_futures[32];
+
+        for (int k = 0; k < count; k++) {
+            if (batch[k].l1_hit) continue;
+
+            io_futures[k] = pool->enqueue([this, &batch, k, &streams]() -> bool {
+                auto& b = batch[k];
+                void* host_ptr = b.host_src;
+
+                if (b.stage_idx >= 0) {
+                    // SSD path: 2.5ms SSD read provides enough time for writeback to complete
+                    auto& stage = staging_ring_[b.stage_idx];
+                    CUDA_CHECK(cudaEventSynchronize(stage.event));
+                    int64_t bytes = expert_file_.pread_exact(stage.ptr, expert_block_size_, b.key * expert_block_size_);
+                    if (bytes != expert_block_size_) return false;
+                    host_ptr = stage.ptr;
+                    CUDA_CHECK(cudaMemcpyAsync(b.gpu_dst, host_ptr, expert_block_size_,
+                                                cudaMemcpyHostToDevice, streams[k]));
+                    CUDA_CHECK(cudaEventRecord(stage.event, streams[k]));
+                } else {
+                    // L2 hit path: DMA is immediate, must wait for writeback to complete first
+                    wait_for_writeback(streams[k]);
+                    if (b.needs_disk) {
+                        // L2 miss — read from SSD into L2 DRAM slot
+                        int64_t bytes = expert_file_.pread_exact(host_ptr, expert_block_size_, b.key * expert_block_size_);
+                        if (bytes != expert_block_size_) return false;
+                    }
+                    // L2 hit or just-read — DMA from DRAM to VRAM
+                    CUDA_CHECK(cudaMemcpyAsync(b.gpu_dst, host_ptr, expert_block_size_,
+                                                cudaMemcpyHostToDevice, streams[k]));
+                }
+                return true;
+            });
+        }
+
+        // Wait for all I/O to complete
+        for (int k = 0; k < count; k++) {
+            if (batch[k].l1_hit) continue;
+            if (!io_futures[k].get()) {
+                LOG_ERROR("Failed to fetch expert L%d E%d", layer_id, expert_ids[k]);
+                gpu_ptrs_out[k] = nullptr;
+            }
+        }
+
+        return n_uncached;
+    }
+
+    bool preload_all(int n_threads = 16, const std::vector<uint32_t>& freq_counts = {}) {
         int total = n_layers_ * n_experts_;
         int to_load = std::min(total, cache_capacity_);
         LOG_INFO("Preloading %d/%d experts into VRAM L1 cache...", to_load, total);
@@ -1122,39 +1396,100 @@ public:
             int dram_to_load = std::min(total - to_load, dram_cache_capacity_);
             int start_layer = to_load / n_experts_;
             int end_layer = (to_load + dram_to_load - 1) / n_experts_;
-            LOG_INFO("Preloading %d/%d experts into DRAM L2 cache (layers %d..%d)...",
-                     dram_to_load, dram_cache_capacity_, start_layer, end_layer);
-            std::vector<std::thread> dram_workers;
-            int dram_chunk = (dram_to_load + n_threads - 1) / n_threads;
-            for (int t = 0; t < n_threads; t++) {
-                int start_i = t * dram_chunk;
-                int end_i = std::min(start_i + dram_chunk, dram_to_load);
-                if (start_i >= end_i) continue;
 
-                dram_workers.emplace_back([this, start_i, end_i, to_load]() {
-                    for (int i = start_i; i < end_i; i++) {
-                        int expert_global_idx = to_load + i;
-                        int l = expert_global_idx / n_experts_;
-                        int e = expert_global_idx % n_experts_;
-                        int64_t file_offset = (int64_t)expert_global_idx * expert_block_size_;
-                        void* dst = dram_cache_slots_[i].gpu_data;
-                        int64_t bytes_read = expert_file_.pread_exact(dst, expert_block_size_, file_offset);
-                        if (bytes_read == expert_block_size_) {
-                            dram_cache_slots_[i].layer_id = l;
-                            dram_cache_slots_[i].expert_id = e;
-                            dram_cache_slots_[i].last_used = 1;
+            if (!freq_counts.empty() && (int)freq_counts.size() == total) {
+                // Frequency-guided smart preload: pick the hottest experts across all non-L1 slots
+                struct Candidate {
+                    int layer_id;
+                    int expert_id;
+                    uint32_t count;
+                };
+                std::vector<Candidate> candidates;
+                candidates.reserve(total - to_load);
+                for (int l = 0; l < n_layers_; l++) {
+                    for (int e = 0; e < n_experts_; e++) {
+                        int64_t key = (int64_t)l * n_experts_ + e;
+                        if (key_to_slot_.find(key) == key_to_slot_.end()) {
+                            candidates.push_back({l, e, freq_counts[(size_t)l * n_experts_ + e]});
                         }
                     }
+                }
+                std::sort(candidates.begin(), candidates.end(), [](const Candidate& a, const Candidate& b) {
+                    if (a.count != b.count) return a.count > b.count;
+                    if (a.layer_id != b.layer_id) return a.layer_id < b.layer_id;
+                    return a.expert_id < b.expert_id;
                 });
-            }
-            for (auto& w : dram_workers) {
-                w.join();
-            }
 
-            for (int i = 0; i < dram_to_load; i++) {
-                if (dram_cache_slots_[i].layer_id >= 0) {
-                    int64_t key = (int64_t)dram_cache_slots_[i].layer_id * n_experts_ + dram_cache_slots_[i].expert_id;
-                    dram_key_to_slot_[key] = i;
+                LOG_INFO("Preloading %d/%d hot experts into DRAM L2 cache across all %d layers (frequency-guided)...",
+                         dram_to_load, dram_cache_capacity_, n_layers_);
+                std::vector<std::thread> dram_workers;
+                int dram_chunk = (dram_to_load + n_threads - 1) / n_threads;
+                for (int t = 0; t < n_threads; t++) {
+                    int start_i = t * dram_chunk;
+                    int end_i = std::min(start_i + dram_chunk, dram_to_load);
+                    if (start_i >= end_i) continue;
+
+                    dram_workers.emplace_back([this, start_i, end_i, &candidates]() {
+                        for (int i = start_i; i < end_i; i++) {
+                            int l = candidates[i].layer_id;
+                            int e = candidates[i].expert_id;
+                            int expert_global_idx = l * n_experts_ + e;
+                            int64_t file_offset = (int64_t)expert_global_idx * expert_block_size_;
+                            void* dst = dram_cache_slots_[i].gpu_data;
+                            int64_t bytes_read = expert_file_.pread_exact(dst, expert_block_size_, file_offset);
+                            if (bytes_read == expert_block_size_) {
+                                dram_cache_slots_[i].layer_id = l;
+                                dram_cache_slots_[i].expert_id = e;
+                                dram_cache_slots_[i].last_used = 1;
+                            }
+                        }
+                    });
+                }
+                for (auto& w : dram_workers) {
+                    w.join();
+                }
+
+                for (int i = 0; i < dram_to_load; i++) {
+                    if (dram_cache_slots_[i].layer_id >= 0) {
+                        int64_t key = (int64_t)dram_cache_slots_[i].layer_id * n_experts_ + dram_cache_slots_[i].expert_id;
+                        dram_key_to_slot_[key] = i;
+                    }
+                }
+            } else {
+                LOG_INFO("Preloading %d/%d experts into DRAM L2 cache (layers %d..%d)...",
+                         dram_to_load, dram_cache_capacity_, start_layer, end_layer);
+                std::vector<std::thread> dram_workers;
+                int dram_chunk = (dram_to_load + n_threads - 1) / n_threads;
+                for (int t = 0; t < n_threads; t++) {
+                    int start_i = t * dram_chunk;
+                    int end_i = std::min(start_i + dram_chunk, dram_to_load);
+                    if (start_i >= end_i) continue;
+
+                    dram_workers.emplace_back([this, start_i, end_i, to_load]() {
+                        for (int i = start_i; i < end_i; i++) {
+                            int expert_global_idx = to_load + i;
+                            int l = expert_global_idx / n_experts_;
+                            int e = expert_global_idx % n_experts_;
+                            int64_t file_offset = (int64_t)expert_global_idx * expert_block_size_;
+                            void* dst = dram_cache_slots_[i].gpu_data;
+                            int64_t bytes_read = expert_file_.pread_exact(dst, expert_block_size_, file_offset);
+                            if (bytes_read == expert_block_size_) {
+                                dram_cache_slots_[i].layer_id = l;
+                                dram_cache_slots_[i].expert_id = e;
+                                dram_cache_slots_[i].last_used = 1;
+                            }
+                        }
+                    });
+                }
+                for (auto& w : dram_workers) {
+                    w.join();
+                }
+
+                for (int i = 0; i < dram_to_load; i++) {
+                    if (dram_cache_slots_[i].layer_id >= 0) {
+                        int64_t key = (int64_t)dram_cache_slots_[i].layer_id * n_experts_ + dram_cache_slots_[i].expert_id;
+                        dram_key_to_slot_[key] = i;
+                    }
                 }
             }
         }
@@ -1395,6 +1730,7 @@ public:
     // Device-driven inputs for CUDA Graph & Device ArgMax
     GPUTensor buf_input_token_;  // [1] int32_t on GPU
     GPUTensor buf_input_pos_;    // [1] int32_t on GPU
+    GPUTensor buf_track_flag_;   // [1] int32_t on GPU (1=track, 0=skip)
     GPUTensor buf_argmax_out_;   // [1] int32_t on GPU for 4-byte sampling
     cudaGraph_t graph_ = nullptr;
     cudaGraphExec_t graph_exec_ = nullptr;
@@ -1406,6 +1742,17 @@ public:
     GPUTensor d_down_accum_;
     GPUTensor d_expert_counts_;
 
+    // Expert frequency & semantic specialization tracking (--track mode)
+    bool track_expert_freq_ = false;
+    bool track_current_token_ = false; // Only true for generated content tokens (excludes prompt prefill, reasoning block, & control tokens)
+    GPUTensor d_step_topk_;                     // [n_layers * top_k] I32 on GPU
+    int32_t* step_topk_host_ = nullptr;        // [2 * n_layers * top_k] I32 pinned double-buffer
+    int decode_step_idx_ = 0;
+    std::vector<uint32_t> expert_freq_counts_;  // [n_layers * n_experts]
+    int64_t expert_freq_total_tokens_ = 0;
+    std::vector<std::vector<std::unordered_map<int, uint32_t>>> expert_token_counts_; // [n_layers][n_experts][token_id -> count]
+    std::vector<std::vector<std::vector<std::pair<std::string, uint32_t>>>> expert_loaded_top_tokens_; // [n_layers][n_experts] -> list of top tokens
+
     // Pre-allocated host buffers (zero runtime heap allocations)
     std::vector<float> router_probs_host_;
     std::vector<float> router_selection_host_;
@@ -1415,6 +1762,10 @@ public:
     __nv_bfloat16* logits_bf16_host_ = nullptr;
 
     ~MoecherEngine() {
+        if (step_topk_host_) {
+            cudaFreeHost(step_topk_host_);
+            step_topk_host_ = nullptr;
+        }
         if (graph_exec_) {
             cudaGraphExecDestroy(graph_exec_);
             graph_exec_ = nullptr;
@@ -1462,7 +1813,8 @@ public:
 
     // ── Load model from manifest ────────────────────────────────────────────
 
-    bool load(const std::string& manifest_path, float max_vram_gb = 0.0f, float dram_cache_gb = 0.0f, const std::string& expert_dtype_override = "") {
+    bool load(const std::string& manifest_path, float max_vram_gb = 0.0f, float dram_cache_gb = 0.0f,
+              const std::string& expert_dtype_override = "", bool buffered_io = false) {
         LOG_INFO("Loading manifest: %s", manifest_path.c_str());
 
         std::ifstream f(manifest_path);
@@ -1481,6 +1833,7 @@ public:
 
         std::filesystem::path manifest_p(manifest_path);
         std::filesystem::path base_dir = manifest_p.parent_path();
+        model_dir_ = base_dir.string();
 
         // Load tokenizer
         std::string tok_path = manifest["tokenizer"]["tokenizer_json"].get<std::string>();
@@ -1589,7 +1942,7 @@ public:
         if (cfg_.n_routed_experts > 0 && !expert_full.empty()) {
             if (!expert_loader_.init(expert_full, expert_block_size,
                                       expert_n_layers, expert_n_experts,
-                                      cache_budget, dram_cache_budget)) return false;
+                                      cache_budget, dram_cache_budget, buffered_io)) return false;
 
             // Allocate double-buffered streaming slots in VRAM for offloading
             for (int b = 0; b < 2; b++) {
@@ -1598,8 +1951,26 @@ public:
                 }
             }
 
-            // Preload experts into VRAM
-            expert_loader_.preload_all();
+            // Preload experts into VRAM & DRAM (frequency-guided if expert_freq.bin exists)
+            std::string freq_path = (base_dir / "expert_freq.bin").string();
+            expert_freq_counts_ = load_expert_freq(freq_path, cfg_.num_hidden_layers, cfg_.n_routed_experts, &expert_freq_total_tokens_);
+            if (expert_freq_counts_.empty()) {
+                expert_freq_counts_.assign((size_t)cfg_.num_hidden_layers * cfg_.n_routed_experts, 0);
+            }
+            expert_loader_.preload_all(16, expert_freq_counts_);
+
+            expert_token_counts_.resize(cfg_.num_hidden_layers);
+            for (int l = 0; l < cfg_.num_hidden_layers; l++) {
+                expert_token_counts_[l].resize(cfg_.n_routed_experts);
+            }
+            std::string json_profile_path = (base_dir / "expert_profile.json").string();
+            load_expert_profile_json(json_profile_path);
+
+            if (d_expert_counts_.data && !expert_freq_counts_.empty()) {
+                CUDA_CHECK(cudaMemcpy(d_expert_counts_.data, expert_freq_counts_.data(),
+                                      expert_freq_counts_.size() * sizeof(uint32_t),
+                                      cudaMemcpyHostToDevice));
+            }
         } else {
             LOG_INFO("Dense architecture active (0 routed experts). Bypassing expert cache.");
         }
@@ -1742,8 +2113,10 @@ public:
         LOG_INFO("Warming up and capturing CUDA Graph for decode acceleration...");
         int dummy_tok = 0;
         int dummy_pos = 0;
+        int dummy_flag = 0;
         CUDA_CHECK(cudaMemcpy(buf_input_token_.i32(), &dummy_tok, sizeof(int32_t), cudaMemcpyHostToDevice));
         CUDA_CHECK(cudaMemcpy(buf_input_pos_.i32(), &dummy_pos, sizeof(int32_t), cudaMemcpyHostToDevice));
+        CUDA_CHECK(cudaMemcpy(buf_track_flag_.i32(), &dummy_flag, sizeof(int32_t), cudaMemcpyHostToDevice));
 
         // 3 warmup iterations
         for (int i = 0; i < 3; i++) {
@@ -1753,6 +2126,7 @@ public:
 
         CUDA_CHECK(cudaMemcpy(buf_input_token_.i32(), &dummy_tok, sizeof(int32_t), cudaMemcpyHostToDevice));
         CUDA_CHECK(cudaMemcpy(buf_input_pos_.i32(), &dummy_pos, sizeof(int32_t), cudaMemcpyHostToDevice));
+        CUDA_CHECK(cudaMemcpy(buf_track_flag_.i32(), &dummy_flag, sizeof(int32_t), cudaMemcpyHostToDevice));
         CUDA_CHECK(cudaStreamSynchronize(main_stream_));
 
         // Capture forward graph
@@ -1790,19 +2164,41 @@ public:
     std::mt19937 rng_{std::random_device{}()};
 
     void forward_token(int token_id, int position) {
+        int track_flag = (track_expert_freq_ && track_current_token_) ? 1 : 0;
         if (graph_captured_) {
+            CUDA_CHECK(cudaMemcpyAsync(buf_track_flag_.i32(), &track_flag, sizeof(int32_t), cudaMemcpyHostToDevice, main_stream_));
             CUDA_CHECK(cudaMemcpyAsync(buf_input_token_.i32(), &token_id, sizeof(int32_t), cudaMemcpyHostToDevice, main_stream_));
             CUDA_CHECK(cudaMemcpyAsync(buf_input_pos_.i32(), &position, sizeof(int32_t), cudaMemcpyHostToDevice, main_stream_));
             CUDA_CHECK(cudaGraphLaunch(graph_exec_, main_stream_));
         } else {
             forward_token_eager(token_id, position);
         }
+        if (track_expert_freq_ && step_topk_host_ && d_step_topk_.data) {
+            int slot = decode_step_idx_ % 2;
+            int n_layers = cfg_.num_hidden_layers;
+            int top_k = cfg_.num_experts_per_tok;
+            int32_t* dst_ptr = step_topk_host_ + slot * (n_layers * top_k);
+            CUDA_CHECK(cudaMemcpyAsync(dst_ptr, d_step_topk_.data,
+                                       (size_t)n_layers * top_k * sizeof(int32_t),
+                                       cudaMemcpyDeviceToHost, main_stream_));
+        }
     }
 
     void forward_token_eager(int token_id, int position) {
+        int track_flag = (track_expert_freq_ && track_current_token_) ? 1 : 0;
+        CUDA_CHECK(cudaMemcpy(buf_track_flag_.i32(), &track_flag, sizeof(int32_t), cudaMemcpyHostToDevice));
         CUDA_CHECK(cudaMemcpy(buf_input_token_.i32(), &token_id, sizeof(int32_t), cudaMemcpyHostToDevice));
         CUDA_CHECK(cudaMemcpy(buf_input_pos_.i32(), &position, sizeof(int32_t), cudaMemcpyHostToDevice));
         forward_token_device_body(token_id, position);
+        if (track_expert_freq_ && step_topk_host_ && d_step_topk_.data) {
+            int slot = decode_step_idx_ % 2;
+            int n_layers = cfg_.num_hidden_layers;
+            int top_k = cfg_.num_experts_per_tok;
+            int32_t* dst_ptr = step_topk_host_ + slot * (n_layers * top_k);
+            CUDA_CHECK(cudaMemcpyAsync(dst_ptr, d_step_topk_.data,
+                                       (size_t)n_layers * top_k * sizeof(int32_t),
+                                       cudaMemcpyDeviceToHost, main_stream_));
+        }
     }
 
     void forward_token_device_body(int token_id, int position) {
@@ -1850,6 +2246,10 @@ public:
 
         // 6. Logits: hidden @ head_weight.T -> [vocab_size]
         compute_logits();
+
+        if (track_expert_freq_ && track_current_token_ && !is_control_token(token_id)) {
+            expert_freq_total_tokens_++;
+        }
     }
 
     // ── Generate tokens ─────────────────────────────────────────────────────
@@ -1941,6 +2341,9 @@ public:
             CUDA_CHECK(cudaMemset(buf_hc_after_attn_.data, 0, buf_hc_after_attn_.size_bytes));
         }
 
+        // Disable tracking during prompt prefill (prevents system prompt boilerplate from skewing stats)
+        track_current_token_ = false;
+
         // Prefill prompt
         for (size_t i = 0; i < prompt.size(); i++) {
             forward_token_eager(prompt[i], (int)i);
@@ -1985,6 +2388,14 @@ public:
         int content_tokens_generated = 0;
         int thinking_tokens_generated = 0;
 
+        decode_step_idx_ = 0;
+        int n_layers = cfg_.num_hidden_layers;
+        int moe_top_k = cfg_.num_experts_per_tok;
+        int n_experts = cfg_.n_routed_experts;
+        std::vector<std::pair<int, std::vector<int32_t>>> per_token_topk;
+        int prev_tracked_token = -1;
+        int prev_slot = -1;
+
         std::string last_think_token_str;
 
         for (int t = 0; content_tokens_generated < max_tokens; t++) {
@@ -2011,6 +2422,7 @@ public:
                     // 1. Inject </think> to close thinking block
                     in_think_block = false;
                     think_block_ended = true;
+                    track_current_token_ = false;
                     if (think_end_id >= 0) {
                         forward_token(think_end_id, position);
                         position++;
@@ -2021,6 +2433,7 @@ public:
                     // 2. Inject and stream "Allright, here is the solution:\n\n" as the beginning of CONTENT
                     std::vector<int> transition_tokens = tokenizer_.encode("Allright, here is the solution:\n\n");
                     for (int tok_id : transition_tokens) {
+                        track_current_token_ = false; // Synthetic transition tokens not tracked
                         forward_token(tok_id, position);
                         position++;
                         output_ids.push_back(tok_id);
@@ -2046,6 +2459,7 @@ public:
                          t, thinking_tokens_generated);
                 in_think_block = false;
                 think_block_ended = true;
+                track_current_token_ = false;
                 if (think_end_id >= 0) {
                     forward_token(think_end_id, position);
                     position++;
@@ -2074,9 +2488,29 @@ public:
             output_ids.push_back(next_token);
             history.push_back(next_token);
 
+            // Enable tracking for all generated tokens produced by the model (excluding control & special tokens)
+            track_current_token_ = !is_control_token(next_token);
+            if (track_expert_freq_ && track_current_token_) {
+                expert_freq_total_tokens_++;
+            }
+
+            if (prev_slot >= 0 && prev_tracked_token >= 0 && track_expert_freq_ && step_topk_host_) {
+                int32_t* src_ptr = step_topk_host_ + prev_slot * (n_layers * moe_top_k);
+                std::vector<int32_t> topk_copy(src_ptr, src_ptr + (n_layers * moe_top_k));
+                per_token_topk.push_back({prev_tracked_token, std::move(topk_copy)});
+            }
+            if (track_current_token_) {
+                prev_tracked_token = next_token;
+                prev_slot = decode_step_idx_ % 2;
+            } else {
+                prev_tracked_token = -1;
+                prev_slot = -1;
+            }
+
             // Pipeline: Launch GPU forward pass for next token immediately so GPU runs concurrently with CPU text decoding
             forward_token(next_token, position);
             position++;
+            decode_step_idx_++;
            
             // Handle think block filtering
             if (think_start_id >= 0 && next_token == think_start_id) {
@@ -2207,6 +2641,35 @@ public:
         prompt_token_count_ = (int)prompt.size();
         completion_token_count_ = (int)output_ids.size();
         last_finish_reason_ = finish_reason;
+
+        CUDA_CHECK(cudaStreamSynchronize(main_stream_));
+        if (prev_slot >= 0 && prev_tracked_token >= 0 && track_expert_freq_ && step_topk_host_) {
+            int32_t* src_ptr = step_topk_host_ + prev_slot * (n_layers * moe_top_k);
+            std::vector<int32_t> topk_copy(src_ptr, src_ptr + (n_layers * moe_top_k));
+            per_token_topk.push_back({prev_tracked_token, std::move(topk_copy)});
+        }
+
+        sync_expert_freq_from_gpu();
+
+        if (track_expert_freq_ && !per_token_topk.empty()) {
+            std::lock_guard<std::mutex> lock(expert_profile_mutex_);
+            if ((int)expert_token_counts_.size() != n_layers) {
+                expert_token_counts_.resize(n_layers);
+                for (int l = 0; l < n_layers; l++) expert_token_counts_[l].resize(n_experts);
+            }
+            for (auto& [tok, topk_vec] : per_token_topk) {
+                if (!is_control_token(tok)) {
+                    for (int l = 0; l < n_layers && l < (int)expert_token_counts_.size(); l++) {
+                        for (int k = 0; k < moe_top_k; k++) {
+                            int eid = topk_vec[l * moe_top_k + k];
+                            if (eid >= 0 && eid < (int)expert_token_counts_[l].size()) {
+                                expert_token_counts_[l][eid][tok]++;
+                            }
+                        }
+                    }
+                }
+            }
+        }
 
         return result;
     }
@@ -2646,6 +3109,17 @@ private:
         buf_indexer_proj_gate_.alloc(256 * sizeof(float));
 
         buf_argmax_out_.alloc(sizeof(int32_t));
+        buf_track_flag_.alloc(sizeof(int32_t));
+        CUDA_CHECK(cudaMemset(buf_track_flag_.data, 0, sizeof(int32_t)));
+        d_expert_counts_.alloc((size_t)cfg_.num_hidden_layers * std::max(cfg_.n_routed_experts, 256) * sizeof(uint32_t));
+        CUDA_CHECK(cudaMemset(d_expert_counts_.data, 0, d_expert_counts_.size_bytes));
+        
+        size_t step_topk_sz = (size_t)cfg_.num_hidden_layers * std::max(cfg_.num_experts_per_tok, 6) * sizeof(int32_t);
+        d_step_topk_.alloc(step_topk_sz);
+        CUDA_CHECK(cudaMemset(d_step_topk_.data, 0, d_step_topk_.size_bytes));
+        if (step_topk_host_) cudaFreeHost(step_topk_host_);
+        CUDA_CHECK(cudaMallocHost(&step_topk_host_, 2 * step_topk_sz));
+        std::memset(step_topk_host_, 0, 2 * step_topk_sz);
 
         router_indices_host_.resize(cfg_.n_routed_experts);
         logits_host_.resize(cfg_.vocab_size);
@@ -3154,6 +3628,9 @@ private:
             comp_mask_ptr = buf_indexer_mask_.u8();
         }
 
+        // Ensure KV store on side_stream_ is complete before reading KV cache on main_stream_
+        CUDA_CHECK(cudaStreamWaitEvent(main_stream_, side_event_, 0));
+
         // ── Attention computation ───────────────────────────────────────────
         float scale = 1.0f / sqrtf((float)head_dim_val);
         int max_combined = window + cfg_.max_compressed_entries;
@@ -3237,117 +3714,365 @@ private:
                 1, top_k, n_experts, dim, moe_inter, main_stream_);
         }
 
+        // 3c. Track expert activation frequency (GPU-native, 100% CUDA Graph compatible, zero CPU latency)
+        if (d_expert_counts_.data) {
+            accumulate_expert_freq_cuda(
+                (uint32_t*)d_expert_counts_.data,
+                (int32_t*)d_step_topk_.data,
+                buf_topk_idx_.i32(),
+                buf_track_flag_.i32(),
+                layer_id,
+                n_experts,
+                top_k,
+                main_stream_);
+        }
+
         // 4. Populate active expert pointers
         const void* const* flat_ptrs = nullptr;
         if (expert_loader_.all_resident(cfg_.num_hidden_layers)) {
             flat_ptrs = expert_loader_.flat_vram_ptrs_gpu();
         } else {
+            // ── TIMING INSTRUMENTATION for offloading path ──
+            static thread_local int64_t t_token_count = 0;
+            static thread_local double t_cache_resolve_us = 0;
+            static thread_local double t_io_submit_us = 0;
+            static thread_local double t_io_wait_us = 0;
+            static thread_local double t_compute_us = 0;
+            static thread_local int t_l1_hits = 0;
+            static thread_local int t_l2_hits = 0;
+            static thread_local int t_ssd_reads = 0;
+            if (layer_id == 3) {  // Reset per-token at first MoE layer
+                t_cache_resolve_us = 0; t_io_submit_us = 0; t_io_wait_us = 0; t_compute_us = 0;
+                t_l1_hits = 0; t_l2_hits = 0; t_ssd_reads = 0;
+            }
+            auto _tp0 = std::chrono::high_resolution_clock::now();
+            // Async copy top-k IDs to host with event-based sync (no full pipeline flush)
             CUDA_CHECK(cudaMemcpyAsync(topk_ids_host_, buf_topk_idx_.i32(),
                                        top_k * sizeof(int32_t), cudaMemcpyDeviceToHost, main_stream_));
-            CUDA_CHECK(cudaStreamSynchronize(main_stream_));
+            CUDA_CHECK(cudaEventRecord(dma_event_, main_stream_));
 
-            std::future<void*> expert_futures[32];
-            void* cached_blocks[32] = {nullptr};
+            // ── Launch shared expert FIRST on side_stream_ while we wait for top-k IDs ──
+            // This overlaps shared expert GPU compute with the CPU-side expert loading below.
+            // The side_stream_ waits for main_event_ (ffn_norm) which was recorded before forward_moe.
+            CUDA_CHECK(cudaStreamWaitEvent(side_stream_, main_event_, 0));
+            __nv_bfloat16* shared_gate = buf_gate_.bf16() + top_k * moe_inter;
+            __nv_bfloat16* shared_up   = buf_up_.bf16()   + top_k * moe_inter;
+            __nv_bfloat16* shared_down = buf_down_.bf16() + top_k * dim;
 
-            for (int k = 0; k < top_k; k++) {
-                int eid = topk_ids_host_[k];
-                if (eid < 0 || eid >= n_experts) continue;
-                cached_blocks[k] = expert_loader_.touch_expert_cached(layer_id, eid);
-                if (!cached_blocks[k]) {
-                    expert_futures[k] = expert_pool_->enqueue([this, layer_id, eid, k]() {
-                        return expert_loader_.get_expert(layer_id, eid, expert_streams_[k]);
-                    });
+            if (lw.shared_w1_w.dtype == "int4") {
+                gemv_int4_cuda(shared_gate, buf_hidden_.bf16(), (const uint8_t*)lw.shared_w1_w.data, lw.shared_w1_s.bf16(), moe_inter, dim, side_stream_);
+                gemv_int4_cuda(shared_up, buf_hidden_.bf16(), (const uint8_t*)lw.shared_w3_w.data, lw.shared_w3_s.bf16(), moe_inter, dim, side_stream_);
+                silu_mul_cuda(shared_gate, shared_gate, shared_up,
+                              moe_inter, cfg_.swiglu_limit, side_stream_);
+                gemv_int4_cuda(shared_down, shared_gate, (const uint8_t*)lw.shared_w2_w.data, lw.shared_w2_s.bf16(), dim, moe_inter, side_stream_);
+            } else {
+                gemm_fp8_dequant(shared_gate, 1, moe_inter, dim,
+                                 buf_hidden_.bf16(),
+                                 lw.shared_w1_w.u8(), lw.shared_w1_s.u8(), 128, side_stream_);
+                gemm_fp8_dequant(shared_up, 1, moe_inter, dim,
+                                 buf_hidden_.bf16(),
+                                 lw.shared_w3_w.u8(), lw.shared_w3_s.u8(), 128, side_stream_);
+                silu_mul_cuda(shared_gate, shared_gate, shared_up,
+                              moe_inter, cfg_.swiglu_limit, side_stream_);
+                gemm_fp8_dequant(shared_down, 1, dim, moe_inter,
+                                 shared_gate,
+                                 lw.shared_w2_w.u8(), lw.shared_w2_s.u8(), 128, side_stream_);
+            }
+            CUDA_CHECK(cudaEventRecord(side_event_, side_stream_));
+
+            // ── Now wait only for the D→H copy to complete (NOT full pipeline flush) ──
+            CUDA_CHECK(cudaEventSynchronize(dma_event_));
+
+            // ── Resolve all 6 experts' cache in a single lock (no I/O blocking) ──
+            void* batch_ptrs[32] = {nullptr};
+            bool batch_needs_dma[32] = {false};
+            // batch_get_experts resolves cache + starts parallel I/O + waits for all
+            // But we need TRUE interleaving, so we'll do it ourselves:
+
+            // Phase 1: Resolve cache under single lock (fast, no I/O)
+            struct ExpertReq {
+                int64_t key;
+                void* gpu_dst;
+                void* host_src;
+                int stage_idx;
+                bool needs_disk;
+                bool l1_hit;
+            } reqs[32];
+
+            {
+                std::unique_lock<std::mutex> lock(expert_loader_.cache_mutex_);
+                expert_loader_.access_counter_++;
+
+                for (int k = 0; k < top_k; k++) {
+                    int eid = topk_ids_host_[k];
+                    reqs[k].l1_hit = false;
+                    reqs[k].stage_idx = -1;
+                    reqs[k].needs_disk = false;
+
+                    if (eid < 0 || eid >= n_experts) {
+                        batch_ptrs[k] = nullptr;
+                        batch_needs_dma[k] = false;
+                        reqs[k].l1_hit = true;
+                        continue;
+                    }
+
+                    int64_t key = (int64_t)layer_id * expert_loader_.n_experts_ + eid;
+                    reqs[k].key = key;
+
+                    // Check L1 (VRAM)
+                    auto it = expert_loader_.key_to_slot_.find(key);
+                    if (it != expert_loader_.key_to_slot_.end()) {
+                        auto& slot = expert_loader_.cache_slots_[it->second];
+                        slot.last_used = expert_loader_.access_counter_;
+                        batch_ptrs[k] = slot.gpu_data;
+                        batch_needs_dma[k] = false;
+                        reqs[k].l1_hit = true;
+                        continue;
+                    }
+
+                    // L1 miss — find eviction candidate
+                    int evict_slot = -1;
+                    int64_t oldest = INT64_MAX;
+                    for (int i = 0; i < expert_loader_.cache_capacity_; i++) {
+                        if (expert_loader_.cache_slots_[i].layer_id < 0) { evict_slot = i; break; }
+                        if (expert_loader_.cache_slots_[i].last_used < oldest) {
+                            oldest = expert_loader_.cache_slots_[i].last_used;
+                            evict_slot = i;
+                        }
+                    }
+
+                    auto& slot = expert_loader_.cache_slots_[evict_slot];
+                    if (slot.layer_id >= 0) {
+                        int64_t old_key = (int64_t)slot.layer_id * expert_loader_.n_experts_ + slot.expert_id;
+                        expert_loader_.key_to_slot_.erase(old_key);
+                        expert_loader_.flat_vram_ptrs_[old_key] = nullptr;
+                        // Demote evicted expert to L2 DRAM (victim cache)
+                        expert_loader_.demote_to_l2(slot.layer_id, slot.expert_id, old_key, slot.gpu_data);
+                    }
+                    slot.layer_id = layer_id;
+                    slot.expert_id = eid;
+                    slot.last_used = expert_loader_.access_counter_;
+                    expert_loader_.key_to_slot_[key] = evict_slot;
+                    expert_loader_.flat_vram_ptrs_[key] = slot.gpu_data;
+
+                    reqs[k].gpu_dst = slot.gpu_data;
+                    batch_ptrs[k] = slot.gpu_data;
+                    batch_needs_dma[k] = true;
+
+                    // Check L2 (DRAM)
+                    if (expert_loader_.dram_cache_capacity_ > 0) {
+                        auto dram_it = expert_loader_.dram_key_to_slot_.find(key);
+                        if (dram_it != expert_loader_.dram_key_to_slot_.end()) {
+                            auto& ds = expert_loader_.dram_cache_slots_[dram_it->second];
+                            ds.last_used = expert_loader_.access_counter_;
+                            reqs[k].host_src = ds.gpu_data;
+                        } else {
+                            // L2 miss — use staging ring buffer for SSD read
+                            // Do NOT evict L2 entries: L2 is a stable fast cache, not SSD staging
+                            reqs[k].stage_idx = expert_loader_.staging_idx_;
+                            expert_loader_.staging_idx_ = (expert_loader_.staging_idx_ + 1) % ExpertLoader::NUM_STAGING_BUFFERS;
+                            reqs[k].needs_disk = true;
+                        }
+                    } else {
+                        reqs[k].stage_idx = expert_loader_.staging_idx_;
+                        expert_loader_.staging_idx_ = (expert_loader_.staging_idx_ + 1) % ExpertLoader::NUM_STAGING_BUFFERS;
+                        reqs[k].needs_disk = true;
+                    }
                 }
             }
+            // ── Mutex released ──
 
+            auto _tp1 = std::chrono::high_resolution_clock::now();
+            t_cache_resolve_us += std::chrono::duration<double, std::micro>(_tp1 - _tp0).count();
+
+            // Count hits/misses
             for (int k = 0; k < top_k; k++) {
-                int eid = topk_ids_host_[k];
-                if (eid < 0 || eid >= n_experts) {
+                if (reqs[k].l1_hit) { t_l1_hits++; }
+                else if (!reqs[k].needs_disk) { t_l2_hits++; }
+                else { t_ssd_reads++; }
+            }
+
+            // Phase 2: Submit ALL I/O to thread pool (non-blocking, returns futures)
+            std::future<bool> io_futures[32];
+            for (int k = 0; k < top_k; k++) {
+                if (reqs[k].l1_hit) continue;
+                io_futures[k] = expert_pool_->enqueue([this, &reqs, k]() -> bool {
+                    auto& r = reqs[k];
+                    void* host_ptr = r.host_src;
+                    if (r.stage_idx >= 0) {
+                        // SSD path: 2.5ms SSD read provides enough time for writeback (0.27ms) to complete
+                        auto& stage = expert_loader_.staging_ring_[r.stage_idx];
+                        CUDA_CHECK(cudaEventSynchronize(stage.event));
+                        int64_t bytes = expert_loader_.expert_file_.pread_exact(
+                            stage.ptr, expert_loader_.expert_block_size_, r.key * expert_loader_.expert_block_size_);
+                        if (bytes != expert_loader_.expert_block_size_) return false;
+                        host_ptr = stage.ptr;
+                        CUDA_CHECK(cudaMemcpyAsync(r.gpu_dst, host_ptr, expert_loader_.expert_block_size_,
+                                                    cudaMemcpyHostToDevice, expert_streams_[k]));
+                        CUDA_CHECK(cudaEventRecord(stage.event, expert_streams_[k]));
+                    } else {
+                        // L2 hit path: DMA is immediate, must wait for writeback to complete first
+                        expert_loader_.wait_for_writeback(expert_streams_[k]);
+                        if (r.needs_disk) {
+                            int64_t bytes = expert_loader_.expert_file_.pread_exact(
+                                host_ptr, expert_loader_.expert_block_size_, r.key * expert_loader_.expert_block_size_);
+                            if (bytes != expert_loader_.expert_block_size_) return false;
+                        }
+                        // Route through pinned staging if DRAM cache is unpinned
+                        // cudaMemcpyAsync from pageable memory is SYNCHRONOUS — blocks the stream!
+                        // Instead: memcpy(DRAM→pinned) + cudaMemcpyAsync(pinned→VRAM) = true async DMA
+                        if (!expert_loader_.dram_is_pinned_ && k < ExpertLoader::NUM_DMA_STAGING && expert_loader_.dma_staging_[k]) {
+                            memcpy(expert_loader_.dma_staging_[k], host_ptr, expert_loader_.expert_block_size_);
+                            CUDA_CHECK(cudaMemcpyAsync(r.gpu_dst, expert_loader_.dma_staging_[k], expert_loader_.expert_block_size_,
+                                                        cudaMemcpyHostToDevice, expert_streams_[k]));
+                        } else {
+                            CUDA_CHECK(cudaMemcpyAsync(r.gpu_dst, host_ptr, expert_loader_.expert_block_size_,
+                                                        cudaMemcpyHostToDevice, expert_streams_[k]));
+                        }
+                    }
+                    return true;
+                });
+            }
+
+            auto _tp2 = std::chrono::high_resolution_clock::now();
+            t_io_submit_us += std::chrono::duration<double, std::micro>(_tp2 - _tp1).count();
+
+            // Phase 3: Wait for ALL I/O, then batch compute with fused kernel
+            // This eliminates ~30 CUDA API calls per layer (cudaEventRecord + cudaStreamWaitEvent
+            // + 2-4 kernel launches per expert) by using a single fused kernel call.
+            // The lost compute-I/O overlap (~6ms) is outweighed by saved API overhead (~8ms).
+            for (int k = 0; k < top_k; k++) {
+                if (reqs[k].l1_hit) {
+                    active_expert_ptrs_host_[k] = batch_ptrs[k];
+                    continue;
+                }
+                // Wait for this expert's I/O future
+                if (!io_futures[k].get()) {
                     active_expert_ptrs_host_[k] = nullptr;
                     continue;
                 }
-                void* ptr = cached_blocks[k];
-                if (!ptr) {
-                    ptr = expert_futures[k].get();
-                }
-                active_expert_ptrs_host_[k] = ptr;
-                if (!ptr) {
-                    LOG_ERROR("Failed to fetch expert L%d E%d", layer_id, eid);
-                }
+                active_expert_ptrs_host_[k] = batch_ptrs[k];
             }
 
+            // Make main_stream_ wait for ALL expert DMA streams to complete
             for (int k = 0; k < top_k; k++) {
-                if (!cached_blocks[k] && active_expert_ptrs_host_[k]) {
-                    CUDA_CHECK(cudaEventRecord(expert_events_[k], expert_streams_[k]));
-                    CUDA_CHECK(cudaStreamWaitEvent(main_stream_, expert_events_[k], 0));
-                }
+                if (reqs[k].l1_hit || !active_expert_ptrs_host_[k]) continue;
+                CUDA_CHECK(cudaEventRecord(expert_events_[k], expert_streams_[k]));
+                CUDA_CHECK(cudaStreamWaitEvent(main_stream_, expert_events_[k], 0));
             }
 
+            // Copy expert pointers to GPU for fused kernel
             CUDA_CHECK(cudaMemcpyAsync(buf_active_expert_ptrs_.data, active_expert_ptrs_host_,
                                        top_k * sizeof(void*), cudaMemcpyHostToDevice, main_stream_));
+
+            // Launch fused kernel: processes all 6 experts in 2 kernel calls instead of 12-24
+            auto& w1_info = expert_parts_["w1.weight"];
+            auto& w3_info = expert_parts_["w3.weight"];
+            auto& w2_info = expert_parts_["w2.weight"];
+            if (cfg_.expert_dtype == "iq2_xxs") {
+                gemv_iq2_xxs_moe_swiglu_fused_cuda(
+                    buf_gate_.bf16(), buf_hidden_.bf16(),
+                    (const void* const*)buf_active_expert_ptrs_.data,
+                    w1_info.offset_in_block, w3_info.offset_in_block,
+                    moe_inter, dim, cfg_.swiglu_limit,
+                    nullptr, nullptr, 0, 0, main_stream_);
+
+                gemv_q2_k_moe_cuda(
+                    buf_down_.bf16(), buf_gate_.bf16(),
+                    (const void* const*)buf_active_expert_ptrs_.data,
+                    w2_info.offset_in_block,
+                    dim, moe_inter,
+                    nullptr, nullptr, 0, 0, main_stream_);
+            } else {
+                // Fallback: per-expert compute for non-iq2_xxs dtypes
+                for (int k = 0; k < top_k; k++) {
+                    if (active_expert_ptrs_host_[k]) {
+                        execute_expert_swiglu(active_expert_ptrs_host_[k], 1.0f, k);
+                    }
+                }
+            }
+
+            auto _tp3 = std::chrono::high_resolution_clock::now();
+            t_io_wait_us += std::chrono::duration<double, std::micro>(_tp3 - _tp2).count();
+
+            // Log per-token stats at last MoE layer
+            if (layer_id == cfg_.num_hidden_layers - 1) {
+                t_token_count++;
+                if (t_token_count % 10 == 1) {
+                    LOG_INFO("[MoE Perf] Token #%lld: cache_resolve=%.1fms io_submit=%.1fms io_wait+compute=%.1fms | L1=%d L2=%d SSD=%d",
+                             t_token_count, t_cache_resolve_us/1000.0, t_io_submit_us/1000.0,
+                             t_io_wait_us/1000.0, t_l1_hits, t_l2_hits, t_ssd_reads);
+                }
+            }
         }
 
-        // 5. Shared expert executed concurrently on side_stream_ (must wait for ffn_norm to finish on main_stream_)
-        CUDA_CHECK(cudaStreamWaitEvent(side_stream_, main_event_, 0));
-        __nv_bfloat16* shared_gate = buf_gate_.bf16() + top_k * moe_inter;
-        __nv_bfloat16* shared_up   = buf_up_.bf16()   + top_k * moe_inter;
-        __nv_bfloat16* shared_down = buf_down_.bf16() + top_k * dim;
+        // 5. Shared expert (only for all-resident path; offloading path launched it above)
+        if (expert_loader_.all_resident(cfg_.num_hidden_layers)) {
+            CUDA_CHECK(cudaStreamWaitEvent(side_stream_, main_event_, 0));
+            __nv_bfloat16* shared_gate = buf_gate_.bf16() + top_k * moe_inter;
+            __nv_bfloat16* shared_up   = buf_up_.bf16()   + top_k * moe_inter;
+            __nv_bfloat16* shared_down = buf_down_.bf16() + top_k * dim;
 
-        if (lw.shared_w1_w.dtype == "int4") {
-            gemv_int4_cuda(shared_gate, buf_hidden_.bf16(), (const uint8_t*)lw.shared_w1_w.data, lw.shared_w1_s.bf16(), moe_inter, dim, side_stream_);
-            gemv_int4_cuda(shared_up, buf_hidden_.bf16(), (const uint8_t*)lw.shared_w3_w.data, lw.shared_w3_s.bf16(), moe_inter, dim, side_stream_);
-            silu_mul_cuda(shared_gate, shared_gate, shared_up,
-                          moe_inter, cfg_.swiglu_limit, side_stream_);
-            gemv_int4_cuda(shared_down, shared_gate, (const uint8_t*)lw.shared_w2_w.data, lw.shared_w2_s.bf16(), dim, moe_inter, side_stream_);
-        } else {
-            gemm_fp8_dequant(shared_gate, 1, moe_inter, dim,
-                             buf_hidden_.bf16(),
-                             lw.shared_w1_w.u8(), lw.shared_w1_s.u8(), 128, side_stream_);
-            gemm_fp8_dequant(shared_up, 1, moe_inter, dim,
-                             buf_hidden_.bf16(),
-                             lw.shared_w3_w.u8(), lw.shared_w3_s.u8(), 128, side_stream_);
-            silu_mul_cuda(shared_gate, shared_gate, shared_up,
-                          moe_inter, cfg_.swiglu_limit, side_stream_);
-            gemm_fp8_dequant(shared_down, 1, dim, moe_inter,
-                             shared_gate,
-                             lw.shared_w2_w.u8(), lw.shared_w2_s.u8(), 128, side_stream_);
+            if (lw.shared_w1_w.dtype == "int4") {
+                gemv_int4_cuda(shared_gate, buf_hidden_.bf16(), (const uint8_t*)lw.shared_w1_w.data, lw.shared_w1_s.bf16(), moe_inter, dim, side_stream_);
+                gemv_int4_cuda(shared_up, buf_hidden_.bf16(), (const uint8_t*)lw.shared_w3_w.data, lw.shared_w3_s.bf16(), moe_inter, dim, side_stream_);
+                silu_mul_cuda(shared_gate, shared_gate, shared_up,
+                              moe_inter, cfg_.swiglu_limit, side_stream_);
+                gemv_int4_cuda(shared_down, shared_gate, (const uint8_t*)lw.shared_w2_w.data, lw.shared_w2_s.bf16(), dim, moe_inter, side_stream_);
+            } else {
+                gemm_fp8_dequant(shared_gate, 1, moe_inter, dim,
+                                 buf_hidden_.bf16(),
+                                 lw.shared_w1_w.u8(), lw.shared_w1_s.u8(), 128, side_stream_);
+                gemm_fp8_dequant(shared_up, 1, moe_inter, dim,
+                                 buf_hidden_.bf16(),
+                                 lw.shared_w3_w.u8(), lw.shared_w3_s.u8(), 128, side_stream_);
+                silu_mul_cuda(shared_gate, shared_gate, shared_up,
+                              moe_inter, cfg_.swiglu_limit, side_stream_);
+                gemm_fp8_dequant(shared_down, 1, dim, moe_inter,
+                                 shared_gate,
+                                 lw.shared_w2_w.u8(), lw.shared_w2_s.u8(), 128, side_stream_);
+            }
+            CUDA_CHECK(cudaEventRecord(side_event_, side_stream_));
         }
-        CUDA_CHECK(cudaEventRecord(side_event_, side_stream_));
 
-        // 5. Launch 6 routed experts
+        // 6. Launch 6 routed experts (all-resident path uses fused kernel)
         auto& w1_info = expert_parts_["w1.weight"];
         auto& w3_info = expert_parts_["w3.weight"];
         auto& w2_info = expert_parts_["w2.weight"];
 
-        if (cfg_.expert_dtype == "iq2_xxs") {
-            gemv_iq2_xxs_moe_swiglu_fused_cuda(
-                buf_gate_.bf16(), buf_hidden_.bf16(),
-                (const void* const*)buf_active_expert_ptrs_.data,
-                w1_info.offset_in_block, w3_info.offset_in_block,
-                moe_inter, dim, cfg_.swiglu_limit,
-                buf_topk_idx_.i32(), flat_ptrs, layer_id, n_experts, main_stream_);
+        if (expert_loader_.all_resident(cfg_.num_hidden_layers)) {
+            if (cfg_.expert_dtype == "iq2_xxs") {
+                gemv_iq2_xxs_moe_swiglu_fused_cuda(
+                    buf_gate_.bf16(), buf_hidden_.bf16(),
+                    (const void* const*)buf_active_expert_ptrs_.data,
+                    w1_info.offset_in_block, w3_info.offset_in_block,
+                    moe_inter, dim, cfg_.swiglu_limit,
+                    buf_topk_idx_.i32(), flat_ptrs, layer_id, n_experts, main_stream_);
 
-            gemv_q2_k_moe_cuda(
-                buf_down_.bf16(), buf_gate_.bf16(),
-                (const void* const*)buf_active_expert_ptrs_.data,
-                w2_info.offset_in_block,
-                dim, moe_inter,
-                buf_topk_idx_.i32(), flat_ptrs, layer_id, n_experts, main_stream_);
-        } else {
-            for (int k = 0; k < top_k; k++) {
-                void* ptr = active_expert_ptrs_host_[k];
-                if (ptr) {
-                    execute_expert_swiglu(ptr, 1.0f, k);
+                gemv_q2_k_moe_cuda(
+                    buf_down_.bf16(), buf_gate_.bf16(),
+                    (const void* const*)buf_active_expert_ptrs_.data,
+                    w2_info.offset_in_block,
+                    dim, moe_inter,
+                    buf_topk_idx_.i32(), flat_ptrs, layer_id, n_experts, main_stream_);
+            } else {
+                for (int k = 0; k < top_k; k++) {
+                    void* ptr = active_expert_ptrs_host_[k];
+                    if (ptr) {
+                        execute_expert_swiglu(ptr, 1.0f, k);
+                    }
                 }
             }
         }
+        // Note: offloading path already computed experts individually above
 
         // Wait for shared expert on side_stream_ before accumulating
         CUDA_CHECK(cudaStreamWaitEvent(main_stream_, side_event_, 0));
 
-        // 6. Fused 6-way dynamic accumulation + shared expert directly into buf_hidden_
+        // 7. Fused 6-way dynamic accumulation + shared expert directly into buf_hidden_
+        __nv_bfloat16* shared_down_ptr = buf_down_.bf16() + top_k * dim;
         fused_moe_accum_dynamic_cuda(buf_hidden_.bf16(), buf_down_.bf16(),
-                                     buf_topk_vals_.f32(), shared_down, dim, main_stream_);
+                                     buf_topk_vals_.f32(), shared_down_ptr, dim, main_stream_);
     }
 
     // ── Execute a single expert SwiGLU ──────────────────────────────────────
@@ -3584,6 +4309,461 @@ public:
         LOG_INFO("=== Importance matrix calibration complete: %s ===", out_dat_path.c_str());
         return true;
     }
+
+    // ── Expert frequency tracking ────────────────────────────────────────────
+
+    // ── Expert frequency & specialization tracking ──────────────────────────
+
+    bool is_control_token(int token_id) const {
+        if (token_id < 0) return true;
+        if (token_id == cfg_.bos_token_id || token_id == cfg_.eos_token_id) return true;
+
+        std::string tok_str = tokenizer_.decode_token_str(token_id);
+        if (tok_str.empty()) return true;
+
+        if (tok_str == "<think>" || tok_str == "</think>" ||
+            tok_str == "<|im_start|>" || tok_str == "<|im_end|>" ||
+            tok_str == "<|end_of_sentence|>" || tok_str == "<｜end of sentence｜>" ||
+            tok_str == "<｜User｜>" || tok_str == "<｜Assistant｜>" ||
+            tok_str == "<｜begin of sentence｜>" || tok_str == "<|endoftext|>") {
+            return true;
+        }
+
+        // Catch any special tag formatted like <|...|> or <｜...｜> or <..._...>
+        if (tok_str.size() >= 4) {
+            if (tok_str.rfind("<|", 0) == 0 || tok_str.rfind("<｜", 0) == 0) return true;
+            if (tok_str.front() == '<' && tok_str.back() == '>') return true;
+        }
+        return false;
+    }
+
+    std::mutex expert_profile_mutex_;
+
+    void sync_expert_freq_from_gpu() {
+        if (track_expert_freq_ && d_expert_counts_.data && !expert_freq_counts_.empty()) {
+            std::lock_guard<std::mutex> lock(expert_profile_mutex_);
+            CUDA_CHECK(cudaMemcpy(expert_freq_counts_.data(), d_expert_counts_.data,
+                                  expert_freq_counts_.size() * sizeof(uint32_t),
+                                  cudaMemcpyDeviceToHost));
+        }
+    }
+
+    void enable_expert_tracking(const std::string& path = "") {
+        int n_layers = cfg_.num_hidden_layers;
+        int n_experts = cfg_.n_routed_experts;
+        
+        expert_freq_counts_ = load_expert_freq(path, n_layers, n_experts, &expert_freq_total_tokens_);
+        if (expert_freq_counts_.empty()) {
+            expert_freq_counts_.assign((size_t)n_layers * n_experts, 0);
+            expert_freq_total_tokens_ = 0;
+            if (d_expert_counts_.data) {
+                CUDA_CHECK(cudaMemset(d_expert_counts_.data, 0, d_expert_counts_.size_bytes));
+            }
+            LOG_INFO("Expert frequency tracking enabled (%d layers x %d experts, new profile)", n_layers, n_experts);
+        } else {
+            if (d_expert_counts_.data) {
+                CUDA_CHECK(cudaMemcpy(d_expert_counts_.data, expert_freq_counts_.data(),
+                                      expert_freq_counts_.size() * sizeof(uint32_t),
+                                      cudaMemcpyHostToDevice));
+            }
+            LOG_INFO("Expert frequency tracking enabled (%d layers x %d experts, resuming from %lld tokens)", n_layers, n_experts, expert_freq_total_tokens_);
+        }
+
+        expert_token_counts_.resize(n_layers);
+        for (int l = 0; l < n_layers; l++) {
+            expert_token_counts_[l].resize(n_experts);
+        }
+
+        if (!path.empty()) {
+            std::string json_profile_path = (std::filesystem::path(path).parent_path() / "expert_profile.json").string();
+            load_expert_profile_json(json_profile_path);
+        }
+
+        track_expert_freq_ = true;
+    }
+
+    static std::string infer_expert_category(const std::vector<std::pair<std::string, uint32_t>>& top_tokens) {
+        if (top_tokens.empty()) return "General Prose";
+
+        double code_score = 0;
+        double math_score = 0;
+        double reasoning_score = 0;
+        double format_score = 0;
+        double multi_score = 0;
+        double prose_score = 0;
+
+        for (auto& [tok, count] : top_tokens) {
+            double w = (double)count;
+            std::string t = tok;
+
+            size_t start = t.find_first_not_of(" \t\r\n");
+            std::string trimmed = (start == std::string::npos) ? t : t.substr(start);
+            size_t end = trimmed.find_last_not_of(" \t\r\n");
+            if (end != std::string::npos) trimmed = trimmed.substr(0, end + 1);
+
+            std::string lower = trimmed;
+            for (char& c : lower) c = (char)::tolower((unsigned char)c);
+
+            // 1. Format / Punctuation check
+            if (t == "\n" || t == "\n\n" || t == "\r\n" || t == "  " || t == "    " ||
+                t == "#" || t == "##" || t == "###" || t == "|" || t == "---" ||
+                t == "." || t == "," || t == ";" || t == ":" || t == "!" || t == "?" ||
+                t == "\"" || t == "'" || t == "`" || t == "*" || t == "**" || t == "-") {
+                format_score += w * 1.5;
+                continue;
+            }
+
+            // 2. HTML / CSS / JS / Programming check
+            if (lower == "html" || lower == "<!doctype" || lower == "<html" || lower == "</html>" ||
+                lower == "<head" || lower == "</head>" || lower == "<body" || lower == "</body>" ||
+                lower == "<div" || lower == "</div>" || lower == "<span" || lower == "</span>" ||
+                lower == "<script" || lower == "</script>" || lower == "<style" || lower == "</style>" ||
+                lower == "<canvas" || lower == "</canvas>" || lower == "<button" || lower == "</button>" ||
+                lower == "<input" || lower == "<p" || lower == "<h1" || lower == "<h2" || lower == "<h3" ||
+                lower == "function" || lower == "const" || lower == "let" || lower == "var" ||
+                lower == "document" || lower == "window" || lower == "getelementbyid" || lower == "addeventlistener" ||
+                lower == "def" || lower == "class" || lower == "import" || lower == "export" || lower == "return" ||
+                lower == "void" || lower == "int" || lower == "float" || lower == "double" || lower == "bool" ||
+                lower == "char" || lower == "string" || lower == "auto" || lower == "public" || lower == "private" ||
+                lower == "protected" || lower == "virtual" || lower == "override" || lower == "static" ||
+                lower == "template" || lower == "typename" || lower == "struct" || lower == "enum" ||
+                lower == "namespace" || lower == "using" || lower == "include" || lower == "async" || lower == "await" ||
+                lower == "yield" || lower == "lambda" || lower == "try" || lower == "catch" || lower == "throw" ||
+                lower == "finally" || lower == "self" || lower == "this" || lower == "null" || lower == "nullptr" ||
+                lower == "true" || lower == "false" || lower == "undefined" || lower == "console" || lower == "printf" ||
+                lower == "print" || lower == "std" || lower == "sizeof" || lower == "typedef" || lower == "malloc" ||
+                lower == "free" || lower == "cuda" || lower == "ptr" || lower == "select" || lower == "from" ||
+                lower == "where" || lower == "insert" || lower == "update" || lower == "delete" || lower == "join" ||
+                trimmed == "::" || trimmed == "->" || trimmed == "=>" || trimmed == "!=" ||
+                trimmed == "==" || trimmed == "===" || trimmed == "!==" || trimmed == "<=" ||
+                trimmed == ">=" || trimmed == "&&" || trimmed == "||" || trimmed == "++" ||
+                trimmed == "--" || trimmed == "+=" || trimmed == "-=" || trimmed == "*=" ||
+                trimmed == "/=" || trimmed == "//" || trimmed == "/*" || trimmed == "*/" ||
+                trimmed == "{" || trimmed == "}" || trimmed == "[" || trimmed == "]" ||
+                trimmed == "```" || trimmed.find("```") != std::string::npos ||
+                trimmed.find("px") != std::string::npos || trimmed.find("rgb") != std::string::npos) {
+                code_score += w * 3.0;
+                continue;
+            }
+
+            // 3. Reasoning / Thought Process markers
+            if (lower == "wait" || lower == "let" || lower == "first" || lower == "because" ||
+                lower == "therefore" || lower == "however" || lower == "consider" || lower == "analyze" ||
+                lower == "step" || lower == "check" || lower == "verify" || lower == "assume" ||
+                lower == "hypothesis" || lower == "notice" || lower == "recall" || lower == "indeed" ||
+                lower == "clearly" || lower == "specifically" || lower == "alternatively" || lower == "so" ||
+                lower == "thus" || lower == "hence" || lower == "since" || lower == "given" ||
+                lower == "then" || lower == "now" || lower == "next" || lower == "finally" ||
+                lower == "need" || lower == "should" || lower == "must" || lower == "will" ||
+                lower == "goal" || lower == "idea" || lower == "approach" || lower == "solution" ||
+                lower == "method" || lower == "case" || lower == "problem" || lower == "think" ||
+                lower == "thought" || lower == "reasoning" || lower == "logic" ||
+                trimmed == "<think>" || trimmed == "</think>") {
+                reasoning_score += w * 2.5;
+                continue;
+            }
+
+            // 4. Math / Logic & LaTeX notation
+            if (trimmed.find("\\frac") != std::string::npos || trimmed.find("\\int") != std::string::npos ||
+                trimmed.find("\\sum") != std::string::npos || trimmed.find("\\prod") != std::string::npos ||
+                trimmed.find("\\sqrt") != std::string::npos || trimmed.find("\\partial") != std::string::npos ||
+                trimmed.find("\\alpha") != std::string::npos || trimmed.find("\\beta") != std::string::npos ||
+                trimmed.find("\\gamma") != std::string::npos || trimmed.find("\\delta") != std::string::npos ||
+                trimmed.find("\\theta") != std::string::npos || trimmed.find("\\lambda") != std::string::npos ||
+                trimmed.find("\\sigma") != std::string::npos || trimmed.find("\\pi") != std::string::npos ||
+                trimmed.find("\\in") != std::string::npos || trimmed.find("\\approx") != std::string::npos ||
+                trimmed.find("\\le") != std::string::npos || trimmed.find("\\ge") != std::string::npos ||
+                lower == "matrix" || lower == "vector" || lower == "tensor" || lower == "integral" ||
+                lower == "derivative" || lower == "equation" || lower == "theorem" || lower == "lemma" ||
+                lower == "proof" || lower == "sin" || lower == "cos" || lower == "tan" ||
+                lower == "log" || lower == "exp" || lower == "mod" || lower == "prime" ||
+                lower == "eigen" || lower == "polynomial" || trimmed == "+" || trimmed == "=" ||
+                trimmed == "<>" || trimmed == "^" || trimmed == "<" || trimmed == ">" ||
+                (trimmed.size() == 1 && trimmed[0] >= '0' && trimmed[0] <= '9')) {
+                math_score += w * 2.5;
+                continue;
+            }
+
+            // 5. Non-ASCII multilingual
+            bool has_non_ascii = false;
+            for (unsigned char c : t) {
+                if (c >= 0x80) { has_non_ascii = true; break; }
+            }
+            if (has_non_ascii) {
+                multi_score += w * 2.0;
+                continue;
+            }
+
+            prose_score += w;
+        }
+
+        double max_score = prose_score;
+        std::string best_cat = "General Prose";
+
+        if (code_score > max_score) { max_score = code_score; best_cat = "Coding / Syntax"; }
+        if (math_score > max_score) { max_score = math_score; best_cat = "Math / Logic"; }
+        if (reasoning_score > max_score) { max_score = reasoning_score; best_cat = "Reasoning"; }
+        if (format_score > max_score) { max_score = format_score; best_cat = "Format / Syntax"; }
+        if (multi_score > max_score) { max_score = multi_score; best_cat = "Multilingual"; }
+
+        return best_cat;
+    }
+
+    json generate_expert_profile_json() {
+        std::lock_guard<std::mutex> lock(expert_profile_mutex_);
+        json root;
+        root["status"] = "ok";
+        root["tracking_enabled"] = track_expert_freq_;
+        root["total_tokens"] = expert_freq_total_tokens_;
+        root["n_layers"] = cfg_.num_hidden_layers;
+        root["n_experts"] = cfg_.n_routed_experts;
+        root["active_experts_per_tok"] = cfg_.num_experts_per_tok;
+
+        int n_layers = cfg_.num_hidden_layers;
+        int n_experts = cfg_.n_routed_experts;
+        int l1_res_count = expert_loader_.all_resident(n_layers) ? (n_layers * n_experts) : (int)expert_loader_.cache_capacity_;
+        int l2_res_count = expert_loader_.dram_cache_capacity_;
+        int ssd_count = (n_layers * n_experts) - l1_res_count - l2_res_count;
+        if (ssd_count < 0) ssd_count = 0;
+
+        root["l1_capacity"] = expert_loader_.cache_capacity_;
+        root["l1_resident"] = l1_res_count;
+        root["l2_capacity"] = expert_loader_.dram_cache_capacity_;
+        root["l2_resident"] = l2_res_count;
+        root["ssd_count"] = ssd_count;
+
+        std::map<std::string, int> cat_counts;
+        cat_counts["Coding / Syntax"] = 0;
+        cat_counts["Math / Logic"] = 0;
+        cat_counts["Reasoning"] = 0;
+        cat_counts["General Prose"] = 0;
+        cat_counts["Format / Syntax"] = 0;
+        cat_counts["Multilingual"] = 0;
+
+        struct ExpertEntry {
+            int layer;
+            int expert_id;
+            uint32_t count;
+            float hit_pct;
+            std::string category;
+            std::string location;
+            std::string tier;
+            std::vector<std::pair<std::string, uint32_t>> top_tokens;
+        };
+
+        std::vector<ExpertEntry> entries;
+        double denom_tokens = expert_freq_total_tokens_ > 0 ? (double)expert_freq_total_tokens_ : 1.0;
+
+        for (int l = 0; l < n_layers; l++) {
+            for (int e = 0; e < n_experts; e++) {
+                uint32_t cnt = 0;
+                if (!expert_freq_counts_.empty()) {
+                    cnt = expert_freq_counts_[(size_t)l * n_experts + e];
+                }
+                if (cnt == 0) continue;
+
+                std::vector<std::pair<std::string, uint32_t>> top_toks;
+                if (l < (int)expert_token_counts_.size() && e < (int)expert_token_counts_[l].size() && !expert_token_counts_[l][e].empty()) {
+                    std::vector<std::pair<int, uint32_t>> raw_toks;
+                    for (auto& [tid, tcnt] : expert_token_counts_[l][e]) {
+                        if (!is_control_token(tid)) {
+                            raw_toks.push_back({tid, tcnt});
+                        }
+                    }
+                    std::sort(raw_toks.begin(), raw_toks.end(), [](const auto& a, const auto& b) {
+                        return a.second > b.second;
+                    });
+                    int take = std::min((int)raw_toks.size(), 8);
+                    for (int i = 0; i < take; i++) {
+                        std::string decoded = tokenizer_.decode_token_str(raw_toks[i].first);
+                        if (!decoded.empty()) {
+                            top_toks.push_back({decoded, raw_toks[i].second});
+                        }
+                    }
+                } else if (l < (int)expert_loaded_top_tokens_.size() && e < (int)expert_loaded_top_tokens_[l].size()) {
+                    top_toks = expert_loaded_top_tokens_[l][e];
+                }
+
+                std::string category = infer_expert_category(top_toks);
+                cat_counts[category]++;
+
+                std::string loc = expert_loader_.get_expert_location(l, e);
+                std::string tier = expert_loader_.get_expert_tier(l, e);
+
+                float hit_pct = (float)((cnt * 100.0) / denom_tokens);
+                entries.push_back({l, e, cnt, hit_pct, category, loc, tier, top_toks});
+            }
+        }
+
+        std::sort(entries.begin(), entries.end(), [](const ExpertEntry& a, const ExpertEntry& b) {
+            return a.count > b.count;
+        });
+
+        json exp_arr = json::array();
+        int rank = 1;
+        for (auto& ent : entries) {
+            json item;
+            item["rank"] = rank++;
+            item["layer"] = ent.layer;
+            item["expert_id"] = ent.expert_id;
+            item["count"] = ent.count;
+            item["hit_pct"] = std::round(ent.hit_pct * 100.0) / 100.0;
+            item["category"] = ent.category;
+            item["location"] = ent.location;
+            item["tier"] = ent.tier;
+            json toks_json = json::array();
+            for (auto& [tstr, tcnt] : ent.top_tokens) {
+                toks_json.push_back({{"token", tstr}, {"count", tcnt}});
+            }
+            item["top_tokens"] = toks_json;
+            exp_arr.push_back(item);
+        }
+
+        root["experts"] = exp_arr;
+        root["categories_summary"] = cat_counts;
+        root["total_active_experts"] = (int)entries.size();
+        return root;
+    }
+
+    void save_expert_profile(const std::string& base_dir) {
+        if (expert_token_counts_.empty() && expert_freq_counts_.empty()) return;
+        json profile = generate_expert_profile_json();
+
+        std::string json_path = base_dir.empty() ? "expert_profile.json" : (base_dir + "/expert_profile.json");
+        std::string txt_path = base_dir.empty() ? "expert_profile.txt" : (base_dir + "/expert_profile.txt");
+
+        std::ofstream jout(json_path);
+        if (jout.is_open()) {
+            jout << profile.dump(2);
+            jout.close();
+        }
+
+        std::ofstream tout(txt_path);
+        if (tout.is_open()) {
+            tout << "====================================================================================================\n";
+            tout << "                        MINNIETHEMOECHER EXPERT SPECIALIZATION PROFILE\n";
+            tout << "====================================================================================================\n";
+            tout << "Total Tokens Profiled: " << expert_freq_total_tokens_ 
+                 << " | Active Experts: " << profile["total_active_experts"] 
+                 << " | Model: " << cfg_.num_hidden_layers << " layers x " << cfg_.n_routed_experts << " experts\n\n";
+            tout << "LAYER  EXPERT   HITS     HIT %     CATEGORY              TOP TOKENS (TRIGGER VOCABULARY)\n";
+            tout << "----------------------------------------------------------------------------------------------------\n";
+            for (auto& item : profile["experts"]) {
+                char linebuf[512];
+                int l = item["layer"].get<int>();
+                int e = item["expert_id"].get<int>();
+                uint32_t cnt = item["count"].get<uint32_t>();
+                double pct = item["hit_pct"].get<double>();
+                std::string cat = item["category"].get<std::string>();
+
+                std::string toks_str;
+                for (auto& t : item["top_tokens"]) {
+                    if (!toks_str.empty()) toks_str += ", ";
+                    std::string tok_name = t["token"].get<std::string>();
+                    for (char& c : tok_name) { if (c == '\n') c = ' '; if (c == '\r') c = ' '; }
+                    toks_str += "\"" + tok_name + "\" (" + std::to_string(t["count"].get<uint32_t>()) + ")";
+                }
+
+                snprintf(linebuf, sizeof(linebuf), "L%-4d E%-6d %-8u %-8.2f%% %-20s  %s\n",
+                         l, e, cnt, pct, cat.c_str(), toks_str.c_str());
+                tout << linebuf;
+            }
+            tout << "====================================================================================================\n";
+            tout.close();
+        }
+        LOG_INFO("Saved expert specialization profile: %s and %s", json_path.c_str(), txt_path.c_str());
+    }
+
+    void load_expert_profile_json(const std::string& path) {
+        std::ifstream in(path);
+        if (!in.is_open()) return;
+        try {
+            json root;
+            in >> root;
+            if (root.contains("experts") && root["experts"].is_array()) {
+                int n_layers = cfg_.num_hidden_layers;
+                int n_experts = cfg_.n_routed_experts;
+                if ((int)expert_token_counts_.size() != n_layers) {
+                    expert_token_counts_.resize(n_layers);
+                    for (int l = 0; l < n_layers; l++) expert_token_counts_[l].resize(n_experts);
+                }
+                expert_loaded_top_tokens_.resize(n_layers);
+                for (int l = 0; l < n_layers; l++) expert_loaded_top_tokens_[l].resize(n_experts);
+
+                for (auto& exp : root["experts"]) {
+                    int l = exp.value("layer", -1);
+                    int e = exp.value("expert_id", -1);
+                    if (l >= 0 && l < n_layers && e >= 0 && e < n_experts && exp.contains("top_tokens")) {
+                        std::vector<std::pair<std::string, uint32_t>> toks;
+                        for (auto& t : exp["top_tokens"]) {
+                            std::string tstr = t.value("token", "");
+                            uint32_t tcnt = t.value("count", (uint32_t)0);
+                            int tid = t.value("token_id", -1);
+                            if (tid >= 0) {
+                                expert_token_counts_[l][e][tid] += tcnt;
+                            }
+                            if (!tstr.empty()) {
+                                toks.push_back({tstr, tcnt});
+                            }
+                        }
+                        expert_loaded_top_tokens_[l][e] = std::move(toks);
+                    }
+                }
+                LOG_INFO("Loaded existing expert specialization profile from %s", path.c_str());
+            }
+        } catch (...) {
+            LOG_WARN("Failed to parse existing expert profile JSON: %s", path.c_str());
+        }
+    }
+
+    void save_expert_freq(const std::string& path) {
+        if (expert_freq_counts_.empty()) return;
+        std::ofstream out(path, std::ios::binary);
+        if (!out.is_open()) {
+            LOG_ERROR("Cannot write expert freq file: %s", path.c_str());
+            return;
+        }
+        int32_t n_layers = cfg_.num_hidden_layers;
+        int32_t n_experts = cfg_.n_routed_experts;
+        out.write((const char*)&n_layers, sizeof(n_layers));
+        out.write((const char*)&n_experts, sizeof(n_experts));
+        out.write((const char*)&expert_freq_total_tokens_, sizeof(expert_freq_total_tokens_));
+        out.write((const char*)expert_freq_counts_.data(), expert_freq_counts_.size() * sizeof(uint32_t));
+        out.close();
+
+        uint32_t total_selections = 0;
+        for (auto c : expert_freq_counts_) total_selections += c;
+        LOG_INFO("Saved expert frequency data: %s (%d layers, %lld tokens, %u total selections)",
+                 path.c_str(), n_layers, expert_freq_total_tokens_, total_selections);
+
+        // Also save human-readable and JSON semantic profile
+        std::string base_dir = std::filesystem::path(path).parent_path().string();
+        save_expert_profile(base_dir);
+    }
+
+    static std::vector<uint32_t> load_expert_freq(const std::string& path, int expected_layers, int expected_experts, int64_t* total_tokens_out = nullptr) {
+        std::ifstream in(path, std::ios::binary);
+        if (!in.is_open()) return {};
+        int32_t n_layers, n_experts;
+        int64_t total_tokens;
+        in.read((char*)&n_layers, sizeof(n_layers));
+        in.read((char*)&n_experts, sizeof(n_experts));
+        in.read((char*)&total_tokens, sizeof(total_tokens));
+        if (n_layers != expected_layers || n_experts != expected_experts) {
+            LOG_WARN("Expert freq file mismatch: expected %dx%d, got %dx%d. Ignoring.",
+                     expected_layers, expected_experts, n_layers, n_experts);
+            return {};
+        }
+        std::vector<uint32_t> counts((size_t)n_layers * n_experts);
+        in.read((char*)counts.data(), counts.size() * sizeof(uint32_t));
+        if (!in.good()) {
+            LOG_WARN("Expert freq file truncated. Ignoring.");
+            return {};
+        }
+        if (total_tokens_out) *total_tokens_out = total_tokens;
+        LOG_INFO("Loaded expert freq data: %s (%d layers, %lld tokens)", path.c_str(), n_layers, total_tokens);
+        return counts;
+    }
 };
 
 // ════════════════════════════════════════════════════════════════════════════════
@@ -3722,7 +4902,33 @@ static void run_server(MoecherEngine& engine, int port, int default_thinking_bud
         return httplib::Server::HandlerResponse::Unhandled;
     });
 
-    // Serve web UI assets directly
+    // Web UI endpoints: serve from disk if found in ./web, otherwise serve embedded compiled-in assets
+    auto serve_asset = [](const std::string& disk_path, std::string_view embedded, const char* mime, httplib::Response& res) {
+        std::ifstream in(disk_path, std::ios::binary);
+        if (in.is_open()) {
+            std::string content((std::istreambuf_iterator<char>(in)), std::istreambuf_iterator<char>());
+            res.set_content(content, mime);
+        } else {
+            res.set_content(std::string(embedded), mime);
+        }
+        res.set_header("Cache-Control", "no-cache, no-store, must-revalidate");
+        res.set_header("Pragma", "no-cache");
+        res.set_header("Expires", "0");
+    };
+
+    svr.Get("/", [&serve_asset](const httplib::Request&, httplib::Response& res) {
+        serve_asset("web/index.html", moecher::embedded_web::INDEX_HTML(), "text/html; charset=utf-8", res);
+    });
+    svr.Get("/index.html", [&serve_asset](const httplib::Request&, httplib::Response& res) {
+        serve_asset("web/index.html", moecher::embedded_web::INDEX_HTML(), "text/html; charset=utf-8", res);
+    });
+    svr.Get("/style.css", [&serve_asset](const httplib::Request&, httplib::Response& res) {
+        serve_asset("web/style.css", moecher::embedded_web::STYLE_CSS(), "text/css; charset=utf-8", res);
+    });
+    svr.Get("/script.js", [&serve_asset](const httplib::Request&, httplib::Response& res) {
+        serve_asset("web/script.js", moecher::embedded_web::SCRIPT_JS(), "application/javascript; charset=utf-8", res);
+    });
+
     svr.set_mount_point("/", "./web");
     svr.set_mount_point("/", "../web");
 
@@ -3744,6 +4950,16 @@ static void run_server(MoecherEngine& engine, int port, int default_thinking_bud
             }}
         };
         res.set_content(body.dump(), "application/json");
+    });
+
+    // Expert Specialization & Profile endpoints
+    svr.Get("/v1/experts/profile", [&engine](const httplib::Request&, httplib::Response& res) {
+        json profile = engine.generate_expert_profile_json();
+        res.set_content(profile.dump(), "application/json");
+    });
+    svr.Get("/v1/experts/stats", [&engine](const httplib::Request&, httplib::Response& res) {
+        json profile = engine.generate_expert_profile_json();
+        res.set_content(profile.dump(), "application/json");
     });
 
     // Chat completions
@@ -3889,6 +5105,12 @@ static void run_server(MoecherEngine& engine, int port, int default_thinking_bud
                         sink.write(sse.data(), sse.size());
                         sink.write("data: [DONE]\n\n", 14);
                         sink.done();
+
+                        if (g_track_experts && !engine.expert_freq_counts_.empty()) {
+                            std::string fpath = engine.model_dir_.empty() ? "expert_freq.bin" : (engine.model_dir_ + "/expert_freq.bin");
+                            engine.save_expert_freq(fpath);
+                            engine.save_expert_profile(engine.model_dir_);
+                        }
                         return true;
                     }
                 );
@@ -3920,6 +5142,12 @@ static void run_server(MoecherEngine& engine, int port, int default_thinking_bud
             auto end = std::chrono::steady_clock::now();
             auto elapsed_ms = std::chrono::duration<double, std::milli>(end - start).count();
             LOG_INFO("RESPONSE (%.0fms)", elapsed_ms);
+
+            if (g_track_experts && !engine.expert_freq_counts_.empty()) {
+                std::string fpath = engine.model_dir_.empty() ? "expert_freq.bin" : (engine.model_dir_ + "/expert_freq.bin");
+                engine.save_expert_freq(fpath);
+                engine.save_expert_profile(engine.model_dir_);
+            }
         });
 
     // Stop / abort generation endpoints
@@ -3961,6 +5189,7 @@ int main(int argc, char** argv) {
     int port = 8001;
     float max_vram_gb = 0.0f;
     float dram_cache_gb = 0.0f;
+    bool buffered_io = false;
     std::string log_path = "moecher.log";
     std::string expert_dtype_override = "";
     int default_thinking_budget = 4096;
@@ -3996,6 +5225,23 @@ int main(int argc, char** argv) {
         } else if (std::string(argv[i]) == "--quiet" || std::string(argv[i]) == "-q") {
             g_quiet = true;
             g_log_tokens = false;
+        } else if (std::string(argv[i]) == "--buffered-io") {
+            buffered_io = true;
+        } else if (std::string(argv[i]) == "--track" ||
+                   std::string(argv[i]) == "--track-all-moe" ||
+                   std::string(argv[i]) == "-track-all-moe" ||
+                   std::string(argv[i]) == "--track-moe-all" ||
+                   std::string(argv[i]) == "-track-moe-all" ||
+                   std::string(argv[i]) == "--track-moe" ||
+                   std::string(argv[i]) == "-track-moe" ||
+                   std::string(argv[i]) == "-track") {
+            g_track_experts = true;
+        } else if (std::string(argv[i]) == "--track-reset" ||
+                   std::string(argv[i]) == "--reset-track" ||
+                   std::string(argv[i]) == "-track-reset" ||
+                   std::string(argv[i]) == "-reset-track") {
+            g_track_reset = true;
+            g_track_experts = true;
         }
     }
 
@@ -4006,7 +5252,7 @@ int main(int argc, char** argv) {
     LOG_INFO("Default thinking token budget: %d", default_thinking_budget);
 
     MoecherEngine engine;
-    if (!engine.load(manifest_path, max_vram_gb, dram_cache_gb, expert_dtype_override)) {
+    if (!engine.load(manifest_path, max_vram_gb, dram_cache_gb, expert_dtype_override, buffered_io)) {
         LOG_ERROR("Failed to load model");
         return 1;
     }
@@ -4016,6 +5262,24 @@ int main(int argc, char** argv) {
         return ok ? 0 : 1;
     }
 
+    // Enable expert frequency tracking if --track flag is set
+    std::string freq_path = (std::filesystem::path(manifest_path).parent_path() / "expert_freq.bin").string();
+    if (g_track_experts) {
+        if (g_track_reset) {
+            LOG_INFO("Resetting expert frequency & specialization tracking profile...");
+            engine.enable_expert_tracking(""); // Start with empty profile
+        } else {
+            engine.enable_expert_tracking(freq_path);
+        }
+    }
+
     run_server(engine, port, default_thinking_budget);
+
+    // Save expert frequency & specialization profile on shutdown
+    if (g_track_experts && !engine.expert_freq_counts_.empty()) {
+        engine.save_expert_freq(freq_path);
+        std::string model_dir = std::filesystem::path(manifest_path).parent_path().string();
+        engine.save_expert_profile(model_dir);
+    }
     return 0;
 }

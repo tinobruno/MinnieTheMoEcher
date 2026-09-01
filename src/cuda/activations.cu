@@ -4928,3 +4928,41 @@ void sample_multinomial_f32_cuda(
     logits_exp_sum_stage1_kernel<<<N_BLOCKS, 256, 0, stream>>>(s_d_block_sums, logits, n, inv_temp, s_d_global_max, min_p);
     logits_sample_stage2_kernel<<<1, 128, 0, stream>>>(out, logits, s_d_block_sums, out, n, N_BLOCKS, rand_val);
 }
+
+// ── GPU-Native MoE Expert Activation Frequency Counter (CUDA Graph Compatible) ──
+__global__ void accumulate_expert_freq_kernel(
+    uint32_t* __restrict__ expert_counts,  // [n_layers * n_experts]
+    int32_t* __restrict__ step_topk,       // [n_layers * top_k]
+    const int32_t* __restrict__ topk_idx,  // [top_k]
+    const int32_t* __restrict__ track_flag,// [1] device flag (1=track, 0=skip)
+    int layer_id,
+    int n_experts,
+    int top_k)
+{
+    int tid = threadIdx.x;
+    if (tid < top_k) {
+        int eid = topk_idx[tid];
+        if (step_topk != nullptr) {
+            step_topk[layer_id * top_k + tid] = eid;
+        }
+        if (track_flag != nullptr && *track_flag == 0) return;
+        if (eid >= 0 && eid < n_experts) {
+            atomicAdd(&expert_counts[(size_t)layer_id * n_experts + eid], 1);
+        }
+    }
+}
+
+void accumulate_expert_freq_cuda(
+    uint32_t* expert_counts,
+    int32_t* step_topk,
+    const int32_t* topk_idx,
+    const int32_t* track_flag,
+    int layer_id,
+    int n_experts,
+    int top_k,
+    cudaStream_t stream)
+{
+    accumulate_expert_freq_kernel<<<1, 32, 0, stream>>>(
+        expert_counts, step_topk, topk_idx, track_flag, layer_id, n_experts, top_k);
+}
+

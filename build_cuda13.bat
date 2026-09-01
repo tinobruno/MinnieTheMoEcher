@@ -14,6 +14,13 @@ if %errorlevel% neq 0 (
 set "CUDA_PATH=C:\Program Files\NVIDIA GPU Computing Toolkit\CUDA\v13.3"
 set "PATH=C:\Program Files\NVIDIA GPU Computing Toolkit\CUDA\v13.3\bin;C:\Program Files (x86)\Microsoft Visual Studio\2019\Community\Common7\IDE\CommonExtensions\Microsoft\CMake\Ninja;%PATH%"
 
+echo [INFO] Embedding Web UI assets into binary...
+python scripts\embed_web.py
+if %errorlevel% neq 0 (
+    echo [ERROR] Failed to embed web assets!
+    exit /b 1
+)
+
 if exist build rmdir /s /q build
 
 cmake -B build -G Ninja ^

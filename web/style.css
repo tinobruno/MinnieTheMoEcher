@@ -598,7 +598,7 @@ code {
     resize: none;
     outline: none;
     max-height: 200px;
-    padding-right: 48px;
+    padding-right: 155px;
     line-height: 1.5;
 }
 
@@ -606,6 +606,24 @@ code {
     position: absolute;
     right: 12px;
     bottom: 8px;
+    display: flex;
+    align-items: center;
+    gap: 8px;
+}
+
+.hidden {
+    display: none !important;
+}
+
+.chatbar-preview-btn {
+    height: 32px;
+    box-shadow: 0 2px 8px rgba(66, 133, 244, 0.2);
+    animation: fadeInPreview 0.25s ease forwards;
+}
+
+@keyframes fadeInPreview {
+    from { opacity: 0; transform: scale(0.92); }
+    to { opacity: 1; transform: scale(1); }
 }
 
 .send-btn {
@@ -1183,3 +1201,388 @@ iframe#preview-iframe {
     flex: 1;
     white-space: pre-wrap;
 }
+
+/* ════════════════════════════════════════════════════════════════════════════════
+   Expert Specialization & Analytics UI
+   ════════════════════════════════════════════════════════════════════════════════ */
+
+.summary-title-row {
+    display: inline-flex;
+    align-items: center;
+    justify-content: space-between;
+    width: calc(100% - 20px);
+}
+
+.refresh-badge-btn {
+    display: inline-flex;
+    align-items: center;
+    justify-content: center;
+    width: 24px;
+    height: 24px;
+    border-radius: 50%;
+    cursor: pointer;
+    color: var(--text-secondary);
+    transition: background-color 0.2s, transform 0.2s, color 0.2s;
+}
+.refresh-badge-btn:hover {
+    background-color: rgba(255, 255, 255, 0.1);
+    color: var(--accent);
+}
+.refresh-badge-btn:active .refresh-icon {
+    transform: rotate(180deg);
+}
+.refresh-icon {
+    font-size: 16px;
+    transition: transform 0.3s cubic-bezier(0.4, 0, 0.2, 1);
+}
+
+.expert-stats-header {
+    display: flex;
+    gap: 8px;
+    margin: 8px 0 10px 0;
+}
+
+.expert-meta-chip {
+    display: flex;
+    align-items: center;
+    gap: 6px;
+    background-color: rgba(255, 255, 255, 0.04);
+    border: 1px solid rgba(255, 255, 255, 0.08);
+    border-radius: 8px;
+    padding: 5px 8px;
+    font-size: 0.75rem;
+    color: var(--text-secondary);
+    flex: 1;
+}
+.expert-meta-chip .chip-icon {
+    font-size: 14px;
+    color: var(--accent);
+}
+
+/* Category Filter Buttons */
+.expert-category-filters {
+    display: flex;
+    gap: 4px;
+    flex-wrap: wrap;
+    margin-bottom: 10px;
+}
+
+.cat-filter-btn {
+    background-color: #282A2C;
+    border: 1px solid rgba(255, 255, 255, 0.06);
+    color: var(--text-muted);
+    border-radius: 6px;
+    padding: 3px 8px;
+    font-size: 0.72rem;
+    cursor: pointer;
+    transition: all 0.2s;
+}
+.cat-filter-btn:hover {
+    background-color: #333537;
+    color: var(--text-primary);
+}
+.cat-filter-btn.active {
+    background-color: rgba(168, 199, 250, 0.15);
+    border-color: rgba(168, 199, 250, 0.4);
+    color: var(--accent);
+    font-weight: 500;
+}
+.cat-filter-btn.code-filter.active {
+    background-color: rgba(52, 211, 153, 0.15);
+    border-color: rgba(52, 211, 153, 0.4);
+    color: #34D399;
+}
+.cat-filter-btn.math-filter.active {
+    background-color: rgba(192, 132, 252, 0.15);
+    border-color: rgba(192, 132, 252, 0.4);
+    color: #C084FC;
+}
+.cat-filter-btn.reasoning-filter.active {
+    background-color: rgba(251, 191, 36, 0.15);
+    border-color: rgba(251, 191, 36, 0.4);
+    color: #FBBF24;
+}
+
+/* Expert Cards List Container */
+.expert-list-container {
+    display: flex;
+    flex-direction: column;
+    gap: 8px;
+    max-height: 380px;
+    overflow-y: auto;
+    padding-right: 4px;
+    margin-bottom: 12px;
+}
+.expert-list-container::-webkit-scrollbar {
+    width: 3px;
+}
+.expert-list-container::-webkit-scrollbar-thumb {
+    background: rgba(255, 255, 255, 0.15);
+    border-radius: 2px;
+}
+
+.expert-empty-hint {
+    display: flex;
+    flex-direction: column;
+    align-items: center;
+    justify-content: center;
+    gap: 6px;
+    padding: 20px 12px;
+    text-align: center;
+    color: var(--text-muted);
+    font-size: 0.78rem;
+    line-height: 1.4;
+    background-color: rgba(255, 255, 255, 0.02);
+    border-radius: 8px;
+    border: 1px dashed rgba(255, 255, 255, 0.08);
+}
+.expert-empty-hint code {
+    background-color: #282A2C;
+    padding: 2px 5px;
+    border-radius: 4px;
+    color: var(--accent);
+}
+
+/* Individual Expert Card */
+.expert-card {
+    background-color: #242628;
+    border: 1px solid rgba(255, 255, 255, 0.06);
+    border-radius: 10px;
+    padding: 9px 11px;
+    display: flex;
+    flex-direction: column;
+    gap: 6px;
+    transition: transform 0.15s, border-color 0.15s, box-shadow 0.15s;
+}
+.expert-card:hover {
+    border-color: rgba(255, 255, 255, 0.15);
+    transform: translateY(-1px);
+    box-shadow: 0 4px 12px rgba(0, 0, 0, 0.25);
+}
+
+.expert-card-top {
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+}
+
+.expert-badge {
+    font-family: 'Fira Code', 'Consolas', monospace;
+    font-size: 0.78rem;
+    font-weight: 600;
+    color: #E3E3E3;
+    display: flex;
+    align-items: center;
+    gap: 5px;
+}
+.expert-badge .layer-tag {
+    color: var(--accent);
+}
+
+.cat-badge {
+    font-size: 0.68rem;
+    font-weight: 500;
+    padding: 2px 7px;
+    border-radius: 12px;
+    letter-spacing: 0.2px;
+}
+.cat-badge.cat-code {
+    background-color: rgba(52, 211, 153, 0.12);
+    color: #34D399;
+    border: 1px solid rgba(52, 211, 153, 0.3);
+}
+.cat-badge.cat-math {
+    background-color: rgba(192, 132, 252, 0.12);
+    color: #C084FC;
+    border: 1px solid rgba(192, 132, 252, 0.3);
+}
+.cat-badge.cat-reasoning {
+    background-color: rgba(251, 191, 36, 0.12);
+    color: #FBBF24;
+    border: 1px solid rgba(251, 191, 36, 0.3);
+}
+.cat-badge.cat-prose {
+    background-color: rgba(96, 165, 250, 0.12);
+    color: #60A5FA;
+    border: 1px solid rgba(96, 165, 250, 0.3);
+}
+.cat-badge.cat-format {
+    background-color: rgba(148, 163, 184, 0.12);
+    color: #94A3B8;
+    border: 1px solid rgba(148, 163, 184, 0.3);
+}
+.cat-badge.cat-multi {
+    background-color: rgba(244, 114, 182, 0.12);
+    color: #F472B6;
+    border: 1px solid rgba(244, 114, 182, 0.3);
+}
+
+/* Hit Rate Bar */
+.hit-bar-wrapper {
+    display: flex;
+    flex-direction: column;
+    gap: 3px;
+}
+.hit-bar-labels {
+    display: flex;
+    justify-content: space-between;
+    font-size: 0.7rem;
+    color: var(--text-secondary);
+}
+.hit-bar-labels .hit-count {
+    color: var(--text-muted);
+}
+.hit-bar-bg {
+    width: 100%;
+    height: 4px;
+    background-color: rgba(255, 255, 255, 0.08);
+    border-radius: 2px;
+    overflow: hidden;
+}
+.hit-bar-fill {
+    height: 100%;
+    border-radius: 2px;
+    background: linear-gradient(90deg, #A8C7FA, #60A5FA);
+    transition: width 0.3s ease;
+}
+.cat-code .hit-bar-fill, .expert-card[data-cat="Coding / Syntax"] .hit-bar-fill {
+    background: linear-gradient(90deg, #34D399, #10B981);
+}
+.cat-math .hit-bar-fill, .expert-card[data-cat="Math / Logic"] .hit-bar-fill {
+    background: linear-gradient(90deg, #C084FC, #8B5CF6);
+}
+.cat-reasoning .hit-bar-fill, .expert-card[data-cat="Reasoning"] .hit-bar-fill {
+    background: linear-gradient(90deg, #FBBF24, #F59E0B);
+}
+
+/* Token Trigger Pills */
+.token-pills-row {
+    display: flex;
+    gap: 4px;
+    flex-wrap: wrap;
+    margin-top: 2px;
+}
+
+.token-pill {
+    background-color: rgba(255, 255, 255, 0.04);
+    border: 1px solid rgba(255, 255, 255, 0.08);
+    color: var(--text-secondary);
+    border-radius: 4px;
+    padding: 1px 5px;
+    font-family: 'Fira Code', 'Consolas', monospace;
+    font-size: 0.68rem;
+    white-space: nowrap;
+    overflow: hidden;
+    text-overflow: ellipsis;
+    max-width: 90px;
+}
+.token-pill:hover {
+    border-color: rgba(168, 199, 250, 0.4);
+    color: var(--text-primary);
+}
+
+/* Cache Residency Distribution Bar */
+.cache-residency-bar {
+    display: flex;
+    gap: 4px;
+    margin-bottom: 8px;
+    padding: 6px 8px;
+    background: rgba(255, 255, 255, 0.03);
+    border: 1px solid rgba(255, 255, 255, 0.06);
+    border-radius: 6px;
+    align-items: center;
+    justify-content: space-between;
+}
+
+.residency-chip {
+    display: flex;
+    align-items: center;
+    gap: 4px;
+    font-size: 0.7rem;
+    font-weight: 500;
+    color: var(--text-secondary);
+}
+
+.residency-dot {
+    width: 6px;
+    height: 6px;
+    border-radius: 50%;
+    display: inline-block;
+}
+
+.dot-l1 {
+    background-color: #34D399;
+    box-shadow: 0 0 6px rgba(52, 211, 153, 0.6);
+}
+
+.dot-l2 {
+    background-color: #A78BFA;
+    box-shadow: 0 0 6px rgba(167, 139, 250, 0.6);
+}
+
+.dot-ssd {
+    background-color: #9CA3AF;
+}
+
+/* Tier Badges on Expert Cards */
+.tier-badge {
+    font-size: 0.62rem;
+    font-weight: 600;
+    padding: 1px 5px;
+    border-radius: 3px;
+    text-transform: uppercase;
+    letter-spacing: 0.3px;
+}
+
+.tier-badge.l1, .tier-badge[data-tier="l1"] {
+    background: rgba(52, 211, 153, 0.15);
+    color: #6EE7B7;
+    border: 1px solid rgba(52, 211, 153, 0.3);
+}
+
+.tier-badge.l2, .tier-badge[data-tier="l2"] {
+    background: rgba(167, 139, 250, 0.15);
+    color: #C4B5FD;
+    border: 1px solid rgba(167, 139, 250, 0.3);
+}
+
+.tier-badge.ssd, .tier-badge[data-tier="ssd"] {
+    background: rgba(156, 163, 175, 0.15);
+    color: #D1D5DB;
+    border: 1px solid rgba(156, 163, 175, 0.3);
+}
+
+.expert-rank-num {
+    font-size: 0.68rem;
+    font-weight: 600;
+    color: var(--text-muted);
+    font-family: 'Fira Code', monospace;
+    margin-right: 4px;
+}
+
+/* Tier Filter Buttons */
+.cat-filter-btn.tier-l1-btn.active {
+    background: rgba(52, 211, 153, 0.2);
+    color: #6EE7B7;
+    border-color: rgba(52, 211, 153, 0.4);
+}
+.cat-filter-btn.tier-l2-btn.active {
+    background: rgba(167, 139, 250, 0.2);
+    color: #C4B5FD;
+    border-color: rgba(167, 139, 250, 0.4);
+}
+
+/* Export Button */
+.download-profile-btn {
+    width: 100%;
+    justify-content: center;
+    padding: 7px 12px;
+    font-size: 0.8rem;
+    background-color: #282A2C;
+    border: 1px solid rgba(255, 255, 255, 0.08);
+}
+.download-profile-btn:hover {
+    background-color: #333537;
+    border-color: rgba(255, 255, 255, 0.15);
+}
+

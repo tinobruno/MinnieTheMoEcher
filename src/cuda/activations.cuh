@@ -645,4 +645,16 @@ void deltanet_linear_attention_decode_cuda(
     int head_dim = 128,
     cudaStream_t stream = 0);
 
+// ── GPU-Native MoE Expert Activation Frequency Counter ──────────────────────────
+void accumulate_expert_freq_cuda(
+    uint32_t* expert_counts,
+    int32_t* step_topk,
+    const int32_t* topk_idx,
+    const int32_t* track_flag,
+    int layer_id,
+    int n_experts,
+    int top_k,
+    cudaStream_t stream = 0);
+
+
 

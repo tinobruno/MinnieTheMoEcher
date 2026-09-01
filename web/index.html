@@ -129,6 +129,72 @@
                     </div>
                 </div>
             </details>
+
+            <details class="stats-section expert-profile-section" id="expert-profile-details" open>
+                <summary>
+                    <div class="summary-title-row">
+                        <span>Expert Specialization</span>
+                        <span class="refresh-badge-btn" onclick="fetchExpertProfile(event)" title="Refresh Expert Stats">
+                            <span class="material-symbols-outlined refresh-icon">refresh</span>
+                        </span>
+                    </div>
+                </summary>
+
+                <div class="expert-stats-header">
+                    <div class="expert-meta-chip" id="expert-tracked-tokens-chip" title="Total tokens profiled during inference">
+                        <span class="material-symbols-outlined chip-icon">analytics</span>
+                        <span id="expert-tracked-tokens-val">0 tokens</span>
+                    </div>
+                    <div class="expert-meta-chip" id="expert-active-count-chip" title="Number of uniquely activated routed experts">
+                        <span class="material-symbols-outlined chip-icon">psychology</span>
+                        <span id="expert-active-count-val">0 active</span>
+                    </div>
+                </div>
+
+                <!-- Cache Residency Distribution -->
+                <div class="cache-residency-bar" id="cache-residency-bar" title="Expert Cache Residency across VRAM (L1), DRAM (L2), and Disk (SSD)">
+                    <span class="residency-chip chip-l1" title="L1 VRAM Resident Experts">
+                        <span class="residency-dot dot-l1"></span>
+                        <span id="res-l1-label">L1: 11,008</span>
+                    </span>
+                    <span class="residency-chip chip-l2" title="L2 DRAM Resident Experts">
+                        <span class="residency-dot dot-l2"></span>
+                        <span id="res-l2-label">L2: 0</span>
+                    </span>
+                    <span class="residency-chip chip-ssd" title="SSD Cold Experts">
+                        <span class="residency-dot dot-ssd"></span>
+                        <span id="res-ssd-label">SSD: 0</span>
+                    </span>
+                </div>
+
+                <!-- Category & Tier Filters -->
+                <div class="expert-category-filters" id="expert-category-filters">
+                    <button type="button" class="cat-filter-btn active" data-filter-type="cat" data-filter="all">All</button>
+                    <button type="button" class="cat-filter-btn tier-l1-btn" data-filter-type="tier" data-filter="l1" title="Show only L1 VRAM experts">L1 VRAM</button>
+                    <button type="button" class="cat-filter-btn tier-l2-btn" data-filter-type="tier" data-filter="l2" title="Show only L2 DRAM experts">L2 DRAM</button>
+                    <button type="button" class="cat-filter-btn code-filter" data-filter-type="cat" data-filter="Coding / Syntax">Code</button>
+                    <button type="button" class="cat-filter-btn math-filter" data-filter-type="cat" data-filter="Math / Logic">Math</button>
+                    <button type="button" class="cat-filter-btn reasoning-filter" data-filter-type="cat" data-filter="Reasoning">Reasoning</button>
+                    <button type="button" class="cat-filter-btn prose-filter" data-filter-type="cat" data-filter="General Prose">Prose</button>
+                    <button type="button" class="cat-filter-btn format-filter" data-filter-type="cat" data-filter="Format / Syntax">Format</button>
+                </div>
+
+                <!-- Expert List / Mini Chart -->
+                <div class="expert-list-container" id="expert-list-container">
+                    <div class="expert-empty-hint" id="expert-empty-hint">
+                        <span class="material-symbols-outlined">info</span>
+                        <span>Expert specialization profile loaded.</span>
+                    </div>
+                </div>
+
+                <!-- Export Action -->
+                <div class="expert-actions-row">
+                    <button type="button" class="action-btn download-profile-btn" onclick="downloadExpertProfileJson()" title="Download complete expert profile JSON">
+                        <span class="material-symbols-outlined">download</span>
+                        <span>Export Profile JSON</span>
+                    </button>
+                </div>
+            </details>
         </aside>
 
         <!-- Main Chat Area -->
@@ -165,7 +231,10 @@
                 <div class="input-box">
                     <textarea id="chat-input" placeholder="Enter a prompt here..." rows="1"></textarea>
                     <div class="input-controls">
-                        <button id="send-btn" class="send-btn" disabled>
+                        <button type="button" id="preview-btn-chatbar" class="code-action-btn preview-btn chatbar-preview-btn hidden" onclick="previewLatestHtmlSnippet()" title="Test and render HTML code in preview panel">
+                            <span class="material-symbols-outlined btn-icon">play_circle</span> Preview
+                        </button>
+                        <button id="send-btn" class="send-btn" disabled title="Send / Stop">
                             <span class="material-symbols-outlined">send</span>
                         </button>
                     </div>
