@@ -159,6 +159,14 @@ void gemv_int4_cuda(
     int N, int K,
     cudaStream_t stream = 0);
 
+void gemv_int4_f32_cuda(
+    float* out,
+    const __nv_bfloat16* vec,
+    const uint8_t* weight,
+    const __nv_bfloat16* scale,
+    int N, int K,
+    cudaStream_t stream = 0);
+
 void gemv_int4_swiglu_fused_cuda(
     __nv_bfloat16* out,
     const __nv_bfloat16* vec,
@@ -627,6 +635,25 @@ void qwen_gqa_decode_gated_cuda(
     float eps = 1e-6f,
     cudaStream_t stream = 0);
 
+void qwen_gqa_decode_gated_fp8_cuda(
+    __nv_bfloat16* out,             // [n_q_heads * head_dim] (6144)
+    const __nv_bfloat16* q_and_gate,// [2 * n_q_heads * head_dim] (12288)
+    __nv_bfloat16* k,               // [n_kv_heads * head_dim]
+    const __nv_bfloat16* v,         // [n_kv_heads * head_dim]
+    const __nv_bfloat16* q_norm_w,  // [head_dim]
+    const __nv_bfloat16* k_norm_w,  // [head_dim]
+    uint8_t* k_cache,               // [max_seq_len, n_kv_heads, head_dim] FP8
+    uint8_t* v_cache,               // [max_seq_len, n_kv_heads, head_dim] FP8
+    int n_q_heads,
+    int n_kv_heads,
+    int head_dim,
+    const int32_t* d_pos,
+    int pos_scalar,
+    int max_seq_len,
+    float rope_theta = 1000000.0f,
+    float eps = 1e-6f,
+    cudaStream_t stream = 0);
+
 // ── Qwen 3.8 Gated DeltaNet Linear Attention Decode ───────────────────────────
 void deltanet_linear_attention_decode_cuda(
     __nv_bfloat16* out,             // [6144] (48 heads * 128)
@@ -639,7 +666,7 @@ void deltanet_linear_attention_decode_cuda(
     const __nv_bfloat16* A_log,     // [48]
     const __nv_bfloat16* dt_bias,   // [48]
     const __nv_bfloat16* norm_w,    // [128]
-    float* ssm_state,               // [48, 128, 128]
+    __nv_bfloat16* ssm_state,       // [48, 128, 128] BF16 (50% memory cut)
     int num_k_heads = 16,
     int num_v_heads = 48,
     int head_dim = 128,

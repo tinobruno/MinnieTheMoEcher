@@ -1567,7 +1567,7 @@ public:
 
     // Embedding & head
     GPUTensor embed_weight_;   // [vocab_size, hidden_size] BF16
-    GPUTensor head_weight_;    // [vocab_size, hidden_size] BF16 (for logits)
+    GPUTensor head_weight_, head_weight_scale_; // [vocab_size, hidden_size] (BF16 or INT4 for logits)
     GPUTensor norm_weight_;    // [hidden_size] BF16
 
     // Per-layer resident tensors
@@ -1658,7 +1658,7 @@ public:
         GPUTensor dt_bias;        // [48] BF16
         GPUTensor linear_norm_w;  // [128] BF16
         GPUTensor linear_out_proj, linear_out_proj_scale;// [5120, 6144]
-        GPUTensor ssm_state;      // [48, 128, 128] F32
+        GPUTensor ssm_state;      // [48, 128, 128] BF16 (50% memory cut)
         GPUTensor conv_state;     // [10240, 4] BF16
     };
     std::vector<LayerWeights> layers_;
@@ -2742,15 +2742,21 @@ private:
                 load_tensor(embed_weight_, "model.language_model.embed_tokens.weight");
             }
         }
-        if (!load_tensor(head_weight_, "head.weight")) {
-            if (!load_tensor(head_weight_, "lm_head.weight")) {
-                if (!load_tensor(head_weight_, "model.language_model.lm_head.weight")) {
-                    // Tie embeddings if lm_head is shared
-                    if (embed_weight_.data) {
-                        head_weight_.dtype = embed_weight_.dtype;
-                        head_weight_.shape = embed_weight_.shape;
-                        head_weight_.alloc(embed_weight_.size_bytes);
-                        CUDA_CHECK(cudaMemcpy(head_weight_.data, embed_weight_.data, embed_weight_.size_bytes, cudaMemcpyDeviceToDevice));
+        if (!load_quant_tensor(head_weight_, head_weight_scale_, "head.weight")) {
+            if (!load_quant_tensor(head_weight_, head_weight_scale_, "lm_head.weight")) {
+                if (!load_quant_tensor(head_weight_, head_weight_scale_, "model.language_model.lm_head.weight")) {
+                    if (!load_tensor(head_weight_, "head.weight")) {
+                        if (!load_tensor(head_weight_, "lm_head.weight")) {
+                            if (!load_tensor(head_weight_, "model.language_model.lm_head.weight")) {
+                                // Tie embeddings if lm_head is shared
+                                if (embed_weight_.data) {
+                                    head_weight_.dtype = embed_weight_.dtype;
+                                    head_weight_.shape = embed_weight_.shape;
+                                    head_weight_.alloc(embed_weight_.size_bytes);
+                                    CUDA_CHECK(cudaMemcpy(head_weight_.data, embed_weight_.data, embed_weight_.size_bytes, cudaMemcpyDeviceToDevice));
+                                }
+                            }
+                        }
                     }
                 }
             }
@@ -2824,8 +2830,8 @@ private:
                     }
 
                     // Allocate linear attention recurrent states:
-                    // SSM state: [48, 128, 128] F32 = 3 MB
-                    lw.ssm_state.alloc(48 * 128 * 128 * sizeof(float));
+                    // SSM state: [48, 128, 128] BF16 = 1.5 MB (50% memory bandwidth cut)
+                    lw.ssm_state.alloc(48 * 128 * 128 * sizeof(__nv_bfloat16));
                     CUDA_CHECK(cudaMemset(lw.ssm_state.data, 0, lw.ssm_state.size_bytes));
                     // Conv state: [10240, 4] BF16 = 80 KB
                     lw.conv_state.alloc(10240 * 4 * sizeof(__nv_bfloat16));
@@ -2860,12 +2866,12 @@ private:
                         load_tensor(lw.gqa_k_norm_w, hf_prefix + ".self_attn.k_norm.weight");
                     }
 
-                    // Allocate GQA KV cache
+                    // Allocate GQA FP8 KV cache (1 byte per element)
                     int max_seq = cfg_.max_seq_len > 0 ? cfg_.max_seq_len : 32768;
                     int n_kv = cfg_.num_key_value_heads > 0 ? cfg_.num_key_value_heads : 4;
                     int h_dim = cfg_.head_dim > 0 ? cfg_.head_dim : 256;
-                    lw.k_cache_gqa.alloc((size_t)max_seq * n_kv * h_dim * sizeof(__nv_bfloat16));
-                    lw.v_cache_gqa.alloc((size_t)max_seq * n_kv * h_dim * sizeof(__nv_bfloat16));
+                    lw.k_cache_gqa.alloc((size_t)max_seq * n_kv * h_dim * sizeof(uint8_t));
+                    lw.v_cache_gqa.alloc((size_t)max_seq * n_kv * h_dim * sizeof(uint8_t));
                     CUDA_CHECK(cudaMemset(lw.k_cache_gqa.data, 0, lw.k_cache_gqa.size_bytes));
                     CUDA_CHECK(cudaMemset(lw.v_cache_gqa.data, 0, lw.v_cache_gqa.size_bytes));
                 }
@@ -3354,7 +3360,7 @@ private:
                 lw.A_log.bf16(),
                 lw.dt_bias.bf16(),
                 lw.linear_norm_w.bf16(),
-                lw.ssm_state.f32(),
+                lw.ssm_state.bf16(),
                 16, 48, 128, main_stream_);
 
             // 4. Output Projection: buf_attn_out_ (6144) -> buf_hidden2_ (5120)
@@ -3366,16 +3372,16 @@ private:
             matmul_proj(buf_gate_, buf_hidden2_, lw.w_k, lw.w_k_scale, n_kv_heads * head_dim, dim);
             matmul_proj(buf_up_, buf_hidden2_, lw.w_v, lw.w_v_scale, n_kv_heads * head_dim, dim);
 
-            // 3 & 4. QK Norm + RoPE + GQA Decode + Sigmoid Gate
-            qwen_gqa_decode_gated_cuda(
+            // 3 & 4. QK Norm + RoPE + GQA FP8 Decode + Sigmoid Gate
+            qwen_gqa_decode_gated_fp8_cuda(
                 buf_attn_out_.bf16(),
                 buf_q_.bf16(),
                 buf_gate_.bf16(),
                 buf_up_.bf16(),
                 lw.gqa_q_norm_w.bf16(),
                 lw.gqa_k_norm_w.bf16(),
-                lw.k_cache_gqa.bf16(),
-                lw.v_cache_gqa.bf16(),
+                lw.k_cache_gqa.u8(),
+                lw.v_cache_gqa.u8(),
                 n_q_heads, n_kv_heads, head_dim,
                 buf_input_pos_.i32(), position, cfg_.max_seq_len,
                 cfg_.rope_theta, cfg_.rms_norm_eps, main_stream_);
@@ -4133,8 +4139,14 @@ private:
         int dim = cfg_.hidden_size;
         int vocab = cfg_.vocab_size;
 
-        // Fast CUDA graph compatible matrix-vector multiplication directly to float32 logits
-        gemv_bf16_cuda(buf_logits_.f32(), head_weight_.bf16(), buf_hidden_.bf16(), vocab, dim, main_stream_);
+        if (head_weight_.dtype == "int4") {
+            gemv_int4_f32_cuda(buf_logits_.f32(), buf_hidden_.bf16(),
+                               (const uint8_t*)head_weight_.data, head_weight_scale_.bf16(),
+                               vocab, dim, main_stream_);
+        } else {
+            // Fast CUDA graph compatible matrix-vector multiplication directly to float32 logits
+            gemv_bf16_cuda(buf_logits_.f32(), head_weight_.bf16(), buf_hidden_.bf16(), vocab, dim, main_stream_);
+        }
         argmax_f32_cuda(buf_argmax_out_.i32(), buf_logits_.f32(), vocab, main_stream_);
     }
 
