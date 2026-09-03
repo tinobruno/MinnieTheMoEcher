@@ -1532,6 +1532,50 @@ private:
 };
 
 // ════════════════════════════════════════════════════════════════════════════════
+//  Prompt-Lookup Drafting (PLD) Speculative Engine
+// ════════════════════════════════════════════════════════════════════════════════
+
+class PromptLookupDrafter {
+public:
+    static std::vector<int> draft(const std::vector<int>& history, int max_draft = 4, int max_ngram = 3, int min_ngram = 2) {
+        int hist_len = (int)history.size();
+        if (hist_len <= max_ngram + 1) return {};
+
+        for (int n = max_ngram; n >= min_ngram; n--) {
+            if (hist_len <= n + 1) continue;
+
+            const int* match_pattern = &history[hist_len - n];
+
+            // Search backward in history for prior match
+            for (int i = hist_len - n - 2; i >= 0; i--) {
+                bool matched = true;
+                for (int j = 0; j < n; j++) {
+                    if (history[i + j] != match_pattern[j]) {
+                        matched = false;
+                        break;
+                    }
+                }
+                if (matched) {
+                    // Match found! Candidate tokens start right after the match
+                    int start_cand = i + n;
+                    int avail = hist_len - n - start_cand;
+                    int cand_len = std::min(max_draft, avail);
+                    if (cand_len > 0) {
+                        std::vector<int> candidates;
+                        candidates.reserve(cand_len);
+                        for (int k = 0; k < cand_len; k++) {
+                            candidates.push_back(history[start_cand + k]);
+                        }
+                        return candidates;
+                    }
+                }
+            }
+        }
+        return {};
+    }
+};
+
+// ════════════════════════════════════════════════════════════════════════════════
 //  Model Engine
 // ════════════════════════════════════════════════════════════════════════════════
 
@@ -1540,6 +1584,10 @@ public:
     ModelConfig cfg_;
     BPETokenizer tokenizer_;
     std::string model_dir_;
+    
+    // Prompt-Lookup Drafting (PLD) Speculative Decoding
+    bool enable_pld_ = true;
+    int pld_draft_tokens_ = 4;
     
     // Thread pool for loading experts (max 16 concurrent reads)
     std::unique_ptr<ThreadPool> expert_pool_;
@@ -2398,6 +2446,106 @@ public:
 
         std::string last_think_token_str;
 
+        auto emit_token = [&](int next_token, int step_t) -> bool {
+            // Handle think block filtering
+            if (think_start_id >= 0 && next_token == think_start_id) {
+                if (!think_block_ended) {
+                    in_think_block = true;
+                    think_block_ended = false;
+                }
+            }
+            if (think_end_id >= 0 && next_token == think_end_id) {
+                in_think_block = false;
+                think_block_ended = true;
+            }
+
+            output_ids.push_back(next_token);
+            history.push_back(next_token);
+
+            // Enable tracking for all generated tokens produced by the model (excluding control & special tokens)
+            track_current_token_ = !is_control_token(next_token);
+            if (track_expert_freq_ && track_current_token_) {
+                expert_freq_total_tokens_++;
+            }
+
+            if (prev_slot >= 0 && prev_tracked_token >= 0 && track_expert_freq_ && step_topk_host_) {
+                int32_t* src_ptr = step_topk_host_ + prev_slot * (n_layers * moe_top_k);
+                std::vector<int32_t> topk_copy(src_ptr, src_ptr + (n_layers * moe_top_k));
+                per_token_topk.push_back({prev_tracked_token, std::move(topk_copy)});
+            }
+            if (track_current_token_) {
+                prev_tracked_token = next_token;
+                prev_slot = decode_step_idx_ % 2;
+            } else {
+                prev_tracked_token = -1;
+                prev_slot = -1;
+            }
+
+            // Pipeline: Launch GPU forward pass for next token immediately so GPU runs concurrently with CPU text decoding
+            forward_token(next_token, position);
+            position++;
+            decode_step_idx_++;
+
+            if (next_token == think_start_id || next_token == think_end_id) {
+                return true;
+            }
+
+            if (in_think_block) {
+                thinking_tokens_generated++;
+            } else {
+                content_tokens_generated++;
+            }
+
+            std::string token_text = tokenizer_.decode({next_token});
+            if (in_think_block) {
+                last_think_token_str = token_text;
+            }
+
+            token_buffer += token_text;
+            generated_text += token_text;
+
+            // Check if token_buffer ends with a complete UTF-8 character.
+            bool is_complete = true;
+            if (!token_buffer.empty()) {
+                int m = std::min((int)token_buffer.size(), 4);
+                for (int j = 1; j <= m; j++) {
+                    unsigned char b = token_buffer[token_buffer.size() - j];
+                    if ((b & 0xC0) != 0x80) { // Found leading byte or ASCII
+                        if ((b & 0x80) == 0) { // ASCII
+                            is_complete = true;
+                        } else if ((b & 0xE0) == 0xC0) {
+                            is_complete = (j >= 2);
+                        } else if ((b & 0xF0) == 0xE0) {
+                            is_complete = (j >= 3);
+                        } else if ((b & 0xF8) == 0xF0) {
+                            is_complete = (j >= 4);
+                        } else {
+                            is_complete = true; // invalid utf8 leading byte, just flush
+                        }
+                        break;
+                    }
+                }
+            }
+
+            if (is_complete) {
+                if (step_t > cfg_.bos_token_id) {
+                    if (!g_quiet) {
+                        printf("%s", token_buffer.c_str());
+                        fflush(stdout);
+                    }
+                }
+                if (on_token) {
+                    if (!on_token(token_buffer, in_think_block)) {
+                        LOG_WARN("Generation aborted by token callback at step %d", step_t);
+                        token_buffer.clear();
+                        return false;
+                    }
+                }
+                token_buffer.clear();
+            }
+            return true;
+        };
+
         for (int t = 0; content_tokens_generated < max_tokens; t++) {
             if (g_stop_requested.load()) {
                 LOG_WARN("Generation stopped by client stop request at step %d", t);
@@ -2485,126 +2633,46 @@ public:
                 break;
             }
 
-            output_ids.push_back(next_token);
-            history.push_back(next_token);
-
-            // Enable tracking for all generated tokens produced by the model (excluding control & special tokens)
-            track_current_token_ = !is_control_token(next_token);
-            if (track_expert_freq_ && track_current_token_) {
-                expert_freq_total_tokens_++;
+            if (!emit_token(next_token, t)) {
+                finish_reason = "stop";
+                break;
             }
 
-            if (prev_slot >= 0 && prev_tracked_token >= 0 && track_expert_freq_ && step_topk_host_) {
-                int32_t* src_ptr = step_topk_host_ + prev_slot * (n_layers * moe_top_k);
-                std::vector<int32_t> topk_copy(src_ptr, src_ptr + (n_layers * moe_top_k));
-                per_token_topk.push_back({prev_tracked_token, std::move(topk_copy)});
-            }
-            if (track_current_token_) {
-                prev_tracked_token = next_token;
-                prev_slot = decode_step_idx_ % 2;
-            } else {
-                prev_tracked_token = -1;
-                prev_slot = -1;
-            }
+            // 2. Prompt-Lookup Speculative Verification Loop (PLD)
+            if (enable_pld_ && content_tokens_generated < max_tokens) {
+                std::vector<int> candidates = PromptLookupDrafter::draft(history, pld_draft_tokens_, 3, 2);
+                for (int cand : candidates) {
+                    if (content_tokens_generated >= max_tokens) break;
+                    if (g_stop_requested.load()) break;
 
-            // Pipeline: Launch GPU forward pass for next token immediately so GPU runs concurrently with CPU text decoding
-            forward_token(next_token, position);
-            position++;
-            decode_step_idx_++;
-           
-            // Handle think block filtering
-            if (think_start_id >= 0 && next_token == think_start_id) {
-                if (!think_block_ended) {
-                    in_think_block = true;
-                    think_block_ended = false;
-                }
-                continue;
-            }
-            if (think_end_id >= 0 && next_token == think_end_id) {
-                in_think_block = false;
-                think_block_ended = true;
-                continue;
-            }
+                    // Sample prediction at current position from the forwarded logits
+                    int pred = sample_token(temperature, history, content_tokens_generated, in_think_block,
+                                            top_k, top_p, min_p);
 
-            if (in_think_block) {
-                thinking_tokens_generated++;
-            } else {
-                content_tokens_generated++;
-            }
-
-            std::string token_text = tokenizer_.decode({next_token});
-            if (in_think_block) {
-                last_think_token_str = token_text;
-            }
-
-            token_buffer += token_text;
-            generated_text += token_text;
-
-            // Check if token_buffer ends with a complete UTF-8 character.
-            bool is_complete = true;
-            if (!token_buffer.empty()) {
-                int m = std::min((int)token_buffer.size(), 4);
-                for (int j = 1; j <= m; j++) {
-                    unsigned char b = token_buffer[token_buffer.size() - j];
-                    if ((b & 0xC0) != 0x80) { // Found leading byte or ASCII
-                        if ((b & 0x80) == 0) { // ASCII
-                            is_complete = true;
-                        } else if ((b & 0xE0) == 0xC0) {
-                            is_complete = (j >= 2);
-                        } else if ((b & 0xF0) == 0xE0) {
-                            is_complete = (j >= 3);
-                        } else if ((b & 0xF8) == 0xF0) {
-                            is_complete = (j >= 4);
-                        } else {
-                            is_complete = true; // invalid utf8 leading byte, just flush
+                    if (pred == cand && pred != cfg_.eos_token_id && (eos2_id < 0 || pred != eos2_id) &&
+                        (enable_thinking || (pred != think_start_id && pred != think_end_id))) {
+                        // MATCH! Speculative candidate verified and accepted
+                        if (!emit_token(pred, t)) {
+                            finish_reason = "stop";
+                            break;
                         }
+                    } else {
+                        // Mismatch or stop token: Draft sequence ends.
+                        // Emit base model's genuine prediction
+                        if (pred == cfg_.eos_token_id || (eos2_id >= 0 && pred == eos2_id)) {
+                            finish_reason = "stop";
+                            break;
+                        }
+                        if (!enable_thinking && (pred == think_start_id || pred == think_end_id)) {
+                            finish_reason = "stop";
+                            break;
+                        }
+                        emit_token(pred, t);
                         break;
                     }
                 }
+                if (finish_reason == "stop") break;
             }
-
-            if (is_complete) {
-                if (t > cfg_.bos_token_id) {
-                    if (!g_quiet) {
-                        printf("%s", token_buffer.c_str());
-                        fflush(stdout);
-                    }
-                }
-                if (on_token) {
-                    if (!on_token(token_buffer, in_think_block)) {
-                        LOG_WARN("Generation aborted by token callback at step %d", t);
-                        finish_reason = "stop";
-                        token_buffer.clear();
-                        break;
-                    }
-                }
-                token_buffer.clear();
-            }
-
-            // Graceful sentence-boundary stopping:
-            // When we're within 80% of max_tokens and just completed a sentence,
-            // stop early to avoid truncating mid-thought.
-            if (false) {
-                if (content_tokens_generated >= (max_tokens * 4 / 5)) {
-                                // Check if the generated text ends at a sentence boundary
-                                if (!generated_text.empty()) {
-                                    char last_char = generated_text.back();
-                                    // Also check for sentence-ending after whitespace
-                                    size_t last_non_ws = generated_text.find_last_not_of(" \t\n\r");
-                                    if (last_non_ws != std::string::npos) {
-                                        last_char = generated_text[last_non_ws];
-                                    }
-                                    if (last_char == '.' || last_char == '!' || last_char == '?' ||
-                                        last_char == '\n') {
-                                        LOG_WARN("Graceful stop at sentence boundary (token %d/%d)",
-                                                content_tokens_generated, max_tokens);
-                                        finish_reason = "stop";
-                                        break;
-                                    }
-                                }
-                            }
-            }
-            
         }
 
         // Check if we hit max_tokens
@@ -5206,6 +5274,8 @@ int main(int argc, char** argv) {
     std::string imatrix_dataset = "";
     std::string imatrix_out = "";
     int imatrix_max_tokens = -1;
+    bool enable_pld = true;
+    int pld_draft_tokens = 4;
 
     for (int i = 1; i < argc; i++) {
         if ((std::string(argv[i]) == "--manifest" || std::string(argv[i]) == "-m") && i + 1 < argc) {
@@ -5228,6 +5298,10 @@ int main(int argc, char** argv) {
             imatrix_out = argv[++i];
         } else if (std::string(argv[i]) == "--imatrix-max-tokens" && i + 1 < argc) {
             imatrix_max_tokens = std::stoi(argv[++i]);
+        } else if (std::string(argv[i]) == "--no-pld" || std::string(argv[i]) == "--disable-pld") {
+            enable_pld = false;
+        } else if ((std::string(argv[i]) == "--pld-tokens" || std::string(argv[i]) == "--pld-draft-tokens") && i + 1 < argc) {
+            pld_draft_tokens = std::stoi(argv[++i]);
         } else if (std::string(argv[i]) == "--log-experts") {
             g_log_experts = true;
         } else if (std::string(argv[i]) == "--no-log-tokens") {
@@ -5262,6 +5336,10 @@ int main(int argc, char** argv) {
     LOG_INFO("Default thinking token budget: %d", default_thinking_budget);
 
     MoecherEngine engine;
+    engine.enable_pld_ = enable_pld;
+    engine.pld_draft_tokens_ = pld_draft_tokens;
+    LOG_INFO("Prompt-Lookup Drafting (PLD): %s (draft_tokens=%d)", enable_pld ? "enabled" : "disabled", pld_draft_tokens);
+
     if (!engine.load(manifest_path, max_vram_gb, dram_cache_gb, expert_dtype_override, buffered_io)) {
         LOG_ERROR("Failed to load model");
         return 1;
