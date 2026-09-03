@@ -1709,18 +1709,12 @@ __global__ void gemv_int4_kernel(
 
     float sum = 0.0f;
 
-    int block_idx = tid;
-    uint4 cur_w = (block_idx < num_blocks) ? w_vec16[block_idx] : make_uint4(0, 0, 0, 0);
-    float cur_s = (block_idx < num_blocks) ? __bfloat162float(row_scales[block_idx]) : 0.0f;
-
-    while (block_idx < num_blocks) {
-        int next_idx = block_idx + blockDim.x;
-        // Prefetch next tile from VRAM concurrently
-        uint4 next_w = (next_idx < num_blocks) ? w_vec16[next_idx] : make_uint4(0, 0, 0, 0);
-        float next_s = (next_idx < num_blocks) ? __bfloat162float(row_scales[next_idx]) : 0.0f;
-
+    for (int block_idx = tid; block_idx < num_blocks; block_idx += blockDim.x) {
+        float s = __bfloat162float(row_scales[block_idx]);
+        uint4 w_val = w_vec16[block_idx];
         const uint4* a_ptr = a_vec16 + (block_idx * 4);
-        uint32_t w_arr[4] = {cur_w.x, cur_w.y, cur_w.z, cur_w.w};
+
+        uint32_t w_arr[4] = {w_val.x, w_val.y, w_val.z, w_val.w};
         float block_sum = 0.0f;
 
         #pragma unroll
@@ -1750,11 +1744,7 @@ __global__ void gemv_int4_kernel(
             uint32_t b3 = (chunk >> 24) & 0xFF;
             block_sum += ((float)(b3 & 0x0F) - 8.0f) * f3.x + ((float)(b3 >> 4) - 8.0f) * f3.y;
         }
-        sum += block_sum * cur_s;
-
-        cur_w = next_w;
-        cur_s = next_s;
-        block_idx = next_idx;
+        sum += block_sum * s;
     }
 
     #pragma unroll
@@ -1836,23 +1826,16 @@ __global__ void gemv_int4_swiglu_fused_kernel(
     float sum_g = 0.0f;
     float sum_u = 0.0f;
 
-    int block_idx = tid;
-    uint4 cur_g = (block_idx < num_blocks) ? g_vec16[block_idx] : make_uint4(0, 0, 0, 0);
-    uint4 cur_u = (block_idx < num_blocks) ? u_vec16[block_idx] : make_uint4(0, 0, 0, 0);
-    float cur_sg = (block_idx < num_blocks) ? __bfloat162float(gate_row_scales[block_idx]) : 0.0f;
-    float cur_su = (block_idx < num_blocks) ? __bfloat162float(up_row_scales[block_idx]) : 0.0f;
+    for (int block_idx = tid; block_idx < num_blocks; block_idx += blockDim.x) {
+        float sg = __bfloat162float(gate_row_scales[block_idx]);
+        float su = __bfloat162float(up_row_scales[block_idx]);
 
-    while (block_idx < num_blocks) {
-        int next_idx = block_idx + blockDim.x;
-        // Prefetch next tile from VRAM concurrently
-        uint4 next_g = (next_idx < num_blocks) ? g_vec16[next_idx] : make_uint4(0, 0, 0, 0);
-        uint4 next_u = (next_idx < num_blocks) ? u_vec16[next_idx] : make_uint4(0, 0, 0, 0);
-        float next_sg = (next_idx < num_blocks) ? __bfloat162float(gate_row_scales[next_idx]) : 0.0f;
-        float next_su = (next_idx < num_blocks) ? __bfloat162float(up_row_scales[next_idx]) : 0.0f;
-
+        uint4 g_val = g_vec16[block_idx];
+        uint4 u_val = u_vec16[block_idx];
         const uint4* a_ptr = a_vec16 + (block_idx * 4);
-        uint32_t g_arr[4] = {cur_g.x, cur_g.y, cur_g.z, cur_g.w};
-        uint32_t u_arr[4] = {cur_u.x, cur_u.y, cur_u.z, cur_u.w};
+
+        uint32_t g_arr[4] = {g_val.x, g_val.y, g_val.z, g_val.w};
+        uint32_t u_arr[4] = {u_val.x, u_val.y, u_val.z, u_val.w};
 
         float block_sum_g = 0.0f;
         float block_sum_u = 0.0f;
@@ -1897,14 +1880,8 @@ __global__ void gemv_int4_swiglu_fused_kernel(
             block_sum_g += ((float)(gb3 & 0x0F) - 8.0f) * f3.x + ((float)(gb3 >> 4) - 8.0f) * f3.y;
             block_sum_u += ((float)(ub3 & 0x0F) - 8.0f) * f3.x + ((float)(ub3 >> 4) - 8.0f) * f3.y;
         }
-        sum_g += block_sum_g * cur_sg;
-        sum_u += block_sum_u * cur_su;
-
-        cur_g = next_g;
-        cur_u = next_u;
-        cur_sg = next_sg;
-        cur_su = next_su;
-        block_idx = next_idx;
+        sum_g += block_sum_g * sg;
+        sum_u += block_sum_u * su;
     }
 
     #pragma unroll
