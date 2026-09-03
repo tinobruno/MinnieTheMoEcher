@@ -3328,11 +3328,12 @@ private:
         int head_dim = cfg_.head_dim;
         int inter_size = cfg_.intermediate_size > 0 ? cfg_.intermediate_size : cfg_.moe_intermediate_size;
 
-        auto matmul_proj = [&](GPUTensor& out, GPUTensor& in_vec, GPUTensor& weight, GPUTensor& scale, int N, int K) {
+        auto matmul_proj = [&](GPUTensor& out, GPUTensor& in_vec, GPUTensor& weight, GPUTensor& scale, int N, int K, cudaStream_t stream = 0) {
+            if (stream == 0) stream = main_stream_;
             if (weight.dtype == "int4") {
-                gemv_int4_cuda(out.bf16(), in_vec.bf16(), (const uint8_t*)weight.data, scale.bf16(), N, K, main_stream_);
+                gemv_int4_cuda(out.bf16(), in_vec.bf16(), (const uint8_t*)weight.data, scale.bf16(), N, K, stream);
             } else {
-                gemm_bf16(out.bf16(), 1, N, K, in_vec.bf16(), weight.bf16());
+                gemv_bf16_out_bf16_cuda(out.bf16(), weight.bf16(), in_vec.bf16(), N, K, stream);
             }
         };
 
@@ -3341,12 +3342,18 @@ private:
                                    lw.attn_norm_w.bf16(), dim, cfg_.rms_norm_eps, main_stream_);
 
         if (lw.is_linear_attn) {
-            // Qwen 3.8 Gated DeltaNet Linear Attention
-            // 2. Projections: in_proj_qkv (10240), in_proj_z (6144), in_proj_a (48), in_proj_b (48)
-            matmul_proj(buf_q_, buf_hidden2_, lw.w_in_qkv, lw.w_in_qkv_scale, 10240, dim);
-            matmul_proj(buf_up_, buf_hidden2_, lw.w_in_z, lw.w_in_z_scale, 6144, dim);
-            gemm_bf16(buf_linear_a_.bf16(), 1, 48, dim, buf_hidden2_.bf16(), lw.w_in_a.bf16());
-            gemm_bf16(buf_linear_b_.bf16(), 1, 48, dim, buf_hidden2_.bf16(), lw.w_in_b.bf16());
+            // Concurrent Projections across Dual Streams:
+            // Stream 1 (main_stream_): in_proj_qkv (10240)
+            matmul_proj(buf_q_, buf_hidden2_, lw.w_in_qkv, lw.w_in_qkv_scale, 10240, dim, main_stream_);
+
+            // Stream 2 (side_stream_): in_proj_z (6144), in_proj_a (48), in_proj_b (48)
+            matmul_proj(buf_up_, buf_hidden2_, lw.w_in_z, lw.w_in_z_scale, 6144, dim, side_stream_);
+            gemv_bf16_out_bf16_cuda(buf_linear_a_.bf16(), lw.w_in_a.bf16(), buf_hidden2_.bf16(), 48, dim, side_stream_);
+            gemv_bf16_out_bf16_cuda(buf_linear_b_.bf16(), lw.w_in_b.bf16(), buf_hidden2_.bf16(), 48, dim, side_stream_);
+
+            // Sync main_stream_ with side_stream_ before DeltaNet decode
+            CUDA_CHECK(cudaEventRecord(side_event_, side_stream_));
+            CUDA_CHECK(cudaStreamWaitEvent(main_stream_, side_event_, 0));
 
             // 3. Fused 1D Causal Conv + Recurrent SSM Decode Step
             deltanet_linear_attention_decode_cuda(
@@ -3364,13 +3371,19 @@ private:
                 16, 48, 128, main_stream_);
 
             // 4. Output Projection: buf_attn_out_ (6144) -> buf_hidden2_ (5120)
-            matmul_proj(buf_hidden2_, buf_attn_out_, lw.linear_out_proj, lw.linear_out_proj_scale, dim, 6144);
+            matmul_proj(buf_hidden2_, buf_attn_out_, lw.linear_out_proj, lw.linear_out_proj_scale, dim, 6144, main_stream_);
         } else {
-            // Standard Full GQA Attention (Gated)
-            // 2. Q projection (2 * n_q_heads * head_dim), K projection, V projection
-            matmul_proj(buf_q_, buf_hidden2_, lw.w_q, lw.w_q_scale, 2 * n_q_heads * head_dim, dim);
-            matmul_proj(buf_gate_, buf_hidden2_, lw.w_k, lw.w_k_scale, n_kv_heads * head_dim, dim);
-            matmul_proj(buf_up_, buf_hidden2_, lw.w_v, lw.w_v_scale, n_kv_heads * head_dim, dim);
+            // Standard Full GQA Attention (Gated) - Concurrent Projections
+            // Stream 1 (main_stream_): Q projection (2 * n_q_heads * head_dim)
+            matmul_proj(buf_q_, buf_hidden2_, lw.w_q, lw.w_q_scale, 2 * n_q_heads * head_dim, dim, main_stream_);
+
+            // Stream 2 (side_stream_): K projection, V projection
+            matmul_proj(buf_gate_, buf_hidden2_, lw.w_k, lw.w_k_scale, n_kv_heads * head_dim, dim, side_stream_);
+            matmul_proj(buf_up_, buf_hidden2_, lw.w_v, lw.w_v_scale, n_kv_heads * head_dim, dim, side_stream_);
+
+            // Sync main_stream_ with side_stream_ before GQA decode
+            CUDA_CHECK(cudaEventRecord(side_event_, side_stream_));
+            CUDA_CHECK(cudaStreamWaitEvent(main_stream_, side_event_, 0));
 
             // 3 & 4. QK Norm + RoPE + GQA FP8 Decode + Sigmoid Gate
             qwen_gqa_decode_gated_fp8_cuda(
