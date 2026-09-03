@@ -159,12 +159,28 @@ void gemv_int4_cuda(
     int N, int K,
     cudaStream_t stream = 0);
 
+void gemm_int4_batch_cuda(
+    __nv_bfloat16* out,
+    const __nv_bfloat16* A,
+    const uint8_t* weight,
+    const __nv_bfloat16* scale,
+    int N, int K, int M,
+    cudaStream_t stream = 0);
+
 void gemv_int4_f32_cuda(
     float* out,
     const __nv_bfloat16* vec,
     const uint8_t* weight,
     const __nv_bfloat16* scale,
     int N, int K,
+    cudaStream_t stream = 0);
+
+void gemm_int4_f32_batch_cuda(
+    float* out,
+    const __nv_bfloat16* A,
+    const uint8_t* weight,
+    const __nv_bfloat16* scale,
+    int N, int K, int M,
     cudaStream_t stream = 0);
 
 void gemv_int4_swiglu_fused_cuda(
@@ -175,6 +191,16 @@ void gemv_int4_swiglu_fused_cuda(
     const uint8_t* up_weight,
     const __nv_bfloat16* up_scale,
     int N, int K, float swiglu_limit,
+    cudaStream_t stream = 0);
+
+void gemm_int4_swiglu_fused_batch_cuda(
+    __nv_bfloat16* out,
+    const __nv_bfloat16* A,
+    const uint8_t* gate_weight,
+    const __nv_bfloat16* gate_scale,
+    const uint8_t* up_weight,
+    const __nv_bfloat16* up_scale,
+    int N, int K, int M, float swiglu_limit,
     cudaStream_t stream = 0);
 
 void vector_add_bf16_cuda(

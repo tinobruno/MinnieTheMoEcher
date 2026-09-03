@@ -1786,6 +1786,145 @@ void gemv_int4_cuda(
     gemv_int4_kernel<__nv_bfloat16><<<blocks, threads, 0, stream>>>(out, vec, weight, scale, N, K);
 }
 
+// ════════════════════════════════════════════════════════════════════════════════
+//  Batched INT4 GEMM Kernel for M tokens (M <= 8, Block Size = 32, 128-bit)
+// ════════════════════════════════════════════════════════════════════════════════
+template <typename TOut = __nv_bfloat16, int MAX_M = 4>
+__global__ void gemm_int4_batch_kernel(
+    TOut* __restrict__ out,              // [M, N]
+    const __nv_bfloat16* __restrict__ A, // [M, K]
+    const uint8_t* __restrict__ weight,  // [N, K/2]
+    const __nv_bfloat16* __restrict__ scale, // [N, K/32]
+    int N, int K, int M)
+{
+    int row = blockIdx.x * 2 + (threadIdx.y);
+    if (row >= N) return;
+
+    int tid = threadIdx.x; // 0..127
+    int num_blocks = K / 32;
+
+    const __nv_bfloat16* row_scales = scale + (row * num_blocks);
+    const uint4* w_vec16 = reinterpret_cast<const uint4*>(&weight[row * (K / 2)]);
+
+    float sum[MAX_M] = {0.0f};
+
+    for (int block_idx = tid; block_idx < num_blocks; block_idx += blockDim.x) {
+        float s = __bfloat162float(row_scales[block_idx]);
+        uint4 w_val = w_vec16[block_idx];
+        uint32_t w_arr[4] = {w_val.x, w_val.y, w_val.z, w_val.w};
+
+        float block_sum[MAX_M] = {0.0f};
+
+        #pragma unroll
+        for (int k = 0; k < 4; k++) {
+            uint32_t chunk = w_arr[k];
+            uint32_t b0 = chunk & 0xFF;
+            uint32_t b1 = (chunk >> 8) & 0xFF;
+            uint32_t b2 = (chunk >> 16) & 0xFF;
+            uint32_t b3 = (chunk >> 24) & 0xFF;
+
+            float w0x = (float)(b0 & 0x0F) - 8.0f;
+            float w0y = (float)(b0 >> 4) - 8.0f;
+            float w1x = (float)(b1 & 0x0F) - 8.0f;
+            float w1y = (float)(b1 >> 4) - 8.0f;
+            float w2x = (float)(b2 & 0x0F) - 8.0f;
+            float w2y = (float)(b2 >> 4) - 8.0f;
+            float w3x = (float)(b3 & 0x0F) - 8.0f;
+            float w3y = (float)(b3 >> 4) - 8.0f;
+
+            #pragma unroll
+            for (int m = 0; m < MAX_M; m++) {
+                if (m < M) {
+                    const uint4* a_vec16 = reinterpret_cast<const uint4*>(A + m * K);
+                    const uint4* a_ptr = a_vec16 + (block_idx * 4);
+                    uint4 a_val = a_ptr[k];
+
+                    __nv_bfloat162 bf0 = *reinterpret_cast<const __nv_bfloat162*>(&a_val.x);
+                    __nv_bfloat162 bf1 = *reinterpret_cast<const __nv_bfloat162*>(&a_val.y);
+                    __nv_bfloat162 bf2 = *reinterpret_cast<const __nv_bfloat162*>(&a_val.z);
+                    __nv_bfloat162 bf3 = *reinterpret_cast<const __nv_bfloat162*>(&a_val.w);
+
+                    float2 f0 = to_float2_bf162(bf0);
+                    float2 f1 = to_float2_bf162(bf1);
+                    float2 f2 = to_float2_bf162(bf2);
+                    float2 f3 = to_float2_bf162(bf3);
+
+                    block_sum[m] += w0x * f0.x + w0y * f0.y
+                                  + w1x * f1.x + w1y * f1.y
+                                  + w2x * f2.x + w2y * f2.y
+                                  + w3x * f3.x + w3y * f3.y;
+                }
+            }
+        }
+
+        #pragma unroll
+        for (int m = 0; m < MAX_M; m++) {
+            if (m < M) {
+                sum[m] += block_sum[m] * s;
+            }
+        }
+    }
+
+    #pragma unroll
+    for (int m = 0; m < MAX_M; m++) {
+        if (m < M) {
+            #pragma unroll
+            for (int offset = 16; offset > 0; offset /= 2)
+                sum[m] += __shfl_down_sync(0xffffffff, sum[m], offset);
+        }
+    }
+
+    __shared__ float s_sum[MAX_M][2][4];
+    int lane = tid % 32;
+    int warp = tid / 32;
+    if (lane == 0) {
+        #pragma unroll
+        for (int m = 0; m < MAX_M; m++) {
+            if (m < M) {
+                s_sum[m][threadIdx.y][warp] = sum[m];
+            }
+        }
+    }
+    __syncthreads();
+
+    if (warp == 0) {
+        #pragma unroll
+        for (int m = 0; m < MAX_M; m++) {
+            if (m < M) {
+                float total = (lane < 4) ? s_sum[m][threadIdx.y][lane] : 0.0f;
+                #pragma unroll
+                for (int offset = 2; offset > 0; offset /= 2)
+                    total += __shfl_down_sync(0xffffffff, total, offset);
+
+                if (lane == 0) {
+                    if constexpr (std::is_same_v<TOut, float>) {
+                        out[m * N + row] = total;
+                    } else {
+                        out[m * N + row] = __float2bfloat16(total);
+                    }
+                }
+            }
+        }
+    }
+}
+
+void gemm_int4_batch_cuda(
+    __nv_bfloat16* out,
+    const __nv_bfloat16* A,
+    const uint8_t* weight,
+    const __nv_bfloat16* scale,
+    int N, int K, int M,
+    cudaStream_t stream)
+{
+    dim3 threads(128, 2);
+    dim3 blocks((N + 1) / 2);
+    if (M <= 4) {
+        gemm_int4_batch_kernel<__nv_bfloat16, 4><<<blocks, threads, 0, stream>>>(out, A, weight, scale, N, K, M);
+    } else {
+        gemm_int4_batch_kernel<__nv_bfloat16, 8><<<blocks, threads, 0, stream>>>(out, A, weight, scale, N, K, M);
+    }
+}
+
 void gemv_int4_f32_cuda(
     float* out,
     const __nv_bfloat16* vec,
@@ -1797,6 +1936,23 @@ void gemv_int4_f32_cuda(
     dim3 threads(128, 2);
     dim3 blocks((N + 1) / 2);
     gemv_int4_kernel<float><<<blocks, threads, 0, stream>>>(out, vec, weight, scale, N, K);
+}
+
+void gemm_int4_f32_batch_cuda(
+    float* out,
+    const __nv_bfloat16* A,
+    const uint8_t* weight,
+    const __nv_bfloat16* scale,
+    int N, int K, int M,
+    cudaStream_t stream)
+{
+    dim3 threads(128, 2);
+    dim3 blocks((N + 1) / 2);
+    if (M <= 4) {
+        gemm_int4_batch_kernel<float, 4><<<blocks, threads, 0, stream>>>(out, A, weight, scale, N, K, M);
+    } else {
+        gemm_int4_batch_kernel<float, 8><<<blocks, threads, 0, stream>>>(out, A, weight, scale, N, K, M);
+    }
 }
 
 // ════════════════════════════════════════════════════════════════════════════════
@@ -1922,6 +2078,168 @@ __global__ void gemv_int4_swiglu_fused_kernel(
     }
 }
 
+// ════════════════════════════════════════════════════════════════════════════════
+//  Batched INT4 Fused SwiGLU Kernel for M tokens (M <= 8, Block Size = 32, 128-bit)
+// ════════════════════════════════════════════════════════════════════════════════
+template <int MAX_M = 4>
+__global__ void gemm_int4_swiglu_fused_batch_kernel(
+    __nv_bfloat16* __restrict__ out,              // [M, N]
+    const __nv_bfloat16* __restrict__ A,          // [M, K]
+    const uint8_t* __restrict__ gate_weight,
+    const __nv_bfloat16* __restrict__ gate_scale,
+    const uint8_t* __restrict__ up_weight,
+    const __nv_bfloat16* __restrict__ up_scale,
+    int N, int K, int M, float swiglu_limit)
+{
+    int row = blockIdx.x * 2 + (threadIdx.y);
+    if (row >= N) return;
+
+    int tid = threadIdx.x; // 0..127
+    int num_blocks = K / 32;
+
+    const __nv_bfloat16* gate_row_scales = gate_scale + (row * num_blocks);
+    const __nv_bfloat16* up_row_scales = up_scale + (row * num_blocks);
+    const uint4* g_vec16 = reinterpret_cast<const uint4*>(&gate_weight[row * (K / 2)]);
+    const uint4* u_vec16 = reinterpret_cast<const uint4*>(&up_weight[row * (K / 2)]);
+
+    float sum_g[MAX_M] = {0.0f};
+    float sum_u[MAX_M] = {0.0f};
+
+    for (int block_idx = tid; block_idx < num_blocks; block_idx += blockDim.x) {
+        float sg = __bfloat162float(gate_row_scales[block_idx]);
+        float su = __bfloat162float(up_row_scales[block_idx]);
+
+        uint4 g_val = g_vec16[block_idx];
+        uint4 u_val = u_vec16[block_idx];
+        uint32_t g_arr[4] = {g_val.x, g_val.y, g_val.z, g_val.w};
+        uint32_t u_arr[4] = {u_val.x, u_val.y, u_val.z, u_val.w};
+
+        float block_sum_g[MAX_M] = {0.0f};
+        float block_sum_u[MAX_M] = {0.0f};
+
+        #pragma unroll
+        for (int k = 0; k < 4; k++) {
+            uint32_t g_chunk = g_arr[k];
+            uint32_t u_chunk = u_arr[k];
+
+            uint32_t gb0 = g_chunk & 0xFF;
+            uint32_t ub0 = u_chunk & 0xFF;
+            float gw0x = (float)(gb0 & 0x0F) - 8.0f;
+            float gw0y = (float)(gb0 >> 4) - 8.0f;
+            float uw0x = (float)(ub0 & 0x0F) - 8.0f;
+            float uw0y = (float)(ub0 >> 4) - 8.0f;
+
+            uint32_t gb1 = (g_chunk >> 8) & 0xFF;
+            uint32_t ub1 = (u_chunk >> 8) & 0xFF;
+            float gw1x = (float)(gb1 & 0x0F) - 8.0f;
+            float gw1y = (float)(gb1 >> 4) - 8.0f;
+            float uw1x = (float)(ub1 & 0x0F) - 8.0f;
+            float uw1y = (float)(ub1 >> 4) - 8.0f;
+
+            uint32_t gb2 = (g_chunk >> 16) & 0xFF;
+            uint32_t ub2 = (u_chunk >> 16) & 0xFF;
+            float gw2x = (float)(gb2 & 0x0F) - 8.0f;
+            float gw2y = (float)(gb2 >> 4) - 8.0f;
+            float uw2x = (float)(ub2 & 0x0F) - 8.0f;
+            float uw2y = (float)(ub2 >> 4) - 8.0f;
+
+            uint32_t gb3 = (g_chunk >> 24) & 0xFF;
+            uint32_t ub3 = (u_chunk >> 24) & 0xFF;
+            float gw3x = (float)(gb3 & 0x0F) - 8.0f;
+            float gw3y = (float)(gb3 >> 4) - 8.0f;
+            float uw3x = (float)(ub3 & 0x0F) - 8.0f;
+            float uw3y = (float)(ub3 >> 4) - 8.0f;
+
+            #pragma unroll
+            for (int m = 0; m < MAX_M; m++) {
+                if (m < M) {
+                    const uint4* a_vec16 = reinterpret_cast<const uint4*>(A + m * K);
+                    const uint4* a_ptr = a_vec16 + (block_idx * 4);
+                    uint4 a_val = a_ptr[k];
+
+                    __nv_bfloat162 bf0 = *reinterpret_cast<const __nv_bfloat162*>(&a_val.x);
+                    __nv_bfloat162 bf1 = *reinterpret_cast<const __nv_bfloat162*>(&a_val.y);
+                    __nv_bfloat162 bf2 = *reinterpret_cast<const __nv_bfloat162*>(&a_val.z);
+                    __nv_bfloat162 bf3 = *reinterpret_cast<const __nv_bfloat162*>(&a_val.w);
+
+                    float2 f0 = to_float2_bf162(bf0);
+                    float2 f1 = to_float2_bf162(bf1);
+                    float2 f2 = to_float2_bf162(bf2);
+                    float2 f3 = to_float2_bf162(bf3);
+
+                    block_sum_g[m] += gw0x * f0.x + gw0y * f0.y
+                                    + gw1x * f1.x + gw1y * f1.y
+                                    + gw2x * f2.x + gw2y * f2.y
+                                    + gw3x * f3.x + gw3y * f3.y;
+
+                    block_sum_u[m] += uw0x * f0.x + uw0y * f0.y
+                                    + uw1x * f1.x + uw1y * f1.y
+                                    + uw2x * f2.x + uw2y * f2.y
+                                    + uw3x * f3.x + uw3y * f3.y;
+                }
+            }
+        }
+
+        #pragma unroll
+        for (int m = 0; m < MAX_M; m++) {
+            if (m < M) {
+                sum_g[m] += block_sum_g[m] * sg;
+                sum_u[m] += block_sum_u[m] * su;
+            }
+        }
+    }
+
+    #pragma unroll
+    for (int m = 0; m < MAX_M; m++) {
+        if (m < M) {
+            #pragma unroll
+            for (int offset = 16; offset > 0; offset /= 2) {
+                sum_g[m] += __shfl_down_sync(0xffffffff, sum_g[m], offset);
+                sum_u[m] += __shfl_down_sync(0xffffffff, sum_u[m], offset);
+            }
+        }
+    }
+
+    __shared__ float s_sum_g[MAX_M][2][4];
+    __shared__ float s_sum_u[MAX_M][2][4];
+    int lane = tid % 32;
+    int warp = tid / 32;
+    if (lane == 0) {
+        #pragma unroll
+        for (int m = 0; m < MAX_M; m++) {
+            if (m < M) {
+                s_sum_g[m][threadIdx.y][warp] = sum_g[m];
+                s_sum_u[m][threadIdx.y][warp] = sum_u[m];
+            }
+        }
+    }
+    __syncthreads();
+
+    if (warp == 0) {
+        #pragma unroll
+        for (int m = 0; m < MAX_M; m++) {
+            if (m < M) {
+                float g = (lane < 4) ? s_sum_g[m][threadIdx.y][lane] : 0.0f;
+                float u = (lane < 4) ? s_sum_u[m][threadIdx.y][lane] : 0.0f;
+                #pragma unroll
+                for (int offset = 2; offset > 0; offset /= 2) {
+                    g += __shfl_down_sync(0xffffffff, g, offset);
+                    u += __shfl_down_sync(0xffffffff, u, offset);
+                }
+
+                if (lane == 0) {
+                    if (swiglu_limit > 0.0f) {
+                        g = fminf(g, swiglu_limit);
+                        u = fminf(fmaxf(u, -swiglu_limit), swiglu_limit);
+                    }
+                    float silu_g = g / (1.0f + expf(-g));
+                    out[m * N + row] = __float2bfloat16(silu_g * u);
+                }
+            }
+        }
+    }
+}
+
 void gemv_int4_swiglu_fused_cuda(
     __nv_bfloat16* out,
     const __nv_bfloat16* vec,
@@ -1936,6 +2254,27 @@ void gemv_int4_swiglu_fused_cuda(
     dim3 blocks((N + 1) / 2);
     gemv_int4_swiglu_fused_kernel<<<blocks, threads, 0, stream>>>(
         out, vec, gate_weight, gate_scale, up_weight, up_scale, N, K, swiglu_limit);
+}
+
+void gemm_int4_swiglu_fused_batch_cuda(
+    __nv_bfloat16* out,
+    const __nv_bfloat16* A,
+    const uint8_t* gate_weight,
+    const __nv_bfloat16* gate_scale,
+    const uint8_t* up_weight,
+    const __nv_bfloat16* up_scale,
+    int N, int K, int M, float swiglu_limit,
+    cudaStream_t stream)
+{
+    dim3 threads(128, 2);
+    dim3 blocks((N + 1) / 2);
+    if (M <= 4) {
+        gemm_int4_swiglu_fused_batch_kernel<4><<<blocks, threads, 0, stream>>>(
+            out, A, gate_weight, gate_scale, up_weight, up_scale, N, K, M, swiglu_limit);
+    } else {
+        gemm_int4_swiglu_fused_batch_kernel<8><<<blocks, threads, 0, stream>>>(
+            out, A, gate_weight, gate_scale, up_weight, up_scale, N, K, M, swiglu_limit);
+    }
 }
 
 // ── IQ2_XXS Lookup Tables & CUDA Kernels ─────────────────────────────────────────

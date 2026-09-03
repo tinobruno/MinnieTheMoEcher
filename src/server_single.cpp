@@ -1755,6 +1755,19 @@ public:
     GPUTensor buf_linear_a_;     // [48] BF16 for Qwen 3.8 DeltaNet decay A
     GPUTensor buf_linear_b_;     // [48] BF16 for Qwen 3.8 DeltaNet decay B
     GPUTensor buf_input_ids_;    // [MAX_SEQ_LEN] I32
+
+    // Batched working buffers for Multi-Token Speculative Decoding (M=4..8)
+    GPUTensor buf_input_tokens_batch_; // [8] I32
+    GPUTensor buf_hidden_batch_;       // [8, hidden_size] BF16
+    GPUTensor buf_hidden2_batch_;      // [8, hidden_size] BF16
+    GPUTensor buf_q_batch_;            // [8, 10240] BF16
+    GPUTensor buf_gate_batch_;         // [8, intermediate_size] BF16
+    GPUTensor buf_up_batch_;           // [8, intermediate_size] BF16
+    GPUTensor buf_attn_out_batch_;     // [8, 6144] BF16
+    GPUTensor buf_linear_a_batch_;     // [8, 48] BF16
+    GPUTensor buf_linear_b_batch_;     // [8, 48] BF16
+    GPUTensor buf_logits_batch_;       // [8, vocab_size] F32
+
     GPUTensor buf_hc_state_;      // [hc_mult, hidden_size] BF16 — active HC hidden state
     GPUTensor buf_hc_after_attn_; // [hc_mult, hidden_size] BF16 — intermediate HC state after attention
     GPUTensor buf_hc_pre_;       // [hc_mult] F32
@@ -2641,11 +2654,11 @@ public:
             // 2. Prompt-Lookup Speculative Verification Loop (PLD)
             if (enable_pld_ && content_tokens_generated < max_tokens) {
                 std::vector<int> candidates = PromptLookupDrafter::draft(history, pld_draft_tokens_, 3, 2);
-                for (int cand : candidates) {
+                for (size_t cand_idx = 0; cand_idx < candidates.size(); cand_idx++) {
                     if (content_tokens_generated >= max_tokens) break;
                     if (g_stop_requested.load()) break;
 
-                    // Sample prediction at current position from the forwarded logits
+                    int cand = candidates[cand_idx];
                     int pred = sample_token(temperature, history, content_tokens_generated, in_think_block,
                                             top_k, top_p, min_p);
 
@@ -2657,8 +2670,7 @@ public:
                             break;
                         }
                     } else {
-                        // Mismatch or stop token: Draft sequence ends.
-                        // Emit base model's genuine prediction
+                        // Mismatch or stop token: Draft ends. Emit ground-truth prediction
                         if (pred == cfg_.eos_token_id || (eos2_id >= 0 && pred == eos2_id)) {
                             finish_reason = "stop";
                             break;
@@ -3165,6 +3177,19 @@ private:
         buf_hc_input_.alloc((size_t)hc * dim * sizeof(float));
         buf_active_expert_ptrs_.alloc(32 * sizeof(void*));
 
+        // Speculative decoding batch buffers (M=8 capacity)
+        int max_batch_m = 8;
+        buf_input_tokens_batch_.alloc(max_batch_m * sizeof(int32_t));
+        buf_hidden_batch_.alloc(max_batch_m * dim * sizeof(__nv_bfloat16));
+        buf_hidden2_batch_.alloc(max_batch_m * dim * sizeof(__nv_bfloat16));
+        buf_q_batch_.alloc(max_batch_m * std::max(10240, 2 * n_heads * head_dim_val) * sizeof(__nv_bfloat16));
+        buf_gate_batch_.alloc(max_batch_m * max_inter * sizeof(__nv_bfloat16));
+        buf_up_batch_.alloc(max_batch_m * max_inter * sizeof(__nv_bfloat16));
+        buf_attn_out_batch_.alloc(max_batch_m * std::max(6144, n_heads * head_dim_val) * sizeof(__nv_bfloat16));
+        buf_linear_a_batch_.alloc(max_batch_m * 64 * sizeof(__nv_bfloat16));
+        buf_linear_b_batch_.alloc(max_batch_m * 64 * sizeof(__nv_bfloat16));
+        buf_logits_batch_.alloc((size_t)max_batch_m * cfg_.vocab_size * sizeof(float));
+
         // Compressor working buffers
         // Max projection output size: coff=2 for ratio=4, head_dim=512 -> 1024
         int max_comp_dim = 2 * head_dim_val;  // coff=2
@@ -3480,6 +3505,145 @@ private:
 
         // 11. Residual connection: buf_hidden_ += buf_hidden2_
         vector_add_bf16_cuda(buf_hidden_.bf16(), buf_hidden2_.bf16(), dim, main_stream_);
+    }
+
+    void forward_layer_qwen_batch(int layer_id, int position, int M) {
+        auto& lw = layers_[layer_id];
+        int dim = cfg_.hidden_size;
+        int n_q_heads = cfg_.num_attention_heads;
+        int n_kv_heads = cfg_.num_key_value_heads;
+        int head_dim = cfg_.head_dim;
+        int inter_size = cfg_.intermediate_size > 0 ? cfg_.intermediate_size : cfg_.moe_intermediate_size;
+
+        auto matmul_proj_batch = [&](GPUTensor& out, GPUTensor& in_vec, GPUTensor& weight, GPUTensor& scale, int N, int K) {
+            if (weight.dtype == "int4") {
+                gemm_int4_batch_cuda(out.bf16(), in_vec.bf16(), (const uint8_t*)weight.data, scale.bf16(), N, K, M, main_stream_);
+            } else {
+                for (int m = 0; m < M; m++) {
+                    gemv_bf16_out_bf16_cuda(out.bf16() + m * N, weight.bf16(), in_vec.bf16() + m * K, N, K, main_stream_);
+                }
+            }
+        };
+
+        // 1. Attention Pre-RMSNorm: [M, dim] -> [M, dim]
+        for (int m = 0; m < M; m++) {
+            rms_norm_one_centered_cuda(buf_hidden2_batch_.bf16() + m * dim, buf_hidden_batch_.bf16() + m * dim,
+                                       lw.attn_norm_w.bf16(), dim, cfg_.rms_norm_eps, main_stream_);
+        }
+
+        if (lw.is_linear_attn) {
+            // Qwen 3.8 Gated DeltaNet Linear Attention Projections for M tokens
+            matmul_proj_batch(buf_q_batch_, buf_hidden2_batch_, lw.w_in_qkv, lw.w_in_qkv_scale, 10240, dim);
+            matmul_proj_batch(buf_up_batch_, buf_hidden2_batch_, lw.w_in_z, lw.w_in_z_scale, 6144, dim);
+            for (int m = 0; m < M; m++) {
+                gemv_bf16_out_bf16_cuda(buf_linear_a_batch_.bf16() + m * 48, lw.w_in_a.bf16(), buf_hidden2_batch_.bf16() + m * dim, 48, dim, main_stream_);
+                gemv_bf16_out_bf16_cuda(buf_linear_b_batch_.bf16() + m * 48, lw.w_in_b.bf16(), buf_hidden2_batch_.bf16() + m * dim, 48, dim, main_stream_);
+            }
+
+            // DeltaNet SSM recurrence across M tokens
+            for (int m = 0; m < M; m++) {
+                deltanet_linear_attention_decode_cuda(
+                    buf_attn_out_batch_.bf16() + m * 6144,
+                    buf_q_batch_.bf16() + m * 10240,
+                    buf_up_batch_.bf16() + m * 6144,
+                    buf_linear_a_batch_.bf16() + m * 48,
+                    buf_linear_b_batch_.bf16() + m * 48,
+                    lw.conv1d_w.bf16(),
+                    lw.conv_state.bf16(),
+                    lw.A_log.bf16(),
+                    lw.dt_bias.bf16(),
+                    lw.linear_norm_w.bf16(),
+                    lw.ssm_state.bf16(),
+                    16, 48, 128, main_stream_);
+            }
+
+            // Output projection: [M, 6144] -> [M, 5120]
+            matmul_proj_batch(buf_hidden2_batch_, buf_attn_out_batch_, lw.linear_out_proj, lw.linear_out_proj_scale, dim, 6144);
+        } else {
+            // Full GQA Attention Projections for M tokens
+            matmul_proj_batch(buf_q_batch_, buf_hidden2_batch_, lw.w_q, lw.w_q_scale, 2 * n_q_heads * head_dim, dim);
+            matmul_proj_batch(buf_gate_batch_, buf_hidden2_batch_, lw.w_k, lw.w_k_scale, n_kv_heads * head_dim, dim);
+            matmul_proj_batch(buf_up_batch_, buf_hidden2_batch_, lw.w_v, lw.w_v_scale, n_kv_heads * head_dim, dim);
+
+            for (int m = 0; m < M; m++) {
+                qwen_gqa_decode_gated_fp8_cuda(
+                    buf_attn_out_batch_.bf16() + m * (n_q_heads * head_dim),
+                    buf_q_batch_.bf16() + m * (2 * n_q_heads * head_dim),
+                    buf_gate_batch_.bf16() + m * (n_kv_heads * head_dim),
+                    buf_up_batch_.bf16() + m * (n_kv_heads * head_dim),
+                    lw.gqa_q_norm_w.bf16(),
+                    lw.gqa_k_norm_w.bf16(),
+                    lw.k_cache_gqa.u8(),
+                    lw.v_cache_gqa.u8(),
+                    n_q_heads, n_kv_heads, head_dim,
+                    nullptr, position + m, cfg_.max_seq_len,
+                    cfg_.rope_theta, cfg_.rms_norm_eps, main_stream_);
+            }
+
+            matmul_proj_batch(buf_hidden2_batch_, buf_attn_out_batch_, lw.w_o, lw.w_o_scale, dim, n_q_heads * head_dim);
+        }
+
+        // Residual connection: buf_hidden_ += buf_hidden2_
+        for (int m = 0; m < M; m++) {
+            vector_add_bf16_cuda(buf_hidden_batch_.bf16() + m * dim, buf_hidden2_batch_.bf16() + m * dim, dim, main_stream_);
+            rms_norm_one_centered_cuda(buf_hidden2_batch_.bf16() + m * dim, buf_hidden_batch_.bf16() + m * dim,
+                                       lw.ffn_norm_w.bf16(), dim, cfg_.rms_norm_eps, main_stream_);
+        }
+
+        // FFN SwiGLU for M tokens simultaneously:
+        if (lw.w_gate.dtype == "int4") {
+            gemm_int4_swiglu_fused_batch_cuda(buf_gate_batch_.bf16(), buf_hidden2_batch_.bf16(),
+                                              (const uint8_t*)lw.w_gate.data, lw.w_gate_scale.bf16(),
+                                              (const uint8_t*)lw.w_up.data, lw.w_up_scale.bf16(),
+                                              inter_size, dim, M, cfg_.swiglu_limit, main_stream_);
+        } else {
+            matmul_proj_batch(buf_gate_batch_, buf_hidden2_batch_, lw.w_gate, lw.w_gate_scale, inter_size, dim);
+            matmul_proj_batch(buf_up_batch_, buf_hidden2_batch_, lw.w_up, lw.w_up_scale, inter_size, dim);
+            for (int m = 0; m < M; m++) {
+                silu_mul_cuda(buf_gate_batch_.bf16() + m * inter_size, buf_gate_batch_.bf16() + m * inter_size,
+                              buf_up_batch_.bf16() + m * inter_size, inter_size, cfg_.swiglu_limit, main_stream_);
+            }
+        }
+
+        // Down projection: [M, inter_size] -> [M, dim]
+        matmul_proj_batch(buf_hidden2_batch_, buf_gate_batch_, lw.w_down, lw.w_down_scale, dim, inter_size);
+
+        // Residual connection: buf_hidden_ += buf_hidden2_
+        for (int m = 0; m < M; m++) {
+            vector_add_bf16_cuda(buf_hidden_batch_.bf16() + m * dim, buf_hidden2_batch_.bf16() + m * dim, dim, main_stream_);
+        }
+    }
+
+    void forward_token_batch_qwen(const int* tokens_host, int position, int M) {
+        int dim = cfg_.hidden_size;
+        CUDA_CHECK(cudaMemcpyAsync(buf_input_tokens_batch_.i32(), tokens_host, M * sizeof(int32_t), cudaMemcpyHostToDevice, main_stream_));
+
+        // 1. Embedding lookup for M tokens
+        embedding_cuda(buf_hidden_batch_.bf16(), embed_weight_.bf16(), buf_input_tokens_batch_.i32(), M, dim, main_stream_);
+
+        // 2. Process each layer
+        for (int layer = 0; layer < cfg_.num_hidden_layers; layer++) {
+            forward_layer_qwen_batch(layer, position, M);
+        }
+
+        // 3. Final norm
+        for (int m = 0; m < M; m++) {
+            rms_norm_one_centered_cuda(buf_hidden_batch_.bf16() + m * dim, buf_hidden_batch_.bf16() + m * dim,
+                                       norm_weight_.bf16(), dim, cfg_.rms_norm_eps, main_stream_);
+        }
+
+        // 4. Logits: hidden @ head_weight.T -> [M, vocab_size] in F32
+        if (head_weight_scale_.data) {
+            gemm_int4_f32_batch_cuda(buf_logits_batch_.f32(), buf_hidden_batch_.bf16(),
+                                     (const uint8_t*)head_weight_.data, head_weight_scale_.bf16(),
+                                     cfg_.vocab_size, dim, M, main_stream_);
+        } else {
+            for (int m = 0; m < M; m++) {
+                gemv_bf16_cuda(buf_logits_batch_.f32() + (size_t)m * cfg_.vocab_size,
+                               head_weight_.bf16(), buf_hidden_batch_.bf16() + m * dim,
+                               cfg_.vocab_size, dim, main_stream_);
+            }
+        }
     }
 
     // ── Forward one layer ───────────────────────────────────────────────────
@@ -4222,9 +4386,15 @@ private:
 
     int sample_token(float temperature, const std::vector<int>& history, int step = 0, bool is_reasoning = true,
                      int top_k = 1024, float top_p = 0.95f, float min_p = 0.0f) {
+        return sample_from_logits_ptr(buf_logits_.f32(), temperature, history, step, is_reasoning, top_k, top_p, min_p);
+    }
+
+    int sample_from_logits_ptr(float* logits_ptr, float temperature, const std::vector<int>& history, int step = 0, bool is_reasoning = true,
+                               int top_k = 1024, float top_p = 0.95f, float min_p = 0.0f) {
         int vocab = cfg_.vocab_size;
 
         if (temperature <= 0.0f) {
+            argmax_f32_cuda(buf_argmax_out_.i32(), logits_ptr, vocab, main_stream_);
             int best = 0;
             CUDA_CHECK(cudaMemcpyAsync(&best, buf_argmax_out_.i32(), sizeof(int32_t), cudaMemcpyDeviceToHost, main_stream_));
             CUDA_CHECK(cudaStreamSynchronize(main_stream_));
@@ -4233,7 +4403,7 @@ private:
 
         std::uniform_real_distribution<float> dist(0.0f, 1.0f);
         float r = dist(rng_);
-        sample_multinomial_f32_cuda(buf_argmax_out_.i32(), buf_logits_.f32(), vocab, temperature, r, min_p, main_stream_);
+        sample_multinomial_f32_cuda(buf_argmax_out_.i32(), logits_ptr, vocab, temperature, r, min_p, main_stream_);
         int sampled = 0;
         CUDA_CHECK(cudaMemcpyAsync(&sampled, buf_argmax_out_.i32(), sizeof(int32_t), cudaMemcpyDeviceToHost, main_stream_));
         CUDA_CHECK(cudaStreamSynchronize(main_stream_));
