@@ -40,6 +40,7 @@ check_gpu.py
 test_gen.py
 test_req.json
 train_mtp_ref.py
+installer/inno6/
 
 # Python & Distribution
 __pycache__/

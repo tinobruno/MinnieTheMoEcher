@@ -4,7 +4,7 @@
 ; ─────────────────────────────────────────────────────────────────────────────
 
 #define MyAppName "Moecher Inference Engine"
-#define MyAppVersion "2.05"
+#define MyAppVersion "2.07"
 #define MyAppPublisher "MinnieTheMoEcher Project"
 #define MyAppExeName "moecher.exe"
 
@@ -16,8 +16,8 @@ AppPublisher={#MyAppPublisher}
 DefaultDirName={sd}\Moecher
 DefaultGroupName=Moecher
 AllowNoIcons=yes
-ArchitecturesAllowed=x64compatible
-ArchitecturesInstallIn64BitMode=x64compatible
+ArchitecturesAllowed=x64
+ArchitecturesInstallIn64BitMode=x64
 OutputDir=..\dist
 OutputBaseFilename=Moecher-Setup
 Compression=lzma2/ultra64
@@ -37,7 +37,7 @@ Name: "custom"; Description: "Custom Installation"; Flags: iscustom
 
 [Components]
 Name: "core"; Description: "Moecher Engine Core & Web UI (~40 MB)"; Types: full custom; Flags: fixed
-Name: "dl_qwen"; Description: "Download Qwen 3.8 27B INT4 (~18.7 GB) from Hugging Face"; Types: full custom
+Name: "dl_qwen"; Description: "Download Qwen 3.8 27B INT4 with MTP Speculative Decoding (~19.1 GB) from Hugging Face"; Types: full custom
 Name: "dl_deepseek"; Description: "Download DeepSeek V4 Flash IQ2 - Standard (~81.4 GB) from Hugging Face"; Types: custom
 Name: "dl_deepseek_q4"; Description: "Download DeepSeek V4 Flash Q4 - 8GB GPU Mode (~78.8 GB) from Hugging Face"; Types: custom
 
@@ -47,8 +47,8 @@ Name: "desktopicon"; Description: "{cm:CreateDesktopIcon}"; GroupDescription: "{
 [Files]
 ; Core Binaries & CUDA 13 Runtime
 Source: "..\moecher.exe"; DestDir: "{app}"; Flags: ignoreversion; Components: core
-Source: "C:\Program Files\NVIDIA GPU Computing Toolkit\CUDA\v13.3\bin\cublas64_13.dll"; DestDir: "{app}"; Flags: ignoreversion skipifsourcedoesntexist; Components: core
-Source: "C:\Program Files\NVIDIA GPU Computing Toolkit\CUDA\v13.3\bin\cublasLt64_13.dll"; DestDir: "{app}"; Flags: ignoreversion skipifsourcedoesntexist; Components: core
+Source: "C:\Program Files\NVIDIA GPU Computing Toolkit\CUDA\v13.3\bin\x64\cublas64_13.dll"; DestDir: "{app}"; Flags: ignoreversion skipifsourcedoesntexist; Components: core
+Source: "C:\Program Files\NVIDIA GPU Computing Toolkit\CUDA\v13.3\bin\x64\cublasLt64_13.dll"; DestDir: "{app}"; Flags: ignoreversion skipifsourcedoesntexist; Components: core
 
 ; Launchers, Scripts, Icons & Web UI
 Source: "..\installer\start_qwen_server.bat"; DestDir: "{app}"; Flags: ignoreversion; Components: core

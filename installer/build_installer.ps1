@@ -11,6 +11,8 @@ Write-Host "================================================================" -F
 
 # 1. Locate Inno Setup Compiler (ISCC.exe)
 $IsccPaths = @(
+    "$PSScriptRoot\inno6\ISCC.exe",
+    "F:\dev\innosetup\app\ISCC.exe",
     "$env:LOCALAPPDATA\Programs\Inno Setup 6\ISCC.exe",
     "C:\Program Files (x86)\Inno Setup 6\ISCC.exe",
     "C:\Program Files\Inno Setup 6\ISCC.exe"
@@ -24,9 +26,18 @@ if (-not $IsccExe) {
 
 Write-Host "Found Inno Setup Compiler: $IsccExe" -ForegroundColor Green
 
+# Ensure build\Release\moecher.exe exists
+if (-not (Test-Path "build\Release\moecher.exe") -and (Test-Path "build\moecher.exe")) {
+    New-Item -ItemType Directory -Path "build\Release" -Force | Out-Null
+    Copy-Item "build\moecher.exe" "build\Release\moecher.exe" -Force
+}
+if (-not (Test-Path "moecher.exe") -and (Test-Path "build\moecher.exe")) {
+    Copy-Item "build\moecher.exe" "moecher.exe" -Force
+}
+
 # 2. Verify all prerequisite files
 $RequiredFiles = @(
-    "build\Release\moecher.exe",
+    "moecher.exe",
     "installer\Moecher_Setup.iss",
     "installer\start_qwen_server.bat",
     "installer\start_deepseek_server.bat",

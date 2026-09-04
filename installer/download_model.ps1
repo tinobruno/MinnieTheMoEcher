@@ -36,7 +36,9 @@ $ModelConfigs = @{
         "Files" = @(
             "moecher_manifest.json",
             "tokenizer.json",
-            "attention_dense_layers_q4.bin"
+            "attention_dense_layers_q4.bin",
+            "draft_vocab_ids.bin",
+            "draft_lm_head_int8_bf16.bin"
         )
     }
     "deepseek" = @{
