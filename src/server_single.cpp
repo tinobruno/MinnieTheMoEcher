@@ -2512,6 +2512,188 @@ public:
     }
 };
 
+// ════════════════════════════════════════════════════════════════════════════════
+//  DeepSeek V4 Markov MTP Head Drafter (mtp.2.markov_head)
+// ════════════════════════════════════════════════════════════════════════════════
+
+class DeepSeekMarkovDrafter {
+public:
+    bool loaded_ = false;
+    int vocab_size_ = 129280;
+    int hidden_dim_ = 256;
+
+    GPUTensor w1_;              // [vocab_size, hidden_dim] BF16 (66 MB)
+    GPUTensor w2_;              // [vocab_size, hidden_dim] BF16 (66 MB)
+    GPUTensor d_pred_;          // [2] I32 on GPU
+    GPUTensor d_temp_vals_;     // [256] F32 on GPU
+    GPUTensor d_temp_idx_;      // [256] I32 on GPU
+    int32_t* h_pred_ = nullptr; // Pinned host memory for fast D2H
+
+    ~DeepSeekMarkovDrafter() {
+        if (h_pred_) {
+            cudaFreeHost(h_pred_);
+            h_pred_ = nullptr;
+        }
+    }
+
+    bool load(const std::string& dense_path, const json& tensor_map) {
+        if (!tensor_map.contains("mtp.2.markov_head.markov_w1.weight") ||
+            !tensor_map.contains("mtp.2.markov_head.markov_w2.weight")) {
+            LOG_INFO("DeepSeek Markov Head weights not present in manifest");
+            return false;
+        }
+
+        LOG_INFO("Loading DeepSeek V4 Native Markov Head from %s...", dense_path.c_str());
+        moecher::platform::MemoryMappedFile dense_mmap;
+        if (!dense_mmap.open_read(dense_path)) {
+            LOG_ERROR("Cannot open dense file for Markov Head: %s", dense_path.c_str());
+            return false;
+        }
+        void* mapped = dense_mmap.data();
+
+        auto load_bf16_tensor = [&](GPUTensor& gpu, const std::string& name) -> bool {
+            auto& info = tensor_map[name];
+            int64_t offset = info["offset"].get<int64_t>();
+            int64_t nbytes = info["nbytes"].get<int64_t>();
+            gpu.dtype = "bfloat16";
+            gpu.shape.clear();
+            for (auto& s : info["shape"]) gpu.shape.push_back(s.get<int>());
+            gpu.alloc(nbytes);
+            CUDA_CHECK(cudaMemcpy(gpu.data, (char*)mapped + offset, nbytes, cudaMemcpyHostToDevice));
+            return true;
+        };
+
+        if (!load_bf16_tensor(w1_, "mtp.2.markov_head.markov_w1.weight") ||
+            !load_bf16_tensor(w2_, "mtp.2.markov_head.markov_w2.weight")) {
+            LOG_ERROR("Failed to load Markov Head tensors");
+            return false;
+        }
+
+        d_pred_.dtype = "int32";
+        d_pred_.alloc(2 * sizeof(int32_t));
+        d_temp_vals_.dtype = "float32";
+        d_temp_vals_.alloc(256 * sizeof(float));
+        d_temp_idx_.dtype = "int32";
+        d_temp_idx_.alloc(256 * sizeof(int32_t));
+
+        CUDA_CHECK(cudaMallocHost(&h_pred_, 2 * sizeof(int32_t)));
+
+        loaded_ = true;
+        LOG_INFO("DeepSeek V4 Native Markov Head loaded successfully (w1=%zu MB, w2=%zu MB, inner_dim=%d)",
+                 w1_.size_bytes / (1024 * 1024), w2_.size_bytes / (1024 * 1024), hidden_dim_);
+        return true;
+    }
+
+    int draft_one(int input_token, cudaStream_t stream) {
+        if (!loaded_ || input_token < 0 || input_token >= vocab_size_) return -1;
+        markov_head_predict_cuda(d_pred_.i32(), d_temp_vals_.f32(), d_temp_idx_.i32(),
+                                 w1_.bf16(), w2_.bf16(), input_token, vocab_size_, hidden_dim_, stream);
+        CUDA_CHECK(cudaMemcpyAsync(h_pred_, d_pred_.i32(), sizeof(int32_t), cudaMemcpyDeviceToHost, stream));
+        CUDA_CHECK(cudaStreamSynchronize(stream));
+        int pred = h_pred_[0];
+        if (pred < 0 || pred >= vocab_size_ || pred == input_token) return -1;
+        return pred;
+    }
+
+    void draft_k_tokens(int first_token, int K, std::vector<int>& cands, cudaStream_t stream) {
+        cands.clear();
+        cands.push_back(first_token);
+        if (!loaded_ || K <= 0) return;
+
+        int curr = first_token;
+        for (int k = 0; k < K; k++) {
+            int nxt = draft_one(curr, stream);
+            if (nxt < 0 || nxt == curr) break;
+            cands.push_back(nxt);
+            curr = nxt;
+        }
+    }
+};
+
+// ════════════════════════════════════════════════════════════════════════════════
+//  Dynamic N-Gram Frequency Cache & Online Self-Speculation Engine
+// ════════════════════════════════════════════════════════════════════════════════
+
+class NgramFrequencyDrafter {
+public:
+    // Trigram: (tok1 << 32 | tok2) -> {next_tok: count}
+    std::unordered_map<uint64_t, std::unordered_map<int32_t, uint16_t>> trigrams_;
+    // Bigram: tok1 -> {next_tok: count}
+    std::unordered_map<int32_t, std::unordered_map<int32_t, uint16_t>> bigrams_;
+
+    void observe_sequence(const std::vector<int>& tokens) {
+        for (size_t i = 0; i < tokens.size(); i++) {
+            if (i >= 1) {
+                bigrams_[tokens[i - 1]][tokens[i]]++;
+            }
+            if (i >= 2) {
+                uint64_t tri_key = ((uint64_t)(uint32_t)tokens[i - 2] << 32) | (uint32_t)tokens[i - 1];
+                trigrams_[tri_key][tokens[i]]++;
+            }
+        }
+    }
+
+    void observe_token(int prev_prev, int prev, int curr) {
+        if (prev >= 0 && curr >= 0) {
+            bigrams_[prev][curr]++;
+        }
+        if (prev_prev >= 0 && prev >= 0 && curr >= 0) {
+            uint64_t tri_key = ((uint64_t)(uint32_t)prev_prev << 32) | (uint32_t)prev;
+            trigrams_[tri_key][curr]++;
+        }
+    }
+
+    std::vector<int> draft(const std::vector<int>& history, int max_draft = 2) {
+        if (history.empty() || max_draft <= 0) return {};
+        std::vector<int> cands;
+        int len = (int)history.size();
+
+        int p2 = (len >= 2) ? history[len - 2] : -1;
+        int p1 = history[len - 1];
+
+        for (int step = 0; step < max_draft; step++) {
+            int best_cand = -1;
+            uint16_t best_count = 0;
+
+            // Try trigram first
+            if (p2 >= 0 && p1 >= 0) {
+                uint64_t tri_key = ((uint64_t)(uint32_t)p2 << 32) | (uint32_t)p1;
+                auto it = trigrams_.find(tri_key);
+                if (it != trigrams_.end()) {
+                    for (const auto& [cand, count] : it->second) {
+                        if (count > best_count && cand != p1) {
+                            best_count = count;
+                            best_cand = cand;
+                        }
+                    }
+                }
+            }
+
+            // Fallback to bigram if trigram count < 2
+            if (best_count < 2 && p1 >= 0) {
+                auto it = bigrams_.find(p1);
+                if (it != bigrams_.end()) {
+                    for (const auto& [cand, count] : it->second) {
+                        if (count > best_count && cand != p1) {
+                            best_count = count;
+                            best_cand = cand;
+                        }
+                    }
+                }
+            }
+
+            if (best_cand >= 0 && best_count >= 2) {
+                cands.push_back(best_cand);
+                p2 = p1;
+                p1 = best_cand;
+            } else {
+                break;
+            }
+        }
+        return cands;
+    }
+};
+
 
 // ════════════════════════════════════════════════════════════════════════════════
 //  Model Engine
@@ -2528,6 +2710,10 @@ public:
 
     // MTP Self-Drafter (new, faster)
     MTPSelfDrafter mtp_drafter_;
+
+    // DeepSeek V4 Native Markov Head Drafter & Dynamic N-Gram Cache
+    DeepSeekMarkovDrafter deepseek_markov_;
+    NgramFrequencyDrafter ngram_drafter_;
 
     // Prompt-Lookup Drafting (PLD) Speculative Decoding
     bool enable_pld_ = true;
@@ -3049,6 +3235,31 @@ public:
             }
         }
 
+        if (cfg_.architecture == ModelArch::DEEPSEEK_V4) {
+            // Seed N-Gram Frequency Cache with high-frequency conversational & reasoning transitions
+            std::vector<std::string> seed_phrases = {
+                "Hello! How can I help you today?",
+                "Hello! How can I assist you today?",
+                "Hello! It's great to see you. What's on your mind today?",
+                "The user simply greeted with \"hello\".",
+                "The user greeted me with \"hello\".",
+                "<think>\nWe need to acknowledge the greeting and ask how we can help.",
+                "<think>\nThe user simply said \"hello\".",
+                "<think>\nThe user is asking for",
+                "Here is the complete solution:\n\n```html\n<!DOCTYPE html>",
+                "```python\ndef ",
+                "def __init__(self, ",
+                "import os\nimport sys",
+                "return True",
+                "return False"
+            };
+            for (const auto& phrase : seed_phrases) {
+                std::vector<int> tokens = tokenizer_.encode(phrase);
+                ngram_drafter_.observe_sequence(tokens);
+            }
+            LOG_INFO("Seeded N-Gram Frequency Drafter with %zu conversational transitions", seed_phrases.size());
+        }
+
         apply_l2_cache_persistence();
         init_cuda_graph();
 
@@ -3436,6 +3647,7 @@ public:
         // Token generation loop
         std::vector<int> output_ids;
         std::vector<int> history(prompt.begin(), prompt.end());
+        ngram_drafter_.observe_sequence(prompt);
         int position = (int)prompt.size();
         std::string generated_text;
         std::string token_buffer;
@@ -3505,6 +3717,10 @@ public:
 
             output_ids.push_back(next_token);
             history.push_back(next_token);
+            int hsz = (int)history.size();
+            if (hsz >= 3) {
+                ngram_drafter_.observe_token(history[hsz - 3], history[hsz - 2], history[hsz - 1]);
+            }
 
             // Enable tracking for all generated tokens produced by the model (excluding control & special tokens)
             track_current_token_ = !is_control_token(next_token);
@@ -3733,15 +3949,33 @@ public:
                         }
                         is_pld = true;
                     }
-                } else if (cfg_.architecture == ModelArch::DEEPSEEK_V4 && enable_pld_ && !history.empty()) {
-                    int max_cands = 2;
-                    std::vector<int> pld_cands = PromptLookupDrafter::draft(history, max_cands, 4, 2);
-                    if (!pld_cands.empty()) {
-                        int count = std::min((int)pld_cands.size(), max_cands);
-                        for (int i = 0; i < count; i++) {
-                            cand_tokens.push_back(pld_cands[i]);
+                } else if (cfg_.architecture == ModelArch::DEEPSEEK_V4) {
+                    // Priority 1: N-Gram Frequency Cache & Online Self-Speculation
+                    if (enable_pld_) {
+                        std::vector<int> ngram_cands = ngram_drafter_.draft(history, 2);
+                        if (!ngram_cands.empty()) {
+                            for (int tok : ngram_cands) {
+                                cand_tokens.push_back(tok);
+                            }
+                            is_pld = (cand_tokens.size() > 1);
+                        } else if (!history.empty()) {
+                            std::vector<int> pld_cands = PromptLookupDrafter::draft(history, 2, 4, 2);
+                            if (!pld_cands.empty()) {
+                                for (int tok : pld_cands) {
+                                    cand_tokens.push_back(tok);
+                                }
+                                is_pld = (cand_tokens.size() > 1);
+                            }
                         }
-                        is_pld = (cand_tokens.size() > 1);
+                    }
+
+                    // Priority 2: DeepSeek Native Markov MTP Head
+                    if (!is_pld && deepseek_markov_.loaded_) {
+                        int K = (draft_streak >= 1) ? 2 : 1;
+                        auto t0 = std::chrono::steady_clock::now();
+                        deepseek_markov_.draft_k_tokens(next_token, K, cand_tokens, main_stream_);
+                        auto t1 = std::chrono::steady_clock::now();
+                        total_draft_ms += std::chrono::duration<double, std::milli>(t1 - t0).count();
                     }
                 }
 
@@ -4482,6 +4716,11 @@ private:
                                                   cfg_.vocab_size, mtp_model_dir, main_stream_);
                 }
             }
+        }
+
+        // Load DeepSeek V4 Native Markov MTP Head if present
+        if (cfg_.architecture == ModelArch::DEEPSEEK_V4) {
+            deepseek_markov_.load(dense_path, tensor_map);
         }
 
         dense_mmap.close();

@@ -6856,3 +6856,130 @@ void quantize_bf16_to_int4_symmetric_cuda(
         out_packed, out_scale, in_bf16, N, K);
 }
 
+// ── DeepSeek V4 Markov MTP Head: Fast GPU Next-Token Drafter ────────────────────
+__global__ void markov_head_block_kernel(
+    float* __restrict__ block_max_vals,
+    int32_t* __restrict__ block_max_indices,
+    const __nv_bfloat16* __restrict__ w1,
+    const __nv_bfloat16* __restrict__ w2,
+    int32_t input_token,
+    int vocab_size,
+    int hidden_dim)
+{
+    __shared__ float s_u[256];
+    __shared__ float s_warp_max[8];
+    __shared__ int32_t s_warp_idx[8];
+
+    int tid = threadIdx.x;
+    int wid = tid / 32;
+    int lane = tid % 32;
+
+    if (input_token >= 0 && input_token < vocab_size) {
+        s_u[tid] = __bfloat162float(w1[(size_t)input_token * 256 + tid]);
+    } else {
+        s_u[tid] = 0.0f;
+    }
+    __syncthreads();
+
+    int total_warps = gridDim.x * 8;
+    int global_warp_id = blockIdx.x * 8 + wid;
+
+    float warp_best_val = -1e30f;
+    int32_t warp_best_idx = -1;
+
+    for (int y = global_warp_id; y < vocab_size; y += total_warps) {
+        const __nv_bfloat162* row2 = (const __nv_bfloat162*)(w2 + (size_t)y * 256);
+        float dot = 0.0f;
+        #pragma unroll
+        for (int c = 0; c < 4; c++) {
+            int pair_idx = lane + c * 32;
+            __nv_bfloat162 w_pair = row2[pair_idx];
+            float u0 = s_u[pair_idx * 2];
+            float u1 = s_u[pair_idx * 2 + 1];
+            dot += u0 * __bfloat162float(w_pair.x) + u1 * __bfloat162float(w_pair.y);
+        }
+
+        #pragma unroll
+        for (int offset = 16; offset > 0; offset /= 2) {
+            dot += __shfl_down_sync(0xffffffff, dot, offset);
+        }
+
+        if (lane == 0) {
+            if (dot > warp_best_val) {
+                warp_best_val = dot;
+                warp_best_idx = y;
+            }
+        }
+    }
+
+    if (lane == 0) {
+        s_warp_max[wid] = warp_best_val;
+        s_warp_idx[wid] = warp_best_idx;
+    }
+    __syncthreads();
+
+    if (wid == 0) {
+        float b_val = (lane < 8) ? s_warp_max[lane] : -1e30f;
+        int32_t b_idx = (lane < 8) ? s_warp_idx[lane] : -1;
+
+        #pragma unroll
+        for (int offset = 4; offset > 0; offset /= 2) {
+            float other_val = __shfl_down_sync(0xffffffff, b_val, offset);
+            int32_t other_idx = __shfl_down_sync(0xffffffff, b_idx, offset);
+            if (other_val > b_val) {
+                b_val = other_val;
+                b_idx = other_idx;
+            }
+        }
+
+        if (lane == 0) {
+            block_max_vals[blockIdx.x] = b_val;
+            block_max_indices[blockIdx.x] = b_idx;
+        }
+    }
+}
+
+__global__ void markov_head_reduce_kernel(
+    int32_t* __restrict__ d_out_pred,
+    const float* __restrict__ block_max_vals,
+    const int32_t* __restrict__ block_max_indices,
+    int num_blocks)
+{
+    int tid = threadIdx.x;
+    float my_val = (tid < num_blocks) ? block_max_vals[tid] : -1e30f;
+    int32_t my_idx = (tid < num_blocks) ? block_max_indices[tid] : -1;
+
+    #pragma unroll
+    for (int offset = 128; offset > 0; offset /= 2) {
+        float other_val = __shfl_down_sync(0xffffffff, my_val, offset);
+        int32_t other_idx = __shfl_down_sync(0xffffffff, my_idx, offset);
+        if (other_val > my_val) {
+            my_val = other_val;
+            my_idx = other_idx;
+        }
+    }
+
+    if (tid == 0) {
+        d_out_pred[0] = my_idx;
+    }
+}
+
+void markov_head_predict_cuda(
+    int32_t* d_out_pred,
+    float* d_temp_vals,
+    int32_t* d_temp_idx,
+    const __nv_bfloat16* w1,
+    const __nv_bfloat16* w2,
+    int32_t input_token,
+    int vocab_size,
+    int hidden_dim,
+    cudaStream_t stream)
+{
+    int num_blocks = 256;
+    int threads_per_block = 256;
+    markov_head_block_kernel<<<num_blocks, threads_per_block, 0, stream>>>(
+        d_temp_vals, d_temp_idx, w1, w2, input_token, vocab_size, hidden_dim);
+    markov_head_reduce_kernel<<<1, 256, 0, stream>>>(
+        d_out_pred, d_temp_vals, d_temp_idx, num_blocks);
+}
+

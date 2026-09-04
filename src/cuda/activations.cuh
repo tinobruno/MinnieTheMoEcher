@@ -850,5 +850,17 @@ void quantize_bf16_to_int4_symmetric_cuda(
     int N, int K,
     cudaStream_t stream = 0);
 
+// ── DeepSeek V4 Markov MTP Head: Fast GPU Next-Token Drafter ────────────────────
+void markov_head_predict_cuda(
+    int32_t* d_out_pred,             // [2] I32 on GPU (predicted token IDs)
+    float* d_temp_vals,              // [256] F32 temp buffer for block reduction
+    int32_t* d_temp_idx,             // [256] I32 temp buffer for block reduction
+    const __nv_bfloat16* w1,         // [vocab_size, hidden_dim] BF16
+    const __nv_bfloat16* w2,         // [vocab_size, hidden_dim] BF16
+    int32_t input_token,             // Token ID to predict transition from
+    int vocab_size,                  // 129280
+    int hidden_dim,                  // 256
+    cudaStream_t stream = 0);
+
 
 
