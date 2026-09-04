@@ -3198,7 +3198,9 @@ public:
         graph_captured_ = true;
         LOG_INFO("CUDA Graph instantiated successfully! Decode speed accelerated.");
 
-        if (qwen_draft_.loaded_) {
+        if (cfg_.architecture == ModelArch::DEEPSEEK_V4) {
+            init_batch_cuda_graphs_deepseek();
+        } else if (qwen_draft_.loaded_) {
             qwen_draft_.init_cuda_graph(main_stream_);
             init_batch_cuda_graphs();
         }
@@ -3735,11 +3737,10 @@ public:
                     int max_cands = 2;
                     if (!cfg_.compress_ratios.empty()) {
                         int rem = (position + 1) % 4;
-                        if (rem == 0) max_cands = 0;
-                        else max_cands = std::min(2, 4 - rem);
+                        max_cands = (rem == 1) ? 2 : ((rem == 2) ? 1 : 0);
                     }
                     if (max_cands > 0) {
-                        std::vector<int> pld_cands = PromptLookupDrafter::draft(history, 5, max_cands + 1, 2);
+                        std::vector<int> pld_cands = PromptLookupDrafter::draft(history, max_cands, 4, 2);
                         if (!pld_cands.empty()) {
                             int count = std::min((int)pld_cands.size(), max_cands);
                             for (int i = 0; i < count; i++) {
@@ -3762,19 +3763,19 @@ public:
                     forward_token_batch_deepseek(cand_tokens.data(), position, M);
 
                     int num_verify = M - 1;
-                    argmax_f32_batch_cuda(buf_argmax_out_batch_.i32(), buf_logits_batch_.f32(), cfg_.vocab_size, num_verify, main_stream_);
+                    argmax_f32_batch_cuda(buf_argmax_out_batch_.i32(), buf_logits_batch_.f32(), cfg_.vocab_size, M, main_stream_);
 
                     static int32_t* host_batch_preds_ds = nullptr;
                     if (!host_batch_preds_ds) {
                         CUDA_CHECK(cudaMallocHost(&host_batch_preds_ds, 16 * sizeof(int32_t)));
                     }
-                    CUDA_CHECK(cudaMemcpyAsync(host_batch_preds_ds, buf_argmax_out_batch_.i32(), num_verify * sizeof(int32_t), cudaMemcpyDeviceToHost, main_stream_));
+                    CUDA_CHECK(cudaMemcpyAsync(host_batch_preds_ds, buf_argmax_out_batch_.i32(), M * sizeof(int32_t), cudaMemcpyDeviceToHost, main_stream_));
                     CUDA_CHECK(cudaStreamSynchronize(main_stream_));
                     auto tv1 = std::chrono::steady_clock::now();
                     double ver_ms = std::chrono::duration<double, std::milli>(tv1 - tv0).count();
                     total_verify_ms += ver_ms;
                     if (spec_cycles < 5) {
-                        LOG_INFO("DEEPSEEK VERIFY: cycle=%d M=%d took %.2fms", spec_cycles, M, ver_ms);
+                        LOG_INFO("DEEPSEEK VERIFY: cycle=%d M=%d took %.2fms (graph=%d)", spec_cycles, M, ver_ms, (int)batch_graph_captured_[M]);
                     }
 
                     int accepted = 0;
@@ -3813,15 +3814,19 @@ public:
                             cfg_.hc_mult * cfg_.hidden_size * sizeof(__nv_bfloat16),
                             cudaMemcpyDeviceToDevice, main_stream_));
 
-                        // Copy latest logits from position M - 1 for next token sampling
-                        CUDA_CHECK(cudaMemcpyAsync(buf_logits_.f32(),
-                                                   buf_logits_batch_.f32() + (size_t)(M - 1) * cfg_.vocab_size,
-                                                   cfg_.vocab_size * sizeof(float),
-                                                   cudaMemcpyDeviceToDevice, main_stream_));
-                        CUDA_CHECK(cudaStreamSynchronize(main_stream_));
+                        if (temperature <= 0.0f) {
+                            next_token = host_batch_preds_ds[M - 1];
+                        } else {
+                            // Copy latest logits from position M - 1 for next token sampling
+                            CUDA_CHECK(cudaMemcpyAsync(buf_logits_.f32(),
+                                                       buf_logits_batch_.f32() + (size_t)(M - 1) * cfg_.vocab_size,
+                                                       cfg_.vocab_size * sizeof(float),
+                                                       cudaMemcpyDeviceToDevice, main_stream_));
+                            CUDA_CHECK(cudaStreamSynchronize(main_stream_));
 
-                        next_token = sample_token(temperature, history, content_tokens_generated, in_think_block,
-                                                  top_k, top_p, min_p);
+                            next_token = sample_token(temperature, history, content_tokens_generated, in_think_block,
+                                                      top_k, top_p, min_p);
+                        }
 
                         position += M;
                         decode_step_idx_ += M;
@@ -6181,7 +6186,55 @@ private:
         CUDA_CHECK(cudaMemcpyAsync(buf_input_pos_batch_.i32(), h_target_batch_pos_, M * sizeof(int32_t), cudaMemcpyHostToDevice, main_stream_));
         CUDA_CHECK(cudaMemcpyAsync(buf_input_tokens_batch_.i32(), h_target_batch_tok_, M * sizeof(int32_t), cudaMemcpyHostToDevice, main_stream_));
 
-        forward_token_batch_deepseek_device_body(position, M);
+        if (M >= 2 && M <= 8 && batch_graph_captured_[M]) {
+            CUDA_CHECK(cudaGraphLaunch(batch_graph_exec_[M], main_stream_));
+        } else {
+            forward_token_batch_deepseek_device_body(position, M);
+        }
+    }
+
+    void init_batch_cuda_graphs_deepseek() {
+        if (!expert_loader_.all_resident(cfg_.num_hidden_layers)) return;
+        for (int M : {2, 3}) {
+            LOG_INFO("Warming up and capturing DeepSeek Batched Target CUDA Graph (M=%d)...", M);
+
+            std::vector<int32_t> dummy_toks(M, 0);
+            std::vector<int32_t> dummy_pos(M, 0);
+            CUDA_CHECK(cudaMemcpy(buf_input_tokens_batch_.i32(), dummy_toks.data(), M * sizeof(int32_t), cudaMemcpyHostToDevice));
+            CUDA_CHECK(cudaMemcpy(buf_input_pos_batch_.i32(), dummy_pos.data(), M * sizeof(int32_t), cudaMemcpyHostToDevice));
+
+            // Warmup
+            for (int i = 0; i < 3; i++) {
+                forward_token_batch_deepseek_device_body(0, M);
+            }
+            CUDA_CHECK(cudaStreamSynchronize(main_stream_));
+
+            cudaError_t cap_err = cudaStreamBeginCapture(main_stream_, cudaStreamCaptureModeGlobal);
+            if (cap_err != cudaSuccess) {
+                LOG_WARN("cudaStreamBeginCapture failed for DeepSeek M=%d: %s", M, cudaGetErrorString(cap_err));
+                batch_graph_captured_[M] = false;
+                continue;
+            }
+
+            forward_token_batch_deepseek_device_body(0, M);
+
+            cudaError_t end_err = cudaStreamEndCapture(main_stream_, &batch_graph_[M]);
+            if (end_err != cudaSuccess) {
+                LOG_WARN("cudaStreamEndCapture failed for DeepSeek M=%d: %s", M, cudaGetErrorString(end_err));
+                batch_graph_captured_[M] = false;
+                continue;
+            }
+
+            cudaError_t inst_err = cudaGraphInstantiate(&batch_graph_exec_[M], batch_graph_[M], nullptr, nullptr, 0);
+            if (inst_err != cudaSuccess) {
+                LOG_WARN("cudaGraphInstantiate failed for DeepSeek M=%d: %s", M, cudaGetErrorString(inst_err));
+                batch_graph_captured_[M] = false;
+                continue;
+            }
+
+            batch_graph_captured_[M] = true;
+            LOG_INFO("DeepSeek Batched Target CUDA Graph (M=%d) instantiated successfully!", M);
+        }
     }
 
     // ── Sample from logits ──────────────────────────────────────────────────
