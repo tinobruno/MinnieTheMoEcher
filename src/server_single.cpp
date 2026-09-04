@@ -2715,6 +2715,18 @@ public:
     GPUTensor buf_linear_b_batch_;     // [8, 48] BF16
     GPUTensor buf_logits_batch_;       // [8, vocab_size] F32
     GPUTensor buf_argmax_out_batch_;   // [8] I32
+    GPUTensor buf_down_batch_;         // [8, max_inter] BF16
+    GPUTensor buf_kv_batch_;           // [8, head_dim] BF16
+    GPUTensor buf_lora_batch_;         // [8, lora_dim] BF16
+    GPUTensor buf_scores_bf16_batch_;  // [8, n_routed_experts] BF16
+    GPUTensor buf_topk_idx_batch_;     // [8, top_k] I32
+    GPUTensor buf_topk_vals_batch_;    // [8, top_k] F32
+    GPUTensor buf_hc_state_batch_;     // [8, hc_mult, hidden_size] BF16
+    GPUTensor buf_hc_after_attn_batch_;// [8, hc_mult, hidden_size] BF16
+    GPUTensor buf_hc_pre_batch_;       // [8, hc_mult] F32
+    GPUTensor buf_hc_post_batch_;      // [8, hc_mult] F32
+    GPUTensor buf_hc_comb_batch_;      // [8, hc_mult*hc_mult] F32
+    GPUTensor buf_hc_mixes_batch_;     // [8, (2+hc)*hc] F32
 
     GPUTensor target_ssm_pool_;
     GPUTensor target_ssm_slots_[8];
@@ -3719,6 +3731,23 @@ public:
                         }
                         is_pld = true;
                     }
+                } else if (cfg_.architecture == ModelArch::DEEPSEEK_V4 && enable_pld_ && !history.empty()) {
+                    int max_cands = 2;
+                    if (!cfg_.compress_ratios.empty()) {
+                        int rem = (position + 1) % 4;
+                        if (rem == 0) max_cands = 0;
+                        else max_cands = std::min(2, 4 - rem);
+                    }
+                    if (max_cands > 0) {
+                        std::vector<int> pld_cands = PromptLookupDrafter::draft(history, 5, max_cands + 1, 2);
+                        if (!pld_cands.empty()) {
+                            int count = std::min((int)pld_cands.size(), max_cands);
+                            for (int i = 0; i < count; i++) {
+                                cand_tokens.push_back(pld_cands[i]);
+                            }
+                            is_pld = (cand_tokens.size() > 1);
+                        }
+                    }
                 }
 
                 // Priority 3: Legacy 2B Neural Drafter (fallback)
@@ -3728,7 +3757,98 @@ public:
                 }
 
                 int M = (int)cand_tokens.size();
-                if (cfg_.architecture == ModelArch::QWEN && M >= 2) {
+                if (cfg_.architecture == ModelArch::DEEPSEEK_V4 && M >= 2) {
+                    auto tv0 = std::chrono::steady_clock::now();
+                    forward_token_batch_deepseek(cand_tokens.data(), position, M);
+
+                    int num_verify = M - 1;
+                    argmax_f32_batch_cuda(buf_argmax_out_batch_.i32(), buf_logits_batch_.f32(), cfg_.vocab_size, num_verify, main_stream_);
+
+                    static int32_t* host_batch_preds_ds = nullptr;
+                    if (!host_batch_preds_ds) {
+                        CUDA_CHECK(cudaMallocHost(&host_batch_preds_ds, 16 * sizeof(int32_t)));
+                    }
+                    CUDA_CHECK(cudaMemcpyAsync(host_batch_preds_ds, buf_argmax_out_batch_.i32(), num_verify * sizeof(int32_t), cudaMemcpyDeviceToHost, main_stream_));
+                    CUDA_CHECK(cudaStreamSynchronize(main_stream_));
+                    auto tv1 = std::chrono::steady_clock::now();
+                    double ver_ms = std::chrono::duration<double, std::milli>(tv1 - tv0).count();
+                    total_verify_ms += ver_ms;
+                    if (spec_cycles < 5) {
+                        LOG_INFO("DEEPSEEK VERIFY: cycle=%d M=%d took %.2fms", spec_cycles, M, ver_ms);
+                    }
+
+                    int accepted = 0;
+                    int bonus_token = -1;
+
+                    for (int k = 0; k < num_verify; k++) {
+                        int pred_k = host_batch_preds_ds[k];
+                        int draft_cand = cand_tokens[k + 1];
+
+                        if (pred_k == draft_cand &&
+                            pred_k != cfg_.eos_token_id && (eos2_id < 0 || pred_k != eos2_id) &&
+                            (enable_thinking || (pred_k != think_start_id && pred_k != think_end_id))) {
+                            accepted++;
+                            if (!emit_token_cpu(draft_cand, t)) {
+                                finish_reason = "stop";
+                                break;
+                            }
+                        } else {
+                            bonus_token = pred_k;
+                            break;
+                        }
+                    }
+
+                    if (finish_reason == "stop") break;
+
+                    spec_cycles++;
+                    spec_drafted += num_verify;
+                    spec_accepted += accepted;
+
+                    if (accepted == num_verify) {
+                        // All draft tokens accepted!
+                        // Commit HC state from slot M - 1
+                        CUDA_CHECK(cudaMemcpyAsync(
+                            buf_hc_state_.bf16(),
+                            buf_hc_state_batch_.bf16() + (size_t)(M - 1) * (cfg_.hc_mult * cfg_.hidden_size),
+                            cfg_.hc_mult * cfg_.hidden_size * sizeof(__nv_bfloat16),
+                            cudaMemcpyDeviceToDevice, main_stream_));
+
+                        // Copy latest logits from position M - 1 for next token sampling
+                        CUDA_CHECK(cudaMemcpyAsync(buf_logits_.f32(),
+                                                   buf_logits_batch_.f32() + (size_t)(M - 1) * cfg_.vocab_size,
+                                                   cfg_.vocab_size * sizeof(float),
+                                                   cudaMemcpyDeviceToDevice, main_stream_));
+                        CUDA_CHECK(cudaStreamSynchronize(main_stream_));
+
+                        next_token = sample_token(temperature, history, content_tokens_generated, in_think_block,
+                                                  top_k, top_p, min_p);
+
+                        position += M;
+                        decode_step_idx_ += M;
+                        draft_streak = std::min(draft_streak + 2, 6);
+                    } else {
+                        // Mismatch at index 'accepted'
+                        // Commit HC state from accepted slot
+                        CUDA_CHECK(cudaMemcpyAsync(
+                            buf_hc_state_.bf16(),
+                            buf_hc_state_batch_.bf16() + (size_t)accepted * (cfg_.hc_mult * cfg_.hidden_size),
+                            cfg_.hc_mult * cfg_.hidden_size * sizeof(__nv_bfloat16),
+                            cudaMemcpyDeviceToDevice, main_stream_));
+
+                        // bonus_token becomes next_token for next cycle
+                        next_token = bonus_token;
+
+                        position += (accepted + 1);
+                        decode_step_idx_ += (accepted + 1);
+
+                        if (accepted == 0) {
+                            draft_streak = 0;
+                        } else {
+                            draft_streak = std::min(draft_streak + accepted, 6);
+                        }
+                    }
+                    continue;
+                } else if (cfg_.architecture == ModelArch::QWEN && M >= 2) {
                     auto tv0 = std::chrono::steady_clock::now();
                     forward_token_batch_qwen(cand_tokens.data(), position, M);
 
@@ -4440,6 +4560,22 @@ private:
         buf_linear_b_batch_.alloc(max_batch_m * 64 * sizeof(__nv_bfloat16));
         buf_logits_batch_.alloc((size_t)max_batch_m * cfg_.vocab_size * sizeof(float));
         buf_argmax_out_batch_.alloc(max_batch_m * sizeof(int32_t));
+        buf_down_batch_.alloc(max_batch_m * max_inter * sizeof(__nv_bfloat16));
+        buf_kv_batch_.alloc(max_batch_m * head_dim_val * sizeof(__nv_bfloat16));
+        buf_lora_batch_.alloc(max_batch_m * std::max({
+            (size_t)cfg_.q_lora_rank,
+            (size_t)cfg_.o_lora_rank * cfg_.o_groups,
+            (size_t)n_heads * head_dim_val
+        }) * sizeof(__nv_bfloat16));
+        buf_scores_bf16_batch_.alloc(max_batch_m * std::max(cfg_.n_routed_experts, 64) * sizeof(__nv_bfloat16));
+        buf_topk_idx_batch_.alloc(max_batch_m * std::max(cfg_.num_experts_per_tok, 64) * sizeof(int32_t));
+        buf_topk_vals_batch_.alloc(max_batch_m * std::max(cfg_.num_experts_per_tok, 64) * sizeof(float));
+        buf_hc_state_batch_.alloc((size_t)max_batch_m * hc * dim * sizeof(__nv_bfloat16));
+        buf_hc_after_attn_batch_.alloc((size_t)max_batch_m * hc * dim * sizeof(__nv_bfloat16));
+        buf_hc_pre_batch_.alloc(max_batch_m * hc * sizeof(float));
+        buf_hc_post_batch_.alloc(max_batch_m * hc * sizeof(float));
+        buf_hc_comb_batch_.alloc(max_batch_m * hc * hc * sizeof(float));
+        buf_hc_mixes_batch_.alloc(max_batch_m * (2 + hc) * hc * sizeof(float));
 
         // Compressor working buffers
         // Max projection output size: coff=2 for ratio=4, head_dim=512 -> 1024
@@ -5120,6 +5256,55 @@ private:
                             dim, hc, main_stream_);
     }
 
+    // ── Batched HC operations for Multi-Token Speculative Verification ──────
+
+    void hc_pre_norm_batch(int m, const __nv_bfloat16* in_hc, GPUTensor& hc_fn, GPUTensor& hc_scale, GPUTensor& hc_base,
+                           const __nv_bfloat16* norm_weight) {
+        int dim = cfg_.hidden_size;
+        int hc = cfg_.hc_mult;
+        int mix_size = (2 + hc) * hc;
+        int hc_dim = hc * dim;
+
+        gemv_hc_pre_norm_cuda(buf_hc_mixes_batch_.f32() + (size_t)m * mix_size, in_hc, hc_fn.f32(),
+                              mix_size, hc_dim, cfg_.hc_eps, main_stream_);
+
+        hc_split_sinkhorn_cuda(
+            buf_hc_pre_batch_.f32() + (size_t)m * hc,
+            buf_hc_post_batch_.f32() + (size_t)m * hc,
+            buf_hc_comb_batch_.f32() + (size_t)m * (hc * hc),
+            buf_hc_mixes_batch_.f32() + (size_t)m * mix_size,
+            hc_scale.f32(), hc_base.f32(),
+            hc, cfg_.hc_sinkhorn_iters, cfg_.hc_eps, main_stream_);
+
+        hc_pre_weighted_add_norm_cuda(buf_hidden_batch_.bf16() + (size_t)m * dim, in_hc,
+                                      buf_hc_pre_batch_.f32() + (size_t)m * hc, norm_weight,
+                                      dim, hc, cfg_.rms_norm_eps, main_stream_);
+    }
+
+    void hc_post_batch(int m, __nv_bfloat16* out_hc, const __nv_bfloat16* in_hc) {
+        int dim = cfg_.hidden_size;
+        int hc = cfg_.hc_mult;
+
+        hc_post_update_cuda(out_hc, buf_hidden_batch_.bf16() + (size_t)m * dim, in_hc,
+                            buf_hc_post_batch_.f32() + (size_t)m * hc,
+                            buf_hc_comb_batch_.f32() + (size_t)m * (hc * hc),
+                            dim, hc, main_stream_);
+    }
+
+    void hc_head_reduce_batch(int m, const __nv_bfloat16* in_hc) {
+        int dim = cfg_.hidden_size;
+        int hc = cfg_.hc_mult;
+        int hc_dim = hc * dim;
+
+        gemv_hc_pre_norm_cuda(buf_hc_mixes_batch_.f32() + (size_t)m * hc, in_hc,
+                              hc_head_fn_.f32(), hc, hc_dim, cfg_.rms_norm_eps, main_stream_);
+
+        hc_head_reduce_cuda(buf_hidden_batch_.bf16() + (size_t)m * dim, in_hc,
+                            buf_hc_mixes_batch_.f32() + (size_t)m * hc,
+                            hc_head_scale_.f32(), hc_head_base_.f32(),
+                            dim, hc, main_stream_);
+    }
+
     // ── Attention forward ───────────────────────────────────────────────────
 
     void forward_attention(int layer_id, int position) {
@@ -5741,6 +5926,262 @@ private:
             gemv_bf16_cuda(buf_logits_.f32(), head_weight_.bf16(), buf_hidden_.bf16(), vocab, dim, main_stream_);
         }
         argmax_f32_cuda(buf_argmax_out_.i32(), buf_logits_.f32(), vocab, main_stream_);
+    }
+
+    void compute_logits_deepseek_batch(int M) {
+        int dim = cfg_.hidden_size;
+        int vocab = cfg_.vocab_size;
+
+        for (int m = 0; m < M; m++) {
+            float* dst_logits = buf_logits_batch_.f32() + (size_t)m * vocab;
+            const __nv_bfloat16* src_hid = buf_hidden_batch_.bf16() + (size_t)m * dim;
+            if (head_weight_.dtype == "int4") {
+                gemv_int4_f32_cuda(dst_logits, src_hid,
+                                   (const uint8_t*)head_weight_.data, head_weight_scale_.bf16(),
+                                   vocab, dim, main_stream_);
+            } else {
+                gemv_bf16_cuda(dst_logits, head_weight_.bf16(), src_hid, vocab, dim, main_stream_);
+            }
+        }
+    }
+
+    void forward_layer_deepseek_batch(int layer_id, int position, int M) {
+        auto& lw = layers_[layer_id];
+        int dim = cfg_.hidden_size;
+        int n_heads = cfg_.num_attention_heads;
+        int head_dim_val = cfg_.head_dim;
+        int rope_dim = cfg_.qk_rope_head_dim;
+        int q_lora = cfg_.q_lora_rank;
+        int o_lora = cfg_.o_lora_rank;
+        int o_groups = cfg_.o_groups;
+        int window = cfg_.sliding_window;
+        int hc = cfg_.hc_mult;
+        int top_k = cfg_.num_experts_per_tok;
+        int moe_inter = cfg_.moe_intermediate_size;
+        int n_experts = cfg_.n_routed_experts;
+        size_t max_inter = std::max({
+            (size_t)(top_k + 1) * moe_inter,
+            (size_t)cfg_.intermediate_size,
+            (size_t)17408
+        });
+
+        bool is_compressed = (layer_id < (int)cfg_.compress_ratios.size() &&
+                             cfg_.compress_ratios[layer_id] > 0);
+        float* layer_rope_freqs = is_compressed ? rope_freqs_compressed_.f32()
+                                                : rope_freqs_.f32();
+
+        // ── 1. HC Pre-Norm for Attention: [M, hc, dim] -> [M, dim] ───────────
+        for (int m = 0; m < M; m++) {
+            hc_pre_norm_batch(m, buf_hc_state_batch_.bf16() + (size_t)m * (hc * dim),
+                              lw.hc_attn_fn, lw.hc_attn_scale, lw.hc_attn_base,
+                              lw.attn_norm_w.bf16());
+        }
+
+        // ── 2. KV Projection & Store into Cache for all M tokens ─────────────
+        for (int m = 0; m < M; m++) {
+            __nv_bfloat16* kv_m = buf_kv_batch_.bf16() + (size_t)m * head_dim_val;
+            const __nv_bfloat16* hid_m = buf_hidden_batch_.bf16() + (size_t)m * dim;
+            if (lw.wkv_w.dtype == "int4") {
+                gemv_int4_cuda(kv_m, hid_m, (const uint8_t*)lw.wkv_w.data, lw.wkv_s.bf16(), head_dim_val, dim, main_stream_);
+            } else {
+                gemm_fp8_dequant(kv_m, 1, head_dim_val, dim, hid_m, lw.wkv_w.u8(), lw.wkv_s.u8(), 128, main_stream_);
+            }
+            rms_norm_cuda(kv_m, kv_m, lw.kv_norm_w.bf16(), head_dim_val, cfg_.rms_norm_eps, main_stream_);
+        }
+        rope_device_pos_batch_cuda(buf_kv_batch_.bf16(), head_dim_val, rope_dim,
+                                   buf_input_pos_batch_.i32(), layer_rope_freqs, false, M, main_stream_);
+        store_kv_device_pos_batch_cuda(lw.kv_cache.bf16(), buf_kv_batch_.bf16(),
+                                       buf_input_pos_batch_.i32(), window, head_dim_val, M, main_stream_);
+
+        // ── 3. Q Projection for all M tokens ─────────────────────────────────
+        for (int m = 0; m < M; m++) {
+            const __nv_bfloat16* hid_m = buf_hidden_batch_.bf16() + (size_t)m * dim;
+            __nv_bfloat16* lora_m = buf_lora_batch_.bf16() + (size_t)m * q_lora;
+            if (lw.wq_a_w.dtype == "int4") {
+                gemv_int4_cuda(lora_m, hid_m, (const uint8_t*)lw.wq_a_w.data, lw.wq_a_s.bf16(), q_lora, dim, main_stream_);
+            } else {
+                gemm_fp8_dequant(lora_m, 1, q_lora, dim, hid_m, lw.wq_a_w.u8(), lw.wq_a_s.u8(), 128, main_stream_);
+            }
+            rms_norm_cuda(lora_m, lora_m, lw.q_norm_w.bf16(), q_lora, cfg_.rms_norm_eps, main_stream_);
+
+            __nv_bfloat16* q_m = buf_q_batch_.bf16() + (size_t)m * (n_heads * head_dim_val);
+            if (lw.wq_b_w.dtype == "int4") {
+                gemv_int4_cuda(q_m, lora_m, (const uint8_t*)lw.wq_b_w.data, lw.wq_b_s.bf16(), n_heads * head_dim_val, q_lora, main_stream_);
+            } else {
+                gemm_fp8_dequant(q_m, 1, n_heads * head_dim_val, q_lora, lora_m, lw.wq_b_w.u8(), lw.wq_b_s.u8(), 128, main_stream_);
+            }
+        }
+
+        // ── 4. Batched Flash-MLA Attention (M * 64 heads in single launch) ──
+        float scale = 1.0f / sqrtf((float)head_dim_val);
+        int max_combined = window + cfg_.max_compressed_entries;
+
+        mla_attention_fused_batch_cuda(
+            buf_q_batch_.bf16(), lw.kv_cache.bf16(), lw.comp_kv_cache.bf16(), lw.attn_sink.f32(),
+            buf_attn_out_batch_.bf16(), buf_input_pos_batch_.i32(), lw.d_comp_kv_count.i32(),
+            layer_rope_freqs, max_combined, head_dim_val, rope_dim, scale,
+            cfg_.rms_norm_eps, nullptr, window, M, main_stream_
+        );
+
+        // ── 5. Output projection (wo_a and wo_b) for all M tokens ────────────
+        int heads_per_group = n_heads / o_groups;  // 64 / 8 = 8
+        int hpg_dim = heads_per_group * head_dim_val;  // 8 * 512 = 4096
+
+        for (int m = 0; m < M; m++) {
+            const __nv_bfloat16* a_m = buf_attn_out_batch_.bf16() + (size_t)m * (n_heads * head_dim_val);
+            __nv_bfloat16* lora_m = buf_lora_batch_.bf16() + (size_t)m * (o_groups * o_lora);
+            __nv_bfloat16* hid_m = buf_hidden_batch_.bf16() + (size_t)m * dim;
+
+            if (lw.wo_a_w.dtype == "int4") {
+                for (int g = 0; g < o_groups; g++) {
+                    const uint8_t* w_g = (const uint8_t*)lw.wo_a_w.data + (size_t)g * o_lora * (hpg_dim / 2);
+                    const __nv_bfloat16* s_g = lw.wo_a_s.bf16() + (size_t)g * o_lora * (hpg_dim / 32);
+                    const __nv_bfloat16* a_g = a_m + (size_t)g * hpg_dim;
+                    __nv_bfloat16* out_g = lora_m + (size_t)g * o_lora;
+                    gemv_int4_cuda(out_g, a_g, w_g, s_g, o_lora, hpg_dim, main_stream_);
+                }
+            } else {
+                gemv_fp8_grouped_cuda(lora_m, a_m, lw.wo_a_w.u8(), lw.wo_a_s.u8(),
+                                      o_lora, hpg_dim, o_groups, 128, main_stream_);
+            }
+
+            if (lw.wo_b_w.dtype == "int4") {
+                gemv_int4_cuda(hid_m, lora_m, (const uint8_t*)lw.wo_b_w.data, lw.wo_b_s.bf16(), dim, o_groups * o_lora, main_stream_);
+            } else {
+                gemm_fp8_dequant(hid_m, 1, dim, o_groups * o_lora, lora_m, lw.wo_b_w.u8(), lw.wo_b_s.u8(), 128, main_stream_);
+            }
+        }
+
+        // ── 6. HC Post for Attention ─────────────────────────────────────────
+        for (int m = 0; m < M; m++) {
+            hc_post_batch(m, buf_hc_after_attn_batch_.bf16() + (size_t)m * (hc * dim),
+                          buf_hc_state_batch_.bf16() + (size_t)m * (hc * dim));
+        }
+
+        // ── 7. HC Pre-Norm for FFN ───────────────────────────────────────────
+        for (int m = 0; m < M; m++) {
+            hc_pre_norm_batch(m, buf_hc_after_attn_batch_.bf16() + (size_t)m * (hc * dim),
+                              lw.hc_ffn_fn, lw.hc_ffn_scale, lw.hc_ffn_base,
+                              lw.ffn_norm_w.bf16());
+        }
+
+        // ── 8. MoE FFN for all M tokens ──────────────────────────────────────
+        const void* const* flat_ptrs = expert_loader_.all_resident(cfg_.num_hidden_layers) ? expert_loader_.flat_vram_ptrs_gpu() : nullptr;
+
+        // Routing:
+        if (layer_id < cfg_.n_hash_layers) {
+            moe_route_hash_device_id_batch_cuda(
+                buf_topk_idx_batch_.i32(), buf_topk_vals_batch_.f32(),
+                lw.tid2eid.i64(), buf_input_tokens_batch_.i32(), top_k,
+                cfg_.routed_scaling_factor, M, main_stream_);
+        } else {
+            for (int m = 0; m < M; m++) {
+                gemm_bf16(buf_scores_bf16_batch_.bf16() + (size_t)m * n_experts, 1, n_experts, dim,
+                          buf_hidden_batch_.bf16() + (size_t)m * dim, lw.gate_w.bf16());
+            }
+            moe_route_top6_from_bf16_batch_cuda(
+                buf_topk_idx_batch_.i32(), buf_topk_vals_batch_.f32(),
+                buf_scores_bf16_batch_.bf16(), lw.gate_bias.f32(),
+                n_experts, top_k, cfg_.routed_scaling_factor, M, main_stream_);
+        }
+
+        auto& w1_info = expert_parts_["w1.weight"];
+        auto& w3_info = expert_parts_["w3.weight"];
+        auto& w2_info = expert_parts_["w2.weight"];
+
+        for (int m = 0; m < M; m++) {
+            __nv_bfloat16* shared_gate = buf_gate_batch_.bf16() + (size_t)m * max_inter + top_k * moe_inter;
+            __nv_bfloat16* shared_up   = buf_up_batch_.bf16()   + (size_t)m * max_inter + top_k * moe_inter;
+            __nv_bfloat16* shared_down = buf_down_batch_.bf16() + (size_t)m * max_inter + top_k * dim;
+            __nv_bfloat16* hid_m       = buf_hidden_batch_.bf16() + (size_t)m * dim;
+
+            if (lw.shared_w1_w.dtype == "int4") {
+                gemv_int4_cuda(shared_gate, hid_m, (const uint8_t*)lw.shared_w1_w.data, lw.shared_w1_s.bf16(), moe_inter, dim, main_stream_);
+                gemv_int4_cuda(shared_up, hid_m, (const uint8_t*)lw.shared_w3_w.data, lw.shared_w3_s.bf16(), moe_inter, dim, main_stream_);
+                silu_mul_cuda(shared_gate, shared_gate, shared_up, moe_inter, cfg_.swiglu_limit, main_stream_);
+                gemv_int4_cuda(shared_down, shared_gate, (const uint8_t*)lw.shared_w2_w.data, lw.shared_w2_s.bf16(), dim, moe_inter, main_stream_);
+            } else {
+                gemm_fp8_dequant(shared_gate, 1, moe_inter, dim, hid_m, lw.shared_w1_w.u8(), lw.shared_w1_s.u8(), 128, main_stream_);
+                gemm_fp8_dequant(shared_up, 1, moe_inter, dim, hid_m, lw.shared_w3_w.u8(), lw.shared_w3_s.u8(), 128, main_stream_);
+                silu_mul_cuda(shared_gate, shared_gate, shared_up, moe_inter, cfg_.swiglu_limit, main_stream_);
+                gemm_fp8_dequant(shared_down, 1, dim, moe_inter, shared_gate, lw.shared_w2_w.u8(), lw.shared_w2_s.u8(), 128, main_stream_);
+            }
+
+            if (expert_loader_.all_resident(cfg_.num_hidden_layers) && cfg_.expert_dtype == "iq2_xxs") {
+                gemv_iq2_xxs_moe_swiglu_fused_cuda(
+                    buf_gate_batch_.bf16() + (size_t)m * max_inter,
+                    hid_m,
+                    nullptr,
+                    w1_info.offset_in_block, w3_info.offset_in_block,
+                    moe_inter, dim, cfg_.swiglu_limit,
+                    buf_topk_idx_batch_.i32() + (size_t)m * top_k, flat_ptrs, layer_id, n_experts, main_stream_);
+
+                gemv_q2_k_moe_cuda(
+                    buf_down_batch_.bf16() + (size_t)m * max_inter,
+                    buf_gate_batch_.bf16() + (size_t)m * max_inter,
+                    nullptr,
+                    w2_info.offset_in_block,
+                    dim, moe_inter,
+                    buf_topk_idx_batch_.i32() + (size_t)m * top_k, flat_ptrs, layer_id, n_experts, main_stream_);
+            }
+
+            fused_moe_accum_dynamic_cuda(
+                hid_m,
+                buf_down_batch_.bf16() + (size_t)m * max_inter,
+                buf_topk_vals_batch_.f32() + (size_t)m * top_k,
+                shared_down, dim, main_stream_);
+        }
+
+        // ── 9. HC Post for FFN ───────────────────────────────────────────────
+        for (int m = 0; m < M; m++) {
+            hc_post_batch(m, buf_hc_state_batch_.bf16() + (size_t)m * (hc * dim),
+                          buf_hc_after_attn_batch_.bf16() + (size_t)m * (hc * dim));
+        }
+    }
+
+    void forward_token_batch_deepseek_device_body(int position, int M) {
+        int dim = cfg_.hidden_size;
+        int hc = cfg_.hc_mult;
+
+        // 1. Embedding lookup and broadcast to HC copies for each token m in batch:
+        embedding_broadcast_device_id_batch_cuda(
+            buf_hidden_batch_.bf16(), buf_hc_state_batch_.bf16(),
+            embed_weight_.bf16(), buf_input_tokens_batch_.i32(), dim, hc, M, main_stream_);
+
+        // 2. Process each layer
+        for (int layer = 0; layer < cfg_.num_hidden_layers; layer++) {
+            forward_layer_deepseek_batch(layer, position, M);
+        }
+
+        // 3. Head HC reduction for each token m:
+        for (int m = 0; m < M; m++) {
+            hc_head_reduce_batch(m, buf_hc_state_batch_.bf16() + (size_t)m * (hc * dim));
+        }
+
+        // 4. Final norm for each token m:
+        for (int m = 0; m < M; m++) {
+            rms_norm_cuda(buf_hidden_batch_.bf16() + (size_t)m * dim,
+                          buf_hidden_batch_.bf16() + (size_t)m * dim,
+                          norm_weight_.bf16(), dim, cfg_.rms_norm_eps, main_stream_);
+        }
+
+        // 5. Compute logits for each token m:
+        compute_logits_deepseek_batch(M);
+    }
+
+    void forward_token_batch_deepseek(const int* tokens_host, int position, int M) {
+        if (!h_target_batch_tok_) {
+            CUDA_CHECK(cudaMallocHost(&h_target_batch_tok_, 16 * sizeof(int32_t)));
+            CUDA_CHECK(cudaMallocHost(&h_target_batch_pos_, 16 * sizeof(int32_t)));
+        }
+        for (int m = 0; m < M; m++) {
+            h_target_batch_pos_[m] = position + m;
+            h_target_batch_tok_[m] = tokens_host[m];
+        }
+        CUDA_CHECK(cudaMemcpyAsync(buf_input_pos_batch_.i32(), h_target_batch_pos_, M * sizeof(int32_t), cudaMemcpyHostToDevice, main_stream_));
+        CUDA_CHECK(cudaMemcpyAsync(buf_input_tokens_batch_.i32(), h_target_batch_tok_, M * sizeof(int32_t), cudaMemcpyHostToDevice, main_stream_));
+
+        forward_token_batch_deepseek_device_body(position, M);
     }
 
     // ── Sample from logits ──────────────────────────────────────────────────
@@ -6884,7 +7325,7 @@ int main(int argc, char** argv) {
     // Open log file
     g_log_file.open(log_path, std::ios::app);
     LOG_INFO("=== moecher starting ===");
-    LOG_INFO("=== v2.05 ===");
+    LOG_INFO("=== v2.07 ===");
     LOG_INFO("Default thinking token budget: %d", default_thinking_budget);
 
     MoecherEngine engine;

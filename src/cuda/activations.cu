@@ -3448,6 +3448,81 @@ void moe_route_top6_from_bf16_cuda(
         topk_ids, topk_weights, scores_bf16, gate_bias, n_experts, top_k, routed_scaling_factor);
 }
 
+__global__ void moe_route_top6_from_bf16_batch_kernel(
+    int32_t* __restrict__ topk_ids,
+    float* __restrict__ topk_weights,
+    const __nv_bfloat16* __restrict__ scores_bf16,
+    const float* __restrict__ gate_bias,
+    int n_experts, int top_k, float routed_scaling_factor,
+    int M)
+{
+    int m = blockIdx.x;
+    if (m >= M) return;
+
+    __shared__ float s_probs[256];
+    __shared__ float s_scores[256];
+    __shared__ int   s_indices[256];
+
+    const __nv_bfloat16* token_scores = scores_bf16 + (size_t)m * n_experts;
+    int32_t* token_topk_ids = topk_ids + m * top_k;
+    float* token_topk_weights = topk_weights + m * top_k;
+
+    int tid = threadIdx.x;
+    if (tid < n_experts) {
+        float raw = __bfloat162float(token_scores[tid]);
+        float sp = (raw > 20.0f) ? raw : ((raw < -20.0f) ? expf(raw) : log1pf(expf(raw)));
+        float prob = sqrtf(sp);
+        s_probs[tid] = prob;
+        s_scores[tid] = prob + (gate_bias ? gate_bias[tid] : 0.0f);
+        s_indices[tid] = tid;
+    } else {
+        s_probs[tid] = 0.0f;
+        s_scores[tid] = -1e38f;
+        s_indices[tid] = -1;
+    }
+    __syncthreads();
+
+    if (tid == 0) {
+        for (int i = 0; i < top_k; i++) {
+            int max_idx = i;
+            float max_val = s_scores[i];
+            for (int j = i + 1; j < n_experts; j++) {
+                if (s_scores[j] > max_val) {
+                    max_val = s_scores[j];
+                    max_idx = j;
+                }
+            }
+            float tmp_s = s_scores[i]; s_scores[i] = s_scores[max_idx]; s_scores[max_idx] = tmp_s;
+            float tmp_p = s_probs[i];  s_probs[i]  = s_probs[max_idx];  s_probs[max_idx]  = tmp_p;
+            int   tmp_id = s_indices[i]; s_indices[i] = s_indices[max_idx]; s_indices[max_idx] = tmp_id;
+        }
+
+        float weight_sum = 0.0f;
+        for (int k = 0; k < top_k; k++) {
+            weight_sum += s_probs[k];
+        }
+        if (weight_sum < 6.103515625e-5f) weight_sum = 6.103515625e-5f;
+
+        for (int k = 0; k < top_k; k++) {
+            token_topk_ids[k] = s_indices[k];
+            token_topk_weights[k] = (s_probs[k] / weight_sum) * routed_scaling_factor;
+        }
+    }
+}
+
+void moe_route_top6_from_bf16_batch_cuda(
+    int32_t* topk_ids,
+    float* topk_weights,
+    const __nv_bfloat16* scores_bf16,
+    const float* gate_bias,
+    int n_experts, int top_k, float routed_scaling_factor,
+    int M,
+    cudaStream_t stream)
+{
+    moe_route_top6_from_bf16_batch_kernel<<<M, 256, 0, stream>>>(
+        topk_ids, topk_weights, scores_bf16, gate_bias, n_experts, top_k, routed_scaling_factor, M);
+}
+
 __global__ void moe_route_top6_kernel(
     int32_t* __restrict__ topk_ids,
     float* __restrict__ topk_weights,
@@ -3563,6 +3638,41 @@ void moe_route_hash_device_id_cuda(
     moe_route_hash_device_id_kernel<<<1, 32, 0, stream>>>(
         topk_ids, topk_weights, tid2eid_table,
         d_token_id, top_k, routed_scaling_factor);
+}
+
+__global__ void moe_route_hash_device_id_batch_kernel(
+    int32_t* __restrict__ topk_ids,
+    float* __restrict__ topk_weights,
+    const int64_t* __restrict__ tid2eid_table,
+    const int32_t* __restrict__ d_token_ids, int top_k, float routed_scaling_factor,
+    int M)
+{
+    int m = blockIdx.x;
+    if (m >= M) return;
+
+    int tid = threadIdx.x;
+    if (tid == 0) {
+        int token_id = d_token_ids[m];
+        const int64_t* eid_ptr = tid2eid_table ? (tid2eid_table + (size_t)token_id * top_k) : nullptr;
+        float w = routed_scaling_factor / (float)top_k;
+        for (int k = 0; k < top_k; k++) {
+            topk_ids[m * top_k + k] = eid_ptr ? (int32_t)eid_ptr[k] : -1;
+            topk_weights[m * top_k + k] = w;
+        }
+    }
+}
+
+void moe_route_hash_device_id_batch_cuda(
+    int32_t* topk_ids,
+    float* topk_weights,
+    const int64_t* tid2eid_table,
+    const int32_t* d_token_ids, int top_k, float routed_scaling_factor,
+    int M,
+    cudaStream_t stream)
+{
+    moe_route_hash_device_id_batch_kernel<<<M, 32, 0, stream>>>(
+        topk_ids, topk_weights, tid2eid_table,
+        d_token_ids, top_k, routed_scaling_factor, M);
 }
 
 // ── Populate Active Expert Pointers Kernel ────────────────────────────────────
@@ -3926,6 +4036,38 @@ void embedding_broadcast_device_id_cuda(
         hidden, hc_state, table, d_token_id, dim, hc);
 }
 
+__global__ void embedding_broadcast_device_id_batch_kernel(
+    __nv_bfloat16* __restrict__ hidden,
+    __nv_bfloat16* __restrict__ hc_state,
+    const __nv_bfloat16* __restrict__ table,
+    const int32_t* __restrict__ d_token_ids, int dim, int hc, int M)
+{
+    int m = blockIdx.y;
+    if (m >= M) return;
+
+    int d = threadIdx.x + blockIdx.x * blockDim.x;
+    if (d >= dim) return;
+
+    int token_id = d_token_ids[m];
+    __nv_bfloat16 val = table[(size_t)token_id * dim + d];
+    hidden[(size_t)m * dim + d] = val;
+    for (int h = 0; h < hc; h++) {
+        hc_state[(size_t)m * (hc * dim) + (size_t)h * dim + d] = val;
+    }
+}
+
+void embedding_broadcast_device_id_batch_cuda(
+    __nv_bfloat16* hidden, __nv_bfloat16* hc_state,
+    const __nv_bfloat16* table, const int32_t* d_token_ids, int dim, int hc, int M,
+    cudaStream_t stream)
+{
+    int threads = 256;
+    int blocks_x = (dim + threads - 1) / threads;
+    dim3 blocks(blocks_x, M);
+    embedding_broadcast_device_id_batch_kernel<<<blocks, threads, 0, stream>>>(
+        hidden, hc_state, table, d_token_ids, dim, hc, M);
+}
+
 __global__ void rope_device_pos_kernel(
     __nv_bfloat16* __restrict__ x,
     int n_vectors, int head_dim, int rope_dim,
@@ -3967,6 +4109,47 @@ void rope_device_pos_cuda(
         x, n_vectors, head_dim, rope_dim, d_position, freq_table, inverse);
 }
 
+__global__ void rope_device_pos_batch_kernel(
+    __nv_bfloat16* __restrict__ x,
+    int head_dim, int rope_dim,
+    const int32_t* __restrict__ d_positions,
+    const float* __restrict__ freq_table,
+    bool inverse, int M)
+{
+    int m = blockIdx.x;
+    int pair_id = threadIdx.x;
+
+    if (m >= M || pair_id >= rope_dim / 2) return;
+
+    int position = d_positions[m];
+    int half_rope = rope_dim / 2;
+    int base_idx = m * head_dim + (head_dim - rope_dim) + 2 * pair_id;
+
+    float x0 = bf16_to_float(x[base_idx]);
+    float x1 = bf16_to_float(x[base_idx + 1]);
+
+    float cos_val = freq_table[position * half_rope * 2 + pair_id * 2];
+    float sin_val = freq_table[position * half_rope * 2 + pair_id * 2 + 1];
+
+    if (inverse) sin_val = -sin_val;
+
+    float y0 = x0 * cos_val - x1 * sin_val;
+    float y1 = x0 * sin_val + x1 * cos_val;
+
+    x[base_idx]     = float_to_bf16(y0);
+    x[base_idx + 1] = float_to_bf16(y1);
+}
+
+void rope_device_pos_batch_cuda(
+    __nv_bfloat16* x, int head_dim, int rope_dim,
+    const int32_t* d_positions, const float* freq_table, bool inverse, int M,
+    cudaStream_t stream)
+{
+    int pairs = rope_dim / 2;
+    rope_device_pos_batch_kernel<<<M, pairs, 0, stream>>>(
+        x, head_dim, rope_dim, d_positions, freq_table, inverse, M);
+}
+
 __global__ void store_kv_device_pos_kernel(
     __nv_bfloat16* __restrict__ kv_cache,
     const __nv_bfloat16* __restrict__ kv_val,
@@ -3990,6 +4173,34 @@ void store_kv_device_pos_cuda(
     int blocks = (head_dim + threads - 1) / threads;
     store_kv_device_pos_kernel<<<blocks, threads, 0, stream>>>(
         kv_cache, kv_val, d_position, window, head_dim);
+}
+
+__global__ void store_kv_device_pos_batch_kernel(
+    __nv_bfloat16* __restrict__ kv_cache,
+    const __nv_bfloat16* __restrict__ kv_vals,
+    const int32_t* __restrict__ d_positions,
+    int window, int head_dim, int M)
+{
+    int m = blockIdx.y;
+    if (m >= M) return;
+    int d = threadIdx.x + blockIdx.x * blockDim.x;
+    if (d >= head_dim) return;
+
+    int position = d_positions[m];
+    int cache_pos = position % window;
+    kv_cache[(size_t)cache_pos * head_dim + d] = kv_vals[(size_t)m * head_dim + d];
+}
+
+void store_kv_device_pos_batch_cuda(
+    __nv_bfloat16* kv_cache, const __nv_bfloat16* kv_vals,
+    const int32_t* d_positions, int window, int head_dim, int M,
+    cudaStream_t stream)
+{
+    int threads = 256;
+    int blocks_x = (head_dim + threads - 1) / threads;
+    dim3 blocks(blocks_x, M);
+    store_kv_device_pos_batch_kernel<<<blocks, threads, 0, stream>>>(
+        kv_cache, kv_vals, d_positions, window, head_dim, M);
 }
 
 // ════════════════════════════════════════════════════════════════════════════════
@@ -4262,6 +4473,269 @@ void mla_attention_fused_cuda(
         d_position, d_comp_count, freq_table,
         max_cache_len, head_dim, rope_dim, scale, q_norm_eps,
         comp_mask, window);
+}
+
+__global__ void mla_attention_fused_batch_kernel(
+    const __nv_bfloat16* __restrict__ raw_q,
+    const __nv_bfloat16* __restrict__ raw_kv,
+    const __nv_bfloat16* __restrict__ comp_kv,
+    const float* __restrict__ attn_sink,
+    __nv_bfloat16* __restrict__ out,
+    const int32_t* __restrict__ d_positions,
+    const int32_t* __restrict__ d_comp_count,
+    const float* __restrict__ freq_table,
+    int max_cache_len,
+    int head_dim,
+    int rope_dim,
+    float scale,
+    float q_norm_eps,
+    const uint8_t* __restrict__ comp_mask,
+    int window,
+    int M)
+{
+    int block_id = blockIdx.x;
+    int m = block_id / 64;
+    int h = block_id % 64;
+    if (m >= M) return;
+
+    int tid = threadIdx.x;
+    int n_threads = blockDim.x;
+
+    extern __shared__ float s_mem[];
+    float* scores = s_mem;
+
+    __shared__ float s_q[512];
+    __shared__ float s_out[512];
+    __shared__ float s_red[32];
+
+    // ── Step 1: Load raw Q & compute unweighted RMSNorm in shared memory ──────
+    float local_sum_sq = 0.0f;
+    for (int d = tid; d < head_dim; d += n_threads) {
+        float val = bf16_to_float(raw_q[(m * 64 + h) * head_dim + d]);
+        s_q[d] = val;
+        local_sum_sq += val * val;
+    }
+
+    // Warp-level sum reduction for RMSNorm
+    float warp_sum_sq = local_sum_sq;
+    #pragma unroll
+    for (int offset = 16; offset > 0; offset /= 2) {
+        warp_sum_sq += __shfl_down_sync(0xffffffff, warp_sum_sq, offset);
+    }
+    int lane = tid & 31;
+    int warp = tid >> 5;
+    if (lane == 0) s_red[warp] = warp_sum_sq;
+    __syncthreads();
+
+    float block_sum_sq = (tid < (n_threads >> 5)) ? s_red[tid] : 0.0f;
+    #pragma unroll
+    for (int offset = 16; offset > 0; offset /= 2) {
+        block_sum_sq += __shfl_down_sync(0xffffffff, block_sum_sq, offset);
+    }
+    if (tid == 0) s_red[0] = rsqrtf(block_sum_sq / (float)head_dim + q_norm_eps);
+    __syncthreads();
+
+    float rsqrt_val = s_red[0];
+    for (int d = tid; d < head_dim; d += n_threads) {
+        s_q[d] *= rsqrt_val;
+    }
+    __syncthreads();
+
+    // ── Step 2: Apply forward RoPE rotation directly in s_q ───────────────────
+    int pos = (d_positions != nullptr) ? d_positions[m] : 0;
+    int half_rope = rope_dim / 2;
+    if (tid < half_rope) {
+        int pair_id = tid;
+        int base_idx = (head_dim - rope_dim) + 2 * pair_id;
+        float x0 = s_q[base_idx];
+        float x1 = s_q[base_idx + 1];
+
+        float cos_val = freq_table[pos * half_rope * 2 + pair_id * 2];
+        float sin_val = freq_table[pos * half_rope * 2 + pair_id * 2 + 1];
+
+        s_q[base_idx]     = x0 * cos_val - x1 * sin_val;
+        s_q[base_idx + 1] = x0 * sin_val + x1 * cos_val;
+    }
+    __syncthreads();
+
+    // ── Step 3: Direct Dual-Cache Attention Scores (Q @ KV.T) ─────────────────
+    int n_raw = (pos + 1 < window) ? (pos + 1) : window;
+    int n_comp = (pos + 1 > window && d_comp_count != nullptr && comp_kv != nullptr) ? *d_comp_count : 0;
+    int cache_len = n_raw + n_comp;
+    if (cache_len > max_cache_len) cache_len = max_cache_len;
+    if (cache_len < 1) cache_len = 1;
+
+    int raw_start = (pos + 1 > window) ? ((pos + 1) % window) : 0;
+
+    for (int t = tid; t < cache_len; t += n_threads) {
+        const __nv_bfloat16* kv_t = nullptr;
+        if (t < n_raw) {
+            int raw_slot = (raw_start + t) % window;
+            kv_t = raw_kv + (size_t)raw_slot * head_dim;
+        } else {
+            int comp_slot = t - n_raw;
+            if (comp_mask != nullptr && comp_mask[comp_slot] == 0) {
+                scores[t] = -1e38f;
+                continue;
+            }
+            kv_t = comp_kv + (size_t)comp_slot * head_dim;
+        }
+        float dot = 0.0f;
+        const uint4* kv_u4 = reinterpret_cast<const uint4*>(kv_t);
+        #pragma unroll 4
+        for (int chunk = 0; chunk < 64; chunk++) {
+            uint4 u = kv_u4[chunk];
+            const __nv_bfloat162* p = reinterpret_cast<const __nv_bfloat162*>(&u);
+            float2 f0 = to_float2_bf162(p[0]);
+            float2 f1 = to_float2_bf162(p[1]);
+            float2 f2 = to_float2_bf162(p[2]);
+            float2 f3 = to_float2_bf162(p[3]);
+
+            int bd = chunk * 8;
+            dot += s_q[bd + 0] * f0.x + s_q[bd + 1] * f0.y
+                 + s_q[bd + 2] * f1.x + s_q[bd + 3] * f1.y
+                 + s_q[bd + 4] * f2.x + s_q[bd + 5] * f2.y
+                 + s_q[bd + 6] * f3.x + s_q[bd + 7] * f3.y;
+        }
+        scores[t] = dot * scale;
+    }
+    __syncthreads();
+
+    // ── Step 4: Online Flash Softmax Max + Exp + Sum ─────────────────────────
+    float local_max = -1e38f;
+    for (int t = tid; t < cache_len; t += n_threads) {
+        local_max = fmaxf(local_max, scores[t]);
+    }
+    if (attn_sink != nullptr) {
+        local_max = fmaxf(local_max, attn_sink[h]);
+    }
+
+    float warp_max = local_max;
+    #pragma unroll
+    for (int offset = 16; offset > 0; offset /= 2) {
+        warp_max = fmaxf(warp_max, __shfl_down_sync(0xffffffff, warp_max, offset));
+    }
+    if (lane == 0) s_red[warp] = warp_max;
+    __syncthreads();
+
+    float block_max = (tid < (n_threads >> 5)) ? s_red[tid] : -1e38f;
+    #pragma unroll
+    for (int offset = 16; offset > 0; offset /= 2) {
+        block_max = fmaxf(block_max, __shfl_down_sync(0xffffffff, block_max, offset));
+    }
+    if (tid == 0) s_red[0] = block_max;
+    __syncthreads();
+    block_max = s_red[0];
+
+    float local_sum = 0.0f;
+    for (int t = tid; t < cache_len; t += n_threads) {
+        float e = expf(scores[t] - block_max);
+        scores[t] = e;
+        local_sum += e;
+    }
+    if (tid == 0 && attn_sink != nullptr) {
+        local_sum += expf(attn_sink[h] - block_max);
+    }
+
+    float warp_sum = local_sum;
+    #pragma unroll
+    for (int offset = 16; offset > 0; offset /= 2) {
+        warp_sum += __shfl_down_sync(0xffffffff, warp_sum, offset);
+    }
+    if (lane == 0) s_red[warp] = warp_sum;
+    __syncthreads();
+
+    float block_sum = (tid < (n_threads >> 5)) ? s_red[tid] : 0.0f;
+    #pragma unroll
+    for (int offset = 16; offset > 0; offset /= 2) {
+        block_sum += __shfl_down_sync(0xffffffff, block_sum, offset);
+    }
+    if (tid == 0) s_red[0] = 1.0f / block_sum;
+    __syncthreads();
+    float inv_sum = s_red[0];
+
+    for (int t = tid; t < cache_len; t += n_threads) {
+        scores[t] *= inv_sum;
+    }
+    __syncthreads();
+
+    // ── Step 5: Direct 100% Coalesced Value Reduction (scores @ KV) ──────────
+    float sum0 = 0.0f;
+    float sum1 = 0.0f;
+    #pragma unroll 4
+    for (int t = 0; t < n_raw; t++) {
+        int raw_slot = (raw_start + t) % window;
+        float sc = scores[t];
+        const __nv_bfloat162* kv_pairs = reinterpret_cast<const __nv_bfloat162*>(raw_kv + (size_t)raw_slot * head_dim);
+        float2 kv_val = to_float2_bf162(kv_pairs[tid]);
+        sum0 += sc * kv_val.x;
+        sum1 += sc * kv_val.y;
+    }
+    #pragma unroll 4
+    for (int t = 0; t < n_comp; t++) {
+        float sc = scores[n_raw + t];
+        const __nv_bfloat162* kv_pairs = reinterpret_cast<const __nv_bfloat162*>(comp_kv + (size_t)t * head_dim);
+        float2 kv_val = to_float2_bf162(kv_pairs[tid]);
+        sum0 += sc * kv_val.x;
+        sum1 += sc * kv_val.y;
+    }
+    s_out[tid * 2 + 0] = sum0;
+    s_out[tid * 2 + 1] = sum1;
+    __syncthreads();
+
+    // ── Step 6: Inverse RoPE Rotation & Output Store ─────────────────────────
+    if (tid < half_rope) {
+        int pair_id = tid;
+        int base_idx = (head_dim - rope_dim) + 2 * pair_id;
+        float y0 = s_out[base_idx];
+        float y1 = s_out[base_idx + 1];
+
+        float cos_val = freq_table[pos * half_rope * 2 + pair_id * 2];
+        float sin_val = -freq_table[pos * half_rope * 2 + pair_id * 2 + 1]; // negative for inverse
+
+        s_out[base_idx]     = y0 * cos_val - y1 * sin_val;
+        s_out[base_idx + 1] = y0 * sin_val + y1 * cos_val;
+    }
+    __syncthreads();
+
+    out[(m * 64 + h) * head_dim + tid * 2 + 0] = float_to_bf16(s_out[tid * 2 + 0]);
+    out[(m * 64 + h) * head_dim + tid * 2 + 1] = float_to_bf16(s_out[tid * 2 + 1]);
+}
+
+void mla_attention_fused_batch_cuda(
+    const __nv_bfloat16* raw_q,
+    const __nv_bfloat16* raw_kv,
+    const __nv_bfloat16* comp_kv,
+    const float* attn_sink,
+    __nv_bfloat16* out,
+    const int32_t* d_positions,
+    const int32_t* d_comp_count,
+    const float* freq_table,
+    int max_cache_len,
+    int head_dim,
+    int rope_dim,
+    float scale,
+    float q_norm_eps,
+    const uint8_t* comp_mask,
+    int window,
+    int M,
+    cudaStream_t stream)
+{
+    int n_threads = 256;
+    size_t smem_bytes = max_cache_len * sizeof(float);
+    if (smem_bytes > 49152) {
+        static bool s_smem_fused_batch_configured = false;
+        if (!s_smem_fused_batch_configured) {
+            cudaFuncSetAttribute(mla_attention_fused_batch_kernel, cudaFuncAttributeMaxDynamicSharedMemorySize, 98304);
+            s_smem_fused_batch_configured = true;
+        }
+    }
+    int total_blocks = M * 64;
+    mla_attention_fused_batch_kernel<<<total_blocks, n_threads, smem_bytes, stream>>>(
+        raw_q, raw_kv, comp_kv, attn_sink, out,
+        d_positions, d_comp_count, freq_table,
+        max_cache_len, head_dim, rope_dim, scale, q_norm_eps,
+        comp_mask, window, M);
 }
 
 // ════════════════════════════════════════════════════════════════════════════════

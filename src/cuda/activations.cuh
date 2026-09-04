@@ -532,12 +532,29 @@ void moe_route_hash_device_id_cuda(
     const int32_t* d_token_id, int top_k, float routed_scaling_factor,
     cudaStream_t stream = 0);
 
+void moe_route_hash_device_id_batch_cuda(
+    int32_t* topk_ids,
+    float* topk_weights,
+    const int64_t* tid2eid_table,
+    const int32_t* d_token_ids, int top_k, float routed_scaling_factor,
+    int M,
+    cudaStream_t stream = 0);
+
 void moe_route_top6_from_bf16_cuda(
     int32_t* topk_ids,
     float* topk_weights,
     const __nv_bfloat16* scores_bf16,
     const float* gate_bias,
     int n_experts, int top_k, float routed_scaling_factor,
+    cudaStream_t stream = 0);
+
+void moe_route_top6_from_bf16_batch_cuda(
+    int32_t* topk_ids,
+    float* topk_weights,
+    const __nv_bfloat16* scores_bf16,
+    const float* gate_bias,
+    int n_experts, int top_k, float routed_scaling_factor,
+    int M,
     cudaStream_t stream = 0);
 
 void gemv_f32_cuda(
@@ -567,14 +584,29 @@ void embedding_broadcast_device_id_cuda(
     const __nv_bfloat16* table, const int32_t* d_token_id, int dim, int hc,
     cudaStream_t stream = 0);
 
+void embedding_broadcast_device_id_batch_cuda(
+    __nv_bfloat16* hidden, __nv_bfloat16* hc_state,
+    const __nv_bfloat16* table, const int32_t* d_token_ids, int dim, int hc, int M,
+    cudaStream_t stream = 0);
+
 void rope_device_pos_cuda(
     __nv_bfloat16* x, int n_vectors, int head_dim, int rope_dim,
     const int32_t* d_position, const float* freq_table, bool inverse,
     cudaStream_t stream = 0);
 
+void rope_device_pos_batch_cuda(
+    __nv_bfloat16* x, int head_dim, int rope_dim,
+    const int32_t* d_positions, const float* freq_table, bool inverse, int M,
+    cudaStream_t stream = 0);
+
 void store_kv_device_pos_cuda(
     __nv_bfloat16* kv_cache, const __nv_bfloat16* kv_val,
     const int32_t* d_position, int window, int head_dim,
+    cudaStream_t stream = 0);
+
+void store_kv_device_pos_batch_cuda(
+    __nv_bfloat16* kv_cache, const __nv_bfloat16* kv_vals,
+    const int32_t* d_positions, int window, int head_dim, int M,
     cudaStream_t stream = 0);
 
 void mla_attention_fused_cuda(
@@ -593,6 +625,25 @@ void mla_attention_fused_cuda(
     float q_norm_eps,
     const uint8_t* comp_mask = nullptr,
     int window = 128,
+    cudaStream_t stream = 0);
+
+void mla_attention_fused_batch_cuda(
+    const __nv_bfloat16* raw_q,
+    const __nv_bfloat16* raw_kv,
+    const __nv_bfloat16* comp_kv,
+    const float* attn_sink,
+    __nv_bfloat16* out,
+    const int32_t* d_positions,
+    const int32_t* d_comp_count,
+    const float* freq_table,
+    int max_cache_len,
+    int head_dim,
+    int rope_dim,
+    float scale,
+    float q_norm_eps,
+    const uint8_t* comp_mask = nullptr,
+    int window = 128,
+    int M = 1,
     cudaStream_t stream = 0);
 
 void compressor_device_step_cuda(
