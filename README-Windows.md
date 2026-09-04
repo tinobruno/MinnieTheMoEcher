@@ -44,6 +44,14 @@ This automatically configures CMake, compiles `moecher.exe` with MSVC and CUDA, 
 
 ## 💾 Model Weights Setup
 
+### Option 1: Qwen 3.8 27B INT4 (Native MTP Speculative Decoding ~98 tok/s)
+Place the files from [TinoBruno/moecher-qwen-3.8-27b-q4](https://huggingface.co/TinoBruno/moecher-qwen-3.8-27b-q4):
+- `attention_dense_layers_q4.bin` (~17.8 GB)
+- `draft_vocab_ids.bin` (160 KB)
+- `draft_lm_head_int8_bf16.bin` (390.6 MB)
+- `moecher_manifest.json`
+
+### Option 2: DeepSeek-V4-Flash (MoE 284B / 13B Active)
 Place the weight files in the repository root:
 - `attention_dense_layers.bin` (9.44 GB)
 - `moe_experts_iq2.bin` (72.56 GB)
@@ -55,15 +63,19 @@ Place the weight files in the repository root:
 
 ## 🎯 Running MinnieTheMoECher
 
-### Option A: 1-Click Batch Launcher
-Simply double-click:
-```bat
-start.bat
+### Running Qwen 3.8 27B with MTP Speculative Decoding
+```powershell
+.\moecher.exe --manifest moecher_manifest.json --port 8001
 ```
 
-### Option B: Manual Command Line
+### Running DeepSeek-V4-Flash MoE
 ```powershell
-.\moecher.exe --manifest moecher_manifest_iq2.json --max-vram 22 --dram-cache-gb 48 --quiet
+.\moecher.exe --manifest moecher_manifest_iq2.json --max-vram 85 --port 8001
+```
+
+### Consumer GPUs with DRAM Offloading (e.g. RTX 3090 / 4090 24GB)
+```powershell
+.\moecher.exe --manifest moecher_manifest_iq2.json --max-vram 22 --dram-cache-gb 48 --port 8001
 ```
 
 ### Command Line Arguments

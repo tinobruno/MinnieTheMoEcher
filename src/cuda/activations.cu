@@ -262,6 +262,58 @@ void rms_norm_cuda_batched(__nv_bfloat16* out, const __nv_bfloat16* x,
     rms_norm_batched_kernel<<<n, threads, shared, stream>>>(out, x, weight, n, dim, eps);
 }
 
+__global__ void rms_norm_one_centered_batched_kernel(
+    __nv_bfloat16* __restrict__ out,
+    const __nv_bfloat16* __restrict__ x,
+    const __nv_bfloat16* __restrict__ weight,
+    int n, int dim, float eps)
+{
+    int row = blockIdx.x;
+    if (row >= n) return;
+
+    extern __shared__ float sdata[];
+    int tid = threadIdx.x;
+    int lane = tid & 31;
+    int warp = tid >> 5;
+
+    const __nv_bfloat16* x_row = x + (size_t)row * dim;
+    __nv_bfloat16* out_row = out + (size_t)row * dim;
+
+    float sum_sq = 0.0f;
+    for (int i = tid; i < dim; i += blockDim.x) {
+        float v = bf16_to_float(x_row[i]);
+        sum_sq += v * v;
+    }
+
+    for (int offset = 16; offset > 0; offset >>= 1)
+        sum_sq += __shfl_down_sync(0xFFFFFFFF, sum_sq, offset);
+    if (lane == 0) sdata[warp] = sum_sq;
+    __syncthreads();
+
+    if (warp == 0) {
+        sum_sq = (lane < (blockDim.x >> 5)) ? sdata[lane] : 0.0f;
+        for (int offset = 16; offset > 0; offset >>= 1)
+            sum_sq += __shfl_down_sync(0xFFFFFFFF, sum_sq, offset);
+        if (lane == 0) sdata[0] = sum_sq;
+    }
+    __syncthreads();
+
+    float rsqrt_val = rsqrtf(sdata[0] / (float)dim + eps);
+    for (int i = tid; i < dim; i += blockDim.x) {
+        float v = bf16_to_float(x_row[i]) * rsqrt_val;
+        float w = 1.0f + bf16_to_float(weight[i]);
+        out_row[i] = float_to_bf16(w * v);
+    }
+}
+
+void rms_norm_one_centered_cuda_batched(__nv_bfloat16* out, const __nv_bfloat16* x,
+                                       const __nv_bfloat16* weight, int n, int dim,
+                                       float eps, cudaStream_t stream) {
+    int threads = min(1024, ((dim + 31) / 32) * 32);
+    int shared = (threads / 32) * sizeof(float);
+    rms_norm_one_centered_batched_kernel<<<n, threads, shared, stream>>>(out, x, weight, n, dim, eps);
+}
+
 // Unweighted batched RMS norm: x * rsqrt(mean(x^2) + eps) per row
 // Used for per-head Q normalization (DeepseekV4UnweightedRMSNorm)
 __global__ void rms_norm_unweighted_batched_kernel(
@@ -1154,6 +1206,101 @@ void gemv_bf16_out_bf16_cuda(
     gemv_bf16_generic_kernel<<<blocks, threads, 0, stream>>>(out, W, x, N, K);
 }
 
+template<typename TOut, int MAX_M>
+__global__ void gemv_bf16_batch_generic_kernel(
+    TOut* __restrict__ out,
+    const __nv_bfloat16* __restrict__ W,
+    const __nv_bfloat16* __restrict__ X,
+    int N, int K, int M)
+{
+    int row = blockIdx.x * blockDim.y + threadIdx.y;
+    if (row >= N) return;
+
+    int lane = threadIdx.x;
+    float sum[MAX_M];
+    #pragma unroll
+    for (int m = 0; m < MAX_M; m++) {
+        sum[m] = 0.0f;
+    }
+
+    const uint4* w_vec4 = reinterpret_cast<const uint4*>(W + (size_t)row * K);
+
+    int n_chunks = K / 8;
+    for (int chunk = lane; chunk < n_chunks; chunk += 32) {
+        uint4 w4 = w_vec4[chunk];
+        const __nv_bfloat162* w_pairs = reinterpret_cast<const __nv_bfloat162*>(&w4);
+        float2 wf[4];
+        #pragma unroll
+        for (int p = 0; p < 4; p++) {
+            wf[p] = to_float2_bf162(w_pairs[p]);
+        }
+
+        #pragma unroll
+        for (int m = 0; m < MAX_M; m++) {
+            if (m < M) {
+                const uint4* x_vec4 = reinterpret_cast<const uint4*>(X + (size_t)m * K);
+                uint4 x4 = x_vec4[chunk];
+                const __nv_bfloat162* x_pairs = reinterpret_cast<const __nv_bfloat162*>(&x4);
+                #pragma unroll
+                for (int p = 0; p < 4; p++) {
+                    float2 xf = to_float2_bf162(x_pairs[p]);
+                    sum[m] += wf[p].x * xf.x + wf[p].y * xf.y;
+                }
+            }
+        }
+    }
+
+    #pragma unroll
+    for (int m = 0; m < MAX_M; m++) {
+        if (m < M) {
+            #pragma unroll
+            for (int offset = 16; offset > 0; offset /= 2) {
+                sum[m] += __shfl_down_sync(0xffffffff, sum[m], offset);
+            }
+            if (lane == 0) {
+                if constexpr (std::is_same_v<TOut, __nv_bfloat16>) {
+                    out[(size_t)m * N + row] = __float2bfloat16(sum[m]);
+                } else {
+                    out[(size_t)m * N + row] = sum[m];
+                }
+            }
+        }
+    }
+}
+
+void gemv_bf16_batch_cuda(
+    float* out,
+    const __nv_bfloat16* W,
+    const __nv_bfloat16* X,
+    int N, int K, int M,
+    cudaStream_t stream)
+{
+    dim3 threads(32, 8);
+    dim3 blocks((N + 7) / 8);
+    if (M <= 4) {
+        gemv_bf16_batch_generic_kernel<float, 4><<<blocks, threads, 0, stream>>>(out, W, X, N, K, M);
+    } else {
+        gemv_bf16_batch_generic_kernel<float, 8><<<blocks, threads, 0, stream>>>(out, W, X, N, K, M);
+    }
+}
+
+void gemv_bf16_out_bf16_batch_cuda(
+    __nv_bfloat16* out,
+    const __nv_bfloat16* W,
+    const __nv_bfloat16* X,
+    int N, int K, int M,
+    cudaStream_t stream)
+{
+    dim3 threads(32, 8);
+    dim3 blocks((N + 7) / 8);
+    if (M <= 4) {
+        gemv_bf16_batch_generic_kernel<__nv_bfloat16, 4><<<blocks, threads, 0, stream>>>(out, W, X, N, K, M);
+    } else {
+        gemv_bf16_batch_generic_kernel<__nv_bfloat16, 8><<<blocks, threads, 0, stream>>>(out, W, X, N, K, M);
+    }
+}
+
+
 
 // Softmax-gated pooling: each thread handles one output dimension.
 // For each dimension d:
@@ -1687,9 +1834,10 @@ void gemv_int2_cuda(__nv_bfloat16* out, const __nv_bfloat16* vec,
 }
 
 // ════════════════════════════════════════════════════════════════════════════════
-//  GEMV INT4 Kernel (Block Size = 32, Symmetric with Zero-point 8, 128-bit uint4)
 // ════════════════════════════════════════════════════════════════════════════════
-template <typename TOut = __nv_bfloat16>
+//  GEMV INT4 Kernel with Double-Buffered Memory Prefetching & In-Place Residual
+// ════════════════════════════════════════════════════════════════════════════════
+template <typename TOut = __nv_bfloat16, bool ACCUM_RESIDUAL = false>
 __global__ void gemv_int4_kernel(
     TOut* __restrict__ out,
     const __nv_bfloat16* __restrict__ vec,
@@ -1697,10 +1845,10 @@ __global__ void gemv_int4_kernel(
     const __nv_bfloat16* __restrict__ scale,
     int N, int K)
 {
-    int row = blockIdx.x * 2 + (threadIdx.y);
+    int row = blockIdx.x * 4 + (threadIdx.y);
     if (row >= N) return;
 
-    int tid = threadIdx.x; // 0..127
+    int tid = threadIdx.x; // 0..63
     int num_blocks = K / 32;
 
     const __nv_bfloat16* row_scales = scale + (row * num_blocks);
@@ -1709,12 +1857,27 @@ __global__ void gemv_int4_kernel(
 
     float sum = 0.0f;
 
-    for (int block_idx = tid; block_idx < num_blocks; block_idx += blockDim.x) {
-        float s = __bfloat162float(row_scales[block_idx]);
-        uint4 w_val = w_vec16[block_idx];
-        const uint4* a_ptr = a_vec16 + (block_idx * 4);
+    // Asynchronous double-buffered prefetch for the first iteration
+    uint4 next_w_val;
+    float next_s = 0.0f;
+    if (tid < num_blocks) {
+        next_w_val = w_vec16[tid];
+        next_s = __bfloat162float(row_scales[tid]);
+    }
 
-        uint32_t w_arr[4] = {w_val.x, w_val.y, w_val.z, w_val.w};
+    for (int block_idx = tid; block_idx < num_blocks; block_idx += blockDim.x) {
+        uint4 curr_w_val = next_w_val;
+        float curr_s = next_s;
+
+        // Concurrently prefetch next block from memory while compute ALUs run
+        int next_block_idx = block_idx + blockDim.x;
+        if (next_block_idx < num_blocks) {
+            next_w_val = w_vec16[next_block_idx];
+            next_s = __bfloat162float(row_scales[next_block_idx]);
+        }
+
+        const uint4* a_ptr = a_vec16 + (block_idx * 4);
+        uint32_t w_arr[4] = {curr_w_val.x, curr_w_val.y, curr_w_val.z, curr_w_val.w};
         float block_sum = 0.0f;
 
         #pragma unroll
@@ -1744,30 +1907,33 @@ __global__ void gemv_int4_kernel(
             uint32_t b3 = (chunk >> 24) & 0xFF;
             block_sum += ((float)(b3 & 0x0F) - 8.0f) * f3.x + ((float)(b3 >> 4) - 8.0f) * f3.y;
         }
-        sum += block_sum * s;
+        sum += block_sum * curr_s;
     }
 
     #pragma unroll
     for (int offset = 16; offset > 0; offset /= 2)
         sum += __shfl_down_sync(0xffffffff, sum, offset);
 
-    __shared__ float s_sum[2][4];
+    __shared__ float s_sum[4][2];
     int lane = tid % 32;
     int warp = tid / 32;
     if (lane == 0) s_sum[threadIdx.y][warp] = sum;
     __syncthreads();
 
     if (warp == 0) {
-        sum = (lane < 4) ? s_sum[threadIdx.y][lane] : 0.0f;
-        #pragma unroll
-        for (int offset = 2; offset > 0; offset /= 2)
-            sum += __shfl_down_sync(0xffffffff, sum, offset);
+        sum = (lane < 2) ? s_sum[threadIdx.y][lane] : 0.0f;
+        sum += __shfl_down_sync(0xffffffff, sum, 1);
 
         if (lane == 0) {
-            if constexpr (std::is_same_v<TOut, float>) {
-                out[row] = sum;
+            if constexpr (ACCUM_RESIDUAL) {
+                float existing = __bfloat162float(out[row]);
+                out[row] = __float2bfloat16(existing + sum);
             } else {
-                out[row] = __float2bfloat16(sum);
+                if constexpr (std::is_same_v<TOut, float>) {
+                    out[row] = sum;
+                } else {
+                    out[row] = __float2bfloat16(sum);
+                }
             }
         }
     }
@@ -1781,9 +1947,22 @@ void gemv_int4_cuda(
     int N, int K,
     cudaStream_t stream)
 {
-    dim3 threads(128, 2);
-    dim3 blocks((N + 1) / 2);
-    gemv_int4_kernel<__nv_bfloat16><<<blocks, threads, 0, stream>>>(out, vec, weight, scale, N, K);
+    dim3 threads(64, 4);
+    dim3 blocks((N + 3) / 4);
+    gemv_int4_kernel<__nv_bfloat16, false><<<blocks, threads, 0, stream>>>(out, vec, weight, scale, N, K);
+}
+
+void gemv_int4_residual_cuda(
+    __nv_bfloat16* inout,
+    const __nv_bfloat16* vec,
+    const uint8_t* weight,
+    const __nv_bfloat16* scale,
+    int N, int K,
+    cudaStream_t stream)
+{
+    dim3 threads(64, 4);
+    dim3 blocks((N + 3) / 4);
+    gemv_int4_kernel<__nv_bfloat16, true><<<blocks, threads, 0, stream>>>(inout, vec, weight, scale, N, K);
 }
 
 // ════════════════════════════════════════════════════════════════════════════════
@@ -1933,9 +2112,9 @@ void gemv_int4_f32_cuda(
     int N, int K,
     cudaStream_t stream)
 {
-    dim3 threads(128, 2);
-    dim3 blocks((N + 1) / 2);
-    gemv_int4_kernel<float><<<blocks, threads, 0, stream>>>(out, vec, weight, scale, N, K);
+    dim3 threads(64, 4);
+    dim3 blocks((N + 3) / 4);
+    gemv_int4_kernel<float, false><<<blocks, threads, 0, stream>>>(out, vec, weight, scale, N, K);
 }
 
 void gemm_int4_f32_batch_cuda(
@@ -1958,6 +2137,9 @@ void gemm_int4_f32_batch_cuda(
 // ════════════════════════════════════════════════════════════════════════════════
 //  GEMV INT4 Fused SwiGLU Kernel (Block Size = 32, Symmetric Zero-point 8, 128-bit)
 // ════════════════════════════════════════════════════════════════════════════════
+// ════════════════════════════════════════════════════════════════════════════════
+//  GEMV INT4 Fused SwiGLU Kernel (Double-Buffered Prefetching, 4-Row Cooperative Tiling)
+// ════════════════════════════════════════════════════════════════════════════════
 __global__ void gemv_int4_swiglu_fused_kernel(
     __nv_bfloat16* __restrict__ out,
     const __nv_bfloat16* __restrict__ vec,
@@ -1967,10 +2149,10 @@ __global__ void gemv_int4_swiglu_fused_kernel(
     const __nv_bfloat16* __restrict__ up_scale,
     int N, int K, float swiglu_limit)
 {
-    int row = blockIdx.x * 2 + (threadIdx.y);
+    int row = blockIdx.x * 4 + (threadIdx.y);
     if (row >= N) return;
 
-    int tid = threadIdx.x; // 0..127
+    int tid = threadIdx.x; // 0..63
     int num_blocks = K / 32;
 
     const __nv_bfloat16* gate_row_scales = gate_scale + (row * num_blocks);
@@ -1982,16 +2164,34 @@ __global__ void gemv_int4_swiglu_fused_kernel(
     float sum_g = 0.0f;
     float sum_u = 0.0f;
 
+    // Asynchronous double-buffered prefetch for the first iteration
+    uint4 next_g_val, next_u_val;
+    float next_sg = 0.0f, next_su = 0.0f;
+    if (tid < num_blocks) {
+        next_g_val = g_vec16[tid];
+        next_u_val = u_vec16[tid];
+        next_sg = __bfloat162float(gate_row_scales[tid]);
+        next_su = __bfloat162float(up_row_scales[tid]);
+    }
+
     for (int block_idx = tid; block_idx < num_blocks; block_idx += blockDim.x) {
-        float sg = __bfloat162float(gate_row_scales[block_idx]);
-        float su = __bfloat162float(up_row_scales[block_idx]);
+        uint4 curr_g_val = next_g_val;
+        uint4 curr_u_val = next_u_val;
+        float curr_sg = next_sg;
+        float curr_su = next_su;
 
-        uint4 g_val = g_vec16[block_idx];
-        uint4 u_val = u_vec16[block_idx];
+        // Concurrently prefetch next block from memory while compute ALUs run
+        int next_block_idx = block_idx + blockDim.x;
+        if (next_block_idx < num_blocks) {
+            next_g_val = g_vec16[next_block_idx];
+            next_u_val = u_vec16[next_block_idx];
+            next_sg = __bfloat162float(gate_row_scales[next_block_idx]);
+            next_su = __bfloat162float(up_row_scales[next_block_idx]);
+        }
+
         const uint4* a_ptr = a_vec16 + (block_idx * 4);
-
-        uint32_t g_arr[4] = {g_val.x, g_val.y, g_val.z, g_val.w};
-        uint32_t u_arr[4] = {u_val.x, u_val.y, u_val.z, u_val.w};
+        uint32_t g_arr[4] = {curr_g_val.x, curr_g_val.y, curr_g_val.z, curr_g_val.w};
+        uint32_t u_arr[4] = {curr_u_val.x, curr_u_val.y, curr_u_val.z, curr_u_val.w};
 
         float block_sum_g = 0.0f;
         float block_sum_u = 0.0f;
@@ -2036,8 +2236,8 @@ __global__ void gemv_int4_swiglu_fused_kernel(
             block_sum_g += ((float)(gb3 & 0x0F) - 8.0f) * f3.x + ((float)(gb3 >> 4) - 8.0f) * f3.y;
             block_sum_u += ((float)(ub3 & 0x0F) - 8.0f) * f3.x + ((float)(ub3 >> 4) - 8.0f) * f3.y;
         }
-        sum_g += block_sum_g * sg;
-        sum_u += block_sum_u * su;
+        sum_g += block_sum_g * curr_sg;
+        sum_u += block_sum_u * curr_su;
     }
 
     #pragma unroll
@@ -2046,8 +2246,8 @@ __global__ void gemv_int4_swiglu_fused_kernel(
         sum_u += __shfl_down_sync(0xffffffff, sum_u, offset);
     }
 
-    __shared__ float s_sum_g[2][4];
-    __shared__ float s_sum_u[2][4];
+    __shared__ float s_sum_g[4][2];
+    __shared__ float s_sum_u[4][2];
     int lane = tid % 32;
     int warp = tid / 32;
     if (lane == 0) {
@@ -2057,13 +2257,10 @@ __global__ void gemv_int4_swiglu_fused_kernel(
     __syncthreads();
 
     if (warp == 0) {
-        sum_g = (lane < 4) ? s_sum_g[threadIdx.y][lane] : 0.0f;
-        sum_u = (lane < 4) ? s_sum_u[threadIdx.y][lane] : 0.0f;
-        #pragma unroll
-        for (int offset = 2; offset > 0; offset /= 2) {
-            sum_g += __shfl_down_sync(0xffffffff, sum_g, offset);
-            sum_u += __shfl_down_sync(0xffffffff, sum_u, offset);
-        }
+        sum_g = (lane < 2) ? s_sum_g[threadIdx.y][lane] : 0.0f;
+        sum_u = (lane < 2) ? s_sum_u[threadIdx.y][lane] : 0.0f;
+        sum_g += __shfl_down_sync(0xffffffff, sum_g, 1);
+        sum_u += __shfl_down_sync(0xffffffff, sum_u, 1);
 
         if (lane == 0) {
             float g = sum_g;
@@ -2250,8 +2447,8 @@ void gemv_int4_swiglu_fused_cuda(
     int N, int K, float swiglu_limit,
     cudaStream_t stream)
 {
-    dim3 threads(128, 2);
-    dim3 blocks((N + 1) / 2);
+    dim3 threads(64, 4);
+    dim3 blocks((N + 3) / 4);
     gemv_int4_swiglu_fused_kernel<<<blocks, threads, 0, stream>>>(
         out, vec, gate_weight, gate_scale, up_weight, up_scale, N, K, swiglu_limit);
 }
@@ -3885,7 +4082,7 @@ __global__ void mla_attention_fused_kernel(
     __syncthreads();
 
     // ── Step 3: Direct Dual-Cache Attention Scores (Q @ KV.T) ─────────────────
-    // Exact DwarfStar context partitioning:
+    // Dual-tier compressed context partitioning:
     // When pos < window (pos < 128): raw cache holds all tokens 0..pos. n_comp = 0.
     // When pos >= window (pos >= 128): raw cache holds sliding window of last 128 tokens,
     // and comp cache holds previous compressed history.
@@ -4361,7 +4558,7 @@ __global__ void indexer_score_kernel(
     const __nv_bfloat16* kv_c = index_comp + (size_t)c * 128;
     __shared__ float s_kv[128];
     if (tid < 128) {
-        s_kv[tid] = bf16_to_float(kv_c[tid]);
+        s_kv[tid] = __bfloat162float(kv_c[tid]);
     }
     __syncthreads();
 
@@ -4371,7 +4568,7 @@ __global__ void indexer_score_kernel(
         float dot = 0.0f;
         #pragma unroll 4
         for (int d = 0; d < 128; d++) {
-            dot += s_kv[d] * bf16_to_float(q_h[d]);
+            dot += s_kv[d] * __bfloat162float(q_h[d]);
         }
         if (dot > 0.0f) {
             local_total += dot * weights[h];
@@ -4617,7 +4814,7 @@ __global__ void qwen_gqa_write_kv_kernel(
 
     float k_rrms = rsqrtf(s_k_sum / (float)head_dim + eps);
     for (int i = tid; i < head_dim; i += blockDim.x) {
-        float k_normed = __bfloat162float(k_vec[i]) * k_rrms * (1.0f + __bfloat162float(k_norm_w[i]));
+        float k_normed = __bfloat162float(k_vec[i]) * k_rrms * __bfloat162float(k_norm_w[i]);
         k_vec[i] = __float2bfloat16(k_normed);
     }
     __syncthreads();
@@ -4701,7 +4898,7 @@ __global__ void qwen_gqa_compute_attn_kernel(
 
     float q_rrms = rsqrtf(s_q_sum / (float)head_dim + eps);
     for (int i = tid; i < head_dim; i += blockDim.x) {
-        s_q[i] = s_q[i] * q_rrms * (1.0f + __bfloat162float(q_norm_w[i]));
+        s_q[i] = s_q[i] * q_rrms * __bfloat162float(q_norm_w[i]);
     }
     __syncthreads();
 
@@ -5210,25 +5407,27 @@ __global__ void deltanet_conv_kernel(
     __nv_bfloat16* __restrict__ conv_out,
     const __nv_bfloat16* __restrict__ in_qkv,
     const __nv_bfloat16* __restrict__ conv1d_w,
-    __nv_bfloat16* __restrict__ conv_state,
+    const __nv_bfloat16* __restrict__ in_conv_state,
+    __nv_bfloat16* __restrict__ out_conv_state,
     int channels)
 {
     int c = blockIdx.x * blockDim.x + threadIdx.x;
     if (c >= channels) return;
 
-    __nv_bfloat16* cs = conv_state + c * 4;
+    const __nv_bfloat16* in_cs = in_conv_state + c * 4;
+    __nv_bfloat16* out_cs = out_conv_state + c * 4;
     const __nv_bfloat16* cw = conv1d_w + c * 4;
 
-    float s0 = __bfloat162float(cs[1]);
-    float s1 = __bfloat162float(cs[2]);
-    float s2 = __bfloat162float(cs[3]);
+    float s0 = __bfloat162float(in_cs[1]);
+    float s1 = __bfloat162float(in_cs[2]);
+    float s2 = __bfloat162float(in_cs[3]);
     float s3 = __bfloat162float(in_qkv[c]);
 
     // Update state (shift left)
-    cs[0] = __float2bfloat16(s0);
-    cs[1] = __float2bfloat16(s1);
-    cs[2] = __float2bfloat16(s2);
-    cs[3] = __float2bfloat16(s3);
+    out_cs[0] = __float2bfloat16(s0);
+    out_cs[1] = __float2bfloat16(s1);
+    out_cs[2] = __float2bfloat16(s2);
+    out_cs[3] = __float2bfloat16(s3);
 
     float w0 = __bfloat162float(cw[0]);
     float w1 = __bfloat162float(cw[1]);
@@ -5249,7 +5448,8 @@ __global__ void deltanet_ssm_step_kernel(
     const __nv_bfloat16* __restrict__ A_log,
     const __nv_bfloat16* __restrict__ dt_bias,
     const __nv_bfloat16* __restrict__ norm_w,
-    __nv_bfloat16* __restrict__ ssm_state,
+    const __nv_bfloat16* __restrict__ in_ssm_state,
+    __nv_bfloat16* __restrict__ out_ssm_state,
     int num_k_heads,
     int num_v_heads,
     int head_dim)
@@ -5279,7 +5479,8 @@ __global__ void deltanet_ssm_step_kernel(
     const __nv_bfloat16* v_vec = conv_out + v_offset;
     const __nv_bfloat16* z_vec = in_z + h * head_dim;
 
-    __nv_bfloat16* state_h = ssm_state + (size_t)h * head_dim * head_dim;
+    const __nv_bfloat16* in_state_h = in_ssm_state + (size_t)h * head_dim * head_dim;
+    __nv_bfloat16* out_state_h = out_ssm_state + (size_t)h * head_dim * head_dim;
 
     float a_val = __bfloat162float(in_a[h]);
     float b_val = __bfloat162float(in_b[h]);
@@ -5327,12 +5528,12 @@ __global__ void deltanet_ssm_step_kernel(
     }
     __syncthreads();
 
-    // 2. Compute kv_mem[col] = sum_row (decay * S[row, col]) * k[row] (read state_h in BF16)
+    // 2. Compute kv_mem[col] = sum_row (decay * S[row, col]) * k[row] (read in_state_h in BF16)
     if (tid < head_dim) {
         float mem = 0.0f;
         #pragma unroll 4
         for (int r = 0; r < head_dim; r++) {
-            float s_val = __bfloat162float(state_h[r * head_dim + tid]);
+            float s_val = __bfloat162float(in_state_h[r * head_dim + tid]);
             mem += (decay * s_val) * s_k[r];
         }
         s_kv_mem[tid] = mem;
@@ -5346,8 +5547,8 @@ __global__ void deltanet_ssm_step_kernel(
         float out_c = 0.0f;
         #pragma unroll 4
         for (int r = 0; r < head_dim; r++) {
-            float new_s = decay * __bfloat162float(state_h[r * head_dim + tid]) + s_k[r] * delta_c;
-            state_h[r * head_dim + tid] = __float2bfloat16(new_s);
+            float new_s = decay * __bfloat162float(in_state_h[r * head_dim + tid]) + s_k[r] * delta_c;
+            out_state_h[r * head_dim + tid] = __float2bfloat16(new_s);
             out_c += new_s * s_q[r];
         }
         s_out[tid] = out_c;
@@ -5378,27 +5579,300 @@ void deltanet_linear_attention_decode_cuda(
     const __nv_bfloat16* in_a,
     const __nv_bfloat16* in_b,
     const __nv_bfloat16* conv1d_w,
-    __nv_bfloat16* conv_state,
+    const __nv_bfloat16* in_conv_state,
+    __nv_bfloat16* out_conv_state,
     const __nv_bfloat16* A_log,
     const __nv_bfloat16* dt_bias,
     const __nv_bfloat16* norm_w,
-    __nv_bfloat16* ssm_state,
+    const __nv_bfloat16* in_ssm_state,
+    __nv_bfloat16* out_ssm_state,
     int num_k_heads,
     int num_v_heads,
     int head_dim,
     cudaStream_t stream)
 {
-    int channels = 10240;
+    int channels = (2 * num_k_heads + num_v_heads) * head_dim;
     int threads = 256;
     int blocks = (channels + threads - 1) / threads;
 
     __nv_bfloat16* conv_out = const_cast<__nv_bfloat16*>(in_qkv);
     deltanet_conv_kernel<<<blocks, threads, 0, stream>>>(
-        conv_out, in_qkv, conv1d_w, conv_state, channels);
+        conv_out, in_qkv, conv1d_w, in_conv_state, out_conv_state, channels);
 
     deltanet_ssm_step_kernel<<<num_v_heads, 128, 0, stream>>>(
-        out, conv_out, in_z, in_a, in_b, A_log, dt_bias, norm_w, ssm_state,
+        out, conv_out, in_z, in_a, in_b, A_log, dt_bias, norm_w,
+        in_ssm_state, out_ssm_state,
         num_k_heads, num_v_heads, head_dim);
+}
+
+__global__ void deltanet_conv_batch_kernel(
+    __nv_bfloat16* __restrict__ conv_out,
+    const __nv_bfloat16* __restrict__ in_qkv,
+    const __nv_bfloat16* __restrict__ conv1d_w,
+    const __nv_bfloat16* __restrict__ in_conv_state,
+    __nv_bfloat16* __restrict__ out_conv_state,
+    __nv_bfloat16* __restrict__ slot_conv_0,
+    __nv_bfloat16* __restrict__ slot_conv_1,
+    int channels, int M)
+{
+    int c = blockIdx.x * blockDim.x + threadIdx.x;
+    if (c >= channels) return;
+
+    const __nv_bfloat16* in_cs = in_conv_state + (size_t)c * 4;
+    const __nv_bfloat16* cw = conv1d_w + (size_t)c * 4;
+
+    float s0 = __bfloat162float(in_cs[1]);
+    float s1 = __bfloat162float(in_cs[2]);
+    float s2 = __bfloat162float(in_cs[3]);
+
+    float w0 = __bfloat162float(cw[0]);
+    float w1 = __bfloat162float(cw[1]);
+    float w2 = __bfloat162float(cw[2]);
+    float w3 = __bfloat162float(cw[3]);
+
+    for (int m = 0; m < M; m++) {
+        float s3 = __bfloat162float(in_qkv[(size_t)m * channels + c]);
+        float val = s0 * w0 + s1 * w1 + s2 * w2 + s3 * w3;
+        float silu_val = val / (1.0f + __expf(-val));
+        conv_out[(size_t)m * channels + c] = __float2bfloat16(silu_val);
+
+        if (m == 0 && slot_conv_0) {
+            __nv_bfloat16* slot_cs = slot_conv_0 + (size_t)c * 4;
+            slot_cs[0] = __float2bfloat16(s0);
+            slot_cs[1] = __float2bfloat16(s1);
+            slot_cs[2] = __float2bfloat16(s2);
+            slot_cs[3] = __float2bfloat16(s3);
+        } else if (m == 1 && slot_conv_1) {
+            __nv_bfloat16* slot_cs = slot_conv_1 + (size_t)c * 4;
+            slot_cs[0] = __float2bfloat16(s0);
+            slot_cs[1] = __float2bfloat16(s1);
+            slot_cs[2] = __float2bfloat16(s2);
+            slot_cs[3] = __float2bfloat16(s3);
+        }
+
+        if (m == M - 1 && out_conv_state) {
+            __nv_bfloat16* out_cs = out_conv_state + (size_t)c * 4;
+            out_cs[0] = __float2bfloat16(s0);
+            out_cs[1] = __float2bfloat16(s1);
+            out_cs[2] = __float2bfloat16(s2);
+            out_cs[3] = __float2bfloat16(s3);
+        }
+
+        s0 = s1;
+        s1 = s2;
+        s2 = s3;
+    }
+}
+
+__global__ void deltanet_ssm_batch_kernel(
+    __nv_bfloat16* __restrict__ out,
+    const __nv_bfloat16* __restrict__ conv_out,
+    const __nv_bfloat16* __restrict__ in_z,
+    const __nv_bfloat16* __restrict__ in_a,
+    const __nv_bfloat16* __restrict__ in_b,
+    const __nv_bfloat16* __restrict__ A_log,
+    const __nv_bfloat16* __restrict__ dt_bias,
+    const __nv_bfloat16* __restrict__ norm_w,
+    const __nv_bfloat16* __restrict__ in_ssm_state,
+    __nv_bfloat16* __restrict__ out_ssm_state,
+    __nv_bfloat16* __restrict__ slot_ssm_0,
+    __nv_bfloat16* __restrict__ slot_ssm_1,
+    int num_k_heads,
+    int num_v_heads,
+    int head_dim,
+    int M)
+{
+    int h = blockIdx.x;
+    if (h >= num_v_heads) return;
+
+    int tid = threadIdx.x;
+    int k_h = h / (num_v_heads / num_k_heads); // 48 / 16 = 3
+
+    __shared__ __nv_bfloat16 s_state[128][132];
+
+    __shared__ float s_q[128];
+    __shared__ float s_k[128];
+    __shared__ float s_v[128];
+    __shared__ float s_z[128];
+    __shared__ float s_kv_mem[128];
+    __shared__ float s_out[128];
+    __shared__ float s_q_norm_sq;
+    __shared__ float s_k_norm_sq;
+    __shared__ float s_out_norm_sq;
+
+    const __nv_bfloat16* in_state_h = in_ssm_state + (size_t)h * head_dim * head_dim;
+
+    // Load initial state into shared memory once
+    #pragma unroll 4
+    for (int r = 0; r < head_dim; r++) {
+        s_state[r][tid] = in_state_h[r * head_dim + tid];
+    }
+    __syncthreads();
+
+    float dt_val = __bfloat162float(dt_bias[h]);
+    float a_log_val = __bfloat162float(A_log[h]);
+    float nw_val = (tid < head_dim) ? __bfloat162float(norm_w[tid]) : 0.0f;
+
+    int q_offset = k_h * head_dim;
+    int k_offset = (num_k_heads * head_dim) + k_h * head_dim;
+    int v_offset = (2 * num_k_heads * head_dim) + h * head_dim;
+    int qkv_stride = (2 * num_k_heads + num_v_heads) * head_dim; // 10240
+    int z_stride = num_v_heads * head_dim; // 6144
+
+    for (int m = 0; m < M; m++) {
+        const __nv_bfloat16* m_conv = conv_out + (size_t)m * qkv_stride;
+        const __nv_bfloat16* m_z = in_z + (size_t)m * z_stride;
+        const __nv_bfloat16* m_a = in_a + (size_t)m * num_v_heads;
+        const __nv_bfloat16* m_b = in_b + (size_t)m * num_v_heads;
+
+        float a_val = __bfloat162float(m_a[h]);
+        float b_val = __bfloat162float(m_b[h]);
+        float beta = 1.0f / (1.0f + __expf(-b_val));
+        float val_a = a_val + dt_val;
+        float softplus_a = (val_a > 20.0f) ? val_a : log1pf(__expf(val_a));
+        float g = -__expf(a_log_val) * softplus_a;
+        float decay = __expf(g);
+
+        if (tid < head_dim) {
+            s_q[tid] = __bfloat162float(m_conv[q_offset + tid]);
+            s_k[tid] = __bfloat162float(m_conv[k_offset + tid]);
+            s_v[tid] = __bfloat162float(m_conv[v_offset + tid]);
+            s_z[tid] = __bfloat162float(m_z[h * head_dim + tid]);
+        }
+        if (tid == 0) {
+            s_q_norm_sq = 0.0f;
+            s_k_norm_sq = 0.0f;
+            s_out_norm_sq = 0.0f;
+        }
+        __syncthreads();
+
+        // 1. L2 Normalize Q and K
+        float q_sq = (tid < head_dim) ? (s_q[tid] * s_q[tid]) : 0.0f;
+        float k_sq = (tid < head_dim) ? (s_k[tid] * s_k[tid]) : 0.0f;
+        for (int offset = 16; offset > 0; offset /= 2) {
+            q_sq += __shfl_down_sync(0xFFFFFFFF, q_sq, offset);
+            k_sq += __shfl_down_sync(0xFFFFFFFF, k_sq, offset);
+        }
+        if (tid % 32 == 0) {
+            atomicAdd(&s_q_norm_sq, q_sq);
+            atomicAdd(&s_k_norm_sq, k_sq);
+        }
+        __syncthreads();
+
+        if (tid < head_dim) {
+            float r_q = rsqrtf(s_q_norm_sq + 1e-6f) * (1.0f / sqrtf((float)head_dim));
+            float r_k = rsqrtf(s_k_norm_sq + 1e-6f);
+            s_q[tid] *= r_q;
+            s_k[tid] *= r_k;
+        }
+        __syncthreads();
+
+        // 2. Compute kv_mem[col] from shared memory state
+        if (tid < head_dim) {
+            float mem = 0.0f;
+            #pragma unroll 4
+            for (int r = 0; r < head_dim; r++) {
+                float s_val = __bfloat162float(s_state[r][tid]);
+                mem += (decay * s_val) * s_k[r];
+            }
+            s_kv_mem[tid] = mem;
+        }
+        __syncthreads();
+
+        // 3. State delta update in shared memory
+        if (tid < head_dim) {
+            float delta_c = (s_v[tid] - s_kv_mem[tid]) * beta;
+            float out_c = 0.0f;
+            #pragma unroll 4
+            for (int r = 0; r < head_dim; r++) {
+                float new_s = decay * __bfloat162float(s_state[r][tid]) + s_k[r] * delta_c;
+                s_state[r][tid] = __float2bfloat16(new_s);
+                out_c += new_s * s_q[r];
+            }
+            s_out[tid] = out_c;
+        }
+        __syncthreads();
+
+        // Save intermediate state slot if needed for rollback
+        if (m == 0 && slot_ssm_0) {
+            __nv_bfloat16* slot_state_h = slot_ssm_0 + (size_t)h * head_dim * head_dim;
+            #pragma unroll 4
+            for (int r = 0; r < head_dim; r++) {
+                slot_state_h[r * head_dim + tid] = s_state[r][tid];
+            }
+        } else if (m == 1 && slot_ssm_1) {
+            __nv_bfloat16* slot_state_h = slot_ssm_1 + (size_t)h * head_dim * head_dim;
+            #pragma unroll 4
+            for (int r = 0; r < head_dim; r++) {
+                slot_state_h[r * head_dim + tid] = s_state[r][tid];
+            }
+        }
+
+        // 4. Output RMSNorm + Z-gating
+        float out_sq = (tid < head_dim) ? (s_out[tid] * s_out[tid]) : 0.0f;
+        for (int offset = 16; offset > 0; offset /= 2) {
+            out_sq += __shfl_down_sync(0xFFFFFFFF, out_sq, offset);
+        }
+        if (tid % 32 == 0) atomicAdd(&s_out_norm_sq, out_sq);
+        __syncthreads();
+
+        float r_out = rsqrtf(s_out_norm_sq / (float)head_dim + 1e-6f);
+        if (tid < head_dim) {
+            float normed = s_out[tid] * r_out * nw_val;
+            float z = s_z[tid];
+            float silu_z = z / (1.0f + __expf(-z));
+            out[(size_t)m * z_stride + h * head_dim + tid] = __float2bfloat16(normed * silu_z);
+        }
+        __syncthreads();
+    }
+
+    // Write final state to out_ssm_state in VRAM
+    if (out_ssm_state) {
+        __nv_bfloat16* out_state_h = out_ssm_state + (size_t)h * head_dim * head_dim;
+        #pragma unroll 4
+        for (int r = 0; r < head_dim; r++) {
+            out_state_h[r * head_dim + tid] = s_state[r][tid];
+        }
+    }
+}
+
+void deltanet_linear_attention_decode_batch_cuda(
+    __nv_bfloat16* out,
+    const __nv_bfloat16* in_qkv,
+    const __nv_bfloat16* in_z,
+    const __nv_bfloat16* in_a,
+    const __nv_bfloat16* in_b,
+    const __nv_bfloat16* conv1d_w,
+    const __nv_bfloat16* in_conv_state,
+    __nv_bfloat16* out_conv_state,
+    __nv_bfloat16* slot_conv_0,
+    __nv_bfloat16* slot_conv_1,
+    const __nv_bfloat16* A_log,
+    const __nv_bfloat16* dt_bias,
+    const __nv_bfloat16* norm_w,
+    const __nv_bfloat16* in_ssm_state,
+    __nv_bfloat16* out_ssm_state,
+    __nv_bfloat16* slot_ssm_0,
+    __nv_bfloat16* slot_ssm_1,
+    int num_k_heads,
+    int num_v_heads,
+    int head_dim,
+    int M,
+    cudaStream_t stream)
+{
+    int channels = (2 * num_k_heads + num_v_heads) * head_dim;
+    int threads = 256;
+    int blocks = (channels + threads - 1) / threads;
+
+    __nv_bfloat16* conv_out = const_cast<__nv_bfloat16*>(in_qkv);
+    deltanet_conv_batch_kernel<<<blocks, threads, 0, stream>>>(
+        conv_out, in_qkv, conv1d_w, in_conv_state, out_conv_state,
+        slot_conv_0, slot_conv_1, channels, M);
+
+    deltanet_ssm_batch_kernel<<<num_v_heads, 128, 0, stream>>>(
+        out, conv_out, in_z, in_a, in_b, A_log, dt_bias, norm_w,
+        in_ssm_state, out_ssm_state, slot_ssm_0, slot_ssm_1,
+        num_k_heads, num_v_heads, head_dim, M);
 }
 
 // ── Qwen 3.8 Gated GQA Attention Decode Kernels ───────────────────────────────
@@ -5531,6 +6005,147 @@ void argmax_f32_cuda(int32_t* out, const float* logits, int n, cudaStream_t stre
     }
     argmax_f32_stage1_kernel<<<N_BLOCKS, 256, 0, stream>>>(s_d_block_maxes, s_d_block_indices, logits, n);
     argmax_f32_stage2_kernel<<<1, 128, 0, stream>>>(out, nullptr, s_d_block_maxes, s_d_block_indices, N_BLOCKS);
+}
+
+__global__ void argmax_f32_batch_stage1_kernel(
+    float* __restrict__ block_maxes,
+    int32_t* __restrict__ block_indices,
+    const float* __restrict__ logits,
+    int n)
+{
+    int m = blockIdx.y;
+    const float* row_logits = logits + (size_t)m * n;
+    float* row_block_maxes = block_maxes + m * gridDim.x;
+    int32_t* row_block_indices = block_indices + m * gridDim.x;
+
+    __shared__ float s_max[32];
+    __shared__ int32_t s_idx[32];
+
+    int tid = threadIdx.x;
+    int gid = blockIdx.x * blockDim.x + threadIdx.x;
+    int stride = gridDim.x * blockDim.x;
+
+    float max_val = -1e38f;
+    int32_t max_idx = 0;
+
+    for (int i = gid; i < n; i += stride) {
+        float v = row_logits[i];
+        if (v > max_val) {
+            max_val = v;
+            max_idx = i;
+        }
+    }
+
+    #pragma unroll
+    for (int offset = 16; offset > 0; offset /= 2) {
+        float other_val = __shfl_down_sync(0xffffffff, max_val, offset);
+        int32_t other_idx = __shfl_down_sync(0xffffffff, max_idx, offset);
+        if (other_val > max_val) {
+            max_val = other_val;
+            max_idx = other_idx;
+        }
+    }
+
+    int lane = tid & 31;
+    int warp = tid >> 5;
+    if (lane == 0) {
+        s_max[warp] = max_val;
+        s_idx[warp] = max_idx;
+    }
+    __syncthreads();
+
+    if (warp == 0) {
+        int n_warps = blockDim.x / 32;
+        max_val = (lane < n_warps) ? s_max[lane] : -1e38f;
+        max_idx = (lane < n_warps) ? s_idx[lane] : 0;
+        #pragma unroll
+        for (int offset = 16; offset > 0; offset /= 2) {
+            float other_val = __shfl_down_sync(0xffffffff, max_val, offset);
+            int32_t other_idx = __shfl_down_sync(0xffffffff, max_idx, offset);
+            if (other_val > max_val) {
+                max_val = other_val;
+                max_idx = other_idx;
+            }
+        }
+        if (lane == 0) {
+            row_block_maxes[blockIdx.x] = max_val;
+            row_block_indices[blockIdx.x] = max_idx;
+        }
+    }
+}
+
+__global__ void argmax_f32_batch_stage2_kernel(
+    int32_t* __restrict__ out_idx,
+    const float* __restrict__ block_maxes,
+    const int32_t* __restrict__ block_indices,
+    int n_blocks)
+{
+    int m = blockIdx.x;
+    const float* row_block_maxes = block_maxes + m * n_blocks;
+    const int32_t* row_block_indices = block_indices + m * n_blocks;
+
+    __shared__ float s_max[32];
+    __shared__ int32_t s_idx[32];
+
+    int tid = threadIdx.x;
+    int lane = tid & 31;
+    int warp = tid >> 5;
+
+    float max_val = (tid < n_blocks) ? row_block_maxes[tid] : -1e38f;
+    int32_t max_idx = (tid < n_blocks) ? row_block_indices[tid] : 0;
+
+    #pragma unroll
+    for (int offset = 16; offset > 0; offset /= 2) {
+        float other_val = __shfl_down_sync(0xffffffff, max_val, offset);
+        int32_t other_idx = __shfl_down_sync(0xffffffff, max_idx, offset);
+        if (other_val > max_val) {
+            max_val = other_val;
+            max_idx = other_idx;
+        }
+    }
+
+    if (lane == 0) {
+        s_max[warp] = max_val;
+        s_idx[warp] = max_idx;
+    }
+    __syncthreads();
+
+    if (warp == 0) {
+        int n_warps = (blockDim.x + 31) / 32;
+        max_val = (lane < n_warps) ? s_max[lane] : -1e38f;
+        max_idx = (lane < n_warps) ? s_idx[lane] : 0;
+        #pragma unroll
+        for (int offset = 16; offset > 0; offset /= 2) {
+            float other_val = __shfl_down_sync(0xffffffff, max_val, offset);
+            int32_t other_idx = __shfl_down_sync(0xffffffff, max_idx, offset);
+            if (other_val > max_val) {
+                max_val = other_val;
+                max_idx = other_idx;
+            }
+        }
+        if (lane == 0) {
+            out_idx[m] = max_idx;
+        }
+    }
+}
+
+void argmax_f32_batch_cuda(int32_t* out, const float* logits, int n, int M, cudaStream_t stream) {
+    static float* s_d_block_maxes = nullptr;
+    static int32_t* s_d_block_indices = nullptr;
+    static const int N_BLOCKS = 64;
+    static int s_alloc_m = 0;
+    if (!s_d_block_maxes || s_alloc_m < M) {
+        if (s_d_block_maxes) {
+            cudaFree(s_d_block_maxes);
+            cudaFree(s_d_block_indices);
+        }
+        s_alloc_m = (M > 8) ? M : 8;
+        cudaMalloc(&s_d_block_maxes, s_alloc_m * N_BLOCKS * sizeof(float));
+        cudaMalloc(&s_d_block_indices, s_alloc_m * N_BLOCKS * sizeof(int32_t));
+    }
+    dim3 grid1(N_BLOCKS, M);
+    argmax_f32_batch_stage1_kernel<<<grid1, 256, 0, stream>>>(s_d_block_maxes, s_d_block_indices, logits, n);
+    argmax_f32_batch_stage2_kernel<<<M, 64, 0, stream>>>(out, s_d_block_maxes, s_d_block_indices, N_BLOCKS);
 }
 
 // ── GPU-Native Multinomial Softmax Sampling with Min-P Filtering ─────────────
@@ -5696,5 +6311,74 @@ void accumulate_expert_freq_cuda(
 {
     accumulate_expert_freq_kernel<<<1, 32, 0, stream>>>(
         expert_counts, step_topk, topk_idx, track_flag, layer_id, n_experts, top_k);
+}
+
+// ── Increment Int32 Scalar on Device (CUDA Graph Compatible) ────────────────────
+__global__ void increment_i32_kernel(int32_t* __restrict__ ptr, int inc) {
+    if (threadIdx.x == 0 && ptr != nullptr) {
+        *ptr += inc;
+    }
+}
+
+void increment_i32_cuda(int32_t* ptr, int inc, cudaStream_t stream) {
+    increment_i32_kernel<<<1, 1, 0, stream>>>(ptr, inc);
+}
+
+// ── Fast GPU Quantization: BF16 to INT4 Symmetric (Block Size = 32, Zero-point 8) ──
+__global__ void quantize_bf16_to_int4_symmetric_kernel(
+    uint8_t* __restrict__ out_packed,         // [N, K / 2]
+    __nv_bfloat16* __restrict__ out_scale,   // [N, K / 32]
+    const __nv_bfloat16* __restrict__ in_bf16,// [N, K]
+    int N, int K)
+{
+    int row = blockIdx.y;
+    int block_idx = blockIdx.x * blockDim.x + threadIdx.x; // index of 32-element block
+    int num_blocks = K / 32;
+    if (row >= N || block_idx >= num_blocks) return;
+
+    const __nv_bfloat16* in_block = in_bf16 + (size_t)row * K + (size_t)block_idx * 32;
+
+    // 1. Find max abs across 32 elements
+    float max_val = 0.0f;
+    #pragma unroll
+    for (int i = 0; i < 32; i++) {
+        float val = fabsf(__bfloat162float(in_block[i]));
+        if (val > max_val) max_val = val;
+    }
+    float scale = fmaxf(max_val / 7.0f, 1e-8f);
+    float inv_scale = 1.0f / scale;
+
+    out_scale[(size_t)row * num_blocks + block_idx] = __float2bfloat16(scale);
+
+    // 2. Quantize and pack into 16 bytes
+    uint8_t* out_ptr = out_packed + (size_t)row * (K / 2) + (size_t)block_idx * 16;
+    #pragma unroll
+    for (int p = 0; p < 16; p++) {
+        float x0 = __bfloat162float(in_block[2 * p]);
+        float x1 = __bfloat162float(in_block[2 * p + 1]);
+
+        int q0 = __float2int_rn(x0 * inv_scale) + 8;
+        int q1 = __float2int_rn(x1 * inv_scale) + 8;
+
+        q0 = max(0, min(15, q0));
+        q1 = max(0, min(15, q1));
+
+        out_ptr[p] = (uint8_t)((q0 & 0x0F) | ((q1 & 0x0F) << 4));
+    }
+}
+
+void quantize_bf16_to_int4_symmetric_cuda(
+    uint8_t* out_packed,
+    __nv_bfloat16* out_scale,
+    const __nv_bfloat16* in_bf16,
+    int N, int K,
+    cudaStream_t stream)
+{
+    int num_blocks = K / 32;
+    int threads = 128;
+    int grid_x = (num_blocks + threads - 1) / threads;
+    dim3 grid(grid_x, N);
+    quantize_bf16_to_int4_symmetric_kernel<<<grid, threads, 0, stream>>>(
+        out_packed, out_scale, in_bf16, N, K);
 }
 

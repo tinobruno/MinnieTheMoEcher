@@ -1576,6 +1576,944 @@ public:
 };
 
 // ════════════════════════════════════════════════════════════════════════════════
+//  Qwen 3.8 2B Neural Speculative Decoding Draft Engine
+// ════════════════════════════════════════════════════════════════════════════════
+
+struct QwenDraftLayer {
+    bool is_linear_attn = true;
+    // Linear Attention (DeltaNet)
+    GPUTensor w_in_qkv, w_in_qkv_scale; // [6144, 2048]
+    GPUTensor w_in_z, w_in_z_scale;     // [2048, 2048]
+    GPUTensor w_in_a, w_in_a_scale;     // [16, 2048]
+    GPUTensor w_in_b, w_in_b_scale;     // [16, 2048]
+    GPUTensor conv1d_w;                 // [6144, 1, 4]
+    GPUTensor A_log, dt_bias;           // [16]
+    GPUTensor linear_norm_w;            // [128]
+    GPUTensor linear_out_proj, linear_out_proj_scale; // [2048, 2048]
+    GPUTensor ssm_state, ssm_state_chk;                // [16, 128, 128]
+    GPUTensor conv_state, conv_state_chk;              // [6144, 4]
+
+    // Full GQA Attention
+    GPUTensor w_q, w_q_scale;           // [4096, 2048]
+    GPUTensor w_k, w_k_scale;           // [512, 2048]
+    GPUTensor w_v, w_v_scale;           // [512, 2048]
+    GPUTensor q_norm_w, k_norm_w;       // [256]
+    GPUTensor w_o, w_o_scale;           // [2048, 2048]
+    GPUTensor k_cache, v_cache;         // [2048, 2, 256]
+
+    // Shared layer norms & MLP
+    GPUTensor input_norm_w, post_attn_norm_w;
+    GPUTensor w_gate, w_gate_scale;     // [6144, 2048]
+    GPUTensor w_up, w_up_scale;         // [6144, 2048]
+    GPUTensor w_down, w_down_scale;     // [2048, 6144]
+};
+
+class QwenDraftEngine2B {
+public:
+    bool loaded_ = false;
+    int vocab_size_ = 248320;
+    int hidden_size_ = 2048;
+    int num_layers_ = 24;
+    int intermediate_size_ = 6144;
+    int num_heads_ = 8;
+    int num_kv_heads_ = 2;
+    int head_dim_ = 256;
+    int linear_num_heads_ = 16;
+    int linear_head_dim_ = 128;
+
+    GPUTensor embed_w_;
+    GPUTensor embed_w_int4_;
+    GPUTensor embed_w_scale_;
+    GPUTensor final_norm_w_;
+    std::vector<QwenDraftLayer> layers_;
+
+    // Working activations
+    GPUTensor buf_input_token_;
+    GPUTensor buf_hidden_;
+    GPUTensor buf_hidden2_;
+    GPUTensor buf_qkv_;
+    GPUTensor buf_z_;
+    GPUTensor buf_a_;
+    GPUTensor buf_b_;
+    GPUTensor buf_q_;
+    GPUTensor buf_k_;
+    GPUTensor buf_v_;
+    GPUTensor buf_attn_out_;
+    GPUTensor buf_gate_;
+    GPUTensor buf_up_;
+    GPUTensor buf_logits_;
+    GPUTensor buf_argmax_out_;
+
+    GPUTensor draft_ssm_pool_;
+    GPUTensor draft_ssm_slots_[8];
+    GPUTensor draft_conv_pool_;
+    GPUTensor draft_conv_slots_[8];
+    int32_t* h_draft_tok_ = nullptr;
+    int32_t* h_draft_pos_ = nullptr;
+
+    bool load(const std::string& draft_manifest_path, cudaStream_t stream = nullptr) {
+        std::ifstream mf(draft_manifest_path);
+        if (!mf.is_open()) return false;
+        json manifest;
+        try { mf >> manifest; } catch (...) { return false; }
+        mf.close();
+
+        std::string manifest_dir = "";
+        size_t last_slash = draft_manifest_path.find_last_of("/\\");
+        if (last_slash != std::string::npos) {
+            manifest_dir = draft_manifest_path.substr(0, last_slash + 1);
+        }
+
+        std::string bin_name = manifest.value("dense_bin", "qwen3_8_draft_2b.bin");
+        std::string bin_path = manifest_dir + bin_name;
+
+        std::ifstream bf(bin_path, std::ios::binary);
+        if (!bf.is_open()) {
+            LOG_WARN("Cannot open draft binary: %s", bin_path.c_str());
+            return false;
+        }
+
+        auto& dense_tensors = manifest["dense_tensors"];
+
+        auto load_t = [&](GPUTensor& t, const std::string& name) -> bool {
+            if (!dense_tensors.contains(name)) return false;
+            auto& meta = dense_tensors[name];
+            size_t offset = meta["offset"].get<size_t>();
+            size_t nbytes = meta["nbytes"].get<size_t>();
+            t.alloc(nbytes);
+            std::vector<uint8_t> host_buf(nbytes);
+            bf.seekg(offset);
+            bf.read((char*)host_buf.data(), nbytes);
+            CUDA_CHECK(cudaMemcpy(t.data, host_buf.data(), nbytes, cudaMemcpyHostToDevice));
+            return true;
+        };
+
+        auto load_quant_t = [&](GPUTensor& w, GPUTensor& s, const std::string& name) -> bool {
+            if (!dense_tensors.contains(name)) return false;
+            auto& meta = dense_tensors[name];
+            size_t offset = meta["offset"].get<size_t>();
+            size_t nbytes = meta["nbytes"].get<size_t>();
+            w.alloc(nbytes);
+            w.dtype = meta.value("dtype", "int4");
+            std::vector<uint8_t> host_buf(nbytes);
+            bf.seekg(offset);
+            bf.read((char*)host_buf.data(), nbytes);
+            CUDA_CHECK(cudaMemcpy(w.data, host_buf.data(), nbytes, cudaMemcpyHostToDevice));
+
+            if (meta.contains("scale_offset")) {
+                size_t s_off = meta["scale_offset"].get<size_t>();
+                size_t s_nb = meta["scale_nbytes"].get<size_t>();
+                s.alloc(s_nb);
+                std::vector<uint8_t> s_buf(s_nb);
+                bf.seekg(s_off);
+                bf.read((char*)s_buf.data(), s_nb);
+                CUDA_CHECK(cudaMemcpy(s.data, s_buf.data(), s_nb, cudaMemcpyHostToDevice));
+            }
+            return true;
+        };
+
+        load_t(embed_w_, "model.language_model.embed_tokens.weight");
+        load_t(final_norm_w_, "model.language_model.norm.weight");
+
+        layers_.resize(num_layers_);
+        int n_linear = 0;
+        for (int l = 0; l < num_layers_; l++) {
+            std::string prefix = "model.language_model.layers." + std::to_string(l);
+            auto& lw = layers_[l];
+            load_t(lw.input_norm_w, prefix + ".input_layernorm.weight");
+            load_t(lw.post_attn_norm_w, prefix + ".post_attention_layernorm.weight");
+            load_quant_t(lw.w_gate, lw.w_gate_scale, prefix + ".mlp.gate_proj.weight");
+            load_quant_t(lw.w_up, lw.w_up_scale, prefix + ".mlp.up_proj.weight");
+            load_quant_t(lw.w_down, lw.w_down_scale, prefix + ".mlp.down_proj.weight");
+
+            if (dense_tensors.contains(prefix + ".linear_attn.in_proj_qkv.weight")) {
+                lw.is_linear_attn = true;
+                n_linear++;
+                load_quant_t(lw.w_in_qkv, lw.w_in_qkv_scale, prefix + ".linear_attn.in_proj_qkv.weight");
+                load_quant_t(lw.w_in_z, lw.w_in_z_scale, prefix + ".linear_attn.in_proj_z.weight");
+                load_quant_t(lw.w_in_a, lw.w_in_a_scale, prefix + ".linear_attn.in_proj_a.weight");
+                load_quant_t(lw.w_in_b, lw.w_in_b_scale, prefix + ".linear_attn.in_proj_b.weight");
+                load_t(lw.conv1d_w, prefix + ".linear_attn.conv1d.weight");
+                load_t(lw.A_log, prefix + ".linear_attn.A_log");
+                load_t(lw.dt_bias, prefix + ".linear_attn.dt_bias");
+                load_t(lw.linear_norm_w, prefix + ".linear_attn.norm.weight");
+                load_quant_t(lw.linear_out_proj, lw.linear_out_proj_scale, prefix + ".linear_attn.out_proj.weight");
+            } else {
+                lw.is_linear_attn = false;
+                load_quant_t(lw.w_q, lw.w_q_scale, prefix + ".self_attn.q_proj.weight");
+                load_quant_t(lw.w_k, lw.w_k_scale, prefix + ".self_attn.k_proj.weight");
+                load_quant_t(lw.w_v, lw.w_v_scale, prefix + ".self_attn.v_proj.weight");
+                load_t(lw.q_norm_w, prefix + ".self_attn.q_norm.weight");
+                load_t(lw.k_norm_w, prefix + ".self_attn.k_norm.weight");
+                load_quant_t(lw.w_o, lw.w_o_scale, prefix + ".self_attn.o_proj.weight");
+
+                lw.k_cache.alloc(2048 * num_kv_heads_ * head_dim_ * sizeof(__nv_bfloat16));
+                lw.v_cache.alloc(2048 * num_kv_heads_ * head_dim_ * sizeof(__nv_bfloat16));
+                CUDA_CHECK(cudaMemset(lw.k_cache.data, 0, lw.k_cache.size_bytes));
+                CUDA_CHECK(cudaMemset(lw.v_cache.data, 0, lw.v_cache.size_bytes));
+            }
+        }
+
+        if (n_linear > 0) {
+            size_t ssm_bytes_per_layer = 16 * 128 * 128 * sizeof(__nv_bfloat16);
+            size_t conv_bytes_per_layer = 6144 * 4 * sizeof(__nv_bfloat16);
+            draft_ssm_pool_.alloc(n_linear * ssm_bytes_per_layer);
+            draft_conv_pool_.alloc(n_linear * conv_bytes_per_layer);
+            CUDA_CHECK(cudaMemset(draft_ssm_pool_.data, 0, draft_ssm_pool_.size_bytes));
+            CUDA_CHECK(cudaMemset(draft_conv_pool_.data, 0, draft_conv_pool_.size_bytes));
+
+            for (int s = 0; s < 8; s++) {
+                draft_ssm_slots_[s].alloc(n_linear * ssm_bytes_per_layer);
+                draft_conv_slots_[s].alloc(n_linear * conv_bytes_per_layer);
+                CUDA_CHECK(cudaMemset(draft_ssm_slots_[s].data, 0, draft_ssm_slots_[s].size_bytes));
+                CUDA_CHECK(cudaMemset(draft_conv_slots_[s].data, 0, draft_conv_slots_[s].size_bytes));
+            }
+
+            int lin_idx = 0;
+            for (int l = 0; l < num_layers_; l++) {
+                if (layers_[l].is_linear_attn) {
+                    layers_[l].ssm_state.data = (uint8_t*)draft_ssm_pool_.data + lin_idx * ssm_bytes_per_layer;
+                    layers_[l].ssm_state.size_bytes = ssm_bytes_per_layer;
+
+                    layers_[l].conv_state.data = (uint8_t*)draft_conv_pool_.data + lin_idx * conv_bytes_per_layer;
+                    layers_[l].conv_state.size_bytes = conv_bytes_per_layer;
+                    lin_idx++;
+                }
+            }
+        }
+
+        buf_input_token_.alloc(sizeof(int32_t));
+        buf_hidden_.alloc(hidden_size_ * sizeof(__nv_bfloat16));
+        buf_hidden2_.alloc(hidden_size_ * sizeof(__nv_bfloat16));
+        buf_qkv_.alloc(6144 * sizeof(__nv_bfloat16));
+        buf_z_.alloc(2048 * sizeof(__nv_bfloat16));
+        buf_a_.alloc(16 * sizeof(__nv_bfloat16));
+        buf_b_.alloc(16 * sizeof(__nv_bfloat16));
+        buf_q_.alloc(2 * num_heads_ * head_dim_ * sizeof(__nv_bfloat16));
+        buf_k_.alloc(num_kv_heads_ * head_dim_ * sizeof(__nv_bfloat16));
+        buf_v_.alloc(num_kv_heads_ * head_dim_ * sizeof(__nv_bfloat16));
+        buf_attn_out_.alloc(hidden_size_ * sizeof(__nv_bfloat16));
+        buf_gate_.alloc(intermediate_size_ * sizeof(__nv_bfloat16));
+        buf_up_.alloc(intermediate_size_ * sizeof(__nv_bfloat16));
+        buf_logits_.alloc(vocab_size_ * sizeof(float));
+        buf_argmax_out_.alloc(sizeof(int32_t));
+
+        loaded_ = true;
+        LOG_INFO("Qwen 3.8 2B Neural Speculative Draft Model loaded successfully (24 layers, 1.7GB VRAM)!");
+        return true;
+    }
+
+    void reset_state(cudaStream_t stream = nullptr) {
+        if (!loaded_) return;
+        if (draft_ssm_pool_.data) CUDA_CHECK(cudaMemsetAsync(draft_ssm_pool_.data, 0, draft_ssm_pool_.size_bytes, stream));
+        if (draft_conv_pool_.data) CUDA_CHECK(cudaMemsetAsync(draft_conv_pool_.data, 0, draft_conv_pool_.size_bytes, stream));
+        for (int s = 0; s < 8; s++) {
+            if (draft_ssm_slots_[s].data) CUDA_CHECK(cudaMemsetAsync(draft_ssm_slots_[s].data, 0, draft_ssm_slots_[s].size_bytes, stream));
+            if (draft_conv_slots_[s].data) CUDA_CHECK(cudaMemsetAsync(draft_conv_slots_[s].data, 0, draft_conv_slots_[s].size_bytes, stream));
+        }
+        for (auto& lw : layers_) {
+            if (!lw.is_linear_attn) {
+                if (lw.k_cache.data) CUDA_CHECK(cudaMemsetAsync(lw.k_cache.data, 0, lw.k_cache.size_bytes, stream));
+                if (lw.v_cache.data) CUDA_CHECK(cudaMemsetAsync(lw.v_cache.data, 0, lw.v_cache.size_bytes, stream));
+            }
+        }
+    }
+
+    inline void checkpoint_state(cudaStream_t stream = nullptr) {
+        if (!loaded_) return;
+        if (draft_ssm_pool_.data && draft_ssm_slots_[0].data) {
+            CUDA_CHECK(cudaMemcpyAsync(draft_ssm_slots_[0].data, draft_ssm_pool_.data, draft_ssm_pool_.size_bytes, cudaMemcpyDeviceToDevice, stream));
+            CUDA_CHECK(cudaMemcpyAsync(draft_conv_slots_[0].data, draft_conv_pool_.data, draft_conv_pool_.size_bytes, cudaMemcpyDeviceToDevice, stream));
+        }
+    }
+
+    inline void restore_state(cudaStream_t stream = nullptr) {
+        if (!loaded_) return;
+        if (draft_ssm_pool_.data && draft_ssm_slots_[0].data) {
+            CUDA_CHECK(cudaMemcpyAsync(draft_ssm_pool_.data, draft_ssm_slots_[0].data, draft_ssm_pool_.size_bytes, cudaMemcpyDeviceToDevice, stream));
+            CUDA_CHECK(cudaMemcpyAsync(draft_conv_pool_.data, draft_conv_slots_[0].data, draft_conv_pool_.size_bytes, cudaMemcpyDeviceToDevice, stream));
+        }
+    }
+
+    inline void commit_state_slot(int slot_idx, cudaStream_t stream = nullptr) {
+        if (!loaded_ || slot_idx < 0 || slot_idx >= 8) return;
+        if (draft_ssm_pool_.data && draft_ssm_slots_[slot_idx].data) {
+            CUDA_CHECK(cudaMemcpyAsync(draft_ssm_pool_.data, draft_ssm_slots_[slot_idx].data, draft_ssm_pool_.size_bytes, cudaMemcpyDeviceToDevice, stream));
+            CUDA_CHECK(cudaMemcpyAsync(draft_conv_pool_.data, draft_conv_slots_[slot_idx].data, draft_conv_pool_.size_bytes, cudaMemcpyDeviceToDevice, stream));
+        }
+    }
+
+    bool graph_captured_ = false;
+    cudaGraph_t graph_;
+    cudaGraphExec_t graph_exec_;
+    bool draft_k_graph_captured_[9] = {false};
+    cudaGraph_t draft_k_graph_[9];
+    cudaGraphExec_t draft_k_graph_exec_[9];
+    GPUTensor buf_input_pos_;
+    int32_t* draft_best_host_ = nullptr;
+    GPUTensor buf_draft_k_tokens_;
+    int32_t* h_draft_k_cands_ = nullptr;
+    int32_t* h_draft_k_pos_ = nullptr;
+
+    void forward_token_device_body(int position, cudaStream_t stream) {
+        // 1. Embedding lookup
+        embedding_cuda(buf_hidden_.bf16(), embed_w_.bf16(), buf_input_token_.i32(), 1, hidden_size_, stream);
+
+        auto matmul_proj = [&](GPUTensor& out, GPUTensor& in_vec, GPUTensor& weight, GPUTensor& scale, int N, int K) {
+            if (weight.dtype == "int4") {
+                gemv_int4_cuda(out.bf16(), in_vec.bf16(), (const uint8_t*)weight.data, scale.bf16(), N, K, stream);
+            } else {
+                gemv_bf16_out_bf16_cuda(out.bf16(), weight.bf16(), in_vec.bf16(), N, K, stream);
+            }
+        };
+
+        // 2. 24 Layers
+        for (int l = 0; l < num_layers_; l++) {
+            auto& lw = layers_[l];
+
+            // Attention RMSNorm (1-centered for Qwen 3.8)
+            rms_norm_one_centered_cuda(buf_hidden2_.bf16(), buf_hidden_.bf16(),
+                                       lw.input_norm_w.bf16(), hidden_size_, 1e-6f, stream);
+
+            if (lw.is_linear_attn) {
+                matmul_proj(buf_qkv_, buf_hidden2_, lw.w_in_qkv, lw.w_in_qkv_scale, 6144, hidden_size_);
+                matmul_proj(buf_z_, buf_hidden2_, lw.w_in_z, lw.w_in_z_scale, 2048, hidden_size_);
+                matmul_proj(buf_a_, buf_hidden2_, lw.w_in_a, lw.w_in_a_scale, 16, hidden_size_);
+                matmul_proj(buf_b_, buf_hidden2_, lw.w_in_b, lw.w_in_b_scale, 16, hidden_size_);
+
+                deltanet_linear_attention_decode_cuda(
+                    buf_attn_out_.bf16(), buf_qkv_.bf16(), buf_z_.bf16(),
+                    buf_a_.bf16(), buf_b_.bf16(),
+                    lw.conv1d_w.bf16(), lw.conv_state.bf16(),
+                    lw.A_log.bf16(), lw.dt_bias.bf16(),
+                    lw.linear_norm_w.bf16(), lw.ssm_state.bf16(),
+                    16, 16, 128, stream);
+
+                if (lw.linear_out_proj.dtype == "int4") {
+                    gemv_int4_residual_cuda(buf_hidden_.bf16(), buf_attn_out_.bf16(),
+                                            (const uint8_t*)lw.linear_out_proj.data, lw.linear_out_proj_scale.bf16(),
+                                            hidden_size_, 2048, stream);
+                } else {
+                    matmul_proj(buf_hidden2_, buf_attn_out_, lw.linear_out_proj, lw.linear_out_proj_scale, hidden_size_, 2048);
+                    vector_add_bf16_cuda(buf_hidden_.bf16(), buf_hidden2_.bf16(), hidden_size_, stream);
+                }
+            } else {
+                matmul_proj(buf_q_, buf_hidden2_, lw.w_q, lw.w_q_scale, 2 * num_heads_ * head_dim_, hidden_size_);
+                matmul_proj(buf_k_, buf_hidden2_, lw.w_k, lw.w_k_scale, num_kv_heads_ * head_dim_, hidden_size_);
+                matmul_proj(buf_v_, buf_hidden2_, lw.w_v, lw.w_v_scale, num_kv_heads_ * head_dim_, hidden_size_);
+
+                qwen_gqa_decode_gated_cuda(
+                    buf_attn_out_.bf16(), buf_q_.bf16(), buf_k_.bf16(), buf_v_.bf16(),
+                    lw.q_norm_w.bf16(), lw.k_norm_w.bf16(),
+                    lw.k_cache.bf16(), lw.v_cache.bf16(),
+                    num_heads_, num_kv_heads_, head_dim_,
+                    buf_input_pos_.data ? buf_input_pos_.i32() : nullptr, position, 2048, 10000000.0f, 1e-6f, stream);
+
+                if (lw.w_o.dtype == "int4") {
+                    gemv_int4_residual_cuda(buf_hidden_.bf16(), buf_attn_out_.bf16(),
+                                            (const uint8_t*)lw.w_o.data, lw.w_o_scale.bf16(),
+                                            hidden_size_, num_heads_ * head_dim_, stream);
+                } else {
+                    matmul_proj(buf_hidden2_, buf_attn_out_, lw.w_o, lw.w_o_scale, hidden_size_, num_heads_ * head_dim_);
+                    vector_add_bf16_cuda(buf_hidden_.bf16(), buf_hidden2_.bf16(), hidden_size_, stream);
+                }
+            }
+
+            // FFN RMSNorm (1-centered for Qwen 3.8)
+            rms_norm_one_centered_cuda(buf_hidden2_.bf16(), buf_hidden_.bf16(),
+                                       lw.post_attn_norm_w.bf16(), hidden_size_, 1e-6f, stream);
+
+            // Fused SwiGLU & Down Projection
+            if (lw.w_gate.dtype == "int4") {
+                gemv_int4_swiglu_fused_cuda(buf_gate_.bf16(), buf_hidden2_.bf16(),
+                                            (const uint8_t*)lw.w_gate.data, lw.w_gate_scale.bf16(),
+                                            (const uint8_t*)lw.w_up.data, lw.w_up_scale.bf16(),
+                                            intermediate_size_, hidden_size_, 0.0f, stream);
+            } else {
+                matmul_proj(buf_gate_, buf_hidden2_, lw.w_gate, lw.w_gate_scale, intermediate_size_, hidden_size_);
+                matmul_proj(buf_up_, buf_hidden2_, lw.w_up, lw.w_up_scale, intermediate_size_, hidden_size_);
+                silu_mul_cuda(buf_gate_.bf16(), buf_gate_.bf16(), buf_up_.bf16(), intermediate_size_, 0.0f, stream);
+            }
+
+            if (lw.w_down.dtype == "int4") {
+                gemv_int4_residual_cuda(buf_hidden_.bf16(), buf_gate_.bf16(),
+                                        (const uint8_t*)lw.w_down.data, lw.w_down_scale.bf16(),
+                                        hidden_size_, intermediate_size_, stream);
+            } else {
+                matmul_proj(buf_hidden2_, buf_gate_, lw.w_down, lw.w_down_scale, hidden_size_, intermediate_size_);
+                vector_add_bf16_cuda(buf_hidden_.bf16(), buf_hidden2_.bf16(), hidden_size_, stream);
+            }
+        }
+
+        // 3. Final RMSNorm
+        rms_norm_cuda(buf_hidden_.bf16(), buf_hidden_.bf16(),
+                      final_norm_w_.bf16(), hidden_size_, 1e-6f, stream);
+
+        // 4. Logits
+        gemv_bf16_cuda(buf_logits_.f32(), embed_w_.bf16(), buf_hidden_.bf16(), vocab_size_, hidden_size_, stream);
+
+        // 5. Argmax
+        argmax_f32_cuda(buf_argmax_out_.i32(), buf_logits_.f32(), vocab_size_, stream);
+    }
+
+    void draft_k_tokens_device_body(int K, cudaStream_t stream) {
+        for (int k = 0; k < K; k++) {
+            forward_token_device_body(0, stream);
+
+            // Save draft state after step k (after processing cand_tokens[k]) into slot k
+            if (k < 8 && draft_ssm_pool_.data && draft_ssm_slots_[k].data) {
+                CUDA_CHECK(cudaMemcpyAsync(draft_ssm_slots_[k].data, draft_ssm_pool_.data, draft_ssm_pool_.size_bytes, cudaMemcpyDeviceToDevice, stream));
+                CUDA_CHECK(cudaMemcpyAsync(draft_conv_slots_[k].data, draft_conv_pool_.data, draft_conv_pool_.size_bytes, cudaMemcpyDeviceToDevice, stream));
+            }
+
+            // Save argmax output into device candidate slot (k+1) and feed directly to input for step k+1
+            CUDA_CHECK(cudaMemcpyAsync(buf_draft_k_tokens_.i32() + (k + 1), buf_argmax_out_.i32(), sizeof(int32_t), cudaMemcpyDeviceToDevice, stream));
+            if (k + 1 < K) {
+                CUDA_CHECK(cudaMemcpyAsync(buf_input_token_.i32(), buf_argmax_out_.i32(), sizeof(int32_t), cudaMemcpyDeviceToDevice, stream));
+                increment_i32_cuda(buf_input_pos_.i32(), 1, stream);
+            }
+        }
+    }
+
+    void init_cuda_graph(cudaStream_t stream = nullptr) {
+        if (!loaded_) return;
+        buf_input_pos_.alloc(sizeof(int32_t));
+        buf_draft_k_tokens_.alloc(16 * sizeof(int32_t));
+        if (!h_draft_k_cands_) {
+            CUDA_CHECK(cudaMallocHost(&h_draft_k_cands_, 16 * sizeof(int32_t)));
+            CUDA_CHECK(cudaMallocHost(&h_draft_k_pos_, 16 * sizeof(int32_t)));
+        }
+
+        int dummy_tok = 0;
+        int dummy_pos = 0;
+        CUDA_CHECK(cudaMemcpy(buf_input_token_.i32(), &dummy_tok, sizeof(int32_t), cudaMemcpyHostToDevice));
+        CUDA_CHECK(cudaMemcpy(buf_input_pos_.i32(), &dummy_pos, sizeof(int32_t), cudaMemcpyHostToDevice));
+
+        // Warmup single step
+        for (int i = 0; i < 3; i++) {
+            forward_token_device_body(0, stream);
+        }
+        CUDA_CHECK(cudaStreamSynchronize(stream));
+
+        cudaError_t cap_err = cudaStreamBeginCapture(stream, cudaStreamCaptureModeGlobal);
+        if (cap_err == cudaSuccess) {
+            forward_token_device_body(0, stream);
+            cudaError_t end_err = cudaStreamEndCapture(stream, &graph_);
+            if (end_err == cudaSuccess) {
+                if (cudaGraphInstantiate(&graph_exec_, graph_, nullptr, nullptr, 0) == cudaSuccess) {
+                    graph_captured_ = true;
+                    LOG_INFO("Qwen 3.8 2B Single-Step Draft CUDA Graph instantiated successfully!");
+                }
+            }
+        }
+
+        // Multi-Step Draft CUDA Graph capture for K in {1, 2, 3, 4, 5, 6, 7}
+        for (int K : {1, 2, 3, 4, 5, 6, 7}) {
+            for (int i = 0; i < 2; i++) {
+                draft_k_tokens_device_body(K, stream);
+            }
+            CUDA_CHECK(cudaStreamSynchronize(stream));
+
+            cudaError_t k_cap = cudaStreamBeginCapture(stream, cudaStreamCaptureModeGlobal);
+            if (k_cap != cudaSuccess) continue;
+
+            draft_k_tokens_device_body(K, stream);
+
+            cudaError_t k_end = cudaStreamEndCapture(stream, &draft_k_graph_[K]);
+            if (k_end != cudaSuccess) continue;
+
+            cudaError_t k_inst = cudaGraphInstantiate(&draft_k_graph_exec_[K], draft_k_graph_[K], nullptr, nullptr, 0);
+            if (k_inst == cudaSuccess) {
+                draft_k_graph_captured_[K] = true;
+                LOG_INFO("Qwen 3.8 2B Multi-Step Draft CUDA Graph (K=%d) instantiated successfully!", K);
+            }
+        }
+    }
+
+    void draft_k_tokens(int start_token, int start_pos, int K, std::vector<int>& cands, cudaStream_t stream = nullptr) {
+        cands.clear();
+        cands.push_back(start_token);
+        if (!loaded_ || K <= 0) return;
+
+        if (!h_draft_k_cands_) {
+            CUDA_CHECK(cudaMallocHost(&h_draft_k_cands_, 16 * sizeof(int32_t)));
+            CUDA_CHECK(cudaMallocHost(&h_draft_k_pos_, 16 * sizeof(int32_t)));
+            buf_draft_k_tokens_.alloc(16 * sizeof(int32_t));
+        }
+
+        h_draft_k_cands_[0] = start_token;
+        CUDA_CHECK(cudaMemcpyAsync(buf_input_token_.i32(), &h_draft_k_cands_[0], sizeof(int32_t), cudaMemcpyHostToDevice, stream));
+        CUDA_CHECK(cudaMemcpyAsync(buf_input_pos_.i32(), &start_pos, sizeof(int32_t), cudaMemcpyHostToDevice, stream));
+
+        if (K >= 1 && K <= 7 && draft_k_graph_captured_[K]) {
+            CUDA_CHECK(cudaGraphLaunch(draft_k_graph_exec_[K], stream));
+        } else {
+            draft_k_tokens_device_body(K, stream);
+        }
+
+        // Copy all K drafted tokens to host in ONE single DMA transfer
+        CUDA_CHECK(cudaMemcpyAsync(h_draft_k_cands_ + 1, buf_draft_k_tokens_.i32() + 1, K * sizeof(int32_t), cudaMemcpyDeviceToHost, stream));
+        CUDA_CHECK(cudaStreamSynchronize(stream));
+
+        for (int k = 0; k < K; k++) {
+            cands.push_back(h_draft_k_cands_[k + 1]);
+        }
+    }
+
+    void replay_tokens(const int* tokens, int start_pos, int count, cudaStream_t stream = nullptr) {
+        if (!loaded_ || count <= 0) return;
+        for (int j = 0; j < count; j++) {
+            forward_token_async(tokens[j], start_pos + j, stream);
+            CUDA_CHECK(cudaStreamSynchronize(stream));
+        }
+    }
+
+    void forward_token_async(int token_id, int position, cudaStream_t stream = nullptr) {
+        if (!loaded_) return;
+        if (!h_draft_tok_) {
+            CUDA_CHECK(cudaMallocHost(&h_draft_tok_, sizeof(int32_t)));
+            CUDA_CHECK(cudaMallocHost(&h_draft_pos_, sizeof(int32_t)));
+        }
+        *h_draft_tok_ = token_id;
+        *h_draft_pos_ = position;
+        CUDA_CHECK(cudaMemcpyAsync(buf_input_token_.i32(), h_draft_tok_, sizeof(int32_t), cudaMemcpyHostToDevice, stream));
+        if (buf_input_pos_.data) {
+            CUDA_CHECK(cudaMemcpyAsync(buf_input_pos_.i32(), h_draft_pos_, sizeof(int32_t), cudaMemcpyHostToDevice, stream));
+        }
+
+        if (graph_captured_) {
+            CUDA_CHECK(cudaGraphLaunch(graph_exec_, stream));
+        } else {
+            forward_token_device_body(position, stream);
+        }
+    }
+
+    int forward_token(int token_id, int position, cudaStream_t stream = nullptr) {
+        forward_token_async(token_id, position, stream);
+
+        if (!draft_best_host_) {
+            CUDA_CHECK(cudaMallocHost(&draft_best_host_, sizeof(int32_t)));
+        }
+        CUDA_CHECK(cudaMemcpyAsync(draft_best_host_, buf_argmax_out_.i32(), sizeof(int32_t), cudaMemcpyDeviceToHost, stream));
+        CUDA_CHECK(cudaStreamSynchronize(stream));
+
+        static int dbg_cnt = 0;
+        if (dbg_cnt++ < 6) {
+            std::vector<float> all_logits(vocab_size_);
+            CUDA_CHECK(cudaMemcpy(all_logits.data(), buf_logits_.f32(), vocab_size_ * sizeof(float), cudaMemcpyDeviceToHost));
+            std::vector<int> indices(vocab_size_);
+            std::iota(indices.begin(), indices.end(), 0);
+            std::partial_sort(indices.begin(), indices.begin() + 3, indices.end(), [&](int a, int b) {
+                return all_logits[a] > all_logits[b];
+            });
+            LOG_INFO("[DRAFT TOP3] in=%d pos=%d -> #1=%d(%.2f) #2=%d(%.2f) #3=%d(%.2f)",
+                     token_id, position,
+                     indices[0], all_logits[indices[0]],
+                     indices[1], all_logits[indices[1]],
+                     indices[2], all_logits[indices[2]]);
+        }
+
+        return *draft_best_host_;
+    }
+};
+
+// ════════════════════════════════════════════════════════════════════════════════
+//  MTP Self-Drafter: Multi-Token Prediction using the target model's own MTP module
+//  Reference: syv-ai/qwen38-27b-rtx3090 — MTP speculation with draft vocabulary
+// ════════════════════════════════════════════════════════════════════════════════
+
+class MTPSelfDrafter {
+public:
+    bool loaded_ = false;
+    int hidden_size_ = 5120;
+    int intermediate_size_ = 17408;
+    int num_heads_ = 24;       // q heads
+    int num_kv_heads_ = 4;     // kv heads
+    int head_dim_ = 256;
+    int full_vocab_size_ = 0;   // Size of full vocabulary (248320)
+    float rms_eps_ = 1e-6f;
+
+    // MTP module weights (loaded from main model checkpoint)
+    GPUTensor mtp_fc_w_;                   // [5120, 10240] BF16
+    GPUTensor mtp_pre_fc_norm_hidden_w_;   // [5120] BF16
+    GPUTensor mtp_pre_fc_norm_embed_w_;    // [5120] BF16
+    GPUTensor mtp_norm_w_;                 // [5120] BF16
+
+    // MTP transformer layer weights
+    GPUTensor mtp_layer_attn_norm_w_;      // [5120] BF16
+    GPUTensor mtp_layer_post_attn_norm_w_; // [5120] BF16
+    GPUTensor mtp_layer_q_proj_w_, mtp_layer_q_proj_s_;   // [12288, 5120] INT4
+    GPUTensor mtp_layer_k_proj_w_, mtp_layer_k_proj_s_;   // [1024, 5120] INT4
+    GPUTensor mtp_layer_v_proj_w_, mtp_layer_v_proj_s_;   // [1024, 5120] INT4
+    GPUTensor mtp_layer_o_proj_w_, mtp_layer_o_proj_s_;   // [5120, 6144] INT4
+    GPUTensor mtp_layer_q_norm_w_;          // [256] BF16
+    GPUTensor mtp_layer_k_norm_w_;          // [256] BF16
+    GPUTensor mtp_layer_gate_w_, mtp_layer_gate_s_;  // [17408, 5120] INT4
+    GPUTensor mtp_layer_up_w_, mtp_layer_up_s_;      // [17408, 5120] INT4
+    GPUTensor mtp_layer_down_w_, mtp_layer_down_s_;  // [5120, 17408] INT4
+
+    // MTP KV cache (small - only 1 layer, limited context)
+    GPUTensor mtp_k_cache_;  // [MAX_SEQ_LEN, num_kv_heads, head_dim] BF16
+    GPUTensor mtp_v_cache_;  // [MAX_SEQ_LEN, num_kv_heads, head_dim] BF16
+
+    // Full model lm_head (shared pointer, not owned — points to MoecherEngine::head_weight_)
+    __nv_bfloat16* full_lm_head_w_ = nullptr;  // [full_vocab_size, hidden_size] BF16
+
+    // Draft vocabulary and compact draft lm_head (40k x 5120 BF16 = ~400MB vs 2.54GB full)
+    bool use_draft_vocab_ = false;
+    int draft_vocab_size_ = 0;
+    GPUTensor draft_lm_head_w_;                // [draft_vocab_size, hidden_size] BF16
+    std::vector<int32_t> draft_vocab_ids_;     // [draft_vocab_size] host table mapping draft_id -> full_vocab_id
+
+    // Working buffers
+    GPUTensor buf_mtp_hidden_;      // [5120] BF16
+    GPUTensor buf_mtp_hidden2_;     // [5120] BF16
+    GPUTensor buf_mtp_concat_;      // [10240] BF16
+    GPUTensor buf_mtp_embed_;       // [5120] BF16
+    GPUTensor buf_mtp_q_;           // [24*256*2] BF16 (gated)
+    GPUTensor buf_mtp_k_;           // [4*256] BF16
+    GPUTensor buf_mtp_v_;           // [4*256] BF16
+    GPUTensor buf_mtp_attn_out_;    // [24*256] BF16
+    GPUTensor buf_mtp_gate_;        // [17408] BF16
+    GPUTensor buf_mtp_up_;          // [17408] BF16
+    GPUTensor buf_mtp_logits_;      // [full_vocab_size] F32
+    GPUTensor buf_mtp_argmax_;      // [1] INT32
+    GPUTensor buf_mtp_input_pos_;   // [1] INT32
+    GPUTensor buf_draft_k_tokens_;  // [16] INT32 — output candidate tokens
+
+    int32_t* h_draft_best_ = nullptr;
+    int32_t* h_draft_k_cands_ = nullptr;
+    int32_t* h_draft_pos_ = nullptr;
+
+    // Reference to target model's embedding table (shared, not owned)
+    __nv_bfloat16* target_embed_w_ = nullptr;
+
+    bool load_mtp_weights(const void* mapped_data, const json& tensor_map,
+                          __nv_bfloat16* embed_w, __nv_bfloat16* full_lm_head,
+                          int full_vocab,
+                          const std::string& model_dir, cudaStream_t stream) {
+        full_vocab_size_ = full_vocab;
+        target_embed_w_ = embed_w;
+        full_lm_head_w_ = full_lm_head;
+
+        auto load_t = [&](GPUTensor& gpu, const std::string& name) -> bool {
+            if (!tensor_map.contains(name)) return false;
+            auto& info = tensor_map[name];
+            int64_t offset = info["offset"].get<int64_t>();
+            int64_t nbytes = info["nbytes"].get<int64_t>();
+            gpu.dtype = info["dtype"].get<std::string>();
+            gpu.shape.clear();
+            for (auto& s : info["shape"]) gpu.shape.push_back(s.get<int>());
+            gpu.alloc(nbytes);
+            CUDA_CHECK(cudaMemcpyAsync(gpu.data, (const char*)mapped_data + offset, nbytes,
+                                       cudaMemcpyHostToDevice, stream));
+            return true;
+        };
+
+        auto load_quant_t = [&](GPUTensor& gpu_w, GPUTensor& gpu_s, const std::string& name) -> bool {
+            if (!tensor_map.contains(name)) return false;
+            auto& info = tensor_map[name];
+            std::string dtype = info.value("dtype", "");
+            if (dtype != "int4") return false;
+            int64_t offset = info["offset"].get<int64_t>();
+            int64_t nbytes = info["nbytes"].get<int64_t>();
+            gpu_w.dtype = dtype;
+            gpu_w.shape.clear();
+            for (auto& s : info["shape"]) gpu_w.shape.push_back(s.get<int>());
+            gpu_w.alloc(nbytes);
+            CUDA_CHECK(cudaMemcpyAsync(gpu_w.data, (const char*)mapped_data + offset, nbytes,
+                                       cudaMemcpyHostToDevice, stream));
+            if (info.contains("scale_offset")) {
+                int64_t scale_offset = info["scale_offset"].get<int64_t>();
+                int64_t scale_nbytes = info["scale_nbytes"].get<int64_t>();
+                gpu_s.dtype = info.value("scale_dtype", "bfloat16");
+                gpu_s.alloc(scale_nbytes);
+                CUDA_CHECK(cudaMemcpyAsync(gpu_s.data, (const char*)mapped_data + scale_offset, scale_nbytes,
+                                           cudaMemcpyHostToDevice, stream));
+            }
+            return true;
+        };
+
+        // Load MTP module weights
+        if (!load_t(mtp_fc_w_, "mtp.fc.weight")) {
+            LOG_WARN("MTP: mtp.fc.weight not found, MTP self-drafter disabled");
+            return false;
+        }
+        load_t(mtp_pre_fc_norm_hidden_w_, "mtp.pre_fc_norm_hidden.weight");
+        load_t(mtp_pre_fc_norm_embed_w_, "mtp.pre_fc_norm_embedding.weight");
+        load_t(mtp_norm_w_, "mtp.norm.weight");
+
+        // Load MTP transformer layer
+        load_t(mtp_layer_attn_norm_w_, "mtp.layers.0.input_layernorm.weight");
+        load_t(mtp_layer_post_attn_norm_w_, "mtp.layers.0.post_attention_layernorm.weight");
+        load_quant_t(mtp_layer_q_proj_w_, mtp_layer_q_proj_s_, "mtp.layers.0.self_attn.q_proj.weight");
+        load_quant_t(mtp_layer_k_proj_w_, mtp_layer_k_proj_s_, "mtp.layers.0.self_attn.k_proj.weight");
+        load_quant_t(mtp_layer_v_proj_w_, mtp_layer_v_proj_s_, "mtp.layers.0.self_attn.v_proj.weight");
+        load_quant_t(mtp_layer_o_proj_w_, mtp_layer_o_proj_s_, "mtp.layers.0.self_attn.o_proj.weight");
+        load_t(mtp_layer_q_norm_w_, "mtp.layers.0.self_attn.q_norm.weight");
+        load_t(mtp_layer_k_norm_w_, "mtp.layers.0.self_attn.k_norm.weight");
+        load_quant_t(mtp_layer_gate_w_, mtp_layer_gate_s_, "mtp.layers.0.mlp.gate_proj.weight");
+        load_quant_t(mtp_layer_up_w_, mtp_layer_up_s_, "mtp.layers.0.mlp.up_proj.weight");
+        load_quant_t(mtp_layer_down_w_, mtp_layer_down_s_, "mtp.layers.0.mlp.down_proj.weight");
+
+        // Allocate MTP KV cache
+        int max_seq = 32768;
+        mtp_k_cache_.alloc(max_seq * num_kv_heads_ * head_dim_ * sizeof(__nv_bfloat16));
+        mtp_v_cache_.alloc(max_seq * num_kv_heads_ * head_dim_ * sizeof(__nv_bfloat16));
+        CUDA_CHECK(cudaMemsetAsync(mtp_k_cache_.data, 0, mtp_k_cache_.size_bytes, stream));
+        CUDA_CHECK(cudaMemsetAsync(mtp_v_cache_.data, 0, mtp_v_cache_.size_bytes, stream));
+
+        // Validate full lm_head pointer
+        if (!full_lm_head_w_) {
+            LOG_WARN("MTP: full lm_head pointer is null, MTP drafter disabled");
+            return false;
+        }
+
+        // Try loading compact draft vocabulary and draft lm_head (BF16)
+        std::string draft_ids_path = model_dir + "/draft_vocab_ids.bin";
+        std::string draft_head_path = model_dir + "/draft_lm_head_int8_bf16.bin";
+
+        FILE* f_ids = fopen(draft_ids_path.c_str(), "rb");
+        FILE* f_head = fopen(draft_head_path.c_str(), "rb");
+        if (f_ids && f_head) {
+            uint32_t n_ids = 0;
+            if (fread(&n_ids, sizeof(uint32_t), 1, f_ids) == 1 && n_ids > 0) {
+                draft_vocab_ids_.resize(n_ids);
+                if (fread(draft_vocab_ids_.data(), sizeof(int32_t), n_ids, f_ids) == n_ids) {
+                    uint32_t rows = 0, cols = 0;
+                    if (fread(&rows, sizeof(uint32_t), 1, f_head) == 1 &&
+                        fread(&cols, sizeof(uint32_t), 1, f_head) == 1 &&
+                        rows == n_ids && (int)cols == hidden_size_) {
+                        size_t head_bytes = (size_t)rows * cols * sizeof(__nv_bfloat16);
+                        std::vector<char> head_buf(head_bytes);
+                        if (fread(head_buf.data(), 1, head_bytes, f_head) == head_bytes) {
+                            draft_lm_head_w_.alloc(head_bytes);
+                            CUDA_CHECK(cudaMemcpyAsync(draft_lm_head_w_.data, head_buf.data(), head_bytes, cudaMemcpyHostToDevice, stream));
+                            use_draft_vocab_ = true;
+                            draft_vocab_size_ = (int)n_ids;
+                            LOG_INFO("MTP: Loaded draft vocabulary (%d tokens) and draft lm_head (%.1f MB BF16, 6.2x faster drafting!)",
+                                     draft_vocab_size_, head_bytes / (1024.0 * 1024.0));
+                        }
+                    }
+                }
+            }
+        }
+        if (f_ids) fclose(f_ids);
+        if (f_head) fclose(f_head);
+
+        if (!use_draft_vocab_) {
+            LOG_INFO("MTP: Using full model lm_head [%d, %d] BF16 (shared, no extra VRAM)",
+                     full_vocab_size_, hidden_size_);
+        }
+
+        // Allocate working buffers
+        buf_mtp_hidden_.alloc(hidden_size_ * sizeof(__nv_bfloat16));
+        buf_mtp_hidden2_.alloc(hidden_size_ * sizeof(__nv_bfloat16));
+        buf_mtp_concat_.alloc(2 * hidden_size_ * sizeof(__nv_bfloat16));
+        buf_mtp_embed_.alloc(hidden_size_ * sizeof(__nv_bfloat16));
+        buf_mtp_q_.alloc(2 * num_heads_ * head_dim_ * sizeof(__nv_bfloat16));
+        buf_mtp_k_.alloc(num_kv_heads_ * head_dim_ * sizeof(__nv_bfloat16));
+        buf_mtp_v_.alloc(num_kv_heads_ * head_dim_ * sizeof(__nv_bfloat16));
+        buf_mtp_attn_out_.alloc(num_heads_ * head_dim_ * sizeof(__nv_bfloat16));
+        buf_mtp_gate_.alloc(intermediate_size_ * sizeof(__nv_bfloat16));
+        buf_mtp_up_.alloc(intermediate_size_ * sizeof(__nv_bfloat16));
+        buf_mtp_logits_.alloc(full_vocab_size_ * sizeof(float));
+        buf_mtp_argmax_.alloc(sizeof(int32_t));
+        buf_mtp_input_pos_.alloc(sizeof(int32_t));
+        buf_draft_k_tokens_.alloc(16 * sizeof(int32_t));
+
+        CUDA_CHECK(cudaMallocHost(&h_draft_best_, sizeof(int32_t)));
+        CUDA_CHECK(cudaMallocHost(&h_draft_k_cands_, 16 * sizeof(int32_t)));
+        CUDA_CHECK(cudaMallocHost(&h_draft_pos_, sizeof(int32_t)));
+
+        CUDA_CHECK(cudaStreamSynchronize(stream));
+
+        loaded_ = true;
+        LOG_INFO("MTP Self-Drafter loaded: 1 transformer layer + full %dk vocab (shared lm_head) = %.1f MB own VRAM",
+                 full_vocab_size_ / 1000,
+                 (mtp_fc_w_.size_bytes + mtp_layer_q_proj_w_.size_bytes + mtp_layer_k_proj_w_.size_bytes +
+                  mtp_layer_v_proj_w_.size_bytes + mtp_layer_o_proj_w_.size_bytes +
+                  mtp_layer_gate_w_.size_bytes + mtp_layer_up_w_.size_bytes + mtp_layer_down_w_.size_bytes +
+                  mtp_k_cache_.size_bytes + mtp_v_cache_.size_bytes) / (1024.0 * 1024.0));
+        return true;
+    }
+
+    void reset_kv_cache(cudaStream_t stream = nullptr) {
+        if (mtp_k_cache_.data) CUDA_CHECK(cudaMemsetAsync(mtp_k_cache_.data, 0, mtp_k_cache_.size_bytes, stream));
+        if (mtp_v_cache_.data) CUDA_CHECK(cudaMemsetAsync(mtp_v_cache_.data, 0, mtp_v_cache_.size_bytes, stream));
+    }
+
+    // Forward one MTP step: given target hidden state and last token, produce draft token
+    // target_hidden: [hidden_size] BF16 — the hidden state from the target model's last layer (pre-norm)
+    // last_token_id: the last token that was predicted (full vocab id)
+    // position: current sequence position
+    // Returns: draft token id (in full vocabulary space), or -1 if not in draft vocab
+    int forward_one_step(const __nv_bfloat16* target_hidden, int last_token_id,
+                         int position, cudaStream_t stream) {
+        if (!loaded_) return -1;
+
+        auto matmul_proj = [&](GPUTensor& out, __nv_bfloat16* in_vec, GPUTensor& weight, GPUTensor& scale, int N, int K) {
+            if (weight.dtype == "int4") {
+                gemv_int4_cuda(out.bf16(), in_vec, (const uint8_t*)weight.data, scale.bf16(), N, K, stream);
+            } else {
+                gemv_bf16_out_bf16_cuda(out.bf16(), weight.bf16(), in_vec, N, K, stream);
+            }
+        };
+
+        // 1. Norm the target hidden state
+        rms_norm_one_centered_cuda(buf_mtp_hidden_.bf16(), target_hidden,
+                                   mtp_pre_fc_norm_hidden_w_.bf16(), hidden_size_, rms_eps_, stream);
+
+        // 2. Embed the last token and norm it
+        int32_t tok = last_token_id;
+        CUDA_CHECK(cudaMemcpyAsync(buf_mtp_argmax_.i32(), &tok, sizeof(int32_t), cudaMemcpyHostToDevice, stream));
+        embedding_cuda(buf_mtp_embed_.bf16(), target_embed_w_, buf_mtp_argmax_.i32(), 1, hidden_size_, stream);
+        rms_norm_one_centered_cuda(buf_mtp_embed_.bf16(), buf_mtp_embed_.bf16(),
+                                   mtp_pre_fc_norm_embed_w_.bf16(), hidden_size_, rms_eps_, stream);
+
+        // 3. Concatenate: [normed_embed, normed_hidden] → [10240]
+        //    Order matters! FC weight trained with embed first, hidden second (per reference impl)
+        CUDA_CHECK(cudaMemcpyAsync(buf_mtp_concat_.bf16(), buf_mtp_embed_.bf16(),
+                                   hidden_size_ * sizeof(__nv_bfloat16), cudaMemcpyDeviceToDevice, stream));
+        CUDA_CHECK(cudaMemcpyAsync(buf_mtp_concat_.bf16() + hidden_size_, buf_mtp_hidden_.bf16(),
+                                   hidden_size_ * sizeof(__nv_bfloat16), cudaMemcpyDeviceToDevice, stream));
+
+        // 4. FC projection: [10240] → [5120]
+        gemv_bf16_out_bf16_cuda(buf_mtp_hidden_.bf16(), mtp_fc_w_.bf16(), buf_mtp_concat_.bf16(),
+                                hidden_size_, 2 * hidden_size_, stream);
+
+        // 5. MTP Transformer layer
+        // 5a. Attention pre-norm
+        rms_norm_one_centered_cuda(buf_mtp_hidden2_.bf16(), buf_mtp_hidden_.bf16(),
+                                   mtp_layer_attn_norm_w_.bf16(), hidden_size_, rms_eps_, stream);
+
+        // 5b. Q/K/V projections
+        matmul_proj(buf_mtp_q_, buf_mtp_hidden2_.bf16(), mtp_layer_q_proj_w_, mtp_layer_q_proj_s_,
+                    2 * num_heads_ * head_dim_, hidden_size_);
+        matmul_proj(buf_mtp_k_, buf_mtp_hidden2_.bf16(), mtp_layer_k_proj_w_, mtp_layer_k_proj_s_,
+                    num_kv_heads_ * head_dim_, hidden_size_);
+        matmul_proj(buf_mtp_v_, buf_mtp_hidden2_.bf16(), mtp_layer_v_proj_w_, mtp_layer_v_proj_s_,
+                    num_kv_heads_ * head_dim_, hidden_size_);
+
+        // 5c. GQA decode attention with gated Q (same as main model)
+        *h_draft_pos_ = position;
+        CUDA_CHECK(cudaMemcpyAsync(buf_mtp_input_pos_.i32(), h_draft_pos_, sizeof(int32_t),
+                                   cudaMemcpyHostToDevice, stream));
+        qwen_gqa_decode_gated_cuda(
+            buf_mtp_attn_out_.bf16(), buf_mtp_q_.bf16(), buf_mtp_k_.bf16(), buf_mtp_v_.bf16(),
+            mtp_layer_q_norm_w_.bf16(), mtp_layer_k_norm_w_.bf16(),
+            mtp_k_cache_.bf16(), mtp_v_cache_.bf16(),
+            num_heads_, num_kv_heads_, head_dim_,
+            buf_mtp_input_pos_.i32(), position, 32768,
+            10000000.0f, rms_eps_, stream);
+
+        // 5d. Output projection + residual
+        if (mtp_layer_o_proj_w_.dtype == "int4") {
+            gemv_int4_residual_cuda(buf_mtp_hidden_.bf16(), buf_mtp_attn_out_.bf16(),
+                                    (const uint8_t*)mtp_layer_o_proj_w_.data, mtp_layer_o_proj_s_.bf16(),
+                                    hidden_size_, num_heads_ * head_dim_, stream);
+        } else {
+            gemv_bf16_out_bf16_cuda(buf_mtp_hidden2_.bf16(), mtp_layer_o_proj_w_.bf16(),
+                                    buf_mtp_attn_out_.bf16(), hidden_size_, num_heads_ * head_dim_, stream);
+            vector_add_bf16_cuda(buf_mtp_hidden_.bf16(), buf_mtp_hidden2_.bf16(), hidden_size_, stream);
+        }
+
+        // 5e. FFN pre-norm
+        rms_norm_one_centered_cuda(buf_mtp_hidden2_.bf16(), buf_mtp_hidden_.bf16(),
+                                   mtp_layer_post_attn_norm_w_.bf16(), hidden_size_, rms_eps_, stream);
+
+        // 5f. FFN: SwiGLU + Down projection
+        if (mtp_layer_gate_w_.dtype == "int4") {
+            gemv_int4_swiglu_fused_cuda(buf_mtp_gate_.bf16(), buf_mtp_hidden2_.bf16(),
+                                        (const uint8_t*)mtp_layer_gate_w_.data, mtp_layer_gate_s_.bf16(),
+                                        (const uint8_t*)mtp_layer_up_w_.data, mtp_layer_up_s_.bf16(),
+                                        intermediate_size_, hidden_size_, 0.0f, stream);
+        } else {
+            gemv_bf16_out_bf16_cuda(buf_mtp_gate_.bf16(), mtp_layer_gate_w_.bf16(),
+                                    buf_mtp_hidden2_.bf16(), intermediate_size_, hidden_size_, stream);
+            gemv_bf16_out_bf16_cuda(buf_mtp_up_.bf16(), mtp_layer_up_w_.bf16(),
+                                    buf_mtp_hidden2_.bf16(), intermediate_size_, hidden_size_, stream);
+            silu_mul_cuda(buf_mtp_gate_.bf16(), buf_mtp_gate_.bf16(), buf_mtp_up_.bf16(), intermediate_size_, 0.0f, stream);
+        }
+
+        if (mtp_layer_down_w_.dtype == "int4") {
+            gemv_int4_residual_cuda(buf_mtp_hidden_.bf16(), buf_mtp_gate_.bf16(),
+                                    (const uint8_t*)mtp_layer_down_w_.data, mtp_layer_down_s_.bf16(),
+                                    hidden_size_, intermediate_size_, stream);
+        } else {
+            gemv_bf16_out_bf16_cuda(buf_mtp_hidden2_.bf16(), mtp_layer_down_w_.bf16(),
+                                    buf_mtp_gate_.bf16(), hidden_size_, intermediate_size_, stream);
+            vector_add_bf16_cuda(buf_mtp_hidden_.bf16(), buf_mtp_hidden2_.bf16(), hidden_size_, stream);
+        }
+
+        // 6. Final norm
+        rms_norm_one_centered_cuda(buf_mtp_hidden_.bf16(), buf_mtp_hidden_.bf16(),
+                                   mtp_norm_w_.bf16(), hidden_size_, rms_eps_, stream);
+
+        int active_vocab = use_draft_vocab_ ? draft_vocab_size_ : full_vocab_size_;
+        const __nv_bfloat16* active_head = use_draft_vocab_ ? draft_lm_head_w_.bf16() : full_lm_head_w_;
+
+        // 7. lm_head: hidden @ lm_head.T → [active_vocab] F32
+        gemv_bf16_cuda(buf_mtp_logits_.f32(), active_head, buf_mtp_hidden_.bf16(),
+                       active_vocab, hidden_size_, stream);
+
+        // 8. Argmax over active vocab
+        argmax_f32_cuda(buf_mtp_argmax_.i32(), buf_mtp_logits_.f32(), active_vocab, stream);
+
+        // 9. Copy argmax to host
+        CUDA_CHECK(cudaMemcpyAsync(h_draft_best_, buf_mtp_argmax_.i32(), sizeof(int32_t),
+                                   cudaMemcpyDeviceToHost, stream));
+        CUDA_CHECK(cudaStreamSynchronize(stream));
+
+        // 10. Return full_vocab_id
+        int best_idx = *h_draft_best_;
+        if (best_idx < 0 || best_idx >= active_vocab) return -1;
+        int predicted_id = use_draft_vocab_ ? draft_vocab_ids_[best_idx] : best_idx;
+        if (predicted_id < 0 || predicted_id >= full_vocab_size_) return -1;
+        return predicted_id;
+    }
+
+    // Draft K tokens using the MTP module
+    // target_hidden: [hidden_size] BF16 — hidden state from target model after final norm
+    // first_token: the token to start drafting from (the last sampled token)
+    // position: current sequence position (where first_token will be placed)
+    // K: number of draft tokens to generate
+    // cands: output vector of candidate tokens [first_token, draft_1, draft_2, ..., draft_K]
+    // target_embed: pointer to target model's embedding table
+    void draft_k_tokens(const __nv_bfloat16* target_hidden, int first_token,
+                        int position, int K, std::vector<int>& cands,
+                        cudaStream_t stream) {
+        cands.clear();
+        cands.push_back(first_token);
+        if (!loaded_ || K <= 0) return;
+
+        // The MTP module takes:
+        // - The target model's hidden state (after the final norm of the last layer)
+        // - The embedding of the previously predicted token
+        // And produces a draft token prediction
+
+        // For chained drafting (K > 1):
+        // Step 0: hidden = target_hidden, token = first_token → draft_1
+        // Step 1: hidden = mtp_hidden (from step 0), token = draft_1 → draft_2
+        // Step 2: hidden = mtp_hidden (from step 1), token = draft_2 → draft_3
+        // ...
+
+        const __nv_bfloat16* current_hidden = target_hidden;
+        int current_token = first_token;
+
+        for (int k = 0; k < K; k++) {
+            int draft_token = forward_one_step(current_hidden, current_token, position + 1 + k, stream);
+            if (draft_token < 0) break;
+
+            cands.push_back(draft_token);
+            current_hidden = buf_mtp_hidden_.bf16();  // Use the MTP's own hidden state for next step
+            current_token = draft_token;
+        }
+    }
+};
+
+
+// ════════════════════════════════════════════════════════════════════════════════
 //  Model Engine
 // ════════════════════════════════════════════════════════════════════════════════
 
@@ -1585,6 +2523,12 @@ public:
     BPETokenizer tokenizer_;
     std::string model_dir_;
     
+    // Qwen 3.8 2B Neural Speculative Draft Engine (legacy)
+    QwenDraftEngine2B qwen_draft_;
+
+    // MTP Self-Drafter (new, faster)
+    MTPSelfDrafter mtp_drafter_;
+
     // Prompt-Lookup Drafting (PLD) Speculative Decoding
     bool enable_pld_ = true;
     int pld_draft_tokens_ = 4;
@@ -1708,6 +2652,8 @@ public:
         GPUTensor linear_out_proj, linear_out_proj_scale;// [5120, 6144]
         GPUTensor ssm_state;      // [48, 128, 128] BF16 (50% memory cut)
         GPUTensor conv_state;     // [10240, 4] BF16
+        GPUTensor ssm_state_slots[8];
+        GPUTensor conv_state_slots[8];
     };
     std::vector<LayerWeights> layers_;
 
@@ -1758,6 +2704,7 @@ public:
 
     // Batched working buffers for Multi-Token Speculative Decoding (M=4..8)
     GPUTensor buf_input_tokens_batch_; // [8] I32
+    GPUTensor buf_input_pos_batch_;    // [8] I32
     GPUTensor buf_hidden_batch_;       // [8, hidden_size] BF16
     GPUTensor buf_hidden2_batch_;      // [8, hidden_size] BF16
     GPUTensor buf_q_batch_;            // [8, 10240] BF16
@@ -1767,6 +2714,17 @@ public:
     GPUTensor buf_linear_a_batch_;     // [8, 48] BF16
     GPUTensor buf_linear_b_batch_;     // [8, 48] BF16
     GPUTensor buf_logits_batch_;       // [8, vocab_size] F32
+    GPUTensor buf_argmax_out_batch_;   // [8] I32
+
+    GPUTensor target_ssm_pool_;
+    GPUTensor target_ssm_slots_[8];
+    GPUTensor target_conv_pool_;
+    GPUTensor target_conv_slots_[8];
+    int32_t* h_target_batch_tok_ = nullptr;
+    int32_t* h_target_batch_pos_ = nullptr;
+    int32_t* h_single_tok_ = nullptr;
+    int32_t* h_single_pos_ = nullptr;
+    int32_t* h_single_flag_ = nullptr;
 
     GPUTensor buf_hc_state_;      // [hc_mult, hidden_size] BF16 — active HC hidden state
     GPUTensor buf_hc_after_attn_; // [hc_mult, hidden_size] BF16 — intermediate HC state after attention
@@ -2068,6 +3026,17 @@ public:
             LOG_INFO("No compress_ratios found, using full window for all layers");
         }
 
+        // Auto-load Qwen 3.8 2B Neural Speculative Draft Model if available
+        if (cfg_.architecture == ModelArch::QWEN) {
+            std::string draft_path = model_dir_.empty() ? "draft_2b/draft_manifest.json" : (model_dir_ + "/draft_2b/draft_manifest.json");
+            if (!std::ifstream(draft_path).good()) {
+                draft_path = "f:/Moecher/models/qwen3_8_27b_q4/draft_2b/draft_manifest.json";
+            }
+            if (std::ifstream(draft_path).good()) {
+                qwen_draft_.load(draft_path, main_stream_);
+            }
+        }
+
         apply_l2_cache_persistence();
         init_cuda_graph();
 
@@ -2216,6 +3185,11 @@ public:
 
         graph_captured_ = true;
         LOG_INFO("CUDA Graph instantiated successfully! Decode speed accelerated.");
+
+        if (qwen_draft_.loaded_) {
+            qwen_draft_.init_cuda_graph(main_stream_);
+            init_batch_cuda_graphs();
+        }
     }
 
     // ── Forward pass for a single token (decode mode) ───────────────────────
@@ -2225,11 +3199,19 @@ public:
     std::mt19937 rng_{std::random_device{}()};
 
     void forward_token(int token_id, int position) {
+        if (!h_single_tok_) {
+            CUDA_CHECK(cudaMallocHost(&h_single_tok_, sizeof(int32_t)));
+            CUDA_CHECK(cudaMallocHost(&h_single_pos_, sizeof(int32_t)));
+            CUDA_CHECK(cudaMallocHost(&h_single_flag_, sizeof(int32_t)));
+        }
         int track_flag = (track_expert_freq_ && track_current_token_) ? 1 : 0;
+        *h_single_flag_ = track_flag;
+        *h_single_tok_ = token_id;
+        *h_single_pos_ = position;
         if (graph_captured_) {
-            CUDA_CHECK(cudaMemcpyAsync(buf_track_flag_.i32(), &track_flag, sizeof(int32_t), cudaMemcpyHostToDevice, main_stream_));
-            CUDA_CHECK(cudaMemcpyAsync(buf_input_token_.i32(), &token_id, sizeof(int32_t), cudaMemcpyHostToDevice, main_stream_));
-            CUDA_CHECK(cudaMemcpyAsync(buf_input_pos_.i32(), &position, sizeof(int32_t), cudaMemcpyHostToDevice, main_stream_));
+            CUDA_CHECK(cudaMemcpyAsync(buf_track_flag_.i32(), h_single_flag_, sizeof(int32_t), cudaMemcpyHostToDevice, main_stream_));
+            CUDA_CHECK(cudaMemcpyAsync(buf_input_token_.i32(), h_single_tok_, sizeof(int32_t), cudaMemcpyHostToDevice, main_stream_));
+            CUDA_CHECK(cudaMemcpyAsync(buf_input_pos_.i32(), h_single_pos_, sizeof(int32_t), cudaMemcpyHostToDevice, main_stream_));
             CUDA_CHECK(cudaGraphLaunch(graph_exec_, main_stream_));
         } else {
             forward_token_eager(token_id, position);
@@ -2284,7 +3266,14 @@ public:
                               norm_weight_.bf16(), dim, cfg_.rms_norm_eps, main_stream_);
             }
 
-            // 4. Logits: hidden @ head_weight.T -> [vocab_size]
+            // 4. Save POST-norm hidden state for MTP drafter
+            //    (MTP expects the output of the final RMSNorm, per Qwen3 MTP spec)
+            if (mtp_drafter_.loaded_) {
+                CUDA_CHECK(cudaMemcpyAsync(buf_hidden2_.bf16(), buf_hidden_.bf16(),
+                                           dim * sizeof(__nv_bfloat16), cudaMemcpyDeviceToDevice, main_stream_));
+            }
+
+            // 5. Logits: hidden @ head_weight.T -> [vocab_size]
             compute_logits();
             return;
         }
@@ -2405,9 +3394,29 @@ public:
         // Disable tracking during prompt prefill (prevents system prompt boilerplate from skewing stats)
         track_current_token_ = false;
 
-        // Prefill prompt
+        if (target_ssm_pool_.data) {
+            CUDA_CHECK(cudaMemsetAsync(target_ssm_pool_.data, 0, target_ssm_pool_.size_bytes, main_stream_));
+            CUDA_CHECK(cudaMemsetAsync(target_conv_pool_.data, 0, target_conv_pool_.size_bytes, main_stream_));
+            for (int s = 0; s < 8; s++) {
+                if (target_ssm_slots_[s].data) CUDA_CHECK(cudaMemsetAsync(target_ssm_slots_[s].data, 0, target_ssm_slots_[s].size_bytes, main_stream_));
+                if (target_conv_slots_[s].data) CUDA_CHECK(cudaMemsetAsync(target_conv_slots_[s].data, 0, target_conv_slots_[s].size_bytes, main_stream_));
+            }
+        }
+
+        if (qwen_draft_.loaded_) {
+            qwen_draft_.reset_state(main_stream_);
+        }
+        if (mtp_drafter_.loaded_) {
+            mtp_drafter_.reset_kv_cache(main_stream_);
+        }
+
+        // Prefill prompt using CUDA Graphs
         for (size_t i = 0; i < prompt.size(); i++) {
-            forward_token_eager(prompt[i], (int)i);
+            forward_token(prompt[i], (int)i);
+            if (qwen_draft_.loaded_) {
+                qwen_draft_.forward_token_async(prompt[i], (int)i, main_stream_);
+            }
+            CUDA_CHECK(cudaStreamSynchronize(main_stream_));
         }
 
         // Token generation loop
@@ -2456,10 +3465,18 @@ public:
         std::vector<std::pair<int, std::vector<int32_t>>> per_token_topk;
         int prev_tracked_token = -1;
         int prev_slot = -1;
+        int draft_streak = 0;
 
         std::string last_think_token_str;
 
-        auto emit_token = [&](int next_token, int step_t) -> bool {
+        auto gen_start_time = std::chrono::steady_clock::now();
+        int spec_cycles = 0;
+        int spec_drafted = 0;
+        int spec_accepted = 0;
+        double total_draft_ms = 0.0;
+        double total_verify_ms = 0.0;
+
+        auto emit_token_cpu = [&](int next_token, int step_t) -> bool {
             // Handle think block filtering
             if (think_start_id >= 0 && next_token == think_start_id) {
                 if (!think_block_ended) {
@@ -2493,11 +3510,6 @@ public:
                 prev_tracked_token = -1;
                 prev_slot = -1;
             }
-
-            // Pipeline: Launch GPU forward pass for next token immediately so GPU runs concurrently with CPU text decoding
-            forward_token(next_token, position);
-            position++;
-            decode_step_idx_++;
 
             if (next_token == think_start_id || next_token == think_end_id) {
                 return true;
@@ -2559,6 +3571,18 @@ public:
             return true;
         };
 
+        auto emit_token = [&](int next_token, int step_t) -> bool {
+            if (!emit_token_cpu(next_token, step_t)) return false;
+            forward_token(next_token, position);
+            if (qwen_draft_.loaded_) {
+                qwen_draft_.forward_token_async(next_token, position, main_stream_);
+            }
+            position++;
+            decode_step_idx_++;
+            return true;
+        };
+
+        int next_token = -1;
         for (int t = 0; content_tokens_generated < max_tokens; t++) {
             if (g_stop_requested.load()) {
                 LOG_WARN("Generation stopped by client stop request at step %d", t);
@@ -2586,6 +3610,9 @@ public:
                     track_current_token_ = false;
                     if (think_end_id >= 0) {
                         forward_token(think_end_id, position);
+                        if (qwen_draft_.loaded_) {
+                            qwen_draft_.forward_token_async(think_end_id, position, main_stream_);
+                        }
                         position++;
                         output_ids.push_back(think_end_id);
                         history.push_back(think_end_id);
@@ -2596,6 +3623,9 @@ public:
                     for (int tok_id : transition_tokens) {
                         track_current_token_ = false; // Synthetic transition tokens not tracked
                         forward_token(tok_id, position);
+                        if (qwen_draft_.loaded_) {
+                            qwen_draft_.forward_token_async(tok_id, position, main_stream_);
+                        }
                         position++;
                         output_ids.push_back(tok_id);
                         history.push_back(tok_id);
@@ -2606,13 +3636,16 @@ public:
                             on_token(tok_str, false); // Streamed directly as content
                         }
                     }
+                    next_token = -1;
                     continue;
                 }
             }
 
-            // Sample from logits
-            int next_token = sample_token(temperature, history, content_tokens_generated, in_think_block,
+            // Sample from logits if next_token is not pre-set
+            if (next_token < 0) {
+                next_token = sample_token(temperature, history, content_tokens_generated, in_think_block,
                                           top_k, top_p, min_p);
+            }
             
             // If EOS is sampled while inside think block, transition to </think> and continue
             if (in_think_block && (next_token == cfg_.eos_token_id || (eos2_id >= 0 && next_token == eos2_id))) {
@@ -2623,10 +3656,14 @@ public:
                 track_current_token_ = false;
                 if (think_end_id >= 0) {
                     forward_token(think_end_id, position);
+                    if (qwen_draft_.loaded_) {
+                        qwen_draft_.forward_token_async(think_end_id, position, main_stream_);
+                    }
                     position++;
                     output_ids.push_back(think_end_id);
                     history.push_back(think_end_id);
                 }
+                next_token = -1;
                 continue;
             }
 
@@ -2641,50 +3678,200 @@ public:
             }
 
             if (!enable_thinking && (next_token == think_start_id || next_token == think_end_id)) {
-                LOG_WARN("Thinking control token hit in no-think mode: token=%d", next_token);
-                finish_reason = "stop";
-                break;
+                next_token = -1;
+                continue;
             }
+
+            // 2. Speculative Decoding Verification Loop (MTP Self-Drafter + PLD + 2B Neural Drafter fallback)
+            bool allow_draft = (draft_streak >= 0) &&
+                               (content_tokens_generated + 4 < max_tokens || in_think_block) && !g_stop_requested.load();
+
+            if (allow_draft) {
+                if (!emit_token_cpu(next_token, t)) {
+                    finish_reason = "stop";
+                    break;
+                }
+
+                std::vector<int> cand_tokens;
+                cand_tokens.reserve(8);
+                cand_tokens.push_back(next_token);
+
+                bool is_pld = false;
+                bool is_mtp = false;
+
+                // Priority 1: MTP Self-Drafter (uses target model's POST-NORM hidden state)
+                if (cfg_.architecture == ModelArch::QWEN && mtp_drafter_.loaded_) {
+                    // Adaptive MTP draft depth: K=2 on streak, K=1 otherwise (maximizes sustained tok/s)
+                    int K = (draft_streak >= 1) ? 2 : 1;
+                    auto t0 = std::chrono::steady_clock::now();
+                    mtp_drafter_.draft_k_tokens(buf_hidden2_.bf16(), next_token, position, K, cand_tokens, main_stream_);
+                    auto t1 = std::chrono::steady_clock::now();
+                    total_draft_ms += std::chrono::duration<double, std::milli>(t1 - t0).count();
+                    is_mtp = (cand_tokens.size() > 1);
+                }
+
+                // Priority 2: Prompt-Lookup Drafting (free, zero GPU cost)
+                if (cfg_.architecture == ModelArch::QWEN && !is_mtp && enable_pld_ && !history.empty()) {
+                    std::vector<int> pld_cands = PromptLookupDrafter::draft(history, 5, 3, 2);
+                    if (!pld_cands.empty()) {
+                        for (int tok : pld_cands) {
+                            cand_tokens.push_back(tok);
+                        }
+                        is_pld = true;
+                    }
+                }
+
+                // Priority 3: Legacy 2B Neural Drafter (fallback)
+                if (cfg_.architecture == ModelArch::QWEN && !is_mtp && !is_pld && qwen_draft_.loaded_) {
+                    int K = (draft_streak >= 2) ? 4 : 3;
+                    qwen_draft_.draft_k_tokens(next_token, position, K, cand_tokens, main_stream_);
+                }
+
+                int M = (int)cand_tokens.size();
+                if (cfg_.architecture == ModelArch::QWEN && M >= 2) {
+                    auto tv0 = std::chrono::steady_clock::now();
+                    forward_token_batch_qwen(cand_tokens.data(), position, M);
+
+                    int num_verify = M - 1;
+                    // Verify candidate positions simultaneously in ONE GPU pass
+                    argmax_f32_batch_cuda(buf_argmax_out_batch_.i32(), buf_logits_batch_.f32(), cfg_.vocab_size, num_verify, main_stream_);
+
+                    static int32_t* host_batch_preds = nullptr;
+                    if (!host_batch_preds) {
+                        CUDA_CHECK(cudaMallocHost(&host_batch_preds, 16 * sizeof(int32_t)));
+                    }
+                    CUDA_CHECK(cudaMemcpyAsync(host_batch_preds, buf_argmax_out_batch_.i32(), num_verify * sizeof(int32_t), cudaMemcpyDeviceToHost, main_stream_));
+                    CUDA_CHECK(cudaStreamSynchronize(main_stream_));
+                    auto tv1 = std::chrono::steady_clock::now();
+                    double ver_ms = std::chrono::duration<double, std::milli>(tv1 - tv0).count();
+                    total_verify_ms += ver_ms;
+                    if (spec_cycles < 5) {
+                        LOG_INFO("VERIFY TIMING: cycle=%d M=%d took %.2fms (graph=%d)", spec_cycles, M, ver_ms, (int)batch_graph_captured_[M]);
+                    }
+
+                    int accepted = 0;
+                    int bonus_token = -1;
+
+                    for (int k = 0; k < num_verify; k++) {
+                        int pred_k = host_batch_preds[k];
+                        int draft_cand = cand_tokens[k + 1];
+
+                        // Debug: log first 5 MTP spec cycles
+                        if (is_mtp && spec_cycles < 5) {
+                            LOG_INFO("MTP DEBUG: cycle=%d k=%d pred=%d draft=%d %s",
+                                     spec_cycles, k, pred_k, draft_cand,
+                                     pred_k == draft_cand ? "MATCH" : "MISS");
+                        }
+
+                        if (pred_k == draft_cand &&
+                            pred_k != cfg_.eos_token_id && (eos2_id < 0 || pred_k != eos2_id) &&
+                            (enable_thinking || (pred_k != think_start_id && pred_k != think_end_id))) {
+                            accepted++;
+                            if (!emit_token_cpu(draft_cand, t)) {
+                                finish_reason = "stop";
+                                break;
+                            }
+                        } else {
+                            bonus_token = pred_k;
+                            break;
+                        }
+                    }
+
+                    if (finish_reason == "stop") break;
+
+                    spec_cycles++;
+                    spec_drafted += num_verify;
+                    spec_accepted += accepted;
+
+                    if (accepted == num_verify) {
+                        // All draft tokens accepted!
+                        // For MTP: no drafter state management needed (it reads hidden state each time)
+                        // For 2B drafter: need to keep it in sync
+                        if (!is_mtp && qwen_draft_.loaded_) {
+                            if (is_pld) {
+                                qwen_draft_.replay_tokens(cand_tokens.data() + 1, position + 1, num_verify, main_stream_);
+                            } else {
+                                qwen_draft_.forward_token_async(cand_tokens[M - 1], position + (M - 1), main_stream_);
+                            }
+                        }
+
+                        // Copy latest logits from position M - 1 for next token sampling
+                        CUDA_CHECK(cudaMemcpyAsync(buf_logits_.f32(),
+                                                   buf_logits_batch_.f32() + (size_t)(M - 1) * cfg_.vocab_size,
+                                                   cfg_.vocab_size * sizeof(float),
+                                                   cudaMemcpyDeviceToDevice, main_stream_));
+                        // Save post-norm hidden state from last batch slot for MTP drafter
+                        if (mtp_drafter_.loaded_) {
+                            CUDA_CHECK(cudaMemcpyAsync(buf_hidden2_.bf16(),
+                                                       buf_hidden_batch_.bf16() + (size_t)(M - 1) * cfg_.hidden_size,
+                                                       cfg_.hidden_size * sizeof(__nv_bfloat16),
+                                                       cudaMemcpyDeviceToDevice, main_stream_));
+                        }
+                        CUDA_CHECK(cudaStreamSynchronize(main_stream_));
+
+                        next_token = sample_token(temperature, history, content_tokens_generated, in_think_block,
+                                                  top_k, top_p, min_p);
+
+                        position += M;
+                        decode_step_idx_ += M;
+                        draft_streak = std::min(draft_streak + 2, 6);
+                    } else {
+                        // Mismatch at index 'accepted' (0 <= accepted < num_verify)
+                        // Valid candidate sequence: cand_tokens[0 .. accepted]
+                        // 1. Commit Target model state to slot 'accepted' (0-overhead D2D copy)
+                        commit_target_state_slot(accepted);
+                        // Save post-norm hidden state from accepted batch slot for MTP drafter
+                        if (mtp_drafter_.loaded_) {
+                            CUDA_CHECK(cudaMemcpyAsync(buf_hidden2_.bf16(),
+                                                       buf_hidden_batch_.bf16() + (size_t)accepted * cfg_.hidden_size,
+                                                       cfg_.hidden_size * sizeof(__nv_bfloat16),
+                                                       cudaMemcpyDeviceToDevice, main_stream_));
+                        }
+
+                        // 2. Commit Draft model state to slot 'accepted' (only for 2B drafter)
+                        if (!is_mtp && qwen_draft_.loaded_) {
+                            if (is_pld) {
+                                if (accepted > 0) {
+                                    qwen_draft_.replay_tokens(cand_tokens.data() + 1, position + 1, accepted, main_stream_);
+                                }
+                            } else {
+                                qwen_draft_.commit_state_slot(accepted, main_stream_);
+                            }
+                        }
+
+                        // 3. bonus_token becomes next_token for next cycle
+                        next_token = bonus_token;
+
+                        position += (accepted + 1);
+                        decode_step_idx_ += (accepted + 1);
+
+                        if (accepted == 0) {
+                            draft_streak = 0;
+                        } else {
+                            draft_streak = std::min(draft_streak + accepted, 6);
+                        }
+                    }
+                    continue;
+                } else {
+                    // Fallback to single token forward if drafting failed
+                    forward_token(next_token, position);
+                    if (qwen_draft_.loaded_) {
+                        qwen_draft_.forward_token_async(next_token, position, main_stream_);
+                    }
+                    position++;
+                    decode_step_idx_++;
+                    next_token = -1;
+                    continue;
+                }
+            }
+
+            if (draft_streak < 0) draft_streak++;
 
             if (!emit_token(next_token, t)) {
                 finish_reason = "stop";
                 break;
             }
-
-            // 2. Prompt-Lookup Speculative Verification Loop (PLD)
-            if (enable_pld_ && content_tokens_generated < max_tokens) {
-                std::vector<int> candidates = PromptLookupDrafter::draft(history, pld_draft_tokens_, 3, 2);
-                for (size_t cand_idx = 0; cand_idx < candidates.size(); cand_idx++) {
-                    if (content_tokens_generated >= max_tokens) break;
-                    if (g_stop_requested.load()) break;
-
-                    int cand = candidates[cand_idx];
-                    int pred = sample_token(temperature, history, content_tokens_generated, in_think_block,
-                                            top_k, top_p, min_p);
-
-                    if (pred == cand && pred != cfg_.eos_token_id && (eos2_id < 0 || pred != eos2_id) &&
-                        (enable_thinking || (pred != think_start_id && pred != think_end_id))) {
-                        // MATCH! Speculative candidate verified and accepted
-                        if (!emit_token(pred, t)) {
-                            finish_reason = "stop";
-                            break;
-                        }
-                    } else {
-                        // Mismatch or stop token: Draft ends. Emit ground-truth prediction
-                        if (pred == cfg_.eos_token_id || (eos2_id >= 0 && pred == eos2_id)) {
-                            finish_reason = "stop";
-                            break;
-                        }
-                        if (!enable_thinking && (pred == think_start_id || pred == think_end_id)) {
-                            finish_reason = "stop";
-                            break;
-                        }
-                        emit_token(pred, t);
-                        break;
-                    }
-                }
-                if (finish_reason == "stop") break;
-            }
+            next_token = -1;
         }
 
         // Check if we hit max_tokens
@@ -2721,6 +3908,19 @@ public:
         prompt_token_count_ = (int)prompt.size();
         completion_token_count_ = (int)output_ids.size();
         last_finish_reason_ = finish_reason;
+
+        auto gen_end_time = std::chrono::steady_clock::now();
+        double total_sec = std::chrono::duration<double>(gen_end_time - gen_start_time).count();
+        double tok_per_sec = (total_sec > 0.0) ? (double)output_ids.size() / total_sec : 0.0;
+        LOG_INFO("[GENERATION STATS] %zu tokens in %.3fs -> %.2f tok/s (Content: %d, Thinking: %d)",
+                 output_ids.size(), total_sec, tok_per_sec, content_tokens_generated, thinking_tokens_generated);
+        if (spec_cycles > 0) {
+            LOG_INFO("[SPECULATIVE STATS] %d cycles | %d drafted | %d accepted (%.1f%% acceptance rate) | draft: %.1fms total (%.2fms/c) | verify: %.1fms total (%.2fms/c)",
+                     spec_cycles, spec_drafted, spec_accepted,
+                     spec_drafted > 0 ? (100.0 * spec_accepted / spec_drafted) : 0.0,
+                     total_draft_ms, total_draft_ms / spec_cycles,
+                     total_verify_ms, total_verify_ms / spec_cycles);
+        }
 
         CUDA_CHECK(cudaStreamSynchronize(main_stream_));
         if (prev_slot >= 0 && prev_tracked_token >= 0 && track_expert_freq_ && step_topk_host_) {
@@ -2909,13 +4109,7 @@ private:
                         load_quant_tensor(lw.linear_out_proj, lw.linear_out_proj_scale, hf_prefix + ".linear_attn.out_proj.weight");
                     }
 
-                    // Allocate linear attention recurrent states:
-                    // SSM state: [48, 128, 128] BF16 = 1.5 MB (50% memory bandwidth cut)
-                    lw.ssm_state.alloc(48 * 128 * 128 * sizeof(__nv_bfloat16));
-                    CUDA_CHECK(cudaMemset(lw.ssm_state.data, 0, lw.ssm_state.size_bytes));
-                    // Conv state: [10240, 4] BF16 = 80 KB
-                    lw.conv_state.alloc(10240 * 4 * sizeof(__nv_bfloat16));
-                    CUDA_CHECK(cudaMemset(lw.conv_state.data, 0, lw.conv_state.size_bytes));
+                    // Linear attention recurrent states managed in contiguous target_ssm_pool_
                 } else {
                     // Full GQA Projections
                     lw.is_linear_attn = false;
@@ -3116,6 +4310,61 @@ private:
             }
         }
 
+        if (cfg_.architecture == ModelArch::QWEN) {
+            int n_linear = 0;
+            for (auto& lw : layers_) if (lw.is_linear_attn) n_linear++;
+            if (n_linear > 0) {
+                size_t ssm_bytes_per_layer = 48 * 128 * 128 * sizeof(__nv_bfloat16);
+                size_t conv_bytes_per_layer = 10240 * 4 * sizeof(__nv_bfloat16);
+                target_ssm_pool_.alloc(n_linear * ssm_bytes_per_layer);
+                target_conv_pool_.alloc(n_linear * conv_bytes_per_layer);
+                CUDA_CHECK(cudaMemset(target_ssm_pool_.data, 0, target_ssm_pool_.size_bytes));
+                CUDA_CHECK(cudaMemset(target_conv_pool_.data, 0, target_conv_pool_.size_bytes));
+
+                for (int s = 0; s < 8; s++) {
+                    target_ssm_slots_[s].alloc(n_linear * ssm_bytes_per_layer);
+                    target_conv_slots_[s].alloc(n_linear * conv_bytes_per_layer);
+                    CUDA_CHECK(cudaMemset(target_ssm_slots_[s].data, 0, target_ssm_slots_[s].size_bytes));
+                    CUDA_CHECK(cudaMemset(target_conv_slots_[s].data, 0, target_conv_slots_[s].size_bytes));
+                }
+
+                int lin_idx = 0;
+                for (int l = 0; l < cfg_.num_hidden_layers; l++) {
+                    if (layers_[l].is_linear_attn) {
+                        layers_[l].ssm_state.data = (uint8_t*)target_ssm_pool_.data + lin_idx * ssm_bytes_per_layer;
+                        layers_[l].ssm_state.size_bytes = ssm_bytes_per_layer;
+                        layers_[l].conv_state.data = (uint8_t*)target_conv_pool_.data + lin_idx * conv_bytes_per_layer;
+                        layers_[l].conv_state.size_bytes = conv_bytes_per_layer;
+
+                        for (int s = 0; s < 8; s++) {
+                            layers_[l].ssm_state_slots[s].data = (uint8_t*)target_ssm_slots_[s].data + lin_idx * ssm_bytes_per_layer;
+                            layers_[l].ssm_state_slots[s].size_bytes = ssm_bytes_per_layer;
+                            layers_[l].conv_state_slots[s].data = (uint8_t*)target_conv_slots_[s].data + lin_idx * conv_bytes_per_layer;
+                            layers_[l].conv_state_slots[s].size_bytes = conv_bytes_per_layer;
+                        }
+                        lin_idx++;
+                    }
+                }
+            }
+        }
+
+        // Load MTP Self-Drafter weights from the same checkpoint
+        if (cfg_.architecture == ModelArch::QWEN && embed_weight_.data) {
+            std::string mtp_model_dir = model_dir_;
+            if (mtp_model_dir.empty()) {
+                mtp_model_dir = "f:/Moecher/models/qwen3_8_27b_q4";
+            }
+            if (tensor_map.contains("mtp.fc.weight")) {
+                if (head_weight_.dtype == "int4") {
+                    LOG_WARN("MTP: Full lm_head is INT4, not supported for MTP yet — skipping MTP");
+                } else {
+                    mtp_drafter_.load_mtp_weights(mapped, tensor_map, embed_weight_.bf16(),
+                                                  head_weight_.bf16(),
+                                                  cfg_.vocab_size, mtp_model_dir, main_stream_);
+                }
+            }
+        }
+
         dense_mmap.close();
         LOG_INFO("Dense tensors loaded");
         return true;
@@ -3180,6 +4429,7 @@ private:
         // Speculative decoding batch buffers (M=8 capacity)
         int max_batch_m = 8;
         buf_input_tokens_batch_.alloc(max_batch_m * sizeof(int32_t));
+        buf_input_pos_batch_.alloc(max_batch_m * sizeof(int32_t));
         buf_hidden_batch_.alloc(max_batch_m * dim * sizeof(__nv_bfloat16));
         buf_hidden2_batch_.alloc(max_batch_m * dim * sizeof(__nv_bfloat16));
         buf_q_batch_.alloc(max_batch_m * std::max(10240, 2 * n_heads * head_dim_val) * sizeof(__nv_bfloat16));
@@ -3189,6 +4439,7 @@ private:
         buf_linear_a_batch_.alloc(max_batch_m * 64 * sizeof(__nv_bfloat16));
         buf_linear_b_batch_.alloc(max_batch_m * 64 * sizeof(__nv_bfloat16));
         buf_logits_batch_.alloc((size_t)max_batch_m * cfg_.vocab_size * sizeof(float));
+        buf_argmax_out_batch_.alloc(max_batch_m * sizeof(int32_t));
 
         // Compressor working buffers
         // Max projection output size: coff=2 for ratio=4, head_dim=512 -> 1024
@@ -3255,6 +4506,30 @@ private:
             A, CUDA_R_16BF, K,    // ldb = K
             &beta,
             C, CUDA_R_16BF, N,    // ldc = N
+            CUBLAS_COMPUTE_32F,
+            CUBLAS_GEMM_DEFAULT));
+    }
+
+    void gemm_bf16_f32(
+        float* C, int M, int N, int K,
+        const __nv_bfloat16* A,  // [M, K]
+        const __nv_bfloat16* B,  // [N, K] — stored as weight[out, in]
+        float alpha = 1.0f, float beta = 0.0f)
+    {
+        if (M == 1) {
+            gemv_bf16_cuda(C, B, A, N, K, main_stream_);
+            return;
+        }
+        CUBLAS_CHECK(cublasGemmEx(
+            cublas_handle_,
+            CUBLAS_OP_T,    // B transposed (K x N -> N x K)
+            CUBLAS_OP_N,    // A not transposed
+            N, M, K,        // m=N, n=M, k=K in cuBLAS terms
+            &alpha,
+            B, CUDA_R_16BF, K,    // lda = K
+            A, CUDA_R_16BF, K,    // ldb = K
+            &beta,
+            C, CUDA_R_32F, N,     // ldc = N
             CUBLAS_COMPUTE_32F,
             CUBLAS_GEMM_DEFAULT));
     }
@@ -3455,8 +4730,15 @@ private:
                 lw.ssm_state.bf16(),
                 16, 48, 128, main_stream_);
 
-            // 4. Output Projection: buf_attn_out_ (6144) -> buf_hidden2_ (5120)
-            matmul_proj(buf_hidden2_, buf_attn_out_, lw.linear_out_proj, lw.linear_out_proj_scale, dim, 6144);
+            // 4. Output Projection: in-place residual accumulation into buf_hidden_
+            if (lw.linear_out_proj.dtype == "int4") {
+                gemv_int4_residual_cuda(buf_hidden_.bf16(), buf_attn_out_.bf16(),
+                                        (const uint8_t*)lw.linear_out_proj.data, lw.linear_out_proj_scale.bf16(),
+                                        dim, 6144, main_stream_);
+            } else {
+                matmul_proj(buf_hidden2_, buf_attn_out_, lw.linear_out_proj, lw.linear_out_proj_scale, dim, 6144);
+                vector_add_bf16_cuda(buf_hidden_.bf16(), buf_hidden2_.bf16(), dim, main_stream_);
+            }
         } else {
             // Standard Full GQA Attention (Gated) Projections
             matmul_proj(buf_q_, buf_hidden2_, lw.w_q, lw.w_q_scale, 2 * n_q_heads * head_dim, dim);
@@ -3477,12 +4759,16 @@ private:
                 buf_input_pos_.i32(), position, cfg_.max_seq_len,
                 cfg_.rope_theta, cfg_.rms_norm_eps, main_stream_);
 
-            // 5. Output Projection: buf_attn_out_ -> buf_hidden2_
-            matmul_proj(buf_hidden2_, buf_attn_out_, lw.w_o, lw.w_o_scale, dim, n_q_heads * head_dim);
+            // 5. Output Projection: in-place residual accumulation into buf_hidden_
+            if (lw.w_o.dtype == "int4") {
+                gemv_int4_residual_cuda(buf_hidden_.bf16(), buf_attn_out_.bf16(),
+                                        (const uint8_t*)lw.w_o.data, lw.w_o_scale.bf16(),
+                                        dim, n_q_heads * head_dim, main_stream_);
+            } else {
+                matmul_proj(buf_hidden2_, buf_attn_out_, lw.w_o, lw.w_o_scale, dim, n_q_heads * head_dim);
+                vector_add_bf16_cuda(buf_hidden_.bf16(), buf_hidden2_.bf16(), dim, main_stream_);
+            }
         }
-
-        // 6. Residual connection: buf_hidden_ += buf_hidden2_
-        vector_add_bf16_cuda(buf_hidden_.bf16(), buf_hidden2_.bf16(), dim, main_stream_);
 
         // 7. FFN Pre-RMSNorm: buf_hidden_ -> buf_hidden2_
         rms_norm_one_centered_cuda(buf_hidden2_.bf16(), buf_hidden_.bf16(),
@@ -3500,11 +4786,15 @@ private:
             silu_mul_cuda(buf_gate_.bf16(), buf_gate_.bf16(), buf_up_.bf16(), inter_size, cfg_.swiglu_limit, main_stream_);
         }
 
-        // 10. Down projection: buf_gate_ -> buf_hidden2_
-        matmul_proj(buf_hidden2_, buf_gate_, lw.w_down, lw.w_down_scale, dim, inter_size);
-
-        // 11. Residual connection: buf_hidden_ += buf_hidden2_
-        vector_add_bf16_cuda(buf_hidden_.bf16(), buf_hidden2_.bf16(), dim, main_stream_);
+        // 10. Down projection: in-place residual accumulation into buf_hidden_
+        if (lw.w_down.dtype == "int4") {
+            gemv_int4_residual_cuda(buf_hidden_.bf16(), buf_gate_.bf16(),
+                                    (const uint8_t*)lw.w_down.data, lw.w_down_scale.bf16(),
+                                    dim, inter_size, main_stream_);
+        } else {
+            matmul_proj(buf_hidden2_, buf_gate_, lw.w_down, lw.w_down_scale, dim, inter_size);
+            vector_add_bf16_cuda(buf_hidden_.bf16(), buf_hidden2_.bf16(), dim, main_stream_);
+        }
     }
 
     void forward_layer_qwen_batch(int layer_id, int position, int M) {
@@ -3519,43 +4809,41 @@ private:
             if (weight.dtype == "int4") {
                 gemm_int4_batch_cuda(out.bf16(), in_vec.bf16(), (const uint8_t*)weight.data, scale.bf16(), N, K, M, main_stream_);
             } else {
-                for (int m = 0; m < M; m++) {
-                    gemv_bf16_out_bf16_cuda(out.bf16() + m * N, weight.bf16(), in_vec.bf16() + m * K, N, K, main_stream_);
-                }
+                gemv_bf16_out_bf16_batch_cuda(out.bf16(), weight.bf16(), in_vec.bf16(), N, K, M, main_stream_);
             }
         };
 
         // 1. Attention Pre-RMSNorm: [M, dim] -> [M, dim]
-        for (int m = 0; m < M; m++) {
-            rms_norm_one_centered_cuda(buf_hidden2_batch_.bf16() + m * dim, buf_hidden_batch_.bf16() + m * dim,
-                                       lw.attn_norm_w.bf16(), dim, cfg_.rms_norm_eps, main_stream_);
-        }
+        rms_norm_one_centered_cuda_batched(buf_hidden2_batch_.bf16(), buf_hidden_batch_.bf16(),
+                                           lw.attn_norm_w.bf16(), M, dim, cfg_.rms_norm_eps, main_stream_);
 
         if (lw.is_linear_attn) {
             // Qwen 3.8 Gated DeltaNet Linear Attention Projections for M tokens
             matmul_proj_batch(buf_q_batch_, buf_hidden2_batch_, lw.w_in_qkv, lw.w_in_qkv_scale, 10240, dim);
             matmul_proj_batch(buf_up_batch_, buf_hidden2_batch_, lw.w_in_z, lw.w_in_z_scale, 6144, dim);
-            for (int m = 0; m < M; m++) {
-                gemv_bf16_out_bf16_cuda(buf_linear_a_batch_.bf16() + m * 48, lw.w_in_a.bf16(), buf_hidden2_batch_.bf16() + m * dim, 48, dim, main_stream_);
-                gemv_bf16_out_bf16_cuda(buf_linear_b_batch_.bf16() + m * 48, lw.w_in_b.bf16(), buf_hidden2_batch_.bf16() + m * dim, 48, dim, main_stream_);
-            }
+            gemv_bf16_out_bf16_batch_cuda(buf_linear_a_batch_.bf16(), lw.w_in_a.bf16(), buf_hidden2_batch_.bf16(), 48, dim, M, main_stream_);
+            gemv_bf16_out_bf16_batch_cuda(buf_linear_b_batch_.bf16(), lw.w_in_b.bf16(), buf_hidden2_batch_.bf16(), 48, dim, M, main_stream_);
 
-            // DeltaNet SSM recurrence across M tokens
-            for (int m = 0; m < M; m++) {
-                deltanet_linear_attention_decode_cuda(
-                    buf_attn_out_batch_.bf16() + m * 6144,
-                    buf_q_batch_.bf16() + m * 10240,
-                    buf_up_batch_.bf16() + m * 6144,
-                    buf_linear_a_batch_.bf16() + m * 48,
-                    buf_linear_b_batch_.bf16() + m * 48,
-                    lw.conv1d_w.bf16(),
-                    lw.conv_state.bf16(),
-                    lw.A_log.bf16(),
-                    lw.dt_bias.bf16(),
-                    lw.linear_norm_w.bf16(),
-                    lw.ssm_state.bf16(),
-                    16, 48, 128, main_stream_);
-            }
+            // DeltaNet SSM recurrence across M tokens (fully batched, zero intermediate VRAM roundtrips)
+            deltanet_linear_attention_decode_batch_cuda(
+                buf_attn_out_batch_.bf16(),
+                buf_q_batch_.bf16(),
+                buf_up_batch_.bf16(),
+                buf_linear_a_batch_.bf16(),
+                buf_linear_b_batch_.bf16(),
+                lw.conv1d_w.bf16(),
+                lw.conv_state.bf16(),
+                lw.conv_state.bf16(),
+                (M > 1) ? lw.conv_state_slots[0].bf16() : nullptr,
+                (M > 2) ? lw.conv_state_slots[1].bf16() : nullptr,
+                lw.A_log.bf16(),
+                lw.dt_bias.bf16(),
+                lw.linear_norm_w.bf16(),
+                lw.ssm_state.bf16(),
+                lw.ssm_state.bf16(),
+                (M > 1) ? lw.ssm_state_slots[0].bf16() : nullptr,
+                (M > 2) ? lw.ssm_state_slots[1].bf16() : nullptr,
+                16, 48, 128, M, main_stream_);
 
             // Output projection: [M, 6144] -> [M, 5120]
             matmul_proj_batch(buf_hidden2_batch_, buf_attn_out_batch_, lw.linear_out_proj, lw.linear_out_proj_scale, dim, 6144);
@@ -3576,7 +4864,7 @@ private:
                     lw.k_cache_gqa.u8(),
                     lw.v_cache_gqa.u8(),
                     n_q_heads, n_kv_heads, head_dim,
-                    nullptr, position + m, cfg_.max_seq_len,
+                    buf_input_pos_batch_.data ? (buf_input_pos_batch_.i32() + m) : nullptr, position + m, cfg_.max_seq_len,
                     cfg_.rope_theta, cfg_.rms_norm_eps, main_stream_);
             }
 
@@ -3584,11 +4872,9 @@ private:
         }
 
         // Residual connection: buf_hidden_ += buf_hidden2_
-        for (int m = 0; m < M; m++) {
-            vector_add_bf16_cuda(buf_hidden_batch_.bf16() + m * dim, buf_hidden2_batch_.bf16() + m * dim, dim, main_stream_);
-            rms_norm_one_centered_cuda(buf_hidden2_batch_.bf16() + m * dim, buf_hidden_batch_.bf16() + m * dim,
-                                       lw.ffn_norm_w.bf16(), dim, cfg_.rms_norm_eps, main_stream_);
-        }
+        vector_add_bf16_cuda(buf_hidden_batch_.bf16(), buf_hidden2_batch_.bf16(), M * dim, main_stream_);
+        rms_norm_one_centered_cuda_batched(buf_hidden2_batch_.bf16(), buf_hidden_batch_.bf16(),
+                                           lw.ffn_norm_w.bf16(), M, dim, cfg_.rms_norm_eps, main_stream_);
 
         // FFN SwiGLU for M tokens simultaneously:
         if (lw.w_gate.dtype == "int4") {
@@ -3609,15 +4895,15 @@ private:
         matmul_proj_batch(buf_hidden2_batch_, buf_gate_batch_, lw.w_down, lw.w_down_scale, dim, inter_size);
 
         // Residual connection: buf_hidden_ += buf_hidden2_
-        for (int m = 0; m < M; m++) {
-            vector_add_bf16_cuda(buf_hidden_batch_.bf16() + m * dim, buf_hidden2_batch_.bf16() + m * dim, dim, main_stream_);
-        }
+        vector_add_bf16_cuda(buf_hidden_batch_.bf16(), buf_hidden2_batch_.bf16(), M * dim, main_stream_);
     }
 
-    void forward_token_batch_qwen(const int* tokens_host, int position, int M) {
-        int dim = cfg_.hidden_size;
-        CUDA_CHECK(cudaMemcpyAsync(buf_input_tokens_batch_.i32(), tokens_host, M * sizeof(int32_t), cudaMemcpyHostToDevice, main_stream_));
+    bool batch_graph_captured_[9] = {false};
+    cudaGraph_t batch_graph_[9];
+    cudaGraphExec_t batch_graph_exec_[9];
 
+    void forward_token_batch_qwen_device_body(int position, int M) {
+        int dim = cfg_.hidden_size;
         // 1. Embedding lookup for M tokens
         embedding_cuda(buf_hidden_batch_.bf16(), embed_weight_.bf16(), buf_input_tokens_batch_.i32(), M, dim, main_stream_);
 
@@ -3627,10 +4913,8 @@ private:
         }
 
         // 3. Final norm
-        for (int m = 0; m < M; m++) {
-            rms_norm_one_centered_cuda(buf_hidden_batch_.bf16() + m * dim, buf_hidden_batch_.bf16() + m * dim,
-                                       norm_weight_.bf16(), dim, cfg_.rms_norm_eps, main_stream_);
-        }
+        rms_norm_one_centered_cuda_batched(buf_hidden_batch_.bf16(), buf_hidden_batch_.bf16(),
+                                           norm_weight_.bf16(), M, dim, cfg_.rms_norm_eps, main_stream_);
 
         // 4. Logits: hidden @ head_weight.T -> [M, vocab_size] in F32
         if (head_weight_scale_.data) {
@@ -3638,11 +4922,90 @@ private:
                                      (const uint8_t*)head_weight_.data, head_weight_scale_.bf16(),
                                      cfg_.vocab_size, dim, M, main_stream_);
         } else {
-            for (int m = 0; m < M; m++) {
-                gemv_bf16_cuda(buf_logits_batch_.f32() + (size_t)m * cfg_.vocab_size,
-                               head_weight_.bf16(), buf_hidden_batch_.bf16() + m * dim,
-                               cfg_.vocab_size, dim, main_stream_);
+            gemm_bf16_f32(buf_logits_batch_.f32(), M, cfg_.vocab_size, dim,
+                          buf_hidden_batch_.bf16(), head_weight_.bf16());
+        }
+    }
+
+    void forward_token_batch_qwen(const int* tokens_host, int position, int M) {
+        if (!h_target_batch_tok_) {
+            CUDA_CHECK(cudaMallocHost(&h_target_batch_tok_, 16 * sizeof(int32_t)));
+            CUDA_CHECK(cudaMallocHost(&h_target_batch_pos_, 16 * sizeof(int32_t)));
+        }
+        for (int m = 0; m < M; m++) {
+            h_target_batch_pos_[m] = position + m;
+            h_target_batch_tok_[m] = tokens_host[m];
+        }
+        CUDA_CHECK(cudaMemcpyAsync(buf_input_pos_batch_.i32(), h_target_batch_pos_, M * sizeof(int32_t), cudaMemcpyHostToDevice, main_stream_));
+        CUDA_CHECK(cudaMemcpyAsync(buf_input_tokens_batch_.i32(), h_target_batch_tok_, M * sizeof(int32_t), cudaMemcpyHostToDevice, main_stream_));
+
+        if (M >= 2 && M <= 8 && batch_graph_captured_[M]) {
+            CUDA_CHECK(cudaGraphLaunch(batch_graph_exec_[M], main_stream_));
+        } else {
+            forward_token_batch_qwen_device_body(position, M);
+        }
+    }
+
+    void init_batch_cuda_graphs() {
+        if (cfg_.architecture != ModelArch::QWEN) return;
+        for (int M : {2, 3, 4, 5, 6, 7, 8}) {
+            LOG_INFO("Warming up and capturing Batched Target CUDA Graph (M=%d)...", M);
+
+            std::vector<int32_t> dummy_toks(M, 0);
+            std::vector<int32_t> dummy_pos(M, 0);
+            CUDA_CHECK(cudaMemcpy(buf_input_tokens_batch_.i32(), dummy_toks.data(), M * sizeof(int32_t), cudaMemcpyHostToDevice));
+            CUDA_CHECK(cudaMemcpy(buf_input_pos_batch_.i32(), dummy_pos.data(), M * sizeof(int32_t), cudaMemcpyHostToDevice));
+
+            // Warmup
+            for (int i = 0; i < 3; i++) {
+                forward_token_batch_qwen_device_body(0, M);
             }
+            CUDA_CHECK(cudaStreamSynchronize(main_stream_));
+
+            cudaError_t cap_err = cudaStreamBeginCapture(main_stream_, cudaStreamCaptureModeGlobal);
+            if (cap_err != cudaSuccess) {
+                batch_graph_captured_[M] = false;
+                continue;
+            }
+
+            forward_token_batch_qwen_device_body(0, M);
+
+            cudaError_t end_err = cudaStreamEndCapture(main_stream_, &batch_graph_[M]);
+            if (end_err != cudaSuccess) {
+                batch_graph_captured_[M] = false;
+                continue;
+            }
+
+            cudaError_t inst_err = cudaGraphInstantiate(&batch_graph_exec_[M], batch_graph_[M], nullptr, nullptr, 0);
+            if (inst_err != cudaSuccess) {
+                batch_graph_captured_[M] = false;
+                continue;
+            }
+
+            batch_graph_captured_[M] = true;
+            LOG_INFO("Batched Target CUDA Graph (M=%d) instantiated successfully!", M);
+        }
+    }
+
+    inline void checkpoint_target_state() {
+        if (target_ssm_pool_.data && target_ssm_slots_[0].data) {
+            CUDA_CHECK(cudaMemcpyAsync(target_ssm_slots_[0].data, target_ssm_pool_.data, target_ssm_pool_.size_bytes, cudaMemcpyDeviceToDevice, main_stream_));
+            CUDA_CHECK(cudaMemcpyAsync(target_conv_slots_[0].data, target_conv_pool_.data, target_conv_pool_.size_bytes, cudaMemcpyDeviceToDevice, main_stream_));
+        }
+    }
+
+    inline void restore_target_state() {
+        if (target_ssm_pool_.data && target_ssm_slots_[0].data) {
+            CUDA_CHECK(cudaMemcpyAsync(target_ssm_pool_.data, target_ssm_slots_[0].data, target_ssm_pool_.size_bytes, cudaMemcpyDeviceToDevice, main_stream_));
+            CUDA_CHECK(cudaMemcpyAsync(target_conv_pool_.data, target_conv_slots_[0].data, target_conv_pool_.size_bytes, cudaMemcpyDeviceToDevice, main_stream_));
+        }
+    }
+
+    inline void commit_target_state_slot(int slot_idx) {
+        if (slot_idx < 0 || slot_idx >= 8) return;
+        if (target_ssm_pool_.data && target_ssm_slots_[slot_idx].data) {
+            CUDA_CHECK(cudaMemcpyAsync(target_ssm_pool_.data, target_ssm_slots_[slot_idx].data, target_ssm_pool_.size_bytes, cudaMemcpyDeviceToDevice, main_stream_));
+            CUDA_CHECK(cudaMemcpyAsync(target_conv_pool_.data, target_conv_slots_[slot_idx].data, target_conv_pool_.size_bytes, cudaMemcpyDeviceToDevice, main_stream_));
         }
     }
 
@@ -5059,6 +6422,9 @@ static std::vector<int> apply_chat_template(const json& messages, const BPEToken
             if (enable_thinking) {
                 auto think_enc = tok.encode("<think>\n");
                 result.insert(result.end(), think_enc.begin(), think_enc.end());
+            } else {
+                auto think_enc = tok.encode("<think>\n\n</think>\n");
+                result.insert(result.end(), think_enc.begin(), think_enc.end());
             }
         }
         return result;
@@ -5120,6 +6486,7 @@ static std::vector<int> apply_chat_template(const json& messages, const BPEToken
             if (enable_thinking) {
                 result.push_back(THINK_BEGIN);
             } else {
+                result.push_back(THINK_BEGIN);
                 result.push_back(THINK_END);
             }
         }
@@ -5446,6 +6813,11 @@ int main(int argc, char** argv) {
     int imatrix_max_tokens = -1;
     bool enable_pld = true;
     int pld_draft_tokens = 4;
+    std::string test_prompt = "";
+    bool benchmark_mode = false;
+    float test_temp = 0.7f;
+    int test_max_tokens = 150;
+    bool test_thinking = true;
 
     for (int i = 1; i < argc; i++) {
         if ((std::string(argv[i]) == "--manifest" || std::string(argv[i]) == "-m") && i + 1 < argc) {
@@ -5462,12 +6834,22 @@ int main(int argc, char** argv) {
             expert_dtype_override = argv[++i];
         } else if ((std::string(argv[i]) == "--thinking-budget" || std::string(argv[i]) == "--budget" || std::string(argv[i]) == "--max-thinking-tokens") && i + 1 < argc) {
             default_thinking_budget = std::stoi(argv[++i]);
+        } else if ((std::string(argv[i]) == "--temp" || std::string(argv[i]) == "--temperature") && i + 1 < argc) {
+            test_temp = std::stof(argv[++i]);
+        } else if ((std::string(argv[i]) == "--max-tokens" || std::string(argv[i]) == "-n") && i + 1 < argc) {
+            test_max_tokens = std::stoi(argv[++i]);
+        } else if (std::string(argv[i]) == "--no-think" || std::string(argv[i]) == "--no-thinking") {
+            test_thinking = false;
         } else if (std::string(argv[i]) == "--imatrix-dataset" && i + 1 < argc) {
             imatrix_dataset = argv[++i];
         } else if (std::string(argv[i]) == "--imatrix-out" && i + 1 < argc) {
             imatrix_out = argv[++i];
         } else if (std::string(argv[i]) == "--imatrix-max-tokens" && i + 1 < argc) {
             imatrix_max_tokens = std::stoi(argv[++i]);
+        } else if (std::string(argv[i]) == "--test-prompt" && i + 1 < argc) {
+            test_prompt = argv[++i];
+        } else if (std::string(argv[i]) == "--benchmark") {
+            benchmark_mode = true;
         } else if (std::string(argv[i]) == "--no-pld" || std::string(argv[i]) == "--disable-pld") {
             enable_pld = false;
         } else if ((std::string(argv[i]) == "--pld-tokens" || std::string(argv[i]) == "--pld-draft-tokens") && i + 1 < argc) {
@@ -5518,6 +6900,19 @@ int main(int argc, char** argv) {
     if (!imatrix_dataset.empty() && !imatrix_out.empty()) {
         bool ok = engine.collect_imatrix(imatrix_dataset, imatrix_out, imatrix_max_tokens);
         return ok ? 0 : 1;
+    }
+
+    if (!test_prompt.empty() || benchmark_mode) {
+        std::string prompt_str = test_prompt.empty() ? "Write a short story about an astronaut." : test_prompt;
+        json messages = json::array({
+            {{"role", "user"}, {"content", prompt_str}}
+        });
+        std::vector<int> prompt = apply_chat_template(messages, engine.tokenizer_, test_thinking, "high");
+        LOG_INFO("Running test generation for prompt: '%s' (%zu prompt tokens, temp=%.2f, max_tokens=%d, thinking=%d)...",
+                 prompt_str.c_str(), prompt.size(), test_temp, test_max_tokens, test_thinking ? 1 : 0);
+        std::string result = engine.generate(prompt, test_max_tokens, test_temp, nullptr, 1.0f, test_thinking, default_thinking_budget, 0.95f, 0.0f, 1024);
+        printf("\n\n--- Output ---\n%s\n--------------\n", result.c_str());
+        return 0;
     }
 
     // Enable expert frequency tracking if --track flag is set

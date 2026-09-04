@@ -35,6 +35,14 @@ void rms_norm_cuda_batched(
     float eps,
     cudaStream_t stream = 0);
 
+void rms_norm_one_centered_cuda_batched(
+    __nv_bfloat16* out,            // [n, dim]
+    const __nv_bfloat16* x,        // [n, dim]
+    const __nv_bfloat16* weight,   // [dim]
+    int n, int dim,
+    float eps,
+    cudaStream_t stream = 0);
+
 void rms_norm_f32_cuda(float* x, int dim, float eps, cudaStream_t stream = 0);
 
 void rms_norm_weighted_f32_cuda(
@@ -153,6 +161,14 @@ void gemm_int2_cuda(__nv_bfloat16* out, const __nv_bfloat16* A,
 // ── INT4 symmetric block quantization (Block Size = 32) ───────────────────────
 void gemv_int4_cuda(
     __nv_bfloat16* out,
+    const __nv_bfloat16* vec,
+    const uint8_t* weight,
+    const __nv_bfloat16* scale,
+    int N, int K,
+    cudaStream_t stream = 0);
+
+void gemv_int4_residual_cuda(
+    __nv_bfloat16* inout,
     const __nv_bfloat16* vec,
     const uint8_t* weight,
     const __nv_bfloat16* scale,
@@ -318,6 +334,12 @@ void argmax_f32_cuda(
     int n,
     cudaStream_t stream = 0);
 
+void argmax_f32_batch_cuda(
+    int32_t* out,
+    const float* logits,
+    int n, int M,
+    cudaStream_t stream = 0);
+
 void sample_multinomial_f32_cuda(
     int32_t* out,
     float* logits,
@@ -396,6 +418,20 @@ void gemv_bf16_out_bf16_cuda(
     int N, int K,
     cudaStream_t stream = 0);
 
+void gemv_bf16_batch_cuda(
+    float* out,                    // [M, N] F32 output
+    const __nv_bfloat16* W,        // [N, K] BF16 weight matrix (row-major)
+    const __nv_bfloat16* X,        // [M, K] BF16 input vectors
+    int N, int K, int M,
+    cudaStream_t stream = 0);
+
+void gemv_bf16_out_bf16_batch_cuda(
+    __nv_bfloat16* out,            // [M, N] BF16 output
+    const __nv_bfloat16* W,        // [N, K] BF16 weight matrix (row-major)
+    const __nv_bfloat16* X,        // [M, K] BF16 input vectors
+    int N, int K, int M,
+    cudaStream_t stream = 0);
+
 // Softmax-gated weighted sum for KV compression (non-overlapping)
 // Computes: out[d] = sum_i( kv[i][d] * softmax(score[i][d]) ) for d in [0, dim)
 // kv:    [window, dim] F32 — accumulated KV entries in the compression window
@@ -419,14 +455,6 @@ void combine_kv_cuda(
     int comp_len,
     int head_dim,
     cudaStream_t stream = 0);
-
-
-void gemv_bf16_out_bf16_cuda(
-    __nv_bfloat16* out,
-    const __nv_bfloat16* W,
-    const __nv_bfloat16* x,
-    int N, int K,
-    cudaStream_t stream);
 
 void hc_pre_weighted_add_cuda(
     __nv_bfloat16* hidden, const __nv_bfloat16* hc_state, const float* pre_weights,
@@ -688,14 +716,65 @@ void deltanet_linear_attention_decode_cuda(
     const __nv_bfloat16* in_a,      // [48]
     const __nv_bfloat16* in_b,      // [48]
     const __nv_bfloat16* conv1d_w,  // [10240, 4]
-    __nv_bfloat16* conv_state,      // [10240, 4]
+    const __nv_bfloat16* in_conv_state, // [10240, 4]
+    __nv_bfloat16* out_conv_state,      // [10240, 4]
     const __nv_bfloat16* A_log,     // [48]
     const __nv_bfloat16* dt_bias,   // [48]
     const __nv_bfloat16* norm_w,    // [128]
-    __nv_bfloat16* ssm_state,       // [48, 128, 128] BF16 (50% memory cut)
+    const __nv_bfloat16* in_ssm_state,  // [48, 128, 128] BF16 (50% memory cut)
+    __nv_bfloat16* out_ssm_state,       // [48, 128, 128] BF16
     int num_k_heads = 16,
     int num_v_heads = 48,
     int head_dim = 128,
+    cudaStream_t stream = 0);
+
+inline void deltanet_linear_attention_decode_cuda(
+    __nv_bfloat16* out,
+    const __nv_bfloat16* in_qkv,
+    const __nv_bfloat16* in_z,
+    const __nv_bfloat16* in_a,
+    const __nv_bfloat16* in_b,
+    const __nv_bfloat16* conv1d_w,
+    __nv_bfloat16* conv_state,
+    const __nv_bfloat16* A_log,
+    const __nv_bfloat16* dt_bias,
+    const __nv_bfloat16* norm_w,
+    __nv_bfloat16* ssm_state,
+    int num_k_heads = 16,
+    int num_v_heads = 48,
+    int head_dim = 128,
+    cudaStream_t stream = 0)
+{
+    deltanet_linear_attention_decode_cuda(
+        out, in_qkv, in_z, in_a, in_b, conv1d_w,
+        conv_state, conv_state,
+        A_log, dt_bias, norm_w,
+        ssm_state, ssm_state,
+        num_k_heads, num_v_heads, head_dim, stream);
+}
+
+void deltanet_linear_attention_decode_batch_cuda(
+    __nv_bfloat16* out,                 // [M, 6144]
+    const __nv_bfloat16* in_qkv,        // [M, 10240]
+    const __nv_bfloat16* in_z,          // [M, 6144]
+    const __nv_bfloat16* in_a,          // [M, 48]
+    const __nv_bfloat16* in_b,          // [M, 48]
+    const __nv_bfloat16* conv1d_w,      // [10240, 4]
+    const __nv_bfloat16* in_conv_state, // [10240, 4]
+    __nv_bfloat16* out_conv_state,      // [10240, 4]
+    __nv_bfloat16* slot_conv_0,
+    __nv_bfloat16* slot_conv_1,
+    const __nv_bfloat16* A_log,         // [48]
+    const __nv_bfloat16* dt_bias,       // [48]
+    const __nv_bfloat16* norm_w,        // [128]
+    const __nv_bfloat16* in_ssm_state,  // [48, 128, 128] BF16
+    __nv_bfloat16* out_ssm_state,       // [48, 128, 128] BF16
+    __nv_bfloat16* slot_ssm_0,
+    __nv_bfloat16* slot_ssm_1,
+    int num_k_heads,
+    int num_v_heads,
+    int head_dim,
+    int M,
     cudaStream_t stream = 0);
 
 // ── GPU-Native MoE Expert Activation Frequency Counter ──────────────────────────
@@ -707,6 +786,17 @@ void accumulate_expert_freq_cuda(
     int layer_id,
     int n_experts,
     int top_k,
+    cudaStream_t stream = 0);
+
+// ── Increment Int32 Scalar on Device (CUDA Graph Compatible) ────────────────────
+void increment_i32_cuda(int32_t* ptr, int inc, cudaStream_t stream = 0);
+
+// ── Fast GPU Quantization: BF16 to INT4 Symmetric (Block Size = 32, Zero-point 8) ──
+void quantize_bf16_to_int4_symmetric_cuda(
+    uint8_t* out_packed,
+    __nv_bfloat16* out_scale,
+    const __nv_bfloat16* in_bf16,
+    int N, int K,
     cudaStream_t stream = 0);
 
 
