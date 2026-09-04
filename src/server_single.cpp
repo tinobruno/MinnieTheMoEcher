@@ -3735,19 +3735,13 @@ public:
                     }
                 } else if (cfg_.architecture == ModelArch::DEEPSEEK_V4 && enable_pld_ && !history.empty()) {
                     int max_cands = 2;
-                    if (!cfg_.compress_ratios.empty()) {
-                        int rem = (position + 1) % 4;
-                        max_cands = (rem == 1) ? 2 : ((rem == 2) ? 1 : 0);
-                    }
-                    if (max_cands > 0) {
-                        std::vector<int> pld_cands = PromptLookupDrafter::draft(history, max_cands, 4, 2);
-                        if (!pld_cands.empty()) {
-                            int count = std::min((int)pld_cands.size(), max_cands);
-                            for (int i = 0; i < count; i++) {
-                                cand_tokens.push_back(pld_cands[i]);
-                            }
-                            is_pld = (cand_tokens.size() > 1);
+                    std::vector<int> pld_cands = PromptLookupDrafter::draft(history, max_cands, 4, 2);
+                    if (!pld_cands.empty()) {
+                        int count = std::min((int)pld_cands.size(), max_cands);
+                        for (int i = 0; i < count; i++) {
+                            cand_tokens.push_back(pld_cands[i]);
                         }
+                        is_pld = (cand_tokens.size() > 1);
                     }
                 }
 
