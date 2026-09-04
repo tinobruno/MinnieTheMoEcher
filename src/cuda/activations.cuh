@@ -804,6 +804,27 @@ inline void deltanet_linear_attention_decode_cuda(
         num_k_heads, num_v_heads, head_dim, stream);
 }
 
+// ── DeepSeek V4 DSpark Native MTP Helpers ────────────────────────────────────
+void hc_mean_pool_cuda(
+    __nv_bfloat16* out_h,
+    const __nv_bfloat16* in_hc,
+    int dim, int hc,
+    cudaStream_t stream = 0);
+
+void vector_broadcast_hc_cuda(
+    __nv_bfloat16* out_hc,
+    const __nv_bfloat16* in_vec,
+    int dim, int hc,
+    cudaStream_t stream = 0);
+
+void concat_3_bf16_cuda(
+    __nv_bfloat16* out_cat,
+    const __nv_bfloat16* a,
+    const __nv_bfloat16* b,
+    const __nv_bfloat16* c,
+    int dim,
+    cudaStream_t stream = 0);
+
 void deltanet_linear_attention_decode_batch_cuda(
     __nv_bfloat16* out,                 // [M, 6144]
     const __nv_bfloat16* in_qkv,        // [M, 10240]
@@ -850,17 +871,7 @@ void quantize_bf16_to_int4_symmetric_cuda(
     int N, int K,
     cudaStream_t stream = 0);
 
-// ── DeepSeek V4 Markov MTP Head: Fast GPU Next-Token Drafter ────────────────────
-void markov_head_predict_cuda(
-    int32_t* d_out_pred,             // [2] I32 on GPU (predicted token IDs)
-    float* d_temp_vals,              // [256] F32 temp buffer for block reduction
-    int32_t* d_temp_idx,             // [256] I32 temp buffer for block reduction
-    const __nv_bfloat16* w1,         // [vocab_size, hidden_dim] BF16
-    const __nv_bfloat16* w2,         // [vocab_size, hidden_dim] BF16
-    int32_t input_token,             // Token ID to predict transition from
-    int vocab_size,                  // 129280
-    int hidden_dim,                  // 256
-    cudaStream_t stream = 0);
+
 
 
 

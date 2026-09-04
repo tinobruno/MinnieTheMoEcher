@@ -6855,3 +6855,81 @@ void quantize_bf16_to_int4_symmetric_cuda(
         out_packed, out_scale, in_bf16, N, K);
 }
 
+// ── DeepSeek V4 DSpark Native MTP Helpers ────────────────────────────────────
+__global__ void hc_mean_pool_kernel(
+    __nv_bfloat16* __restrict__ out_h,
+    const __nv_bfloat16* __restrict__ in_hc,
+    int dim, int hc)
+{
+    int d = threadIdx.x + blockIdx.x * blockDim.x;
+    if (d >= dim) return;
+    float sum = 0.0f;
+    for (int h = 0; h < hc; h++) {
+        sum += __bfloat162float(in_hc[(size_t)h * dim + d]);
+    }
+    out_h[d] = __float2bfloat16(sum / (float)hc);
+}
+
+void hc_mean_pool_cuda(
+    __nv_bfloat16* out_h,
+    const __nv_bfloat16* in_hc,
+    int dim, int hc,
+    cudaStream_t stream)
+{
+    int threads = 256;
+    int blocks = (dim + threads - 1) / threads;
+    hc_mean_pool_kernel<<<blocks, threads, 0, stream>>>(out_h, in_hc, dim, hc);
+}
+
+__global__ void vector_broadcast_hc_kernel(
+    __nv_bfloat16* __restrict__ hc_state,
+    const __nv_bfloat16* __restrict__ vec,
+    int dim, int hc)
+{
+    int d = threadIdx.x + blockIdx.x * blockDim.x;
+    if (d >= dim) return;
+    __nv_bfloat16 val = vec[d];
+    for (int h = 0; h < hc; h++) {
+        hc_state[(size_t)h * dim + d] = val;
+    }
+}
+
+void vector_broadcast_hc_cuda(
+    __nv_bfloat16* hc_state,
+    const __nv_bfloat16* vec,
+    int dim, int hc,
+    cudaStream_t stream)
+{
+    int threads = 256;
+    int blocks = (dim + threads - 1) / threads;
+    vector_broadcast_hc_kernel<<<blocks, threads, 0, stream>>>(hc_state, vec, dim, hc);
+}
+
+__global__ void concat_3_bf16_kernel(
+    __nv_bfloat16* __restrict__ out_cat,
+    const __nv_bfloat16* __restrict__ a,
+    const __nv_bfloat16* __restrict__ b,
+    const __nv_bfloat16* __restrict__ c,
+    int dim)
+{
+    int d = threadIdx.x + blockIdx.x * blockDim.x;
+    if (d >= dim) return;
+    out_cat[d] = a[d];
+    out_cat[dim + d] = b[d];
+    out_cat[2 * dim + d] = c[d];
+}
+
+void concat_3_bf16_cuda(
+    __nv_bfloat16* out_cat,
+    const __nv_bfloat16* a,
+    const __nv_bfloat16* b,
+    const __nv_bfloat16* c,
+    int dim,
+    cudaStream_t stream)
+{
+    int threads = 256;
+    int blocks = (dim + threads - 1) / threads;
+    concat_3_bf16_kernel<<<blocks, threads, 0, stream>>>(out_cat, a, b, c, dim);
+}
+
+

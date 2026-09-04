@@ -113,6 +113,7 @@ static void log_msg(const char* level, const char* fmt, ...) {
 #define LOG_INFO(...)  log_msg("INFO",  __VA_ARGS__)
 #define LOG_WARN(...)  log_msg("WARN",  __VA_ARGS__)
 #define LOG_ERROR(...) log_msg("ERROR", __VA_ARGS__)
+#define LOG_DEBUG(...) do {} while (0)
 
 // ════════════════════════════════════════════════════════════════════════════════
 //  Model Config (from manifest)
@@ -2758,6 +2759,17 @@ public:
     GPUTensor buf_indexer_proj_kv_;      // [256] F32
     GPUTensor buf_indexer_proj_gate_;    // [256] F32
 
+    // DeepSeek V4 Native MTP (DSpark) drafter state
+    bool deepseek_mtp_enabled_ = false;
+    GPUTensor mtp_main_proj_w_, mtp_main_proj_s_;
+    GPUTensor mtp_main_norm_w_;
+    GPUTensor buf_h40_, buf_h41_, buf_h42_;
+    GPUTensor buf_h_deep_cat_;
+    GPUTensor buf_mtp_proj_out_;
+    GPUTensor buf_hc_state_main_saved_;
+    GPUTensor buf_mtp_draft_cand_;
+    int32_t* h_mtp_draft_cand_ = nullptr;
+
     // Device-driven inputs for CUDA Graph & Device ArgMax
     GPUTensor buf_input_token_;  // [1] int32_t on GPU
     GPUTensor buf_input_pos_;    // [1] int32_t on GPU
@@ -2793,6 +2805,10 @@ public:
     __nv_bfloat16* logits_bf16_host_ = nullptr;
 
     ~MoecherEngine() {
+        if (h_mtp_draft_cand_) {
+            cudaFreeHost(h_mtp_draft_cand_);
+            h_mtp_draft_cand_ = nullptr;
+        }
         if (step_topk_host_) {
             cudaFreeHost(step_topk_host_);
             step_topk_host_ = nullptr;
@@ -2869,8 +2885,8 @@ public:
         // Load tokenizer
         std::string tok_path = manifest["tokenizer"]["tokenizer_json"].get<std::string>();
         std::string tok_full = (base_dir / tok_path).string();
-        if (!tokenizer_.load(tok_full) && !tokenizer_.load(tok_path)) {
-            LOG_ERROR("Failed to load tokenizer from %s or %s", tok_full.c_str(), tok_path.c_str());
+        if (!tokenizer_.load(tok_full) && !tokenizer_.load(tok_path) && !tokenizer_.load("tokenizer.json")) {
+            LOG_ERROR("Failed to load tokenizer from %s or %s or tokenizer.json", tok_full.c_str(), tok_path.c_str());
             return false;
         }
 
@@ -2985,13 +3001,13 @@ public:
             // Preload experts into VRAM & DRAM (frequency-guided if expert_freq.bin exists)
             std::string freq_path = (base_dir / "expert_freq.bin").string();
             expert_freq_counts_ = load_expert_freq(freq_path, cfg_.num_hidden_layers, cfg_.n_routed_experts, &expert_freq_total_tokens_);
-            if (expert_freq_counts_.empty()) {
-                expert_freq_counts_.assign((size_t)cfg_.num_hidden_layers * cfg_.n_routed_experts, 0);
+            if (expert_freq_counts_.size() < (size_t)expert_n_layers * expert_n_experts) {
+                expert_freq_counts_.resize((size_t)expert_n_layers * expert_n_experts, 0);
             }
             expert_loader_.preload_all(16, expert_freq_counts_);
 
-            expert_token_counts_.resize(cfg_.num_hidden_layers);
-            for (int l = 0; l < cfg_.num_hidden_layers; l++) {
+            expert_token_counts_.resize(expert_n_layers);
+            for (int l = 0; l < expert_n_layers; l++) {
                 expert_token_counts_[l].resize(cfg_.n_routed_experts);
             }
             std::string json_profile_path = (base_dir / "expert_profile.json").string();
@@ -3769,9 +3785,7 @@ public:
                     auto tv1 = std::chrono::steady_clock::now();
                     double ver_ms = std::chrono::duration<double, std::milli>(tv1 - tv0).count();
                     total_verify_ms += ver_ms;
-                    if (spec_cycles < 5) {
-                        LOG_INFO("DEEPSEEK VERIFY: cycle=%d M=%d took %.2fms (graph=%d)", spec_cycles, M, ver_ms, (int)batch_graph_captured_[M]);
-                    }
+                    LOG_DEBUG("DEEPSEEK VERIFY: cycle=%d M=%d took %.2fms (graph=%d)", spec_cycles, M, ver_ms, (int)batch_graph_captured_[M]);
 
                     int accepted = 0;
                     int bonus_token = -1;
@@ -4484,8 +4498,16 @@ private:
                 }
             }
         }
-
-
+        // Load DeepSeek V4 Native MTP (DSpark) weights if present
+        if (cfg_.architecture == ModelArch::DEEPSEEK_V4 && tensor_map.contains("mtp.0.main_proj.weight")) {
+            load_tensor(mtp_main_proj_w_, "mtp.0.main_proj.weight");
+            load_tensor(mtp_main_proj_s_, "mtp.0.main_proj.scale");
+            load_tensor(mtp_main_norm_w_, "mtp.0.main_norm.weight");
+            deepseek_mtp_enabled_ = (mtp_main_proj_w_.data != nullptr && mtp_main_norm_w_.data != nullptr && layers_.size() >= 44);
+            if (deepseek_mtp_enabled_) {
+                LOG_INFO("[MTP] DeepSeek V4 DSpark Native MTP Drafter loaded successfully! (Layer 43 + main_proj 12288->4096)");
+            }
+        }
 
         dense_mmap.close();
         LOG_INFO("Dense tensors loaded");
