@@ -2536,6 +2536,92 @@ public:
     bool enable_pld_ = true;
     int pld_draft_tokens_ = 4;
     
+    // Prompt Prefix KV Cache Tracking
+    std::vector<int> cached_tokens_;
+
+    void reset_all_kv_caches() {
+        for (int l = 0; l < cfg_.num_hidden_layers; l++) {
+            if (layers_[l].kv_cache.data) {
+                CUDA_CHECK(cudaMemset(layers_[l].kv_cache.data, 0,
+                                       layers_[l].kv_cache.size_bytes));
+            }
+            if (layers_[l].k_cache_gqa.data) {
+                CUDA_CHECK(cudaMemset(layers_[l].k_cache_gqa.data, 0, layers_[l].k_cache_gqa.size_bytes));
+                CUDA_CHECK(cudaMemset(layers_[l].v_cache_gqa.data, 0, layers_[l].v_cache_gqa.size_bytes));
+            }
+            if (layers_[l].ssm_state.data) {
+                CUDA_CHECK(cudaMemset(layers_[l].ssm_state.data, 0, layers_[l].ssm_state.size_bytes));
+            }
+            if (layers_[l].conv_state.data) {
+                CUDA_CHECK(cudaMemset(layers_[l].conv_state.data, 0, layers_[l].conv_state.size_bytes));
+            }
+            if (layers_[l].d_comp_kv_count.data) {
+                CUDA_CHECK(cudaMemset(layers_[l].d_comp_kv_count.data, 0, sizeof(int32_t)));
+            }
+            if (layers_[l].d_attn_cache_len.data) {
+                CUDA_CHECK(cudaMemset(layers_[l].d_attn_cache_len.data, 0, sizeof(int32_t)));
+            }
+            int ratio = cfg_.layer_compress_ratio(l);
+            if (ratio > 0) {
+                layers_[l].comp_kv_count = 0;
+                if (layers_[l].comp_kv_cache.data)
+                    CUDA_CHECK(cudaMemset(layers_[l].comp_kv_cache.data, 0,
+                                           layers_[l].comp_kv_cache.size_bytes));
+                if (layers_[l].comp_kv_state.data)
+                    CUDA_CHECK(cudaMemset(layers_[l].comp_kv_state.data, 0,
+                                           layers_[l].comp_kv_state.size_bytes));
+                if (layers_[l].comp_score_state.data) {
+                    int coff = (ratio == 4) ? 2 : 1;
+                    int state_rows = coff * ratio;
+                    int state_cols = coff * cfg_.head_dim;
+                    std::vector<float> neg_inf(state_rows * state_cols,
+                                               -std::numeric_limits<float>::infinity());
+                    CUDA_CHECK(cudaMemcpy(layers_[l].comp_score_state.data, neg_inf.data(),
+                                           neg_inf.size() * sizeof(float), cudaMemcpyHostToDevice));
+                }
+                if (ratio == 4) {
+                    if (layers_[l].indexer_comp_kv_cache.data)
+                        CUDA_CHECK(cudaMemset(layers_[l].indexer_comp_kv_cache.data, 0,
+                                               layers_[l].indexer_comp_kv_cache.size_bytes));
+                    if (layers_[l].indexer_comp_kv_state.data)
+                        CUDA_CHECK(cudaMemset(layers_[l].indexer_comp_kv_state.data, 0,
+                                               layers_[l].indexer_comp_kv_state.size_bytes));
+                    if (layers_[l].indexer_comp_score_state.data) {
+                        int indexer_head_dim = 128;
+                        int indexer_proj_dim = 2 * indexer_head_dim;
+                        int indexer_state_rows = 2 * ratio;
+                        std::vector<float> neg_inf_idx(indexer_state_rows * indexer_proj_dim,
+                                                       -std::numeric_limits<float>::infinity());
+                        CUDA_CHECK(cudaMemcpy(layers_[l].indexer_comp_score_state.data, neg_inf_idx.data(),
+                                               neg_inf_idx.size() * sizeof(float), cudaMemcpyHostToDevice));
+                    }
+                }
+            }
+        }
+
+        if (buf_hc_state_.data) {
+            CUDA_CHECK(cudaMemset(buf_hc_state_.data, 0, buf_hc_state_.size_bytes));
+        }
+        if (buf_hc_after_attn_.data) {
+            CUDA_CHECK(cudaMemset(buf_hc_after_attn_.data, 0, buf_hc_after_attn_.size_bytes));
+        }
+        if (target_ssm_pool_.data) {
+            CUDA_CHECK(cudaMemsetAsync(target_ssm_pool_.data, 0, target_ssm_pool_.size_bytes, main_stream_));
+            CUDA_CHECK(cudaMemsetAsync(target_conv_pool_.data, 0, target_conv_pool_.size_bytes, main_stream_));
+            for (int s = 0; s < 8; s++) {
+                if (target_ssm_slots_[s].data) CUDA_CHECK(cudaMemsetAsync(target_ssm_slots_[s].data, 0, target_ssm_slots_[s].size_bytes, main_stream_));
+                if (target_conv_slots_[s].data) CUDA_CHECK(cudaMemsetAsync(target_conv_slots_[s].data, 0, target_conv_slots_[s].size_bytes, main_stream_));
+            }
+        }
+        if (qwen_draft_.loaded_) {
+            qwen_draft_.reset_state(main_stream_);
+        }
+        if (mtp_drafter_.loaded_) {
+            mtp_drafter_.reset_kv_cache(main_stream_);
+        }
+        cached_tokens_.clear();
+    }
+
     // Thread pool for loading experts (max 16 concurrent reads)
     std::unique_ptr<ThreadPool> expert_pool_;
     bool dbg_first_token_ = false;
@@ -3322,99 +3408,40 @@ public:
         dbg_head_ = true;
         dbg_sample_count_ = 0;
 
-        // Reset KV caches for all layers (critical: stale cache = garbled output)
-        for (int l = 0; l < cfg_.num_hidden_layers; l++) {
-            if (layers_[l].kv_cache.data) {
-                CUDA_CHECK(cudaMemset(layers_[l].kv_cache.data, 0,
-                                       layers_[l].kv_cache.size_bytes));
-            }
-            if (layers_[l].k_cache_gqa.data) {
-                CUDA_CHECK(cudaMemset(layers_[l].k_cache_gqa.data, 0, layers_[l].k_cache_gqa.size_bytes));
-                CUDA_CHECK(cudaMemset(layers_[l].v_cache_gqa.data, 0, layers_[l].v_cache_gqa.size_bytes));
-            }
-            if (layers_[l].ssm_state.data) {
-                CUDA_CHECK(cudaMemset(layers_[l].ssm_state.data, 0, layers_[l].ssm_state.size_bytes));
-            }
-            if (layers_[l].conv_state.data) {
-                CUDA_CHECK(cudaMemset(layers_[l].conv_state.data, 0, layers_[l].conv_state.size_bytes));
-            }
-            if (layers_[l].d_comp_kv_count.data) {
-                CUDA_CHECK(cudaMemset(layers_[l].d_comp_kv_count.data, 0, sizeof(int32_t)));
-            }
-            if (layers_[l].d_attn_cache_len.data) {
-                CUDA_CHECK(cudaMemset(layers_[l].d_attn_cache_len.data, 0, sizeof(int32_t)));
-            }
-            // Reset compressor state for compressed layers
-            int ratio = cfg_.layer_compress_ratio(l);
-            if (ratio > 0) {
-                layers_[l].comp_kv_count = 0;
-                if (layers_[l].comp_kv_cache.data)
-                    CUDA_CHECK(cudaMemset(layers_[l].comp_kv_cache.data, 0,
-                                           layers_[l].comp_kv_cache.size_bytes));
-                if (layers_[l].comp_kv_state.data)
-                    CUDA_CHECK(cudaMemset(layers_[l].comp_kv_state.data, 0,
-                                           layers_[l].comp_kv_state.size_bytes));
-                if (layers_[l].comp_score_state.data) {
-                    int coff = (ratio == 4) ? 2 : 1;
-                    int state_rows = coff * ratio;
-                    int state_cols = coff * cfg_.head_dim;
-                    std::vector<float> neg_inf(state_rows * state_cols,
-                                               -std::numeric_limits<float>::infinity());
-                    CUDA_CHECK(cudaMemcpy(layers_[l].comp_score_state.data, neg_inf.data(),
-                                           neg_inf.size() * sizeof(float), cudaMemcpyHostToDevice));
-                }
-                if (ratio == 4) {
-                    if (layers_[l].indexer_comp_kv_cache.data)
-                        CUDA_CHECK(cudaMemset(layers_[l].indexer_comp_kv_cache.data, 0,
-                                               layers_[l].indexer_comp_kv_cache.size_bytes));
-                    if (layers_[l].indexer_comp_kv_state.data)
-                        CUDA_CHECK(cudaMemset(layers_[l].indexer_comp_kv_state.data, 0,
-                                               layers_[l].indexer_comp_kv_state.size_bytes));
-                    if (layers_[l].indexer_comp_score_state.data) {
-                        int indexer_head_dim = 128;
-                        int indexer_proj_dim = 2 * indexer_head_dim;
-                        int indexer_state_rows = 2 * ratio;
-                        std::vector<float> neg_inf_idx(indexer_state_rows * indexer_proj_dim,
-                                                       -std::numeric_limits<float>::infinity());
-                        CUDA_CHECK(cudaMemcpy(layers_[l].indexer_comp_score_state.data, neg_inf_idx.data(),
-                                               neg_inf_idx.size() * sizeof(float), cudaMemcpyHostToDevice));
-                    }
-                }
-            }
+        // ── Prefix Matching against existing KV cache ────────────────────────────
+        size_t prefix_len = 0;
+        while (prefix_len < prompt.size() && prefix_len < cached_tokens_.size() &&
+               prompt[prefix_len] == cached_tokens_[prefix_len]) {
+            prefix_len++;
         }
 
-        // Reset HC (Hierarchical Compressor) routing state.
-        // This is critical: stale HC state from a previous request causes
-        // the expert routing to be biased by the old conversation, leading
-        // to garbled output on subsequent turns.
-        if (buf_hc_state_.data) {
-            CUDA_CHECK(cudaMemset(buf_hc_state_.data, 0, buf_hc_state_.size_bytes));
+        // For architectures with recurrent/stateful compression (DeepSeek V4 MLA / Linear Attn),
+        // we can safely reuse the prefix when prefix_len == cached_tokens_.size() (exact continuation)
+        // or for pure positional GQA.
+        bool can_reuse_prefix = (prefix_len > 0);
+        if (cfg_.architecture == ModelArch::DEEPSEEK_V4 && prefix_len < cached_tokens_.size()) {
+            can_reuse_prefix = false;
+            prefix_len = 0;
         }
-        if (buf_hc_after_attn_.data) {
-            CUDA_CHECK(cudaMemset(buf_hc_after_attn_.data, 0, buf_hc_after_attn_.size_bytes));
+
+        // Ensure at least the last token is forwarded so buf_logits_ is correctly populated
+        if (prefix_len >= prompt.size() && !prompt.empty()) {
+            prefix_len = prompt.size() - 1;
+        }
+
+        if (!can_reuse_prefix || prefix_len == 0) {
+            reset_all_kv_caches();
+            prefix_len = 0;
+        } else {
+            LOG_INFO("Reusing KV Cache prefix of %zu tokens (skipping prefill 0..%zu, evaluating %zu..%zu)",
+                     prefix_len, prefix_len > 0 ? prefix_len - 1 : 0, prefix_len, prompt.size() - 1);
         }
 
         // Disable tracking during prompt prefill (prevents system prompt boilerplate from skewing stats)
         track_current_token_ = false;
 
-        if (target_ssm_pool_.data) {
-            CUDA_CHECK(cudaMemsetAsync(target_ssm_pool_.data, 0, target_ssm_pool_.size_bytes, main_stream_));
-            CUDA_CHECK(cudaMemsetAsync(target_conv_pool_.data, 0, target_conv_pool_.size_bytes, main_stream_));
-            for (int s = 0; s < 8; s++) {
-                if (target_ssm_slots_[s].data) CUDA_CHECK(cudaMemsetAsync(target_ssm_slots_[s].data, 0, target_ssm_slots_[s].size_bytes, main_stream_));
-                if (target_conv_slots_[s].data) CUDA_CHECK(cudaMemsetAsync(target_conv_slots_[s].data, 0, target_conv_slots_[s].size_bytes, main_stream_));
-            }
-        }
-
-        if (qwen_draft_.loaded_) {
-            qwen_draft_.reset_state(main_stream_);
-        }
-        if (mtp_drafter_.loaded_) {
-            mtp_drafter_.reset_kv_cache(main_stream_);
-        }
-
-        // Prefill prompt using CUDA Graphs
-        for (size_t i = 0; i < prompt.size(); i++) {
+        // Prefill prompt starting from prefix_len
+        for (size_t i = prefix_len; i < prompt.size(); i++) {
             forward_token(prompt[i], (int)i);
             if (qwen_draft_.loaded_) {
                 qwen_draft_.forward_token_async(prompt[i], (int)i, main_stream_);
@@ -3954,6 +3981,7 @@ public:
             }
         }
 
+        cached_tokens_ = history;
         return result;
     }
 

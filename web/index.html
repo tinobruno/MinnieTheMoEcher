@@ -83,6 +83,32 @@
                 </div>
             </details>
 
+            <details class="settings-section" open>
+                <summary>Context & History Optimization</summary>
+
+                <div class="setting-item">
+                    <label>Max History Turns</label>
+                    <div class="slider-container">
+                        <input type="range" id="sidebar-max-turns-slider" min="0" max="32" step="2" value="8">
+                        <span id="sidebar-max-turns-val">8</span>
+                    </div>
+                </div>
+
+                <div class="setting-item">
+                    <label class="checkbox-label" title="Truncate bulky raw HTML / file dumps from earlier conversation turns">
+                        <input type="checkbox" id="sidebar-compact-tools" checked>
+                        Compact Prior Tool Outputs
+                    </label>
+                </div>
+
+                <div class="setting-item">
+                    <label class="checkbox-label" title="Do not re-send internal thinking traces from earlier turns into subsequent prompts">
+                        <input type="checkbox" id="sidebar-omit-reasoning" checked>
+                        Omit Past Reasoning
+                    </label>
+                </div>
+            </details>
+
             <details class="stats-section" open>
                 <summary>Performance Stats</summary>
 
@@ -213,6 +239,9 @@
                     <span class="material-symbols-outlined">expand_more</span>
                 </div>
                 <div class="topbar-actions">
+                    <button class="topbar-icon-btn agentic-toggle-btn" id="agentic-toggle-btn" onclick="openAgenticSettingsTab()" title="Open Agentic Settings & Security Guardrails">
+                        <span class="material-symbols-outlined">shield_person</span>
+                    </button>
                     <button class="topbar-icon-btn preview-toggle-btn" id="preview-toggle-btn" onclick="togglePreviewPanel()" title="Toggle HTML Preview Panel">
                         <span class="material-symbols-outlined">preview</span>
                     </button>
@@ -497,6 +526,44 @@
                                 <div class="agentic-path-tags" id="agentic-path-tags">
                                     <!-- Dynamic chips -->
                                 </div>
+                            </div>
+                        </div>
+
+                        <div class="agentic-card">
+                            <div class="agentic-card-header">
+                                <span class="material-symbols-outlined agentic-card-icon">history_edu</span>
+                                <div class="agentic-card-title-group">
+                                    <h4>Context & History Optimization</h4>
+                                    <p class="agentic-subtitle">Manage prompt history window and compact past tool responses</p>
+                                </div>
+                            </div>
+                            <div class="agentic-control-row">
+                                <div class="agentic-slider-wrapper">
+                                    <label for="agentic-max-turns-slider">Max History Turns</label>
+                                    <input type="range" id="agentic-max-turns-slider" min="2" max="32" step="2" value="8">
+                                </div>
+                                <div class="agentic-num-badge">
+                                    <input type="number" id="agentic-max-turns-input" min="0" max="64" value="8" class="agentic-num-field">
+                                    <span class="agentic-unit">turns</span>
+                                </div>
+                            </div>
+                            <div class="agentic-hint">Limits dialogue history sent in prompts (0 = Unlimited). Prevents prefill slowdown across long chats.</div>
+                            
+                            <div class="agentic-toggle-group" style="margin-top: 14px;">
+                                <label class="agentic-switch-row">
+                                    <div class="agentic-switch-info">
+                                        <span class="agentic-switch-label">Compact Prior Tool Outputs</span>
+                                        <span class="agentic-switch-sub">Truncate bulky raw HTML / file dumps from earlier turns</span>
+                                    </div>
+                                    <input type="checkbox" id="agentic-compact-tools" class="agentic-toggle" checked>
+                                </label>
+                                <label class="agentic-switch-row">
+                                    <div class="agentic-switch-info">
+                                        <span class="agentic-switch-label">Omit Past Reasoning from History</span>
+                                        <span class="agentic-switch-sub">Do not resend internal thinking traces from earlier turns</span>
+                                    </div>
+                                    <input type="checkbox" id="agentic-omit-reasoning" class="agentic-toggle" checked>
+                                </label>
                             </div>
                         </div>
 

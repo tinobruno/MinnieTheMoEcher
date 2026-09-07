@@ -313,6 +313,11 @@ function switchPreviewTab(tabId) {
     }
 }
 
+function openAgenticSettingsTab() {
+    openPreviewPanel();
+    switchPreviewTab('tab-agentic');
+}
+
 // Viewport Emulation
 function setupViewportControls() {
     const vpButtons = document.querySelectorAll('.viewport-controls .preview-tool-btn');
@@ -1276,6 +1281,9 @@ let agenticSettings = {
     boundaryEnforced: true,
     requireAuth: true,
     authorizedPaths: [],
+    maxTurns: 8,
+    compactToolOutputs: true,
+    omitPastReasoning: true,
     tools: {
         read_file: true,
         write_file: true,
@@ -1299,6 +1307,15 @@ function loadAgenticSettings() {
         const savedAuth = localStorage.getItem('moecher_agentic_require_auth');
         if (savedAuth !== null) agenticSettings.requireAuth = savedAuth === 'true';
 
+        const savedMaxTurns = localStorage.getItem('moecher_agentic_max_turns');
+        if (savedMaxTurns !== null) agenticSettings.maxTurns = parseInt(savedMaxTurns, 10);
+
+        const savedCompactTools = localStorage.getItem('moecher_agentic_compact_tools');
+        if (savedCompactTools !== null) agenticSettings.compactToolOutputs = savedCompactTools === 'true';
+
+        const savedOmitReasoning = localStorage.getItem('moecher_agentic_omit_reasoning');
+        if (savedOmitReasoning !== null) agenticSettings.omitPastReasoning = savedOmitReasoning === 'true';
+
         const savedPaths = localStorage.getItem('moecher_agentic_auth_paths');
         if (savedPaths) {
             try { agenticSettings.authorizedPaths = JSON.parse(savedPaths); } catch (e) {}
@@ -1318,6 +1335,9 @@ function saveAgenticSettings() {
         localStorage.setItem('moecher_agentic_timeout', agenticSettings.timeoutSec);
         localStorage.setItem('moecher_agentic_boundary', agenticSettings.boundaryEnforced);
         localStorage.setItem('moecher_agentic_require_auth', agenticSettings.requireAuth);
+        localStorage.setItem('moecher_agentic_max_turns', agenticSettings.maxTurns);
+        localStorage.setItem('moecher_agentic_compact_tools', agenticSettings.compactToolOutputs);
+        localStorage.setItem('moecher_agentic_omit_reasoning', agenticSettings.omitPastReasoning);
         localStorage.setItem('moecher_agentic_auth_paths', JSON.stringify(agenticSettings.authorizedPaths));
         localStorage.setItem('moecher_agentic_tools', JSON.stringify(agenticSettings.tools));
     } catch (e) {
@@ -1350,6 +1370,76 @@ function initAgenticSettingsUI() {
             agenticSettings.timeoutSec = val;
             saveAgenticSettings();
         });
+    }
+
+    // Context Optimization UI (Right Panel & Left Sidebar sync)
+    const maxTurnsSlider = document.getElementById('agentic-max-turns-slider');
+    const maxTurnsInput = document.getElementById('agentic-max-turns-input');
+    const sideMaxTurnsSlider = document.getElementById('sidebar-max-turns-slider');
+    const sideMaxTurnsVal = document.getElementById('sidebar-max-turns-val');
+
+    const updateMaxTurnsUI = (val) => {
+        agenticSettings.maxTurns = val;
+        if (maxTurnsSlider) maxTurnsSlider.value = Math.min(val, 32);
+        if (maxTurnsInput) maxTurnsInput.value = val;
+        if (sideMaxTurnsSlider) sideMaxTurnsSlider.value = Math.min(val, 32);
+        if (sideMaxTurnsVal) sideMaxTurnsVal.textContent = val === 0 ? 'Unlimited' : val;
+        saveAgenticSettings();
+    };
+
+    updateMaxTurnsUI(agenticSettings.maxTurns);
+
+    if (maxTurnsSlider) {
+        maxTurnsSlider.addEventListener('input', (e) => updateMaxTurnsUI(parseInt(e.target.value, 10)));
+    }
+    if (maxTurnsInput) {
+        maxTurnsInput.addEventListener('input', (e) => {
+            let val = parseInt(e.target.value, 10);
+            if (isNaN(val) || val < 0) val = 0;
+            if (val > 64) val = 64;
+            updateMaxTurnsUI(val);
+        });
+    }
+    if (sideMaxTurnsSlider) {
+        sideMaxTurnsSlider.addEventListener('input', (e) => updateMaxTurnsUI(parseInt(e.target.value, 10)));
+    }
+
+    // Compact Tools Toggles
+    const compactToolsToggle = document.getElementById('agentic-compact-tools');
+    const sideCompactToolsToggle = document.getElementById('sidebar-compact-tools');
+    const updateCompactToolsUI = (checked) => {
+        agenticSettings.compactToolOutputs = checked;
+        if (compactToolsToggle) compactToolsToggle.checked = checked;
+        if (sideCompactToolsToggle) sideCompactToolsToggle.checked = checked;
+        saveAgenticSettings();
+    };
+
+    updateCompactToolsUI(agenticSettings.compactToolOutputs !== false);
+
+    if (compactToolsToggle) {
+        compactToolsToggle.addEventListener('change', (e) => updateCompactToolsUI(e.target.checked));
+    }
+    if (sideCompactToolsToggle) {
+        sideCompactToolsToggle.addEventListener('change', (e) => updateCompactToolsUI(e.target.checked));
+    }
+
+    // Omit Reasoning Toggles
+    const omitReasoningToggle = document.getElementById('agentic-omit-reasoning');
+    const sideOmitReasoningToggle = document.getElementById('sidebar-omit-reasoning');
+    const updateOmitReasoningUI = (checked) => {
+        agenticSettings.omitPastReasoning = checked;
+        if (omitReasoningToggle) omitReasoningToggle.checked = checked;
+        if (sideOmitReasoningToggle) sideOmitReasoningToggle.checked = checked;
+        saveAgenticSettings();
+    };
+
+    updateOmitReasoningUI(agenticSettings.omitPastReasoning !== false);
+
+    if (omitReasoningToggle) {
+        omitReasoningToggle.addEventListener('change', (e) => updateOmitReasoningUI(e.target.checked));
+    }
+    if (sideOmitReasoningToggle) {
+        sideOmitReasoningToggle.addEventListener('change', (e) => updateOmitReasoningUI(e.target.checked));
     }
 
     // Boundary & Auth Toggles
@@ -1640,8 +1730,66 @@ function resolveAuthPrompt(allow, always = false) {
 }
 
 // ============================================================================
-// Main Chat Logic
+// Main Chat Logic & Context Window Optimization
 // ============================================================================
+
+function buildOptimizedMessagesPayload() {
+    const messagesToSend = [];
+    const sysPrompt = systemPromptInput ? systemPromptInput.value.trim() : '';
+    if (sysPrompt) {
+        messagesToSend.push({ role: 'system', content: sysPrompt });
+    }
+
+    // 1. Slice history according to maxTurns limit (1 turn = 1 user + 1 assistant message)
+    let historySlice = chatHistory.slice();
+    const maxTurns = agenticSettings.maxTurns;
+    if (maxTurns > 0 && historySlice.length > maxTurns * 2) {
+        historySlice = historySlice.slice(historySlice.length - (maxTurns * 2));
+    }
+
+    // 2. Clean, prune, and compact messages
+    for (let idx = 0; idx < historySlice.length; idx++) {
+        const msg = historySlice[idx];
+        const isCurrentActiveTurn = (idx === historySlice.length - 1);
+        
+        const cleanedMsg = {
+            role: msg.role,
+            content: msg.content || ''
+        };
+
+        if (msg.tool_calls) {
+            cleanedMsg.tool_calls = msg.tool_calls;
+        }
+
+        // If explicitly requested, preserve past reasoning; otherwise omit past reasoning traces
+        // to avoid injecting thousands of redundant <think> tokens into subsequent turns.
+        if (agenticSettings.omitPastReasoning === false && msg.reasoning_content) {
+            cleanedMsg.reasoning_content = msg.reasoning_content;
+        }
+
+        // Compact past bulky tool outputs from earlier turns
+        if (agenticSettings.compactToolOutputs !== false && !isCurrentActiveTurn) {
+            if (cleanedMsg.role === 'tool' || cleanedMsg.role === 'function') {
+                if (cleanedMsg.content && cleanedMsg.content.length > 250) {
+                    cleanedMsg.content = cleanedMsg.content.slice(0, 250) + `\n... [Content compacted for context window: total ${cleanedMsg.content.length} chars]`;
+                }
+            } else if (cleanedMsg.role === 'assistant' || cleanedMsg.role === 'user') {
+                if (cleanedMsg.content && cleanedMsg.content.includes('<tool_response>')) {
+                    cleanedMsg.content = cleanedMsg.content.replace(/<tool_response>([\s\S]*?)<\/tool_response>/g, (match, p1) => {
+                        if (p1.length > 250) {
+                            return `<tool_response>\n${p1.slice(0, 250)}\n... [Output compacted for context: ${p1.length} chars]\n</tool_response>`;
+                        }
+                        return match;
+                    });
+                }
+            }
+        }
+
+        messagesToSend.push(cleanedMsg);
+    }
+
+    return messagesToSend;
+}
 
 async function sendMessage() {
     const text = chatInput.value.trim();
@@ -1682,13 +1830,8 @@ async function sendMessage() {
     `;
     mainContent.appendChild(liveIndicator);
 
-    // Build messages payload with optional system prompt
-    const messagesToSend = [];
-    const sysPrompt = systemPromptInput ? systemPromptInput.value.trim() : '';
-    if (sysPrompt) {
-        messagesToSend.push({ role: 'system', content: sysPrompt });
-    }
-    messagesToSend.push(...chatHistory);
+    // Build optimized messages payload with context pruning applied
+    const messagesToSend = buildOptimizedMessagesPayload();
 
     const isThinking = thinkingEnabled ? thinkingEnabled.checked : true;
     const budgetVal = isThinking ? (thinkingBudget ? parseInt(thinkingBudget.value, 10) : 4096) : 0;
