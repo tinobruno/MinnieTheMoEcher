@@ -2091,6 +2091,20 @@ public:
         }
     }
 
+    void forward_token_async_pinned(const int32_t* h_tok, const int32_t* h_pos, int position, cudaStream_t stream = nullptr) {
+        if (!loaded_) return;
+        CUDA_CHECK(cudaMemcpyAsync(buf_input_token_.i32(), h_tok, sizeof(int32_t), cudaMemcpyHostToDevice, stream));
+        if (buf_input_pos_.data) {
+            CUDA_CHECK(cudaMemcpyAsync(buf_input_pos_.i32(), h_pos, sizeof(int32_t), cudaMemcpyHostToDevice, stream));
+        }
+
+        if (graph_captured_) {
+            CUDA_CHECK(cudaGraphLaunch(graph_exec_, stream));
+        } else {
+            forward_token_device_body(position, stream);
+        }
+    }
+
     int forward_token(int token_id, int position, cudaStream_t stream = nullptr) {
         forward_token_async(token_id, position, stream);
 
@@ -2814,6 +2828,20 @@ public:
     int32_t* h_single_tok_ = nullptr;
     int32_t* h_single_pos_ = nullptr;
     int32_t* h_single_flag_ = nullptr;
+    int32_t* h_prefill_tok_ = nullptr;
+    int32_t* h_prefill_pos_ = nullptr;
+    size_t h_prefill_cap_ = 0;
+
+    void ensure_prefill_host_capacity(size_t n) {
+        if (n <= h_prefill_cap_) return;
+        if (h_prefill_tok_) CUDA_CHECK(cudaFreeHost(h_prefill_tok_));
+        if (h_prefill_pos_) CUDA_CHECK(cudaFreeHost(h_prefill_pos_));
+        size_t cap = std::max(n, (size_t)cfg_.max_seq_len);
+        if (cap < 2048) cap = 2048;
+        CUDA_CHECK(cudaMallocHost(&h_prefill_tok_, cap * sizeof(int32_t)));
+        CUDA_CHECK(cudaMallocHost(&h_prefill_pos_, cap * sizeof(int32_t)));
+        h_prefill_cap_ = cap;
+    }
 
     GPUTensor buf_hc_state_;      // [hc_mult, hidden_size] BF16 — active HC hidden state
     GPUTensor buf_hc_after_attn_; // [hc_mult, hidden_size] BF16 — intermediate HC state after attention
@@ -2870,6 +2898,44 @@ public:
     __nv_bfloat16* logits_bf16_host_ = nullptr;
 
     ~MoecherEngine() {
+        if (h_prefill_tok_) {
+            cudaFreeHost(h_prefill_tok_);
+            h_prefill_tok_ = nullptr;
+        }
+        if (h_prefill_pos_) {
+            cudaFreeHost(h_prefill_pos_);
+            h_prefill_pos_ = nullptr;
+        }
+        if (h_single_tok_) {
+            cudaFreeHost(h_single_tok_);
+            h_single_tok_ = nullptr;
+        }
+        if (h_single_pos_) {
+            cudaFreeHost(h_single_pos_);
+            h_single_pos_ = nullptr;
+        }
+        if (h_single_flag_) {
+            cudaFreeHost(h_single_flag_);
+            h_single_flag_ = nullptr;
+        }
+        if (h_target_batch_tok_) {
+            cudaFreeHost(h_target_batch_tok_);
+            h_target_batch_tok_ = nullptr;
+        }
+        if (h_target_batch_pos_) {
+            cudaFreeHost(h_target_batch_pos_);
+            h_target_batch_pos_ = nullptr;
+        }
+        for (int m = 0; m <= 8; m++) {
+            if (batch_graph_exec_[m]) {
+                cudaGraphExecDestroy(batch_graph_exec_[m]);
+                batch_graph_exec_[m] = nullptr;
+            }
+            if (batch_graph_[m]) {
+                cudaGraphDestroy(batch_graph_[m]);
+                batch_graph_[m] = nullptr;
+            }
+        }
         if (step_topk_host_) {
             cudaFreeHost(step_topk_host_);
             step_topk_host_ = nullptr;
@@ -3275,9 +3341,11 @@ public:
         graph_captured_ = true;
         LOG_INFO("CUDA Graph instantiated successfully! Decode speed accelerated.");
 
+        if (cfg_.architecture == ModelArch::QWEN) {
+            init_batch_cuda_graphs();
+        }
         if (qwen_draft_.loaded_) {
             qwen_draft_.init_cuda_graph(main_stream_);
-            init_batch_cuda_graphs();
         }
     }
 
@@ -3440,12 +3508,92 @@ public:
         // Disable tracking during prompt prefill (prevents system prompt boilerplate from skewing stats)
         track_current_token_ = false;
 
-        // Prefill prompt starting from prefix_len
-        for (size_t i = prefix_len; i < prompt.size(); i++) {
-            forward_token(prompt[i], (int)i);
-            if (qwen_draft_.loaded_) {
-                qwen_draft_.forward_token_async(prompt[i], (int)i, main_stream_);
+        if (prefix_len < prompt.size()) {
+            ensure_prefill_host_capacity(prompt.size());
+            for (size_t i = prefix_len; i < prompt.size(); i++) {
+                h_prefill_tok_[i] = prompt[i];
+                h_prefill_pos_[i] = (int32_t)i;
             }
+
+            if (!h_single_flag_) {
+                CUDA_CHECK(cudaMallocHost(&h_single_flag_, sizeof(int32_t)));
+            }
+            *h_single_flag_ = 0;
+
+            if (cfg_.architecture == ModelArch::QWEN) {
+                size_t curr = prefix_len;
+                // Prefill intermediate prompt tokens using batched CUDA graphs (chunks of up to 8)
+                while (curr + 1 < prompt.size()) {
+                    size_t remaining = (prompt.size() - 1) - curr;
+                    int chunk_m = (remaining >= 8) ? 8 : (int)remaining;
+                    if (chunk_m >= 2 && chunk_m <= 8) {
+                        CUDA_CHECK(cudaMemcpyAsync(buf_input_pos_batch_.i32(), &h_prefill_pos_[curr],
+                                                   chunk_m * sizeof(int32_t), cudaMemcpyHostToDevice, main_stream_));
+                        CUDA_CHECK(cudaMemcpyAsync(buf_input_tokens_batch_.i32(), &h_prefill_tok_[curr],
+                                                   chunk_m * sizeof(int32_t), cudaMemcpyHostToDevice, main_stream_));
+                        if (batch_graph_captured_[chunk_m]) {
+                            CUDA_CHECK(cudaGraphLaunch(batch_graph_exec_[chunk_m], main_stream_));
+                        } else {
+                            forward_token_batch_qwen_device_body((int)curr, chunk_m);
+                        }
+                        if (qwen_draft_.loaded_) {
+                            for (int m = 0; m < chunk_m; m++) {
+                                qwen_draft_.forward_token_async_pinned(&h_prefill_tok_[curr + m],
+                                                                       &h_prefill_pos_[curr + m],
+                                                                       (int)(curr + m), main_stream_);
+                            }
+                        }
+                        curr += chunk_m;
+                    } else {
+                        // chunk_m == 1: forward single token asynchronously
+                        if (graph_captured_) {
+                            CUDA_CHECK(cudaMemcpyAsync(buf_track_flag_.i32(), h_single_flag_, sizeof(int32_t), cudaMemcpyHostToDevice, main_stream_));
+                            CUDA_CHECK(cudaMemcpyAsync(buf_input_token_.i32(), &h_prefill_tok_[curr], sizeof(int32_t), cudaMemcpyHostToDevice, main_stream_));
+                            CUDA_CHECK(cudaMemcpyAsync(buf_input_pos_.i32(), &h_prefill_pos_[curr], sizeof(int32_t), cudaMemcpyHostToDevice, main_stream_));
+                            CUDA_CHECK(cudaGraphLaunch(graph_exec_, main_stream_));
+                        } else {
+                            forward_token_eager(prompt[curr], (int)curr);
+                        }
+                        if (qwen_draft_.loaded_) {
+                            qwen_draft_.forward_token_async_pinned(&h_prefill_tok_[curr],
+                                                                   &h_prefill_pos_[curr],
+                                                                   (int)curr, main_stream_);
+                        }
+                        curr += 1;
+                    }
+                }
+
+                // Forward the very last token individually so buf_logits_ and buf_hidden2_ (for MTP) are populated
+                if (curr < prompt.size()) {
+                    if (graph_captured_) {
+                        CUDA_CHECK(cudaMemcpyAsync(buf_track_flag_.i32(), h_single_flag_, sizeof(int32_t), cudaMemcpyHostToDevice, main_stream_));
+                        CUDA_CHECK(cudaMemcpyAsync(buf_input_token_.i32(), &h_prefill_tok_[curr], sizeof(int32_t), cudaMemcpyHostToDevice, main_stream_));
+                        CUDA_CHECK(cudaMemcpyAsync(buf_input_pos_.i32(), &h_prefill_pos_[curr], sizeof(int32_t), cudaMemcpyHostToDevice, main_stream_));
+                        CUDA_CHECK(cudaGraphLaunch(graph_exec_, main_stream_));
+                    } else {
+                        forward_token_eager(prompt[curr], (int)curr);
+                    }
+                    if (qwen_draft_.loaded_) {
+                        qwen_draft_.forward_token_async_pinned(&h_prefill_tok_[curr],
+                                                               &h_prefill_pos_[curr],
+                                                               (int)curr, main_stream_);
+                    }
+                }
+            } else {
+                // ModelArch::DEEPSEEK_V4
+                for (size_t i = prefix_len; i < prompt.size(); i++) {
+                    if (graph_captured_) {
+                        CUDA_CHECK(cudaMemcpyAsync(buf_track_flag_.i32(), h_single_flag_, sizeof(int32_t), cudaMemcpyHostToDevice, main_stream_));
+                        CUDA_CHECK(cudaMemcpyAsync(buf_input_token_.i32(), &h_prefill_tok_[i], sizeof(int32_t), cudaMemcpyHostToDevice, main_stream_));
+                        CUDA_CHECK(cudaMemcpyAsync(buf_input_pos_.i32(), &h_prefill_pos_[i], sizeof(int32_t), cudaMemcpyHostToDevice, main_stream_));
+                        CUDA_CHECK(cudaGraphLaunch(graph_exec_, main_stream_));
+                    } else {
+                        forward_token_eager(prompt[i], (int)i);
+                    }
+                }
+            }
+
+            // Synchronize main_stream_ ONCE at the end of the entire prefill pipeline
             CUDA_CHECK(cudaStreamSynchronize(main_stream_));
         }
 
