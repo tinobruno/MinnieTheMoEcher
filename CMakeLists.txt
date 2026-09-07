@@ -74,6 +74,7 @@ if(WIN32)
         ws2_32
         crypt32
         winmm
+        winhttp
     )
 else()
     target_link_libraries(moecher PRIVATE

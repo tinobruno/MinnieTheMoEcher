@@ -10,6 +10,7 @@
 #include "platform/platform_io.hpp"
 #include "thread_pool.h"
 #include "embedded_web.hpp"
+#include "tool_exec.hpp"
 
 #include <cstdio>
 #include <cstdlib>
@@ -84,6 +85,8 @@ bool g_quiet = false;
 bool g_server_ready = false;
 bool g_track_experts = false;
 bool g_track_reset = false;
+bool g_enable_tools = true;
+bool g_server_exec = true;
 static std::atomic<bool> g_stop_requested{false};
 
 
@@ -6386,15 +6389,50 @@ static const std::string DEEPSEEK_V4_REASONING_EFFORT_MAX_PREFIX =
     "You MUST be very thorough in your thinking and comprehensively decompose the problem to resolve the root cause, rigorously stress-testing your logic against all potential paths, edge cases, and adversarial scenarios.\n"
     "Explicitly write out your entire deliberation process, documenting every intermediate step, considered alternative, and rejected hypothesis to ensure absolutely no assumption is left unchecked.\n\n";
 
-static std::vector<int> apply_chat_template(const json& messages, const BPETokenizer& tok, bool enable_thinking = true, const std::string& reasoning_effort = "high") {
+static std::vector<int> apply_chat_template(const json& messages, const BPETokenizer& tok, bool enable_thinking = true, const std::string& reasoning_effort = "high", const json& tools = json()) {
+    bool has_tools = (!tools.empty() && tools.is_array());
+    std::string tools_system_prompt;
+    if (has_tools) {
+        tools_system_prompt =
+            "\n\n# Tools\n\n"
+            "You have access to a set of built-in tools to inspect files, make precise code modifications, run commands, and search the web.\n"
+            "You are provided with function signatures within <tools></tools> XML tags:\n"
+            "<tools>\n" + tools.dump(2) + "\n</tools>\n\n"
+            "For each function call, return a json object with function name and arguments within <tool_call></tool_call> XML tags:\n"
+            "<tool_call>\n"
+            "{\"name\": \"<function-name>\", \"arguments\": <args-json-object>}\n"
+            "</tool_call>\n\n"
+            "## Tool Usage Guidelines:\n"
+            "- read_file: View file content with optional start_line / end_line. Always inspect files before modifying them.\n"
+            "- write_file: Write or create complete files.\n"
+            "- edit_file: Perform precise search-and-replace on a unique snippet within a file.\n"
+            "- execute_command: Run system commands, build scripts, tests, directory listings (e.g. dir, ls, git).\n"
+            "- fetch_url: Retrieve web content, search DuckDuckGo, or trigger YouTube playback.\n"
+            "When you emit a <tool_call>, the system will execute it and return the results in a <tool_response> block.\n"
+            "\n"
+            "## Media Playback & Web Preview Integration:\n"
+            "You are integrated with an interactive client-side HTML Preview Panel that displays web pages and plays YouTube videos with autoplay.\n"
+            "- When the user asks to play a song, video, or watch media (e.g. 'play no one knows from youtube'):\n"
+            "  1. Use fetch_url to search (e.g. 'https://html.duckduckgo.com/html/?q=queens+of+the+stone+age+no+one+knows+youtube').\n"
+            "  2. Find the direct YouTube URL from the search results (e.g. 'https://www.youtube.com/watch?v=...').\n"
+            "  3. Call fetch_url on that direct YouTube URL in the next turn.\n"
+            "  4. Fetching the YouTube URL automatically opens the player in the user's preview panel and starts autoplay. Inform the user that the video is now playing in the preview panel!\n";
+    }
+
     int IM_START = tok.get_token_id("<|im_start|>");
     int IM_END = tok.get_token_id("<|im_end|>");
     if (IM_START >= 0 && IM_END >= 0) {
         // ChatML template (Qwen / Llama / SmolLM)
         std::vector<int> result;
-        bool has_system = (!messages.empty() && messages[0]["role"].get<std::string>() == "system");
-        if (!has_system && enable_thinking) {
-            std::string sys_prompt = "Reasoning effort is set to xhigh. Please think carefully through the task, validate key assumptions, consider plausible alternatives, and prioritize correctness, consistency, and clarity in the final answer.";
+        bool has_system = (!messages.empty() && messages[0].value("role", "") == "system");
+        if (!has_system && (enable_thinking || has_tools)) {
+            std::string sys_prompt;
+            if (enable_thinking) {
+                sys_prompt = "Reasoning effort is set to xhigh. Please think carefully through the task, validate key assumptions, consider plausible alternatives, and prioritize correctness, consistency, and clarity in the final answer.";
+            }
+            if (has_tools) {
+                sys_prompt += tools_system_prompt;
+            }
             result.push_back(IM_START);
             auto sys_role = tok.encode("system\n" + sys_prompt);
             result.insert(result.end(), sys_role.begin(), sys_role.end());
@@ -6403,28 +6441,57 @@ static std::vector<int> apply_chat_template(const json& messages, const BPEToken
             result.insert(result.end(), nl_enc.begin(), nl_enc.end());
         }
         for (size_t i = 0; i < messages.size(); i++) {
-            std::string role = messages[i]["role"].get<std::string>();
-            std::string content = messages[i]["content"].get<std::string>();
+            std::string role = messages[i].value("role", "user");
+            std::string content = messages[i].value("content", "");
+
+            if (role == "system" && i == 0 && has_tools) {
+                content += tools_system_prompt;
+            }
+
+            if (role == "tool" || role == "function") {
+                result.push_back(IM_START);
+                auto user_role = tok.encode("user\n<tool_response>\n" + content + "\n</tool_response>");
+                result.insert(result.end(), user_role.begin(), user_role.end());
+                result.push_back(IM_END);
+                auto nl_enc = tok.encode("\n");
+                result.insert(result.end(), nl_enc.begin(), nl_enc.end());
+                continue;
+            }
 
             result.push_back(IM_START);
             auto role_enc = tok.encode(role + "\n");
             result.insert(result.end(), role_enc.begin(), role_enc.end());
-            auto content_enc = tok.encode(content);
+
+            std::string body = content;
+            if (role == "assistant" && messages[i].contains("tool_calls") && messages[i]["tool_calls"].is_array()) {
+                for (const auto& tc : messages[i]["tool_calls"]) {
+                    std::string fn_name = tc.value("function", json::object()).value("name", "");
+                    json fn_args = tc.value("function", json::object()).value("arguments", json::object());
+                    std::string args_str = fn_args.is_string() ? fn_args.get<std::string>() : fn_args.dump();
+                    if (!body.empty() && body.back() != '\n') body += "\n";
+                    body += "<tool_call>\n{\"name\": \"" + fn_name + "\", \"arguments\": " + args_str + "}\n</tool_call>\n";
+                }
+            }
+
+            auto content_enc = tok.encode(body);
             result.insert(result.end(), content_enc.begin(), content_enc.end());
             result.push_back(IM_END);
             auto nl_enc = tok.encode("\n");
             result.insert(result.end(), nl_enc.begin(), nl_enc.end());
         }
-        if (!messages.empty() && messages.back()["role"].get<std::string>() == "user") {
-            result.push_back(IM_START);
-            auto asst_enc = tok.encode("assistant\n");
-            result.insert(result.end(), asst_enc.begin(), asst_enc.end());
-            if (enable_thinking) {
-                auto think_enc = tok.encode("<think>\n");
-                result.insert(result.end(), think_enc.begin(), think_enc.end());
-            } else {
-                auto think_enc = tok.encode("<think>\n\n</think>\n");
-                result.insert(result.end(), think_enc.begin(), think_enc.end());
+        if (!messages.empty()) {
+            std::string last_role = messages.back().value("role", "user");
+            if (last_role == "user" || last_role == "tool" || last_role == "function") {
+                result.push_back(IM_START);
+                auto asst_enc = tok.encode("assistant\n");
+                result.insert(result.end(), asst_enc.begin(), asst_enc.end());
+                if (enable_thinking) {
+                    auto think_enc = tok.encode("<think>\n");
+                    result.insert(result.end(), think_enc.begin(), think_enc.end());
+                } else {
+                    auto think_enc = tok.encode("<think>\n\n</think>\n");
+                    result.insert(result.end(), think_enc.begin(), think_enc.end());
+                }
             }
         }
         return result;
@@ -6457,22 +6524,46 @@ static std::vector<int> apply_chat_template(const json& messages, const BPEToken
         auto prefix_enc = tok.encode(DEEPSEEK_V4_REASONING_EFFORT_MAX_PREFIX);
         result.insert(result.end(), prefix_enc.begin(), prefix_enc.end());
     }
+
+    bool has_system = (!messages.empty() && messages[0].value("role", "") == "system");
+    if (!has_system && has_tools) {
+        std::string sys_text = "You are DeepSeek-V4, a helpful AI assistant with tool calling capabilities." + tools_system_prompt;
+        auto enc = tok.encode(sys_text);
+        result.insert(result.end(), enc.begin(), enc.end());
+    }
+
     for (size_t i = 0; i < messages.size(); i++) {
-        std::string role = messages[i]["role"].get<std::string>();
-        std::string content = messages[i]["content"].get<std::string>();
+        std::string role = messages[i].value("role", "user");
+        std::string content = messages[i].value("content", "");
 
         if (role == "system") {
-            // System message: raw content, no wrapper tokens (per official encoding)
+            if (i == 0 && has_tools) {
+                content += tools_system_prompt;
+            }
             auto enc = tok.encode(content);
             result.insert(result.end(), enc.begin(), enc.end());
         } else if (role == "user") {
             result.push_back(USER);
             auto enc = tok.encode(content);
             result.insert(result.end(), enc.begin(), enc.end());
+        } else if (role == "tool" || role == "function") {
+            result.push_back(USER);
+            auto enc = tok.encode("<tool_response>\n" + content + "\n</tool_response>");
+            result.insert(result.end(), enc.begin(), enc.end());
         } else if (role == "assistant") {
             result.push_back(ASSISTANT);
             result.push_back(THINK_END);
-            auto enc = tok.encode(content);
+            std::string body = content;
+            if (messages[i].contains("tool_calls") && messages[i]["tool_calls"].is_array()) {
+                for (const auto& tc : messages[i]["tool_calls"]) {
+                    std::string fn_name = tc.value("function", json::object()).value("name", "");
+                    json fn_args = tc.value("function", json::object()).value("arguments", json::object());
+                    std::string args_str = fn_args.is_string() ? fn_args.get<std::string>() : fn_args.dump();
+                    if (!body.empty() && body.back() != '\n') body += "\n";
+                    body += "<tool_call>\n{\"name\": \"" + fn_name + "\", \"arguments\": " + args_str + "}\n</tool_call>\n";
+                }
+            }
+            auto enc = tok.encode(body);
             result.insert(result.end(), enc.begin(), enc.end());
             result.push_back(EOS); // <｜end▁of▁sentence｜>
         }
@@ -6480,8 +6571,8 @@ static std::vector<int> apply_chat_template(const json& messages, const BPEToken
 
     // Add assistant prompt for generation
     if (!messages.empty()) {
-        std::string last_role = messages.back()["role"].get<std::string>();
-        if (last_role == "user") {
+        std::string last_role = messages.back().value("role", "user");
+        if (last_role == "user" || last_role == "tool" || last_role == "function") {
             result.push_back(ASSISTANT);
             if (enable_thinking) {
                 result.push_back(THINK_BEGIN);
@@ -6517,14 +6608,16 @@ static void run_server(MoecherEngine& engine, int port, int default_thinking_bud
         return httplib::Server::HandlerResponse::Unhandled;
     });
 
-    // Web UI endpoints: serve from disk if found in ./web, otherwise serve embedded compiled-in assets
+    // Web UI endpoints: serve compiled-in embedded assets directly for standalone reliability
     auto serve_asset = [](const std::string& disk_path, std::string_view embedded, const char* mime, httplib::Response& res) {
-        std::ifstream in(disk_path, std::ios::binary);
-        if (in.is_open()) {
-            std::string content((std::istreambuf_iterator<char>(in)), std::istreambuf_iterator<char>());
-            res.set_content(content, mime);
-        } else {
+        if (!embedded.empty()) {
             res.set_content(std::string(embedded), mime);
+        } else {
+            std::ifstream in(disk_path, std::ios::binary);
+            if (in.is_open()) {
+                std::string content((std::istreambuf_iterator<char>(in)), std::istreambuf_iterator<char>());
+                res.set_content(content, mime);
+            }
         }
         res.set_header("Cache-Control", "no-cache, no-store, must-revalidate");
         res.set_header("Pragma", "no-cache");
@@ -6544,12 +6637,17 @@ static void run_server(MoecherEngine& engine, int port, int default_thinking_bud
         serve_asset("web/script.js", moecher::embedded_web::SCRIPT_JS(), "application/javascript; charset=utf-8", res);
     });
 
-    svr.set_mount_point("/", "./web");
-    svr.set_mount_point("/", "../web");
-
     // Health & status check
     svr.Get("/health", [](const httplib::Request&, httplib::Response& res) {
         res.set_content("{\"status\":\"ok\",\"engine\":\"moecher\",\"version\":\"2.05\"}", "application/json");
+    });
+
+    svr.Get("/v1/workspace", [](const httplib::Request&, httplib::Response& res) {
+        json info = {
+            {"workspace_directory", moecher::tooling::get_workspace_directory()},
+            {"default_timeout_sec", 60}
+        };
+        res.set_content(info.dump(), "application/json");
     });
 
     svr.Get("/v1/models", [&engine](const httplib::Request&, httplib::Response& res) {
@@ -6618,6 +6716,11 @@ static void run_server(MoecherEngine& engine, int port, int default_thinking_bud
             bool enable_thinking = true;
             int max_thinking_tokens = default_thinking_budget;
 
+            json tools = json::array();
+            if (g_enable_tools && request.contains("tools") && request["tools"].is_array() && !request["tools"].empty()) {
+                tools = request["tools"];
+            }
+
             if (reasoning_effort == "none") {
                 enable_thinking = false;
                 max_thinking_tokens = 0;
@@ -6646,20 +6749,35 @@ static void run_server(MoecherEngine& engine, int port, int default_thinking_bud
                 max_thinking_tokens = 0;
             }
 
-            LOG_INFO("Reasoning effort: %s, Thinking: %s, Thinking budget: %d",
-                     reasoning_effort.c_str(), enable_thinking ? "enabled" : "disabled", max_thinking_tokens);
+            int execution_timeout_ms = 60000;
+            if (request.contains("execution_timeout_ms") && request["execution_timeout_ms"].is_number()) {
+                execution_timeout_ms = request["execution_timeout_ms"].get<int>();
+            } else if (request.contains("execution_timeout_sec") && request["execution_timeout_sec"].is_number()) {
+                execution_timeout_ms = request["execution_timeout_sec"].get<int>() * 1000;
+            }
+            if (execution_timeout_ms <= 0) execution_timeout_ms = 60000;
 
-            // Apply chat template
-            std::vector<int> prompt = apply_chat_template(messages, engine.tokenizer_, enable_thinking, reasoning_effort);
-            LOG_INFO("PROMPT (len=%zu)", prompt.size());
+            bool require_external_authorization = request.value("require_external_authorization", true);
+            bool workspace_boundary_enforced = request.value("workspace_boundary_enforced", true);
+            std::vector<std::string> authorized_paths;
+            if (request.contains("authorized_paths") && request["authorized_paths"].is_array()) {
+                for (const auto& ap : request["authorized_paths"]) {
+                    if (ap.is_string()) authorized_paths.push_back(ap.get<std::string>());
+                }
+            }
+
+            LOG_INFO("Reasoning effort: %s, Thinking: %s, Thinking budget: %d, Tools: %zu, Server-Exec: %s, Timeout: %dms",
+                     reasoning_effort.c_str(), enable_thinking ? "enabled" : "disabled", max_thinking_tokens,
+                     tools.size(), (g_server_exec ? "enabled" : "disabled"), execution_timeout_ms);
 
             std::string req_id = "chatcmpl-moecher-" + std::to_string(++g_request_counter);
+            std::string model_id = (engine.cfg_.architecture == ModelArch::QWEN) ? "qwen3.8-27b-q4" : "deepseek-v4-flash";
 
             if (stream) {
                 // SSE streaming
                 res.set_chunked_content_provider(
                     "text/event-stream",
-                    [&engine, prompt, max_tokens, temperature, req_id, repetition_penalty, enable_thinking, max_thinking_tokens, top_p, min_p, top_k](size_t offset, httplib::DataSink &sink) {
+                    [&engine, messages, tools, max_tokens, temperature, req_id, repetition_penalty, enable_thinking, max_thinking_tokens, top_p, min_p, top_k, reasoning_effort, model_id, execution_timeout_ms, require_external_authorization, workspace_boundary_enforced, authorized_paths](size_t offset, httplib::DataSink &sink) {
                         if (offset > 0) return false;
                         std::lock_guard<std::mutex> lock(g_engine_mutex);
 
@@ -6667,7 +6785,7 @@ static void run_server(MoecherEngine& engine, int port, int default_thinking_bud
                             {"id", req_id},
                             {"object", "chat.completion.chunk"},
                             {"created", std::chrono::system_clock::to_time_t(std::chrono::system_clock::now())},
-                            {"model", "deepseek-v4-flash"},
+                            {"model", model_id},
                             {"choices", {{
                                 {"index", 0},
                                 {"delta", {{"role", "assistant"}}},
@@ -6676,35 +6794,552 @@ static void run_server(MoecherEngine& engine, int port, int default_thinking_bud
                         };
                         std::string sse = "data: " + initial_chunk.dump(-1, ' ', false, json::error_handler_t::replace) + "\n\n";
                         sink.write(sse.data(), sse.size());
-                        
-                        engine.generate(prompt, max_tokens, temperature, [&](const std::string& text, bool is_reasoning) -> bool {
-                            if (g_stop_requested.load()) return false;
-                            if (text.empty()) return true; // Skip empty tokens
-          
-                            json delta_chunk = {
-                                {"id", req_id},
-                                {"object", "chat.completion.chunk"},
-                                {"created", std::chrono::system_clock::to_time_t(std::chrono::system_clock::now())},
-                                {"model", "deepseek-v4-flash"},
-                                {"choices", {{
-                                    {"index", 0},
-                                    {"delta", is_reasoning ? json{{"reasoning_content", text}} : json{{"content", text}}},
-                                    {"finish_reason", nullptr}
-                                }}}
+
+                        json current_messages = messages;
+                        int max_tool_rounds = (g_server_exec && !tools.empty() && g_enable_tools) ? 5 : 1;
+                        std::string final_finish_reason = "stop";
+
+                        for (int round = 0; round < max_tool_rounds; round++) {
+                            std::vector<int> prompt = apply_chat_template(current_messages, engine.tokenizer_, enable_thinking, reasoning_effort, tools);
+                            LOG_INFO("STREAM PROMPT [round %d] (len=%zu)", round + 1, prompt.size());
+
+                            std::string round_content;
+                            std::string round_reasoning;
+
+                            engine.generate(prompt, max_tokens, temperature, [&](const std::string& text, bool is_reasoning) -> bool {
+                                if (g_stop_requested.load()) return false;
+                                if (text.empty()) return true;
+
+                                if (is_reasoning) {
+                                    round_reasoning += text;
+                                    json delta_chunk = {
+                                        {"id", req_id},
+                                        {"object", "chat.completion.chunk"},
+                                        {"created", std::chrono::system_clock::to_time_t(std::chrono::system_clock::now())},
+                                        {"model", model_id},
+                                        {"choices", {{
+                                            {"index", 0},
+                                            {"delta", {{"reasoning_content", text}}},
+                                            {"finish_reason", nullptr}
+                                        }}}
+                                    };
+                                    std::string sse_chunk = "data: " + delta_chunk.dump(-1, ' ', false, json::error_handler_t::replace) + "\n\n";
+                                    return sink.write(sse_chunk.data(), sse_chunk.size()) && !g_stop_requested.load();
+                                } else {
+                                    round_content += text;
+                                    if (!g_enable_tools || tools.empty() || !g_server_exec) {
+                                        json delta_chunk = {
+                                            {"id", req_id},
+                                            {"object", "chat.completion.chunk"},
+                                            {"created", std::chrono::system_clock::to_time_t(std::chrono::system_clock::now())},
+                                            {"model", model_id},
+                                            {"choices", {{
+                                                {"index", 0},
+                                                {"delta", {{"content", text}}},
+                                                {"finish_reason", nullptr}
+                                            }}}
+                                        };
+                                        std::string sse_chunk = "data: " + delta_chunk.dump(-1, ' ', false, json::error_handler_t::replace) + "\n\n";
+                                        return sink.write(sse_chunk.data(), sse_chunk.size()) && !g_stop_requested.load();
+                                    }
+                                    return true;
+                                }
+                            }, repetition_penalty, enable_thinking, max_thinking_tokens, top_p, min_p, top_k);
+
+                            final_finish_reason = engine.last_finish_reason_.empty() ? "stop" : engine.last_finish_reason_;
+
+                            if (!g_enable_tools || tools.empty()) {
+                                break;
+                            }
+
+                            std::string clean_content;
+                            std::vector<moecher::tooling::ToolCall> round_tool_calls;
+                            moecher::tooling::extract_tool_calls(round_content, clean_content, round_tool_calls);
+
+                            if (round_tool_calls.empty()) {
+                                if (g_server_exec && !clean_content.empty()) {
+                                    json delta_chunk = {
+                                        {"id", req_id},
+                                        {"object", "chat.completion.chunk"},
+                                        {"created", std::chrono::system_clock::to_time_t(std::chrono::system_clock::now())},
+                                        {"model", model_id},
+                                        {"choices", {{
+                                            {"index", 0},
+                                            {"delta", {{"content", clean_content}}},
+                                            {"finish_reason", nullptr}
+                                        }}}
+                                    };
+                                    std::string sse_chunk = "data: " + delta_chunk.dump(-1, ' ', false, json::error_handler_t::replace) + "\n\n";
+                                    sink.write(sse_chunk.data(), sse_chunk.size());
+                                }
+                                break;
+                            }
+
+                            // Stream any leading text from model before tool call
+                            if (!clean_content.empty()) {
+                                std::string field_name = enable_thinking ? "reasoning_content" : "content";
+                                json intro_chunk = {
+                                    {"id", req_id},
+                                    {"object", "chat.completion.chunk"},
+                                    {"created", std::chrono::system_clock::to_time_t(std::chrono::system_clock::now())},
+                                    {"model", model_id},
+                                    {"choices", {{
+                                        {"index", 0},
+                                        {"delta", {{field_name, clean_content + "\n\n"}}},
+                                        {"finish_reason", nullptr}
+                                    }}}
+                                };
+                                std::string sse_intro = "data: " + intro_chunk.dump(-1, ' ', false, json::error_handler_t::replace) + "\n\n";
+                                sink.write(sse_intro.data(), sse_intro.size());
+                            }
+
+                            if (!g_server_exec) {
+                                final_finish_reason = "tool_calls";
+                                json tc_arr = json::array();
+                                for (size_t idx = 0; idx < round_tool_calls.size(); idx++) {
+                                    const auto& tc = round_tool_calls[idx];
+                                    tc_arr.push_back({
+                                        {"index", (int)idx},
+                                        {"id", tc.id},
+                                        {"type", tc.type},
+                                        {"function", {{"name", tc.name}, {"arguments", tc.arguments}}}
+                                    });
+                                }
+                                json tc_chunk = {
+                                    {"id", req_id},
+                                    {"object", "chat.completion.chunk"},
+                                    {"created", std::chrono::system_clock::to_time_t(std::chrono::system_clock::now())},
+                                    {"model", model_id},
+                                    {"choices", {{
+                                        {"index", 0},
+                                        {"delta", {{"tool_calls", tc_arr}}},
+                                        {"finish_reason", "tool_calls"}
+                                    }}}
+                                };
+                                std::string sse_chunk = "data: " + tc_chunk.dump(-1, ' ', false, json::error_handler_t::replace) + "\n\n";
+                                sink.write(sse_chunk.data(), sse_chunk.size());
+                                break;
+                            }
+
+                            // Server-side tool execution
+                            bool can_execute_all = true;
+                            json assistant_msg = {{"role", "assistant"}, {"content", round_content}};
+                            json tc_json_arr = json::array();
+                            for (const auto& tc : round_tool_calls) {
+                                tc_json_arr.push_back({
+                                    {"id", tc.id},
+                                    {"type", tc.type},
+                                    {"function", {{"name", tc.name}, {"arguments", tc.arguments}}}
+                                });
+                            }
+                            assistant_msg["tool_calls"] = tc_json_arr;
+                            current_messages.push_back(assistant_msg);
+
+                            std::string tool_delta_field = enable_thinking ? "reasoning_content" : "content";
+
+                            auto is_path_authorized = [&](const std::string& p) -> bool {
+                                if (!require_external_authorization && !workspace_boundary_enforced) return true;
+                                if (moecher::tooling::is_path_inside_workspace(p)) return true;
+                                for (const auto& ap : authorized_paths) {
+                                    if (ap == "*" || ap == p) return true;
+                                    if (!ap.empty() && moecher::tooling::is_path_inside_workspace(p, ap)) return true;
+                                }
+                                return false;
                             };
 
-                            std::string sse_chunk = "data: " + delta_chunk.dump(-1, ' ', false, json::error_handler_t::replace) + "\n\n";
-                            bool ok = sink.write(sse_chunk.data(), sse_chunk.size());
-                            return ok && !g_stop_requested.load();
-                        }, repetition_penalty, enable_thinking, max_thinking_tokens, top_p, min_p, top_k);
+                            for (const auto& tc : round_tool_calls) {
+                                std::string exec_output;
+                                if (tc.name == "fetch_url") {
+                                    std::string url;
+                                    try {
+                                        json args = json::parse(tc.arguments);
+                                        url = args.value("url", "");
+                                    } catch (...) { url = tc.arguments; }
 
-                        std::string final_finish_reason = engine.last_finish_reason_.empty() ? "stop" : engine.last_finish_reason_;
+                                    std::string active_card =
+                                        "\n\n<div class=\"tool-activity-block active\" id=\"tool-act-" + tc.id + "\">\n"
+                                        "  <span class=\"thinking-spinner\">progress_activity</span>\n"
+                                        "  <span class=\"tool-action-label\">Searching Web</span>\n"
+                                        "  <span class=\"tool-target-subtle\">" + url + "</span>\n"
+                                        "</div>\n\n";
 
+                                    json info_chunk = {
+                                        {"id", req_id},
+                                        {"object", "chat.completion.chunk"},
+                                        {"created", std::chrono::system_clock::to_time_t(std::chrono::system_clock::now())},
+                                        {"model", model_id},
+                                        {"choices", {{
+                                            {"index", 0},
+                                            {"delta", {{tool_delta_field, active_card}}},
+                                            {"finish_reason", nullptr}
+                                        }}}
+                                    };
+                                    std::string sse_info = "data: " + info_chunk.dump(-1, ' ', false, json::error_handler_t::replace) + "\n\n";
+                                    sink.write(sse_info.data(), sse_info.size());
+
+                                    LOG_INFO("Streaming Tool Exec: fetch_url('%s')", url.c_str());
+                                    auto doc = moecher::tooling::fetch_url_full(url, std::min(execution_timeout_ms, 30000));
+                                    exec_output = doc.clean_text;
+
+                                    // Stream the retrieved document metadata & HTML to the frontend for the Retrieved Documents panel
+                                    json doc_chunk = {
+                                        {"id", req_id},
+                                        {"object", "chat.completion.chunk"},
+                                        {"created", std::chrono::system_clock::to_time_t(std::chrono::system_clock::now())},
+                                        {"model", model_id},
+                                        {"choices", {{
+                                            {"index", 0},
+                                            {"delta", {
+                                                {"retrieved_document", {
+                                                    {"id", tc.id},
+                                                    {"url", doc.url},
+                                                    {"title", doc.title.empty() ? doc.url : doc.title},
+                                                    {"html", doc.raw_html},
+                                                    {"snippet", (doc.clean_text.size() > 300 ? doc.clean_text.substr(0, 300) + "..." : doc.clean_text)}
+                                                }}
+                                            }},
+                                            {"finish_reason", nullptr}
+                                        }}}
+                                    };
+                                    std::string sse_doc = "data: " + doc_chunk.dump(-1, ' ', false, json::error_handler_t::replace) + "\n\n";
+                                    sink.write(sse_doc.data(), sse_doc.size());
+
+                                    std::string completed_card =
+                                        "\n\n<div class=\"tool-activity-block completed\" id=\"tool-act-" + tc.id + "\">\n"
+                                        "  <span class=\"material-symbols-outlined tool-done-icon\">travel_explore</span>\n"
+                                        "  <span class=\"tool-action-label\">Searched</span>\n"
+                                        "  <span class=\"tool-target-subtle\">" + doc.url + "</span>\n"
+                                        "</div>\n\n";
+
+                                    json comp_chunk = {
+                                        {"id", req_id},
+                                        {"object", "chat.completion.chunk"},
+                                        {"created", std::chrono::system_clock::to_time_t(std::chrono::system_clock::now())},
+                                        {"model", model_id},
+                                        {"choices", {{
+                                            {"index", 0},
+                                            {"delta", {{tool_delta_field, completed_card}}},
+                                            {"finish_reason", nullptr}
+                                        }}}
+                                    };
+                                    std::string sse_comp = "data: " + comp_chunk.dump(-1, ' ', false, json::error_handler_t::replace) + "\n\n";
+                                    sink.write(sse_comp.data(), sse_comp.size());
+
+                                } else if (tc.name == "read_file") {
+                                    std::string path;
+                                    int start_line = 1;
+                                    int end_line = -1;
+                                    try {
+                                        json args = json::parse(tc.arguments);
+                                        path = args.value("path", "");
+                                        start_line = args.value("start_line", 1);
+                                        end_line = args.value("end_line", -1);
+                                    } catch (...) { path = tc.arguments; }
+
+                                    std::string active_card =
+                                        "\n\n<div class=\"tool-activity-block active\" id=\"tool-act-" + tc.id + "\">\n"
+                                        "  <span class=\"thinking-spinner\">progress_activity</span>\n"
+                                        "  <span class=\"tool-action-label\">Reading file</span>\n"
+                                        "  <span class=\"tool-target-subtle\">" + path + "</span>\n"
+                                        "</div>\n\n";
+
+                                    json info_chunk = {
+                                        {"id", req_id},
+                                        {"object", "chat.completion.chunk"},
+                                        {"created", std::chrono::system_clock::to_time_t(std::chrono::system_clock::now())},
+                                        {"model", model_id},
+                                        {"choices", {{
+                                            {"index", 0},
+                                            {"delta", {{tool_delta_field, active_card}}},
+                                            {"finish_reason", nullptr}
+                                        }}}
+                                    };
+                                    std::string sse_info = "data: " + info_chunk.dump(-1, ' ', false, json::error_handler_t::replace) + "\n\n";
+                                    sink.write(sse_info.data(), sse_info.size());
+
+                                    LOG_INFO("Streaming Tool Exec: read_file('%s', start=%d, end=%d)", path.c_str(), start_line, end_line);
+
+                                    if (!is_path_authorized(path)) {
+                                        exec_output = "[Authorization Required: The path '" + path + "' is outside the current workspace directory (" + moecher::tooling::get_workspace_directory() + "). Action requires explicit user authorization for path: " + path + "]";
+                                        json auth_chunk = {
+                                            {"id", req_id},
+                                            {"object", "chat.completion.chunk"},
+                                            {"created", std::chrono::system_clock::to_time_t(std::chrono::system_clock::now())},
+                                            {"model", model_id},
+                                            {"choices", {{
+                                                {"index", 0},
+                                                {"delta", {
+                                                    {"authorization_required", {
+                                                        {"tool", "read_file"},
+                                                        {"path", path},
+                                                        {"id", tc.id}
+                                                    }}
+                                                }},
+                                                {"finish_reason", nullptr}
+                                            }}}
+                                        };
+                                        std::string sse_auth = "data: " + auth_chunk.dump(-1, ' ', false, json::error_handler_t::replace) + "\n\n";
+                                        sink.write(sse_auth.data(), sse_auth.size());
+                                    } else {
+                                        exec_output = moecher::tooling::read_file(path, start_line, end_line);
+                                    }
+
+                                    std::string completed_card =
+                                        "\n\n<div class=\"tool-activity-block completed\" id=\"tool-act-" + tc.id + "\">\n"
+                                        "  <span class=\"material-symbols-outlined tool-done-icon\">description</span>\n"
+                                        "  <span class=\"tool-action-label\">Read file</span>\n"
+                                        "  <span class=\"tool-target-subtle\">" + path + "</span>\n"
+                                        "</div>\n\n";
+
+                                    json comp_chunk = {
+                                        {"id", req_id},
+                                        {"object", "chat.completion.chunk"},
+                                        {"created", std::chrono::system_clock::to_time_t(std::chrono::system_clock::now())},
+                                        {"model", model_id},
+                                        {"choices", {{
+                                            {"index", 0},
+                                            {"delta", {{tool_delta_field, completed_card}}},
+                                            {"finish_reason", nullptr}
+                                        }}}
+                                    };
+                                    std::string sse_comp = "data: " + comp_chunk.dump(-1, ' ', false, json::error_handler_t::replace) + "\n\n";
+                                    sink.write(sse_comp.data(), sse_comp.size());
+
+                                } else if (tc.name == "write_file") {
+                                    std::string path;
+                                    std::string content;
+                                    bool overwrite = true;
+                                    try {
+                                        json args = json::parse(tc.arguments);
+                                        path = args.value("path", "");
+                                        content = args.value("content", "");
+                                        overwrite = args.value("overwrite", true);
+                                    } catch (...) { path = tc.arguments; }
+
+                                    std::string active_card =
+                                        "\n\n<div class=\"tool-activity-block active\" id=\"tool-act-" + tc.id + "\">\n"
+                                        "  <span class=\"thinking-spinner\">progress_activity</span>\n"
+                                        "  <span class=\"tool-action-label\">Writing file</span>\n"
+                                        "  <span class=\"tool-target-subtle\">" + path + "</span>\n"
+                                        "</div>\n\n";
+
+                                    json info_chunk = {
+                                        {"id", req_id},
+                                        {"object", "chat.completion.chunk"},
+                                        {"created", std::chrono::system_clock::to_time_t(std::chrono::system_clock::now())},
+                                        {"model", model_id},
+                                        {"choices", {{
+                                            {"index", 0},
+                                            {"delta", {{tool_delta_field, active_card}}},
+                                            {"finish_reason", nullptr}
+                                        }}}
+                                    };
+                                    std::string sse_info = "data: " + info_chunk.dump(-1, ' ', false, json::error_handler_t::replace) + "\n\n";
+                                    sink.write(sse_info.data(), sse_info.size());
+
+                                    LOG_INFO("Streaming Tool Exec: write_file('%s', %zu bytes)", path.c_str(), content.size());
+
+                                    if (!is_path_authorized(path)) {
+                                        exec_output = "[Authorization Required: The path '" + path + "' is outside the current workspace directory (" + moecher::tooling::get_workspace_directory() + "). Action requires explicit user authorization for path: " + path + "]";
+                                        json auth_chunk = {
+                                            {"id", req_id},
+                                            {"object", "chat.completion.chunk"},
+                                            {"created", std::chrono::system_clock::to_time_t(std::chrono::system_clock::now())},
+                                            {"model", model_id},
+                                            {"choices", {{
+                                                {"index", 0},
+                                                {"delta", {
+                                                    {"authorization_required", {
+                                                        {"tool", "write_file"},
+                                                        {"path", path},
+                                                        {"id", tc.id}
+                                                    }}
+                                                }},
+                                                {"finish_reason", nullptr}
+                                            }}}
+                                        };
+                                        std::string sse_auth = "data: " + auth_chunk.dump(-1, ' ', false, json::error_handler_t::replace) + "\n\n";
+                                        sink.write(sse_auth.data(), sse_auth.size());
+                                    } else {
+                                        exec_output = moecher::tooling::write_file(path, content, overwrite);
+                                    }
+
+                                    std::string completed_card =
+                                        "\n\n<div class=\"tool-activity-block completed\" id=\"tool-act-" + tc.id + "\">\n"
+                                        "  <span class=\"material-symbols-outlined tool-done-icon\">edit_note</span>\n"
+                                        "  <span class=\"tool-action-label\">Wrote file</span>\n"
+                                        "  <span class=\"tool-target-subtle\">" + path + "</span>\n"
+                                        "</div>\n\n";
+
+                                    json comp_chunk = {
+                                        {"id", req_id},
+                                        {"object", "chat.completion.chunk"},
+                                        {"created", std::chrono::system_clock::to_time_t(std::chrono::system_clock::now())},
+                                        {"model", model_id},
+                                        {"choices", {{
+                                            {"index", 0},
+                                            {"delta", {{tool_delta_field, completed_card}}},
+                                            {"finish_reason", nullptr}
+                                        }}}
+                                    };
+                                    std::string sse_comp = "data: " + comp_chunk.dump(-1, ' ', false, json::error_handler_t::replace) + "\n\n";
+                                    sink.write(sse_comp.data(), sse_comp.size());
+
+                                } else if (tc.name == "edit_file") {
+                                    std::string path;
+                                    std::string target_content;
+                                    std::string replacement_content;
+                                    try {
+                                        json args = json::parse(tc.arguments);
+                                        path = args.value("path", "");
+                                        target_content = args.value("target_content", "");
+                                        replacement_content = args.value("replacement_content", "");
+                                    } catch (...) { path = tc.arguments; }
+
+                                    std::string active_card =
+                                        "\n\n<div class=\"tool-activity-block active\" id=\"tool-act-" + tc.id + "\">\n"
+                                        "  <span class=\"thinking-spinner\">progress_activity</span>\n"
+                                        "  <span class=\"tool-action-label\">Editing file</span>\n"
+                                        "  <span class=\"tool-target-subtle\">" + path + "</span>\n"
+                                        "</div>\n\n";
+
+                                    json info_chunk = {
+                                        {"id", req_id},
+                                        {"object", "chat.completion.chunk"},
+                                        {"created", std::chrono::system_clock::to_time_t(std::chrono::system_clock::now())},
+                                        {"model", model_id},
+                                        {"choices", {{
+                                            {"index", 0},
+                                            {"delta", {{tool_delta_field, active_card}}},
+                                            {"finish_reason", nullptr}
+                                        }}}
+                                    };
+                                    std::string sse_info = "data: " + info_chunk.dump(-1, ' ', false, json::error_handler_t::replace) + "\n\n";
+                                    sink.write(sse_info.data(), sse_info.size());
+
+                                    LOG_INFO("Streaming Tool Exec: edit_file('%s')", path.c_str());
+
+                                    if (!is_path_authorized(path)) {
+                                        exec_output = "[Authorization Required: The path '" + path + "' is outside the current workspace directory (" + moecher::tooling::get_workspace_directory() + "). Action requires explicit user authorization for path: " + path + "]";
+                                        json auth_chunk = {
+                                            {"id", req_id},
+                                            {"object", "chat.completion.chunk"},
+                                            {"created", std::chrono::system_clock::to_time_t(std::chrono::system_clock::now())},
+                                            {"model", model_id},
+                                            {"choices", {{
+                                                {"index", 0},
+                                                {"delta", {
+                                                    {"authorization_required", {
+                                                        {"tool", "edit_file"},
+                                                        {"path", path},
+                                                        {"id", tc.id}
+                                                    }}
+                                                }},
+                                                {"finish_reason", nullptr}
+                                            }}}
+                                        };
+                                        std::string sse_auth = "data: " + auth_chunk.dump(-1, ' ', false, json::error_handler_t::replace) + "\n\n";
+                                        sink.write(sse_auth.data(), sse_auth.size());
+                                    } else {
+                                        exec_output = moecher::tooling::edit_file(path, target_content, replacement_content);
+                                    }
+
+                                    std::string completed_card =
+                                        "\n\n<div class=\"tool-activity-block completed\" id=\"tool-act-" + tc.id + "\">\n"
+                                        "  <span class=\"material-symbols-outlined tool-done-icon\">edit_square</span>\n"
+                                        "  <span class=\"tool-action-label\">Edited file</span>\n"
+                                        "  <span class=\"tool-target-subtle\">" + path + "</span>\n"
+                                        "</div>\n\n";
+
+                                    json comp_chunk = {
+                                        {"id", req_id},
+                                        {"object", "chat.completion.chunk"},
+                                        {"created", std::chrono::system_clock::to_time_t(std::chrono::system_clock::now())},
+                                        {"model", model_id},
+                                        {"choices", {{
+                                            {"index", 0},
+                                            {"delta", {{tool_delta_field, completed_card}}},
+                                            {"finish_reason", nullptr}
+                                        }}}
+                                    };
+                                    std::string sse_comp = "data: " + comp_chunk.dump(-1, ' ', false, json::error_handler_t::replace) + "\n\n";
+                                    sink.write(sse_comp.data(), sse_comp.size());
+
+                                } else if (tc.name == "execute_command") {
+                                    std::string cmd;
+                                    try {
+                                        json args = json::parse(tc.arguments);
+                                        cmd = args.value("command", "");
+                                    } catch (...) { cmd = tc.arguments; }
+
+                                    std::string active_card =
+                                        "\n\n<div class=\"tool-activity-block active\" id=\"tool-act-" + tc.id + "\">\n"
+                                        "  <span class=\"thinking-spinner\">progress_activity</span>\n"
+                                        "  <span class=\"tool-action-label\">Running command</span>\n"
+                                        "  <span class=\"tool-target-subtle\">" + cmd + "</span>\n"
+                                        "</div>\n\n";
+
+                                    json info_chunk = {
+                                        {"id", req_id},
+                                        {"object", "chat.completion.chunk"},
+                                        {"created", std::chrono::system_clock::to_time_t(std::chrono::system_clock::now())},
+                                        {"model", model_id},
+                                        {"choices", {{
+                                            {"index", 0},
+                                            {"delta", {{tool_delta_field, active_card}}},
+                                            {"finish_reason", nullptr}
+                                        }}}
+                                    };
+                                    std::string sse_info = "data: " + info_chunk.dump(-1, ' ', false, json::error_handler_t::replace) + "\n\n";
+                                    sink.write(sse_info.data(), sse_info.size());
+
+                                    LOG_INFO("Streaming Tool Exec: execute_command('%s', timeout=%dms)", cmd.c_str(), execution_timeout_ms);
+                                    exec_output = moecher::tooling::execute_system_command(cmd, execution_timeout_ms);
+
+                                    std::string completed_card =
+                                        "\n\n<div class=\"tool-activity-block completed\" id=\"tool-act-" + tc.id + "\">\n"
+                                        "  <span class=\"material-symbols-outlined tool-done-icon\">terminal</span>\n"
+                                        "  <span class=\"tool-action-label\">Executed</span>\n"
+                                        "  <span class=\"tool-target-subtle\">" + cmd + "</span>\n"
+                                        "</div>\n\n";
+
+                                    json comp_chunk = {
+                                        {"id", req_id},
+                                        {"object", "chat.completion.chunk"},
+                                        {"created", std::chrono::system_clock::to_time_t(std::chrono::system_clock::now())},
+                                        {"model", model_id},
+                                        {"choices", {{
+                                            {"index", 0},
+                                            {"delta", {{tool_delta_field, completed_card}}},
+                                            {"finish_reason", nullptr}
+                                        }}}
+                                    };
+                                    std::string sse_comp = "data: " + comp_chunk.dump(-1, ' ', false, json::error_handler_t::replace) + "\n\n";
+                                    sink.write(sse_comp.data(), sse_comp.size());
+                                } else {
+                                    can_execute_all = false;
+                                    break;
+                                }
+
+                                current_messages.push_back({
+                                    {"role", "tool"},
+                                    {"tool_call_id", tc.id},
+                                    {"content", exec_output}
+                                });
+                            }
+
+                            if (!can_execute_all) {
+                                final_finish_reason = "tool_calls";
+                                break;
+                            }
+                        }
+
+                        // Final finish chunk
                         json finish = {
                             {"id", req_id},
                             {"object", "chat.completion.chunk"},
                             {"created", std::chrono::system_clock::to_time_t(std::chrono::system_clock::now())},
-                            {"model", "deepseek-v4-flash"},
+                            {"model", model_id},
                             {"choices", {{
                                 {"index", 0},
                                 {"delta", json::object()},
@@ -6730,22 +7365,181 @@ static void run_server(MoecherEngine& engine, int port, int default_thinking_bud
                     }
                 );
             } else {
-                std::string response_text;
-                {
-                    std::lock_guard<std::mutex> lock(g_engine_mutex);
-                    response_text = engine.generate(prompt, max_tokens, temperature, nullptr, repetition_penalty, enable_thinking, max_thinking_tokens, top_p, min_p, top_k);
+                std::string final_response_text;
+                std::vector<moecher::tooling::ToolCall> emitted_tool_calls;
+                json current_messages = messages;
+                std::string finish_reason = "stop";
+
+                int max_tool_rounds = (g_server_exec && !tools.empty() && g_enable_tools) ? 5 : 1;
+
+                for (int round = 0; round < max_tool_rounds; round++) {
+                    std::vector<int> prompt = apply_chat_template(current_messages, engine.tokenizer_, enable_thinking, reasoning_effort, tools);
+                    LOG_INFO("PROMPT [round %d] (len=%zu)", round + 1, prompt.size());
+
+                    std::string response_text;
+                    {
+                        std::lock_guard<std::mutex> lock(g_engine_mutex);
+                        response_text = engine.generate(prompt, max_tokens, temperature, nullptr, repetition_penalty, enable_thinking, max_thinking_tokens, top_p, min_p, top_k);
+                        finish_reason = engine.last_finish_reason_;
+                    }
+
+                    if (!g_enable_tools || tools.empty()) {
+                        final_response_text = response_text;
+                        break;
+                    }
+
+                    std::string clean_content;
+                    std::vector<moecher::tooling::ToolCall> round_tool_calls;
+                    moecher::tooling::extract_tool_calls(response_text, clean_content, round_tool_calls);
+
+                    if (round_tool_calls.empty()) {
+                        final_response_text = clean_content;
+                        break;
+                    }
+
+                    emitted_tool_calls = round_tool_calls;
+                    final_response_text = clean_content;
+
+                    if (!g_server_exec) {
+                        finish_reason = "tool_calls";
+                        break;
+                    }
+
+                    // Server-side tool execution
+                    bool can_execute_all = true;
+                    json assistant_msg = {{"role", "assistant"}, {"content", response_text}};
+                    json tc_json_arr = json::array();
+                    for (const auto& tc : round_tool_calls) {
+                        tc_json_arr.push_back({
+                            {"id", tc.id},
+                            {"type", tc.type},
+                            {"function", {{"name", tc.name}, {"arguments", tc.arguments}}}
+                        });
+                    }
+                    assistant_msg["tool_calls"] = tc_json_arr;
+                    current_messages.push_back(assistant_msg);
+
+                    auto is_path_authorized = [&](const std::string& p) -> bool {
+                        if (!require_external_authorization && !workspace_boundary_enforced) return true;
+                        if (moecher::tooling::is_path_inside_workspace(p)) return true;
+                        for (const auto& ap : authorized_paths) {
+                            if (ap == "*" || ap == p) return true;
+                            if (!ap.empty() && moecher::tooling::is_path_inside_workspace(p, ap)) return true;
+                        }
+                        return false;
+                    };
+
+                    for (const auto& tc : round_tool_calls) {
+                        std::string exec_output;
+                        if (tc.name == "fetch_url") {
+                            std::string url;
+                            try {
+                                json args = json::parse(tc.arguments);
+                                url = args.value("url", "");
+                            } catch (...) { url = tc.arguments; }
+                            LOG_INFO("Executing built-in tool fetch_url: %s", url.c_str());
+                            exec_output = moecher::tooling::fetch_url_content(url, std::min(execution_timeout_ms, 30000));
+                        } else if (tc.name == "read_file") {
+                            std::string path;
+                            int start_line = 1;
+                            int end_line = -1;
+                            try {
+                                json args = json::parse(tc.arguments);
+                                path = args.value("path", "");
+                                start_line = args.value("start_line", 1);
+                                end_line = args.value("end_line", -1);
+                            } catch (...) { path = tc.arguments; }
+                            LOG_INFO("Executing built-in tool read_file: %s", path.c_str());
+                            if (!is_path_authorized(path)) {
+                                exec_output = "[Authorization Required: The path '" + path + "' is outside the current workspace directory (" + moecher::tooling::get_workspace_directory() + "). Action requires explicit user authorization for path: " + path + "]";
+                            } else {
+                                exec_output = moecher::tooling::read_file(path, start_line, end_line);
+                            }
+                        } else if (tc.name == "write_file") {
+                            std::string path;
+                            std::string content;
+                            bool overwrite = true;
+                            try {
+                                json args = json::parse(tc.arguments);
+                                path = args.value("path", "");
+                                content = args.value("content", "");
+                                overwrite = args.value("overwrite", true);
+                            } catch (...) { path = tc.arguments; }
+                            LOG_INFO("Executing built-in tool write_file: %s (%zu bytes)", path.c_str(), content.size());
+                            if (!is_path_authorized(path)) {
+                                exec_output = "[Authorization Required: The path '" + path + "' is outside the current workspace directory (" + moecher::tooling::get_workspace_directory() + "). Action requires explicit user authorization for path: " + path + "]";
+                            } else {
+                                exec_output = moecher::tooling::write_file(path, content, overwrite);
+                            }
+                        } else if (tc.name == "edit_file") {
+                            std::string path;
+                            std::string target_content;
+                            std::string replacement_content;
+                            try {
+                                json args = json::parse(tc.arguments);
+                                path = args.value("path", "");
+                                target_content = args.value("target_content", "");
+                                replacement_content = args.value("replacement_content", "");
+                            } catch (...) { path = tc.arguments; }
+                            LOG_INFO("Executing built-in tool edit_file: %s", path.c_str());
+                            if (!is_path_authorized(path)) {
+                                exec_output = "[Authorization Required: The path '" + path + "' is outside the current workspace directory (" + moecher::tooling::get_workspace_directory() + "). Action requires explicit user authorization for path: " + path + "]";
+                            } else {
+                                exec_output = moecher::tooling::edit_file(path, target_content, replacement_content);
+                            }
+                        } else if (tc.name == "execute_command") {
+                            std::string cmd;
+                            try {
+                                json args = json::parse(tc.arguments);
+                                cmd = args.value("command", "");
+                            } catch (...) { cmd = tc.arguments; }
+                            LOG_INFO("Executing built-in tool execute_command: %s (timeout=%dms)", cmd.c_str(), execution_timeout_ms);
+                            exec_output = moecher::tooling::execute_system_command(cmd, execution_timeout_ms);
+                        } else {
+                            can_execute_all = false;
+                            break;
+                        }
+
+                        current_messages.push_back({
+                            {"role", "tool"},
+                            {"tool_call_id", tc.id},
+                            {"content", exec_output}
+                        });
+                    }
+
+                    if (!can_execute_all) {
+                        finish_reason = "tool_calls";
+                        break;
+                    }
                 }
-                
+
+                json choice = {
+                    {"index", 0},
+                    {"message", {
+                        {"role", "assistant"},
+                        {"content", final_response_text}
+                    }},
+                    {"finish_reason", finish_reason}
+                };
+
+                if (!emitted_tool_calls.empty() && (!g_server_exec || finish_reason == "tool_calls")) {
+                    json tc_arr = json::array();
+                    for (const auto& tc : emitted_tool_calls) {
+                        tc_arr.push_back({
+                            {"id", tc.id},
+                            {"type", tc.type},
+                            {"function", {{"name", tc.name}, {"arguments", tc.arguments}}}
+                        });
+                    }
+                    choice["message"]["tool_calls"] = tc_arr;
+                }
+
                 json response = {
                     {"id", req_id},
                     {"object", "chat.completion"},
                     {"created", std::chrono::system_clock::to_time_t(std::chrono::system_clock::now())},
-                    {"model", "deepseek-v4-flash"},
-                    {"choices", {{
-                        {"index", 0},
-                        {"message", {{"role", "assistant"}, {"content", response_text}}},
-                        {"finish_reason", engine.last_finish_reason_}
-                    }}},
+                    {"model", model_id},
+                    {"choices", {choice}},
                     {"usage", {
                         {"prompt_tokens", engine.prompt_token_count_},
                         {"completion_tokens", engine.completion_token_count_},
@@ -6872,6 +7666,14 @@ int main(int argc, char** argv) {
                    std::string(argv[i]) == "-track-moe" ||
                    std::string(argv[i]) == "-track") {
             g_track_experts = true;
+        } else if (std::string(argv[i]) == "--no-tools" || std::string(argv[i]) == "--disable-tools") {
+            g_enable_tools = false;
+        } else if (std::string(argv[i]) == "--tools") {
+            g_enable_tools = true;
+        } else if (std::string(argv[i]) == "--no-server-exec" || std::string(argv[i]) == "--disable-server-exec") {
+            g_server_exec = false;
+        } else if (std::string(argv[i]) == "--server-exec") {
+            g_server_exec = true;
         } else if (std::string(argv[i]) == "--track-reset" ||
                    std::string(argv[i]) == "--reset-track" ||
                    std::string(argv[i]) == "-track-reset" ||
@@ -6886,6 +7688,8 @@ int main(int argc, char** argv) {
     LOG_INFO("=== moecher starting ===");
     LOG_INFO("=== v2.05 ===");
     LOG_INFO("Default thinking token budget: %d", default_thinking_budget);
+    LOG_INFO("Tool calling support: %s", g_enable_tools ? "enabled" : "disabled");
+    LOG_INFO("Server-side tool execution: %s", g_server_exec ? "enabled" : "disabled");
 
     MoecherEngine engine;
     engine.enable_pld_ = enable_pld;

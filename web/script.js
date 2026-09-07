@@ -3,12 +3,20 @@ const sendBtn = document.getElementById('send-btn');
 const messagesContainer = document.getElementById('messages-container');
 const welcomeScreen = document.getElementById('welcome-screen');
 
+if (typeof marked !== 'undefined' && marked.setOptions) {
+    marked.setOptions({
+        gfm: true,
+        breaks: true
+    });
+}
+
 const tempSlider = document.getElementById('temp-slider');
 const tempVal = document.getElementById('temp-val');
 const tokensInput = document.getElementById('tokens-input');
 const reasoningEffort = document.getElementById('reasoning-effort');
 const thinkingBudget = document.getElementById('thinking-budget');
 const thinkingEnabled = document.getElementById('thinking-enabled');
+const webRetrievalEnabled = document.getElementById('web-retrieval-enabled');
 const systemPromptInput = document.getElementById('system-prompt');
 
 let chatHistory = [];
@@ -486,6 +494,7 @@ function renderPreviewIframe(htmlCode) {
         finalHtml = consoleBridge + finalHtml;
     }
 
+    previewIframe.setAttribute('allow', 'accelerometer; autoplay; clipboard-write; encrypted-media; gyroscope; picture-in-picture; web-share');
     previewIframe.srcdoc = finalHtml;
 }
 
@@ -906,6 +915,13 @@ function isHtmlContent(codeContent, lang = '') {
     return false;
 }
 
+function isFullHtmlDocument(text) {
+    if (!text || typeof text !== 'string') return false;
+    const trimmed = text.trim();
+    if (trimmed.includes('tool-activity-block') || trimmed.includes('<tool_response>') || trimmed.includes('tool-activity-card')) return false;
+    return (/^<!doctype\s+html/i.test(trimmed) || /^<html[\s>]/i.test(trimmed));
+}
+
 // Markdown rendering and code-block post-processing
 function renderMarkdownContent(rawText, containerElement) {
     containerElement.innerHTML = marked.parse(rawText);
@@ -980,8 +996,8 @@ function renderMarkdownContent(rawText, containerElement) {
         wrapper.appendChild(preEl);
     });
 
-    // Check if raw message (without code blocks or enclosing entire text) is an HTML document
-    if (!hasPreviewableHtml && isHtmlContent(rawText)) {
+    // Check if raw message (without code blocks or enclosing entire text) is an explicit full HTML document
+    if (!hasPreviewableHtml && isFullHtmlDocument(rawText)) {
         let existingBanner = containerElement.parentElement ? containerElement.parentElement.querySelector('.msg-html-banner') : null;
         if (!existingBanner) {
             const banner = document.createElement('div');
@@ -1006,7 +1022,621 @@ function renderMarkdownContent(rawText, containerElement) {
             containerElement.appendChild(banner);
         }
     }
+    // Detect YouTube URLs in message and auto-load interactive player preview
+    const ytMatch = rawText.match(/(?:https?:\/\/)?(?:www\.)?(?:youtube\.com\/watch\?v=|youtu\.be\/|youtube\.com\/embed\/)([a-zA-Z0-9_-]{11})/i);
+    if (ytMatch) {
+        const videoId = ytMatch[1];
+        const ytDocId = 'yt_' + videoId;
+        if (!retrievedDocsStore[ytDocId]) {
+            const ytHtml = `<!DOCTYPE html>
+<html>
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>YouTube Video Player</title>
+  <style>
+    * { box-sizing: border-box; }
+    body { font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, Helvetica, Arial, sans-serif; margin: 0; padding: 20px; background: #0f0f0f; color: #f1f1f1; line-height: 1.5; }
+    .yt-container { max-width: 900px; margin: 0 auto; }
+    .video-wrapper { position: relative; padding-bottom: 56.25%; height: 0; overflow: hidden; border-radius: 12px; box-shadow: 0 8px 32px rgba(0,0,0,0.7); background: #000; margin-bottom: 18px; border: 1px solid rgba(255,255,255,0.12); }
+    .video-wrapper iframe, .video-wrapper #player { position: absolute; top: 0; left: 0; width: 100%; height: 100%; border: none; }
+    .video-title { font-size: 1.35rem; font-weight: 600; margin-bottom: 8px; color: #ffffff; }
+    .video-actions a { display: inline-flex; align-items: center; gap: 6px; color: #fff; background: rgba(255,255,255,0.12); padding: 6px 14px; border-radius: 18px; text-decoration: none; font-size: 0.85rem; }
+  </style>
+</head>
+<body>
+  <div class="yt-container">
+    <div class="video-wrapper">
+      <div id="player"></div>
+    </div>
+    <div class="video-title">YouTube Video</div>
+    <div class="video-actions">
+      <a href="https://www.youtube.com/watch?v=${videoId}" target="_blank">Watch on YouTube &#x2197;</a>
+    </div>
+  </div>
+  <script src="https://www.youtube.com/iframe_api"></script>
+  <script>
+    var player;
+    function onYouTubeIframeAPIReady() {
+      player = new YT.Player('player', {
+        videoId: '${videoId}',
+        playerVars: {
+          'autoplay': 1,
+          'playsinline': 1,
+          'enablejsapi': 1,
+          'rel': 0
+        },
+        events: {
+          'onReady': function(e) {
+            try {
+              e.target.unMute();
+              e.target.setVolume(100);
+              e.target.playVideo();
+            } catch(err) {}
+          }
+        }
+      });
+    }
+    setTimeout(function() {
+      var container = document.getElementById('player');
+      if (container && container.tagName !== 'IFRAME') {
+        container.innerHTML = '<iframe src="https://www.youtube-nocookie.com/embed/${videoId}?autoplay=1&enablejsapi=1&rel=0" allow="accelerometer; autoplay; clipboard-write; encrypted-media; gyroscope; picture-in-picture; web-share" allowfullscreen style="position:absolute;top:0;left:0;width:100%;height:100%;border:none;"></iframe>';
+      }
+    }, 2500);
+  </script>
+</body>
+</html>`;
+            addRetrievedDocument({
+                id: ytDocId,
+                url: `https://www.youtube.com/watch?v=${videoId}`,
+                title: 'YouTube Video',
+                html: ytHtml,
+                snippet: 'YouTube interactive player'
+            });
+        }
+    }
+
     updateChatbarPreviewButtonVisibility();
+}
+
+// ============================================================================
+// Retrieved Documents Store & Management
+// ============================================================================
+
+let retrievedDocuments = [];
+let retrievedDocsStore = {};
+
+function addRetrievedDocument(doc) {
+    if (!doc || !doc.url) return;
+    const docId = doc.id || ('doc_' + Date.now() + '_' + Math.floor(Math.random() * 1000));
+    
+    // Check if already present by url
+    const existingIdx = retrievedDocuments.findIndex(d => d.url === doc.url);
+    const docObj = {
+        id: docId,
+        url: doc.url,
+        title: doc.title || extractDomain(doc.url) || 'Retrieved Web Page',
+        html: doc.html || '',
+        snippet: doc.snippet || '',
+        timeStr: new Date().toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' })
+    };
+
+    if (existingIdx >= 0) {
+        retrievedDocuments[existingIdx] = docObj;
+    } else {
+        retrievedDocuments.push(docObj);
+    }
+    retrievedDocsStore[docId] = docObj;
+
+    renderRetrievedDocsList();
+
+    // Automatically open preview and start autoplay for YouTube videos or media embeds
+    const isYouTube = doc.url.includes('youtube.com') || doc.url.includes('youtu.be') || (doc.html && doc.html.includes('youtube-nocookie.com/embed'));
+    if (isYouTube) {
+        openDocInFullPreview(docId);
+    }
+}
+
+function extractDomain(url) {
+    try {
+        const u = new URL(url);
+        return u.hostname.replace('www.', '');
+    } catch (e) {
+        return url;
+    }
+}
+
+function renderRetrievedDocsList() {
+    const container = document.getElementById('retrieved-docs-container');
+    const badge = document.getElementById('retrieved-docs-badge');
+    const countLabel = document.getElementById('retrieved-doc-count-label');
+    if (!container) return;
+
+    if (retrievedDocuments.length === 0) {
+        container.innerHTML = `
+            <div class="retrieved-empty-state" id="retrieved-empty-state">
+                <span class="material-symbols-outlined empty-icon">travel_explore</span>
+                <h3>No Documents Retrieved</h3>
+                <p>Web pages and search results retrieved during chat turns will appear here as live interactive thumbnails.</p>
+            </div>
+        `;
+        if (badge) { badge.style.display = 'none'; badge.textContent = '0'; }
+        if (countLabel) countLabel.textContent = '0 Documents Retrieved';
+        return;
+    }
+
+    if (badge) {
+        badge.style.display = 'inline-block';
+        badge.textContent = String(retrievedDocuments.length);
+    }
+    if (countLabel) {
+        countLabel.textContent = `${retrievedDocuments.length} Document${retrievedDocuments.length > 1 ? 's' : ''} Retrieved`;
+    }
+
+    let html = '';
+    for (let i = 0; i < retrievedDocuments.length; i++) {
+        const doc = retrievedDocuments[i];
+        const safeTitle = escapeHtml(doc.title);
+        const safeUrl = escapeHtml(doc.url);
+        const safeSnippet = escapeHtml(doc.snippet);
+        const safeSrcdoc = escapeHtml(doc.html || `<!DOCTYPE html><html><body style="font-family:-apple-system,BlinkMacSystemFont,sans-serif;padding:16px;color:#333;"><h3>${safeTitle}</h3><p>${safeSnippet}</p></body></html>`);
+
+        const isDocYouTube = doc.url.includes('youtube.com') || doc.url.includes('youtu.be') || (doc.html && doc.html.includes('youtube-nocookie.com/embed'));
+        let miniContentHtml = '';
+        if (isDocYouTube) {
+            let ytId = '';
+            const ytMatch = (doc.url + ' ' + (doc.html || '')).match(/(?:v=|youtu\.be\/|embed\/)([a-zA-Z0-9_-]{11})/);
+            if (ytMatch) ytId = ytMatch[1];
+
+            if (ytId) {
+                miniContentHtml = `
+                    <div style="width:100%;height:100%;position:relative;background:#000;display:flex;align-items:center;justify-content:center;">
+                        <img src="https://img.youtube.com/vi/${ytId}/mqdefault.jpg" alt="${safeTitle}" style="width:100%;height:100%;object-fit:cover;" />
+                        <div style="position:absolute;width:40px;height:40px;border-radius:50%;background:rgba(255,0,0,0.9);display:flex;align-items:center;justify-content:center;color:#fff;box-shadow:0 4px 12px rgba(0,0,0,0.6);">
+                            <span class="material-symbols-outlined" style="font-size:26px;margin-left:2px;">play_arrow</span>
+                        </div>
+                    </div>
+                `;
+            } else {
+                miniContentHtml = `
+                    <div style="width:100%;height:100%;background:#18181b;display:flex;align-items:center;justify-content:center;color:#ef4444;">
+                        <span class="material-symbols-outlined" style="font-size:36px;">smart_display</span>
+                    </div>
+                `;
+            }
+        } else {
+            miniContentHtml = `<iframe class="retrieved-mini-iframe" sandbox="allow-same-origin" srcdoc="${safeSrcdoc}"></iframe>`;
+        }
+
+        html += `
+            <div class="retrieved-doc-card" onclick="openDocInFullPreview('${doc.id}', event)" title="Click to open in HTML Preview">
+                <div class="retrieved-doc-header">
+                    <div class="retrieved-doc-title-row">
+                        <span class="material-symbols-outlined retrieved-doc-icon">public</span>
+                        <div class="retrieved-doc-meta">
+                            <div class="retrieved-doc-title">${safeTitle}</div>
+                            <a href="${safeUrl}" target="_blank" class="retrieved-doc-url" onclick="event.stopPropagation()">${safeUrl}</a>
+                        </div>
+                    </div>
+                    <div class="retrieved-doc-actions">
+                        <span class="retrieved-doc-time">${doc.timeStr}</span>
+                        <button type="button" class="retrieved-preview-btn" onclick="openDocInFullPreview('${doc.id}', event)" title="Open in Full Preview">
+                            <span class="material-symbols-outlined">visibility</span>
+                            <span>Preview</span>
+                        </button>
+                    </div>
+                </div>
+                <div class="retrieved-mini-preview-wrap">
+                    ${miniContentHtml}
+                    <div class="retrieved-mini-overlay">
+                        <span class="material-symbols-outlined">fullscreen</span>
+                        <span>Click to Open in HTML Preview</span>
+                    </div>
+                </div>
+                ${safeSnippet ? `<div class="retrieved-doc-snippet">${safeSnippet}</div>` : ''}
+            </div>
+        `;
+    }
+    container.innerHTML = html;
+}
+
+function openDocInFullPreview(docId, event) {
+    if (event) {
+        event.stopPropagation();
+    }
+    const doc = retrievedDocsStore[docId];
+    if (!doc) return;
+
+    const htmlToLoad = doc.html || `<!DOCTYPE html><html><head><meta charset="UTF-8"><title>${escapeHtml(doc.title)}</title><style>body{font-family:-apple-system,BlinkMacSystemFont,Segoe UI,Roboto,sans-serif;padding:30px;line-height:1.6;max-width:800px;margin:auto;color:#202124;}</style></head><body><h1>${escapeHtml(doc.title)}</h1><p><a href="${escapeHtml(doc.url)}" target="_blank">${escapeHtml(doc.url)}</a></p><hr/><p>${escapeHtml(doc.snippet)}</p></body></html>`;
+    loadHtmlIntoPreview(htmlToLoad, true);
+}
+
+function clearRetrievedDocs() {
+    retrievedDocuments = [];
+    retrievedDocsStore = {};
+    renderRetrievedDocsList();
+}
+
+function escapeHtml(str) {
+    if (!str) return '';
+    return String(str)
+        .replace(/&/g, '&amp;')
+        .replace(/</g, '&lt;')
+        .replace(/>/g, '&gt;')
+        .replace(/"/g, '&quot;')
+        .replace(/'/g, '&#039;');
+}
+
+// ============================================================================
+// Agentic Settings & Guardrails Management
+// ============================================================================
+
+let agenticSettings = {
+    timeoutSec: 60,
+    boundaryEnforced: true,
+    requireAuth: true,
+    authorizedPaths: [],
+    tools: {
+        read_file: true,
+        write_file: true,
+        edit_file: true,
+        execute_command: true,
+        fetch_url: true
+    },
+    workspaceDir: ''
+};
+
+let currentPendingAuth = null;
+
+function loadAgenticSettings() {
+    try {
+        const savedTimeout = localStorage.getItem('moecher_agentic_timeout');
+        if (savedTimeout) agenticSettings.timeoutSec = parseInt(savedTimeout, 10) || 60;
+
+        const savedBoundary = localStorage.getItem('moecher_agentic_boundary');
+        if (savedBoundary !== null) agenticSettings.boundaryEnforced = savedBoundary === 'true';
+
+        const savedAuth = localStorage.getItem('moecher_agentic_require_auth');
+        if (savedAuth !== null) agenticSettings.requireAuth = savedAuth === 'true';
+
+        const savedPaths = localStorage.getItem('moecher_agentic_auth_paths');
+        if (savedPaths) {
+            try { agenticSettings.authorizedPaths = JSON.parse(savedPaths); } catch (e) {}
+        }
+
+        const savedTools = localStorage.getItem('moecher_agentic_tools');
+        if (savedTools) {
+            try { Object.assign(agenticSettings.tools, JSON.parse(savedTools)); } catch (e) {}
+        }
+    } catch (e) {
+        console.warn('Could not load agentic settings from localStorage', e);
+    }
+}
+
+function saveAgenticSettings() {
+    try {
+        localStorage.setItem('moecher_agentic_timeout', agenticSettings.timeoutSec);
+        localStorage.setItem('moecher_agentic_boundary', agenticSettings.boundaryEnforced);
+        localStorage.setItem('moecher_agentic_require_auth', agenticSettings.requireAuth);
+        localStorage.setItem('moecher_agentic_auth_paths', JSON.stringify(agenticSettings.authorizedPaths));
+        localStorage.setItem('moecher_agentic_tools', JSON.stringify(agenticSettings.tools));
+    } catch (e) {
+        console.warn('Could not save agentic settings to localStorage', e);
+    }
+}
+
+function initAgenticSettingsUI() {
+    loadAgenticSettings();
+
+    // Timeout slider & input sync
+    const slider = document.getElementById('agentic-timeout-slider');
+    const input = document.getElementById('agentic-timeout-input');
+    if (slider && input) {
+        slider.value = agenticSettings.timeoutSec;
+        input.value = agenticSettings.timeoutSec;
+
+        slider.addEventListener('input', (e) => {
+            const val = parseInt(e.target.value, 10);
+            input.value = val;
+            agenticSettings.timeoutSec = val;
+            saveAgenticSettings();
+        });
+
+        input.addEventListener('input', (e) => {
+            let val = parseInt(e.target.value, 10);
+            if (isNaN(val) || val < 5) val = 5;
+            if (val > 600) val = 600;
+            slider.value = Math.min(val, 300);
+            agenticSettings.timeoutSec = val;
+            saveAgenticSettings();
+        });
+    }
+
+    // Boundary & Auth Toggles
+    const boundaryToggle = document.getElementById('agentic-boundary-enforced');
+    if (boundaryToggle) {
+        boundaryToggle.checked = agenticSettings.boundaryEnforced;
+        boundaryToggle.addEventListener('change', (e) => {
+            agenticSettings.boundaryEnforced = e.target.checked;
+            saveAgenticSettings();
+        });
+    }
+
+    const requireAuthToggle = document.getElementById('agentic-require-auth');
+    if (requireAuthToggle) {
+        requireAuthToggle.checked = agenticSettings.requireAuth;
+        requireAuthToggle.addEventListener('change', (e) => {
+            agenticSettings.requireAuth = e.target.checked;
+            saveAgenticSettings();
+        });
+    }
+
+    // Tool Checkboxes
+    const toolCheckboxes = {
+        read_file: document.getElementById('tool-enable-read'),
+        write_file: document.getElementById('tool-enable-write'),
+        edit_file: document.getElementById('tool-enable-edit'),
+        execute_command: document.getElementById('tool-enable-command'),
+        fetch_url: document.getElementById('tool-enable-fetch')
+    };
+
+    Object.entries(toolCheckboxes).forEach(([toolName, cb]) => {
+        if (cb) {
+            cb.checked = agenticSettings.tools[toolName] !== false;
+            cb.addEventListener('change', (e) => {
+                agenticSettings.tools[toolName] = e.target.checked;
+                saveAgenticSettings();
+            });
+        }
+    });
+
+    // Enter key on path input
+    const pathInput = document.getElementById('agentic-new-path-input');
+    if (pathInput) {
+        pathInput.addEventListener('keydown', (e) => {
+            if (e.key === 'Enter') {
+                e.preventDefault();
+                addAuthorizedPath();
+            }
+        });
+    }
+
+    renderAuthorizedPathsTags();
+    fetchWorkspaceInfo();
+}
+
+function fetchWorkspaceInfo() {
+    fetch(`${getApiBase()}/v1/workspace`)
+        .then(res => res.json())
+        .then(data => {
+            if (data && data.workspace_directory) {
+                agenticSettings.workspaceDir = data.workspace_directory;
+                const pathBox = document.getElementById('agentic-workspace-path');
+                if (pathBox) pathBox.textContent = data.workspace_directory;
+                const authModalWs = document.getElementById('auth-modal-workspace');
+                if (authModalWs) authModalWs.textContent = data.workspace_directory;
+            }
+        })
+        .catch(() => {
+            const pathBox = document.getElementById('agentic-workspace-path');
+            if (pathBox) pathBox.textContent = 'Active Working Directory';
+        });
+}
+
+function renderAuthorizedPathsTags() {
+    const container = document.getElementById('agentic-path-tags');
+    if (!container) return;
+
+    if (!agenticSettings.authorizedPaths || agenticSettings.authorizedPaths.length === 0) {
+        container.innerHTML = '<span style="font-size:0.75rem; color:#80868B; font-style:italic;">No external paths authorized yet. Files outside workspace are protected.</span>';
+        return;
+    }
+
+    let html = '';
+    agenticSettings.authorizedPaths.forEach((p, idx) => {
+        html += `
+            <div class="agentic-path-chip">
+                <span>${escapeHtml(p)}</span>
+                <button type="button" class="remove-path-btn" onclick="removeAuthorizedPath(${idx})" title="Remove Authorization">
+                    <span class="material-symbols-outlined">close</span>
+                </button>
+            </div>
+        `;
+    });
+    container.innerHTML = html;
+}
+
+function addAuthorizedPath() {
+    const input = document.getElementById('agentic-new-path-input');
+    if (!input) return;
+    const path = input.value.trim();
+    if (!path) return;
+
+    if (!agenticSettings.authorizedPaths.includes(path)) {
+        agenticSettings.authorizedPaths.push(path);
+        saveAgenticSettings();
+        renderAuthorizedPathsTags();
+    }
+    input.value = '';
+}
+
+function removeAuthorizedPath(idx) {
+    if (idx >= 0 && idx < agenticSettings.authorizedPaths.length) {
+        agenticSettings.authorizedPaths.splice(idx, 1);
+        saveAgenticSettings();
+        renderAuthorizedPathsTags();
+    }
+}
+
+// Built-in tool definitions builder
+function getActiveToolsPayload() {
+    const isWebRetrieval = webRetrievalEnabled ? webRetrievalEnabled.checked : true;
+    if (!isWebRetrieval) return [];
+
+    const allToolDefs = [
+        {
+            name: "fetch_url",
+            type: "function",
+            function: {
+                name: "fetch_url",
+                description: "Fetch and extract readable text content from a public web URL (HTTP/HTTPS), search DuckDuckGo, or trigger YouTube playback.",
+                parameters: {
+                    type: "object",
+                    properties: {
+                        url: {
+                            type: "string",
+                            description: "The complete HTTP or HTTPS URL to fetch (e.g. https://html.duckduckgo.com/html/?q=query or https://example.com)"
+                        }
+                    },
+                    required: ["url"]
+                }
+            }
+        },
+        {
+            name: "read_file",
+            type: "function",
+            function: {
+                name: "read_file",
+                description: "Read the text contents of a file on the local filesystem. Supports line numbering and viewing line ranges.",
+                parameters: {
+                    type: "object",
+                    properties: {
+                        path: {
+                            type: "string",
+                            description: "The relative or absolute file path to read (e.g. 'src/main.cpp' or 'config.json')."
+                        },
+                        start_line: {
+                            type: "integer",
+                            description: "Optional 1-indexed starting line number (default: 1)."
+                        },
+                        end_line: {
+                            type: "integer",
+                            description: "Optional 1-indexed ending line number (default: -1 for entire file)."
+                        }
+                    },
+                    required: ["path"]
+                }
+            }
+        },
+        {
+            name: "write_file",
+            type: "function",
+            function: {
+                name: "write_file",
+                description: "Create a new file or completely overwrite an existing file with the provided text content.",
+                parameters: {
+                    type: "object",
+                    properties: {
+                        path: {
+                            type: "string",
+                            description: "The relative or absolute file path to write."
+                        },
+                        content: {
+                            type: "string",
+                            description: "The complete text content to write to the file."
+                        },
+                        overwrite: {
+                            type: "boolean",
+                            description: "Whether to overwrite if file already exists (default: true)."
+                        }
+                    },
+                    required: ["path", "content"]
+                }
+            }
+        },
+        {
+            name: "edit_file",
+            type: "function",
+            function: {
+                name: "edit_file",
+                description: "Perform a precise search-and-replace on a unique block of text within an existing file.",
+                parameters: {
+                    type: "object",
+                    properties: {
+                        path: {
+                            type: "string",
+                            description: "The relative or absolute file path to edit."
+                        },
+                        target_content: {
+                            type: "string",
+                            description: "The exact, unique block of lines to replace, matching whitespace."
+                        },
+                        replacement_content: {
+                            type: "string",
+                            description: "The new content that replaces the target block."
+                        }
+                    },
+                    required: ["path", "target_content", "replacement_content"]
+                }
+            }
+        },
+        {
+            name: "execute_command",
+            type: "function",
+            function: {
+                name: "execute_command",
+                description: "Execute a terminal/shell command on the local system (e.g. dir, ls, git, cargo, msbuild, cmake) and return its output.",
+                parameters: {
+                    type: "object",
+                    properties: {
+                        command: {
+                            type: "string",
+                            description: "The exact shell command line to execute."
+                        }
+                    },
+                    required: ["command"]
+                }
+            }
+        }
+    ];
+
+    return allToolDefs.filter(t => agenticSettings.tools[t.name] !== false).map(t => ({
+        type: t.type,
+        function: t.function
+    }));
+}
+
+// Authorization Modal Prompt
+function showAuthPrompt(tool, path, id) {
+    currentPendingAuth = { tool, path, id };
+    const modal = document.getElementById('agentic-auth-modal');
+    const toolEl = document.getElementById('auth-modal-tool');
+    const pathEl = document.getElementById('auth-modal-path');
+    const wsEl = document.getElementById('auth-modal-workspace');
+
+    if (toolEl) toolEl.textContent = tool || 'file_tool';
+    if (pathEl) pathEl.textContent = path || 'external_path';
+    if (wsEl) wsEl.textContent = agenticSettings.workspaceDir || 'Workspace Directory';
+
+    if (modal) modal.style.display = 'flex';
+}
+
+function resolveAuthPrompt(allow, always = false) {
+    const modal = document.getElementById('agentic-auth-modal');
+    if (modal) modal.style.display = 'none';
+
+    if (!currentPendingAuth) return;
+    const { tool, path } = currentPendingAuth;
+
+    if (allow) {
+        if (!agenticSettings.authorizedPaths.includes(path)) {
+            agenticSettings.authorizedPaths.push(path);
+            if (always) {
+                saveAgenticSettings();
+            }
+            renderAuthorizedPathsTags();
+        }
+        if (chatInput && !isGenerating) {
+            chatInput.value = `Authorized external path "${path}". Please proceed with the ${tool} operation.`;
+            sendMessage();
+        }
+    } else {
+        if (chatInput && !isGenerating) {
+            chatInput.value = `Access to external path "${path}" was denied by the user. Please stay within the workspace boundary or suggest an alternative.`;
+            sendMessage();
+        }
+    }
+    currentPendingAuth = null;
 }
 
 // ============================================================================
@@ -1041,6 +1671,17 @@ async function sendMessage() {
     let mainContent = document.createElement('div');
     assistantMsgDiv.querySelector('.msg-content').appendChild(mainContent);
 
+    // Initial visual feedback while engine starts thinking/elaborating
+    const liveIndicator = document.createElement('div');
+    liveIndicator.className = 'elaboration-status-badge';
+    liveIndicator.id = 'live-status-indicator';
+    liveIndicator.innerHTML = `
+        <span class="tool-pulse-spinner"></span>
+        <span class="status-msg-text">Thinking and preparing response</span>
+        <div class="elaboration-dots"><span></span><span></span><span></span></div>
+    `;
+    mainContent.appendChild(liveIndicator);
+
     // Build messages payload with optional system prompt
     const messagesToSend = [];
     const sysPrompt = systemPromptInput ? systemPromptInput.value.trim() : '';
@@ -1051,6 +1692,7 @@ async function sendMessage() {
 
     const isThinking = thinkingEnabled ? thinkingEnabled.checked : true;
     const budgetVal = isThinking ? (thinkingBudget ? parseInt(thinkingBudget.value, 10) : 4096) : 0;
+
     const payload = {
         model: "deepseek-v4-flash",
         messages: messagesToSend,
@@ -1062,8 +1704,17 @@ async function sendMessage() {
             budget_tokens: budgetVal
         },
         max_thinking_tokens: budgetVal,
-        reasoning_effort: isThinking ? reasoningEffort.value : "none"
+        reasoning_effort: isThinking ? reasoningEffort.value : "none",
+        execution_timeout_sec: agenticSettings.timeoutSec || 60,
+        workspace_boundary_enforced: agenticSettings.boundaryEnforced !== false,
+        require_external_authorization: agenticSettings.requireAuth !== false,
+        authorized_paths: agenticSettings.authorizedPaths || []
     };
+
+    const activeTools = getActiveToolsPayload();
+    if (activeTools.length > 0) {
+        payload.tools = activeTools;
+    }
 
     let rawReasoning = "";
     let rawContent = "";
@@ -1130,10 +1781,21 @@ async function sendMessage() {
                         
                         if (data.choices && data.choices.length > 0) {
                             const delta = data.choices[0].delta || {};
+
+                            if (delta.retrieved_document) {
+                                addRetrievedDocument(delta.retrieved_document);
+                            }
+
+                            if (delta.authorization_required) {
+                                showAuthPrompt(delta.authorization_required.tool, delta.authorization_required.path, delta.authorization_required.id);
+                            }
                             
                             if (delta.reasoning_content !== undefined) {
                                 if (firstTokenTime === null) firstTokenTime = performance.now();
                                 tokenCount++;
+
+                                const statusText = liveIndicator ? liveIndicator.querySelector('.status-msg-text') : null;
+                                if (statusText) statusText.textContent = 'Reasoning and analyzing query...';
 
                                 if (!reasoningBlock) {
                                     reasoningBlock = document.createElement('details');
@@ -1149,22 +1811,63 @@ async function sendMessage() {
                                     reasoningBlock.appendChild(summary);
                                     reasoningBlock.appendChild(reasoningContent);
                                     assistantMsgDiv.querySelector('.msg-content').insertBefore(reasoningBlock, mainContent);
+                                } else {
+                                    reasoningBlock.open = true;
+                                    const summary = reasoningBlock.querySelector('summary');
+                                    if (summary && !summary.querySelector('.thinking-spinner')) {
+                                        summary.innerHTML = '<span class="thinking-spinner">progress_activity</span> Thinking...';
+                                    }
                                 }
-                                rawReasoning += delta.reasoning_content;
-                                reasoningContent.textContent = rawReasoning;
+
+                                // Check if delta is an in-place update to an existing active tool card
+                                const toolIdMatch = delta.reasoning_content.match(/id="(tool-act-[^"]+)"/);
+                                let replaced = false;
+                                if (toolIdMatch) {
+                                    const actId = toolIdMatch[1];
+                                    const regex = new RegExp('<div class="tool-activity-block active"[^>]*id="' + actId + '"[\\s\\S]*?<\\/div>', 'g');
+                                    if (regex.test(rawReasoning)) {
+                                        rawReasoning = rawReasoning.replace(regex, delta.reasoning_content.trim());
+                                        replaced = true;
+                                    }
+                                }
+                                if (!replaced) {
+                                    rawReasoning += delta.reasoning_content;
+                                }
+                                reasoningContent.innerHTML = marked.parse(rawReasoning);
                             } 
                             
                             if (delta.content !== undefined) {
                                 if (firstTokenTime === null) firstTokenTime = performance.now();
                                 tokenCount++;
 
-                                if (reasoningBlock && !isReasoningDone) {
-                                    isReasoningDone = true;
-                                    reasoningBlock.open = false;
-                                    reasoningBlock.querySelector('summary').innerHTML = 'Thought process';
+                                if (liveIndicator && liveIndicator.parentElement) {
+                                    liveIndicator.remove();
                                 }
-                                rawContent += delta.content;
-                                renderMarkdownContent(rawContent, mainContent);
+
+                                // Check if delta is an in-place update to an existing active tool card (when thinking is disabled)
+                                const toolIdMatch = delta.content.match(/id="(tool-act-[^"]+)"/);
+                                let replaced = false;
+                                if (toolIdMatch) {
+                                    const actId = toolIdMatch[1];
+                                    const regex = new RegExp('<div class="tool-activity-block active"[^>]*id="' + actId + '"[\\s\\S]*?<\\/div>', 'g');
+                                    if (regex.test(rawContent)) {
+                                        rawContent = rawContent.replace(regex, delta.content.trim());
+                                        replaced = true;
+                                        renderMarkdownContent(rawContent, mainContent);
+                                    }
+                                }
+
+                                if (!replaced) {
+                                    // When final answer content arrives, close the reasoning block if open
+                                    if (reasoningBlock && !isReasoningDone) {
+                                        isReasoningDone = true;
+                                        reasoningBlock.open = false;
+                                        const summary = reasoningBlock.querySelector('summary');
+                                        if (summary) summary.innerHTML = 'Thought process';
+                                    }
+                                    rawContent += delta.content;
+                                    renderMarkdownContent(rawContent, mainContent);
+                                }
                             }
                         }
                         
@@ -1208,6 +1911,13 @@ async function sendMessage() {
 
         updateStatsUI(lastStats);
 
+        if (reasoningBlock) {
+            const summary = reasoningBlock.querySelector('summary');
+            if (summary && summary.querySelector('.thinking-spinner')) {
+                summary.innerHTML = 'Thought process';
+            }
+        }
+
         // Final pass on message content
         renderMarkdownContent(rawContent, mainContent);
 
@@ -1241,6 +1951,14 @@ async function sendMessage() {
     } finally {
         currentAbortController = null;
         setGeneratingState(false);
+        const liveEl = assistantMsgDiv.querySelector('#live-status-indicator');
+        if (liveEl && liveEl.parentElement) liveEl.remove();
+        if (reasoningBlock) {
+            const summary = reasoningBlock.querySelector('summary');
+            if (summary && summary.querySelector('.thinking-spinner')) {
+                summary.innerHTML = 'Thought process';
+            }
+        }
         // Refresh expert specialization profile after generation
         fetchExpertProfile();
     }
@@ -1459,4 +2177,5 @@ if (menuBtn && sidebar) {
 document.addEventListener('DOMContentLoaded', () => {
     initPreviewPanel();
     initExpertProfileUI();
+    initAgenticSettingsUI();
 });

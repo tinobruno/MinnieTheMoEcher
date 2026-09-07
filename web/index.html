@@ -74,6 +74,13 @@
                         Enable Thinking
                     </label>
                 </div>
+
+                <div class="setting-item">
+                    <label class="checkbox-label" title="Enable model to fetch and read content from web URLs (fetch_url)">
+                        <input type="checkbox" id="web-retrieval-enabled" checked>
+                        Web Retrieval
+                    </label>
+                </div>
             </details>
 
             <details class="stats-section" open>
@@ -268,10 +275,19 @@
                         <span class="material-symbols-outlined">code</span>
                         <span>Code</span>
                     </button>
+                    <button class="preview-tab" data-tab="tab-retrieved" title="Retrieved Web Documents & Sources">
+                        <span class="material-symbols-outlined">travel_explore</span>
+                        <span>Retrieved Documents</span>
+                        <span class="console-count-badge" id="retrieved-docs-badge" style="display:none;">0</span>
+                    </button>
                     <button class="preview-tab" data-tab="tab-console" title="Console Logs & Errors">
                         <span class="material-symbols-outlined">terminal</span>
                         <span>Console</span>
                         <span class="console-count-badge" id="console-error-badge" style="display:none;">0</span>
+                    </button>
+                    <button class="preview-tab" data-tab="tab-agentic" title="Agentic Settings & Security Guardrails">
+                        <span class="material-symbols-outlined">shield_person</span>
+                        <span>Agentic Settings</span>
                     </button>
                 </div>
 
@@ -318,7 +334,8 @@
                     <div class="preview-canvas dark-bg" id="preview-canvas">
                         <div class="viewport-frame" id="viewport-frame">
                             <iframe id="preview-iframe" 
-                                    sandbox="allow-scripts allow-modals allow-forms allow-popups" 
+                                    sandbox="allow-scripts allow-modals allow-forms allow-popups allow-same-origin allow-presentation" 
+                                    allow="accelerometer; autoplay; clipboard-write; encrypted-media; gyroscope; picture-in-picture; web-share"
                                     title="HTML Document Preview"></iframe>
                             <div class="preview-empty-state" id="preview-empty-state">
                                 <span class="material-symbols-outlined empty-icon">web_asset</span>
@@ -329,6 +346,29 @@
                                     <span>Load Interactive Demo</span>
                                 </button>
                             </div>
+                        </div>
+                    </div>
+                </div>
+
+                <!-- Retrieved Documents Tab Pane -->
+                <div class="tab-pane" id="tab-retrieved">
+                    <div class="retrieved-toolbar">
+                        <div class="retrieved-info">
+                            <span class="material-symbols-outlined">travel_explore</span>
+                            <span id="retrieved-doc-count-label">0 Documents Retrieved</span>
+                        </div>
+                        <div class="retrieved-actions">
+                            <button class="editor-btn" onclick="clearRetrievedDocs()" title="Clear Retrieved Documents">
+                                <span class="material-symbols-outlined">clear_all</span>
+                                <span>Clear</span>
+                            </button>
+                        </div>
+                    </div>
+                    <div class="retrieved-docs-container" id="retrieved-docs-container">
+                        <div class="retrieved-empty-state" id="retrieved-empty-state">
+                            <span class="material-symbols-outlined empty-icon">travel_explore</span>
+                            <h3>No Documents Retrieved</h3>
+                            <p>Web pages and search results retrieved during chat turns will appear here as live interactive thumbnails.</p>
                         </div>
                     </div>
                 </div>
@@ -383,8 +423,181 @@
                         <div class="console-empty">Console is empty. Logs and errors from the running preview will appear here.</div>
                     </div>
                 </div>
+
+                <!-- Agentic Settings Tab Pane -->
+                <div class="tab-pane" id="tab-agentic">
+                    <div class="agentic-settings-scroll">
+                        <div class="agentic-card">
+                            <div class="agentic-card-header">
+                                <span class="material-symbols-outlined agentic-card-icon">folder_open</span>
+                                <div class="agentic-card-title-group">
+                                    <h4>Workspace Root Directory</h4>
+                                    <p class="agentic-subtitle">Base folder where Moecher is currently executing</p>
+                                </div>
+                            </div>
+                            <div class="agentic-workspace-box">
+                                <code id="agentic-workspace-path">Loading workspace...</code>
+                            </div>
+                        </div>
+
+                        <div class="agentic-card">
+                            <div class="agentic-card-header">
+                                <span class="material-symbols-outlined agentic-card-icon">timer</span>
+                                <div class="agentic-card-title-group">
+                                    <h4>Tool Execution Timeout</h4>
+                                    <p class="agentic-subtitle">Maximum execution time for commands and tools</p>
+                                </div>
+                            </div>
+                            <div class="agentic-control-row">
+                                <div class="slider-container" style="flex:1;">
+                                    <input type="range" id="agentic-timeout-slider" min="5" max="300" step="5" value="60">
+                                </div>
+                                <div class="agentic-num-badge">
+                                    <input type="number" id="agentic-timeout-input" min="5" max="600" value="60" class="agentic-num-field">
+                                    <span>sec</span>
+                                </div>
+                            </div>
+                            <div class="agentic-hint">Default: 60 seconds (1 minute). Set up to 600s for large compilations.</div>
+                        </div>
+
+                        <div class="agentic-card">
+                            <div class="agentic-card-header">
+                                <span class="material-symbols-outlined agentic-card-icon">security</span>
+                                <div class="agentic-card-title-group">
+                                    <h4>Workspace Guardrails & Path Authorization</h4>
+                                    <p class="agentic-subtitle">Protect system files and ask confirmation on external paths</p>
+                                </div>
+                            </div>
+                            <div class="agentic-toggle-group">
+                                <label class="agentic-switch-row">
+                                    <div class="agentic-switch-info">
+                                        <span class="agentic-switch-label">Enforce Workspace Boundary</span>
+                                        <span class="agentic-switch-sub">Restrict file operations to current workspace folder</span>
+                                    </div>
+                                    <input type="checkbox" id="agentic-boundary-enforced" class="agentic-toggle" checked>
+                                </label>
+                                <label class="agentic-switch-row">
+                                    <div class="agentic-switch-info">
+                                        <span class="agentic-switch-label">Prompt for External Authorization</span>
+                                        <span class="agentic-switch-sub">Ask user confirmation if model attempts outside workspace access</span>
+                                    </div>
+                                    <input type="checkbox" id="agentic-require-auth" class="agentic-toggle" checked>
+                                </label>
+                            </div>
+                            
+                            <div class="agentic-auth-paths-section">
+                                <label class="agentic-section-label">Authorized External Paths (Session)</label>
+                                <div class="agentic-path-input-row">
+                                    <input type="text" id="agentic-new-path-input" placeholder="e.g. C:\Users\..., /var/log, or *" class="agentic-text-field">
+                                    <button type="button" class="editor-btn" onclick="addAuthorizedPath()" title="Authorize Path">
+                                        <span class="material-symbols-outlined">add</span>
+                                        <span>Add</span>
+                                    </button>
+                                </div>
+                                <div class="agentic-path-tags" id="agentic-path-tags">
+                                    <!-- Dynamic chips -->
+                                </div>
+                            </div>
+                        </div>
+
+                        <div class="agentic-card">
+                            <div class="agentic-card-header">
+                                <span class="material-symbols-outlined agentic-card-icon">handyman</span>
+                                <div class="agentic-card-title-group">
+                                    <h4>Active Tools Configuration</h4>
+                                    <p class="agentic-subtitle">Select which built-in tools are provided to the model</p>
+                                </div>
+                            </div>
+                            <div class="agentic-tools-grid">
+                                <label class="agentic-tool-chip">
+                                    <input type="checkbox" id="tool-enable-read" checked>
+                                    <span class="material-symbols-outlined tool-chip-icon">description</span>
+                                    <div class="tool-chip-text">
+                                        <strong>read_file</strong>
+                                        <small>Inspect file content</small>
+                                    </div>
+                                </label>
+                                <label class="agentic-tool-chip">
+                                    <input type="checkbox" id="tool-enable-write" checked>
+                                    <span class="material-symbols-outlined tool-chip-icon">edit_note</span>
+                                    <div class="tool-chip-text">
+                                        <strong>write_file</strong>
+                                        <small>Create / replace files</small>
+                                    </div>
+                                </label>
+                                <label class="agentic-tool-chip">
+                                    <input type="checkbox" id="tool-enable-edit" checked>
+                                    <span class="material-symbols-outlined tool-chip-icon">edit_square</span>
+                                    <div class="tool-chip-text">
+                                        <strong>edit_file</strong>
+                                        <small>Surgical search & replace</small>
+                                    </div>
+                                </label>
+                                <label class="agentic-tool-chip">
+                                    <input type="checkbox" id="tool-enable-command" checked>
+                                    <span class="material-symbols-outlined tool-chip-icon">terminal</span>
+                                    <div class="tool-chip-text">
+                                        <strong>execute_command</strong>
+                                        <small>Run system shell commands</small>
+                                    </div>
+                                </label>
+                                <label class="agentic-tool-chip">
+                                    <input type="checkbox" id="tool-enable-fetch" checked>
+                                    <span class="material-symbols-outlined tool-chip-icon">travel_explore</span>
+                                    <div class="tool-chip-text">
+                                        <strong>fetch_url</strong>
+                                        <small>Web search & URL fetch</small>
+                                    </div>
+                                </label>
+                            </div>
+                        </div>
+                    </div>
+                </div>
             </div>
         </aside>
+    </div>
+
+    <!-- External Path Authorization Modal Dialog -->
+    <div class="agentic-modal-overlay" id="agentic-auth-modal" style="display:none;">
+        <div class="agentic-modal-card">
+            <div class="agentic-modal-header">
+                <div class="agentic-modal-icon-wrap">
+                    <span class="material-symbols-outlined modal-warn-icon">gpp_maybe</span>
+                </div>
+                <div>
+                    <h3>External Path Authorization</h3>
+                    <p class="modal-sub">The model requested to access a file outside the workspace boundary.</p>
+                </div>
+            </div>
+            <div class="agentic-modal-body">
+                <div class="modal-info-row">
+                    <span class="modal-label">Tool Action:</span>
+                    <span class="modal-val" id="auth-modal-tool">read_file</span>
+                </div>
+                <div class="modal-info-row">
+                    <span class="modal-label">Target Path:</span>
+                    <code class="modal-path-code" id="auth-modal-path">C:\...</code>
+                </div>
+                <div class="modal-info-row">
+                    <span class="modal-label">Workspace Root:</span>
+                    <code class="modal-path-code" id="auth-modal-workspace">...</code>
+                </div>
+            </div>
+            <div class="agentic-modal-actions">
+                <button type="button" class="modal-btn deny-btn" onclick="resolveAuthPrompt(false)">
+                    <span class="material-symbols-outlined">block</span>
+                    <span>Deny</span>
+                </button>
+                <button type="button" class="modal-btn allow-once-btn" onclick="resolveAuthPrompt(true, false)">
+                    <span class="material-symbols-outlined">check</span>
+                    <span>Allow Once</span>
+                </button>
+                <button type="button" class="modal-btn allow-always-btn" onclick="resolveAuthPrompt(true, true)">
+                    <span class="material-symbols-outlined">verified_user</span>
+                    <span>Always Allow Path</span>
+                </button>
+            </div>
+        </div>
     </div>
     
     <script src="script.js"></script>

@@ -38,4 +38,9 @@ if %errorlevel% neq 0 (
     exit /b 1
 )
 
+if exist build\moecher.exe (
+    copy /y build\moecher.exe . >nul
+    echo [INFO] Copied build\moecher.exe to root folder.
+)
+
 echo [SUCCESS] Build completed successfully with CUDA 13.3!
