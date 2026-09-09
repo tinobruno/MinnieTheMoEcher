@@ -10,6 +10,7 @@ Makefile
 _deps/
 *.a
 *.o
+*.obj
 *.so
 moecher
 *.exe
@@ -34,13 +35,18 @@ debug/
 src_backups/
 *.out
 *.txt
+*.jsonl
+.moecher_*
+cookie_jar.json
 
 # Scratch scripts & temporary test files
-scratch_*.py
+/*.html
+scratch_*
 check_gpu.py
-test_gen.py
-test_req.json
+test_*
+print_curl_*
 train_mtp_ref.py
+scripts/parse_saved_gbv.py
 installer/inno6/
 
 # Python & Distribution

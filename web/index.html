@@ -609,13 +609,125 @@
                                     </div>
                                 </label>
                                 <label class="agentic-tool-chip">
-                                    <input type="checkbox" id="tool-enable-fetch" checked>
+                                    <input type="checkbox" id="tool-enable-web-search" checked>
                                     <span class="material-symbols-outlined tool-chip-icon">travel_explore</span>
                                     <div class="tool-chip-text">
-                                        <strong>fetch_url</strong>
-                                        <small>Web search & URL fetch</small>
+                                        <strong>web_search</strong>
+                                        <small>Multi-engine web search</small>
                                     </div>
                                 </label>
+                                <label class="agentic-tool-chip">
+                                    <input type="checkbox" id="tool-enable-fetch" checked>
+                                    <span class="material-symbols-outlined tool-chip-icon">public</span>
+                                    <div class="tool-chip-text">
+                                        <strong>fetch_url</strong>
+                                        <small>Web page & media fetch</small>
+                                    </div>
+                                </label>
+                            </div>
+                        </div>
+
+                        <!-- Universal Web Search Configuration Card -->
+                        <div class="agentic-card">
+                            <div class="agentic-card-header">
+                                <span class="material-symbols-outlined agentic-card-icon" style="color: #60a5fa;">manage_search</span>
+                                <div class="agentic-card-title-group">
+                                    <h4>Web Search Engine Configuration</h4>
+                                    <p class="agentic-subtitle">Select your preferred search provider or use free zero-config metasearch</p>
+                                </div>
+                                <span class="badge" id="search-provider-status-badge" style="background: rgba(34, 197, 94, 0.2); color: #4ade80; font-size: 11px; padding: 3px 8px; border-radius: 10px; margin-left: auto;">Ready</span>
+                            </div>
+                            
+                            <div style="display: flex; flex-direction: column; gap: 12px; margin-top: 10px;">
+                                <div class="setting-field-group">
+                                    <label class="agentic-section-label" for="search-provider-select">Search Provider</label>
+                                    <select id="search-provider-select" class="agentic-select-field" onchange="onSearchProviderChange()" style="width: 100%; background: #1e293b; color: #f1f5f9; border: 1px solid rgba(255,255,255,0.15); border-radius: 6px; padding: 8px 10px; font-size: 13px;">
+                                        <option value="tavily" selected>Tavily AI (Recommended - 1,000 Free/Mo, No Card)</option>
+                                        <option value="searxng">SearXNG (100% Free, Unlimited, No API Key)</option>
+                                        <option value="brave">Brave Search (1,000 Free/Mo, Independent Index)</option>
+                                        <option value="serper">Serper.dev (Google Mirror - 2,500 Free)</option>
+                                        <option value="google">Google Custom Search (Legacy)</option>
+                                    </select>
+                                </div>
+
+                                <!-- Tavily Section -->
+                                <div id="provider-section-tavily" class="provider-config-section">
+                                    <div class="setting-field-group">
+                                        <label class="agentic-section-label" for="tavily-api-key-input">Tavily API Key</label>
+                                        <div style="display: flex; gap: 8px; align-items: center;">
+                                            <input type="password" id="tavily-api-key-input" placeholder="tvly-..." class="agentic-text-field" style="flex: 1; font-family: monospace;">
+                                            <button type="button" class="editor-btn" onclick="toggleKeyVisibility('tavily-api-key-input', 'tavily-key-visibility-icon')" title="Show/Hide Key" style="padding: 6px 10px;">
+                                                <span class="material-symbols-outlined" id="tavily-key-visibility-icon" style="font-size: 18px;">visibility</span>
+                                            </button>
+                                        </div>
+                                        <div class="agentic-hint">Obtain 1,000 free monthly queries at <a href="https://tavily.com" target="_blank" style="color: #60a5fa; text-decoration: underline;">tavily.com</a> (no credit card required).</div>
+                                    </div>
+                                </div>
+
+                                <!-- SearXNG Section -->
+                                <div id="provider-section-searxng" class="provider-config-section" style="display: none;">
+                                    <div class="setting-field-group">
+                                        <label class="agentic-section-label" for="searxng-url-input">SearXNG Instance URL</label>
+                                        <input type="text" id="searxng-url-input" placeholder="https://searx.be" value="https://searx.be" class="agentic-text-field" style="font-family: monospace;">
+                                        <div class="agentic-hint">100% Free open-source metasearch (Google, Bing, DDG, Reddit, Wiki). Zero API keys required. Public instances: <code>https://searx.be</code>, <code>https://search.ononoki.org</code>, <code>https://searx.tiekoetter.com</code> or local Docker <code>http://localhost:8080</code>.</div>
+                                    </div>
+                                </div>
+
+                                <!-- Brave Section -->
+                                <div id="provider-section-brave" class="provider-config-section" style="display: none;">
+                                    <div class="setting-field-group">
+                                        <label class="agentic-section-label" for="brave-api-key-input">Brave Search API Key</label>
+                                        <div style="display: flex; gap: 8px; align-items: center;">
+                                            <input type="password" id="brave-api-key-input" placeholder="BSA..." class="agentic-text-field" style="flex: 1; font-family: monospace;">
+                                            <button type="button" class="editor-btn" onclick="toggleKeyVisibility('brave-api-key-input', 'brave-key-visibility-icon')" title="Show/Hide Key" style="padding: 6px 10px;">
+                                                <span class="material-symbols-outlined" id="brave-key-visibility-icon" style="font-size: 18px;">visibility</span>
+                                            </button>
+                                        </div>
+                                        <div class="agentic-hint">Obtain $5/month in free search credits (~1,000 queries) at <a href="https://brave.com/search/api/" target="_blank" style="color: #60a5fa; text-decoration: underline;">brave.com/search/api</a>.</div>
+                                    </div>
+                                </div>
+
+                                <!-- Serper Section -->
+                                <div id="provider-section-serper" class="provider-config-section" style="display: none;">
+                                    <div class="setting-field-group">
+                                        <label class="agentic-section-label" for="serper-api-key-input">Serper.dev API Key</label>
+                                        <div style="display: flex; gap: 8px; align-items: center;">
+                                            <input type="password" id="serper-api-key-input" placeholder="Enter Serper API Key" class="agentic-text-field" style="flex: 1; font-family: monospace;">
+                                            <button type="button" class="editor-btn" onclick="toggleKeyVisibility('serper-api-key-input', 'serper-key-visibility-icon')" title="Show/Hide Key" style="padding: 6px 10px;">
+                                                <span class="material-symbols-outlined" id="serper-key-visibility-icon" style="font-size: 18px;">visibility</span>
+                                            </button>
+                                        </div>
+                                        <div class="agentic-hint">Get 2,500 free Google searches on signup at <a href="https://serper.dev" target="_blank" style="color: #60a5fa; text-decoration: underline;">serper.dev</a>.</div>
+                                    </div>
+                                </div>
+
+                                <!-- Google Legacy Section -->
+                                <div id="provider-section-google" class="provider-config-section" style="display: none;">
+                                    <div class="setting-field-group">
+                                        <label class="agentic-section-label" for="google-api-key-input">Google API Key</label>
+                                        <div style="display: flex; gap: 8px; align-items: center;">
+                                            <input type="password" id="google-api-key-input" placeholder="AIzaSy..." class="agentic-text-field" style="flex: 1; font-family: monospace;">
+                                            <button type="button" class="editor-btn" onclick="toggleKeyVisibility('google-api-key-input', 'google-key-visibility-icon')" title="Show/Hide Key" style="padding: 6px 10px;">
+                                                <span class="material-symbols-outlined" id="google-key-visibility-icon" style="font-size: 18px;">visibility</span>
+                                            </button>
+                                        </div>
+                                        <div class="agentic-hint">Obtain from <a href="https://console.cloud.google.com/apis/credentials" target="_blank" style="color: #60a5fa; text-decoration: underline;">Google Cloud Console Credentials</a>.</div>
+                                    </div>
+
+                                    <div class="setting-field-group" style="margin-top: 8px;">
+                                        <label class="agentic-section-label" for="google-cx-input">Search Engine ID (CX)</label>
+                                        <input type="text" id="google-cx-input" placeholder="e.g. 012345678901234567890:abcdefghijk" class="agentic-text-field" style="font-family: monospace;">
+                                        <div class="agentic-hint">From <a href="https://programmablesearchengine.google.com/controlpanel/all" target="_blank" style="color: #60a5fa; text-decoration: underline;">Programmable Search Engine</a>.</div>
+                                    </div>
+                                </div>
+
+                                <div style="display: flex; align-items: center; justify-content: space-between; margin-top: 4px;">
+                                    <button type="button" class="editor-btn" onclick="saveSearchProviderSettingsUI()" style="background: rgba(59, 130, 246, 0.2); border-color: rgba(59, 130, 246, 0.4); color: #93c5fd; padding: 6px 14px; font-weight: 500;">
+                                        <span class="material-symbols-outlined" style="font-size: 16px;">save</span>
+                                        <span>Save Search Settings</span>
+                                    </button>
+                                    <span id="search-provider-save-msg" style="font-size: 12px; color: #4ade80; display: none;">Saved successfully!</span>
+                                </div>
                             </div>
                         </div>
                     </div>
@@ -666,7 +778,106 @@
             </div>
         </div>
     </div>
-    
+
+    <!-- Interactive CAPTCHA / Network Verification Modal Dialog -->
+    <div class="agentic-modal-overlay" id="captcha-verification-modal" style="display:none; z-index: 100000;">
+        <div class="agentic-modal-card" style="width: 860px; max-width: 95vw; max-height: 90vh; display: flex; flex-direction: column;">
+            <div class="agentic-modal-header" style="flex-shrink: 0;">
+                <div class="agentic-modal-icon-wrap" id="captcha-modal-icon-wrap" style="background: rgba(245, 158, 11, 0.15); color: #f59e0b;">
+                    <span class="material-symbols-outlined modal-warn-icon" id="captcha-modal-icon">verified_user</span>
+                </div>
+                <div>
+                    <h3 id="captcha-modal-title">Interactive Verification & Challenge</h3>
+                    <p class="modal-sub" id="captcha-modal-sub">Solve the verification or CAPTCHA challenge directly in your browser.</p>
+                </div>
+            </div>
+            <div class="agentic-modal-body" style="flex: 1; display: flex; flex-direction: column; overflow-y: auto; padding: 14px 18px; gap: 14px;">
+                <!-- Automatic Client Proxy Assistant Card (Shown only for CORS) -->
+                <div class="proxy-assistant-card" id="proxy-assistant-card" style="display: none; background: rgba(59, 130, 246, 0.08); border: 1px solid rgba(59, 130, 246, 0.25); border-radius: 8px; padding: 12px 16px; flex-shrink: 0;">
+                    <div style="display: flex; align-items: center; justify-content: space-between; margin-bottom: 6px;">
+                        <div style="display: flex; align-items: center; gap: 8px; font-weight: 600; font-size: 13px; color: #60a5fa;">
+                            <span class="material-symbols-outlined" style="font-size: 18px;">router</span>
+                            <span id="proxy-assistant-card-title">Client Forward Proxy Configuration</span>
+                        </div>
+                        <span class="proxy-badge" style="font-size: 11px; background: rgba(59, 130, 246, 0.2); color: #93c5fd; padding: 2px 8px; border-radius: 12px; font-family: monospace;" id="proxy-assistant-host-badge">Proxy: zetaorangews:8002</span>
+                    </div>
+                    <div style="font-size: 12px; color: #cbd5e1; margin-bottom: 10px; line-height: 1.4;" id="proxy-assistant-desc">
+                        Browsers enforce Same-Origin / CORS restrictions on direct JavaScript network requests. To route cross-origin requests transparently with full browser credentials, apply the proxy:
+                    </div>
+                    <div style="display: flex; flex-wrap: wrap; gap: 8px;">
+                        <a id="btn-download-proxy-setup" class="proxy-quick-btn proxy-btn-primary" href="/api/proxy/setup.bat" download="setup_proxy.bat">
+                            <span class="material-symbols-outlined">download</span>
+                            <span>1-Click Windows Setup (.bat)</span>
+                        </a>
+                        <button type="button" class="proxy-quick-btn proxy-btn-secondary" onclick="copyProxyPacUrl()">
+                            <span class="material-symbols-outlined">content_copy</span>
+                            <span>Copy PAC URL</span>
+                        </button>
+                        <button type="button" class="proxy-quick-btn proxy-btn-secondary" onclick="copyBrowserLaunchCmd()">
+                            <span class="material-symbols-outlined">terminal</span>
+                            <span>Copy Browser Launch Cmd</span>
+                        </button>
+                        <button type="button" class="proxy-quick-btn proxy-btn-secondary" onclick="checkProxyConnectivity(true)">
+                            <span class="material-symbols-outlined">wifi_tethering</span>
+                            <span>Test Proxy Status</span>
+                        </button>
+                        <a id="btn-download-proxy-restore" class="proxy-quick-btn proxy-btn-danger" href="/api/proxy/restore.bat" download="restore_proxy.bat">
+                            <span class="material-symbols-outlined">undo</span>
+                            <span>Restore / Disable (.bat)</span>
+                        </a>
+                    </div>
+                </div>
+
+                <!-- Challenge Assistant Card (Shown for CAPTCHA / Bot challenges) -->
+                <div class="challenge-assistant-card" id="challenge-assistant-card" style="display: none; background: rgba(245, 158, 11, 0.08); border: 1px solid rgba(245, 158, 11, 0.3); border-radius: 10px; padding: 16px; flex-shrink: 0;">
+                    <div style="display: flex; align-items: flex-start; gap: 12px; margin-bottom: 12px;">
+                        <span class="material-symbols-outlined" style="font-size: 28px; color: #f59e0b; margin-top: 2px;">security</span>
+                        <div style="flex: 1;">
+                            <div style="font-size: 14px; font-weight: 600; color: #fbbf24; margin-bottom: 4px;">Host Security Verification Required</div>
+                            <div style="font-size: 12px; color: #cbd5e1; line-height: 1.5;">
+                                Google reCAPTCHA verifies the authentic <code style="background: rgba(0,0,0,0.3); padding: 1px 4px; border-radius: 4px;">google.com</code> domain origin and cannot execute inside an embedded localhost frame.
+                                <br>Click below to open and solve the verification directly in your browser, then click <strong>"I Solved the Challenge - Continue"</strong>.
+                            </div>
+                        </div>
+                    </div>
+                    <div style="display: flex; gap: 10px; align-items: center; justify-content: flex-start;">
+                        <button type="button" class="proxy-quick-btn proxy-btn-primary" style="padding: 8px 16px; font-size: 13px; font-weight: 600; background: #3b82f6; border-color: #60a5fa;" onclick="openCaptchaInBrowser()">
+                            <span class="material-symbols-outlined" style="font-size: 18px;">open_in_new</span>
+                            <span>Open Verification in Browser Window</span>
+                        </button>
+                    </div>
+                </div>
+
+                <div class="modal-info-row" style="margin-bottom: 2px; flex-shrink: 0; display: flex; align-items: center; justify-content: space-between;">
+                    <div style="display: flex; align-items: center; gap: 8px; overflow: hidden;">
+                        <span class="modal-label">Target URL:</span>
+                        <code class="modal-path-code" id="captcha-modal-url" style="max-width: 540px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap;">...</code>
+                    </div>
+                    <button type="button" class="proxy-quick-btn proxy-btn-secondary" style="padding: 3px 8px; font-size: 11px;" onclick="openCaptchaInBrowser()">
+                        <span class="material-symbols-outlined" style="font-size: 14px;">open_in_new</span>
+                        <span>Open in Tab</span>
+                    </button>
+                </div>
+                <div id="captcha-iframe-wrapper" style="flex: 1; width: 100%; border-radius: 8px; overflow: hidden; border: 1px solid var(--border-subtle); background: #fff; min-height: 240px; display: none;">
+                    <iframe id="captcha-modal-iframe" style="width: 100%; height: 100%; border: none;" sandbox="allow-scripts allow-same-origin allow-forms allow-popups allow-modals" title="Verification Frame"></iframe>
+                </div>
+            </div>
+            <div class="agentic-modal-actions" style="flex-shrink: 0; padding-top: 12px;">
+                <button type="button" class="modal-btn deny-btn" onclick="resolveCaptchaPrompt(false)">
+                    <span class="material-symbols-outlined">close</span>
+                    <span id="captcha-modal-cancel-text">Cancel</span>
+                </button>
+                <button type="button" class="modal-btn allow-always-btn" onclick="resolveCaptchaPrompt(true)">
+                    <span class="material-symbols-outlined" id="captcha-modal-confirm-icon">check_circle</span>
+                    <span id="captcha-modal-confirm-text">I Solved the Challenge - Continue</span>
+                </button>
+            </div>
+        </div>
+    </div>
+
+    <!-- Client Sandbox Iframe for Frontend Browser DOM & Script Execution -->
+    <iframe id="client-sandbox-iframe" style="position: absolute; width: 1024px; height: 768px; left: -9999px; top: -9999px; visibility: hidden; border: none;" sandbox="allow-scripts allow-same-origin allow-forms allow-popups allow-modals" title="Client Background Sandbox"></iframe>
+
     <script src="script.js"></script>
 </body>
 </html>

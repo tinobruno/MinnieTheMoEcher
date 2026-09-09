@@ -18,6 +18,7 @@ def generate_header():
     html_bytes, html_len = file_to_c_array(os.path.join(web_dir, 'index.html'))
     css_bytes, css_len = file_to_c_array(os.path.join(web_dir, 'style.css'))
     js_bytes, js_len = file_to_c_array(os.path.join(web_dir, 'script.js'))
+    sw_bytes, sw_len = file_to_c_array(os.path.join(web_dir, 'sw.js'))
 
     header = f'''#pragma once
 #include <string_view>
@@ -37,6 +38,10 @@ inline const unsigned char SCRIPT_JS_DATA[] = {{
 {js_bytes}
 }};
 
+inline const unsigned char SW_JS_DATA[] = {{
+{sw_bytes}
+}};
+
 inline std::string_view INDEX_HTML() {{
     return std::string_view(reinterpret_cast<const char*>(INDEX_HTML_DATA), sizeof(INDEX_HTML_DATA));
 }}
@@ -49,12 +54,16 @@ inline std::string_view SCRIPT_JS() {{
     return std::string_view(reinterpret_cast<const char*>(SCRIPT_JS_DATA), sizeof(SCRIPT_JS_DATA));
 }}
 
+inline std::string_view SW_JS() {{
+    return std::string_view(reinterpret_cast<const char*>(SW_JS_DATA), sizeof(SW_JS_DATA));
+}}
+
 }} // namespace moecher::embedded_web
 '''
 
     with open(out_path, 'w', encoding='utf-8') as f:
         f.write(header)
-    print(f"Generated {out_path} successfully ({html_len} bytes HTML, {css_len} bytes CSS, {js_len} bytes JS)")
+    print(f"Generated {out_path} successfully ({html_len} bytes HTML, {css_len} bytes CSS, {js_len} bytes JS, {sw_len} bytes SW)")
 
 if __name__ == '__main__':
     generate_header()

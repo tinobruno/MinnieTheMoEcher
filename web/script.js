@@ -58,7 +58,7 @@ function updateStatsUI(lastStats) {
         const avgTtftSec = (sessionStats.totalTtftMs / sessionStats.totalTurns) / 1000.0;
         const totalPrefillSec = sessionStats.totalTtftMs / 1000.0;
         const totalDecodeSec = sessionStats.totalDecodeTimeMs / 1000.0;
-        
+
         const avgPrefillTps = (totalPrefillSec > 0 && sessionStats.totalPromptTokens > 0)
             ? (sessionStats.totalPromptTokens / totalPrefillSec)
             : 0;
@@ -108,7 +108,7 @@ function stopGeneration() {
         currentAbortController = null;
     }
     const apiUrl = `${getApiBase()}/v1/chat/stop`;
-    fetch(apiUrl, { method: 'POST' }).catch(() => {});
+    fetch(apiUrl, { method: 'POST' }).catch(() => { });
 }
 
 tempSlider.addEventListener('input', (e) => {
@@ -326,7 +326,7 @@ function setupViewportControls() {
             vpButtons.forEach(b => b.classList.remove('active'));
             btn.classList.add('active');
             const vp = btn.getAttribute('data-viewport');
-            
+
             viewportFrame.classList.remove('tablet-mode', 'mobile-mode');
             if (vp === '768px') {
                 viewportFrame.classList.add('tablet-mode');
@@ -388,10 +388,7 @@ function hasHtmlSnippet() {
     for (let i = codeBlocks.length - 1; i >= 0; i--) {
         const code = codeBlocks[i].textContent || '';
         const lang = (codeBlocks[i].className || '').toLowerCase();
-        if (lang.includes('html') || lang.includes('svg') || lang.includes('xml') ||
-            code.includes('<!DOCTYPE') || code.includes('<!doctype') || code.includes('<html') || code.includes('<div') || 
-            code.includes('<svg') || code.includes('<script') || code.includes('<style') ||
-            code.includes('<canvas') || code.includes('<button') || code.includes('<body') || code.includes('<head')) {
+        if (isHtmlContent(code, lang)) {
             return true;
         }
     }
@@ -407,15 +404,30 @@ function getLatestHtmlCode() {
     for (let i = codeBlocks.length - 1; i >= 0; i--) {
         const code = codeBlocks[i].textContent || '';
         const lang = (codeBlocks[i].className || '').toLowerCase();
-        if (lang.includes('html') || lang.includes('svg') || lang.includes('xml') ||
-            code.includes('<!DOCTYPE') || code.includes('<!doctype') || code.includes('<html') || code.includes('<div') || 
-            code.includes('<svg') || code.includes('<script') || code.includes('<style') ||
-            code.includes('<canvas') || code.includes('<button') || code.includes('<body') || code.includes('<head')) {
+        if (isHtmlContent(code, lang)) {
             return code;
         }
     }
     if (currentHtmlCode && currentHtmlCode.trim().length > 0) {
         return currentHtmlCode;
+    }
+    return '';
+}
+
+// Extract HTML snippet specifically generated in the current assistant message
+function getTurnHtmlCode(assistantMsgEl, rawText) {
+    if (assistantMsgEl) {
+        const codeBlocks = assistantMsgEl.querySelectorAll('pre code');
+        for (let i = codeBlocks.length - 1; i >= 0; i--) {
+            const code = codeBlocks[i].textContent || '';
+            const lang = (codeBlocks[i].className || '').toLowerCase();
+            if (isHtmlContent(code, lang)) {
+                return code;
+            }
+        }
+    }
+    if (isFullHtmlDocument(rawText)) {
+        return rawText;
     }
     return '';
 }
@@ -499,6 +511,7 @@ function renderPreviewIframe(htmlCode) {
         finalHtml = consoleBridge + finalHtml;
     }
 
+    previewIframe.removeAttribute('src');
     previewIframe.setAttribute('allow', 'accelerometer; autoplay; clipboard-write; encrypted-media; gyroscope; picture-in-picture; web-share');
     previewIframe.srcdoc = finalHtml;
 }
@@ -904,15 +917,15 @@ function isHtmlContent(codeContent, lang = '') {
     const tagMatches = trimmed.match(/<\/?([a-zA-Z][a-zA-Z0-9-]*)\b[^>]*>/g);
     if (tagMatches && tagMatches.length >= 2) {
         const commonHtmlTags = [
-            'div', 'span', 'p', 'h1', 'h2', 'h3', 'h4', 'h5', 'h6', 
+            'div', 'span', 'p', 'h1', 'h2', 'h3', 'h4', 'h5', 'h6',
             'ul', 'ol', 'li', 'table', 'tr', 'td', 'th', 'thead', 'tbody',
             'button', 'input', 'form', 'label', 'select', 'option', 'textarea',
             'canvas', 'section', 'article', 'nav', 'header', 'footer', 'main',
             'aside', 'iframe', 'video', 'audio', 'img', 'a', 'link', 'meta',
             'details', 'summary', 'style', 'script', 'style'
         ];
-        return commonHtmlTags.some(tag => 
-            new RegExp(`<${tag}[\\s>]`, 'i').test(trimmed) || 
+        return commonHtmlTags.some(tag =>
+            new RegExp(`<${tag}[\\s>]`, 'i').test(trimmed) ||
             new RegExp(`</${tag}>`, 'i').test(trimmed)
         );
     }
@@ -927,6 +940,56 @@ function isFullHtmlDocument(text) {
     return (/^<!doctype\s+html/i.test(trimmed) || /^<html[\s>]/i.test(trimmed));
 }
 
+function createYouTubePlayerHtml(videoId, title = 'YouTube Video') {
+    return `<!DOCTYPE html>
+<html>
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>${escapeHtml(title)}</title>
+  <style>
+    * { box-sizing: border-box; }
+    body { font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, Helvetica, Arial, sans-serif; margin: 0; padding: 20px; background: #0f0f0f; color: #f1f1f1; line-height: 1.5; }
+    .yt-container { max-width: 900px; margin: 0 auto; }
+    .video-wrapper { position: relative; padding-bottom: 56.25%; height: 0; overflow: hidden; border-radius: 12px; box-shadow: 0 8px 32px rgba(0,0,0,0.7); background: #000; margin-bottom: 18px; border: 1px solid rgba(255,255,255,0.12); }
+    .video-wrapper iframe, .video-wrapper #player { position: absolute; top: 0; left: 0; width: 100%; height: 100%; border: none; }
+    .video-title { font-size: 1.35rem; font-weight: 600; margin-bottom: 8px; color: #ffffff; }
+    .video-actions a { display: inline-flex; align-items: center; gap: 6px; color: #fff; background: rgba(255,255,255,0.12); padding: 6px 14px; border-radius: 18px; text-decoration: none; font-size: 0.85rem; }
+  </style>
+</head>
+<body>
+  <div class="yt-container">
+    <div class="video-wrapper">
+      <iframe id="player" src="https://www.youtube-nocookie.com/embed/${videoId}?autoplay=1&enablejsapi=1&rel=0" allow="accelerometer; autoplay; clipboard-write; encrypted-media; gyroscope; picture-in-picture; web-share" allowfullscreen style="position:absolute;top:0;left:0;width:100%;height:100%;border:none;"></iframe>
+    </div>
+    <div class="video-title">${escapeHtml(title)}</div>
+    <div class="video-actions">
+      <a href="https://www.youtube.com/watch?v=${videoId}" target="_blank">Watch on YouTube &#x2197;</a>
+    </div>
+  </div>
+  <script src="https://www.youtube.com/iframe_api"></script>
+  <script>
+    var player;
+    function onYouTubeIframeAPIReady() {
+      try {
+        player = new YT.Player('player', {
+          events: {
+            'onReady': function(e) {
+              try {
+                e.target.unMute();
+                e.target.setVolume(100);
+                e.target.playVideo();
+              } catch(err) {}
+            }
+          }
+        });
+      } catch(e) {}
+    }
+  </script>
+</body>
+</html>`;
+}
+
 // Markdown rendering and code-block post-processing
 function renderMarkdownContent(rawText, containerElement) {
     containerElement.innerHTML = marked.parse(rawText);
@@ -934,51 +997,39 @@ function renderMarkdownContent(rawText, containerElement) {
     // Decorate code blocks
     const codeBlocks = containerElement.querySelectorAll('pre > code');
     let hasPreviewableHtml = false;
-    let firstHtmlSnippet = '';
 
     codeBlocks.forEach(codeEl => {
         const preEl = codeEl.parentElement;
-        if (preEl.parentElement.classList.contains('code-block-wrapper')) return;
+        const codeContent = codeEl.textContent || '';
+        const rawClass = codeEl.className || '';
+        const match = /language-(\w+)/.exec(rawClass);
+        const lang = match ? match[1] : '';
+
+        const isHtmlCandidate = isHtmlContent(codeContent, lang);
+        if (isHtmlCandidate) {
+            hasPreviewableHtml = true;
+        }
 
         const wrapper = document.createElement('div');
         wrapper.className = 'code-block-wrapper';
-
-        // Detect language
-        let lang = 'code';
-        const classes = codeEl.className.split(' ');
-        for (const cls of classes) {
-            if (cls.startsWith('language-')) {
-                lang = cls.replace('language-', '').toLowerCase();
-                break;
-            }
-        }
-
-        const codeContent = codeEl.textContent;
-        const isHtmlCandidate = isHtmlContent(codeContent, lang);
-
-        if (isHtmlCandidate && !firstHtmlSnippet) {
-            hasPreviewableHtml = true;
-            firstHtmlSnippet = codeContent;
-        }
 
         const header = document.createElement('div');
         header.className = 'code-block-header';
 
         const langDiv = document.createElement('div');
         langDiv.className = 'code-block-lang';
-        langDiv.innerHTML = `<span class="material-symbols-outlined lang-icon">${isHtmlCandidate ? 'html' : 'code'}</span> ${lang.toUpperCase()}`;
+        langDiv.textContent = (lang || 'code').toUpperCase();
 
         const actionsDiv = document.createElement('div');
         actionsDiv.className = 'code-block-actions';
 
         const previewBtn = document.createElement('button');
-        previewBtn.className = isHtmlCandidate ? 'code-action-btn preview-btn' : 'code-action-btn';
+        previewBtn.className = 'code-action-btn' + (isHtmlCandidate ? ' preview-btn-highlight' : '');
         previewBtn.innerHTML = `<span class="material-symbols-outlined btn-icon">${isHtmlCandidate ? 'play_circle' : 'preview'}</span> Preview`;
         previewBtn.title = 'Test and render this snippet in the HTML preview panel';
         previewBtn.addEventListener('click', () => {
             loadHtmlIntoPreview(codeContent, true);
         });
-        actionsDiv.appendChild(previewBtn);
 
         const copyBtn = document.createElement('button');
         copyBtn.className = 'code-action-btn';
@@ -991,6 +1042,7 @@ function renderMarkdownContent(rawText, containerElement) {
                 }, 2000);
             });
         });
+        actionsDiv.appendChild(previewBtn);
         actionsDiv.appendChild(copyBtn);
 
         header.appendChild(langDiv);
@@ -1033,64 +1085,7 @@ function renderMarkdownContent(rawText, containerElement) {
         const videoId = ytMatch[1];
         const ytDocId = 'yt_' + videoId;
         if (!retrievedDocsStore[ytDocId]) {
-            const ytHtml = `<!DOCTYPE html>
-<html>
-<head>
-  <meta charset="UTF-8">
-  <meta name="viewport" content="width=device-width, initial-scale=1.0">
-  <title>YouTube Video Player</title>
-  <style>
-    * { box-sizing: border-box; }
-    body { font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, Helvetica, Arial, sans-serif; margin: 0; padding: 20px; background: #0f0f0f; color: #f1f1f1; line-height: 1.5; }
-    .yt-container { max-width: 900px; margin: 0 auto; }
-    .video-wrapper { position: relative; padding-bottom: 56.25%; height: 0; overflow: hidden; border-radius: 12px; box-shadow: 0 8px 32px rgba(0,0,0,0.7); background: #000; margin-bottom: 18px; border: 1px solid rgba(255,255,255,0.12); }
-    .video-wrapper iframe, .video-wrapper #player { position: absolute; top: 0; left: 0; width: 100%; height: 100%; border: none; }
-    .video-title { font-size: 1.35rem; font-weight: 600; margin-bottom: 8px; color: #ffffff; }
-    .video-actions a { display: inline-flex; align-items: center; gap: 6px; color: #fff; background: rgba(255,255,255,0.12); padding: 6px 14px; border-radius: 18px; text-decoration: none; font-size: 0.85rem; }
-  </style>
-</head>
-<body>
-  <div class="yt-container">
-    <div class="video-wrapper">
-      <div id="player"></div>
-    </div>
-    <div class="video-title">YouTube Video</div>
-    <div class="video-actions">
-      <a href="https://www.youtube.com/watch?v=${videoId}" target="_blank">Watch on YouTube &#x2197;</a>
-    </div>
-  </div>
-  <script src="https://www.youtube.com/iframe_api"></script>
-  <script>
-    var player;
-    function onYouTubeIframeAPIReady() {
-      player = new YT.Player('player', {
-        videoId: '${videoId}',
-        playerVars: {
-          'autoplay': 1,
-          'playsinline': 1,
-          'enablejsapi': 1,
-          'rel': 0
-        },
-        events: {
-          'onReady': function(e) {
-            try {
-              e.target.unMute();
-              e.target.setVolume(100);
-              e.target.playVideo();
-            } catch(err) {}
-          }
-        }
-      });
-    }
-    setTimeout(function() {
-      var container = document.getElementById('player');
-      if (container && container.tagName !== 'IFRAME') {
-        container.innerHTML = '<iframe src="https://www.youtube-nocookie.com/embed/${videoId}?autoplay=1&enablejsapi=1&rel=0" allow="accelerometer; autoplay; clipboard-write; encrypted-media; gyroscope; picture-in-picture; web-share" allowfullscreen style="position:absolute;top:0;left:0;width:100%;height:100%;border:none;"></iframe>';
-      }
-    }, 2500);
-  </script>
-</body>
-</html>`;
+            const ytHtml = createYouTubePlayerHtml(videoId, 'YouTube Video');
             addRetrievedDocument({
                 id: ytDocId,
                 url: `https://www.youtube.com/watch?v=${videoId}`,
@@ -1114,14 +1109,21 @@ let retrievedDocsStore = {};
 function addRetrievedDocument(doc) {
     if (!doc || !doc.url) return;
     const docId = doc.id || ('doc_' + Date.now() + '_' + Math.floor(Math.random() * 1000));
-    
+
+    // Auto-generate YouTube player HTML if this document is a YouTube video
+    let docHtml = doc.html || '';
+    const ytMatch = (doc.url + ' ' + (doc.title || '')).match(/(?:youtube\.com\/watch\?v=|youtu\.be\/|youtube\.com\/embed\/)([a-zA-Z0-9_-]{11})/i);
+    if (ytMatch && (!docHtml || (!docHtml.includes('<iframe') && !docHtml.includes('YT.Player')))) {
+        docHtml = createYouTubePlayerHtml(ytMatch[1], doc.title || 'YouTube Video');
+    }
+
     // Check if already present by url
     const existingIdx = retrievedDocuments.findIndex(d => d.url === doc.url);
     const docObj = {
         id: docId,
         url: doc.url,
         title: doc.title || extractDomain(doc.url) || 'Retrieved Web Page',
-        html: doc.html || '',
+        html: docHtml,
         snippet: doc.snippet || '',
         timeStr: new Date().toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' })
     };
@@ -1132,14 +1134,13 @@ function addRetrievedDocument(doc) {
         retrievedDocuments.push(docObj);
     }
     retrievedDocsStore[docId] = docObj;
+    if (doc.id) retrievedDocsStore[doc.id] = docObj;
+    retrievedDocsStore[doc.url] = docObj;
+    if (ytMatch) {
+        retrievedDocsStore['yt_' + ytMatch[1]] = docObj;
+    }
 
     renderRetrievedDocsList();
-
-    // Automatically open preview and start autoplay for YouTube videos or media embeds
-    const isYouTube = doc.url.includes('youtube.com') || doc.url.includes('youtu.be') || (doc.html && doc.html.includes('youtube-nocookie.com/embed'));
-    if (isYouTube) {
-        openDocInFullPreview(docId);
-    }
 }
 
 function extractDomain(url) {
@@ -1186,11 +1187,11 @@ function renderRetrievedDocsList() {
         const safeSnippet = escapeHtml(doc.snippet);
         const safeSrcdoc = escapeHtml(doc.html || `<!DOCTYPE html><html><body style="font-family:-apple-system,BlinkMacSystemFont,sans-serif;padding:16px;color:#333;"><h3>${safeTitle}</h3><p>${safeSnippet}</p></body></html>`);
 
-        const isDocYouTube = doc.url.includes('youtube.com') || doc.url.includes('youtu.be') || (doc.html && doc.html.includes('youtube-nocookie.com/embed'));
+        const isDocYouTube = (doc.url && (doc.url.includes('youtube.com') || doc.url.includes('youtu.be'))) || (doc.html && doc.html.includes('youtube-nocookie.com/embed'));
         let miniContentHtml = '';
         if (isDocYouTube) {
             let ytId = '';
-            const ytMatch = (doc.url + ' ' + (doc.html || '')).match(/(?:v=|youtu\.be\/|embed\/)([a-zA-Z0-9_-]{11})/);
+            const ytMatch = ((doc.url || '') + ' ' + (doc.html || '')).match(/(?:v=|youtu\.be\/|embed\/)([a-zA-Z0-9_-]{11})/);
             if (ytMatch) ytId = ytMatch[1];
 
             if (ytId) {
@@ -1210,7 +1211,17 @@ function renderRetrievedDocsList() {
                 `;
             }
         } else {
-            miniContentHtml = `<iframe class="retrieved-mini-iframe" sandbox="allow-same-origin" srcdoc="${safeSrcdoc}"></iframe>`;
+            miniContentHtml = `
+                <div class="retrieved-mini-snapshot" style="width:100%;height:100%;background:linear-gradient(135deg,rgba(30,41,59,0.7),rgba(15,23,42,0.9));display:flex;flex-direction:column;justify-content:center;padding:14px;box-sizing:border-box;">
+                    <div style="display:flex;align-items:center;gap:6px;margin-bottom:6px;">
+                        <span class="material-symbols-outlined" style="font-size:18px;color:#38bdf8;">language</span>
+                        <span style="font-size:11px;font-weight:600;color:#94a3b8;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;">${escapeHtml(extractDomain(doc.url))}</span>
+                    </div>
+                    <div style="font-size:11px;color:#cbd5e1;line-height:1.4;display:-webkit-box;-webkit-line-clamp:3;-webkit-box-orient:vertical;overflow:hidden;">
+                        ${safeSnippet || safeTitle}
+                    </div>
+                </div>
+            `;
         }
 
         html += `
@@ -1252,7 +1263,42 @@ function openDocInFullPreview(docId, event) {
     const doc = retrievedDocsStore[docId];
     if (!doc) return;
 
-    const htmlToLoad = doc.html || `<!DOCTYPE html><html><head><meta charset="UTF-8"><title>${escapeHtml(doc.title)}</title><style>body{font-family:-apple-system,BlinkMacSystemFont,Segoe UI,Roboto,sans-serif;padding:30px;line-height:1.6;max-width:800px;margin:auto;color:#202124;}</style></head><body><h1>${escapeHtml(doc.title)}</h1><p><a href="${escapeHtml(doc.url)}" target="_blank">${escapeHtml(doc.url)}</a></p><hr/><p>${escapeHtml(doc.snippet)}</p></body></html>`;
+    // A. YouTube video player embed or direct video player HTML
+    const isDocYouTube = (doc.url && (doc.url.includes('youtube.com') || doc.url.includes('youtu.be'))) || (doc.html && doc.html.includes('youtube-nocookie.com/embed'));
+    if (isDocYouTube && doc.html) {
+        loadHtmlIntoPreview(doc.html, true);
+        return;
+    }
+
+    // B. External Web URLs (such as LinkedIn, GitHub, Google, Wikipedia, etc.) -> ALWAYS load via Moecher Reverse Proxy
+    if (doc.url && (doc.url.startsWith('http://') || doc.url.startsWith('https://'))) {
+        if (!isPreviewOpen) openPreviewPanel();
+        if (previewIframe) {
+            previewIframe.removeAttribute('srcdoc');
+            previewIframe.setAttribute('allow', 'accelerometer; autoplay; clipboard-write; encrypted-media; gyroscope; picture-in-picture; web-share');
+            previewIframe.src = `${getApiBase()}/api/proxy?url=${encodeURIComponent(doc.url)}`;
+        }
+        if (previewCodeEditor) {
+            previewCodeEditor.value = doc.html || `<!-- Live proxied page from: ${doc.url} -->\n<iframe src="${getApiBase()}/api/proxy?url=${encodeURIComponent(doc.url)}" style="width:100%;height:100%;border:none;"></iframe>`;
+            updateEditorLineNumbers();
+        }
+        clearConsoleLogs();
+        if (previewEmptyState) previewEmptyState.classList.add('hidden');
+        if (docStatusBadge) {
+            docStatusBadge.textContent = 'Active (Proxied Live)';
+            docStatusBadge.classList.remove('modified');
+        }
+        switchPreviewTab('tab-preview');
+        return;
+    }
+
+    // C. User-generated / local HTML documents
+    if (doc.html && doc.html.trim().length > 0) {
+        loadHtmlIntoPreview(doc.html, true);
+        return;
+    }
+
+    const htmlToLoad = `<!DOCTYPE html><html><head><meta charset="UTF-8"><title>${escapeHtml(doc.title)}</title><style>body{font-family:-apple-system,BlinkMacSystemFont,Segoe UI,Roboto,sans-serif;padding:30px;line-height:1.6;max-width:800px;margin:auto;color:#202124;}</style></head><body><h1>${escapeHtml(doc.title)}</h1><p><a href="${escapeHtml(doc.url)}" target="_blank">${escapeHtml(doc.url)}</a></p><hr/><p>${escapeHtml(doc.snippet)}</p></body></html>`;
     loadHtmlIntoPreview(htmlToLoad, true);
 }
 
@@ -1284,11 +1330,20 @@ let agenticSettings = {
     maxTurns: 8,
     compactToolOutputs: true,
     omitPastReasoning: true,
+    searchProvider: 'tavily',
+    tavilyApiKey: '',
+    searxngUrl: 'https://searx.be',
+    braveApiKey: '',
+    serperApiKey: '',
+    googleApiKey: '',
+    googleCx: '',
     tools: {
         read_file: true,
         write_file: true,
         edit_file: true,
         execute_command: true,
+        web_search: true,
+        google_search: true,
         fetch_url: true
     },
     workspaceDir: ''
@@ -1316,14 +1371,35 @@ function loadAgenticSettings() {
         const savedOmitReasoning = localStorage.getItem('moecher_agentic_omit_reasoning');
         if (savedOmitReasoning !== null) agenticSettings.omitPastReasoning = savedOmitReasoning === 'true';
 
+        const savedProvider = localStorage.getItem('moecher_search_provider');
+        if (savedProvider) agenticSettings.searchProvider = savedProvider;
+
+        const savedTavilyKey = localStorage.getItem('moecher_tavily_api_key');
+        if (savedTavilyKey) agenticSettings.tavilyApiKey = savedTavilyKey;
+
+        const savedSearxngUrl = localStorage.getItem('moecher_searxng_url');
+        if (savedSearxngUrl) agenticSettings.searxngUrl = savedSearxngUrl;
+
+        const savedBraveKey = localStorage.getItem('moecher_brave_api_key');
+        if (savedBraveKey) agenticSettings.braveApiKey = savedBraveKey;
+
+        const savedSerperKey = localStorage.getItem('moecher_serper_api_key');
+        if (savedSerperKey) agenticSettings.serperApiKey = savedSerperKey;
+
+        const savedGoogleKey = localStorage.getItem('moecher_google_api_key');
+        if (savedGoogleKey) agenticSettings.googleApiKey = savedGoogleKey;
+
+        const savedGoogleCx = localStorage.getItem('moecher_google_cx');
+        if (savedGoogleCx) agenticSettings.googleCx = savedGoogleCx;
+
         const savedPaths = localStorage.getItem('moecher_agentic_auth_paths');
         if (savedPaths) {
-            try { agenticSettings.authorizedPaths = JSON.parse(savedPaths); } catch (e) {}
+            try { agenticSettings.authorizedPaths = JSON.parse(savedPaths); } catch (e) { }
         }
 
         const savedTools = localStorage.getItem('moecher_agentic_tools');
         if (savedTools) {
-            try { Object.assign(agenticSettings.tools, JSON.parse(savedTools)); } catch (e) {}
+            try { Object.assign(agenticSettings.tools, JSON.parse(savedTools)); } catch (e) { }
         }
     } catch (e) {
         console.warn('Could not load agentic settings from localStorage', e);
@@ -1338,11 +1414,218 @@ function saveAgenticSettings() {
         localStorage.setItem('moecher_agentic_max_turns', agenticSettings.maxTurns);
         localStorage.setItem('moecher_agentic_compact_tools', agenticSettings.compactToolOutputs);
         localStorage.setItem('moecher_agentic_omit_reasoning', agenticSettings.omitPastReasoning);
+        localStorage.setItem('moecher_search_provider', agenticSettings.searchProvider || 'tavily');
+        localStorage.setItem('moecher_tavily_api_key', agenticSettings.tavilyApiKey || '');
+        localStorage.setItem('moecher_searxng_url', agenticSettings.searxngUrl || 'https://searx.be');
+        localStorage.setItem('moecher_brave_api_key', agenticSettings.braveApiKey || '');
+        localStorage.setItem('moecher_serper_api_key', agenticSettings.serperApiKey || '');
+        localStorage.setItem('moecher_google_api_key', agenticSettings.googleApiKey || '');
+        localStorage.setItem('moecher_google_cx', agenticSettings.googleCx || '');
         localStorage.setItem('moecher_agentic_auth_paths', JSON.stringify(agenticSettings.authorizedPaths));
         localStorage.setItem('moecher_agentic_tools', JSON.stringify(agenticSettings.tools));
     } catch (e) {
         console.warn('Could not save agentic settings to localStorage', e);
     }
+}
+
+function toggleKeyVisibility(inputId, iconId) {
+    const input = document.getElementById(inputId);
+    const icon = document.getElementById(iconId);
+    if (!input || !icon) return;
+    if (input.type === 'password') {
+        input.type = 'text';
+        icon.textContent = 'visibility_off';
+    } else {
+        input.type = 'password';
+        icon.textContent = 'visibility';
+    }
+}
+
+function toggleGoogleKeyVisibility() {
+    toggleKeyVisibility('google-api-key-input', 'google-key-visibility-icon');
+}
+
+function updateSearchProviderStatusBadge(configured) {
+    const badge = document.getElementById('search-provider-status-badge');
+    if (!badge) return;
+    const provider = agenticSettings.searchProvider || 'tavily';
+
+    let isReady = false;
+    let label = 'Configured';
+    if (provider === 'searxng') {
+        isReady = !!(agenticSettings.searxngUrl && agenticSettings.searxngUrl.trim());
+        label = isReady ? 'Zero-Config Ready' : 'URL Required';
+    } else if (provider === 'tavily') {
+        isReady = !!(agenticSettings.tavilyApiKey && agenticSettings.tavilyApiKey.trim());
+        label = isReady ? 'Tavily Ready' : 'Key Required';
+    } else if (provider === 'brave') {
+        isReady = !!(agenticSettings.braveApiKey && agenticSettings.braveApiKey.trim());
+        label = isReady ? 'Brave Ready' : 'Key Required';
+    } else if (provider === 'serper') {
+        isReady = !!(agenticSettings.serperApiKey && agenticSettings.serperApiKey.trim());
+        label = isReady ? 'Serper Ready' : 'Key Required';
+    } else if (provider === 'google') {
+        isReady = !!(agenticSettings.googleApiKey && agenticSettings.googleCx);
+        label = isReady ? 'Google Ready' : 'Key/CX Required';
+    }
+
+    if (configured !== undefined && typeof configured === 'boolean') {
+        isReady = configured;
+    }
+
+    if (isReady) {
+        badge.textContent = label;
+        badge.style.background = 'rgba(34, 197, 94, 0.2)';
+        badge.style.color = '#4ade80';
+    } else {
+        badge.textContent = label;
+        badge.style.background = 'rgba(239, 68, 68, 0.2)';
+        badge.style.color = '#f87171';
+    }
+}
+
+function updateGoogleSearchStatusBadge(isConfigured) {
+    updateSearchProviderStatusBadge(isConfigured);
+}
+
+function onSearchProviderChange(targetProvider) {
+    const select = document.getElementById('search-provider-select');
+    const provider = targetProvider || (select ? select.value : 'tavily');
+    agenticSettings.searchProvider = provider;
+    if (select && select.value !== provider) {
+        select.value = provider;
+    }
+
+    const providers = ['tavily', 'searxng', 'brave', 'serper', 'google'];
+    providers.forEach(p => {
+        const sec = document.getElementById(`provider-section-${p}`);
+        if (sec) {
+            sec.style.display = (p === provider) ? 'block' : 'none';
+        }
+    });
+
+    saveAgenticSettings();
+    updateSearchProviderStatusBadge();
+}
+
+function saveSearchProviderSettingsUI() {
+    const select = document.getElementById('search-provider-select');
+    const tavilyInput = document.getElementById('tavily-api-key-input');
+    const searxngInput = document.getElementById('searxng-url-input');
+    const braveInput = document.getElementById('brave-api-key-input');
+    const serperInput = document.getElementById('serper-api-key-input');
+    const googleKeyInput = document.getElementById('google-api-key-input');
+    const googleCxInput = document.getElementById('google-cx-input');
+    const saveMsg = document.getElementById('search-provider-save-msg');
+
+    const provider = select ? select.value : (agenticSettings.searchProvider || 'tavily');
+    const tavilyKey = tavilyInput ? tavilyInput.value.trim() : '';
+    const searxngUrl = searxngInput ? searxngInput.value.trim() : 'https://searx.be';
+    const braveKey = braveInput ? braveInput.value.trim() : '';
+    const serperKey = serperInput ? serperInput.value.trim() : '';
+    const googleKey = googleKeyInput ? googleKeyInput.value.trim() : '';
+    const googleCx = googleCxInput ? googleCxInput.value.trim() : '';
+
+    agenticSettings.searchProvider = provider;
+    agenticSettings.tavilyApiKey = tavilyKey;
+    agenticSettings.searxngUrl = searxngUrl;
+    agenticSettings.braveApiKey = braveKey;
+    agenticSettings.serperApiKey = serperKey;
+    agenticSettings.googleApiKey = googleKey;
+    agenticSettings.googleCx = googleCx;
+
+    saveAgenticSettings();
+
+    // Sync to backend server
+    fetch(`${getApiBase()}/api/settings/search_provider`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+            search_provider: provider,
+            tavily_api_key: tavilyKey,
+            searxng_url: searxngUrl,
+            brave_api_key: braveKey,
+            serper_api_key: serperKey,
+            google_search_api_key: googleKey,
+            google_search_cx: googleCx
+        })
+    })
+    .then(r => r.json())
+    .then(data => {
+        updateSearchProviderStatusBadge(data.configured);
+        if (saveMsg) {
+            saveMsg.style.display = 'inline';
+            saveMsg.textContent = 'Saved to server & browser!';
+            setTimeout(() => { saveMsg.style.display = 'none'; }, 3000);
+        }
+    })
+    .catch(() => {
+        updateSearchProviderStatusBadge();
+        if (saveMsg) {
+            saveMsg.style.display = 'inline';
+            saveMsg.textContent = 'Saved to browser!';
+            setTimeout(() => { saveMsg.style.display = 'none'; }, 3000);
+        }
+    });
+}
+
+function saveGoogleSearchCredentialsUI() {
+    saveSearchProviderSettingsUI();
+}
+
+function fetchSearchProviderSettings() {
+    fetch(`${getApiBase()}/api/settings/search_provider`)
+        .then(r => r.json())
+        .then(data => {
+            if (data) {
+                if (data.search_provider) {
+                    agenticSettings.searchProvider = data.search_provider;
+                }
+                if (data.searxng_url) {
+                    agenticSettings.searxngUrl = data.searxng_url;
+                }
+                if (data.google_search_cx) {
+                    agenticSettings.googleCx = data.google_search_cx;
+                }
+
+                // Update UI inputs
+                const select = document.getElementById('search-provider-select');
+                if (select && data.search_provider) select.value = data.search_provider;
+
+                const tavilyInput = document.getElementById('tavily-api-key-input');
+                if (tavilyInput && agenticSettings.tavilyApiKey) tavilyInput.value = agenticSettings.tavilyApiKey;
+
+                const searxngInput = document.getElementById('searxng-url-input');
+                if (searxngInput && (data.searxng_url || agenticSettings.searxngUrl)) {
+                    searxngInput.value = data.searxng_url || agenticSettings.searxngUrl;
+                }
+
+                const braveInput = document.getElementById('brave-api-key-input');
+                if (braveInput && agenticSettings.braveApiKey) braveInput.value = agenticSettings.braveApiKey;
+
+                const serperInput = document.getElementById('serper-api-key-input');
+                if (serperInput && agenticSettings.serperApiKey) serperInput.value = agenticSettings.serperApiKey;
+
+                const googleKeyInput = document.getElementById('google-api-key-input');
+                if (googleKeyInput && agenticSettings.googleApiKey) googleKeyInput.value = agenticSettings.googleApiKey;
+
+                const googleCxInput = document.getElementById('google-cx-input');
+                if (googleCxInput && (data.google_search_cx || agenticSettings.googleCx)) {
+                    googleCxInput.value = data.google_search_cx || agenticSettings.googleCx;
+                }
+
+                onSearchProviderChange(agenticSettings.searchProvider);
+                updateSearchProviderStatusBadge(data.configured);
+            }
+        })
+        .catch(() => {
+            onSearchProviderChange(agenticSettings.searchProvider);
+            updateSearchProviderStatusBadge();
+        });
+}
+
+function fetchGoogleSearchSettings() {
+    fetchSearchProviderSettings();
 }
 
 function initAgenticSettingsUI() {
@@ -1467,6 +1750,8 @@ function initAgenticSettingsUI() {
         write_file: document.getElementById('tool-enable-write'),
         edit_file: document.getElementById('tool-enable-edit'),
         execute_command: document.getElementById('tool-enable-command'),
+        web_search: document.getElementById('tool-enable-web-search'),
+        google_search: document.getElementById('tool-enable-google-search'),
         fetch_url: document.getElementById('tool-enable-fetch')
     };
 
@@ -1491,8 +1776,36 @@ function initAgenticSettingsUI() {
         });
     }
 
+    // Populate search inputs
+    const tavilyKeyInput = document.getElementById('tavily-api-key-input');
+    if (tavilyKeyInput && agenticSettings.tavilyApiKey) {
+        tavilyKeyInput.value = agenticSettings.tavilyApiKey;
+    }
+    const searxngUrlInput = document.getElementById('searxng-url-input');
+    if (searxngUrlInput && agenticSettings.searxngUrl) {
+        searxngUrlInput.value = agenticSettings.searxngUrl;
+    }
+    const braveKeyInput = document.getElementById('brave-api-key-input');
+    if (braveKeyInput && agenticSettings.braveApiKey) {
+        braveKeyInput.value = agenticSettings.braveApiKey;
+    }
+    const serperKeyInput = document.getElementById('serper-api-key-input');
+    if (serperKeyInput && agenticSettings.serperApiKey) {
+        serperKeyInput.value = agenticSettings.serperApiKey;
+    }
+    const keyInput = document.getElementById('google-api-key-input');
+    if (keyInput && agenticSettings.googleApiKey) {
+        keyInput.value = agenticSettings.googleApiKey;
+    }
+    const cxInput = document.getElementById('google-cx-input');
+    if (cxInput && agenticSettings.googleCx) {
+        cxInput.value = agenticSettings.googleCx;
+    }
+
+    onSearchProviderChange(agenticSettings.searchProvider);
     renderAuthorizedPathsTags();
     fetchWorkspaceInfo();
+    fetchSearchProviderSettings();
 }
 
 function fetchWorkspaceInfo() {
@@ -1561,21 +1874,89 @@ function removeAuthorizedPath(idx) {
 // Built-in tool definitions builder
 function getActiveToolsPayload() {
     const isWebRetrieval = webRetrievalEnabled ? webRetrievalEnabled.checked : true;
-    if (!isWebRetrieval) return [];
 
     const allToolDefs = [
+        {
+            name: "web_search",
+            type: "function",
+            function: {
+                name: "web_search",
+                description: "Search the live web using the configured search provider (Tavily AI, SearXNG, Brave, Serper Google, or Google Custom Search) to find current news, facts, documentation, APIs, and web pages.",
+                parameters: {
+                    type: "object",
+                    properties: {
+                        query: {
+                            type: "string",
+                            description: "The search query string (e.g. 'latest AI news', 'deepseek v4 architecture', 'tavily api docs')."
+                        },
+                        num_results: {
+                            type: "integer",
+                            description: "Optional number of search results to return (1-10, default: 5)."
+                        },
+                        site: {
+                            type: "string",
+                            description: "Optional domain filter to restrict search to a specific website (e.g. 'github.com', 'wikipedia.org')."
+                        }
+                    },
+                    required: ["query"]
+                }
+            }
+        },
+        {
+            name: "google_search",
+            type: "function",
+            function: {
+                name: "google_search",
+                description: "Search the web using official Google Custom Search or configured universal search engine.",
+                parameters: {
+                    type: "object",
+                    properties: {
+                        query: {
+                            type: "string",
+                            description: "The search query string (e.g. 'latest AI news', 'Tino Bruno GitHub', 'llama.cpp documentation')."
+                        },
+                        num_results: {
+                            type: "integer",
+                            description: "Optional number of search results to return (1-10, default: 5)."
+                        },
+                        site: {
+                            type: "string",
+                            description: "Optional domain filter to restrict search to a specific website (e.g. 'github.com', 'wikipedia.org')."
+                        }
+                    },
+                    required: ["query"]
+                }
+            }
+        },
         {
             name: "fetch_url",
             type: "function",
             function: {
                 name: "fetch_url",
-                description: "Fetch and extract readable text content from a public web URL (HTTP/HTTPS), search DuckDuckGo, or trigger YouTube playback.",
+                description: "Fetch web content, inspect raw source code, or extract JavaScript/links from a public web URL. Raw responses are cached to '.moecher_web_cache.html' for dynamic script/JSON parsing.",
                 parameters: {
                     type: "object",
                     properties: {
                         url: {
                             type: "string",
-                            description: "The complete HTTP or HTTPS URL to fetch (e.g. https://html.duckduckgo.com/html/?q=query or https://example.com)"
+                            description: "The complete HTTP or HTTPS URL or search query to fetch (e.g. https://www.youtube.com/results?search_query=query, https://www.google.com/search?q=query, or https://example.com)"
+                        },
+                        mode: {
+                            type: "string",
+                            enum: ["text", "raw", "scripts", "links"],
+                            description: "Content extraction mode: 'text' (default: clean readable text, metadata, detected links), 'raw' (unaltered source HTML/code), 'scripts' (extracted <script> tags and embedded JS), 'links' (all hyperlinks). Default: 'text'."
+                        },
+                        pattern: {
+                            type: "string",
+                            description: "Optional case-insensitive substring or keyword filter. In 'raw' mode, extracts surrounding context windows around matches; in 'scripts' mode, extracts scripts containing this keyword; in 'links' mode, extracts URLs/anchors containing this keyword."
+                        },
+                        offset: {
+                            type: "integer",
+                            description: "Optional pagination offset for matches/scripts/links (default: 0)."
+                        },
+                        max_chars: {
+                            type: "integer",
+                            description: "Optional maximum character length for the output (default: 4000)."
                         }
                     },
                     required: ["url"]
@@ -1680,7 +2061,12 @@ function getActiveToolsPayload() {
         }
     ];
 
-    return allToolDefs.filter(t => agenticSettings.tools[t.name] !== false).map(t => ({
+    return allToolDefs.filter(t => {
+        if ((t.name === 'web_search' || t.name === 'google_search' || t.name === 'fetch_url') && !isWebRetrieval) {
+            return false;
+        }
+        return agenticSettings.tools[t.name] !== false;
+    }).map(t => ({
         type: t.type,
         function: t.function
     }));
@@ -1729,6 +2115,148 @@ function resolveAuthPrompt(allow, always = false) {
     currentPendingAuth = null;
 }
 
+// CAPTCHA / Network Verification Modal Prompt & Proxy Assistant
+let currentCaptchaPending = null;
+let currentCaptchaUrl = '';
+
+function updateProxyAssistantInfo() {
+    const host = window.location.hostname || 'localhost';
+    const proxyPort = 8002;
+    const badge = document.getElementById('proxy-assistant-host-badge');
+    const btnSetup = document.getElementById('btn-download-proxy-setup');
+    const btnRestore = document.getElementById('btn-download-proxy-restore');
+
+    if (badge) badge.textContent = `Proxy: ${host}:${proxyPort}`;
+    if (btnSetup) btnSetup.href = `${getApiBase()}/api/proxy/setup.bat`;
+    if (btnRestore) btnRestore.href = `${getApiBase()}/api/proxy/restore.bat`;
+
+    checkProxyConnectivity(false);
+}
+
+function checkProxyConnectivity(showFeedback = false) {
+    const badge = document.getElementById('proxy-assistant-host-badge');
+    fetch(`${getApiBase()}/api/proxy/status`)
+        .then(r => r.json())
+        .then(data => {
+            if (badge) {
+                badge.textContent = `Proxy Online: ${data.proxy_host}:${data.proxy_port}`;
+                badge.style.background = 'rgba(34, 197, 94, 0.2)';
+                badge.style.color = '#86efac';
+            }
+            if (showFeedback) {
+                showToast(`Proxy listener online on port ${data.proxy_port}! Client: ${data.remote_addr}`);
+            }
+        })
+        .catch(err => {
+            if (badge) {
+                badge.textContent = `Proxy: Offline / Unreachable`;
+                badge.style.background = 'rgba(239, 68, 68, 0.2)';
+                badge.style.color = '#fca5a5';
+            }
+            if (showFeedback) {
+                showToast(`Proxy status check failed: ${err.message}`);
+            }
+        });
+}
+
+function copyProxyPacUrl() {
+    const pacUrl = `${window.location.protocol}//${window.location.host}/proxy.pac`;
+    if (navigator.clipboard && navigator.clipboard.writeText) {
+        navigator.clipboard.writeText(pacUrl).then(() => {
+            showToast('PAC URL copied to clipboard!');
+        }).catch(() => {
+            prompt('Copy PAC URL:', pacUrl);
+        });
+    } else {
+        prompt('Copy PAC URL:', pacUrl);
+    }
+}
+
+function copyBrowserLaunchCmd() {
+    const host = window.location.hostname || 'localhost';
+    const webUrl = `${window.location.protocol}//${window.location.host}`;
+    const cmd = `msedge.exe --proxy-server="http://${host}:8002" ${webUrl}`;
+    if (navigator.clipboard && navigator.clipboard.writeText) {
+        navigator.clipboard.writeText(cmd).then(() => {
+            showToast('Browser launch command copied to clipboard!');
+        }).catch(() => {
+            prompt('Copy Browser Command:', cmd);
+        });
+    } else {
+        prompt('Copy Browser Command:', cmd);
+    }
+}
+
+function showCaptchaPrompt(url, callback, reason = 'captcha') {
+    currentCaptchaUrl = url || '';
+    currentCaptchaPending = { url, callback };
+    const modal = document.getElementById('captcha-verification-modal');
+    const urlEl = document.getElementById('captcha-modal-url');
+    const iframeEl = document.getElementById('captcha-modal-iframe');
+    const iframeWrap = document.getElementById('captcha-iframe-wrapper');
+    const titleEl = document.getElementById('captcha-modal-title');
+    const subEl = document.getElementById('captcha-modal-sub');
+    const iconEl = document.getElementById('captcha-modal-icon');
+    const iconWrap = document.getElementById('captcha-modal-icon-wrap');
+    const proxyCard = document.getElementById('proxy-assistant-card');
+    const challengeCard = document.getElementById('challenge-assistant-card');
+    const confirmTextEl = document.getElementById('captcha-modal-confirm-text');
+    const confirmIconEl = document.getElementById('captcha-modal-confirm-icon');
+
+    if (urlEl) urlEl.textContent = url || 'https://www.google.com';
+
+    if (reason === 'cors') {
+        if (proxyCard) proxyCard.style.display = 'block';
+        if (challengeCard) challengeCard.style.display = 'none';
+        if (iframeWrap) iframeWrap.style.display = 'none';
+        updateProxyAssistantInfo();
+
+        if (titleEl) titleEl.textContent = 'Cross-Origin (CORS) Security Restriction';
+        if (subEl) subEl.textContent = 'Direct browser fetch was blocked by Cross-Origin (CORS) security policy. Configure the engine proxy to bypass CORS transparently.';
+        if (iconEl) iconEl.textContent = 'shield_lock';
+        if (iconWrap) {
+            iconWrap.style.background = 'rgba(239, 68, 68, 0.15)';
+            iconWrap.style.color = '#ef4444';
+        }
+        if (confirmTextEl) confirmTextEl.textContent = 'Proxy Configured - Retry Request';
+        if (confirmIconEl) confirmIconEl.textContent = 'refresh';
+    } else {
+        if (proxyCard) proxyCard.style.display = 'none';
+        if (challengeCard) challengeCard.style.display = 'block';
+        if (iframeWrap) iframeWrap.style.display = 'none';
+
+        if (titleEl) titleEl.textContent = 'Host Security Verification';
+        if (subEl) subEl.textContent = 'The host (e.g. Google) requires human verification. Open in your browser to solve.';
+        if (iconEl) iconEl.textContent = 'verified_user';
+        if (iconWrap) {
+            iconWrap.style.background = 'rgba(245, 158, 11, 0.15)';
+            iconWrap.style.color = '#f59e0b';
+        }
+        if (confirmTextEl) confirmTextEl.textContent = 'I Solved the Challenge - Continue';
+        if (confirmIconEl) confirmIconEl.textContent = 'check_circle';
+    }
+
+    if (modal) modal.style.display = 'flex';
+}
+
+function openCaptchaInBrowser() {
+    if (currentCaptchaUrl) {
+        window.open(currentCaptchaUrl, '_blank');
+    }
+}
+
+function resolveCaptchaPrompt(retried) {
+    const modal = document.getElementById('captcha-verification-modal');
+    const iframeEl = document.getElementById('captcha-modal-iframe');
+    if (iframeEl) iframeEl.src = 'about:blank';
+    if (modal) modal.style.display = 'none';
+
+    if (!currentCaptchaPending) return;
+    const { callback } = currentCaptchaPending;
+    currentCaptchaPending = null;
+    if (callback) callback(retried);
+}
+
 // ============================================================================
 // Main Chat Logic & Context Window Optimization
 // ============================================================================
@@ -1751,7 +2279,7 @@ function buildOptimizedMessagesPayload() {
     for (let idx = 0; idx < historySlice.length; idx++) {
         const msg = historySlice[idx];
         const isCurrentActiveTurn = (idx === historySlice.length - 1);
-        
+
         const cleanedMsg = {
             role: msg.role,
             content: msg.content || ''
@@ -1791,10 +2319,511 @@ function buildOptimizedMessagesPayload() {
     return messagesToSend;
 }
 
+function stripToolCallsFromText(text) {
+    if (!text) return '';
+    let out = text;
+    out = out.replace(/<tool_call>[\s\S]*?<\/tool_call>/g, '');
+    out = out.replace(/<｜tool call begin｜>[\s\S]*?<｜tool call end｜>/g, '');
+    out = out.replace(/\{"name":\s*"[^"]+"[\s\S]*?\}/g, '');
+    out = out.replace(/\{"function":\s*"[^"]+"[\s\S]*?\}/g, '');
+    return out.trim();
+}
+
+function isRawToolCallString(text) {
+    if (!text) return false;
+    const trimmed = text.trim();
+    if (trimmed.startsWith('<tool_call>') || trimmed.startsWith('<｜tool call begin｜>')) return true;
+    if (trimmed.startsWith('{"name"') || trimmed.startsWith('{"function"') || trimmed.startsWith('{"name":') || trimmed.startsWith('{"function":')) return true;
+    return false;
+}
+
+
+function extractFromLoadedDom(doc, url, mode = 'text', pattern = '', maxChars = 4000) {
+    if (!doc) return { text: '', isBlocked: false, searchCount: 0 };
+    const rawHtml = doc.documentElement ? doc.documentElement.outerHTML : (doc.body ? doc.body.innerHTML : '');
+    const pageTitle = doc.title || extractDomain(url);
+    const docTitle = (doc.title || '').toLowerCase();
+    const rawBodyText = (doc.body ? (doc.body.innerText || doc.body.textContent || '') : '').toLowerCase();
+
+    // Genuine bot / CAPTCHA block detection (avoids false positives from normal Google search scripts)
+    const isSorry = (doc.location && typeof doc.location.pathname === 'string' && doc.location.pathname.includes('/sorry/')) ||
+        (docTitle.includes('about this page') && rawBodyText.includes('unusual traffic')) ||
+        (docTitle.includes('informazioni su questa pagina') && rawBodyText.includes('traffico insolito')) ||
+        (rawHtml.includes('/sorry/index') || rawHtml.includes('unusual traffic from your computer network'));
+    const isJsChallenge = rawHtml.includes('knitsail') || rawHtml.includes('/httpservice/retry/enablejs') || rawHtml.includes('emsg=SG_REL') || rawHtml.includes('having trouble accessing Google Search');
+    const isBotBlocked = isSorry || (isJsChallenge && !doc.querySelector('div.g, div.MjjYud, div[data-sokoban-container], #rso, .BNeawe, div.kCrYT, div.Gx5Zad'));
+
+    if (mode === 'raw') {
+        if (pattern) {
+            const idx = rawHtml.toLowerCase().indexOf(pattern.toLowerCase());
+            if (idx >= 0) {
+                const start = Math.max(0, idx - 400);
+                const end = Math.min(rawHtml.length, idx + pattern.length + 400);
+                return { text: `... ${rawHtml.slice(start, end)} ...`, isBlocked: isBotBlocked, searchCount: 0 };
+            }
+        }
+        return { text: rawHtml.slice(0, maxChars), isBlocked: isBotBlocked, searchCount: 0 };
+    }
+
+    if (mode === 'scripts') {
+        const scripts = Array.from(doc.querySelectorAll('script'));
+        let found = [];
+        for (const s of scripts) {
+            const text = s.textContent || '';
+            if (!pattern || text.toLowerCase().includes(pattern.toLowerCase())) {
+                found.push(text.trim());
+            }
+        }
+        return { text: found.join('\n---\n').slice(0, maxChars), isBlocked: isBotBlocked, searchCount: 0 };
+    }
+
+    if (mode === 'links') {
+        const links = Array.from(doc.querySelectorAll('a[href]'));
+        let found = [];
+        for (const a of links) {
+            const href = a.getAttribute('href');
+            const text = a.textContent ? a.textContent.trim() : '';
+            if (href && (!pattern || href.toLowerCase().includes(pattern.toLowerCase()) || text.toLowerCase().includes(pattern.toLowerCase()))) {
+                found.push(`- [${text || href}](${href})`);
+            }
+        }
+        return { text: found.slice(0, 50).join('\n'), isBlocked: isBotBlocked, searchCount: 0 };
+    }
+
+    // Default 'text' mode: Search engine result extraction
+    const isGoogle = url.includes('google.');
+    const isBing = url.includes('bing.com');
+    const isDdg = url.includes('duckduckgo.com');
+    const isYt = url.includes('youtube.com');
+
+    let searchItems = [];
+
+    if (isGoogle) {
+        // 1. Standard Desktop and gbv=1 Google Search Cards
+        const cards = doc.querySelectorAll('div.g, div.MjjYud, div[data-sokoban-container], div.tF2Cxc, #rso > div, div.kCrYT, div.Gx5Zad, div.ZINbbc, div.Gx5Zad > div');
+        cards.forEach(c => {
+            const h3 = c.querySelector('h3, h2, .vvjwJb, .BNeawe.vvjwJb, div[role="heading"]');
+            const a = c.querySelector('a[href]');
+            if (h3) {
+                const title = h3.textContent.trim();
+                let link = a ? (a.getAttribute('href') || '') : '';
+                if (link.startsWith('/url?q=')) {
+                    link = decodeURIComponent(link.slice(7).split('&')[0]);
+                } else if (link.startsWith('/url?')) {
+                    try {
+                        const urlParams = new URLSearchParams(link.slice(5));
+                        if (urlParams.has('url')) link = urlParams.get('url');
+                        else if (urlParams.has('q')) link = urlParams.get('q');
+                    } catch (e) { }
+                }
+                if (!link || link.startsWith('/') || link.includes('google.')) {
+                    const cite = c.querySelector('cite');
+                    if (cite && cite.textContent.trim()) {
+                        link = cite.textContent.trim();
+                    }
+                }
+                if (!link || link.startsWith('/')) {
+                    link = `https://www.google.com/search?q=${encodeURIComponent(title)}&hl=en&gl=us&gbv=1`;
+                }
+                const snippetEl = c.querySelector('.VwiC3b, .yXK7lf, .IsZvec, div[data-sncf], .b_caption, .b_snippet, .BNeawe.s3v9rd, .s3v9rd');
+                const snippet = snippetEl ? snippetEl.textContent.trim() : '';
+                if (title && !title.startsWith('http') && title !== 'Google' && !searchItems.some(item => item.title === title)) {
+                    searchItems.push({ title, link, snippet });
+                }
+            }
+        });
+
+        // 2. Fallback for basic Google markup with /url?q= links
+        if (searchItems.length === 0) {
+            const urlLinks = doc.querySelectorAll('a[href^="/url?q="]');
+            urlLinks.forEach(a => {
+                const href = a.getAttribute('href') || '';
+                let cleanLink = decodeURIComponent(href.slice(7).split('&')[0]);
+                const title = a.textContent.trim();
+                if (title && cleanLink && cleanLink.startsWith('http') && !cleanLink.includes('google.') && !searchItems.some(item => item.link === cleanLink)) {
+                    searchItems.push({ title, link: cleanLink, snippet: '' });
+                }
+            });
+        }
+    } else if (isBing) {
+        const cards = doc.querySelectorAll('li.b_algo, #b_results > li');
+        cards.forEach(c => {
+            const h2a = c.querySelector('h2 a');
+            if (h2a) {
+                const title = h2a.textContent.trim();
+                const link = h2a.getAttribute('href') || '';
+                const snippetEl = c.querySelector('.b_caption p, .b_snippet');
+                const snippet = snippetEl ? snippetEl.textContent.trim() : '';
+                if (title && link && !searchItems.some(item => item.link === link)) {
+                    searchItems.push({ title, link, snippet });
+                }
+            }
+        });
+    } else if (isDdg) {
+        const cards = doc.querySelectorAll('article[data-testid="result"], .result__body');
+        cards.forEach(c => {
+            const a = c.querySelector('h2 a, .result__title a');
+            if (a) {
+                const title = a.textContent.trim();
+                const link = a.getAttribute('href') || '';
+                const snippetEl = c.querySelector('[data-result="snippet"], .result__snippet');
+                const snippet = snippetEl ? snippetEl.textContent.trim() : '';
+                if (title && link && !searchItems.some(item => item.link === link)) {
+                    searchItems.push({ title, link, snippet });
+                }
+            }
+        });
+    } else if (isYt) {
+        const links = doc.querySelectorAll('a[href*="/watch?v="]');
+        links.forEach(a => {
+            const href = a.getAttribute('href') || '';
+            const title = (a.getAttribute('title') || a.textContent || '').trim();
+            const fullLink = href.startsWith('http') ? href : ('https://www.youtube.com' + href);
+            if (title && fullLink && !searchItems.some(item => item.link === fullLink)) {
+                searchItems.push({ title, link: fullLink, snippet: 'YouTube Video' });
+            }
+        });
+    }
+
+    if (searchItems.length > 0) {
+        let out = `Search Results for "${url}":\n\n`;
+        searchItems.slice(0, 10).forEach((item, idx) => {
+            out += `${idx + 1}. **[${item.title}](${item.link})**\n   URL: ${item.link}\n`;
+            if (item.snippet) out += `   Snippet: ${item.snippet}\n`;
+            out += '\n';
+        });
+        return { text: out.slice(0, maxChars), isBlocked: false, searchCount: searchItems.length };
+    }
+
+    // Fallback: Generic clean DOM text extraction (stripping out useless scripts, css, nav, headers)
+    try {
+        const bodyClone = doc.body ? doc.body.cloneNode(true) : null;
+        if (bodyClone) {
+            const unwanted = bodyClone.querySelectorAll('script, style, noscript, svg, nav, footer, header, form, iframe, aside');
+            unwanted.forEach(el => el.remove());
+            let text = bodyClone.innerText || bodyClone.textContent || '';
+            text = text.replace(/[ \t]+/g, ' ').replace(/\n\s*\n\s*\n+/g, '\n\n').trim();
+            if (pattern) {
+                const idx = text.toLowerCase().indexOf(pattern.toLowerCase());
+                if (idx >= 0) {
+                    const start = Math.max(0, idx - 400);
+                    const end = Math.min(text.length, idx + pattern.length + 400);
+                    return { text: `... ${text.slice(start, end)} ...`, isBlocked: isBotBlocked, searchCount: 0 };
+                }
+            }
+            return { text: `Page Title: ${pageTitle}\nURL: ${url}\n\n${text.slice(0, maxChars)}`, isBlocked: isBotBlocked, searchCount: 0 };
+        }
+    } catch (e) {
+        console.warn('DOM clone text extraction error', e);
+    }
+    return { text: `Page Title: ${pageTitle}\nURL: ${url}`, isBlocked: isBotBlocked, searchCount: 0 };
+}
+
+// ============================================================================
+// Direct JavaScript Tavily AI API Client (SDK Equivalent: @tavily/core)
+// ============================================================================
+
+async function executeTavilySearchJS(query, apiKey, maxResults = 5) {
+    const key = (apiKey || agenticSettings.tavilyApiKey || '').trim();
+    if (!key) {
+        return {
+            output: "[Tavily Search API Key Not Configured]\n\n" +
+                    "Tavily provides 1,000 free web searches monthly without requiring a credit card.\n" +
+                    "1. Get your free API key at: https://tavily.com\n" +
+                    "2. Save your API key in Settings.",
+            retrieved_document: null
+        };
+    }
+
+    const payload = {
+        api_key: key,
+        query: query,
+        search_depth: "basic",
+        include_answer: true,
+        max_results: maxResults || 5
+    };
+
+    const res = await fetch('https://api.tavily.com/search', {
+        method: 'POST',
+        headers: {
+            'Content-Type': 'application/json'
+        },
+        body: JSON.stringify(payload)
+    });
+
+    if (!res.ok) {
+        const errJson = await res.json().catch(() => ({}));
+        throw new Error(errJson.error || `HTTP ${res.status} ${res.statusText}`);
+    }
+
+    const data = await res.json();
+    const results = data.results || [];
+    const answer = data.answer || '';
+
+    let textOut = `[Web Search Results (Tavily AI): "${query}"]\n\n`;
+    if (answer) {
+        textOut += `Direct AI Summary: ${answer}\n\n`;
+    }
+
+    let htmlCards = `<div style="font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',Roboto,sans-serif; color:#e2e8f0; background:#0f172a; padding:20px; border-radius:12px; max-width:860px; margin:0 auto;">`;
+    htmlCards += `<h2 style="margin:0 0 16px 0; font-size:18px; color:#60a5fa;">Tavily AI Search: ${escapeHtml(query)}</h2>`;
+    if (answer) {
+        htmlCards += `<div style="background:rgba(59,130,246,0.15); border:1px solid rgba(59,130,246,0.3); border-radius:8px; padding:12px 14px; margin-bottom:16px; font-size:14px; color:#93c5fd;"><strong>AI Summary:</strong> ${escapeHtml(answer)}</div>`;
+    }
+
+    results.slice(0, maxResults || 5).forEach((item, idx) => {
+        const title = item.title || 'Source';
+        const link = item.url || '';
+        const snippet = item.content || '';
+        const score = item.score !== undefined ? ` (Score: ${(item.score * 100).toFixed(0)}%)` : '';
+
+        textOut += `${idx + 1}. **${title}**\n   URL: ${link}\n   Snippet: ${snippet}\n\n`;
+
+        htmlCards += `
+            <div style="background:rgba(255,255,255,0.04); border:1px solid rgba(255,255,255,0.08); border-radius:8px; padding:14px 16px; margin-bottom:12px;">
+                <a href="${escapeHtml(link)}" target="_blank" style="font-size:16px; font-weight:600; color:#93c5fd; text-decoration:none; display:inline-block; margin-bottom:6px;">${escapeHtml(title)}${score} &rarr;</a>
+                <p style="font-size:13px; color:#cbd5e1; margin:0; line-height:1.5;">${escapeHtml(snippet)}</p>
+            </div>
+        `;
+    });
+    htmlCards += `</div>`;
+
+    if (results.length === 0) {
+        textOut += `No search results found for query: "${query}"`;
+    }
+
+    const primaryUrl = (results.length > 0 && results[0].url) ? results[0].url : 'https://tavily.com';
+
+    return {
+        output: textOut,
+        retrieved_document: {
+            id: 'tavily_' + Date.now(),
+            url: primaryUrl,
+            title: (results.length > 0 && results[0].title) ? results[0].title : `Tavily Search: ${query}`,
+            html: htmlCards,
+            snippet: answer || (results.length > 0 ? results[0].content : '')
+        }
+    };
+}
+
+function executeBrowserFetch(url, mode = 'text', pattern = '', maxChars = 4000) {
+    return new Promise(async (resolve) => {
+        // 1. Direct Media / YouTube playback detection (Instant 0-latency player registration)
+        const ytMatch = url.match(/(?:youtube\.com\/watch\?v=|youtu\.be\/|youtube\.com\/embed\/)([a-zA-Z0-9_-]{11})/i);
+        if (ytMatch) {
+            const videoId = ytMatch[1];
+            const ytDocId = 'yt_' + videoId;
+            const ytHtml = createYouTubePlayerHtml(videoId, 'YouTube Video');
+            const ytDoc = {
+                id: ytDocId,
+                url: `https://www.youtube.com/watch?v=${videoId}`,
+                title: 'YouTube Video',
+                html: ytHtml,
+                snippet: 'Interactive YouTube Player'
+            };
+            addRetrievedDocument(ytDoc);
+            resolve({
+                output: `[Retrieved YouTube Video: https://www.youtube.com/watch?v=${videoId} | Video player registered for preview]`,
+                retrieved_document: ytDoc
+            });
+            return;
+        }
+
+        // 2. Audio / Video Direct File Playback detection
+        if (/\.(mp4|webm|ogv|mp3|wav|ogg|m4a|aac)(\?.*)?$/i.test(url)) {
+            const isVideo = /\.(mp4|webm|ogv)(\?.*)?$/i.test(url);
+            const mediaHtml = `<!DOCTYPE html><html><head><meta charset="UTF-8"><title>Media Playback</title><style>body{margin:0;padding:24px;background:#0f0f0f;color:#fff;display:flex;flex-direction:column;align-items:center;justify-content:center;font-family:sans-serif;} video,audio{max-width:90%;border-radius:12px;box-shadow:0 8px 30px rgba(0,0,0,0.7);}</style></head><body><h3>Media Stream</h3>${isVideo ? `<video controls autoplay src="${escapeHtml(url)}" style="max-height:480px;"></video>` : `<audio controls autoplay src="${escapeHtml(url)}"></audio>`}<p><a href="${escapeHtml(url)}" target="_blank" style="color:#60a5fa;">${escapeHtml(url)}</a></p></body></html>`;
+            const mediaDoc = {
+                id: 'media_' + Date.now(),
+                url: url,
+                title: 'Media Playback',
+                html: mediaHtml,
+                snippet: 'Media Stream Player'
+            };
+            addRetrievedDocument(mediaDoc);
+            resolve({
+                output: `[Retrieved Media Stream: ${url} | Media player registered]`,
+                retrieved_document: mediaDoc
+            });
+            return;
+        }
+
+        // 3. Direct document / web page retrieval via backend engine tool executor
+        try {
+            const res = await fetch(`${getApiBase()}/api/tool/execute`, {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify({
+                    name: 'fetch_url',
+                    arguments: JSON.stringify({ url, mode, pattern, max_chars: maxChars }),
+                    timeout_ms: (agenticSettings.timeoutSec || 60) * 1000
+                })
+            });
+            const data = await res.json();
+            if (data.retrieved_document) {
+                const docText = data.output || data.retrieved_document.clean_text || '';
+                const ytMatchInDoc = docText.match(/(?:https?:\/\/)?(?:www\.)?(?:youtube\.com\/watch\?v=|youtu\.be\/|youtube\.com\/embed\/)([a-zA-Z0-9_-]{11})/i);
+                if (ytMatchInDoc && !data.retrieved_document.html) {
+                    data.retrieved_document.html = createYouTubePlayerHtml(ytMatchInDoc[1], data.retrieved_document.title || 'YouTube Video');
+                }
+                addRetrievedDocument(data.retrieved_document);
+            }
+            resolve({
+                output: data.output || JSON.stringify(data),
+                retrieved_document: data.retrieved_document
+            });
+            return;
+        } catch (err) {
+            console.warn('[executeBrowserFetch] Backend tool execute failed, falling back to embedded proxy:', err);
+        }
+
+        // 4. Fallback via embedded Moecher proxy (/api/proxy?url=...)
+        try {
+            const proxyRes = await fetch(`${getApiBase()}/api/proxy?url=${encodeURIComponent(url)}`);
+            const htmlStr = await proxyRes.text();
+            const parser = new DOMParser();
+            const parsedDoc = parser.parseFromString(htmlStr, 'text/html');
+            const res = extractFromLoadedDom(parsedDoc, url, mode, pattern, maxChars);
+            const finalText = (res && res.text) ? res.text : htmlStr.slice(0, maxChars);
+
+            let ytId = null;
+            const ytMatch = (htmlStr + ' ' + url).match(/(?:youtube\.com\/watch\?v=|youtu\.be\/|youtube\.com\/embed\/)([a-zA-Z0-9_-]{11})/i);
+            if (ytMatch) ytId = ytMatch[1];
+
+            const fetchedDoc = {
+                id: 'doc_' + Date.now(),
+                url: url,
+                title: parsedDoc.title || extractDomain(url),
+                html: ytId ? createYouTubePlayerHtml(ytId, parsedDoc.title || 'YouTube Video') : htmlStr,
+                snippet: finalText.slice(0, 300)
+            };
+            addRetrievedDocument(fetchedDoc);
+            resolve({
+                output: finalText,
+                retrieved_document: fetchedDoc
+            });
+        } catch (proxyErr) {
+            resolve({
+                output: `[Fetch error for ${url}: ${proxyErr.message}]`,
+                retrieved_document: null
+            });
+        }
+    });
+}
+
+async function executeClientToolCall(tc, turnRetrievedDocs = null) {
+    if (tc.name === 'fetch_url') {
+        let args = {};
+        try {
+            args = typeof tc.arguments === 'string' ? JSON.parse(tc.arguments) : (tc.arguments || {});
+        } catch (e) {
+            args = { url: tc.arguments };
+        }
+        let url = args.url || '';
+        if (!url.startsWith('http://') && !url.startsWith('https://')) {
+            url = `https://www.google.com/search?q=${encodeURIComponent(url)}&hl=en&gl=us`;
+        }
+        const mode = args.mode || 'text';
+        const pattern = args.pattern || '';
+        const maxChars = args.max_chars || 4000;
+
+        const fetchRes = await executeBrowserFetch(url, mode, pattern, maxChars);
+        if (typeof fetchRes === 'object' && fetchRes !== null) {
+            if (fetchRes.retrieved_document && turnRetrievedDocs) {
+                turnRetrievedDocs.push(fetchRes.retrieved_document);
+            }
+            return fetchRes.output || JSON.stringify(fetchRes);
+        }
+        return fetchRes;
+    } else if (tc.name === 'web_search' || tc.name === 'google_search') {
+        let args = {};
+        try {
+            args = typeof tc.arguments === 'string' ? JSON.parse(tc.arguments) : (tc.arguments || {});
+        } catch (e) {
+            args = { query: tc.arguments };
+        }
+        const query = args.query || '';
+        const provider = args.provider || agenticSettings.searchProvider || 'tavily';
+        const tavilyKey = args.tavily_api_key || agenticSettings.tavilyApiKey || '';
+
+        // Direct JavaScript Tavily AI execution (SDK Equivalent: @tavily/core)
+        if (provider === 'tavily' && tavilyKey) {
+            try {
+                const tavilyResult = await executeTavilySearchJS(query, tavilyKey, args.num_results || 5);
+                if (tavilyResult && !tavilyResult.error) {
+                    if (tavilyResult.retrieved_document) {
+                        addRetrievedDocument(tavilyResult.retrieved_document);
+                        if (turnRetrievedDocs) turnRetrievedDocs.push(tavilyResult.retrieved_document);
+                    }
+                    return tavilyResult.output;
+                }
+            } catch (jsErr) {
+                console.warn('[Tavily JS Client] Direct fetch fallback to backend:', jsErr);
+            }
+        }
+
+        if (!args.provider && agenticSettings.searchProvider) args.provider = agenticSettings.searchProvider;
+        if (!args.tavily_api_key && agenticSettings.tavilyApiKey) args.tavily_api_key = agenticSettings.tavilyApiKey;
+        if (!args.searxng_url && agenticSettings.searxngUrl) args.searxng_url = agenticSettings.searxngUrl;
+        if (!args.brave_api_key && agenticSettings.braveApiKey) args.brave_api_key = agenticSettings.braveApiKey;
+        if (!args.serper_api_key && agenticSettings.serperApiKey) args.serper_api_key = agenticSettings.serperApiKey;
+        if (!args.api_key && agenticSettings.googleApiKey) args.api_key = agenticSettings.googleApiKey;
+        if (!args.google_search_api_key && agenticSettings.googleApiKey) args.google_search_api_key = agenticSettings.googleApiKey;
+        if (!args.cx && agenticSettings.googleCx) args.cx = agenticSettings.googleCx;
+        if (!args.google_search_cx && agenticSettings.googleCx) args.google_search_cx = agenticSettings.googleCx;
+
+        try {
+            const res = await fetch(`${getApiBase()}/api/tool/execute`, {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify({
+                    name: 'web_search',
+                    arguments: JSON.stringify(args),
+                    timeout_ms: (agenticSettings.timeoutSec || 60) * 1000
+                })
+            });
+            const data = await res.json();
+            if (data.retrieved_document) {
+                addRetrievedDocument(data.retrieved_document);
+                if (turnRetrievedDocs) turnRetrievedDocs.push(data.retrieved_document);
+            }
+            return data.output || JSON.stringify(data);
+        } catch (err) {
+            return `[Failed to execute ${tc.name}: ${err.message}]`;
+        }
+    } else {
+        try {
+            const res = await fetch(`${getApiBase()}/api/tool/execute`, {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify({
+                    name: tc.name,
+                    arguments: tc.arguments,
+                    timeout_ms: (agenticSettings.timeoutSec || 60) * 1000,
+                    require_external_authorization: agenticSettings.requireAuth !== false,
+                    workspace_boundary_enforced: agenticSettings.boundaryEnforced !== false,
+                    authorized_paths: agenticSettings.authorizedPaths || []
+                })
+            });
+            const data = await res.json();
+            if (data.authorization_required) {
+                showAuthPrompt(data.authorization_required.tool, data.authorization_required.path, tc.id);
+            }
+            if (data.retrieved_document) {
+                addRetrievedDocument(data.retrieved_document);
+                if (turnRetrievedDocs) turnRetrievedDocs.push(data.retrieved_document);
+            }
+            return data.output || JSON.stringify(data);
+        } catch (err) {
+            return `[Failed to execute ${tc.name}: ${err.message}]`;
+        }
+    }
+}
+
 async function sendMessage() {
     const text = chatInput.value.trim();
     if (!text || isGenerating) return;
-    
+
     if (currentAbortController) {
         currentAbortController.abort();
     }
@@ -1812,7 +2841,7 @@ async function sendMessage() {
     // Create assistant message container
     const assistantMsgDiv = createMessageContainer('assistant');
     messagesContainer.appendChild(assistantMsgDiv);
-    
+
     // Add reasoning block (hidden initially)
     let reasoningBlock = null;
     let reasoningContent = null;
@@ -1830,44 +2859,19 @@ async function sendMessage() {
     `;
     mainContent.appendChild(liveIndicator);
 
-    // Build optimized messages payload with context pruning applied
-    const messagesToSend = buildOptimizedMessagesPayload();
-
     const isThinking = thinkingEnabled ? thinkingEnabled.checked : true;
     const budgetVal = isThinking ? (thinkingBudget ? parseInt(thinkingBudget.value, 10) : 4096) : 0;
-
-    const payload = {
-        model: "deepseek-v4-flash",
-        messages: messagesToSend,
-        max_tokens: parseInt(tokensInput.value, 10),
-        temperature: parseFloat(tempSlider.value),
-        stream: true,
-        thinking: { 
-            type: isThinking ? "enabled" : "disabled",
-            budget_tokens: budgetVal
-        },
-        max_thinking_tokens: budgetVal,
-        reasoning_effort: isThinking ? reasoningEffort.value : "none",
-        execution_timeout_sec: agenticSettings.timeoutSec || 60,
-        workspace_boundary_enforced: agenticSettings.boundaryEnforced !== false,
-        require_external_authorization: agenticSettings.requireAuth !== false,
-        authorized_paths: agenticSettings.authorizedPaths || []
-    };
-
     const activeTools = getActiveToolsPayload();
-    if (activeTools.length > 0) {
-        payload.tools = activeTools;
-    }
-
-    let rawReasoning = "";
-    let rawContent = "";
-    let isReasoningDone = false;
 
     const startTime = performance.now();
     let firstTokenTime = null;
-    let tokenCount = 0;
-    let promptTokens = 0;
-    let completionTokens = 0;
+    let totalPromptTokens = 0;
+    let totalCompletionTokens = 0;
+    let turnRetrievedDocs = [];
+    let isReasoningDone = false;
+
+    const maxRounds = 6;
+    let round = 0;
 
     try {
         const apiUrl = `${getApiBase()}/v1/chat/completions`;
@@ -1887,145 +2891,404 @@ async function sendMessage() {
             return JSON.stringify(obj);
         }
 
-        const response = await fetch(apiUrl, {
-            method: 'POST',
-            headers: { 
-                'Content-Type': 'application/json',
-                'Accept': 'text/event-stream'
-            },
-            body: pythonJsonDumps(payload),
-            signal: currentAbortController.signal
-        });
+        const clientUa = navigator.userAgent || '';
+        const clientLang = (navigator.languages && navigator.languages.length) ? navigator.languages.join(',') : (navigator.language || 'en-US,en');
+        const clientSecUa = (navigator.userAgentData && navigator.userAgentData.brands) ? navigator.userAgentData.brands.map(b => `"${b.brand}";v="${b.version}"`).join(', ') : '"Chromium";v="133", "Not(A:Brand";v="99", "Microsoft Edge";v="133"';
+        const clientMobile = (navigator.userAgentData && navigator.userAgentData.mobile) ? '?1' : '?0';
+        const clientPlatform = (navigator.userAgentData && navigator.userAgentData.platform) ? `"${navigator.userAgentData.platform}"` : '"Windows"';
+        const clientCookies = document.cookie || '';
 
-        const reader = response.body.getReader();
-        const decoder = new TextDecoder('utf-8');
-        let buffer = '';
+        while (round < maxRounds) {
+            round++;
+            const messagesToSend = buildOptimizedMessagesPayload();
 
-        while (true) {
-            const { done, value } = await reader.read();
-            if (done) break;
-            
-            buffer += decoder.decode(value, { stream: true });
-            const lines = buffer.split('\n');
-            buffer = lines.pop(); // Keep incomplete line
+            const payload = {
+                model: "deepseek-v4-flash",
+                messages: messagesToSend,
+                max_tokens: parseInt(tokensInput.value, 10),
+                temperature: parseFloat(tempSlider.value),
+                stream: true,
+                thinking: {
+                    type: isThinking ? "enabled" : "disabled",
+                    budget_tokens: budgetVal
+                },
+                max_thinking_tokens: budgetVal,
+                reasoning_effort: isThinking ? reasoningEffort.value : "none",
+                execution_timeout_sec: agenticSettings.timeoutSec || 60,
+                workspace_boundary_enforced: agenticSettings.boundaryEnforced !== false,
+                require_external_authorization: agenticSettings.requireAuth !== false,
+                authorized_paths: agenticSettings.authorizedPaths || [],
+                client_tool_execution: true,
+                client_context: {
+                    user_agent: clientUa,
+                    languages: clientLang,
+                    sec_ch_ua: clientSecUa,
+                    mobile: clientMobile,
+                    platform: clientPlatform,
+                    cookies: clientCookies
+                }
+            };
 
-            for (const line of lines) {
-                if (line.startsWith('data: ')) {
-                    const dataStr = line.slice(6);
-                    if (dataStr === '[DONE]') break;
-                    
-                    try {
-                        const data = JSON.parse(dataStr);
+            if (activeTools.length > 0) {
+                payload.tools = activeTools;
+            }
 
-                        if (data.usage) {
-                            if (data.usage.prompt_tokens !== undefined) promptTokens = data.usage.prompt_tokens;
-                            if (data.usage.completion_tokens !== undefined) completionTokens = data.usage.completion_tokens;
-                        }
-                        
-                        if (data.choices && data.choices.length > 0) {
-                            const delta = data.choices[0].delta || {};
+            let roundReasoning = "";
+            let roundContent = "";
+            let roundToolCalls = [];
+            let roundFinishReason = "stop";
 
-                            if (delta.retrieved_document) {
-                                addRetrievedDocument(delta.retrieved_document);
+            const response = await fetch(apiUrl, {
+                method: 'POST',
+                headers: {
+                    'Content-Type': 'application/json',
+                    'Accept': 'text/event-stream',
+                    'X-Client-Tool-Execution': 'true',
+                    'X-Client-User-Agent': clientUa,
+                    'X-Client-Accept-Language': clientLang,
+                    'X-Client-Cookie': clientCookies
+                },
+                body: pythonJsonDumps(payload),
+                signal: currentAbortController.signal
+            });
+
+            if (!response.ok) {
+                throw new Error(`Server returned error ${response.status}: ${response.statusText}`);
+            }
+
+            const reader = response.body.getReader();
+            const decoder = new TextDecoder('utf-8');
+            let buffer = '';
+
+            while (true) {
+                const { done, value } = await reader.read();
+                if (done) break;
+
+                buffer += decoder.decode(value, { stream: true });
+                const lines = buffer.split('\n');
+                buffer = lines.pop(); // Keep incomplete line
+
+                for (const line of lines) {
+                    if (line.startsWith('data: ')) {
+                        const dataStr = line.slice(6);
+                        if (dataStr === '[DONE]') break;
+
+                        try {
+                            const data = JSON.parse(dataStr);
+
+                            if (data.usage) {
+                                if (data.usage.prompt_tokens !== undefined) totalPromptTokens += data.usage.prompt_tokens;
+                                if (data.usage.completion_tokens !== undefined) totalCompletionTokens += data.usage.completion_tokens;
                             }
 
-                            if (delta.authorization_required) {
-                                showAuthPrompt(delta.authorization_required.tool, delta.authorization_required.path, delta.authorization_required.id);
-                            }
-                            
-                            if (delta.reasoning_content !== undefined) {
-                                if (firstTokenTime === null) firstTokenTime = performance.now();
-                                tokenCount++;
+                            if (data.choices && data.choices.length > 0) {
+                                const choice = data.choices[0];
+                                const delta = choice.delta || {};
+                                if (choice.finish_reason) {
+                                    roundFinishReason = choice.finish_reason;
+                                }
 
-                                const statusText = liveIndicator ? liveIndicator.querySelector('.status-msg-text') : null;
-                                if (statusText) statusText.textContent = 'Reasoning and analyzing query...';
+                                if (delta.retrieved_document) {
+                                    turnRetrievedDocs.push(delta.retrieved_document);
+                                    addRetrievedDocument(delta.retrieved_document);
+                                }
 
-                                if (!reasoningBlock) {
-                                    reasoningBlock = document.createElement('details');
-                                    reasoningBlock.className = 'reasoning-block';
-                                    reasoningBlock.open = true;
-                                    
-                                    const summary = document.createElement('summary');
-                                    summary.innerHTML = '<span class="thinking-spinner">progress_activity</span> Thinking...';
-                                    
-                                    reasoningContent = document.createElement('div');
-                                    reasoningContent.className = 'reasoning-content';
-                                    
-                                    reasoningBlock.appendChild(summary);
-                                    reasoningBlock.appendChild(reasoningContent);
-                                    assistantMsgDiv.querySelector('.msg-content').insertBefore(reasoningBlock, mainContent);
-                                } else {
-                                    reasoningBlock.open = true;
-                                    const summary = reasoningBlock.querySelector('summary');
-                                    if (summary && !summary.querySelector('.thinking-spinner')) {
+                                if (delta.authorization_required) {
+                                    showAuthPrompt(delta.authorization_required.tool, delta.authorization_required.path, delta.authorization_required.id);
+                                }
+
+                                if (delta.tool_calls && Array.isArray(delta.tool_calls)) {
+                                    for (const tc of delta.tool_calls) {
+                                        const idx = tc.index !== undefined ? tc.index : roundToolCalls.length;
+                                        if (!roundToolCalls[idx]) {
+                                            roundToolCalls[idx] = { id: tc.id || ('tc_' + idx), type: tc.type || 'function', name: '', arguments: '' };
+                                        }
+                                        if (tc.id) roundToolCalls[idx].id = tc.id;
+                                        if (tc.function) {
+                                            if (tc.function.name) roundToolCalls[idx].name = tc.function.name;
+                                            if (tc.function.arguments) roundToolCalls[idx].arguments += tc.function.arguments;
+                                        }
+                                    }
+                                }
+
+                                if (delta.reasoning_content !== undefined) {
+                                    if (firstTokenTime === null) firstTokenTime = performance.now();
+
+                                    const statusText = liveIndicator ? liveIndicator.querySelector('.status-msg-text') : null;
+                                    if (statusText) statusText.textContent = 'Reasoning and analyzing query...';
+
+                                    if (!reasoningBlock) {
+                                        reasoningBlock = document.createElement('details');
+                                        reasoningBlock.className = 'reasoning-block';
+                                        reasoningBlock.open = true;
+
+                                        const summary = document.createElement('summary');
                                         summary.innerHTML = '<span class="thinking-spinner">progress_activity</span> Thinking...';
-                                    }
-                                }
 
-                                // Check if delta is an in-place update to an existing active tool card
-                                const toolIdMatch = delta.reasoning_content.match(/id="(tool-act-[^"]+)"/);
-                                let replaced = false;
-                                if (toolIdMatch) {
-                                    const actId = toolIdMatch[1];
-                                    const regex = new RegExp('<div class="tool-activity-block active"[^>]*id="' + actId + '"[\\s\\S]*?<\\/div>', 'g');
-                                    if (regex.test(rawReasoning)) {
-                                        rawReasoning = rawReasoning.replace(regex, delta.reasoning_content.trim());
-                                        replaced = true;
-                                    }
-                                }
-                                if (!replaced) {
-                                    rawReasoning += delta.reasoning_content;
-                                }
-                                reasoningContent.innerHTML = marked.parse(rawReasoning);
-                            } 
-                            
-                            if (delta.content !== undefined) {
-                                if (firstTokenTime === null) firstTokenTime = performance.now();
-                                tokenCount++;
+                                        reasoningContent = document.createElement('div');
+                                        reasoningContent.className = 'reasoning-content';
 
-                                if (liveIndicator && liveIndicator.parentElement) {
-                                    liveIndicator.remove();
-                                }
-
-                                // Check if delta is an in-place update to an existing active tool card (when thinking is disabled)
-                                const toolIdMatch = delta.content.match(/id="(tool-act-[^"]+)"/);
-                                let replaced = false;
-                                if (toolIdMatch) {
-                                    const actId = toolIdMatch[1];
-                                    const regex = new RegExp('<div class="tool-activity-block active"[^>]*id="' + actId + '"[\\s\\S]*?<\\/div>', 'g');
-                                    if (regex.test(rawContent)) {
-                                        rawContent = rawContent.replace(regex, delta.content.trim());
-                                        replaced = true;
-                                        renderMarkdownContent(rawContent, mainContent);
-                                    }
-                                }
-
-                                if (!replaced) {
-                                    // When final answer content arrives, close the reasoning block if open
-                                    if (reasoningBlock && !isReasoningDone) {
-                                        isReasoningDone = true;
-                                        reasoningBlock.open = false;
+                                        reasoningBlock.appendChild(summary);
+                                        reasoningBlock.appendChild(reasoningContent);
+                                        assistantMsgDiv.querySelector('.msg-content').insertBefore(reasoningBlock, mainContent);
+                                    } else {
+                                        reasoningBlock.open = true;
                                         const summary = reasoningBlock.querySelector('summary');
-                                        if (summary) summary.innerHTML = 'Thought process';
+                                        if (summary && !summary.querySelector('.thinking-spinner')) {
+                                            summary.innerHTML = '<span class="thinking-spinner">progress_activity</span> Thinking...';
+                                        }
                                     }
-                                    rawContent += delta.content;
-                                    renderMarkdownContent(rawContent, mainContent);
+
+                                    const toolIdMatch = delta.reasoning_content.match(/id="(tool-act-[^"]+)"/);
+                                    let replaced = false;
+                                    if (toolIdMatch) {
+                                        const actId = toolIdMatch[1];
+                                        const regex = new RegExp('<div class="tool-activity-block active"[^>]*id="' + actId + '"[\\s\\S]*?<\\/div>', 'g');
+                                        if (regex.test(roundReasoning)) {
+                                            roundReasoning = roundReasoning.replace(regex, delta.reasoning_content.trim());
+                                            replaced = true;
+                                        }
+                                    }
+                                    if (!replaced) {
+                                        roundReasoning += delta.reasoning_content;
+                                    }
+                                    reasoningContent.innerHTML = marked.parse(roundReasoning);
+                                }
+
+                                if (delta.content !== undefined) {
+                                    if (firstTokenTime === null) firstTokenTime = performance.now();
+
+                                    if (liveIndicator && liveIndicator.parentElement) {
+                                        liveIndicator.remove();
+                                    }
+
+                                    const toolIdMatch = delta.content.match(/id="(tool-act-[^"]+)"/);
+                                    let replaced = false;
+                                    if (toolIdMatch) {
+                                        const actId = toolIdMatch[1];
+                                        const regex = new RegExp('<div class="tool-activity-block active"[^>]*id="' + actId + '"[\\s\\S]*?<\\/div>', 'g');
+                                        if (regex.test(roundContent)) {
+                                            roundContent = roundContent.replace(regex, delta.content.trim());
+                                            replaced = true;
+                                            renderMarkdownContent(roundContent, mainContent);
+                                        }
+                                    }
+
+                                    if (!replaced) {
+                                        if (reasoningBlock && !isReasoningDone) {
+                                            isReasoningDone = true;
+                                            reasoningBlock.open = false;
+                                            const summary = reasoningBlock.querySelector('summary');
+                                            if (summary) summary.innerHTML = 'Thought process';
+                                        }
+                                        roundContent += delta.content;
+
+                                        // Filter out raw tool call JSON so it never pollutes the chat UI
+                                        const displayContent = stripToolCallsFromText(roundContent);
+                                        if (displayContent.length > 0) {
+                                            renderMarkdownContent(displayContent, mainContent);
+                                        } else if (isRawToolCallString(roundContent)) {
+                                            mainContent.innerHTML = '';
+                                        }
+                                    }
                                 }
                             }
-                        }
-                        
-                        messagesContainer.scrollTo({
-                            top: messagesContainer.scrollHeight,
-                            behavior: 'smooth'
-                        });
 
-                    } catch (e) {
-                        console.error('JSON Parse error', e, dataStr);
+                            messagesContainer.scrollTo({
+                                top: messagesContainer.scrollHeight,
+                                behavior: 'smooth'
+                            });
+
+                        } catch (e) {
+                            console.error('JSON Parse error', e, dataStr);
+                        }
                     }
                 }
             }
+
+            const validToolCalls = roundToolCalls.filter(tc => tc && tc.name);
+
+            if (validToolCalls.length > 0 && (roundFinishReason === 'tool_calls' || roundFinishReason === 'stop')) {
+                const cleanRoundContent = stripToolCallsFromText(roundContent);
+                if (cleanRoundContent.length > 0) {
+                    renderMarkdownContent(cleanRoundContent, mainContent);
+                } else {
+                    mainContent.innerHTML = '';
+                }
+
+                chatHistory.push({
+                    role: 'assistant',
+                    content: cleanRoundContent,
+                    reasoning_content: roundReasoning || undefined,
+                    tool_calls: validToolCalls.map(tc => ({
+                        id: tc.id,
+                        type: tc.type || 'function',
+                        function: { name: tc.name, arguments: tc.arguments }
+                    }))
+                });
+
+                for (const tc of validToolCalls) {
+                    let toolTarget = '';
+                    let actionLabel = 'Executing tool';
+                    let doneIcon = 'done';
+                    let completedLabel = 'Completed';
+
+                    try {
+                        const parsedArgs = typeof tc.arguments === 'string' ? JSON.parse(tc.arguments) : tc.arguments;
+                        if (tc.name === 'web_search' || tc.name === 'google_search') {
+                            toolTarget = parsedArgs.query || '';
+                            const prov = agenticSettings.searchProvider || 'web';
+                            let provName = 'Web';
+                            if (prov === 'tavily') provName = 'Tavily';
+                            else if (prov === 'searxng') provName = 'SearXNG';
+                            else if (prov === 'brave') provName = 'Brave';
+                            else if (prov === 'serper') provName = 'Serper';
+                            else if (prov === 'google') provName = 'Google';
+                            actionLabel = `${provName} Searching`;
+                            doneIcon = 'travel_explore';
+                            completedLabel = `${provName} Searched`;
+                        } else if (tc.name === 'fetch_url') {
+                            toolTarget = parsedArgs.url || '';
+                            actionLabel = 'Browsing web page';
+                            doneIcon = 'travel_explore';
+                            completedLabel = 'Rendered DOM';
+                        } else if (tc.name === 'read_file') {
+                            toolTarget = parsedArgs.path || '';
+                            actionLabel = 'Reading file';
+                            doneIcon = 'description';
+                            completedLabel = 'Read file';
+                        } else if (tc.name === 'write_file') {
+                            toolTarget = parsedArgs.path || '';
+                            actionLabel = 'Writing file';
+                            doneIcon = 'edit_document';
+                            completedLabel = 'Wrote file';
+                        } else if (tc.name === 'edit_file') {
+                            toolTarget = parsedArgs.path || '';
+                            actionLabel = 'Editing file';
+                            doneIcon = 'find_replace';
+                            completedLabel = 'Edited file';
+                        } else if (tc.name === 'execute_command') {
+                            toolTarget = parsedArgs.command || '';
+                            actionLabel = 'Running command';
+                            doneIcon = 'terminal';
+                            completedLabel = 'Executed';
+                        }
+                    } catch (e) {
+                        toolTarget = tc.arguments || '';
+                    }
+
+                    const activeCardHtml = `
+<div class="tool-activity-block active" id="tool-act-${tc.id}">
+  <span class="thinking-spinner">progress_activity</span>
+  <span class="tool-action-label">${escapeHtml(actionLabel)}</span>
+  <span class="tool-target-subtle">${escapeHtml(toolTarget)}</span>
+</div>
+`;
+                    const toolTargetContainer = (reasoningContent && !isReasoningDone) ? reasoningContent : mainContent;
+                    toolTargetContainer.insertAdjacentHTML('beforeend', activeCardHtml);
+
+                    const toolOutput = await executeClientToolCall(tc, turnRetrievedDocs);
+
+                    const activeCardEl = document.getElementById(`tool-act-${tc.id}`);
+                    if (activeCardEl) {
+                        activeCardEl.className = 'tool-activity-block completed';
+                        activeCardEl.innerHTML = `
+  <span class="material-symbols-outlined tool-done-icon">${doneIcon}</span>
+  <span class="tool-action-label">${escapeHtml(completedLabel)}</span>
+  <span class="tool-target-subtle">${escapeHtml(toolTarget)}</span>
+`;
+                    }
+
+                    chatHistory.push({
+                        role: 'tool',
+                        tool_call_id: tc.id,
+                        content: toolOutput
+                    });
+                }
+
+                continue;
+            }
+
+            chatHistory.push({
+                role: 'assistant',
+                content: roundContent,
+                reasoning_content: roundReasoning || undefined
+            });
+
+            // --- Turn Media & Preview Detection ---
+            let turnMediaDoc = null;
+
+            // 1. Check all turnRetrievedDocs from this turn
+            for (let i = turnRetrievedDocs.length - 1; i >= 0; i--) {
+                const d = turnRetrievedDocs[i];
+                if (!d) continue;
+                if (d.html && (d.html.includes('youtube-nocookie.com/embed') || d.html.includes('youtube.com/iframe_api') || d.html.includes('<video') || d.html.includes('<audio'))) {
+                    turnMediaDoc = d;
+                    break;
+                }
+                if (d.url && (d.url.includes('watch?v=') || d.url.includes('youtu.be') || d.url.includes('youtube.com/embed'))) {
+                    const m = d.url.match(/(?:watch\?v=|youtu\.be\/|youtube\.com\/embed\/)([a-zA-Z0-9_-]{11})/i);
+                    if (m) {
+                        turnMediaDoc = {
+                            id: 'yt_' + m[1],
+                            url: `https://www.youtube.com/watch?v=${m[1]}`,
+                            title: d.title || 'YouTube Video',
+                            html: createYouTubePlayerHtml(m[1], d.title || 'YouTube Video'),
+                            snippet: 'Interactive YouTube Player'
+                        };
+                        addRetrievedDocument(turnMediaDoc);
+                        break;
+                    }
+                }
+            }
+
+            // 2. If not found in turnRetrievedDocs, check all tool outputs in chatHistory from this turn
+            if (!turnMediaDoc) {
+                const toolOutputs = chatHistory.filter(m => m.role === 'tool').map(m => m.content || '').join('\n');
+                const ytMatch = toolOutputs.match(/(?:https?:\/\/)?(?:www\.)?(?:youtube\.com\/watch\?v=|youtu\.be\/|youtube\.com\/embed\/)([a-zA-Z0-9_-]{11})/i);
+                if (ytMatch) {
+                    const videoId = ytMatch[1];
+                    const ytHtml = createYouTubePlayerHtml(videoId, 'YouTube Video');
+                    turnMediaDoc = {
+                        id: 'yt_' + videoId,
+                        url: `https://www.youtube.com/watch?v=${videoId}`,
+                        title: 'YouTube Video',
+                        html: ytHtml,
+                        snippet: 'Interactive YouTube Player'
+                    };
+                    addRetrievedDocument(turnMediaDoc);
+                }
+            }
+
+            // 3. If not found in tool outputs, check the assistant response (roundContent)
+            if (!turnMediaDoc) {
+                const ytMatch = roundContent.match(/(?:https?:\/\/)?(?:www\.)?(?:youtube\.com\/watch\?v=|youtu\.be\/|youtube\.com\/embed\/)([a-zA-Z0-9_-]{11})/i);
+                if (ytMatch) {
+                    const videoId = ytMatch[1];
+                    const ytHtml = createYouTubePlayerHtml(videoId, 'YouTube Video');
+                    turnMediaDoc = {
+                        id: 'yt_' + videoId,
+                        url: `https://www.youtube.com/watch?v=${videoId}`,
+                        title: 'YouTube Video',
+                        html: ytHtml,
+                        snippet: 'Interactive YouTube Player'
+                    };
+                    addRetrievedDocument(turnMediaDoc);
+                }
+            }
+
+            // 4. Check if turn generated an explicit HTML code block or web app
+            const turnHtml = getTurnHtmlCode(assistantMsgDiv, roundContent);
+
+            if (turnMediaDoc && turnMediaDoc.html) {
+                loadHtmlIntoPreview(turnMediaDoc.html, true);
+            } else if (turnHtml && turnHtml.trim().length > 0) {
+                loadHtmlIntoPreview(turnHtml, false);
+            }
+
+            break;
         }
-        
+
         const endTime = performance.now();
         if (firstTokenTime === null) firstTokenTime = endTime;
         const ttftMs = firstTokenTime - startTime;
@@ -2033,21 +3296,21 @@ async function sendMessage() {
         const ttftSec = ttftMs / 1000.0;
         const decodeSec = decodeTimeMs / 1000.0;
 
-        const actualCompletionTokens = completionTokens > 0 ? completionTokens : tokenCount;
-        const prefillTps = (ttftSec > 0 && promptTokens > 0) ? (promptTokens / ttftSec) : 0.0;
+        const actualCompletionTokens = totalCompletionTokens > 0 ? totalCompletionTokens : 1;
+        const prefillTps = (ttftSec > 0 && totalPromptTokens > 0) ? (totalPromptTokens / ttftSec) : 0.0;
         const decodeTps = (decodeSec > 0 && actualCompletionTokens > 1) ? ((actualCompletionTokens - 1) / decodeSec) : 0.0;
 
         const lastStats = {
             ttftSec,
             decodeSec,
-            promptTokens,
+            promptTokens: totalPromptTokens,
             completionTokens: actualCompletionTokens,
             prefillTps,
             decodeTps
         };
 
         sessionStats.totalTurns++;
-        sessionStats.totalPromptTokens += promptTokens;
+        sessionStats.totalPromptTokens += totalPromptTokens;
         sessionStats.totalCompletionTokens += actualCompletionTokens;
         sessionStats.totalTtftMs += ttftMs;
         sessionStats.totalDecodeTimeMs += decodeTimeMs;
@@ -2061,15 +3324,6 @@ async function sendMessage() {
             }
         }
 
-        // Final pass on message content
-        renderMarkdownContent(rawContent, mainContent);
-
-        chatHistory.push({
-            role: 'assistant',
-            content: rawContent,
-            reasoning_content: rawReasoning || undefined
-        });
-        
     } catch (err) {
         if (err.name === 'AbortError') {
             console.log('Request aborted by user.');
@@ -2079,18 +3333,10 @@ async function sendMessage() {
                 const summaryEl = reasoningBlock.querySelector('summary');
                 if (summaryEl) summaryEl.innerHTML = 'Thought process (stopped)';
             }
-            if (rawContent || rawReasoning) {
-                renderMarkdownContent(rawContent, mainContent);
-                chatHistory.push({
-                    role: 'assistant',
-                    content: rawContent,
-                    reasoning_content: rawReasoning || undefined
-                });
-            }
             return;
         }
         console.error(err);
-        mainContent.innerHTML += `<br><br><b>Error:</b> Failed to connect to engine. Make sure it's running.`;
+        mainContent.innerHTML += `<br><br><b>Error:</b> ${escapeHtml(err.message || "Failed to connect to engine. Make sure it's running.")}`;
     } finally {
         currentAbortController = null;
         setGeneratingState(false);
@@ -2102,7 +3348,6 @@ async function sendMessage() {
                 summary.innerHTML = 'Thought process';
             }
         }
-        // Refresh expert specialization profile after generation
         fetchExpertProfile();
     }
 }
@@ -2110,10 +3355,10 @@ async function sendMessage() {
 function createMessageContainer(role) {
     const div = document.createElement('div');
     div.className = `message ${role}`;
-    
+
     const contentWrapper = document.createElement('div');
     contentWrapper.className = 'msg-content';
-    
+
     div.appendChild(contentWrapper);
     return div;
 }
@@ -2316,8 +3561,22 @@ if (menuBtn && sidebar) {
     });
 }
 
+// Clean up any legacy Service Worker interceptors
+function initProxyServiceWorker() {
+    if ('serviceWorker' in navigator) {
+        navigator.serviceWorker.getRegistrations().then(registrations => {
+            for (const r of registrations) {
+                r.unregister();
+            }
+        }).catch(err => {
+            console.debug('[SW] ServiceWorker unregister error:', err);
+        });
+    }
+}
+
 // Run initialization on DOM load
 document.addEventListener('DOMContentLoaded', () => {
+    initProxyServiceWorker();
     initPreviewPanel();
     initExpertProfileUI();
     initAgenticSettingsUI();

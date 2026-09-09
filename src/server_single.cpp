@@ -41,7 +41,24 @@
 #include <cublas_v2.h>
 #include <immintrin.h>
 #include <nlohmann/json.hpp>
+
+#ifndef CPPHTTPLIB_FORM_URL_ENCODED_PAYLOAD_MAX_LENGTH
+#define CPPHTTPLIB_FORM_URL_ENCODED_PAYLOAD_MAX_LENGTH (64 * 1024 * 1024)
+#endif
+#ifndef CPPHTTPLIB_PAYLOAD_MAX_LENGTH
+#define CPPHTTPLIB_PAYLOAD_MAX_LENGTH (64 * 1024 * 1024)
+#endif
+#ifndef CPPHTTPLIB_HEADER_MAX_LENGTH
+#define CPPHTTPLIB_HEADER_MAX_LENGTH (1024 * 1024)
+#endif
+#ifndef CPPHTTPLIB_REQUEST_URI_MAX_LENGTH
+#define CPPHTTPLIB_REQUEST_URI_MAX_LENGTH (1024 * 1024)
+#endif
+
 #include <httplib.h>
+#ifdef _WIN32
+#include <wininet.h>
+#endif
 
 #include "activations.cuh"
 
@@ -87,6 +104,7 @@ bool g_track_experts = false;
 bool g_track_reset = false;
 bool g_enable_tools = true;
 bool g_server_exec = true;
+bool g_headless_browsing = false;
 static std::atomic<bool> g_stop_requested{false};
 
 
@@ -3012,7 +3030,8 @@ public:
         // Load tokenizer
         std::string tok_path = manifest["tokenizer"]["tokenizer_json"].get<std::string>();
         std::string tok_full = (base_dir / tok_path).string();
-        if (!tokenizer_.load(tok_full) && !tokenizer_.load(tok_path)) {
+        if (!tokenizer_.load(tok_full) && !tokenizer_.load(tok_path) &&
+            !tokenizer_.load("tokenizer.json") && !tokenizer_.load((base_dir / "tokenizer.json").string())) {
             LOG_ERROR("Failed to load tokenizer from %s or %s", tok_full.c_str(), tok_path.c_str());
             return false;
         }
@@ -3508,6 +3527,8 @@ public:
         // Disable tracking during prompt prefill (prevents system prompt boilerplate from skewing stats)
         track_current_token_ = false;
 
+        auto prefill_start_time = std::chrono::steady_clock::now();
+
         if (prefix_len < prompt.size()) {
             ensure_prefill_host_capacity(prompt.size());
             for (size_t i = prefix_len; i < prompt.size(); i++) {
@@ -3519,6 +3540,8 @@ public:
                 CUDA_CHECK(cudaMallocHost(&h_single_flag_, sizeof(int32_t)));
             }
             *h_single_flag_ = 0;
+
+            bool draft_model_active = (!mtp_drafter_.loaded_ && qwen_draft_.loaded_);
 
             if (cfg_.architecture == ModelArch::QWEN) {
                 size_t curr = prefix_len;
@@ -3536,7 +3559,7 @@ public:
                         } else {
                             forward_token_batch_qwen_device_body((int)curr, chunk_m);
                         }
-                        if (qwen_draft_.loaded_) {
+                        if (draft_model_active) {
                             for (int m = 0; m < chunk_m; m++) {
                                 qwen_draft_.forward_token_async_pinned(&h_prefill_tok_[curr + m],
                                                                        &h_prefill_pos_[curr + m],
@@ -3554,7 +3577,7 @@ public:
                         } else {
                             forward_token_eager(prompt[curr], (int)curr);
                         }
-                        if (qwen_draft_.loaded_) {
+                        if (draft_model_active) {
                             qwen_draft_.forward_token_async_pinned(&h_prefill_tok_[curr],
                                                                    &h_prefill_pos_[curr],
                                                                    (int)curr, main_stream_);
@@ -3573,7 +3596,7 @@ public:
                     } else {
                         forward_token_eager(prompt[curr], (int)curr);
                     }
-                    if (qwen_draft_.loaded_) {
+                    if (draft_model_active) {
                         qwen_draft_.forward_token_async_pinned(&h_prefill_tok_[curr],
                                                                &h_prefill_pos_[curr],
                                                                (int)curr, main_stream_);
@@ -3596,6 +3619,15 @@ public:
             // Synchronize main_stream_ ONCE at the end of the entire prefill pipeline
             CUDA_CHECK(cudaStreamSynchronize(main_stream_));
         }
+
+        auto prefill_end_time = std::chrono::steady_clock::now();
+        double prefill_sec = std::chrono::duration<double>(prefill_end_time - prefill_start_time).count();
+        size_t evaluated_tokens = (prompt.size() > prefix_len) ? (prompt.size() - prefix_len) : 0;
+        double prefill_tps = (prefill_sec > 0.0 && evaluated_tokens > 0) ? (double)evaluated_tokens / prefill_sec : 0.0;
+        LOG_INFO("[PREFILL STATS] %zu tokens evaluated in %.3fs -> %.2f tok/s (prefix cached: %zu / %zu, %.1f%%)",
+                 evaluated_tokens, prefill_sec, prefill_tps,
+                 prefix_len, prompt.size(),
+                 prompt.empty() ? 0.0 : (100.0 * prefix_len / prompt.size()));
 
         // Token generation loop
         std::vector<int> output_ids;
@@ -3700,6 +3732,10 @@ public:
             }
 
             std::string token_text = tokenizer_.decode({next_token});
+            if (in_think_block && (token_text.find("</think>") != std::string::npos || (token_buffer + token_text).find("</think>") != std::string::npos)) {
+                in_think_block = false;
+                think_block_ended = true;
+            }
             if (in_think_block) {
                 last_think_token_str = token_text;
             }
@@ -6578,19 +6614,23 @@ static std::vector<int> apply_chat_template(const json& messages, const BPEToken
             "<tool_call>\n"
             "{\"name\": \"<function-name>\", \"arguments\": <args-json-object>}\n"
             "</tool_call>\n\n"
-            "## Tool Usage Guidelines:\n"
-            "- read_file: View file content with optional start_line / end_line. Always inspect files before modifying them.\n"
-            "- write_file: Write or create complete files.\n"
-            "- edit_file: Perform precise search-and-replace on a unique snippet within a file.\n"
-            "- execute_command: Run system commands, build scripts, tests, directory listings (e.g. dir, ls, git).\n"
-            "- fetch_url: Retrieve web content, search DuckDuckGo, or trigger YouTube playback.\n"
+            "## Tool Usage Instructions:\n"
+            "- CRITICAL RULE: When the user asks to search the web, search Google, look up facts, recent news, people, documentation, code, or websites, you MUST immediately invoke the `web_search` tool.\n"
+            "- When the user provides a specific URL or asks to inspect, fetch, or browse a website, invoke the `fetch_url` tool.\n"
+            "- When the user asks to read, write, or edit local files, invoke `read_file`, `write_file`, or `edit_file`.\n"
+            "- When the user asks to run terminal commands or inspect system state, invoke `execute_command`.\n"
+            "- For simple greetings (e.g. 'hello', 'hi'), answer conversationally without calling tools.\n"
+            "- Example tool call:\n"
+            "<tool_call>\n"
+            "{\"name\": \"web_search\", \"arguments\": {\"query\": \"latest SpaceX rocket launch\"}}\n"
+            "</tool_call>\n"
             "When you emit a <tool_call>, the system will execute it and return the results in a <tool_response> block.\n"
             "\n"
             "## Media Playback & Web Preview Integration:\n"
             "You are integrated with an interactive client-side HTML Preview Panel that displays web pages and plays YouTube videos with autoplay.\n"
-            "- When the user asks to play a song, video, or watch media (e.g. 'play no one knows from youtube'):\n"
-            "  1. Use fetch_url to search (e.g. 'https://html.duckduckgo.com/html/?q=queens+of+the+stone+age+no+one+knows+youtube').\n"
-            "  2. Find the direct YouTube URL from the search results (e.g. 'https://www.youtube.com/watch?v=...').\n"
+            "- When the user asks to play a song, video, or find media:\n"
+            "  1. Use web_search or fetch_url to search YouTube (e.g. query='song name YouTube' or url='https://www.youtube.com/results?search_query=topic').\n"
+            "  2. Find the direct YouTube URL (e.g. 'https://www.youtube.com/watch?v=...').\n"
             "  3. Call fetch_url on that direct YouTube URL in the next turn.\n"
             "  4. Fetching the YouTube URL automatically opens the player in the user's preview panel and starts autoplay. Inform the user that the video is now playing in the preview panel!\n";
     }
@@ -6763,25 +6803,856 @@ static std::vector<int> apply_chat_template(const json& messages, const BPEToken
 }
 
 // ════════════════════════════════════════════════════════════════════════════════
+//  Forward Proxy Engine (HTTP & HTTPS CONNECT Tunneling)
+// ════════════════════════════════════════════════════════════════════════════════
+
+namespace moecher::proxy {
+
+static std::atomic<bool> g_proxy_running{false};
+static std::atomic<int> g_proxy_port{8002};
+#ifdef _WIN32
+static SOCKET g_proxy_listen_sock = INVALID_SOCKET;
+#else
+static int g_proxy_listen_sock = -1;
+#define SOCKET int
+#define INVALID_SOCKET -1
+#define SOCKET_ERROR -1
+#define closesocket close
+#endif
+
+// Helper to reliably send all bytes over socket
+static bool send_all(SOCKET s, const char* data, int len) {
+    int total = 0;
+    while (total < len) {
+        int n = send(s, data + total, len - total, 0);
+        if (n <= 0) return false;
+        total += n;
+    }
+    return true;
+}
+
+// Forward Proxy Client Handler
+static void handle_client_socket(SOCKET client_sock) {
+#ifdef _WIN32
+    DWORD timeout_ms = 15000;
+    setsockopt(client_sock, SOL_SOCKET, SO_RCVTIMEO, (const char*)&timeout_ms, sizeof(timeout_ms));
+    setsockopt(client_sock, SOL_SOCKET, SO_SNDTIMEO, (const char*)&timeout_ms, sizeof(timeout_ms));
+#else
+    struct timeval tv_to{15, 0};
+    setsockopt(client_sock, SOL_SOCKET, SO_RCVTIMEO, (const char*)&tv_to, sizeof(tv_to));
+    setsockopt(client_sock, SOL_SOCKET, SO_SNDTIMEO, (const char*)&tv_to, sizeof(tv_to));
+#endif
+
+    std::vector<char> req_vec(16384);
+    int bytes_read = recv(client_sock, req_vec.data(), (int)req_vec.size() - 1, 0);
+    if (bytes_read <= 0) {
+        closesocket(client_sock);
+        return;
+    }
+    req_vec[bytes_read] = '\0';
+    std::string req_str(req_vec.data(), bytes_read);
+
+    size_t line_end = req_str.find("\r\n");
+    if (line_end == std::string::npos) {
+        closesocket(client_sock);
+        return;
+    }
+
+    std::string first_line = req_str.substr(0, line_end);
+    std::istringstream iss(first_line);
+    std::string method, target, version;
+    iss >> method >> target >> version;
+
+    if (method.empty() || target.empty()) {
+        closesocket(client_sock);
+        return;
+    }
+
+    std::transform(method.begin(), method.end(), method.begin(), ::toupper);
+
+    std::cout << "[PROXY " << g_proxy_port.load() << "] " << method << " " << target << std::endl;
+
+    if (method == "OPTIONS") {
+        const char* preflight_resp = "HTTP/1.1 200 OK\r\n"
+                                      "Access-Control-Allow-Origin: *\r\n"
+                                      "Access-Control-Allow-Methods: GET, POST, PUT, DELETE, OPTIONS, HEAD\r\n"
+                                      "Access-Control-Allow-Headers: *\r\n"
+                                      "Access-Control-Expose-Headers: *\r\n"
+                                      "Access-Control-Max-Age: 86400\r\n"
+                                      "Content-Length: 0\r\n\r\n";
+        send_all(client_sock, preflight_resp, (int)strlen(preflight_resp));
+        closesocket(client_sock);
+        return;
+    }
+
+    if (method == "CONNECT") {
+        // HTTPS Tunneling: CONNECT host:port HTTP/1.1
+        std::string host;
+        int port = 443;
+        size_t colon = target.find(':');
+        if (colon != std::string::npos) {
+            host = target.substr(0, colon);
+            try { port = std::stoi(target.substr(colon + 1)); } catch (...) { port = 443; }
+        } else {
+            host = target;
+        }
+
+        struct addrinfo hints{}, *res = nullptr;
+        hints.ai_family = AF_UNSPEC;
+        hints.ai_socktype = SOCK_STREAM;
+        hints.ai_protocol = IPPROTO_TCP;
+
+        if (getaddrinfo(host.c_str(), std::to_string(port).c_str(), &hints, &res) != 0 || !res) {
+            const char* err_resp = "HTTP/1.1 502 Bad Gateway\r\nContent-Length: 0\r\n\r\n";
+            send(client_sock, err_resp, (int)strlen(err_resp), 0);
+            closesocket(client_sock);
+            return;
+        }
+
+        SOCKET remote_sock = INVALID_SOCKET;
+        for (struct addrinfo* ptr = res; ptr != nullptr; ptr = ptr->ai_next) {
+            remote_sock = socket(ptr->ai_family, ptr->ai_socktype, ptr->ai_protocol);
+            if (remote_sock == INVALID_SOCKET) continue;
+
+#ifdef _WIN32
+            DWORD r_timeout = 10000;
+            setsockopt(remote_sock, SOL_SOCKET, SO_RCVTIMEO, (const char*)&r_timeout, sizeof(r_timeout));
+            setsockopt(remote_sock, SOL_SOCKET, SO_SNDTIMEO, (const char*)&r_timeout, sizeof(r_timeout));
+#else
+            struct timeval r_tv{10, 0};
+            setsockopt(remote_sock, SOL_SOCKET, SO_RCVTIMEO, (const char*)&r_tv, sizeof(r_tv));
+            setsockopt(remote_sock, SOL_SOCKET, SO_SNDTIMEO, (const char*)&r_tv, sizeof(r_tv));
+#endif
+
+            if (connect(remote_sock, ptr->ai_addr, (int)ptr->ai_addrlen) == 0) {
+                break;
+            }
+            closesocket(remote_sock);
+            remote_sock = INVALID_SOCKET;
+        }
+        freeaddrinfo(res);
+
+        if (remote_sock == INVALID_SOCKET) {
+            const char* err_resp = "HTTP/1.1 504 Gateway Timeout\r\nContent-Length: 0\r\n\r\n";
+            send(client_sock, err_resp, (int)strlen(err_resp), 0);
+            closesocket(client_sock);
+            return;
+        }
+
+        const char* ok_resp = "HTTP/1.1 200 Connection Established\r\n\r\n";
+        if (!send_all(client_sock, ok_resp, (int)strlen(ok_resp))) {
+            closesocket(remote_sock);
+            closesocket(client_sock);
+            return;
+        }
+
+        char relay_buf[16384];
+        while (g_proxy_running.load()) {
+            fd_set read_fds;
+            FD_ZERO(&read_fds);
+            FD_SET(client_sock, &read_fds);
+            FD_SET(remote_sock, &read_fds);
+
+            struct timeval tv;
+            tv.tv_sec = 60;
+            tv.tv_usec = 0;
+
+            int max_fd = (int)std::max(client_sock, remote_sock);
+            int activity = select(max_fd + 1, &read_fds, nullptr, nullptr, &tv);
+            if (activity <= 0) break;
+
+            if (FD_ISSET(client_sock, &read_fds)) {
+                int n = recv(client_sock, relay_buf, sizeof(relay_buf), 0);
+                if (n <= 0) break;
+                if (!send_all(remote_sock, relay_buf, n)) break;
+            }
+
+            if (FD_ISSET(remote_sock, &read_fds)) {
+                int n = recv(remote_sock, relay_buf, sizeof(relay_buf), 0);
+                if (n <= 0) break;
+                if (!send_all(client_sock, relay_buf, n)) break;
+            }
+        }
+
+        closesocket(remote_sock);
+        closesocket(client_sock);
+        return;
+    }
+
+    // Forward HTTP Request (GET, POST, HEAD, PUT, DELETE)
+    std::string target_url = target;
+    std::string host_header = "";
+
+    std::unordered_map<std::string, std::string> req_headers;
+    size_t hdr_sep = req_str.find("\r\n\r\n");
+    std::string raw_hdrs = (hdr_sep != std::string::npos) ? req_str.substr(0, hdr_sep) : req_str;
+    std::string req_body = (hdr_sep != std::string::npos && hdr_sep + 4 < req_str.size()) ? req_str.substr(hdr_sep + 4) : "";
+
+    std::istringstream hdr_stream(raw_hdrs);
+    std::string hline;
+    std::getline(hdr_stream, hline); // Skip first line
+    while (std::getline(hdr_stream, hline)) {
+        if (!hline.empty() && hline.back() == '\r') hline.pop_back();
+        size_t cpos = hline.find(':');
+        if (cpos != std::string::npos) {
+            std::string hname = hline.substr(0, cpos);
+            std::string hval = hline.substr(cpos + 1);
+            while (!hval.empty() && hval.front() == ' ') hval.erase(0, 1);
+            std::string hname_lower = hname;
+            std::transform(hname_lower.begin(), hname_lower.end(), hname_lower.begin(), ::tolower);
+            req_headers[hname_lower] = hval;
+        }
+    }
+
+    if (req_headers.count("host")) {
+        host_header = req_headers["host"];
+    }
+
+    if (target_url.rfind("/fetch?url=", 0) == 0) {
+        target_url = moecher::tooling::url_decode(target_url.substr(11));
+    } else if (target_url.rfind("/proxy?url=", 0) == 0) {
+        target_url = moecher::tooling::url_decode(target_url.substr(11));
+    } else if (target_url.rfind("/api/proxy?url=", 0) == 0) {
+        target_url = moecher::tooling::url_decode(target_url.substr(15));
+    } else if (target_url.rfind("/https://", 0) == 0) {
+        target_url = target_url.substr(1);
+    } else if (target_url.rfind("/http://", 0) == 0) {
+        target_url = target_url.substr(1);
+    } else if (target_url.rfind("http://", 0) != 0 && target_url.rfind("https://", 0) != 0) {
+        if (!host_header.empty()) {
+            target_url = "http://" + host_header + (target_url.front() == '/' ? target_url : ("/" + target_url));
+        }
+    }
+
+    if (target_url.empty()) {
+        closesocket(client_sock);
+        return;
+    }
+
+    // Upgrade http to https for upstream fetch to bypass redirects and use TLS securely
+    std::string upstream_url = target_url;
+    if (upstream_url.rfind("http://", 0) == 0 &&
+        upstream_url.find("localhost") == std::string::npos &&
+        upstream_url.find("127.0.0.1") == std::string::npos) {
+        upstream_url = "https://" + upstream_url.substr(7);
+    }
+
+#if defined(_WIN32) || defined(_WIN64)
+    int wlen = MultiByteToWideChar(CP_UTF8, 0, upstream_url.c_str(), -1, NULL, 0);
+    std::vector<wchar_t> wurl(wlen);
+    MultiByteToWideChar(CP_UTF8, 0, upstream_url.c_str(), -1, wurl.data(), wlen);
+
+    URL_COMPONENTS url_comp;
+    ZeroMemory(&url_comp, sizeof(url_comp));
+    url_comp.dwStructSize = sizeof(url_comp);
+    url_comp.dwHostNameLength = (DWORD)-1;
+    url_comp.dwUrlPathLength = (DWORD)-1;
+    url_comp.dwExtraInfoLength = (DWORD)-1;
+
+    if (!WinHttpCrackUrl(wurl.data(), (DWORD)wurl.size(), 0, &url_comp)) {
+        const char* err_resp = "HTTP/1.1 400 Bad Request\r\nContent-Length: 0\r\n\r\n";
+        send(client_sock, err_resp, (int)strlen(err_resp), 0);
+        closesocket(client_sock);
+        return;
+    }
+
+    std::wstring w_host(url_comp.lpszHostName, url_comp.dwHostNameLength);
+    std::wstring w_path(url_comp.lpszUrlPath, url_comp.dwUrlPathLength);
+    if (url_comp.dwExtraInfoLength > 0) {
+        w_path += std::wstring(url_comp.lpszExtraInfo, url_comp.dwExtraInfoLength);
+    }
+    if (w_path.empty()) w_path = L"/";
+
+    bool is_https = (url_comp.nScheme == INTERNET_SCHEME_HTTPS);
+    INTERNET_PORT port = url_comp.nPort;
+
+    std::string ua = req_headers.count("user-agent") ? req_headers["user-agent"] : moecher::tooling::get_client_user_agent();
+    std::string lang = req_headers.count("accept-language") ? req_headers["accept-language"] : moecher::tooling::get_client_accept_language();
+    int ua_wlen = MultiByteToWideChar(CP_UTF8, 0, ua.c_str(), -1, NULL, 0);
+    std::vector<wchar_t> w_ua(ua_wlen);
+    MultiByteToWideChar(CP_UTF8, 0, ua.c_str(), -1, w_ua.data(), ua_wlen);
+
+    HINTERNET h_session = WinHttpOpen(w_ua.empty() ? L"Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36" : w_ua.data(),
+                                      WINHTTP_ACCESS_TYPE_DEFAULT_PROXY,
+                                      WINHTTP_NO_PROXY_NAME,
+                                      WINHTTP_NO_PROXY_BYPASS, 0);
+    if (!h_session) {
+        const char* err_resp = "HTTP/1.1 502 Bad Gateway\r\nContent-Length: 0\r\n\r\n";
+        send(client_sock, err_resp, (int)strlen(err_resp), 0);
+        closesocket(client_sock);
+        return;
+    }
+
+    DWORD timeout_val = 15000;
+    WinHttpSetTimeouts(h_session, timeout_val, timeout_val, timeout_val, timeout_val);
+
+    HINTERNET h_connect = WinHttpConnect(h_session, w_host.c_str(), port, 0);
+    if (!h_connect) {
+        WinHttpCloseHandle(h_session);
+        const char* err_resp = "HTTP/1.1 502 Bad Gateway\r\nContent-Length: 0\r\n\r\n";
+        send(client_sock, err_resp, (int)strlen(err_resp), 0);
+        closesocket(client_sock);
+        return;
+    }
+
+    DWORD open_flags = is_https ? WINHTTP_FLAG_SECURE : 0;
+    std::wstring w_method = L"GET";
+    if (method == "POST") w_method = L"POST";
+    else if (method == "HEAD") w_method = L"HEAD";
+    else if (method == "PUT") w_method = L"PUT";
+    else if (method == "DELETE") w_method = L"DELETE";
+
+    HINTERNET h_request = WinHttpOpenRequest(h_connect, w_method.c_str(), w_path.c_str(),
+                                            NULL, WINHTTP_NO_REFERER,
+                                            WINHTTP_DEFAULT_ACCEPT_TYPES, open_flags);
+    if (!h_request) {
+        WinHttpCloseHandle(h_connect);
+        WinHttpCloseHandle(h_session);
+        const char* err_resp = "HTTP/1.1 502 Bad Gateway\r\nContent-Length: 0\r\n\r\n";
+        send(client_sock, err_resp, (int)strlen(err_resp), 0);
+        closesocket(client_sock);
+        return;
+    }
+
+    DWORD opt_redirect = WINHTTP_OPTION_REDIRECT_POLICY_ALWAYS;
+    WinHttpSetOption(h_request, WINHTTP_OPTION_REDIRECT_POLICY, &opt_redirect, sizeof(opt_redirect));
+
+    // Combine request headers
+    std::string cookies = req_headers.count("cookie") ? req_headers["cookie"] : moecher::tooling::get_cookies_for_url(upstream_url);
+    if (upstream_url.find("google.") != std::string::npos) {
+        if (cookies.find("SOCS=") == std::string::npos) {
+            if (!cookies.empty()) cookies += "; ";
+            cookies += "SOCS=CAESHAgBEhJnd3NfMjAyNDA4MjAtMF9SQzIaAmVuIAEaBgiA_L20Bg; CONSENT=PENDING+999";
+        }
+    }
+
+    std::string hdr_str = "User-Agent: " + ua + "\r\n"
+                          "Accept: " + (req_headers.count("accept") ? req_headers["accept"] : "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8") + "\r\n"
+                          "Accept-Language: " + (lang.empty() ? "en-US,en;q=0.9" : lang) + "\r\n";
+    if (req_headers.count("sec-ch-ua")) hdr_str += "Sec-Ch-Ua: " + req_headers["sec-ch-ua"] + "\r\n";
+    else if (!moecher::tooling::g_client_sec_ch_ua.empty()) hdr_str += "Sec-Ch-Ua: " + moecher::tooling::g_client_sec_ch_ua + "\r\n";
+
+    if (req_headers.count("sec-ch-ua-mobile")) hdr_str += "Sec-Ch-Ua-Mobile: " + req_headers["sec-ch-ua-mobile"] + "\r\n";
+    else if (!moecher::tooling::g_client_sec_ch_ua_mobile.empty()) hdr_str += "Sec-Ch-Ua-Mobile: " + moecher::tooling::g_client_sec_ch_ua_mobile + "\r\n";
+
+    if (req_headers.count("sec-ch-ua-platform")) hdr_str += "Sec-Ch-Ua-Platform: " + req_headers["sec-ch-ua-platform"] + "\r\n";
+    else if (!moecher::tooling::g_client_sec_ch_ua_platform.empty()) hdr_str += "Sec-Ch-Ua-Platform: " + moecher::tooling::g_client_sec_ch_ua_platform + "\r\n";
+
+    if (!cookies.empty()) hdr_str += "Cookie: " + cookies + "\r\n";
+    if (req_headers.count("content-type")) hdr_str += "Content-Type: " + req_headers["content-type"] + "\r\n";
+
+    int hdr_wlen = MultiByteToWideChar(CP_UTF8, 0, hdr_str.c_str(), -1, NULL, 0);
+    std::vector<wchar_t> w_hdr(hdr_wlen);
+    MultiByteToWideChar(CP_UTF8, 0, hdr_str.c_str(), -1, w_hdr.data(), hdr_wlen);
+
+    void* p_data = req_body.empty() ? WINHTTP_NO_REQUEST_DATA : (void*)req_body.data();
+    DWORD dw_data_len = (DWORD)req_body.size();
+
+    BOOL send_ok = WinHttpSendRequest(h_request, w_hdr.data(), (DWORD)-1L, p_data, dw_data_len, dw_data_len, 0);
+    if (!send_ok || !WinHttpReceiveResponse(h_request, NULL)) {
+        WinHttpCloseHandle(h_request);
+        WinHttpCloseHandle(h_connect);
+        WinHttpCloseHandle(h_session);
+        const char* err_resp = "HTTP/1.1 502 Bad Gateway\r\nContent-Length: 0\r\n\r\n";
+        send(client_sock, err_resp, (int)strlen(err_resp), 0);
+        closesocket(client_sock);
+        return;
+    }
+
+    DWORD status_code = 200;
+    DWORD status_size = sizeof(status_code);
+    WinHttpQueryHeaders(h_request, WINHTTP_QUERY_STATUS_CODE | WINHTTP_QUERY_FLAG_NUMBER,
+                        WINHTTP_HEADER_NAME_BY_INDEX, &status_code, &status_size, WINHTTP_NO_HEADER_INDEX);
+
+    // Read upstream headers
+    DWORD raw_hdr_size = 0;
+    std::string raw_headers_str;
+    WinHttpQueryHeaders(h_request, WINHTTP_QUERY_RAW_HEADERS_CRLF, WINHTTP_HEADER_NAME_BY_INDEX, NULL, &raw_hdr_size, WINHTTP_NO_HEADER_INDEX);
+    if (GetLastError() == ERROR_INSUFFICIENT_BUFFER && raw_hdr_size > 0) {
+        std::vector<wchar_t> raw_hdr_buf(raw_hdr_size / sizeof(wchar_t) + 1, 0);
+        if (WinHttpQueryHeaders(h_request, WINHTTP_QUERY_RAW_HEADERS_CRLF, WINHTTP_HEADER_NAME_BY_INDEX, raw_hdr_buf.data(), &raw_hdr_size, WINHTTP_NO_HEADER_INDEX)) {
+            int utf8_len = WideCharToMultiByte(CP_UTF8, 0, raw_hdr_buf.data(), -1, NULL, 0, NULL, NULL);
+            if (utf8_len > 0) {
+                std::vector<char> utf8_buf(utf8_len, 0);
+                WideCharToMultiByte(CP_UTF8, 0, raw_hdr_buf.data(), -1, utf8_buf.data(), utf8_len, NULL, NULL);
+                raw_headers_str = std::string(utf8_buf.data());
+                moecher::tooling::parse_and_store_set_cookie_header(upstream_url, raw_headers_str);
+            }
+        }
+    }
+
+    // Read body
+    std::string resp_body;
+    DWORD bytes_avail = 0;
+    while (WinHttpQueryDataAvailable(h_request, &bytes_avail) && bytes_avail > 0) {
+        std::vector<char> temp_buf(bytes_avail);
+        DWORD bytes_read_chunk = 0;
+        if (WinHttpReadData(h_request, temp_buf.data(), bytes_avail, &bytes_read_chunk) && bytes_read_chunk > 0) {
+            resp_body.append(temp_buf.data(), bytes_read_chunk);
+            if (resp_body.size() > 10000000) break;
+        } else {
+            break;
+        }
+    }
+
+    WinHttpCloseHandle(h_request);
+    WinHttpCloseHandle(h_connect);
+    WinHttpCloseHandle(h_session);
+
+    // Filter headers & build response
+    std::string clean_headers;
+    std::istringstream resp_hdr_iss(raw_headers_str);
+    std::string rh_line;
+    bool is_first_line = true;
+    std::string status_line = "HTTP/1.1 200 OK\r\n";
+
+    while (std::getline(resp_hdr_iss, rh_line)) {
+        if (!rh_line.empty() && rh_line.back() == '\r') rh_line.pop_back();
+        if (rh_line.empty()) continue;
+
+        if (is_first_line) {
+            is_first_line = false;
+            if (status_code == 429 || status_code == 403) {
+                status_line = "HTTP/1.1 200 OK\r\n";
+            } else {
+                status_line = rh_line + "\r\n";
+            }
+            continue;
+        }
+
+        std::string lower = rh_line;
+        std::transform(lower.begin(), lower.end(), lower.begin(), ::tolower);
+
+        // Strip framing restrictions, CORS blockers, COOP/COEP/CORP
+        if (lower.rfind("x-frame-options:", 0) == 0) continue;
+        if (lower.rfind("content-security-policy:", 0) == 0) continue;
+        if (lower.rfind("cross-origin-opener-policy:", 0) == 0) continue;
+        if (lower.rfind("cross-origin-embedder-policy:", 0) == 0) continue;
+        if (lower.rfind("cross-origin-resource-policy:", 0) == 0) continue;
+        if (lower.rfind("transfer-encoding:", 0) == 0) continue;
+        if (lower.rfind("content-length:", 0) == 0) continue;
+        if (lower.rfind("connection:", 0) == 0) continue;
+        if (lower.rfind("location:", 0) == 0 && lower.find("consent.google") != std::string::npos) continue;
+
+        clean_headers += rh_line + "\r\n";
+    }
+
+    // HTML Shims: ensure solveSimpleChallenge is defined so Google challenge script doesn't throw ReferenceError
+    if (resp_body.find("solveSimpleChallenge") != std::string::npos) {
+        size_t ssc_pos = 0;
+        while ((ssc_pos = resp_body.find("solveSimpleChallenge", ssc_pos)) != std::string::npos) {
+            if (ssc_pos >= 3 && resp_body.substr(ssc_pos - 3, 3) == "if(") {
+                resp_body.replace(ssc_pos, 20, "window.solveSimpleChallenge");
+                ssc_pos += 27;
+            } else if (ssc_pos >= 4 && resp_body.substr(ssc_pos - 4, 4) == "if (") {
+                resp_body.replace(ssc_pos, 20, "window.solveSimpleChallenge");
+                ssc_pos += 27;
+            } else {
+                ssc_pos += 20;
+            }
+        }
+    }
+
+    // Inject shim in HTML
+    std::string lower_body = resp_body;
+    std::transform(lower_body.begin(), lower_body.end(), lower_body.begin(), ::tolower);
+    if (lower_body.find("<html") != std::string::npos || lower_body.find("<head") != std::string::npos) {
+        std::string shim = "<script>window.solveSimpleChallenge=window.solveSimpleChallenge||function(){};</script>\n";
+        size_t head_pos = lower_body.find("<head");
+        if (head_pos != std::string::npos) {
+            size_t tag_close = resp_body.find('>', head_pos);
+            if (tag_close != std::string::npos) {
+                resp_body.insert(tag_close + 1, "\n" + shim);
+            }
+        }
+    }
+
+    std::string cors_and_frame_headers = "Access-Control-Allow-Origin: *\r\n"
+                                         "Access-Control-Allow-Methods: GET, POST, PUT, DELETE, OPTIONS, HEAD\r\n"
+                                         "Access-Control-Allow-Headers: *\r\n"
+                                         "Access-Control-Expose-Headers: *\r\n"
+                                         "Content-Security-Policy: frame-ancestors *;\r\n"
+                                         "Content-Length: " + std::to_string(resp_body.size()) + "\r\n"
+                                         "Connection: close\r\n";
+
+    std::string full_response = status_line + clean_headers + cors_and_frame_headers + "\r\n" + resp_body;
+    send_all(client_sock, full_response.data(), (int)full_response.size());
+    closesocket(client_sock);
+
+#else
+    // Fallback socket relay for non-Windows
+    std::string host = host_header;
+    int port = 80;
+    if (host.empty() && target_url.rfind("http://", 0) == 0) {
+        std::string no_proto = target_url.substr(7);
+        size_t slash = no_proto.find('/');
+        std::string host_port = (slash != std::string::npos) ? no_proto.substr(0, slash) : no_proto;
+        size_t colon = host_port.find(':');
+        if (colon != std::string::npos) {
+            host = host_port.substr(0, colon);
+            try { port = std::stoi(host_port.substr(colon + 1)); } catch (...) { port = 80; }
+        } else {
+            host = host_port;
+        }
+    }
+
+    struct addrinfo hints{}, *res = nullptr;
+    hints.ai_family = AF_UNSPEC;
+    hints.ai_socktype = SOCK_STREAM;
+    hints.ai_protocol = IPPROTO_TCP;
+
+    if (getaddrinfo(host.c_str(), std::to_string(port).c_str(), &hints, &res) != 0 || !res) {
+        const char* err_resp = "HTTP/1.1 502 Bad Gateway\r\nContent-Length: 0\r\n\r\n";
+        send(client_sock, err_resp, (int)strlen(err_resp), 0);
+        closesocket(client_sock);
+        return;
+    }
+
+    SOCKET remote_sock = INVALID_SOCKET;
+    for (struct addrinfo* ptr = res; ptr != nullptr; ptr = ptr->ai_next) {
+        remote_sock = socket(ptr->ai_family, ptr->ai_socktype, ptr->ai_protocol);
+        if (remote_sock == INVALID_SOCKET) continue;
+        if (connect(remote_sock, ptr->ai_addr, (int)ptr->ai_addrlen) == 0) break;
+        closesocket(remote_sock);
+        remote_sock = INVALID_SOCKET;
+    }
+    freeaddrinfo(res);
+
+    if (remote_sock == INVALID_SOCKET) {
+        const char* err_resp = "HTTP/1.1 504 Gateway Timeout\r\nContent-Length: 0\r\n\r\n";
+        send(client_sock, err_resp, (int)strlen(err_resp), 0);
+        closesocket(client_sock);
+        return;
+    }
+
+    send_all(remote_sock, req_vec.data(), bytes_read);
+
+    char relay_buf[16384];
+    bool first_remote_chunk = true;
+    while (g_proxy_running.load()) {
+        fd_set read_fds;
+        FD_ZERO(&read_fds);
+        FD_SET(client_sock, &read_fds);
+        FD_SET(remote_sock, &read_fds);
+
+        struct timeval tv{30, 0};
+        int max_fd = (int)std::max(client_sock, remote_sock);
+        int activity = select(max_fd + 1, &read_fds, nullptr, nullptr, &tv);
+        if (activity <= 0) break;
+
+        if (FD_ISSET(client_sock, &read_fds)) {
+            int n = recv(client_sock, relay_buf, sizeof(relay_buf), 0);
+            if (n <= 0) break;
+            if (!send_all(remote_sock, relay_buf, n)) break;
+        }
+        if (FD_ISSET(remote_sock, &read_fds)) {
+            int n = recv(remote_sock, relay_buf, sizeof(relay_buf), 0);
+            if (n <= 0) break;
+
+            if (first_remote_chunk) {
+                first_remote_chunk = false;
+                std::string resp(relay_buf, n);
+                size_t hdr_end = resp.find("\r\n\r\n");
+                if (hdr_end != std::string::npos) {
+                    std::string raw_headers = resp.substr(0, hdr_end);
+                    std::string body = resp.substr(hdr_end + 4);
+
+                    std::istringstream iss_r(raw_headers);
+                    std::string line_r;
+                    std::string clean_hdrs;
+
+                    while (std::getline(iss_r, line_r)) {
+                        if (!line_r.empty() && line_r.back() == '\r') line_r.pop_back();
+                        if (line_r.empty()) continue;
+
+                        std::string lower = line_r;
+                        std::transform(lower.begin(), lower.end(), lower.begin(), ::tolower);
+                        if (lower.rfind("x-frame-options:", 0) == 0) continue;
+                        if (lower.rfind("content-security-policy:", 0) == 0) continue;
+                        if (lower.rfind("cross-origin-opener-policy:", 0) == 0) continue;
+                        if (lower.rfind("cross-origin-embedder-policy:", 0) == 0) continue;
+                        if (lower.rfind("cross-origin-resource-policy:", 0) == 0) continue;
+
+                        clean_hdrs += line_r + "\r\n";
+                    }
+
+                    std::string cors_and_frame = "Access-Control-Allow-Origin: *\r\n"
+                                                 "Access-Control-Allow-Methods: GET, POST, PUT, DELETE, OPTIONS, HEAD\r\n"
+                                                 "Access-Control-Allow-Headers: *\r\n"
+                                                 "Access-Control-Expose-Headers: *\r\n"
+                                                 "Content-Security-Policy: frame-ancestors *;\r\n";
+                    std::string modified = clean_hdrs + cors_and_frame + "\r\n" + body;
+                    if (!send_all(client_sock, modified.data(), (int)modified.size())) break;
+                    continue;
+                }
+            }
+            if (!send_all(client_sock, relay_buf, n)) break;
+        }
+    }
+    closesocket(remote_sock);
+    closesocket(client_sock);
+#endif
+}
+
+// Start Forward Proxy Listener bound to 0.0.0.0:proxy_port
+static bool start_forward_proxy(int proxy_port) {
+    if (g_proxy_running.load()) return true;
+
+#ifdef _WIN32
+    WSADATA wsa;
+    WSAStartup(MAKEWORD(2, 2), &wsa);
+#endif
+
+    g_proxy_listen_sock = socket(AF_INET, SOCK_STREAM, IPPROTO_TCP);
+    if (g_proxy_listen_sock == INVALID_SOCKET) {
+        LOG_ERROR("[Proxy] Failed to create proxy listen socket");
+        return false;
+    }
+
+    int opt = 1;
+    setsockopt(g_proxy_listen_sock, SOL_SOCKET, SO_REUSEADDR, (const char*)&opt, sizeof(opt));
+
+    sockaddr_in saddr{};
+    saddr.sin_family = AF_INET;
+    saddr.sin_addr.s_addr = INADDR_ANY; // 0.0.0.0 (All local and remote interfaces)
+    saddr.sin_port = htons((u_short)proxy_port);
+
+    if (bind(g_proxy_listen_sock, (sockaddr*)&saddr, sizeof(saddr)) == SOCKET_ERROR) {
+        LOG_ERROR("[Proxy] Failed to bind forward proxy to 0.0.0.0:%d", proxy_port);
+        closesocket(g_proxy_listen_sock);
+        g_proxy_listen_sock = INVALID_SOCKET;
+        return false;
+    }
+
+    if (listen(g_proxy_listen_sock, 128) == SOCKET_ERROR) {
+        LOG_ERROR("[Proxy] Failed to listen on forward proxy socket");
+        closesocket(g_proxy_listen_sock);
+        g_proxy_listen_sock = INVALID_SOCKET;
+        return false;
+    }
+
+    g_proxy_port.store(proxy_port);
+    g_proxy_running.store(true);
+    LOG_INFO("[Proxy] Forward Proxy (HTTP/HTTPS CONNECT) listening on 0.0.0.0:%d", proxy_port);
+
+    std::thread proxy_thread([]() {
+        while (g_proxy_running.load()) {
+            sockaddr_in client_addr{};
+            int addr_len = sizeof(client_addr);
+            SOCKET client_sock = accept(g_proxy_listen_sock, (sockaddr*)&client_addr, &addr_len);
+            if (client_sock == INVALID_SOCKET) {
+                if (!g_proxy_running.load()) break;
+                std::this_thread::sleep_for(std::chrono::milliseconds(10));
+                continue;
+            }
+
+            std::thread(handle_client_socket, client_sock).detach();
+        }
+    });
+    proxy_thread.detach();
+
+    return true;
+}
+
+static void stop_forward_proxy() {
+    if (!g_proxy_running.load()) return;
+    g_proxy_running.store(false);
+    if (g_proxy_listen_sock != INVALID_SOCKET) {
+        closesocket(g_proxy_listen_sock);
+        g_proxy_listen_sock = INVALID_SOCKET;
+    }
+}
+
+// Windows System Proxy Manager
+static void set_windows_system_proxy(bool enable, const std::string& proxy_server) {
+#ifdef _WIN32
+    HKEY hKey;
+    if (RegOpenKeyExA(HKEY_CURRENT_USER, "Software\\Microsoft\\Windows\\CurrentVersion\\Internet Settings", 0, KEY_SET_VALUE, &hKey) == ERROR_SUCCESS) {
+        DWORD dwEnable = enable ? 1 : 0;
+        RegSetValueExA(hKey, "ProxyEnable", 0, REG_DWORD, (const BYTE*)&dwEnable, sizeof(dwEnable));
+        if (enable && !proxy_server.empty()) {
+            std::string server_val = "http=" + proxy_server + ";https=" + proxy_server;
+            RegSetValueExA(hKey, "ProxyServer", 0, REG_SZ, (const BYTE*)server_val.c_str(), (DWORD)server_val.length() + 1);
+            std::string override_val = "<local>;localhost;127.0.0.1;zetaorangews";
+            RegSetValueExA(hKey, "ProxyOverride", 0, REG_SZ, (const BYTE*)override_val.c_str(), (DWORD)override_val.length() + 1);
+        }
+        RegCloseKey(hKey);
+
+        HMODULE hWinINet = LoadLibraryA("wininet.dll");
+        if (hWinINet) {
+            typedef BOOL(WINAPI* pfnInternetSetOptionA)(HANDLE, DWORD, LPVOID, DWORD);
+            pfnInternetSetOptionA pInternetSetOptionA = (pfnInternetSetOptionA)GetProcAddress(hWinINet, "InternetSetOptionA");
+            if (pInternetSetOptionA) {
+                pInternetSetOptionA(NULL, 39 /* INTERNET_OPTION_SETTINGS_CHANGED */, NULL, 0);
+                pInternetSetOptionA(NULL, 37 /* INTERNET_OPTION_REFRESH */, NULL, 0);
+            }
+            FreeLibrary(hWinINet);
+        }
+        LOG_INFO("[Proxy] Local Windows System Proxy %s (server: %s)", enable ? "ENABLED" : "DISABLED", proxy_server.c_str());
+    }
+#endif
+}
+
+} // namespace moecher::proxy
+
+// ════════════════════════════════════════════════════════════════════════════════
 //  HTTP Server (OpenAI-compatible)
 // ════════════════════════════════════════════════════════════════════════════════
 
 static std::mutex g_engine_mutex;  // serialize inference requests
 static int g_request_counter = 0;  // for unique request IDs
 
-static void run_server(MoecherEngine& engine, int port, int default_thinking_budget = 4096) {
+static void run_server(MoecherEngine& engine, int port, int default_thinking_budget = 4096, int proxy_port = 8002, bool enable_forward_proxy = true, bool enable_system_proxy = false) {
     httplib::Server svr;
+    svr.set_payload_max_length(64 * 1024 * 1024); // 64 MB
 
-    // CORS headers and OPTIONS preflight
+    if (enable_forward_proxy) {
+        moecher::proxy::start_forward_proxy(proxy_port);
+    }
+
+#ifdef _WIN32
+    if (enable_system_proxy) {
+        moecher::proxy::set_windows_system_proxy(true, "127.0.0.1:" + std::to_string(proxy_port));
+        SetConsoleCtrlHandler([](DWORD) -> BOOL {
+            moecher::proxy::set_windows_system_proxy(false, "");
+            moecher::proxy::stop_forward_proxy();
+            return FALSE;
+        }, TRUE);
+        std::atexit([]() {
+            moecher::proxy::set_windows_system_proxy(false, "");
+            moecher::proxy::stop_forward_proxy();
+        });
+    }
+#endif
+
+    // CORS headers and preflight
     svr.set_pre_routing_handler([](const httplib::Request& req, httplib::Response& res) {
         res.set_header("Access-Control-Allow-Origin", "*");
-        res.set_header("Access-Control-Allow-Methods", "GET, POST, OPTIONS");
+        res.set_header("Access-Control-Allow-Methods", "GET, POST, OPTIONS, PUT, DELETE");
         res.set_header("Access-Control-Allow-Headers", "*");
+
         if (req.method == "OPTIONS") {
             res.status = 200;
             return httplib::Server::HandlerResponse::Handled;
         }
+
+        // Direct HTTP Forward Proxy fallback on main port if accessed via forward proxy
+        std::string target_url = req.path;
+        if (target_url.rfind("http://", 0) == 0 || target_url.rfind("https://", 0) == 0) {
+            std::string client_ua = req.get_header_value("User-Agent");
+            std::string client_lang = req.get_header_value("Accept-Language");
+            std::string client_sec_ua = req.get_header_value("Sec-Ch-Ua");
+            std::string client_sec_mobile = req.get_header_value("Sec-Ch-Ua-Mobile");
+            std::string client_sec_platform = req.get_header_value("Sec-Ch-Ua-Platform");
+            std::string client_cookies = req.get_header_value("Cookie");
+
+            moecher::tooling::set_client_browser_context(client_ua, client_lang, client_sec_ua, client_sec_mobile, client_sec_platform, client_cookies);
+
+            auto doc = moecher::tooling::fetch_url_full(target_url, 30000, 5000000, "raw");
+            res.status = 200;
+            std::string ct = "text/html; charset=utf-8";
+            if (moecher::tooling::is_raw_code_url(target_url)) {
+                if (target_url.find(".json") != std::string::npos) ct = "application/json; charset=utf-8";
+                else if (target_url.find(".js") != std::string::npos) ct = "application/javascript; charset=utf-8";
+                else if (target_url.find(".css") != std::string::npos) ct = "text/css; charset=utf-8";
+                else ct = "text/plain; charset=utf-8";
+            }
+            res.set_content(doc.raw_html.empty() ? doc.clean_text : doc.raw_html, ct);
+            return httplib::Server::HandlerResponse::Handled;
+        }
+
         return httplib::Server::HandlerResponse::Unhandled;
+    });
+
+    // Dynamic Proxy Auto-Configuration (PAC) file for local & remote browsers
+    svr.Get("/proxy.pac", [](const httplib::Request& req, httplib::Response& res) {
+        std::string host_header = req.get_header_value("Host");
+        std::string proxy_host = "127.0.0.1";
+        if (!host_header.empty()) {
+            size_t colon = host_header.find(':');
+            proxy_host = (colon != std::string::npos) ? host_header.substr(0, colon) : host_header;
+        }
+        int p_port = moecher::proxy::g_proxy_port.load();
+        std::string pac = "function FindProxyForURL(url, host) {\n"
+                          "  if (shExpMatch(host, \"localhost\") || shExpMatch(host, \"127.0.0.1\") || shExpMatch(host, \"" + proxy_host + "\") || isPlainHostName(host) || isInNet(host, \"10.0.0.0\", \"255.0.0.0\") || isInNet(host, \"192.168.0.0\", \"255.255.0.0\")) {\n"
+                          "    return \"DIRECT\";\n"
+                          "  }\n"
+                          "  return \"PROXY " + proxy_host + ":" + std::to_string(p_port) + "; DIRECT\";\n"
+                          "}\n";
+        res.set_content(pac, "application/x-ns-proxy-autoconfig");
+    });
+
+    // One-Click Remote Client Windows Setup Batch File
+    svr.Get("/api/proxy/setup.bat", [](const httplib::Request& req, httplib::Response& res) {
+        std::string host_header = req.get_header_value("Host");
+        std::string proxy_host = "127.0.0.1";
+        if (!host_header.empty()) {
+            size_t colon = host_header.find(':');
+            proxy_host = (colon != std::string::npos) ? host_header.substr(0, colon) : host_header;
+        }
+        int p_port = moecher::proxy::g_proxy_port.load();
+        std::string bat = "@echo off\r\n"
+                          "setlocal\r\n"
+                          "chcp 65001 >nul\r\n"
+                          "echo ===============================================================================\r\n"
+                          "echo   Configuring Windows Client Proxy to route through MinnieTheMoEcher\r\n"
+                          "echo   Proxy Server: " + proxy_host + ":" + std::to_string(p_port) + "\r\n"
+                          "echo ===============================================================================\r\n"
+                          "reg add \"HKCU\\Software\\Microsoft\\Windows\\CurrentVersion\\Internet Settings\" /v ProxyEnable /t REG_DWORD /d 1 /f >nul\r\n"
+                          "reg add \"HKCU\\Software\\Microsoft\\Windows\\CurrentVersion\\Internet Settings\" /v ProxyServer /t REG_SZ /d \"http=" + proxy_host + ":" + std::to_string(p_port) + ";https=" + proxy_host + ":" + std::to_string(p_port) + "\" /f >nul\r\n"
+                          "reg add \"HKCU\\Software\\Microsoft\\Windows\\CurrentVersion\\Internet Settings\" /v ProxyOverride /t REG_SZ /d \"<local>;localhost;127.0.0.1;" + proxy_host + "\" /f >nul\r\n"
+                          "echo.\r\n"
+                          "echo [SUCCESS] Windows System & Browser Proxy configured to " + proxy_host + ":" + std::to_string(p_port) + "!\r\n"
+                          "echo Edge, Chrome, and system web browsers will now route external traffic transparently.\r\n"
+                          "echo.\r\n"
+                          "echo To disable later, run restore_proxy.bat or disable Proxy in Windows Settings.\r\n"
+                          "echo.\r\n"
+                          "pause\r\n";
+        res.set_header("Content-Disposition", "attachment; filename=\"setup_proxy.bat\"");
+        res.set_content(bat, "application/x-bat");
+    });
+
+    // One-Click Remote Client Windows Restore / Disable Batch File
+    svr.Get("/api/proxy/restore.bat", [](const httplib::Request&, httplib::Response& res) {
+        std::string bat = "@echo off\r\n"
+                          "setlocal\r\n"
+                          "chcp 65001 >nul\r\n"
+                          "echo ===============================================================================\r\n"
+                          "echo   Disabling Windows Client Proxy\r\n"
+                          "echo ===============================================================================\r\n"
+                          "reg add \"HKCU\\Software\\Microsoft\\Windows\\CurrentVersion\\Internet Settings\" /v ProxyEnable /t REG_DWORD /d 0 /f >nul\r\n"
+                          "echo.\r\n"
+                          "echo [SUCCESS] Windows System Proxy has been disabled.\r\n"
+                          "echo.\r\n"
+                          "pause\r\n";
+        res.set_header("Content-Disposition", "attachment; filename=\"restore_proxy.bat\"");
+        res.set_content(bat, "application/x-bat");
+    });
+
+    // Proxy Status API
+    svr.Get("/api/proxy/status", [](const httplib::Request& req, httplib::Response& res) {
+        std::string host_header = req.get_header_value("Host");
+        std::string proxy_host = "127.0.0.1";
+        if (!host_header.empty()) {
+            size_t colon = host_header.find(':');
+            proxy_host = (colon != std::string::npos) ? host_header.substr(0, colon) : host_header;
+        }
+        int p_port = moecher::proxy::g_proxy_port.load();
+        bool is_running = moecher::proxy::g_proxy_running.load();
+        json status = {
+            {"status", is_running ? "active" : "disabled"},
+            {"proxy_running", is_running},
+            {"proxy_port", p_port},
+            {"detected_host", proxy_host},
+            {"proxy_host", proxy_host},
+            {"remote_addr", req.remote_addr},
+            {"pac_url", "http://" + host_header + "/proxy.pac"},
+            {"setup_bat_url", "http://" + host_header + "/api/proxy/setup.bat"}
+        };
+        res.set_header("Access-Control-Allow-Origin", "*");
+        res.set_header("Access-Control-Allow-Methods", "GET, POST, OPTIONS");
+        res.set_header("Access-Control-Allow-Headers", "*");
+        res.set_content(status.dump(), "application/json");
     });
 
     // Web UI endpoints: serve compiled-in embedded assets directly for standalone reliability
@@ -6812,10 +7683,654 @@ static void run_server(MoecherEngine& engine, int port, int default_thinking_bud
     svr.Get("/script.js", [&serve_asset](const httplib::Request&, httplib::Response& res) {
         serve_asset("web/script.js", moecher::embedded_web::SCRIPT_JS(), "application/javascript; charset=utf-8", res);
     });
+    svr.Get("/sw.js", [&serve_asset](const httplib::Request&, httplib::Response& res) {
+        res.set_header("Service-Worker-Allowed", "/");
+        serve_asset("web/sw.js", moecher::embedded_web::SW_JS(), "application/javascript; charset=utf-8", res);
+    });
 
     // Health & status check
     svr.Get("/health", [](const httplib::Request&, httplib::Response& res) {
         res.set_content("{\"status\":\"ok\",\"engine\":\"moecher\",\"version\":\"2.05\"}", "application/json");
+    });
+
+    // Local Rewriting Reverse Proxy Endpoint for Browser Preview & Cross-Origin Unblocking
+    auto handle_proxy_request = [](const httplib::Request& req, httplib::Response& res) {
+        std::string target_url;
+        if (req.has_param("url")) {
+            target_url = req.get_param_value("url");
+        }
+        if (target_url.empty()) {
+            res.status = 400;
+            res.set_header("Access-Control-Allow-Origin", "*");
+            res.set_header("Access-Control-Allow-Methods", "GET, POST, OPTIONS, PUT, DELETE, PATCH, HEAD");
+            res.set_header("Access-Control-Allow-Headers", "*");
+            res.set_header("Access-Control-Expose-Headers", "*");
+            res.set_header("Access-Control-Allow-Credentials", "true");
+            res.set_content("{\"error\":\"Missing ?url= parameter\"}", "application/json");
+            return;
+        }
+
+        // Fix target_url protocol if protocol-relative
+        if (target_url.rfind("//", 0) == 0) {
+            target_url = "https:" + target_url;
+        } else if (target_url.rfind("http://", 0) != 0 && target_url.rfind("https://", 0) != 0) {
+            target_url = "https://" + target_url;
+        }
+
+        // Capture incoming client headers & cookies to update browser impersonation context
+        std::string client_ua = req.get_header_value("X-Client-User-Agent");
+        if (client_ua.empty()) client_ua = req.get_header_value("User-Agent");
+
+        std::string client_lang = req.get_header_value("X-Client-Accept-Language");
+        if (client_lang.empty()) client_lang = req.get_header_value("Accept-Language");
+
+        std::string client_sec_ua = req.get_header_value("Sec-Ch-Ua");
+        std::string client_sec_mobile = req.get_header_value("Sec-Ch-Ua-Mobile");
+        std::string client_sec_platform = req.get_header_value("Sec-Ch-Ua-Platform");
+        std::string client_cookies = req.get_header_value("X-Client-Cookie");
+        if (client_cookies.empty()) client_cookies = req.get_header_value("Cookie");
+
+        moecher::tooling::set_client_browser_context(client_ua, client_lang, client_sec_ua, client_sec_mobile, client_sec_platform, client_cookies);
+        if (!client_cookies.empty()) {
+            moecher::tooling::parse_and_store_set_cookie_header(target_url, client_cookies);
+        }
+
+        std::string post_body = (req.method == "POST") ? req.body : "";
+        std::string post_ct = req.get_header_value("Content-Type");
+
+        auto doc = moecher::tooling::fetch_url_full(target_url, 30000, 5000000, "raw", "", 0, req.method, post_body, post_ct);
+
+        std::string lookup_url = doc.url.empty() ? target_url : doc.url;
+
+        // Compute domain_origin (e.g. "https://www.linkedin.com")
+        std::string domain_origin = "https://www.google.com";
+        size_t proto_pos = lookup_url.find("://");
+        if (proto_pos != std::string::npos) {
+            size_t slash_pos = lookup_url.find('/', proto_pos + 3);
+            if (slash_pos != std::string::npos) {
+                domain_origin = lookup_url.substr(0, slash_pos);
+            } else {
+                domain_origin = lookup_url;
+            }
+        }
+
+        // Compute directory base_url (e.g. "https://www.linkedin.com/in/")
+        std::string base_url = domain_origin + "/";
+        size_t query_pos = lookup_url.find('?');
+        std::string clean_lookup = (query_pos != std::string::npos) ? lookup_url.substr(0, query_pos) : lookup_url;
+        size_t last_slash = clean_lookup.find_last_of('/');
+        if (last_slash != std::string::npos && last_slash >= 8) {
+            base_url = clean_lookup.substr(0, last_slash + 1);
+        }
+
+        std::string html = doc.raw_html.empty() ? doc.clean_text : doc.raw_html;
+
+        // Determine MIME Content-Type
+        std::string ct = "text/html; charset=utf-8";
+        std::string lower_target = target_url;
+        for (auto& c : lower_target) c = (char)std::tolower((unsigned char)c);
+        size_t q_pos = lower_target.find('?');
+        if (q_pos != std::string::npos) lower_target = lower_target.substr(0, q_pos);
+        size_t h_pos = lower_target.find('#');
+        if (h_pos != std::string::npos) lower_target = lower_target.substr(0, h_pos);
+
+        bool is_html_target = false;
+        if (lower_target.size() >= 5 && lower_target.rfind(".json") == lower_target.size() - 5) ct = "application/json; charset=utf-8";
+        else if (lower_target.size() >= 3 && lower_target.rfind(".js") == lower_target.size() - 3) ct = "application/javascript; charset=utf-8";
+        else if (lower_target.size() >= 4 && lower_target.rfind(".mjs") == lower_target.size() - 4) ct = "application/javascript; charset=utf-8";
+        else if (lower_target.size() >= 4 && lower_target.rfind(".css") == lower_target.size() - 4) ct = "text/css; charset=utf-8";
+        else if (lower_target.size() >= 4 && lower_target.rfind(".png") == lower_target.size() - 4) ct = "image/png";
+        else if (lower_target.size() >= 4 && lower_target.rfind(".jpg") == lower_target.size() - 4) ct = "image/jpeg";
+        else if (lower_target.size() >= 5 && lower_target.rfind(".jpeg") == lower_target.size() - 5) ct = "image/jpeg";
+        else if (lower_target.size() >= 4 && lower_target.rfind(".gif") == lower_target.size() - 4) ct = "image/gif";
+        else if (lower_target.size() >= 5 && lower_target.rfind(".webp") == lower_target.size() - 5) ct = "image/webp";
+        else if (lower_target.size() >= 4 && lower_target.rfind(".svg") == lower_target.size() - 4) ct = "image/svg+xml";
+        else if (lower_target.size() >= 4 && lower_target.rfind(".ico") == lower_target.size() - 4) ct = "image/x-icon";
+        else if (lower_target.size() >= 6 && lower_target.rfind(".woff2") == lower_target.size() - 6) ct = "font/woff2";
+        else if (lower_target.size() >= 5 && lower_target.rfind(".woff") == lower_target.size() - 5) ct = "font/woff";
+        else if (lower_target.size() >= 4 && lower_target.rfind(".ttf") == lower_target.size() - 4) ct = "font/ttf";
+        else if (lower_target.size() >= 4 && lower_target.rfind(".xml") == lower_target.size() - 4) ct = "application/xml; charset=utf-8";
+        else if (lower_target.size() >= 4 && lower_target.rfind(".txt") == lower_target.size() - 4) ct = "text/plain; charset=utf-8";
+        else {
+            is_html_target = true;
+            ct = "text/html; charset=utf-8";
+        }
+
+        if (is_html_target) {
+            // Strip or neutralize any restrictive CSP or X-Frame-Options meta tags
+            std::string lower_doc = html;
+            for (auto& c : lower_doc) c = (char)std::tolower((unsigned char)c);
+
+            auto strip_meta_tag = [&](const std::string& pattern) {
+                size_t mpos = 0;
+                while ((mpos = lower_doc.find(pattern, mpos)) != std::string::npos) {
+                    size_t tag_start = lower_doc.rfind("<meta", mpos);
+                    if (tag_start != std::string::npos && mpos - tag_start < 250) {
+                        size_t tag_end = lower_doc.find('>', mpos);
+                        if (tag_end != std::string::npos) {
+                            std::string spaces(tag_end - tag_start + 1, ' ');
+                            html.replace(tag_start, tag_end - tag_start + 1, spaces);
+                            lower_doc.replace(tag_start, tag_end - tag_start + 1, spaces);
+                            mpos = tag_end + 1;
+                            continue;
+                        }
+                    }
+                    mpos += pattern.size();
+                }
+            };
+
+            strip_meta_tag("content-security-policy");
+            strip_meta_tag("x-frame-options");
+
+            // Fix unquoted/undeclared solveSimpleChallenge checks in inline HTML handlers
+            size_t ssc_pos = 0;
+            while ((ssc_pos = html.find("solveSimpleChallenge", ssc_pos)) != std::string::npos) {
+                if (ssc_pos >= 3 && html.substr(ssc_pos - 3, 3) == "if(") {
+                    html.replace(ssc_pos, 20, "window.solveSimpleChallenge");
+                    ssc_pos += 27;
+                } else if (ssc_pos >= 4 && html.substr(ssc_pos - 4, 4) == "if (") {
+                    html.replace(ssc_pos, 20, "window.solveSimpleChallenge");
+                    ssc_pos += 27;
+                } else {
+                    ssc_pos += 20;
+                }
+            }
+
+            // Neutralize LinkedIn location.host checks in inline 999 challenge scripts
+            if (domain_origin.find("linkedin.com") != std::string::npos) {
+                size_t lh_pos = 0;
+                while ((lh_pos = html.find("location.host", lh_pos)) != std::string::npos) {
+                    html.replace(lh_pos, 13, "\"www.linkedin.com\"");
+                    lh_pos += 18;
+                }
+            }
+
+            std::string clean_base_host = domain_origin;
+
+            // Rewrite meta refresh tags to route through proxy
+            size_t meta_refresh_pos = 0;
+            std::string lower_for_meta = html;
+            for (auto& c : lower_for_meta) c = (char)std::tolower((unsigned char)c);
+            while ((meta_refresh_pos = lower_for_meta.find("url=/", meta_refresh_pos)) != std::string::npos) {
+                size_t path_start = meta_refresh_pos + 4; // points to '/'
+                size_t path_end = html.find_first_of("\"' >", path_start);
+                if (path_end != std::string::npos) {
+                    std::string rel_path = html.substr(path_start, path_end - path_start);
+                    std::string proxied_url = "/api/proxy?url=" + moecher::tooling::url_encode(clean_base_host + rel_path);
+                    html.replace(path_start, path_end - path_start, proxied_url);
+                    lower_for_meta = html;
+                    for (auto& c : lower_for_meta) c = (char)std::tolower((unsigned char)c);
+                    meta_refresh_pos += proxied_url.size() + 4;
+                } else {
+                    meta_refresh_pos += 5;
+                }
+            }
+
+            // Inject <base href="..."> and bulletproof JavaScript network & navigation proxy shims
+            std::string lower_html = html;
+            for (auto& c : lower_html) c = (char)std::tolower((unsigned char)c);
+
+            if (lower_html.find("<html") != std::string::npos || lower_html.find("<body") != std::string::npos ||
+                lower_html.find("<!doctype") != std::string::npos) {
+                std::string shim = "<base href=\"" + base_url + "\">\n"
+                                   "<script>\n"
+                                   "(function(){\n"
+                                   "  try {\n"
+                                   "    Object.defineProperty(window, 'top', { get: function(){ return window.self; }, set: function(){} });\n"
+                                   "    Object.defineProperty(window, 'parent', { get: function(){ return window.self; }, set: function(){} });\n"
+                                   "    Object.defineProperty(window, 'frameElement', { get: function(){ return null; }, set: function(){} });\n"
+                                   "  } catch(e){}\n"
+                                   "  window.solveSimpleChallenge = window.solveSimpleChallenge || function(){};\n"
+                                   "  var baseDir = \"" + base_url + "\";\n"
+                                   "  var domainOrigin = \"" + domain_origin + "\";\n"
+                                   "  var proxyOrigin = window.location.origin;\n"
+                                   "  function isTelemetry(u){\n"
+                                   "    if(!u || typeof u !== 'string') return false;\n"
+                                   "    return u.indexOf('/li/track') !== -1 || u.indexOf('litms') !== -1 ||\n"
+                                   "           u.indexOf('page-view-heartbeat') !== -1 || u.indexOf('pve-pat') !== -1 ||\n"
+                                   "           u.indexOf('realtime') !== -1 || u.indexOf('csp-report') !== -1 ||\n"
+                                   "           u.indexOf('google-analytics') !== -1 || u.indexOf('googletagmanager') !== -1 ||\n"
+                                   "           u.indexOf('doubleclick.net') !== -1 || u.indexOf('clarity.ms') !== -1 ||\n"
+                                   "           u.indexOf('facebook.net') !== -1;\n"
+                                   "  }\n"
+                                   "  function toProxy(u){\n"
+                                   "    if(!u || typeof u !== 'string') return u;\n"
+                                   "    if(u.startsWith('data:') || u.startsWith('blob:') || u.startsWith('javascript:') || u.startsWith('mailto:') || u.startsWith('tel:') || u.startsWith('about:')) return u;\n"
+                                   "    if(u.indexOf(domainOrigin + '/api/proxy') !== -1){\n"
+                                   "      u = u.replace(domainOrigin + '/api/proxy', proxyOrigin + '/api/proxy');\n"
+                                   "    }\n"
+                                   "    if(u.startsWith(proxyOrigin + '/api/proxy')) return u;\n"
+                                   "    if(u.startsWith('/api/proxy')) return proxyOrigin + u;\n"
+                                   "    var full = u;\n"
+                                   "    if(proxyOrigin && full.startsWith(proxyOrigin)){\n"
+                                   "      full = full.substring(proxyOrigin.length);\n"
+                                   "    }\n"
+                                   "    if(full.startsWith('//')) full = 'https:' + full;\n"
+                                   "    else if(full.startsWith('/')) full = domainOrigin + full;\n"
+                                   "    else if(full.indexOf('://') === -1) full = baseDir + full;\n"
+                                   "    return proxyOrigin + '/api/proxy?url=' + encodeURIComponent(full);\n"
+                                   "  }\n"
+                                   "  if (window.fetch) {\n"
+                                   "    var _origFetch = window.fetch;\n"
+                                   "    window.fetch = function(resource, init) {\n"
+                                   "      try {\n"
+                                   "        var urlStr = typeof resource === 'string' ? resource : (resource && resource.url ? resource.url : '');\n"
+                                   "        if (isTelemetry(urlStr)) {\n"
+                                   "          return Promise.resolve(new Response('{\"status\":\"ok\"}', { status: 200, headers: { 'Content-Type': 'application/json' } }));\n"
+                                   "        }\n"
+                                   "        if (typeof resource === 'string') {\n"
+                                   "          return _origFetch.call(this, toProxy(resource), init);\n"
+                                   "        } else if (resource && resource.url) {\n"
+                                   "          var newReq = new Request(toProxy(resource.url), resource);\n"
+                                   "          return _origFetch.call(this, newReq, init);\n"
+                                   "        }\n"
+                                   "      } catch(e){}\n"
+                                   "      return _origFetch.apply(this, arguments);\n"
+                                   "    };\n"
+                                   "  }\n"
+                                   "  if (window.XMLHttpRequest) {\n"
+                                   "    var _origOpen = XMLHttpRequest.prototype.open;\n"
+                                   "    var _origSend = XMLHttpRequest.prototype.send;\n"
+                                   "    XMLHttpRequest.prototype.open = function(method, url, async, user, password) {\n"
+                                   "      this._isTele = isTelemetry(url);\n"
+                                   "      try { url = toProxy(url); } catch(e){}\n"
+                                   "      return _origOpen.call(this, method, url, async === undefined ? true : async, user, password);\n"
+                                   "    };\n"
+                                   "    XMLHttpRequest.prototype.send = function(body) {\n"
+                                   "      if (this._isTele) {\n"
+                                   "        var self = this;\n"
+                                   "        setTimeout(function(){\n"
+                                   "          try {\n"
+                                   "            Object.defineProperty(self, 'readyState', { value: 4, writable: true });\n"
+                                   "            Object.defineProperty(self, 'status', { value: 200, writable: true });\n"
+                                   "            Object.defineProperty(self, 'responseText', { value: '{\"status\":\"ok\"}', writable: true });\n"
+                                   "            if (typeof self.onreadystatechange === 'function') self.onreadystatechange();\n"
+                                   "            if (typeof self.onload === 'function') self.onload();\n"
+                                   "          }catch(e){}\n"
+                                   "        }, 10);\n"
+                                   "        return;\n"
+                                   "      }\n"
+                                   "      return _origSend.call(this, body);\n"
+                                   "    };\n"
+                                   "  }\n"
+                                   "  if (navigator && navigator.sendBeacon) {\n"
+                                   "    navigator.sendBeacon = function(url, data) { return true; };\n"
+                                   "  }\n"
+                                   "  if (window.open) {\n"
+                                   "    var _origOpenWin = window.open;\n"
+                                   "    window.open = function(url, target, features) {\n"
+                                   "      try { if(url) url = toProxy(url); } catch(e){}\n"
+                                   "      return _origOpenWin.call(this, url, target, features);\n"
+                                   "    };\n"
+                                   "  }\n"
+                                   "  try {\n"
+                                   "    var loc = window.location;\n"
+                                   "    var lastNav = '';\n"
+                                   "    var lastNavTime = 0;\n"
+                                   "    var oldReplace = loc.replace.bind(loc);\n"
+                                   "    loc.replace = function(u){\n"
+                                   "      var proxied = toProxy(u);\n"
+                                   "      var now = Date.now();\n"
+                                   "      if (proxied === lastNav && (now - lastNavTime) < 2000) return;\n"
+                                   "      lastNav = proxied; lastNavTime = now;\n"
+                                   "      oldReplace(proxied);\n"
+                                   "    };\n"
+                                   "    if(loc.assign){\n"
+                                   "      var oldAssign = loc.assign.bind(loc);\n"
+                                   "      loc.assign = function(u){\n"
+                                   "        var proxied = toProxy(u);\n"
+                                   "        var now = Date.now();\n"
+                                   "        if (proxied === lastNav && (now - lastNavTime) < 2000) return;\n"
+                                   "        lastNav = proxied; lastNavTime = now;\n"
+                                   "        oldAssign(proxied);\n"
+                                   "      };\n"
+                                   "    }\n"
+                                   "  }catch(e){}\n"
+                                   "  document.addEventListener('click', function(e){\n"
+                                   "    var a = e.target && e.target.closest ? e.target.closest('a') : null;\n"
+                                   "    if(a && a.href){\n"
+                                   "      var origHref = a.getAttribute('href') || a.href;\n"
+                                   "      if(origHref && !origHref.startsWith('#') && !origHref.startsWith('javascript:')){\n"
+                                   "        a.href = toProxy(origHref);\n"
+                                   "        a.target = '_self';\n"
+                                   "      }\n"
+                                   "    }\n"
+                                   "  }, true);\n"
+                                   "  document.addEventListener('submit', function(e){\n"
+                                   "    var f = e.target;\n"
+                                   "    if(f && f.action){\n"
+                                   "      var origAction = f.getAttribute('action') || f.action;\n"
+                                   "      if(origAction && !origAction.startsWith('javascript:')){\n"
+                                   "        f.action = toProxy(origAction);\n"
+                                   "      }\n"
+                                   "    }\n"
+                                   "  }, true);\n"
+                                   "})();\n"
+                                   "</script>\n";
+
+                size_t head_pos = lower_html.find("<head");
+                if (head_pos != std::string::npos) {
+                    size_t tag_close = html.find('>', head_pos);
+                    if (tag_close != std::string::npos) {
+                        html.insert(tag_close + 1, "\n" + shim);
+                    } else {
+                        html.insert(head_pos + 5, "\n" + shim);
+                    }
+                } else {
+                    size_t html_pos = lower_html.find("<html");
+                    if (html_pos != std::string::npos) {
+                        size_t tag_close = html.find('>', html_pos);
+                        if (tag_close != std::string::npos) {
+                            html.insert(tag_close + 1, "\n<head>" + shim + "</head>\n");
+                        } else {
+                            html.insert(html_pos + 5, "\n<head>" + shim + "</head>\n");
+                        }
+                    } else {
+                        html = "<head>" + shim + "</head>\n" + html;
+                    }
+                }
+            }
+        }
+
+        res.set_header("Access-Control-Allow-Origin", "*");
+        res.set_header("Access-Control-Allow-Methods", "GET, POST, OPTIONS, PUT, DELETE, PATCH, HEAD");
+        res.set_header("Access-Control-Allow-Headers", "*");
+        res.set_header("Access-Control-Expose-Headers", "*");
+        res.set_header("Access-Control-Allow-Credentials", "true");
+        res.set_header("X-Frame-Options", "ALLOWALL");
+        res.set_header("Content-Security-Policy", "frame-ancestors *;");
+
+        res.set_content(html, ct);
+    };
+
+    svr.Get("/api/proxy", handle_proxy_request);
+    svr.Post("/api/proxy", handle_proxy_request);
+    svr.Options("/api/proxy", [](const httplib::Request&, httplib::Response& res) {
+        res.set_header("Access-Control-Allow-Origin", "*");
+        res.set_header("Access-Control-Allow-Methods", "GET, POST, OPTIONS, PUT, DELETE, PATCH, HEAD");
+        res.set_header("Access-Control-Allow-Headers", "*");
+        res.set_header("Access-Control-Expose-Headers", "*");
+        res.set_header("Access-Control-Allow-Credentials", "true");
+        res.status = 204;
+    });
+
+    // Fallback catch-all handlers for third-party navigation (such as /authwall, /checkpoint, /uas/*, etc.)
+    auto handle_catchall_proxy = [](const httplib::Request& req, httplib::Response& res) {
+        std::string upstream_host = "https://www.linkedin.com";
+
+        if (req.has_param("sessionRedirect")) {
+            std::string redirect_param = req.get_param_value("sessionRedirect");
+            size_t p_pos = redirect_param.find("://");
+            if (p_pos != std::string::npos) {
+                size_t s_pos = redirect_param.find('/', p_pos + 3);
+                if (s_pos != std::string::npos) {
+                    upstream_host = redirect_param.substr(0, s_pos);
+                } else {
+                    upstream_host = redirect_param;
+                }
+            }
+        } else if (req.has_header("Referer")) {
+            std::string referer = req.get_header_value("Referer");
+            size_t proxy_idx = referer.find("/api/proxy?url=");
+            if (proxy_idx != std::string::npos) {
+                std::string embedded_url = moecher::tooling::url_decode(referer.substr(proxy_idx + 15));
+                size_t p_pos = embedded_url.find("://");
+                if (p_pos != std::string::npos) {
+                    size_t s_pos = embedded_url.find('/', p_pos + 3);
+                    if (s_pos != std::string::npos) upstream_host = embedded_url.substr(0, s_pos);
+                    else upstream_host = embedded_url;
+                }
+            }
+        }
+
+        std::string query_str = "";
+        if (!req.params.empty()) {
+            bool first = true;
+            for (const auto& kv : req.params) {
+                query_str += (first ? "?" : "&") + moecher::tooling::url_encode(kv.first) + "=" + moecher::tooling::url_encode(kv.second);
+                first = false;
+            }
+        }
+
+        std::string full_target = upstream_host + req.path + query_str;
+        std::string proxied_url = "/api/proxy?url=" + moecher::tooling::url_encode(full_target);
+
+        res.set_header("Access-Control-Allow-Origin", "*");
+        res.set_header("Access-Control-Allow-Methods", "GET, POST, OPTIONS, PUT, DELETE, PATCH, HEAD");
+        res.set_header("Access-Control-Allow-Headers", "*");
+        res.set_header("Access-Control-Expose-Headers", "*");
+        res.set_header("Access-Control-Allow-Credentials", "true");
+        res.set_header("Location", proxied_url);
+        res.status = 302;
+    };
+
+    svr.Get("/authwall", handle_catchall_proxy);
+    svr.Post("/authwall", handle_catchall_proxy);
+    svr.Get(R"(/uas/.*)", handle_catchall_proxy);
+    svr.Post(R"(/uas/.*)", handle_catchall_proxy);
+    svr.Get(R"(/checkpoint/.*)", handle_catchall_proxy);
+    svr.Post(R"(/checkpoint/.*)", handle_catchall_proxy);
+    svr.Get(R"(/signup/.*)", handle_catchall_proxy);
+    svr.Post(R"(/signup/.*)", handle_catchall_proxy);
+    svr.Get(R"(/legal/.*)", handle_catchall_proxy);
+    svr.Post(R"(/legal/.*)", handle_catchall_proxy);
+
+    svr.Post("/api/tool/execute", [](const httplib::Request& req, httplib::Response& res) {
+        res.set_header("Access-Control-Allow-Origin", "*");
+        res.set_header("Access-Control-Allow-Methods", "GET, POST, OPTIONS");
+        res.set_header("Access-Control-Allow-Headers", "*");
+
+        json req_data;
+        try { req_data = json::parse(req.body); }
+        catch (...) {
+            res.status = 400;
+            res.set_content("{\"error\":\"Invalid JSON\"}", "application/json");
+            return;
+        }
+
+        std::string tool_name = req_data.value("name", "");
+        json args = json::object();
+        if (req_data.contains("arguments")) {
+            if (req_data["arguments"].is_string()) {
+                try { args = json::parse(req_data["arguments"].get<std::string>()); }
+                catch (...) {}
+            } else if (req_data["arguments"].is_object()) {
+                args = req_data["arguments"];
+            }
+        }
+
+        int timeout_ms = req_data.value("timeout_ms", 60000);
+        bool require_external_authorization = req_data.value("require_external_authorization", true);
+        bool workspace_boundary_enforced = req_data.value("workspace_boundary_enforced", true);
+        std::vector<std::string> authorized_paths;
+        if (req_data.contains("authorized_paths") && req_data["authorized_paths"].is_array()) {
+            for (const auto& ap : req_data["authorized_paths"]) {
+                if (ap.is_string()) authorized_paths.push_back(ap.get<std::string>());
+            }
+        }
+
+        auto is_path_authorized = [&](const std::string& p) -> bool {
+            if (!require_external_authorization && !workspace_boundary_enforced) return true;
+            if (moecher::tooling::is_path_inside_workspace(p)) return true;
+            for (const auto& ap : authorized_paths) {
+                if (ap == "*" || ap == p) return true;
+                if (!ap.empty() && moecher::tooling::is_path_inside_workspace(p, ap)) return true;
+            }
+            return false;
+        };
+
+        json resp_data = json::object();
+        std::string output;
+
+        if (tool_name == "read_file") {
+            std::string path = args.value("path", "");
+            int start_line = args.value("start_line", 1);
+            int end_line = args.value("end_line", -1);
+            if (!is_path_authorized(path)) {
+                resp_data["authorization_required"] = {
+                    {"tool", "read_file"},
+                    {"path", path}
+                };
+                output = "[Authorization Required: The path '" + path + "' is outside the workspace directory (" + moecher::tooling::get_workspace_directory() + "). Action requires explicit user authorization.]";
+            } else {
+                output = moecher::tooling::read_file(path, start_line, end_line);
+            }
+        } else if (tool_name == "write_file") {
+            std::string path = args.value("path", "");
+            std::string content = args.value("content", "");
+            bool overwrite = args.value("overwrite", true);
+            if (!is_path_authorized(path)) {
+                resp_data["authorization_required"] = {
+                    {"tool", "write_file"},
+                    {"path", path}
+                };
+                output = "[Authorization Required: The path '" + path + "' is outside the workspace directory (" + moecher::tooling::get_workspace_directory() + "). Action requires explicit user authorization.]";
+            } else {
+                output = moecher::tooling::write_file(path, content, overwrite);
+            }
+        } else if (tool_name == "edit_file") {
+            std::string path = args.value("path", "");
+            std::string target_content = args.value("target_content", "");
+            std::string replacement_content = args.value("replacement_content", "");
+            if (!is_path_authorized(path)) {
+                resp_data["authorization_required"] = {
+                    {"tool", "edit_file"},
+                    {"path", path}
+                };
+                output = "[Authorization Required: The path '" + path + "' is outside the workspace directory (" + moecher::tooling::get_workspace_directory() + "). Action requires explicit user authorization.]";
+            } else {
+                output = moecher::tooling::edit_file(path, target_content, replacement_content);
+            }
+        } else if (tool_name == "execute_command") {
+            std::string cmd = args.value("command", "");
+            output = moecher::tooling::execute_system_command(cmd, timeout_ms);
+        } else if (tool_name == "web_search" || tool_name == "google_search") {
+            std::string query = args.value("query", "");
+            int num_results = args.value("num_results", 5);
+            std::string site = args.value("site", "");
+            std::string provider = args.value("provider", "");
+            std::string api_key = args.value("api_key", "");
+            std::string cx = args.value("cx", "");
+            std::string searx_url = args.value("searxng_url", "");
+            auto doc = moecher::tooling::web_search_full(query, num_results, site, provider, api_key, cx, searx_url);
+            output = doc.clean_text;
+            resp_data["retrieved_document"] = {
+                {"url", doc.url},
+                {"title", doc.title.empty() ? ("Web Search: " + query) : doc.title},
+                {"html", doc.raw_html},
+                {"snippet", (doc.clean_text.size() > 300 ? doc.clean_text.substr(0, 300) + "..." : doc.clean_text)}
+            };
+        } else if (tool_name == "fetch_url") {
+            std::string url = args.value("url", "");
+            std::string mode = args.value("mode", "text");
+            std::string pattern = args.value("pattern", "");
+            int offset = args.value("offset", 0);
+            int max_chars = args.value("max_chars", 4000);
+            auto doc = moecher::tooling::fetch_url_full(url, std::min(timeout_ms, 30000), max_chars, mode, pattern, offset);
+            output = doc.clean_text;
+            resp_data["retrieved_document"] = {
+                {"url", doc.url},
+                {"title", doc.title.empty() ? doc.url : doc.title},
+                {"html", doc.raw_html},
+                {"snippet", (doc.clean_text.size() > 300 ? doc.clean_text.substr(0, 300) + "..." : doc.clean_text)}
+            };
+        } else {
+            output = "[Unknown tool: " + tool_name + "]";
+        }
+
+        resp_data["output"] = output;
+        res.set_content(resp_data.dump(), "application/json");
+    });
+    svr.Options("/api/tool/execute", [](const httplib::Request&, httplib::Response& res) {
+        res.set_header("Access-Control-Allow-Origin", "*");
+        res.set_header("Access-Control-Allow-Methods", "GET, POST, OPTIONS");
+        res.set_header("Access-Control-Allow-Headers", "*");
+        res.status = 204;
+    });
+
+    svr.Get("/api/settings/search_provider", [](const httplib::Request&, httplib::Response& res) {
+        auto search_settings = moecher::tooling::get_search_settings();
+        res.set_header("Access-Control-Allow-Origin", "*");
+        res.set_content(search_settings.dump(), "application/json");
+    });
+
+    svr.Post("/api/settings/search_provider", [](const httplib::Request& req, httplib::Response& res) {
+        res.set_header("Access-Control-Allow-Origin", "*");
+        try {
+            json body = json::parse(req.body);
+            std::string provider = body.value("provider", "tavily");
+            std::string tavily_key = body.value("tavily_api_key", "");
+            std::string brave_key = body.value("brave_api_key", "");
+            std::string serper_key = body.value("serper_api_key", "");
+            std::string searx_url = body.value("searxng_url", "https://searx.be");
+            std::string google_key = body.value("google_search_api_key", "");
+            std::string google_cx = body.value("google_search_cx", "");
+
+            moecher::tooling::set_search_settings(provider, tavily_key, brave_key, serper_key, searx_url, google_key, google_cx);
+            auto updated_settings = moecher::tooling::get_search_settings();
+            res.set_content(updated_settings.dump(), "application/json");
+        } catch (const std::exception& e) {
+            json err = {{"status", "error"}, {"message", e.what()}};
+            res.status = 400;
+            res.set_content(err.dump(), "application/json");
+        }
+    });
+
+    svr.Options("/api/settings/search_provider", [](const httplib::Request&, httplib::Response& res) {
+        res.set_header("Access-Control-Allow-Origin", "*");
+        res.set_header("Access-Control-Allow-Methods", "GET, POST, OPTIONS");
+        res.set_header("Access-Control-Allow-Headers", "*");
+        res.status = 204;
+    });
+
+    svr.Get("/api/settings/google_search", [](const httplib::Request&, httplib::Response& res) {
+        auto creds = moecher::tooling::get_google_search_credentials();
+        bool configured = !creds.first.empty() && !creds.second.empty();
+        std::string masked_key = "";
+        if (!creds.first.empty()) {
+            if (creds.first.size() > 8) {
+                masked_key = creds.first.substr(0, 6) + "..." + creds.first.substr(creds.first.size() - 4);
+            } else {
+                masked_key = "********";
+            }
+        }
+        json body = {
+            {"configured", configured},
+            {"api_key_set", !creds.first.empty()},
+            {"cx_set", !creds.second.empty()},
+            {"masked_api_key", masked_key},
+            {"cx", creds.second}
+        };
+        res.set_header("Access-Control-Allow-Origin", "*");
+        res.set_content(body.dump(), "application/json");
+    });
+
+    svr.Post("/api/settings/google_search", [](const httplib::Request& req, httplib::Response& res) {
+        res.set_header("Access-Control-Allow-Origin", "*");
+        try {
+            json body = json::parse(req.body);
+            std::string key = body.value("api_key", "");
+            std::string cx = body.value("cx", "");
+            moecher::tooling::set_google_search_credentials(key, cx);
+            auto creds = moecher::tooling::get_google_search_credentials();
+            json resp_body = {
+                {"status", "ok"},
+                {"configured", !creds.first.empty() && !creds.second.empty()},
+                {"cx", creds.second}
+            };
+            res.set_content(resp_body.dump(), "application/json");
+        } catch (const std::exception& e) {
+            json err = {{"status", "error"}, {"message", e.what()}};
+            res.status = 400;
+            res.set_content(err.dump(), "application/json");
+        }
+    });
+
+    svr.Options("/api/settings/google_search", [](const httplib::Request&, httplib::Response& res) {
+        res.set_header("Access-Control-Allow-Origin", "*");
+        res.set_header("Access-Control-Allow-Methods", "GET, POST, OPTIONS");
+        res.set_header("Access-Control-Allow-Headers", "*");
+        res.status = 204;
     });
 
     svr.Get("/v1/workspace", [](const httplib::Request&, httplib::Response& res) {
@@ -6863,6 +8378,44 @@ static void run_server(MoecherEngine& engine, int port, int default_thinking_bud
                 res.status = 400;
                 res.set_content("{\"error\":\"Invalid JSON\"}", "application/json");
                 return;
+            }
+
+            // Capture and propagate active client browser context (User-Agent, Accept-Language, Client Hints, Cookies)
+            std::string client_ua = req.get_header_value("X-Client-User-Agent");
+            if (client_ua.empty()) client_ua = req.get_header_value("User-Agent");
+            if (client_ua.empty() && request.contains("client_context") && request["client_context"].contains("user_agent")) {
+                client_ua = request["client_context"].value("user_agent", "");
+            }
+
+            std::string client_lang = req.get_header_value("X-Client-Accept-Language");
+            if (client_lang.empty()) client_lang = req.get_header_value("Accept-Language");
+            if (client_lang.empty() && request.contains("client_context") && request["client_context"].contains("languages")) {
+                client_lang = request["client_context"].value("languages", "");
+            }
+
+            std::string client_sec_ua = req.get_header_value("Sec-Ch-Ua");
+            if (client_sec_ua.empty() && request.contains("client_context") && request["client_context"].contains("sec_ch_ua")) {
+                client_sec_ua = request["client_context"].value("sec_ch_ua", "");
+            }
+
+            std::string client_sec_mobile = req.get_header_value("Sec-Ch-Ua-Mobile");
+            if (client_sec_mobile.empty() && request.contains("client_context") && request["client_context"].contains("mobile")) {
+                client_sec_mobile = request["client_context"].value("mobile", "");
+            }
+
+            std::string client_sec_platform = req.get_header_value("Sec-Ch-Ua-Platform");
+            if (client_sec_platform.empty() && request.contains("client_context") && request["client_context"].contains("platform")) {
+                client_sec_platform = request["client_context"].value("platform", "");
+            }
+
+            std::string client_cookies = req.get_header_value("X-Client-Cookie");
+            if (client_cookies.empty()) client_cookies = req.get_header_value("Cookie");
+            if (client_cookies.empty() && request.contains("client_context") && request["client_context"].contains("cookies")) {
+                client_cookies = request["client_context"].value("cookies", "");
+            }
+
+            if (!client_ua.empty() || !client_cookies.empty()) {
+                moecher::tooling::set_client_browser_context(client_ua, client_lang, client_sec_ua, client_sec_mobile, client_sec_platform, client_cookies);
             }
 
             // Log request
@@ -6942,9 +8495,18 @@ static void run_server(MoecherEngine& engine, int port, int default_thinking_bud
                 }
             }
 
-            LOG_INFO("Reasoning effort: %s, Thinking: %s, Thinking budget: %d, Tools: %zu, Server-Exec: %s, Timeout: %dms",
+            bool client_tool_exec = false;
+            if (req.has_header("X-Client-Tool-Execution") && req.get_header_value("X-Client-Tool-Execution") == "true") {
+                client_tool_exec = true;
+            }
+            if (request.contains("client_tool_execution") && request["client_tool_execution"].is_boolean()) {
+                client_tool_exec = request["client_tool_execution"].get<bool>();
+            }
+            bool do_server_exec = g_server_exec && (!client_tool_exec || g_headless_browsing);
+
+            LOG_INFO("Reasoning effort: %s, Thinking: %s, Thinking budget: %d, Tools: %zu, Server-Exec: %s (client_tool_exec: %s, headless: %s), Timeout: %dms",
                      reasoning_effort.c_str(), enable_thinking ? "enabled" : "disabled", max_thinking_tokens,
-                     tools.size(), (g_server_exec ? "enabled" : "disabled"), execution_timeout_ms);
+                     tools.size(), (do_server_exec ? "enabled" : "disabled"), client_tool_exec ? "true" : "false", g_headless_browsing ? "true" : "false", execution_timeout_ms);
 
             std::string req_id = "chatcmpl-moecher-" + std::to_string(++g_request_counter);
             std::string model_id = (engine.cfg_.architecture == ModelArch::QWEN) ? "qwen3.8-27b-q4" : "deepseek-v4-flash";
@@ -6953,7 +8515,7 @@ static void run_server(MoecherEngine& engine, int port, int default_thinking_bud
                 // SSE streaming
                 res.set_chunked_content_provider(
                     "text/event-stream",
-                    [&engine, messages, tools, max_tokens, temperature, req_id, repetition_penalty, enable_thinking, max_thinking_tokens, top_p, min_p, top_k, reasoning_effort, model_id, execution_timeout_ms, require_external_authorization, workspace_boundary_enforced, authorized_paths](size_t offset, httplib::DataSink &sink) {
+                    [&engine, messages, tools, max_tokens, temperature, req_id, repetition_penalty, enable_thinking, max_thinking_tokens, top_p, min_p, top_k, reasoning_effort, model_id, execution_timeout_ms, require_external_authorization, workspace_boundary_enforced, authorized_paths, do_server_exec](size_t offset, httplib::DataSink &sink) {
                         if (offset > 0) return false;
                         std::lock_guard<std::mutex> lock(g_engine_mutex);
 
@@ -6972,7 +8534,7 @@ static void run_server(MoecherEngine& engine, int port, int default_thinking_bud
                         sink.write(sse.data(), sse.size());
 
                         json current_messages = messages;
-                        int max_tool_rounds = (g_server_exec && !tools.empty() && g_enable_tools) ? 5 : 1;
+                        int max_tool_rounds = (do_server_exec && !tools.empty() && g_enable_tools) ? 5 : 1;
                         std::string final_finish_reason = "stop";
 
                         for (int round = 0; round < max_tool_rounds; round++) {
@@ -7003,7 +8565,7 @@ static void run_server(MoecherEngine& engine, int port, int default_thinking_bud
                                     return sink.write(sse_chunk.data(), sse_chunk.size()) && !g_stop_requested.load();
                                 } else {
                                     round_content += text;
-                                    if (!g_enable_tools || tools.empty() || !g_server_exec) {
+                                    if (!g_enable_tools || tools.empty()) {
                                         json delta_chunk = {
                                             {"id", req_id},
                                             {"object", "chat.completion.chunk"},
@@ -7032,8 +8594,17 @@ static void run_server(MoecherEngine& engine, int port, int default_thinking_bud
                             std::vector<moecher::tooling::ToolCall> round_tool_calls;
                             moecher::tooling::extract_tool_calls(round_content, clean_content, round_tool_calls);
 
+                            if (round_tool_calls.empty() && !round_reasoning.empty()) {
+                                std::string clean_reasoning;
+                                moecher::tooling::extract_tool_calls(round_reasoning, clean_reasoning, round_tool_calls);
+                                if (!round_tool_calls.empty()) {
+                                    LOG_INFO("Extracted %zu tool call(s) from reasoning stream", round_tool_calls.size());
+                                    round_reasoning = clean_reasoning;
+                                }
+                            }
+
                             if (round_tool_calls.empty()) {
-                                if (g_server_exec && !clean_content.empty()) {
+                                if (!clean_content.empty()) {
                                     json delta_chunk = {
                                         {"id", req_id},
                                         {"object", "chat.completion.chunk"},
@@ -7069,7 +8640,7 @@ static void run_server(MoecherEngine& engine, int port, int default_thinking_bud
                                 sink.write(sse_intro.data(), sse_intro.size());
                             }
 
-                            if (!g_server_exec) {
+                            if (!do_server_exec) {
                                 final_finish_reason = "tool_calls";
                                 json tc_arr = json::array();
                                 for (size_t idx = 0; idx < round_tool_calls.size(); idx++) {
@@ -7125,11 +8696,107 @@ static void run_server(MoecherEngine& engine, int port, int default_thinking_bud
 
                             for (const auto& tc : round_tool_calls) {
                                 std::string exec_output;
-                                if (tc.name == "fetch_url") {
+                                if (tc.name == "web_search" || tc.name == "google_search") {
+                                    std::string query;
+                                    int num_results = 5;
+                                    std::string site = "";
+                                    std::string provider = "";
+                                    std::string api_key = "";
+                                    std::string cx = "";
+                                    std::string searx_url = "";
+                                    try {
+                                        json args = json::parse(tc.arguments);
+                                        query = args.value("query", "");
+                                        num_results = args.value("num_results", 5);
+                                        site = args.value("site", "");
+                                        provider = args.value("provider", "");
+                                        api_key = args.value("api_key", "");
+                                        cx = args.value("cx", "");
+                                        searx_url = args.value("searxng_url", "");
+                                    } catch (...) { query = tc.arguments; }
+
+                                    std::string active_card =
+                                        "\n\n<div class=\"tool-activity-block active\" id=\"tool-act-" + tc.id + "\">\n"
+                                        "  <span class=\"thinking-spinner\">progress_activity</span>\n"
+                                        "  <span class=\"tool-action-label\">Searching Web</span>\n"
+                                        "  <span class=\"tool-target-subtle\">" + query + "</span>\n"
+                                        "</div>\n\n";
+
+                                    json info_chunk = {
+                                        {"id", req_id},
+                                        {"object", "chat.completion.chunk"},
+                                        {"created", std::chrono::system_clock::to_time_t(std::chrono::system_clock::now())},
+                                        {"model", model_id},
+                                        {"choices", {{
+                                            {"index", 0},
+                                            {"delta", {{tool_delta_field, active_card}}},
+                                            {"finish_reason", nullptr}
+                                        }}}
+                                    };
+                                    std::string sse_info = "data: " + info_chunk.dump(-1, ' ', false, json::error_handler_t::replace) + "\n\n";
+                                    sink.write(sse_info.data(), sse_info.size());
+
+                                    LOG_INFO("Streaming Tool Exec: web_search('%s', num=%d, site='%s', provider='%s')", query.c_str(), num_results, site.c_str(), provider.c_str());
+                                    auto doc = moecher::tooling::web_search_full(query, num_results, site, provider, api_key, cx, searx_url);
+                                    exec_output = doc.clean_text;
+
+                                    // Stream retrieved search cards to the frontend
+                                    json doc_chunk = {
+                                        {"id", req_id},
+                                        {"object", "chat.completion.chunk"},
+                                        {"created", std::chrono::system_clock::to_time_t(std::chrono::system_clock::now())},
+                                        {"model", model_id},
+                                        {"choices", {{
+                                            {"index", 0},
+                                            {"delta", {
+                                                {"retrieved_document", {
+                                                    {"id", tc.id},
+                                                    {"url", doc.url},
+                                                    {"title", doc.title.empty() ? ("Web Search: " + query) : doc.title},
+                                                    {"html", doc.raw_html},
+                                                    {"snippet", (doc.clean_text.size() > 300 ? doc.clean_text.substr(0, 300) + "..." : doc.clean_text)}
+                                                }}
+                                            }},
+                                            {"finish_reason", nullptr}
+                                        }}}
+                                    };
+                                    std::string sse_doc = "data: " + doc_chunk.dump(-1, ' ', false, json::error_handler_t::replace) + "\n\n";
+                                    sink.write(sse_doc.data(), sse_doc.size());
+
+                                    std::string completed_card =
+                                        "\n\n<div class=\"tool-activity-block completed\" id=\"tool-act-" + tc.id + "\">\n"
+                                        "  <span class=\"material-symbols-outlined tool-done-icon\">search</span>\n"
+                                        "  <span class=\"tool-action-label\">Web Searched</span>\n"
+                                        "  <span class=\"tool-target-subtle\">" + query + "</span>\n"
+                                        "</div>\n\n";
+
+                                    json comp_chunk = {
+                                        {"id", req_id},
+                                        {"object", "chat.completion.chunk"},
+                                        {"created", std::chrono::system_clock::to_time_t(std::chrono::system_clock::now())},
+                                        {"model", model_id},
+                                        {"choices", {{
+                                            {"index", 0},
+                                            {"delta", {{tool_delta_field, completed_card}}},
+                                            {"finish_reason", nullptr}
+                                        }}}
+                                    };
+                                    std::string sse_comp = "data: " + comp_chunk.dump(-1, ' ', false, json::error_handler_t::replace) + "\n\n";
+                                    sink.write(sse_comp.data(), sse_comp.size());
+
+                                } else if (tc.name == "fetch_url") {
                                     std::string url;
+                                    std::string mode = "text";
+                                    std::string pattern = "";
+                                    int offset = 0;
+                                    int max_chars = 4000;
                                     try {
                                         json args = json::parse(tc.arguments);
                                         url = args.value("url", "");
+                                        mode = args.value("mode", "text");
+                                        pattern = args.value("pattern", "");
+                                        offset = args.value("offset", 0);
+                                        max_chars = args.value("max_chars", 4000);
                                     } catch (...) { url = tc.arguments; }
 
                                     std::string active_card =
@@ -7153,8 +8820,8 @@ static void run_server(MoecherEngine& engine, int port, int default_thinking_bud
                                     std::string sse_info = "data: " + info_chunk.dump(-1, ' ', false, json::error_handler_t::replace) + "\n\n";
                                     sink.write(sse_info.data(), sse_info.size());
 
-                                    LOG_INFO("Streaming Tool Exec: fetch_url('%s')", url.c_str());
-                                    auto doc = moecher::tooling::fetch_url_full(url, std::min(execution_timeout_ms, 30000));
+                                    LOG_INFO("Streaming Tool Exec: fetch_url('%s', mode='%s', pattern='%s')", url.c_str(), mode.c_str(), pattern.c_str());
+                                    auto doc = moecher::tooling::fetch_url_full(url, std::min(execution_timeout_ms, 30000), max_chars, mode, pattern, offset);
                                     exec_output = doc.clean_text;
 
                                     // Stream the retrieved document metadata & HTML to the frontend for the Retrieved Documents panel
@@ -7546,7 +9213,7 @@ static void run_server(MoecherEngine& engine, int port, int default_thinking_bud
                 json current_messages = messages;
                 std::string finish_reason = "stop";
 
-                int max_tool_rounds = (g_server_exec && !tools.empty() && g_enable_tools) ? 5 : 1;
+                int max_tool_rounds = (do_server_exec && !tools.empty() && g_enable_tools) ? 5 : 1;
 
                 for (int round = 0; round < max_tool_rounds; round++) {
                     std::vector<int> prompt = apply_chat_template(current_messages, engine.tokenizer_, enable_thinking, reasoning_effort, tools);
@@ -7576,7 +9243,7 @@ static void run_server(MoecherEngine& engine, int port, int default_thinking_bud
                     emitted_tool_calls = round_tool_calls;
                     final_response_text = clean_content;
 
-                    if (!g_server_exec) {
+                    if (!do_server_exec) {
                         finish_reason = "tool_calls";
                         break;
                     }
@@ -7607,14 +9274,42 @@ static void run_server(MoecherEngine& engine, int port, int default_thinking_bud
 
                     for (const auto& tc : round_tool_calls) {
                         std::string exec_output;
-                        if (tc.name == "fetch_url") {
+                        if (tc.name == "web_search" || tc.name == "google_search") {
+                            std::string query;
+                            int num_results = 5;
+                            std::string site = "";
+                            std::string provider = "";
+                            std::string api_key = "";
+                            std::string cx = "";
+                            std::string searx_url = "";
+                            try {
+                                json args = json::parse(tc.arguments);
+                                query = args.value("query", "");
+                                num_results = args.value("num_results", 5);
+                                site = args.value("site", "");
+                                provider = args.value("provider", "");
+                                api_key = args.value("api_key", "");
+                                cx = args.value("cx", "");
+                                searx_url = args.value("searxng_url", "");
+                            } catch (...) { query = tc.arguments; }
+                            LOG_INFO("Executing built-in tool web_search: %s (num=%d, site=%s, provider=%s)", query.c_str(), num_results, site.c_str(), provider.c_str());
+                            exec_output = moecher::tooling::web_search_content(query, num_results, site, provider, api_key, cx, searx_url);
+                        } else if (tc.name == "fetch_url") {
                             std::string url;
+                            std::string mode = "text";
+                            std::string pattern = "";
+                            int offset = 0;
+                            int max_chars = 4000;
                             try {
                                 json args = json::parse(tc.arguments);
                                 url = args.value("url", "");
+                                mode = args.value("mode", "text");
+                                pattern = args.value("pattern", "");
+                                offset = args.value("offset", 0);
+                                max_chars = args.value("max_chars", 4000);
                             } catch (...) { url = tc.arguments; }
-                            LOG_INFO("Executing built-in tool fetch_url: %s", url.c_str());
-                            exec_output = moecher::tooling::fetch_url_content(url, std::min(execution_timeout_ms, 30000));
+                            LOG_INFO("Executing built-in tool fetch_url: %s (mode=%s, pattern=%s)", url.c_str(), mode.c_str(), pattern.c_str());
+                            exec_output = moecher::tooling::fetch_url_content(url, std::min(execution_timeout_ms, 30000), max_chars, mode, pattern, offset);
                         } else if (tc.name == "read_file") {
                             std::string path;
                             int start_line = 1;
@@ -7788,12 +9483,21 @@ int main(int argc, char** argv) {
     float test_temp = 0.7f;
     int test_max_tokens = 150;
     bool test_thinking = true;
+    int proxy_port = 8002;
+    bool enable_forward_proxy = true;
+    bool enable_system_proxy = false;
 
     for (int i = 1; i < argc; i++) {
         if ((std::string(argv[i]) == "--manifest" || std::string(argv[i]) == "-m") && i + 1 < argc) {
             manifest_path = argv[++i];
         } else if ((std::string(argv[i]) == "--port" || std::string(argv[i]) == "-p") && i + 1 < argc) {
             port = std::stoi(argv[++i]);
+        } else if ((std::string(argv[i]) == "--proxy-port" || std::string(argv[i]) == "-pp") && i + 1 < argc) {
+            proxy_port = std::stoi(argv[++i]);
+        } else if (std::string(argv[i]) == "--no-proxy" || std::string(argv[i]) == "--disable-proxy") {
+            enable_forward_proxy = false;
+        } else if (std::string(argv[i]) == "--system-proxy" || std::string(argv[i]) == "--auto-proxy") {
+            enable_system_proxy = true;
         } else if (std::string(argv[i]) == "--log" && i + 1 < argc) {
             log_path = argv[++i];
         } else if ((std::string(argv[i]) == "--max-vram" || std::string(argv[i]) == "-V") && i + 1 < argc) {
@@ -7850,6 +9554,9 @@ int main(int argc, char** argv) {
             g_server_exec = false;
         } else if (std::string(argv[i]) == "--server-exec") {
             g_server_exec = true;
+        } else if (std::string(argv[i]) == "--headless-browsing" || std::string(argv[i]) == "-headless-browsing" || std::string(argv[i]) == "--enable-headless-browsing") {
+            g_headless_browsing = true;
+            g_server_exec = true;
         } else if (std::string(argv[i]) == "--track-reset" ||
                    std::string(argv[i]) == "--reset-track" ||
                    std::string(argv[i]) == "-track-reset" ||
@@ -7865,7 +9572,7 @@ int main(int argc, char** argv) {
     LOG_INFO("=== v2.05 ===");
     LOG_INFO("Default thinking token budget: %d", default_thinking_budget);
     LOG_INFO("Tool calling support: %s", g_enable_tools ? "enabled" : "disabled");
-    LOG_INFO("Server-side tool execution: %s", g_server_exec ? "enabled" : "disabled");
+    LOG_INFO("Server-side tool execution: %s (headless-browsing: %s)", g_server_exec ? "enabled" : "disabled", g_headless_browsing ? "enabled" : "disabled");
 
     MoecherEngine engine;
     engine.enable_pld_ = enable_pld;
@@ -7906,7 +9613,7 @@ int main(int argc, char** argv) {
         }
     }
 
-    run_server(engine, port, default_thinking_budget);
+    run_server(engine, port, default_thinking_budget, proxy_port, enable_forward_proxy, enable_system_proxy);
 
     // Save expert frequency & specialization profile on shutdown
     if (g_track_experts && !engine.expert_freq_counts_.empty()) {
