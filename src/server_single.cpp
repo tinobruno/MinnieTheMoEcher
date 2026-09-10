@@ -6808,17 +6808,22 @@ static std::vector<int> apply_chat_template(const json& messages, const BPEToken
 
 namespace moecher::proxy {
 
-static std::atomic<bool> g_proxy_running{false};
-static std::atomic<int> g_proxy_port{8002};
-#ifdef _WIN32
-static SOCKET g_proxy_listen_sock = INVALID_SOCKET;
-#else
-static int g_proxy_listen_sock = -1;
+#ifndef SOCKET
 #define SOCKET int
-#define INVALID_SOCKET -1
-#define SOCKET_ERROR -1
+#endif
+#ifndef INVALID_SOCKET
+#define INVALID_SOCKET (-1)
+#endif
+#ifndef SOCKET_ERROR
+#define SOCKET_ERROR (-1)
+#endif
+#ifndef closesocket
 #define closesocket close
 #endif
+
+static std::atomic<bool> g_proxy_running{false};
+static std::atomic<int> g_proxy_port{8002};
+static SOCKET g_proxy_listen_sock = INVALID_SOCKET;
 
 // Helper to reliably send all bytes over socket
 static bool send_all(SOCKET s, const char* data, int len) {
@@ -7438,7 +7443,11 @@ static bool start_forward_proxy(int proxy_port) {
     std::thread proxy_thread([]() {
         while (g_proxy_running.load()) {
             sockaddr_in client_addr{};
+#if defined(_WIN32)
             int addr_len = sizeof(client_addr);
+#else
+            socklen_t addr_len = sizeof(client_addr);
+#endif
             SOCKET client_sock = accept(g_proxy_listen_sock, (sockaddr*)&client_addr, &addr_len);
             if (client_sock == INVALID_SOCKET) {
                 if (!g_proxy_running.load()) break;

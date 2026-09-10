@@ -2396,6 +2396,8 @@ inline RetrievedDocument fetch_url_full(const std::string& raw_url, int timeout_
     }
 
 #else
+    std::string ua = get_client_user_agent();
+    std::string lang = get_client_accept_language();
     std::string cookies = get_cookies_for_url(doc.url);
     std::string cookie_flag = cookies.empty() ? "" : (" -H \"Cookie: " + cookies + "\"");
     std::string ua_flag = ua.empty() ? "" : (" -A \"" + ua + "\"");
@@ -2558,6 +2560,16 @@ inline RetrievedDocument fetch_url_full(const std::string& raw_url, int timeout_
 inline std::string fetch_url_content(const std::string& raw_url, int timeout_ms = 10000, size_t max_chars = 4000, const std::string& mode = "text", const std::string& pattern = "", size_t offset = 0) {
     RetrievedDocument doc = fetch_url_full(raw_url, timeout_ms, max_chars, mode, pattern, offset);
     return doc.clean_text;
+}
+
+inline std::string escape_shell_arg(const std::string& arg) {
+    std::string res = "'";
+    for (char c : arg) {
+        if (c == '\'') res += "'\\''";
+        else res += c;
+    }
+    res += "'";
+    return res;
 }
 
 inline std::string http_request_native(
