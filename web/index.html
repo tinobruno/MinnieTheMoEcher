@@ -81,6 +81,13 @@
                         Web Retrieval
                     </label>
                 </div>
+
+                <div class="setting-item">
+                    <label class="checkbox-label" title="When querying music or videos, search YouTube directly with zero API cost and instant playback">
+                        <input type="checkbox" id="sidebar-fast-media-search" checked onchange="syncFastMediaSearchToggle(this.checked)">
+                        Fast Media / YouTube (0 Cost)
+                    </label>
+                </div>
             </details>
 
             <details class="settings-section" open>
@@ -743,6 +750,15 @@
                                         <input type="text" id="google-cx-input" placeholder="e.g. 012345678901234567890:abcdefghijk" class="agentic-text-field" style="font-family: monospace;">
                                         <div class="agentic-hint">From <a href="https://programmablesearchengine.google.com/controlpanel/all" target="_blank" style="color: #60a5fa; text-decoration: underline;">Programmable Search Engine</a>.</div>
                                     </div>
+                                </div>
+
+                                <!-- Fast Media Search Toggle -->
+                                <div class="agentic-switch-row" style="margin-top: 10px; margin-bottom: 8px; padding: 10px 12px; background: rgba(255,255,255,0.03); border: 1px solid rgba(255,255,255,0.07); border-radius: 8px; display: flex; align-items: center; justify-content: space-between;">
+                                    <div style="flex: 1; padding-right: 12px;">
+                                        <label class="agentic-toggle-label" for="fast-media-search-toggle" style="font-size: 13px; font-weight: 500; color: #f1f5f9; display: block;">Direct YouTube Media Search (0 API Cost)</label>
+                                        <p class="agentic-toggle-sub" style="font-size: 11px; color: #94a3b8; margin: 2px 0 0 0; line-height: 1.4;">When querying videos or music, searches YouTube directly with zero API cost and instant playback, falling back to your search provider if needed.</p>
+                                    </div>
+                                    <input type="checkbox" id="fast-media-search-toggle" class="agentic-toggle" checked onchange="onFastMediaSearchToggleChange()">
                                 </div>
 
                                 <div style="display: flex; align-items: center; justify-content: space-between; margin-top: 4px;">

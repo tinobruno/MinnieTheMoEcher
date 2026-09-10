@@ -98,6 +98,7 @@ inline std::string g_serper_api_key = "";
 inline std::string g_searxng_url = "https://searx.be";
 inline std::string g_google_search_api_key = "";
 inline std::string g_google_search_cx = "";
+inline bool g_fast_media_search = true;
 inline bool g_config_loaded = false;
 
 inline void load_config_from_disk() {
@@ -143,6 +144,9 @@ inline void load_config_from_disk() {
             if (j.contains("brave_api_key") && j["brave_api_key"].is_string() && g_brave_api_key.empty()) {
                 g_brave_api_key = j["brave_api_key"].get<std::string>();
             }
+            if (j.contains("fast_media_search") && j["fast_media_search"].is_boolean()) {
+                g_fast_media_search = j["fast_media_search"].get<bool>();
+            }
             if (j.contains("serper_api_key") && j["serper_api_key"].is_string() && g_serper_api_key.empty()) {
                 g_serper_api_key = j["serper_api_key"].get<std::string>();
             }
@@ -175,6 +179,7 @@ inline void save_config_to_disk() {
         j["searxng_url"] = g_searxng_url;
         j["google_search_api_key"] = g_google_search_api_key;
         j["google_search_cx"] = g_google_search_cx;
+        j["fast_media_search"] = g_fast_media_search;
         std::ofstream wf(".moecher_config.json");
         if (wf.is_open()) {
             wf << j.dump(2);
@@ -189,7 +194,8 @@ inline void set_search_settings(
     const std::string& serper_key,
     const std::string& searxng_url,
     const std::string& google_key,
-    const std::string& google_cx
+    const std::string& google_cx,
+    int fast_media = -1
 ) {
     {
         std::lock_guard<std::mutex> lock(g_config_mutex);
@@ -200,6 +206,7 @@ inline void set_search_settings(
         if (!searxng_url.empty()) g_searxng_url = searxng_url;
         if (!google_key.empty()) g_google_search_api_key = google_key;
         if (!google_cx.empty()) g_google_search_cx = google_cx;
+        if (fast_media != -1) g_fast_media_search = (fast_media != 0);
     }
     save_config_to_disk();
 }
@@ -215,6 +222,7 @@ inline json get_search_settings() {
     j["searxng_url"] = g_searxng_url.empty() ? "https://searx.be" : g_searxng_url;
     j["google_search_api_key"] = g_google_search_api_key;
     j["google_search_cx"] = g_google_search_cx;
+    j["fast_media_search"] = g_fast_media_search;
     
     // Status indicator
     bool is_ready = false;
@@ -2640,6 +2648,167 @@ inline std::string http_request_native(
 //  Search Provider Handlers (Tavily, Brave, SearXNG, Serper, Google)
 // ════════════════════════════════════════════════════════════════════════════════
 
+inline bool is_media_search_query(const std::string& query) {
+    if (query.empty()) return false;
+    std::string q = query;
+    std::transform(q.begin(), q.end(), q.begin(), [](unsigned char c) { return std::tolower(c); });
+    static const std::vector<std::string> kw = {
+        "youtube", "youtu.be", "video", "videos", "song", "songs", "music", "play", "listen",
+        "track", "tracks", "album", "clip", "clips", "audio", "soundtrack", "ost", "theme",
+        "canto", "canzone", "canzoni", "musica", "suona", "ascolta", "videoclip", "trailer",
+        "teaser", "movie", "podcast", "live", "concert", "concerto", "remix", "cover", "lyrics",
+        "testo", "band", "singer", "artist", "cantante", "cantautore", "orchestra", "symphony",
+        "instrumental", "acoustic", "stream", "show", "performance", "discography", "chords",
+        "tab", "vlog", "gameplay", "tutorial", "walkthrough", "scene", "highlight", "highlights",
+        "documentary", "short", "shorts", "official video", "music video", "ep", "lp", "single"
+    };
+    for (const auto& k : kw) {
+        if (q.find(k) != std::string::npos) return true;
+    }
+    return false;
+}
+
+inline RetrievedDocument search_youtube_direct(const std::string& clean_q, int max_results = 3) {
+    RetrievedDocument doc;
+    if (max_results < 1) max_results = 1;
+    if (max_results > 5) max_results = 5;
+
+    std::string enc = url_encode(clean_q);
+    std::string url = "https://www.youtube.com/results?search_query=" + enc;
+    std::vector<std::string> headers = {
+        "User-Agent: Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
+        "Accept-Language: en-US,en;q=0.9"
+    };
+
+    std::string html = http_request_native("GET", url, "", headers, 6000);
+    if (html.empty() || html.find("[Error") != std::string::npos) {
+        return doc;
+    }
+
+    struct YtItem {
+        std::string vid;
+        std::string title;
+        std::string channel;
+        std::string duration;
+    };
+    std::vector<YtItem> videos;
+    std::unordered_set<std::string> seen;
+
+    // Strategy A: ytInitialData JSON
+    size_t data_pos = html.find("ytInitialData");
+    if (data_pos != std::string::npos) {
+        size_t j_start = html.find('{', data_pos);
+        if (j_start != std::string::npos) {
+            size_t j_end = html.find(";</script>", j_start);
+            if (j_end == std::string::npos) j_end = html.find("</script>", j_start);
+            if (j_end != std::string::npos) {
+                std::string j_str = html.substr(j_start, j_end - j_start);
+                try {
+                    auto data = json::parse(j_str);
+                    std::function<void(const json&)> find_renderers = [&](const json& j) {
+                        if (videos.size() >= (size_t)max_results) return;
+                        if (j.is_object()) {
+                            if (j.contains("videoRenderer")) {
+                                const auto& vr = j["videoRenderer"];
+                                std::string vid = vr.value("videoId", "");
+                                if (!vid.empty() && seen.insert(vid).second) {
+                                    std::string title;
+                                    if (vr.contains("title")) {
+                                        if (vr["title"].contains("runs") && vr["title"]["runs"].is_array() && !vr["title"]["runs"].empty()) {
+                                            for (const auto& r : vr["title"]["runs"]) {
+                                                title += r.value("text", "");
+                                            }
+                                        } else if (vr["title"].contains("simpleText")) {
+                                            title = vr["title"].value("simpleText", "");
+                                        }
+                                    }
+                                    std::string channel;
+                                    if (vr.contains("ownerText") && vr["ownerText"].contains("runs") && vr["ownerText"]["runs"].is_array() && !vr["ownerText"]["runs"].empty()) {
+                                        channel = vr["ownerText"]["runs"][0].value("text", "");
+                                    } else if (vr.contains("shortBylineText") && vr["shortBylineText"].contains("runs") && vr["shortBylineText"]["runs"].is_array() && !vr["shortBylineText"]["runs"].empty()) {
+                                        channel = vr["shortBylineText"]["runs"][0].value("text", "");
+                                    }
+                                    std::string duration;
+                                    if (vr.contains("lengthText")) {
+                                        if (vr["lengthText"].contains("simpleText")) {
+                                            duration = vr["lengthText"].value("simpleText", "");
+                                        } else if (vr["lengthText"].contains("runs") && vr["lengthText"]["runs"].is_array() && !vr["lengthText"]["runs"].empty()) {
+                                            duration = vr["lengthText"]["runs"][0].value("text", "");
+                                        }
+                                    }
+                                    if (title.empty()) title = "YouTube Video (" + vid + ")";
+                                    videos.push_back({vid, title, channel, duration});
+                                }
+                            }
+                            for (auto it = j.begin(); it != j.end(); ++it) {
+                                if (it.value().is_structured()) find_renderers(it.value());
+                            }
+                        } else if (j.is_array()) {
+                            for (const auto& elem : j) {
+                                if (videos.size() >= (size_t)max_results) break;
+                                find_renderers(elem);
+                            }
+                        }
+                    };
+                    find_renderers(data);
+                } catch (...) {}
+            }
+        }
+    }
+
+    // Strategy B: substring fallback
+    if (videos.empty()) {
+        size_t vr_pos = 0;
+        while (videos.size() < (size_t)max_results && (vr_pos = html.find("\"videoRenderer\":{\"videoId\":\"", vr_pos)) != std::string::npos) {
+            size_t id_start = vr_pos + 28;
+            if (id_start + 11 <= html.size()) {
+                std::string vid = html.substr(id_start, 11);
+                bool valid = true;
+                for (char c : vid) {
+                    if (!isalnum((unsigned char)c) && c != '-' && c != '_') { valid = false; break; }
+                }
+                if (valid && seen.insert(vid).second) {
+                    std::string title;
+                    std::string duration;
+                    std::string channel;
+                    size_t block_end = std::min(html.size(), vr_pos + 1200);
+                    std::string block = html.substr(vr_pos, block_end - vr_pos);
+
+                    size_t t_pos = block.find("\"title\":{\"runs\":[{\"text\":\"");
+                    if (t_pos != std::string::npos) {
+                        size_t t_start = t_pos + 26;
+                        size_t t_end = block.find('"', t_start);
+                        if (t_end != std::string::npos) title = block.substr(t_start, t_end - t_start);
+                    }
+                    if (title.empty()) title = "YouTube Video (" + vid + ")";
+                    title = unescape_json_string(title);
+                    videos.push_back({vid, title, channel, duration});
+                }
+            }
+            vr_pos += 28;
+        }
+    }
+
+    if (videos.empty()) {
+        return doc;
+    }
+
+    std::string text_out = "[Direct YouTube Search: \"" + clean_q + "\"]\n\n";
+    for (size_t i = 0; i < videos.size(); ++i) {
+        text_out += std::to_string(i + 1) + ". [" + videos[i].title + "](https://www.youtube.com/watch?v=" + videos[i].vid + ")\n";
+        if (!videos[i].channel.empty()) text_out += "   Channel: " + videos[i].channel + "\n";
+        if (!videos[i].duration.empty()) text_out += "   Duration: " + videos[i].duration + "\n";
+    }
+
+    const auto& top = videos[0];
+    doc.url = "https://www.youtube.com/watch?v=" + top.vid;
+    doc.title = top.title;
+    doc.clean_text = text_out;
+    doc.raw_html = generate_youtube_preview_html(top.vid, top.title, text_out, top.channel, doc.url);
+
+    return doc;
+}
+
 inline RetrievedDocument search_tavily(const std::string& clean_q, int num_results, const std::string& api_key) {
     RetrievedDocument doc;
     doc.url = "https://tavily.com";
@@ -2658,12 +2827,21 @@ inline RetrievedDocument search_tavily(const std::string& clean_q, int num_resul
         return doc;
     }
 
+    bool is_media = g_fast_media_search && is_media_search_query(clean_q);
+    int effective_results = is_media ? std::min(num_results, 3) : num_results;
+    std::string query_to_send = clean_q;
+    std::string q_lower = clean_q;
+    for (char &c : q_lower) c = ::tolower((unsigned char)c);
+    if (is_media && q_lower.find("youtube") == std::string::npos && q_lower.find("video") == std::string::npos) {
+        query_to_send += " youtube";
+    }
+
     json req_body = {
         {"api_key", api_key},
-        {"query", clean_q},
-        {"max_results", num_results},
+        {"query", query_to_send},
+        {"max_results", effective_results},
         {"search_depth", "basic"},
-        {"include_answer", true}
+        {"include_answer", !is_media}
     };
 
     std::string resp = http_request_native("POST", "https://api.tavily.com/search", req_body.dump(), {"Content-Type: application/json"});
@@ -2676,6 +2854,42 @@ inline RetrievedDocument search_tavily(const std::string& clean_q, int num_resul
         json j = json::parse(resp);
         if (j.contains("error")) {
             doc.clean_text = "[Tavily Error: " + j["error"].dump() + "]";
+            return doc;
+        }
+
+        std::string top_yt_id = "";
+        std::string top_yt_title = "";
+
+        if (is_media) {
+            std::string text_out = "[YouTube Media Search: \"" + clean_q + "\"]\n\n";
+            int count = 0;
+            if (j.contains("results") && j["results"].is_array()) {
+                for (const auto& item : j["results"]) {
+                    count++;
+                    std::string item_title = item.value("title", "YouTube Video");
+                    std::string item_link = item.value("url", "");
+                    if (count == 1 && !item_link.empty()) {
+                        doc.url = item_link;
+                        doc.title = item_title;
+                    }
+                    if (top_yt_id.empty() && !item_link.empty()) {
+                        std::string vid = extract_youtube_video_id(item_link);
+                        if (!vid.empty()) {
+                            top_yt_id = vid;
+                            top_yt_title = item_title;
+                        }
+                    }
+                    text_out += std::to_string(count) + ". [" + item_title + "](" + item_link + ")\n";
+                    if (count >= 3) break;
+                }
+            }
+            if (count == 0) {
+                text_out += "No YouTube videos found for query: \"" + clean_q + "\"";
+            }
+            doc.clean_text = text_out;
+            if (!top_yt_id.empty()) {
+                doc.raw_html = generate_youtube_preview_html(top_yt_id, top_yt_title, "", "", doc.url);
+            }
             return doc;
         }
 
@@ -2704,6 +2918,14 @@ inline RetrievedDocument search_tavily(const std::string& clean_q, int num_resul
                     doc.title = item_title;
                 }
 
+                if (top_yt_id.empty() && !item_link.empty()) {
+                    std::string vid = extract_youtube_video_id(item_link);
+                    if (!vid.empty()) {
+                        top_yt_id = vid;
+                        top_yt_title = item_title;
+                    }
+                }
+
                 text_out += std::to_string(count) + ". **" + item_title + "**\n";
                 text_out += "   URL: " + item_link + "\n";
                 text_out += "   Snippet: " + item_content + "\n\n";
@@ -2722,7 +2944,11 @@ inline RetrievedDocument search_tavily(const std::string& clean_q, int num_resul
         }
 
         doc.clean_text = text_out;
-        doc.raw_html = html_cards;
+        if (!top_yt_id.empty()) {
+            doc.raw_html = generate_youtube_preview_html(top_yt_id, top_yt_title, "", "", doc.url);
+        } else {
+            doc.raw_html = html_cards;
+        }
         return doc;
     } catch (const std::exception& e) {
         doc.clean_text = "[Error parsing Tavily response: " + std::string(e.what()) + "]";
@@ -3032,6 +3258,15 @@ inline RetrievedDocument web_search_full(
     size_t l = clean_q.find_last_not_of(" \t\r\n");
     if (f != std::string::npos && l != std::string::npos) clean_q = clean_q.substr(f, l - f + 1);
     if (!site.empty()) clean_q += " site:" + site;
+
+    // 1. Direct YouTube Search First for media/video queries (0 API cost, instant response)
+    if (g_fast_media_search && is_media_search_query(clean_q)) {
+        RetrievedDocument yt_doc = search_youtube_direct(clean_q, std::min(num_results, 3));
+        if (!yt_doc.clean_text.empty() && !yt_doc.url.empty()) {
+            return yt_doc;
+        }
+        // Direct YouTube search failed or yielded 0 results -> seamlessly proceed to configured provider fallback below!
+    }
 
     std::string provider = !custom_provider.empty() ? custom_provider : g_search_provider;
     if (provider.empty()) provider = "tavily";

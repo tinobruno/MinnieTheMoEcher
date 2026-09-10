@@ -351,7 +351,6 @@ function togglePreviewBg() {
     }
 }
 
-// Load HTML into preview iframe with console capture bridge
 function loadHtmlIntoPreview(htmlCode, autoSwitchTab = true) {
     currentHtmlCode = htmlCode || '';
     if (!isPreviewOpen) openPreviewPanel();
@@ -362,7 +361,19 @@ function loadHtmlIntoPreview(htmlCode, autoSwitchTab = true) {
     }
 
     clearConsoleLogs();
-    renderPreviewIframe(currentHtmlCode);
+
+    // Direct YouTube video player detection for 100% reliable hardware-accelerated playback
+    const ytMatch = currentHtmlCode.match(/(?:youtube-nocookie\.com\/embed\/|youtube\.com\/watch\?v=|youtu\.be\/)([a-zA-Z0-9_-]{11})/i);
+    if (ytMatch && (currentHtmlCode.includes('youtube-nocookie.com') || currentHtmlCode.includes('YouTube Video') || currentHtmlCode.includes('yt-container') || currentHtmlCode.includes('player'))) {
+        const videoId = ytMatch[1];
+        if (previewIframe) {
+            previewIframe.removeAttribute('srcdoc');
+            previewIframe.setAttribute('allow', 'accelerometer; autoplay; clipboard-write; encrypted-media; gyroscope; picture-in-picture; web-share');
+            previewIframe.src = `https://www.youtube-nocookie.com/embed/${videoId}?autoplay=1&enablejsapi=1&rel=0`;
+        }
+    } else {
+        renderPreviewIframe(currentHtmlCode);
+    }
 
     if (previewEmptyState) {
         if (currentHtmlCode.trim().length > 0) {
@@ -1079,6 +1090,22 @@ function renderMarkdownContent(rawText, containerElement) {
             containerElement.appendChild(banner);
         }
     }
+    // Intercept rendered YouTube links in messages so clicking them plays directly in the HTML Preview Panel
+    const links = containerElement.querySelectorAll('a[href]');
+    links.forEach(a => {
+        const href = a.getAttribute('href') || '';
+        const m = href.match(/(?:youtube\.com\/watch\?v=|youtu\.be\/|youtube\.com\/embed\/)([a-zA-Z0-9_-]{11})/i);
+        if (m) {
+            a.title = 'Click to play in HTML Preview Panel';
+            a.addEventListener('click', (e) => {
+                e.preventDefault();
+                const videoId = m[1];
+                const playerHtml = createYouTubePlayerHtml(videoId, a.textContent || 'YouTube Video');
+                loadHtmlIntoPreview(playerHtml, true);
+            });
+        }
+    });
+
     // Detect YouTube URLs in message and auto-load interactive player preview
     const ytMatch = rawText.match(/(?:https?:\/\/)?(?:www\.)?(?:youtube\.com\/watch\?v=|youtu\.be\/|youtube\.com\/embed\/)([a-zA-Z0-9_-]{11})/i);
     if (ytMatch) {
@@ -1264,10 +1291,18 @@ function openDocInFullPreview(docId, event) {
     if (!doc) return;
 
     // A. YouTube video player embed or direct video player HTML
-    const isDocYouTube = (doc.url && (doc.url.includes('youtube.com') || doc.url.includes('youtu.be'))) || (doc.html && doc.html.includes('youtube-nocookie.com/embed'));
-    if (isDocYouTube && doc.html) {
-        loadHtmlIntoPreview(doc.html, true);
-        return;
+    const isDocYouTube = (doc.url && (doc.url.includes('youtube.com') || doc.url.includes('youtu.be'))) || (doc.html && (doc.html.includes('youtube-nocookie.com/embed') || doc.html.includes('youtube.com')));
+    if (isDocYouTube) {
+        let ytMatch = (doc.url || '').match(/(?:youtube\.com\/watch\?v=|youtu\.be\/|youtube\.com\/embed\/)([a-zA-Z0-9_-]{11})/i);
+        if (!ytMatch && doc.html) {
+            ytMatch = doc.html.match(/(?:youtube-nocookie\.com\/embed\/|youtube\.com\/watch\?v=|youtu\.be\/)([a-zA-Z0-9_-]{11})/i);
+        }
+        const videoId = ytMatch ? ytMatch[1] : '';
+        const playerHtml = videoId ? createYouTubePlayerHtml(videoId, doc.title || 'YouTube Video') : (doc.html || '');
+        if (playerHtml) {
+            loadHtmlIntoPreview(playerHtml, true);
+            return;
+        }
     }
 
     // B. External Web URLs (such as LinkedIn, GitHub, Google, Wikipedia, etc.) -> ALWAYS load via Moecher Reverse Proxy
@@ -1337,6 +1372,7 @@ let agenticSettings = {
     serperApiKey: '',
     googleApiKey: '',
     googleCx: '',
+    fastMediaSearch: true,
     tools: {
         read_file: true,
         write_file: true,
@@ -1350,6 +1386,17 @@ let agenticSettings = {
 };
 
 let currentPendingAuth = null;
+
+function isMediaSearchQuery(query) {
+    if (!query) return false;
+    const q = query.toLowerCase();
+    const kw = [
+        "youtube", "youtu.be", "video", "videos", "song", "songs", "music", "play", "listen",
+        "track", "tracks", "album", "clip", "clips", "audio", "soundtrack", "canto", "canzone",
+        "musica", "suona", "ascolta", "videoclip"
+    ];
+    return kw.some(k => q.includes(k));
+}
 
 function loadAgenticSettings() {
     try {
@@ -1392,6 +1439,10 @@ function loadAgenticSettings() {
         const savedGoogleCx = localStorage.getItem('moecher_google_cx');
         if (savedGoogleCx) agenticSettings.googleCx = savedGoogleCx;
 
+        const savedFastMedia = localStorage.getItem('moecher_fast_media_search');
+        if (savedFastMedia !== null) agenticSettings.fastMediaSearch = savedFastMedia === 'true';
+        else agenticSettings.fastMediaSearch = true;
+
         const savedPaths = localStorage.getItem('moecher_agentic_auth_paths');
         if (savedPaths) {
             try { agenticSettings.authorizedPaths = JSON.parse(savedPaths); } catch (e) { }
@@ -1421,6 +1472,7 @@ function saveAgenticSettings() {
         localStorage.setItem('moecher_serper_api_key', agenticSettings.serperApiKey || '');
         localStorage.setItem('moecher_google_api_key', agenticSettings.googleApiKey || '');
         localStorage.setItem('moecher_google_cx', agenticSettings.googleCx || '');
+        localStorage.setItem('moecher_fast_media_search', agenticSettings.fastMediaSearch !== false);
         localStorage.setItem('moecher_agentic_auth_paths', JSON.stringify(agenticSettings.authorizedPaths));
         localStorage.setItem('moecher_agentic_tools', JSON.stringify(agenticSettings.tools));
     } catch (e) {
@@ -1516,6 +1568,7 @@ function saveSearchProviderSettingsUI() {
     const serperInput = document.getElementById('serper-api-key-input');
     const googleKeyInput = document.getElementById('google-api-key-input');
     const googleCxInput = document.getElementById('google-cx-input');
+    const fastMediaToggle = document.getElementById('fast-media-search-toggle');
     const saveMsg = document.getElementById('search-provider-save-msg');
 
     const provider = select ? select.value : (agenticSettings.searchProvider || 'tavily');
@@ -1525,6 +1578,7 @@ function saveSearchProviderSettingsUI() {
     const serperKey = serperInput ? serperInput.value.trim() : '';
     const googleKey = googleKeyInput ? googleKeyInput.value.trim() : '';
     const googleCx = googleCxInput ? googleCxInput.value.trim() : '';
+    const fastMedia = fastMediaToggle ? fastMediaToggle.checked : (agenticSettings.fastMediaSearch !== false);
 
     agenticSettings.searchProvider = provider;
     agenticSettings.tavilyApiKey = tavilyKey;
@@ -1533,6 +1587,7 @@ function saveSearchProviderSettingsUI() {
     agenticSettings.serperApiKey = serperKey;
     agenticSettings.googleApiKey = googleKey;
     agenticSettings.googleCx = googleCx;
+    agenticSettings.fastMediaSearch = fastMedia;
 
     saveAgenticSettings();
 
@@ -1547,7 +1602,8 @@ function saveSearchProviderSettingsUI() {
             brave_api_key: braveKey,
             serper_api_key: serperKey,
             google_search_api_key: googleKey,
-            google_search_cx: googleCx
+            google_search_cx: googleCx,
+            fast_media_search: fastMedia
         })
     })
     .then(r => r.json())
@@ -1569,6 +1625,29 @@ function saveSearchProviderSettingsUI() {
     });
 }
 
+function syncFastMediaSearchToggle(enabled) {
+    agenticSettings.fastMediaSearch = !!enabled;
+    const sidebarToggle = document.getElementById('sidebar-fast-media-search');
+    const panelToggle = document.getElementById('fast-media-search-toggle');
+    if (sidebarToggle) sidebarToggle.checked = !!enabled;
+    if (panelToggle) panelToggle.checked = !!enabled;
+    saveAgenticSettings();
+
+    // Sync to backend server
+    fetch(`${getApiBase()}/api/settings/search_provider`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+            fast_media_search: !!enabled
+        })
+    }).catch(() => {});
+}
+
+function onFastMediaSearchToggleChange() {
+    const panelToggle = document.getElementById('fast-media-search-toggle');
+    syncFastMediaSearchToggle(panelToggle ? panelToggle.checked : true);
+}
+
 function saveGoogleSearchCredentialsUI() {
     saveSearchProviderSettingsUI();
 }
@@ -1586,6 +1665,9 @@ function fetchSearchProviderSettings() {
                 }
                 if (data.google_search_cx) {
                     agenticSettings.googleCx = data.google_search_cx;
+                }
+                if (data.fast_media_search !== undefined) {
+                    agenticSettings.fastMediaSearch = !!data.fast_media_search;
                 }
 
                 // Update UI inputs
@@ -1614,11 +1696,20 @@ function fetchSearchProviderSettings() {
                     googleCxInput.value = data.google_search_cx || agenticSettings.googleCx;
                 }
 
+                const fastMediaToggle = document.getElementById('fast-media-search-toggle');
+                if (fastMediaToggle) fastMediaToggle.checked = agenticSettings.fastMediaSearch !== false;
+                const sidebarFastMediaToggle = document.getElementById('sidebar-fast-media-search');
+                if (sidebarFastMediaToggle) sidebarFastMediaToggle.checked = agenticSettings.fastMediaSearch !== false;
+
                 onSearchProviderChange(agenticSettings.searchProvider);
                 updateSearchProviderStatusBadge(data.configured);
             }
         })
         .catch(() => {
+            const fastMediaToggle = document.getElementById('fast-media-search-toggle');
+            if (fastMediaToggle) fastMediaToggle.checked = agenticSettings.fastMediaSearch !== false;
+            const sidebarFastMediaToggle = document.getElementById('sidebar-fast-media-search');
+            if (sidebarFastMediaToggle) sidebarFastMediaToggle.checked = agenticSettings.fastMediaSearch !== false;
             onSearchProviderChange(agenticSettings.searchProvider);
             updateSearchProviderStatusBadge();
         });
@@ -1840,6 +1931,17 @@ function initAgenticSettingsUI() {
     const cxInput = document.getElementById('google-cx-input');
     if (cxInput && agenticSettings.googleCx) {
         cxInput.value = agenticSettings.googleCx;
+    }
+
+    const fastMediaToggle = document.getElementById('fast-media-search-toggle');
+    const sidebarFastMediaToggle = document.getElementById('sidebar-fast-media-search');
+    if (fastMediaToggle) {
+        fastMediaToggle.checked = agenticSettings.fastMediaSearch !== false;
+        fastMediaToggle.addEventListener('change', (e) => syncFastMediaSearchToggle(e.target.checked));
+    }
+    if (sidebarFastMediaToggle) {
+        sidebarFastMediaToggle.checked = agenticSettings.fastMediaSearch !== false;
+        sidebarFastMediaToggle.addEventListener('change', (e) => syncFastMediaSearchToggle(e.target.checked));
     }
 
     onSearchProviderChange(agenticSettings.searchProvider);
@@ -2389,12 +2491,16 @@ async function executeTavilySearchJS(query, apiKey, maxResults = 5) {
         };
     }
 
+    const isMedia = (agenticSettings.fastMediaSearch !== false) && isMediaSearchQuery(query);
+    const effectiveMaxResults = isMedia ? Math.min(maxResults || 3, 3) : (maxResults || 5);
+    const effectiveQuery = isMedia && !query.toLowerCase().includes('youtube') && !query.toLowerCase().includes('video') ? `${query} youtube` : query;
+
     const payload = {
         api_key: key,
-        query: query,
+        query: effectiveQuery,
         search_depth: "basic",
-        include_answer: true,
-        max_results: maxResults || 5
+        include_answer: !isMedia,
+        max_results: effectiveMaxResults
     };
 
     const res = await fetch('https://api.tavily.com/search', {
@@ -2413,6 +2519,41 @@ async function executeTavilySearchJS(query, apiKey, maxResults = 5) {
     const data = await res.json();
     const results = data.results || [];
     const answer = data.answer || '';
+
+    if (isMedia) {
+        let textOut = `[Media Search Results: "${query}"]\n\n`;
+        let topYtDoc = null;
+        let count = 0;
+        for (const item of results) {
+            count++;
+            const title = item.title || 'Video Link';
+            const link = item.url || '';
+            const snippet = item.content || '';
+            textOut += `${count}. [${title}](${link})\n`;
+            if (snippet) textOut += `   ${snippet}\n\n`;
+            if (!topYtDoc && link) {
+                const m = link.match(/(?:youtube\.com\/watch\?v=|youtu\.be\/|youtube\.com\/embed\/)([a-zA-Z0-9_-]{11})/i);
+                if (m) {
+                    topYtDoc = {
+                        id: 'yt_' + m[1],
+                        url: `https://www.youtube.com/watch?v=${m[1]}`,
+                        title: title,
+                        html: createYouTubePlayerHtml(m[1], title),
+                        snippet: item.content || 'Interactive YouTube Player'
+                    };
+                    addRetrievedDocument(topYtDoc);
+                }
+            }
+            if (count >= 3) break;
+        }
+        if (count === 0) {
+            textOut += `No media results found for query: "${query}"`;
+        }
+        return {
+            output: textOut,
+            retrieved_document: topYtDoc
+        };
+    }
 
     let textOut = `[Web Search Results (Tavily AI): "${query}"]\n\n`;
     if (answer) {
@@ -2606,7 +2747,7 @@ async function executeClientToolCall(tc, turnRetrievedDocs = null) {
             return fetchRes.output || JSON.stringify(fetchRes);
         }
         return fetchRes;
-    } else if (tc.name === 'web_search' || tc.name === 'google_search') {
+    } else if (tc.name === 'web_search' || tc.name === 'google_search' || tc.name === 'youtube_search') {
         let args = {};
         try {
             args = typeof tc.arguments === 'string' ? JSON.parse(tc.arguments) : (tc.arguments || {});
@@ -2614,6 +2755,31 @@ async function executeClientToolCall(tc, turnRetrievedDocs = null) {
             args = { query: tc.arguments };
         }
         const query = args.query || '';
+        const isMedia = (tc.name === 'youtube_search') || ((agenticSettings.fastMediaSearch !== false) && isMediaSearchQuery(query));
+
+        // 1. If fast media search is enabled or tool is youtube_search, try direct YouTube search first (0 API cost)
+        if (isMedia) {
+            try {
+                const ytRes = await fetch(`${getApiBase()}/api/tool/execute`, {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify({
+                        name: 'youtube_search',
+                        arguments: JSON.stringify({ query: query, num_results: Math.min(args.num_results || 3, 3) }),
+                        timeout_ms: 10000
+                    })
+                });
+                const ytData = await ytRes.json();
+                if (ytData && ytData.output && ytData.retrieved_document && ytData.retrieved_document.url && ytData.retrieved_document.url.includes('youtube.com/watch')) {
+                    addRetrievedDocument(ytData.retrieved_document);
+                    if (turnRetrievedDocs) turnRetrievedDocs.push(ytData.retrieved_document);
+                    return ytData.output;
+                }
+            } catch (ytErr) {
+                console.warn('[YouTube Direct Search] Fallback to configured provider:', ytErr);
+            }
+        }
+
         const provider = args.provider || agenticSettings.searchProvider || 'tavily';
         const tavilyKey = args.tavily_api_key || agenticSettings.tavilyApiKey || '';
 

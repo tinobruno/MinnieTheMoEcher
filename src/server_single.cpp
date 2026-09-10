@@ -6889,6 +6889,21 @@ static json resolve_canonical_tools(const json& tools_input) {
                 }}
             }}
         }},
+        {"youtube_search", {
+            {"type", "function"},
+            {"function", {
+                {"name", "youtube_search"},
+                {"description", "Search YouTube directly for songs, music, videos, trailers, podcasts, and clips. Returns instant video links and playable preview."},
+                {"parameters", {
+                    {"type", "object"},
+                    {"properties", {
+                        {"query", {{"type", "string"}, {"description", "The video, song, or music search query string."}}},
+                        {"num_results", {{"type", "integer"}, {"description", "Optional number of results (1-5, default: 3)."}}}
+                    }},
+                    {"required", json::array({"query"})}
+                }}
+            }}
+        }},
         {"google_search", {
             {"type", "function"},
             {"function", {
@@ -6990,7 +7005,7 @@ static json resolve_canonical_tools(const json& tools_input) {
         std::string s = tools_input.get<std::string>();
         if (s == "default" || s == "all") {
             json arr = json::array();
-            static const std::vector<std::string> default_order = {"web_search", "google_search", "fetch_url", "read_file", "write_file", "edit_file", "execute_command"};
+            static const std::vector<std::string> default_order = {"web_search", "youtube_search", "google_search", "fetch_url", "read_file", "write_file", "edit_file", "execute_command"};
             for (const auto& name : default_order) {
                 if (CANONICAL_TOOLS.count(name)) arr.push_back(CANONICAL_TOOLS.at(name));
             }
@@ -8654,6 +8669,21 @@ static void run_server(MoecherEngine& engine, int port, int default_thinking_bud
         } else if (tool_name == "execute_command") {
             std::string cmd = args.value("command", "");
             output = moecher::tooling::execute_system_command(cmd, timeout_ms);
+        } else if (tool_name == "youtube_search") {
+            std::string query = args.value("query", "");
+            int num_results = args.value("num_results", 3);
+            auto doc = moecher::tooling::search_youtube_direct(query, num_results);
+            if (doc.clean_text.empty()) {
+                // Fall back to configured search engine if direct YouTube gave 0 results
+                doc = moecher::tooling::web_search_full(query, num_results);
+            }
+            output = doc.clean_text;
+            resp_data["retrieved_document"] = {
+                {"url", doc.url},
+                {"title", doc.title.empty() ? ("YouTube: " + query) : doc.title},
+                {"html", doc.raw_html},
+                {"snippet", (doc.clean_text.size() > 300 ? doc.clean_text.substr(0, 300) + "..." : doc.clean_text)}
+            };
         } else if (tool_name == "web_search" || tool_name == "google_search") {
             std::string query = args.value("query", "");
             int num_results = args.value("num_results", 5);
@@ -8715,8 +8745,12 @@ static void run_server(MoecherEngine& engine, int port, int default_thinking_bud
             std::string searx_url = body.value("searxng_url", "https://searx.be");
             std::string google_key = body.value("google_search_api_key", "");
             std::string google_cx = body.value("google_search_cx", "");
+            int fast_media = -1;
+            if (body.contains("fast_media_search") && body["fast_media_search"].is_boolean()) {
+                fast_media = body["fast_media_search"].get<bool>() ? 1 : 0;
+            }
 
-            moecher::tooling::set_search_settings(provider, tavily_key, brave_key, serper_key, searx_url, google_key, google_cx);
+            moecher::tooling::set_search_settings(provider, tavily_key, brave_key, serper_key, searx_url, google_key, google_cx, fast_media);
             auto updated_settings = moecher::tooling::get_search_settings();
             res.set_content(updated_settings.dump(), "application/json");
         } catch (const std::exception& e) {
