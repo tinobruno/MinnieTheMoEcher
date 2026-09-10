@@ -169,9 +169,9 @@ def quantize_deepseek_dense(
 
             is_2d_projection = (len(shape) == 2 and shape[0] >= 512 and shape[1] >= 512 and shape[1] % block_size == 0)
             is_fp8_weight = (dtype == "F8_E4M3")
-            is_embed_or_head = ("embed" in t_name or "head" in t_name) and is_2d_projection
+            is_head = ("head" in t_name) and is_2d_projection and ("embed" not in t_name)
 
-            should_quantize = (is_fp8_weight and is_2d_projection) or (quantize_embeddings and is_embed_or_head)
+            should_quantize = (is_fp8_weight and is_2d_projection) or (quantize_embeddings and is_head)
 
             if should_quantize:
                 # 1. Recover float32 weight matrix
