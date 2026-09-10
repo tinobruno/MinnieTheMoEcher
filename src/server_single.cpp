@@ -5414,9 +5414,15 @@ private:
             int idx_q_dim = idx_heads * idx_head_dim; // 8192
 
             // 1. Indexer Q projection: q = indexer_wq_b @ qr_norm
-            gemm_fp8_dequant(buf_indexer_q_.bf16(), 1, idx_q_dim, q_lora,
-                             buf_lora_.bf16(),
-                             lw.indexer_wq_b_w.u8(), lw.indexer_wq_b_s.u8(), 128, main_stream_);
+            if (lw.indexer_wq_b_w.dtype == "int4") {
+                gemv_int4_cuda(buf_indexer_q_.bf16(), buf_lora_.bf16(),
+                               (const uint8_t*)lw.indexer_wq_b_w.data, lw.indexer_wq_b_s.bf16(),
+                               idx_q_dim, q_lora, main_stream_);
+            } else {
+                gemm_fp8_dequant(buf_indexer_q_.bf16(), 1, idx_q_dim, q_lora,
+                                 buf_lora_.bf16(),
+                                 lw.indexer_wq_b_w.u8(), lw.indexer_wq_b_s.u8(), 128, main_stream_);
+            }
 
             // 2. RoPE on Indexer Q
             rope_device_pos_cuda(buf_indexer_q_.bf16(), idx_heads, idx_head_dim, rope_dim,

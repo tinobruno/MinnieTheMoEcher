@@ -123,8 +123,12 @@ def extract_draft_lm_head(manifest_path, draft_vocab_path, output_path):
     return True
 
 if __name__ == '__main__':
-    manifest_path = 'f:/Moecher/models/qwen3_8_27b_q4/moecher_manifest.json'
-    draft_vocab_path = 'f:/Moecher/models/qwen3_8_27b_q4/draft_vocab_ids.json'
-    output_path = 'f:/Moecher/models/qwen3_8_27b_q4/draft_lm_head_int8.bin'
-    
-    extract_draft_lm_head(manifest_path, draft_vocab_path, output_path)
+    import argparse
+    parser = argparse.ArgumentParser(description="Extract and quantize draft lm_head")
+    parser.add_argument("--manifest", default="models/qwen3_8_27b_q4/moecher_manifest_qwen_q4.json", help="Path to manifest JSON")
+    parser.add_argument("--draft-vocab", default="models/qwen3_8_27b_q4/draft_vocab_ids.json", help="Path to draft_vocab_ids.json")
+    parser.add_argument("--output", default="models/qwen3_8_27b_q4/draft_lm_head_int8.bin", help="Output path for draft_lm_head_int8.bin")
+    args = parser.parse_args()
+
+    extract_draft_lm_head(args.manifest, args.draft_vocab, args.output)
+
