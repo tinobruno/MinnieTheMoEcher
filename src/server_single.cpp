@@ -3478,6 +3478,249 @@ public:
         }
     }
 
+    // ── Pinned System KV Cache Snapshot (for 0ms System Prefix Reuse) ───────
+    struct SystemKVSnapshot {
+        bool valid = false;
+        std::vector<int> tokens;
+
+        struct LayerSnapshot {
+            // DeepSeek V4
+            GPUTensor snap_kv_cache;
+            GPUTensor snap_comp_kv_cache;
+            GPUTensor snap_comp_kv_state;
+            GPUTensor snap_comp_score_state;
+            GPUTensor snap_indexer_comp_kv_cache;
+            GPUTensor snap_indexer_comp_kv_state;
+            GPUTensor snap_indexer_comp_score_state;
+            int comp_kv_count = 0;
+
+            // Qwen
+            GPUTensor snap_k_cache_gqa;
+            GPUTensor snap_v_cache_gqa;
+            GPUTensor snap_ssm_state;
+            GPUTensor snap_conv_state;
+        };
+        std::vector<LayerSnapshot> layers;
+
+        GPUTensor snap_hc_state;
+        GPUTensor snap_hc_after_attn;
+    } system_kv_snapshot_;
+
+    void snapshot_system_kv(const std::vector<int>& tokens) {
+        if (tokens.empty()) return;
+        system_kv_snapshot_.tokens = tokens;
+        system_kv_snapshot_.layers.resize(cfg_.num_hidden_layers);
+
+        for (int l = 0; l < cfg_.num_hidden_layers; l++) {
+            auto& lw = layers_[l];
+            auto& snap = system_kv_snapshot_.layers[l];
+
+            if (lw.kv_cache.data) {
+                if (!snap.snap_kv_cache.data) snap.snap_kv_cache.alloc(lw.kv_cache.size_bytes);
+                CUDA_CHECK(cudaMemcpyAsync(snap.snap_kv_cache.data, lw.kv_cache.data, lw.kv_cache.size_bytes, cudaMemcpyDeviceToDevice, main_stream_));
+            }
+            if (lw.comp_kv_cache.data) {
+                if (!snap.snap_comp_kv_cache.data) snap.snap_comp_kv_cache.alloc(lw.comp_kv_cache.size_bytes);
+                CUDA_CHECK(cudaMemcpyAsync(snap.snap_comp_kv_cache.data, lw.comp_kv_cache.data, lw.comp_kv_cache.size_bytes, cudaMemcpyDeviceToDevice, main_stream_));
+                snap.comp_kv_count = lw.comp_kv_count;
+            }
+            if (lw.comp_kv_state.data) {
+                if (!snap.snap_comp_kv_state.data) snap.snap_comp_kv_state.alloc(lw.comp_kv_state.size_bytes);
+                CUDA_CHECK(cudaMemcpyAsync(snap.snap_comp_kv_state.data, lw.comp_kv_state.data, lw.comp_kv_state.size_bytes, cudaMemcpyDeviceToDevice, main_stream_));
+            }
+            if (lw.comp_score_state.data) {
+                if (!snap.snap_comp_score_state.data) snap.snap_comp_score_state.alloc(lw.comp_score_state.size_bytes);
+                CUDA_CHECK(cudaMemcpyAsync(snap.snap_comp_score_state.data, lw.comp_score_state.data, lw.comp_score_state.size_bytes, cudaMemcpyDeviceToDevice, main_stream_));
+            }
+            if (lw.indexer_comp_kv_cache.data) {
+                if (!snap.snap_indexer_comp_kv_cache.data) snap.snap_indexer_comp_kv_cache.alloc(lw.indexer_comp_kv_cache.size_bytes);
+                CUDA_CHECK(cudaMemcpyAsync(snap.snap_indexer_comp_kv_cache.data, lw.indexer_comp_kv_cache.data, lw.indexer_comp_kv_cache.size_bytes, cudaMemcpyDeviceToDevice, main_stream_));
+            }
+            if (lw.indexer_comp_kv_state.data) {
+                if (!snap.snap_indexer_comp_kv_state.data) snap.snap_indexer_comp_kv_state.alloc(lw.indexer_comp_kv_state.size_bytes);
+                CUDA_CHECK(cudaMemcpyAsync(snap.snap_indexer_comp_kv_state.data, lw.indexer_comp_kv_state.data, lw.indexer_comp_kv_state.size_bytes, cudaMemcpyDeviceToDevice, main_stream_));
+            }
+            if (lw.indexer_comp_score_state.data) {
+                if (!snap.snap_indexer_comp_score_state.data) snap.snap_indexer_comp_score_state.alloc(lw.indexer_comp_score_state.size_bytes);
+                CUDA_CHECK(cudaMemcpyAsync(snap.snap_indexer_comp_score_state.data, lw.indexer_comp_score_state.data, lw.indexer_comp_score_state.size_bytes, cudaMemcpyDeviceToDevice, main_stream_));
+            }
+
+            // Qwen
+            if (lw.k_cache_gqa.data) {
+                if (!snap.snap_k_cache_gqa.data) snap.snap_k_cache_gqa.alloc(lw.k_cache_gqa.size_bytes);
+                CUDA_CHECK(cudaMemcpyAsync(snap.snap_k_cache_gqa.data, lw.k_cache_gqa.data, lw.k_cache_gqa.size_bytes, cudaMemcpyDeviceToDevice, main_stream_));
+            }
+            if (lw.v_cache_gqa.data) {
+                if (!snap.snap_v_cache_gqa.data) snap.snap_v_cache_gqa.alloc(lw.v_cache_gqa.size_bytes);
+                CUDA_CHECK(cudaMemcpyAsync(snap.snap_v_cache_gqa.data, lw.v_cache_gqa.data, lw.v_cache_gqa.size_bytes, cudaMemcpyDeviceToDevice, main_stream_));
+            }
+            if (lw.ssm_state.data) {
+                if (!snap.snap_ssm_state.data) snap.snap_ssm_state.alloc(lw.ssm_state.size_bytes);
+                CUDA_CHECK(cudaMemcpyAsync(snap.snap_ssm_state.data, lw.ssm_state.data, lw.ssm_state.size_bytes, cudaMemcpyDeviceToDevice, main_stream_));
+            }
+            if (lw.conv_state.data) {
+                if (!snap.snap_conv_state.data) snap.snap_conv_state.alloc(lw.conv_state.size_bytes);
+                CUDA_CHECK(cudaMemcpyAsync(snap.snap_conv_state.data, lw.conv_state.data, lw.conv_state.size_bytes, cudaMemcpyDeviceToDevice, main_stream_));
+            }
+        }
+
+        if (buf_hc_state_.data) {
+            if (!system_kv_snapshot_.snap_hc_state.data) system_kv_snapshot_.snap_hc_state.alloc(buf_hc_state_.size_bytes);
+            CUDA_CHECK(cudaMemcpyAsync(system_kv_snapshot_.snap_hc_state.data, buf_hc_state_.data, buf_hc_state_.size_bytes, cudaMemcpyDeviceToDevice, main_stream_));
+        }
+        if (buf_hc_after_attn_.data) {
+            if (!system_kv_snapshot_.snap_hc_after_attn.data) system_kv_snapshot_.snap_hc_after_attn.alloc(buf_hc_after_attn_.size_bytes);
+            CUDA_CHECK(cudaMemcpyAsync(system_kv_snapshot_.snap_hc_after_attn.data, buf_hc_after_attn_.data, buf_hc_after_attn_.size_bytes, cudaMemcpyDeviceToDevice, main_stream_));
+        }
+
+        CUDA_CHECK(cudaStreamSynchronize(main_stream_));
+        system_kv_snapshot_.valid = true;
+        LOG_INFO("Pinned System KV Cache snapshot created (%zu tokens across %d layers).",
+                 tokens.size(), cfg_.num_hidden_layers);
+    }
+
+    void restore_system_kv() {
+        if (!system_kv_snapshot_.valid) return;
+
+        for (int l = 0; l < cfg_.num_hidden_layers; l++) {
+            auto& lw = layers_[l];
+            const auto& snap = system_kv_snapshot_.layers[l];
+
+            if (lw.kv_cache.data && snap.snap_kv_cache.data) {
+                CUDA_CHECK(cudaMemcpyAsync(lw.kv_cache.data, snap.snap_kv_cache.data, lw.kv_cache.size_bytes, cudaMemcpyDeviceToDevice, main_stream_));
+            }
+            if (lw.comp_kv_cache.data && snap.snap_comp_kv_cache.data) {
+                CUDA_CHECK(cudaMemcpyAsync(lw.comp_kv_cache.data, snap.snap_comp_kv_cache.data, lw.comp_kv_cache.size_bytes, cudaMemcpyDeviceToDevice, main_stream_));
+                lw.comp_kv_count = snap.comp_kv_count;
+                if (lw.d_comp_kv_count.data) {
+                    int32_t val = snap.comp_kv_count;
+                    CUDA_CHECK(cudaMemcpyAsync(lw.d_comp_kv_count.data, &val, sizeof(int32_t), cudaMemcpyHostToDevice, main_stream_));
+                }
+                if (lw.d_attn_cache_len.data) {
+                    int32_t val = (int32_t)system_kv_snapshot_.tokens.size();
+                    CUDA_CHECK(cudaMemcpyAsync(lw.d_attn_cache_len.data, &val, sizeof(int32_t), cudaMemcpyHostToDevice, main_stream_));
+                }
+            }
+            if (lw.comp_kv_state.data && snap.snap_comp_kv_state.data) {
+                CUDA_CHECK(cudaMemcpyAsync(lw.comp_kv_state.data, snap.snap_comp_kv_state.data, lw.comp_kv_state.size_bytes, cudaMemcpyDeviceToDevice, main_stream_));
+            }
+            if (lw.comp_score_state.data && snap.snap_comp_score_state.data) {
+                CUDA_CHECK(cudaMemcpyAsync(lw.comp_score_state.data, snap.snap_comp_score_state.data, lw.comp_score_state.size_bytes, cudaMemcpyDeviceToDevice, main_stream_));
+            }
+            if (lw.indexer_comp_kv_cache.data && snap.snap_indexer_comp_kv_cache.data) {
+                CUDA_CHECK(cudaMemcpyAsync(lw.indexer_comp_kv_cache.data, snap.snap_indexer_comp_kv_cache.data, lw.indexer_comp_kv_cache.size_bytes, cudaMemcpyDeviceToDevice, main_stream_));
+            }
+            if (lw.indexer_comp_kv_state.data && snap.snap_indexer_comp_kv_state.data) {
+                CUDA_CHECK(cudaMemcpyAsync(lw.indexer_comp_kv_state.data, snap.snap_indexer_comp_kv_state.data, lw.indexer_comp_kv_state.size_bytes, cudaMemcpyDeviceToDevice, main_stream_));
+            }
+            if (lw.indexer_comp_score_state.data && snap.snap_indexer_comp_score_state.data) {
+                CUDA_CHECK(cudaMemcpyAsync(lw.indexer_comp_score_state.data, snap.snap_indexer_comp_score_state.data, lw.indexer_comp_score_state.size_bytes, cudaMemcpyDeviceToDevice, main_stream_));
+            }
+
+            // Qwen
+            if (lw.k_cache_gqa.data && snap.snap_k_cache_gqa.data) {
+                CUDA_CHECK(cudaMemcpyAsync(lw.k_cache_gqa.data, snap.snap_k_cache_gqa.data, lw.k_cache_gqa.size_bytes, cudaMemcpyDeviceToDevice, main_stream_));
+            }
+            if (lw.v_cache_gqa.data && snap.snap_v_cache_gqa.data) {
+                CUDA_CHECK(cudaMemcpyAsync(lw.v_cache_gqa.data, snap.snap_v_cache_gqa.data, lw.v_cache_gqa.size_bytes, cudaMemcpyDeviceToDevice, main_stream_));
+            }
+            if (lw.ssm_state.data && snap.snap_ssm_state.data) {
+                CUDA_CHECK(cudaMemcpyAsync(lw.ssm_state.data, snap.snap_ssm_state.data, lw.ssm_state.size_bytes, cudaMemcpyDeviceToDevice, main_stream_));
+            }
+            if (lw.conv_state.data && snap.snap_conv_state.data) {
+                CUDA_CHECK(cudaMemcpyAsync(lw.conv_state.data, snap.snap_conv_state.data, lw.conv_state.size_bytes, cudaMemcpyDeviceToDevice, main_stream_));
+            }
+        }
+
+        if (buf_hc_state_.data && system_kv_snapshot_.snap_hc_state.data) {
+            CUDA_CHECK(cudaMemcpyAsync(buf_hc_state_.data, system_kv_snapshot_.snap_hc_state.data, buf_hc_state_.size_bytes, cudaMemcpyDeviceToDevice, main_stream_));
+        }
+        if (buf_hc_after_attn_.data && system_kv_snapshot_.snap_hc_after_attn.data) {
+            CUDA_CHECK(cudaMemcpyAsync(buf_hc_after_attn_.data, system_kv_snapshot_.snap_hc_after_attn.data, buf_hc_after_attn_.size_bytes, cudaMemcpyDeviceToDevice, main_stream_));
+        }
+
+        if (qwen_draft_.loaded_) {
+            qwen_draft_.reset_state(main_stream_);
+        }
+        if (mtp_drafter_.loaded_) {
+            mtp_drafter_.reset_kv_cache(main_stream_);
+        }
+
+        cached_tokens_ = system_kv_snapshot_.tokens;
+    }
+
+    // ── Prefill Prompt Prefix without Generation (for Startup KV Cache Pre-warming) ──
+    void prefill_prefix(const std::vector<int>& prefix_tokens) {
+        if (prefix_tokens.empty()) return;
+        reset_all_kv_caches();
+        cached_tokens_.clear();
+
+        track_current_token_ = false;
+        ensure_prefill_host_capacity(prefix_tokens.size());
+        for (size_t i = 0; i < prefix_tokens.size(); i++) {
+            h_prefill_tok_[i] = prefix_tokens[i];
+            h_prefill_pos_[i] = (int32_t)i;
+        }
+        if (!h_single_flag_) {
+            CUDA_CHECK(cudaMallocHost(&h_single_flag_, sizeof(int32_t)));
+        }
+        *h_single_flag_ = 0;
+
+        auto prefill_start_time = std::chrono::steady_clock::now();
+
+        if (cfg_.architecture == ModelArch::QWEN) {
+            size_t curr = 0;
+            while (curr < prefix_tokens.size()) {
+                size_t remaining = prefix_tokens.size() - curr;
+                int chunk_m = (remaining >= 8) ? 8 : (int)remaining;
+                if (chunk_m >= 2 && chunk_m <= 8) {
+                    CUDA_CHECK(cudaMemcpyAsync(buf_input_pos_batch_.i32(), &h_prefill_pos_[curr],
+                                               chunk_m * sizeof(int32_t), cudaMemcpyHostToDevice, main_stream_));
+                    CUDA_CHECK(cudaMemcpyAsync(buf_input_tokens_batch_.i32(), &h_prefill_tok_[curr],
+                                               chunk_m * sizeof(int32_t), cudaMemcpyHostToDevice, main_stream_));
+                    if (batch_graph_captured_[chunk_m]) {
+                        CUDA_CHECK(cudaGraphLaunch(batch_graph_exec_[chunk_m], main_stream_));
+                    } else {
+                        forward_token_batch_qwen_device_body((int)curr, chunk_m);
+                    }
+                    curr += chunk_m;
+                } else {
+                    if (graph_captured_) {
+                        CUDA_CHECK(cudaMemcpyAsync(buf_track_flag_.i32(), h_single_flag_, sizeof(int32_t), cudaMemcpyHostToDevice, main_stream_));
+                        CUDA_CHECK(cudaMemcpyAsync(buf_input_token_.i32(), &h_prefill_tok_[curr], sizeof(int32_t), cudaMemcpyHostToDevice, main_stream_));
+                        CUDA_CHECK(cudaMemcpyAsync(buf_input_pos_.i32(), &h_prefill_pos_[curr], sizeof(int32_t), cudaMemcpyHostToDevice, main_stream_));
+                        CUDA_CHECK(cudaGraphLaunch(graph_exec_, main_stream_));
+                    } else {
+                        forward_token_eager(prefix_tokens[curr], (int)curr);
+                    }
+                    curr += 1;
+                }
+            }
+        } else {
+            // ModelArch::DEEPSEEK_V4
+            for (size_t i = 0; i < prefix_tokens.size(); i++) {
+                if (graph_captured_) {
+                    CUDA_CHECK(cudaMemcpyAsync(buf_track_flag_.i32(), h_single_flag_, sizeof(int32_t), cudaMemcpyHostToDevice, main_stream_));
+                    CUDA_CHECK(cudaMemcpyAsync(buf_input_token_.i32(), &h_prefill_tok_[i], sizeof(int32_t), cudaMemcpyHostToDevice, main_stream_));
+                    CUDA_CHECK(cudaMemcpyAsync(buf_input_pos_.i32(), &h_prefill_pos_[i], sizeof(int32_t), cudaMemcpyHostToDevice, main_stream_));
+                    CUDA_CHECK(cudaGraphLaunch(graph_exec_, main_stream_));
+                } else {
+                    forward_token_eager(prefix_tokens[i], (int)i);
+                }
+            }
+        }
+        CUDA_CHECK(cudaStreamSynchronize(main_stream_));
+
+        auto prefill_end_time = std::chrono::steady_clock::now();
+        double prefill_sec = std::chrono::duration<double>(prefill_end_time - prefill_start_time).count();
+        double prefill_tps = (prefill_sec > 0.0) ? (double)prefix_tokens.size() / prefill_sec : 0.0;
+        LOG_INFO("[PREFILL STATS] %zu prefix tokens pre-warmed in %.3fs -> %.2f tok/s",
+                 prefix_tokens.size(), prefill_sec, prefill_tps);
+
+        cached_tokens_ = prefix_tokens;
+        snapshot_system_kv(prefix_tokens);
+    }
+
     // ── Generate tokens ─────────────────────────────────────────────────────
 
     std::string generate(const std::vector<int>& prompt, int max_tokens = 512,
@@ -3509,6 +3752,27 @@ public:
         if (cfg_.architecture == ModelArch::DEEPSEEK_V4 && prefix_len < cached_tokens_.size()) {
             can_reuse_prefix = false;
             prefix_len = 0;
+        }
+
+        // If continuous prefix matching failed, check if prompt starts with the pinned System KV snapshot!
+        if (!can_reuse_prefix && system_kv_snapshot_.valid && !system_kv_snapshot_.tokens.empty()) {
+            size_t sys_len = system_kv_snapshot_.tokens.size();
+            if (prompt.size() >= sys_len) {
+                bool sys_matches = true;
+                for (size_t i = 0; i < sys_len; i++) {
+                    if (prompt[i] != system_kv_snapshot_.tokens[i]) {
+                        sys_matches = false;
+                        break;
+                    }
+                }
+                if (sys_matches) {
+                    restore_system_kv();
+                    prefix_len = sys_len;
+                    can_reuse_prefix = true;
+                    LOG_INFO("Restored pinned System KV Cache snapshot of %zu tokens (<0.1ms). Skipping system prefill 0..%zu, evaluating %zu..%zu",
+                             sys_len, sys_len > 0 ? sys_len - 1 : 0, sys_len, prompt.size() - 1);
+                }
+            }
         }
 
         // Ensure at least the last token is forwarded so buf_logits_ is correctly populated
@@ -6607,15 +6871,168 @@ static const std::string DEEPSEEK_V4_REASONING_EFFORT_MAX_PREFIX =
     "You MUST be very thorough in your thinking and comprehensively decompose the problem to resolve the root cause, rigorously stress-testing your logic against all potential paths, edge cases, and adversarial scenarios.\n"
     "Explicitly write out your entire deliberation process, documenting every intermediate step, considered alternative, and rejected hypothesis to ensure absolutely no assumption is left unchecked.\n\n";
 
+static json resolve_canonical_tools(const json& tools_input) {
+    static const std::unordered_map<std::string, json> CANONICAL_TOOLS = {
+        {"web_search", {
+            {"type", "function"},
+            {"function", {
+                {"name", "web_search"},
+                {"description", "Search the live web or find YouTube media. Found YouTube video links will automatically play in the user's preview panel."},
+                {"parameters", {
+                    {"type", "object"},
+                    {"properties", {
+                        {"query", {{"type", "string"}, {"description", "The search query string."}}},
+                        {"num_results", {{"type", "integer"}, {"description", "Optional number of results (1-10, default: 4)."}}},
+                        {"site", {{"type", "string"}, {"description", "Optional domain filter (e.g. 'github.com')."}}}
+                    }},
+                    {"required", json::array({"query"})}
+                }}
+            }}
+        }},
+        {"google_search", {
+            {"type", "function"},
+            {"function", {
+                {"name", "google_search"},
+                {"description", "Search the web using Google Search engine."},
+                {"parameters", {
+                    {"type", "object"},
+                    {"properties", {
+                        {"query", {{"type", "string"}, {"description", "The search query string."}}},
+                        {"num_results", {{"type", "integer"}, {"description", "Optional number of results (1-10, default: 4)."}}},
+                        {"site", {{"type", "string"}, {"description", "Optional domain filter."}}}
+                    }},
+                    {"required", json::array({"query"})}
+                }}
+            }}
+        }},
+        {"fetch_url", {
+            {"type", "function"},
+            {"function", {
+                {"name", "fetch_url"},
+                {"description", "Fetch clean readable text, metadata, or documentation from a public web URL."},
+                {"parameters", {
+                    {"type", "object"},
+                    {"properties", {
+                        {"url", {{"type", "string"}, {"description", "The complete HTTP or HTTPS URL to fetch."}}},
+                        {"mode", {{"type", "string"}, {"enum", {"text", "raw", "scripts", "links"}}, {"description", "Extraction mode (default: 'text')."}}},
+                        {"pattern", {{"type", "string"}, {"description", "Optional substring filter."}}},
+                        {"max_chars", {{"type", "integer"}, {"description", "Max characters (default: 1500)."}}}
+                    }},
+                    {"required", json::array({"url"})}
+                }}
+            }}
+        }},
+        {"read_file", {
+            {"type", "function"},
+            {"function", {
+                {"name", "read_file"},
+                {"description", "Read the text contents of a file on the local filesystem with optional line numbers."},
+                {"parameters", {
+                    {"type", "object"},
+                    {"properties", {
+                        {"path", {{"type", "string"}, {"description", "The relative or absolute file path to read."}}},
+                        {"start_line", {{"type", "integer"}, {"description", "Optional 1-indexed starting line number."}}},
+                        {"end_line", {{"type", "integer"}, {"description", "Optional 1-indexed ending line number."}}}
+                    }},
+                    {"required", json::array({"path"})}
+                }}
+            }}
+        }},
+        {"write_file", {
+            {"type", "function"},
+            {"function", {
+                {"name", "write_file"},
+                {"description", "Create a new file or completely overwrite an existing file with the provided text."},
+                {"parameters", {
+                    {"type", "object"},
+                    {"properties", {
+                        {"path", {{"type", "string"}, {"description", "The relative or absolute file path to write."}}},
+                        {"content", {{"type", "string"}, {"description", "The complete text content to write."}}},
+                        {"overwrite", {{"type", "boolean"}, {"description", "Whether to overwrite (default: true)."}}}
+                    }},
+                    {"required", json::array({"path", "content"})}
+                }}
+            }}
+        }},
+        {"edit_file", {
+            {"type", "function"},
+            {"function", {
+                {"name", "edit_file"},
+                {"description", "Perform a precise search-and-replace on a unique block of text within an existing file."},
+                {"parameters", {
+                    {"type", "object"},
+                    {"properties", {
+                        {"path", {{"type", "string"}, {"description", "The relative or absolute file path to edit."}}},
+                        {"target_content", {{"type", "string"}, {"description", "Exact block of lines to replace."}}},
+                        {"replacement_content", {{"type", "string"}, {"description", "New replacement content."}}}
+                    }},
+                    {"required", json::array({"path", "target_content", "replacement_content"})}
+                }}
+            }}
+        }},
+        {"execute_command", {
+            {"type", "function"},
+            {"function", {
+                {"name", "execute_command"},
+                {"description", "Execute a terminal/shell command on the local system and return its output."},
+                {"parameters", {
+                    {"type", "object"},
+                    {"properties", {
+                        {"command", {{"type", "string"}, {"description", "The exact shell command line to execute."}}}
+                    }},
+                    {"required", json::array({"command"})}
+                }}
+            }}
+        }}
+    };
+
+    if (tools_input.is_string()) {
+        std::string s = tools_input.get<std::string>();
+        if (s == "default" || s == "all") {
+            json arr = json::array();
+            static const std::vector<std::string> default_order = {"web_search", "google_search", "fetch_url", "read_file", "write_file", "edit_file", "execute_command"};
+            for (const auto& name : default_order) {
+                if (CANONICAL_TOOLS.count(name)) arr.push_back(CANONICAL_TOOLS.at(name));
+            }
+            return arr;
+        }
+        if (CANONICAL_TOOLS.count(s)) {
+            return json::array({CANONICAL_TOOLS.at(s)});
+        }
+        return json::array();
+    }
+
+    if (tools_input.is_array()) {
+        json arr = json::array();
+        for (const auto& item : tools_input) {
+            if (item.is_string()) {
+                std::string name = item.get<std::string>();
+                if (CANONICAL_TOOLS.count(name)) {
+                    arr.push_back(CANONICAL_TOOLS.at(name));
+                }
+            } else if (item.is_object()) {
+                arr.push_back(item);
+            }
+        }
+        return arr;
+    }
+
+    return json::array();
+}
+
 static std::vector<int> apply_chat_template(const json& messages, const BPETokenizer& tok, bool enable_thinking = true, const std::string& reasoning_effort = "high", const json& tools = json()) {
-    bool has_tools = (!tools.empty() && tools.is_array());
+    json resolved_tools = tools;
+    if (!resolved_tools.empty()) {
+        resolved_tools = resolve_canonical_tools(resolved_tools);
+    }
+    bool has_tools = (!resolved_tools.empty() && resolved_tools.is_array());
     std::string tools_system_prompt;
     if (has_tools) {
         tools_system_prompt =
             "\n\n# Tools\n\n"
             "You have access to a set of built-in tools to inspect files, make precise code modifications, run commands, and search the web.\n"
             "You are provided with function signatures within <tools></tools> XML tags:\n"
-            "<tools>\n" + tools.dump(2) + "\n</tools>\n\n"
+            "<tools>\n" + resolved_tools.dump(2) + "\n</tools>\n\n"
             "For each function call, return a json object with function name and arguments within <tool_call></tool_call> XML tags:\n"
             "<tool_call>\n"
             "{\"name\": \"<function-name>\", \"arguments\": <args-json-object>}\n"
@@ -6634,10 +7051,10 @@ static std::vector<int> apply_chat_template(const json& messages, const BPEToken
             "\n"
             "## Media Playback & Web Preview Integration:\n"
             "You are integrated with an interactive client-side HTML Preview Panel that displays web pages and plays YouTube videos with autoplay.\n"
-            "- When the user asks to play a song, video, or find media:\n"
-            "  1. Use web_search or fetch_url to search YouTube (e.g. query='song name YouTube' or url='https://www.youtube.com/results?search_query=topic').\n"
-            "  2. Find the direct YouTube URL (e.g. 'https://www.youtube.com/watch?v=...').\n"
-            "  3. Call fetch_url on that direct YouTube URL in the next turn.\n"
+            "- When the user asks to play music, a song, or a video (e.g. 'play ...', 'listen to ...', 'watch ...'):\n"
+            "  1. Use `web_search` to search for the song on YouTube (e.g. query='<song title> youtube').\n"
+            "  2. Find the direct YouTube watch URL from the results (e.g. 'https://www.youtube.com/watch?v=...').\n"
+            "  3. Call `fetch_url` on that direct YouTube URL in the next turn.\n"
             "  4. Fetching the YouTube URL automatically opens the player in the user's preview panel and starts autoplay. Inform the user that the video is now playing in the preview panel!\n";
     }
 
@@ -6648,10 +7065,7 @@ static std::vector<int> apply_chat_template(const json& messages, const BPEToken
         std::vector<int> result;
         bool has_system = (!messages.empty() && messages[0].value("role", "") == "system");
         if (!has_system && (enable_thinking || has_tools)) {
-            std::string sys_prompt;
-            if (enable_thinking) {
-                sys_prompt = "Reasoning effort is set to xhigh. Please think carefully through the task, validate key assumptions, consider plausible alternatives, and prioritize correctness, consistency, and clarity in the final answer.";
-            }
+            std::string sys_prompt = "You are a helpful assistant";
             if (has_tools) {
                 sys_prompt += tools_system_prompt;
             }
@@ -6685,13 +7099,21 @@ static std::vector<int> apply_chat_template(const json& messages, const BPEToken
             result.insert(result.end(), role_enc.begin(), role_enc.end());
 
             std::string body = content;
-            if (role == "assistant" && messages[i].contains("tool_calls") && messages[i]["tool_calls"].is_array()) {
-                for (const auto& tc : messages[i]["tool_calls"]) {
-                    std::string fn_name = tc.value("function", json::object()).value("name", "");
-                    json fn_args = tc.value("function", json::object()).value("arguments", json::object());
-                    std::string args_str = fn_args.is_string() ? fn_args.get<std::string>() : fn_args.dump();
-                    if (!body.empty() && body.back() != '\n') body += "\n";
-                    body += "<tool_call>\n{\"name\": \"" + fn_name + "\", \"arguments\": " + args_str + "}\n</tool_call>\n";
+            if (role == "assistant") {
+                if (messages[i].contains("reasoning_content") && messages[i]["reasoning_content"].is_string()) {
+                    std::string r_content = messages[i]["reasoning_content"].get<std::string>();
+                    if (!r_content.empty()) {
+                        body = "<think>\n" + r_content + "\n</think>\n" + body;
+                    }
+                }
+                if (messages[i].contains("tool_calls") && messages[i]["tool_calls"].is_array()) {
+                    for (const auto& tc : messages[i]["tool_calls"]) {
+                        std::string fn_name = tc.value("function", json::object()).value("name", "");
+                        json fn_args = tc.value("function", json::object()).value("arguments", json::object());
+                        std::string args_str = fn_args.is_string() ? fn_args.get<std::string>() : fn_args.dump();
+                        if (!body.empty() && body.back() != '\n') body += "\n";
+                        body += "<tool_call>\n{\"name\": \"" + fn_name + "\", \"arguments\": " + args_str + "}\n</tool_call>\n";
+                    }
                 }
             }
 
@@ -6749,7 +7171,10 @@ static std::vector<int> apply_chat_template(const json& messages, const BPEToken
 
     bool has_system = (!messages.empty() && messages[0].value("role", "") == "system");
     if (!has_system && has_tools) {
-        std::string sys_text = "You are DeepSeek-V4, a helpful AI assistant with tool calling capabilities." + tools_system_prompt;
+        std::string default_sys = (tok.get_token_id("<｜User｜>") >= 0)
+                                      ? "You are DeepSeek-V4, a helpful AI assistant with tool calling capabilities."
+                                      : "You are a helpful assistant";
+        std::string sys_text = default_sys + tools_system_prompt;
         auto enc = tok.encode(sys_text);
         result.insert(result.end(), enc.begin(), enc.end());
     }
@@ -6774,7 +7199,19 @@ static std::vector<int> apply_chat_template(const json& messages, const BPEToken
             result.insert(result.end(), enc.begin(), enc.end());
         } else if (role == "assistant") {
             result.push_back(ASSISTANT);
-            result.push_back(THINK_END);
+            if (messages[i].contains("reasoning_content") && messages[i]["reasoning_content"].is_string()) {
+                std::string r_content = messages[i]["reasoning_content"].get<std::string>();
+                if (!r_content.empty()) {
+                    result.push_back(THINK_BEGIN);
+                    auto r_enc = tok.encode(r_content);
+                    result.insert(result.end(), r_enc.begin(), r_enc.end());
+                    result.push_back(THINK_END);
+                } else {
+                    result.push_back(THINK_END);
+                }
+            } else {
+                result.push_back(THINK_END);
+            }
             std::string body = content;
             if (messages[i].contains("tool_calls") && messages[i]["tool_calls"].is_array()) {
                 for (const auto& tc : messages[i]["tool_calls"]) {
@@ -7670,16 +8107,14 @@ static void run_server(MoecherEngine& engine, int port, int default_thinking_bud
         res.set_content(status.dump(), "application/json");
     });
 
-    // Web UI endpoints: serve compiled-in embedded assets directly for standalone reliability
+    // Web UI endpoints: serve disk assets when present (live development), fallback to embedded
     auto serve_asset = [](const std::string& disk_path, std::string_view embedded, const char* mime, httplib::Response& res) {
-        if (!embedded.empty()) {
+        std::ifstream in(disk_path, std::ios::binary);
+        if (in.is_open()) {
+            std::string content((std::istreambuf_iterator<char>(in)), std::istreambuf_iterator<char>());
+            res.set_content(content, mime);
+        } else if (!embedded.empty()) {
             res.set_content(std::string(embedded), mime);
-        } else {
-            std::ifstream in(disk_path, std::ios::binary);
-            if (in.is_open()) {
-                std::string content((std::istreambuf_iterator<char>(in)), std::istreambuf_iterator<char>());
-                res.set_content(content, mime);
-            }
         }
         res.set_header("Cache-Control", "no-cache, no-store, must-revalidate");
         res.set_header("Pragma", "no-cache");
@@ -8341,7 +8776,43 @@ static void run_server(MoecherEngine& engine, int port, int default_thinking_bud
         }
     });
 
-    svr.Options("/api/settings/google_search", [](const httplib::Request&, httplib::Response& res) {
+    svr.Post("/api/kv/reset", [&engine](const httplib::Request&, httplib::Response& res) {
+        res.set_header("Access-Control-Allow-Origin", "*");
+        if (engine.system_kv_snapshot_.valid) {
+            engine.restore_system_kv();
+            LOG_INFO("[KV RESET] Restored pinned System KV snapshot of %zu tokens (ready for fresh conversation with 0ms prefill).",
+                     engine.system_kv_snapshot_.tokens.size());
+        } else {
+            engine.reset_all_kv_caches();
+            engine.cached_tokens_.clear();
+            LOG_INFO("[KV RESET] Reset all KV caches to empty.");
+        }
+        json body = {
+            {"status", "ok"},
+            {"message", "KV cache reset successfully"},
+            {"system_snapshot_restored", engine.system_kv_snapshot_.valid},
+            {"cached_tokens", engine.cached_tokens_.size()}
+        };
+        res.set_content(body.dump(), "application/json");
+    });
+
+    svr.Get("/api/kv/reset", [&engine](const httplib::Request&, httplib::Response& res) {
+        res.set_header("Access-Control-Allow-Origin", "*");
+        if (engine.system_kv_snapshot_.valid) {
+            engine.restore_system_kv();
+        } else {
+            engine.reset_all_kv_caches();
+            engine.cached_tokens_.clear();
+        }
+        json body = {
+            {"status", "ok"},
+            {"system_snapshot_restored", engine.system_kv_snapshot_.valid},
+            {"cached_tokens", engine.cached_tokens_.size()}
+        };
+        res.set_content(body.dump(), "application/json");
+    });
+
+    svr.Options("/api/kv/reset", [](const httplib::Request&, httplib::Response& res) {
         res.set_header("Access-Control-Allow-Origin", "*");
         res.set_header("Access-Control-Allow-Methods", "GET, POST, OPTIONS");
         res.set_header("Access-Control-Allow-Headers", "*");
@@ -8461,8 +8932,12 @@ static void run_server(MoecherEngine& engine, int port, int default_thinking_bud
             int max_thinking_tokens = default_thinking_budget;
 
             json tools = json::array();
-            if (g_enable_tools && request.contains("tools") && request["tools"].is_array() && !request["tools"].empty()) {
-                tools = request["tools"];
+            if (g_enable_tools) {
+                if (request.contains("tools") && !request["tools"].empty()) {
+                    tools = resolve_canonical_tools(request["tools"]);
+                } else if (request.contains("enable_tools") && request["enable_tools"].is_boolean() && request["enable_tools"].get<bool>()) {
+                    tools = resolve_canonical_tools("default");
+                }
             }
 
             if (reasoning_effort == "none") {
@@ -9625,6 +10100,32 @@ int main(int argc, char** argv) {
             engine.enable_expert_tracking(""); // Start with empty profile
         } else {
             engine.enable_expert_tracking(freq_path);
+        }
+    }
+
+    // Pre-warm default system prompt and tooling into KV Cache for 0ms initial prefill latency
+    if (g_enable_tools) {
+        json default_messages = json::array({
+            {{"role", "system"}, {"content", "You are a helpful assistant"}},
+            {{"role", "user"}, {"content", ""}}
+        });
+        json default_tools = resolve_canonical_tools("default");
+        std::vector<int> prompt = apply_chat_template(default_messages, engine.tokenizer_, true, "high", default_tools);
+        int user_start = (engine.cfg_.architecture == ModelArch::QWEN)
+                             ? engine.tokenizer_.get_token_id("<|im_start|>")
+                             : engine.tokenizer_.get_token_id("<｜User｜>");
+        size_t sys_len = prompt.size();
+        for (size_t i = 1; i < prompt.size(); i++) {
+            if (prompt[i] == user_start) {
+                sys_len = i;
+                break;
+            }
+        }
+        if (sys_len > 0) {
+            std::vector<int> sys_tokens(prompt.begin(), prompt.begin() + sys_len);
+            LOG_INFO("Pre-warming startup KV Cache with default tooling system prompt (%zu tokens)...", sys_tokens.size());
+            engine.prefill_prefix(sys_tokens);
+            LOG_INFO("Startup KV Cache pre-warmed successfully (0ms latency ready for incoming queries).");
         }
     }
 

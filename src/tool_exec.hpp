@@ -2098,33 +2098,13 @@ inline RetrievedDocument fetch_url_full(const std::string& raw_url, int timeout_
         return doc;
     }
 
-    // 0. Fast direct YouTube video handler (Instant 0-latency playback & metadata resolution)
+    // 0. Fast direct YouTube video handler (Instant 0-latency client-side player registration)
     std::string direct_yt_id = extract_youtube_video_id(doc.url);
     if (!direct_yt_id.empty() && doc.url.find("results") == std::string::npos && doc.url.find("search") == std::string::npos) {
-        std::string title = "";
-        std::string author = "";
-        std::string desc = "";
-
-        std::string oembed_url = "https://www.youtube.com/oembed?url=https://www.youtube.com/watch?v=" + direct_yt_id + "&format=json";
-        std::string oembed_json = fetch_http_fast(oembed_url, 3000);
-        if (!oembed_json.empty() && oembed_json.front() == '{') {
-            try {
-                auto oj = json::parse(oembed_json);
-                title = oj.value("title", "");
-                author = oj.value("author_name", "");
-            } catch (...) {}
-        }
-        if (title.empty()) title = "YouTube Video (" + direct_yt_id + ")";
-
+        std::string title = "YouTube Video (" + direct_yt_id + ")";
         doc.title = title;
-        doc.raw_html = generate_youtube_preview_html(direct_yt_id, title, desc, author, doc.url);
-
-        std::string text_summary = "[Retrieved YouTube Video]\n";
-        text_summary += "Title: " + title + "\n";
-        if (!author.empty()) text_summary += "Channel/Author: " + author + "\n";
-        text_summary += "Video URL: https://www.youtube.com/watch?v=" + direct_yt_id + "\n";
-        text_summary += "[Note: Interactive video player loaded in preview panel.]";
-        doc.clean_text = text_summary;
+        doc.raw_html = generate_youtube_preview_html(direct_yt_id, title, "", "", doc.url);
+        doc.clean_text = "[YouTube video loaded in preview player: https://www.youtube.com/watch?v=" + direct_yt_id + "]";
         return doc;
     }
 

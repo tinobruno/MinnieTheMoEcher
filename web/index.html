@@ -567,50 +567,24 @@
                             </div>
                         </div>
 
+                        <!-- Web & Online Tools Card -->
                         <div class="agentic-card">
-                            <div class="agentic-card-header">
-                                <span class="material-symbols-outlined agentic-card-icon">handyman</span>
-                                <div class="agentic-card-title-group">
-                                    <h4>Active Tools Configuration</h4>
-                                    <p class="agentic-subtitle">Select which built-in tools are provided to the model</p>
+                            <div class="agentic-card-header" style="justify-content: space-between; align-items: center;">
+                                <div style="display: flex; align-items: center; gap: 12px;">
+                                    <span class="material-symbols-outlined agentic-card-icon" style="color: #38bdf8;">travel_explore</span>
+                                    <div class="agentic-card-title-group">
+                                        <h4>Web & Online Tools</h4>
+                                        <p class="agentic-subtitle">Web search, live facts & instant YouTube media playback</p>
+                                    </div>
                                 </div>
+                                <label class="agentic-switch-row" style="margin: 0; padding: 0; background: none; border: none;">
+                                    <input type="checkbox" id="tool-master-web" class="agentic-toggle" checked title="Enable/Disable all Web Tools">
+                                </label>
                             </div>
-                            <div class="agentic-tools-grid">
-                                <label class="agentic-tool-chip">
-                                    <input type="checkbox" id="tool-enable-read" checked>
-                                    <span class="material-symbols-outlined tool-chip-icon">description</span>
-                                    <div class="tool-chip-text">
-                                        <strong>read_file</strong>
-                                        <small>Inspect file content</small>
-                                    </div>
-                                </label>
-                                <label class="agentic-tool-chip">
-                                    <input type="checkbox" id="tool-enable-write" checked>
-                                    <span class="material-symbols-outlined tool-chip-icon">edit_note</span>
-                                    <div class="tool-chip-text">
-                                        <strong>write_file</strong>
-                                        <small>Create / replace files</small>
-                                    </div>
-                                </label>
-                                <label class="agentic-tool-chip">
-                                    <input type="checkbox" id="tool-enable-edit" checked>
-                                    <span class="material-symbols-outlined tool-chip-icon">edit_square</span>
-                                    <div class="tool-chip-text">
-                                        <strong>edit_file</strong>
-                                        <small>Surgical search & replace</small>
-                                    </div>
-                                </label>
-                                <label class="agentic-tool-chip">
-                                    <input type="checkbox" id="tool-enable-command" checked>
-                                    <span class="material-symbols-outlined tool-chip-icon">terminal</span>
-                                    <div class="tool-chip-text">
-                                        <strong>execute_command</strong>
-                                        <small>Run system shell commands</small>
-                                    </div>
-                                </label>
+                            <div class="agentic-tools-grid" id="tools-grid-web" style="margin-top: 10px;">
                                 <label class="agentic-tool-chip">
                                     <input type="checkbox" id="tool-enable-web-search" checked>
-                                    <span class="material-symbols-outlined tool-chip-icon">travel_explore</span>
+                                    <span class="material-symbols-outlined tool-chip-icon" style="color: #38bdf8;">travel_explore</span>
                                     <div class="tool-chip-text">
                                         <strong>web_search</strong>
                                         <small>Multi-engine web search</small>
@@ -618,10 +592,60 @@
                                 </label>
                                 <label class="agentic-tool-chip">
                                     <input type="checkbox" id="tool-enable-fetch" checked>
-                                    <span class="material-symbols-outlined tool-chip-icon">public</span>
+                                    <span class="material-symbols-outlined tool-chip-icon" style="color: #38bdf8;">public</span>
                                     <div class="tool-chip-text">
                                         <strong>fetch_url</strong>
                                         <small>Web page & media fetch</small>
+                                    </div>
+                                </label>
+                            </div>
+                        </div>
+
+                        <!-- Local System & Workspace Tools Card -->
+                        <div class="agentic-card">
+                            <div class="agentic-card-header" style="justify-content: space-between; align-items: center;">
+                                <div style="display: flex; align-items: center; gap: 12px;">
+                                    <span class="material-symbols-outlined agentic-card-icon" style="color: #a78bfa;">terminal</span>
+                                    <div class="agentic-card-title-group">
+                                        <h4>Local System & Workspace Tools</h4>
+                                        <p class="agentic-subtitle">File reading, editing, and terminal command execution</p>
+                                    </div>
+                                </div>
+                                <label class="agentic-switch-row" style="margin: 0; padding: 0; background: none; border: none;">
+                                    <input type="checkbox" id="tool-master-local" class="agentic-toggle" checked title="Enable/Disable all Local Tools">
+                                </label>
+                            </div>
+                            <div class="agentic-tools-grid" id="tools-grid-local" style="margin-top: 10px;">
+                                <label class="agentic-tool-chip">
+                                    <input type="checkbox" id="tool-enable-read" checked>
+                                    <span class="material-symbols-outlined tool-chip-icon" style="color: #a78bfa;">description</span>
+                                    <div class="tool-chip-text">
+                                        <strong>read_file</strong>
+                                        <small>Inspect file content</small>
+                                    </div>
+                                </label>
+                                <label class="agentic-tool-chip">
+                                    <input type="checkbox" id="tool-enable-write" checked>
+                                    <span class="material-symbols-outlined tool-chip-icon" style="color: #a78bfa;">edit_note</span>
+                                    <div class="tool-chip-text">
+                                        <strong>write_file</strong>
+                                        <small>Create / replace files</small>
+                                    </div>
+                                </label>
+                                <label class="agentic-tool-chip">
+                                    <input type="checkbox" id="tool-enable-edit" checked>
+                                    <span class="material-symbols-outlined tool-chip-icon" style="color: #a78bfa;">edit_square</span>
+                                    <div class="tool-chip-text">
+                                        <strong>edit_file</strong>
+                                        <small>Surgical search & replace</small>
+                                    </div>
+                                </label>
+                                <label class="agentic-tool-chip">
+                                    <input type="checkbox" id="tool-enable-command" checked>
+                                    <span class="material-symbols-outlined tool-chip-icon" style="color: #a78bfa;">terminal</span>
+                                    <div class="tool-chip-text">
+                                        <strong>execute_command</strong>
+                                        <small>Run system shell commands</small>
                                     </div>
                                 </label>
                             </div>

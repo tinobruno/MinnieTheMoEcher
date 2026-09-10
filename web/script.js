@@ -1744,7 +1744,13 @@ function initAgenticSettingsUI() {
         });
     }
 
-    // Tool Checkboxes
+    // Tool Checkboxes and Master Toggles
+    const masterWebToggle = document.getElementById('tool-master-web');
+    const masterLocalToggle = document.getElementById('tool-master-local');
+
+    const webToolNames = ['web_search', 'fetch_url', 'google_search'];
+    const localToolNames = ['read_file', 'write_file', 'edit_file', 'execute_command'];
+
     const toolCheckboxes = {
         read_file: document.getElementById('tool-enable-read'),
         write_file: document.getElementById('tool-enable-write'),
@@ -1755,15 +1761,49 @@ function initAgenticSettingsUI() {
         fetch_url: document.getElementById('tool-enable-fetch')
     };
 
+    function syncMasterCheckboxes() {
+        if (masterWebToggle) {
+            masterWebToggle.checked = webToolNames.some(t => agenticSettings.tools[t] !== false);
+        }
+        if (masterLocalToggle) {
+            masterLocalToggle.checked = localToolNames.some(t => agenticSettings.tools[t] !== false);
+        }
+    }
+
+    if (masterWebToggle) {
+        masterWebToggle.addEventListener('change', (e) => {
+            const val = e.target.checked;
+            webToolNames.forEach(t => {
+                agenticSettings.tools[t] = val;
+                if (toolCheckboxes[t]) toolCheckboxes[t].checked = val;
+            });
+            saveAgenticSettings();
+        });
+    }
+
+    if (masterLocalToggle) {
+        masterLocalToggle.addEventListener('change', (e) => {
+            const val = e.target.checked;
+            localToolNames.forEach(t => {
+                agenticSettings.tools[t] = val;
+                if (toolCheckboxes[t]) toolCheckboxes[t].checked = val;
+            });
+            saveAgenticSettings();
+        });
+    }
+
     Object.entries(toolCheckboxes).forEach(([toolName, cb]) => {
         if (cb) {
             cb.checked = agenticSettings.tools[toolName] !== false;
             cb.addEventListener('change', (e) => {
                 agenticSettings.tools[toolName] = e.target.checked;
+                syncMasterCheckboxes();
                 saveAgenticSettings();
             });
         }
     });
+
+    syncMasterCheckboxes();
 
     // Enter key on path input
     const pathInput = document.getElementById('agentic-new-path-input');
@@ -1871,205 +1911,19 @@ function removeAuthorizedPath(idx) {
     }
 }
 
-// Built-in tool definitions builder
+// Built-in tool definitions builder (sends lightweight tool name list to backend)
 function getActiveToolsPayload() {
     const isWebRetrieval = webRetrievalEnabled ? webRetrievalEnabled.checked : true;
+    const knownTools = ['web_search', 'google_search', 'fetch_url', 'read_file', 'write_file', 'edit_file', 'execute_command'];
 
-    const allToolDefs = [
-        {
-            name: "web_search",
-            type: "function",
-            function: {
-                name: "web_search",
-                description: "Search the live web using the configured search provider (Tavily AI, SearXNG, Brave, Serper Google, or Google Custom Search) to find current news, facts, documentation, APIs, and web pages.",
-                parameters: {
-                    type: "object",
-                    properties: {
-                        query: {
-                            type: "string",
-                            description: "The search query string (e.g. 'latest AI news', 'deepseek v4 architecture', 'tavily api docs')."
-                        },
-                        num_results: {
-                            type: "integer",
-                            description: "Optional number of search results to return (1-10, default: 5)."
-                        },
-                        site: {
-                            type: "string",
-                            description: "Optional domain filter to restrict search to a specific website (e.g. 'github.com', 'wikipedia.org')."
-                        }
-                    },
-                    required: ["query"]
-                }
-            }
-        },
-        {
-            name: "google_search",
-            type: "function",
-            function: {
-                name: "google_search",
-                description: "Search the web using official Google Custom Search or configured universal search engine.",
-                parameters: {
-                    type: "object",
-                    properties: {
-                        query: {
-                            type: "string",
-                            description: "The search query string (e.g. 'latest AI news', 'Tino Bruno GitHub', 'llama.cpp documentation')."
-                        },
-                        num_results: {
-                            type: "integer",
-                            description: "Optional number of search results to return (1-10, default: 5)."
-                        },
-                        site: {
-                            type: "string",
-                            description: "Optional domain filter to restrict search to a specific website (e.g. 'github.com', 'wikipedia.org')."
-                        }
-                    },
-                    required: ["query"]
-                }
-            }
-        },
-        {
-            name: "fetch_url",
-            type: "function",
-            function: {
-                name: "fetch_url",
-                description: "Fetch web content, inspect raw source code, or extract JavaScript/links from a public web URL. Raw responses are cached to '.moecher_web_cache.html' for dynamic script/JSON parsing.",
-                parameters: {
-                    type: "object",
-                    properties: {
-                        url: {
-                            type: "string",
-                            description: "The complete HTTP or HTTPS URL or search query to fetch (e.g. https://www.youtube.com/results?search_query=query, https://www.google.com/search?q=query, or https://example.com)"
-                        },
-                        mode: {
-                            type: "string",
-                            enum: ["text", "raw", "scripts", "links"],
-                            description: "Content extraction mode: 'text' (default: clean readable text, metadata, detected links), 'raw' (unaltered source HTML/code), 'scripts' (extracted <script> tags and embedded JS), 'links' (all hyperlinks). Default: 'text'."
-                        },
-                        pattern: {
-                            type: "string",
-                            description: "Optional case-insensitive substring or keyword filter. In 'raw' mode, extracts surrounding context windows around matches; in 'scripts' mode, extracts scripts containing this keyword; in 'links' mode, extracts URLs/anchors containing this keyword."
-                        },
-                        offset: {
-                            type: "integer",
-                            description: "Optional pagination offset for matches/scripts/links (default: 0)."
-                        },
-                        max_chars: {
-                            type: "integer",
-                            description: "Optional maximum character length for the output (default: 4000)."
-                        }
-                    },
-                    required: ["url"]
-                }
-            }
-        },
-        {
-            name: "read_file",
-            type: "function",
-            function: {
-                name: "read_file",
-                description: "Read the text contents of a file on the local filesystem. Supports line numbering and viewing line ranges.",
-                parameters: {
-                    type: "object",
-                    properties: {
-                        path: {
-                            type: "string",
-                            description: "The relative or absolute file path to read (e.g. 'src/main.cpp' or 'config.json')."
-                        },
-                        start_line: {
-                            type: "integer",
-                            description: "Optional 1-indexed starting line number (default: 1)."
-                        },
-                        end_line: {
-                            type: "integer",
-                            description: "Optional 1-indexed ending line number (default: -1 for entire file)."
-                        }
-                    },
-                    required: ["path"]
-                }
-            }
-        },
-        {
-            name: "write_file",
-            type: "function",
-            function: {
-                name: "write_file",
-                description: "Create a new file or completely overwrite an existing file with the provided text content.",
-                parameters: {
-                    type: "object",
-                    properties: {
-                        path: {
-                            type: "string",
-                            description: "The relative or absolute file path to write."
-                        },
-                        content: {
-                            type: "string",
-                            description: "The complete text content to write to the file."
-                        },
-                        overwrite: {
-                            type: "boolean",
-                            description: "Whether to overwrite if file already exists (default: true)."
-                        }
-                    },
-                    required: ["path", "content"]
-                }
-            }
-        },
-        {
-            name: "edit_file",
-            type: "function",
-            function: {
-                name: "edit_file",
-                description: "Perform a precise search-and-replace on a unique block of text within an existing file.",
-                parameters: {
-                    type: "object",
-                    properties: {
-                        path: {
-                            type: "string",
-                            description: "The relative or absolute file path to edit."
-                        },
-                        target_content: {
-                            type: "string",
-                            description: "The exact, unique block of lines to replace, matching whitespace."
-                        },
-                        replacement_content: {
-                            type: "string",
-                            description: "The new content that replaces the target block."
-                        }
-                    },
-                    required: ["path", "target_content", "replacement_content"]
-                }
-            }
-        },
-        {
-            name: "execute_command",
-            type: "function",
-            function: {
-                name: "execute_command",
-                description: "Execute a terminal/shell command on the local system (e.g. dir, ls, git, cargo, msbuild, cmake) and return its output.",
-                parameters: {
-                    type: "object",
-                    properties: {
-                        command: {
-                            type: "string",
-                            description: "The exact shell command line to execute."
-                        }
-                    },
-                    required: ["command"]
-                }
-            }
-        }
-    ];
-
-    return allToolDefs.filter(t => {
-        if ((t.name === 'web_search' || t.name === 'google_search' || t.name === 'fetch_url') && !isWebRetrieval) {
+    const activeList = knownTools.filter(name => {
+        if ((name === 'web_search' || name === 'google_search' || name === 'fetch_url') && !isWebRetrieval) {
             return false;
         }
-        return agenticSettings.tools[t.name] !== false;
-    }).map(t => ({
-        type: t.type,
-        function: t.function
-    }));
+        return agenticSettings.tools[name] !== false;
+    });
+
+    return activeList;
 }
 
 // Authorization Modal Prompt
@@ -2592,11 +2446,28 @@ async function executeTavilySearchJS(query, apiKey, maxResults = 5) {
         textOut += `No search results found for query: "${query}"`;
     }
 
+    let ytDocFromSearch = null;
+    for (const item of results) {
+        const link = item.url || '';
+        const m = link.match(/(?:youtube\.com\/watch\?v=|youtu\.be\/|youtube\.com\/embed\/)([a-zA-Z0-9_-]{11})/i);
+        if (m) {
+            ytDocFromSearch = {
+                id: 'yt_' + m[1],
+                url: `https://www.youtube.com/watch?v=${m[1]}`,
+                title: item.title || 'YouTube Video',
+                html: createYouTubePlayerHtml(m[1], item.title || 'YouTube Video'),
+                snippet: item.content || 'Interactive YouTube Player'
+            };
+            addRetrievedDocument(ytDocFromSearch);
+            break;
+        }
+    }
+
     const primaryUrl = (results.length > 0 && results[0].url) ? results[0].url : 'https://tavily.com';
 
     return {
         output: textOut,
-        retrieved_document: {
+        retrieved_document: ytDocFromSearch || {
             id: 'tavily_' + Date.now(),
             url: primaryUrl,
             title: (results.length > 0 && results[0].title) ? results[0].title : `Tavily Search: ${query}`,
@@ -2834,6 +2705,9 @@ async function sendMessage() {
     setGeneratingState(true);
     welcomeScreen.style.display = 'none';
 
+    // Index where this turn starts in chatHistory
+    const turnHistoryStartIndex = chatHistory.length;
+
     // Add user message
     appendMessage('user', text);
     chatHistory.push({ role: 'user', content: text });
@@ -2930,7 +2804,12 @@ async function sendMessage() {
             };
 
             if (activeTools.length > 0) {
-                payload.tools = activeTools;
+                const allTools = ['web_search', 'google_search', 'fetch_url', 'read_file', 'write_file', 'edit_file', 'execute_command'];
+                if (activeTools.length === allTools.length && activeTools.every((t, i) => t === allTools[i])) {
+                    payload.tools = "default";
+                } else {
+                    payload.tools = activeTools;
+                }
             }
 
             let roundReasoning = "";
@@ -3242,21 +3121,25 @@ async function sendMessage() {
                 }
             }
 
-            // 2. If not found in turnRetrievedDocs, check all tool outputs in chatHistory from this turn
+            // 2. If not found in turnRetrievedDocs, check tool outputs ONLY from THIS turn (in reverse order)
             if (!turnMediaDoc) {
-                const toolOutputs = chatHistory.filter(m => m.role === 'tool').map(m => m.content || '').join('\n');
-                const ytMatch = toolOutputs.match(/(?:https?:\/\/)?(?:www\.)?(?:youtube\.com\/watch\?v=|youtu\.be\/|youtube\.com\/embed\/)([a-zA-Z0-9_-]{11})/i);
-                if (ytMatch) {
-                    const videoId = ytMatch[1];
-                    const ytHtml = createYouTubePlayerHtml(videoId, 'YouTube Video');
-                    turnMediaDoc = {
-                        id: 'yt_' + videoId,
-                        url: `https://www.youtube.com/watch?v=${videoId}`,
-                        title: 'YouTube Video',
-                        html: ytHtml,
-                        snippet: 'Interactive YouTube Player'
-                    };
-                    addRetrievedDocument(turnMediaDoc);
+                const currentTurnToolOutputs = chatHistory.slice(turnHistoryStartIndex).filter(m => m.role === 'tool');
+                for (let i = currentTurnToolOutputs.length - 1; i >= 0; i--) {
+                    const content = currentTurnToolOutputs[i].content || '';
+                    const ytMatch = content.match(/(?:https?:\/\/)?(?:www\.)?(?:youtube\.com\/watch\?v=|youtu\.be\/|youtube\.com\/embed\/)([a-zA-Z0-9_-]{11})/i);
+                    if (ytMatch) {
+                        const videoId = ytMatch[1];
+                        const ytHtml = createYouTubePlayerHtml(videoId, 'YouTube Video');
+                        turnMediaDoc = {
+                            id: 'yt_' + videoId,
+                            url: `https://www.youtube.com/watch?v=${videoId}`,
+                            title: 'YouTube Video',
+                            html: ytHtml,
+                            snippet: 'Interactive YouTube Player'
+                        };
+                        addRetrievedDocument(turnMediaDoc);
+                        break;
+                    }
                 }
             }
 
