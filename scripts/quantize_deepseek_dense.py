@@ -110,7 +110,8 @@ def quantize_deepseek_dense(
     dense_bin_in: Path,
     output_dir: Path,
     block_size: int = 32,
-    quantize_embeddings: bool = True
+    quantize_embeddings: bool = True,
+    quantize_indexer: bool = True
 ):
     output_dir.mkdir(parents=True, exist_ok=True)
 
@@ -170,8 +171,13 @@ def quantize_deepseek_dense(
             is_2d_projection = (len(shape) == 2 and shape[0] >= 512 and shape[1] >= 512 and shape[1] % block_size == 0)
             is_fp8_weight = (dtype == "F8_E4M3")
             is_embed_or_head = ("embed" in t_name or "head" in t_name) and is_2d_projection
+            is_indexer = ("indexer.wq_b.weight" in t_name)
 
-            should_quantize = (is_fp8_weight and is_2d_projection) or (quantize_embeddings and is_embed_or_head)
+            should_quantize = (is_fp8_weight and is_2d_projection)
+            if not quantize_indexer and is_indexer:
+                should_quantize = False
+            if quantize_embeddings and is_embed_or_head:
+                should_quantize = True
 
             if should_quantize:
                 # 1. Recover float32 weight matrix
@@ -296,6 +302,7 @@ if __name__ == "__main__":
     parser.add_argument("--output-dir", default="models/deepseek_v4_flash_q4", help="Output directory")
     parser.add_argument("--block-size", type=int, default=32, help="INT4 block size (default: 32)")
     parser.add_argument("--no-embed-quant", action="store_true", help="Do not quantize embeddings/head")
+    parser.add_argument("--no-indexer-quant", action="store_true", help="Do not quantize indexer tensors")
 
     args = parser.parse_args()
 
@@ -304,5 +311,6 @@ if __name__ == "__main__":
         Path(args.dense_bin_in),
         Path(args.output_dir),
         block_size=args.block_size,
-        quantize_embeddings=not args.no_embed_quant
+        quantize_embeddings=not args.no_embed_quant,
+        quantize_indexer=not args.no_indexer_quant
     )

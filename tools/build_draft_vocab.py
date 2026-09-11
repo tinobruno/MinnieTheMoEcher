@@ -99,12 +99,19 @@ def build_draft_vocab(tokenizer_path, output_path, vocab_size=40000):
     return draft_vocab_ids
 
 if __name__ == '__main__':
-    tokenizer_path = 'f:/Moecher/models/qwen3_8_27b_q4/tokenizer.json'
-    output_dir = 'f:/Moecher/models/qwen3_8_27b_q4'
-    output_path = os.path.join(output_dir, 'draft_vocab_ids.json')
+    import argparse
+    parser = argparse.ArgumentParser(description="Build draft vocabulary for MTP speculative decoding")
+    parser.add_argument("--tokenizer", default="models/qwen3_8_27b_q4/tokenizer.json", help="Path to tokenizer.json")
+    parser.add_argument("--output-dir", default="models/qwen3_8_27b_q4", help="Output directory")
+    parser.add_argument("--vocab-size", type=int, default=40000, help="Draft vocabulary size")
+    args = parser.parse_args()
+
+    os.makedirs(args.output_dir, exist_ok=True)
+    output_path = os.path.join(args.output_dir, 'draft_vocab_ids.json')
     
-    draft_ids = build_draft_vocab(tokenizer_path, output_path, vocab_size=40000)
+    draft_ids = build_draft_vocab(args.tokenizer, output_path, vocab_size=args.vocab_size)
     
     if draft_ids:
         print(f"\nDraft vocabulary built successfully: {len(draft_ids)} tokens")
         print(f"Coverage estimate: ~95-97% of typical model outputs")
+
