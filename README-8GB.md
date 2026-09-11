@@ -17,13 +17,18 @@ Instead of using INT4 for embeddings (which causes massive precision loss and ha
 - **Accuracy**: Minimal degradation. FP8 preserves the precision of these highly sensitive layers much better than INT4.
 - **Performance**: Can slightly increase generation speed (`tok/s`), as it cuts the massive memory bandwidth requirement of the final logit computation in half.
 
-### 2. Disable/Strip MTP (Multi-Token Prediction) Layers
+### 2. Indexer Quantization
+The DeepSeek V4 indexer layers can be selectively quantized. In earlier setups, `--no-indexer-quant` was required to avoid an out-of-bounds illegal memory access when indexers were quantized (or skipped). Now that the engine properly supports non-quantized indexers (BF16 fallback path in Q4 inference) without crashing, we can optionally quantize them to FP8 to save even more memory on the attention projection layers.
+- **Savings**: Modest (depends on the indexer size), but helps.
+
+
+### 3. Disable/Strip MTP (Multi-Token Prediction) Layers
 DeepSeek V4 includes several extra layers (`mtp.0.*`, `mtp.1.*`, etc.) that act as a built-in draft model for speculative decoding.
 - **Savings**: Several hundred megabytes.
 - **Implementation**: Add an engine flag (`--disable-mtp`) or strip these tensors from the Q4 manifest entirely so they are never loaded into VRAM.
 - **Tradeoff**: You lose the token generation speedup provided by speculative decoding, but the base model's intelligence and context recall remain 100% intact.
 
-### 3. Tune Engine Pre-allocations
+### 4. Tune Engine Pre-allocations
 The `moecher` engine aggressively pre-allocates memory for experts and the KV cache. We can pass stricter constraints to the engine:
 - **KV Cache Size**: Pass `--max-seq-len 4096` or `8192` (instead of 32K+) to enforce a strict upper limit on KV cache memory.
 - **Expert Cache Limit**: Reduce the active GPU expert cache pool (e.g., set `--max-vram 5` instead of `6`).
