@@ -279,6 +279,14 @@ void embedding_cuda(
     int seq_len, int dim,
     cudaStream_t stream = 0);
 
+void embedding_int4_cuda(
+    __nv_bfloat16* out,            // [seq_len, dim]
+    const uint8_t* table_w,        // [vocab_size, dim / 2] (INT4 packed)
+    const __nv_bfloat16* table_s,  // [vocab_size, dim / 32] (BF16 scales)
+    const int32_t* ids,            // [seq_len]
+    int seq_len, int dim,
+    cudaStream_t stream = 0);
+
 void embedding_broadcast_cuda(
     __nv_bfloat16* hidden,         // [dim]
     __nv_bfloat16* hc_state,       // [hc, dim]
@@ -565,6 +573,12 @@ void fused_moe_accum_6_cuda(
 void embedding_broadcast_device_id_cuda(
     __nv_bfloat16* hidden, __nv_bfloat16* hc_state,
     const __nv_bfloat16* table, const int32_t* d_token_id, int dim, int hc,
+    cudaStream_t stream = 0);
+
+void embedding_int4_broadcast_device_id_cuda(
+    __nv_bfloat16* hidden, __nv_bfloat16* hc_state,
+    const uint8_t* table_w, const __nv_bfloat16* table_s,
+    const int32_t* d_token_id, int dim, int hc,
     cudaStream_t stream = 0);
 
 void rope_device_pos_cuda(

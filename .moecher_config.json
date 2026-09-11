@@ -1,0 +1,9 @@
+{
+  "brave_api_key": "",
+  "google_search_api_key": "",
+  "google_search_cx": "",
+  "search_provider": "tavily",
+  "searxng_url": "https://searx.be",
+  "serper_api_key": "",
+  "tavily_api_key": "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"
+}

@@ -560,6 +560,39 @@ void embedding_cuda(__nv_bfloat16* out, const __nv_bfloat16* table,
     embedding_kernel<<<blocks, 256, 0, stream>>>(out, table, ids, seq_len, dim);
 }
 
+__global__ void embedding_int4_kernel(
+    __nv_bfloat16* __restrict__ out,
+    const uint8_t* __restrict__ table_w,
+    const __nv_bfloat16* __restrict__ table_s,
+    const int32_t* __restrict__ ids,
+    int seq_len, int dim)
+{
+    int s = blockIdx.x;
+    int d = threadIdx.x + blockIdx.y * blockDim.x;
+    if (s >= seq_len || d >= dim) return;
+
+    int token_id = ids[s];
+    
+    int w_idx = token_id * (dim / 2) + (d / 2);
+    int s_idx = token_id * (dim / 32) + (d / 32);
+    
+    uint8_t packed = table_w[w_idx];
+    __nv_bfloat16 scale = table_s[s_idx];
+    
+    uint8_t nibble = (d % 2 == 0) ? (packed & 0x0F) : ((packed >> 4) & 0x0F);
+    int32_t val_i = (int32_t)nibble - 8;
+    float val_f = (float)val_i * bf16_to_float(scale);
+    
+    out[s * dim + d] = float_to_bf16(val_f);
+}
+
+void embedding_int4_cuda(__nv_bfloat16* out, const uint8_t* table_w, const __nv_bfloat16* table_s,
+                    const int32_t* ids, int seq_len, int dim,
+                    cudaStream_t stream) {
+    dim3 blocks(seq_len, (dim + 255) / 256);
+    embedding_int4_kernel<<<blocks, 256, 0, stream>>>(out, table_w, table_s, ids, seq_len, dim);
+}
+
 __global__ void embedding_broadcast_kernel(
     __nv_bfloat16* __restrict__ hidden,
     __nv_bfloat16* __restrict__ hc_state,
@@ -3924,6 +3957,48 @@ void embedding_broadcast_device_id_cuda(
     int blocks = (dim + threads - 1) / threads;
     embedding_broadcast_device_id_kernel<<<blocks, threads, 0, stream>>>(
         hidden, hc_state, table, d_token_id, dim, hc);
+}
+
+__global__ void embedding_int4_broadcast_device_id_kernel(
+    __nv_bfloat16* __restrict__ hidden,
+    __nv_bfloat16* __restrict__ hc_state,
+    const uint8_t* __restrict__ table_w,
+    const __nv_bfloat16* __restrict__ table_s,
+    const int32_t* __restrict__ d_token_id,
+    int dim, int hc)
+{
+    int d = threadIdx.x + blockIdx.x * blockDim.x;
+    if (d >= dim) return;
+
+    int token_id = *d_token_id;
+    
+    int w_idx = token_id * (dim / 2) + (d / 2);
+    int s_idx = token_id * (dim / 32) + (d / 32);
+    
+    uint8_t packed = table_w[w_idx];
+    __nv_bfloat16 scale = table_s[s_idx];
+    
+    uint8_t nibble = (d % 2 == 0) ? (packed & 0x0F) : ((packed >> 4) & 0x0F);
+    int32_t val_i = (int32_t)nibble - 8;
+    float val_f = (float)val_i * bf16_to_float(scale);
+    __nv_bfloat16 val = float_to_bf16(val_f);
+    
+    hidden[d] = val;
+    for (int h = 0; h < hc; h++) {
+        hc_state[(size_t)h * dim + d] = val;
+    }
+}
+
+void embedding_int4_broadcast_device_id_cuda(
+    __nv_bfloat16* hidden, __nv_bfloat16* hc_state,
+    const uint8_t* table_w, const __nv_bfloat16* table_s,
+    const int32_t* d_token_id, int dim, int hc,
+    cudaStream_t stream)
+{
+    int threads = 256;
+    int blocks = (dim + threads - 1) / threads;
+    embedding_int4_broadcast_device_id_kernel<<<blocks, threads, 0, stream>>>(
+        hidden, hc_state, table_w, table_s, d_token_id, dim, hc);
 }
 
 __global__ void rope_device_pos_kernel(

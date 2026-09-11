@@ -1733,7 +1733,9 @@ public:
             return true;
         };
 
-        load_t(embed_w_, "model.language_model.embed_tokens.weight");
+        if (!load_quant_t(embed_w_, embed_w_scale_, "model.language_model.embed_tokens.weight")) {
+            load_t(embed_w_, "model.language_model.embed_tokens.weight");
+        }
         load_t(final_norm_w_, "model.language_model.norm.weight");
 
         layers_.resize(num_layers_);
@@ -1878,7 +1880,11 @@ public:
 
     void forward_token_device_body(int position, cudaStream_t stream) {
         // 1. Embedding lookup
-        embedding_cuda(buf_hidden_.bf16(), embed_w_.bf16(), buf_input_token_.i32(), 1, hidden_size_, stream);
+        if (embed_w_.dtype == "int4") {
+            embedding_int4_cuda(buf_hidden_.bf16(), (uint8_t*)embed_w_.data, embed_w_scale_.bf16(), buf_input_token_.i32(), 1, hidden_size_, stream);
+        } else {
+            embedding_cuda(buf_hidden_.bf16(), embed_w_.bf16(), buf_input_token_.i32(), 1, hidden_size_, stream);
+        }
 
         auto matmul_proj = [&](GPUTensor& out, GPUTensor& in_vec, GPUTensor& weight, GPUTensor& scale, int N, int K) {
             if (weight.dtype == "int4") {
@@ -2222,13 +2228,19 @@ public:
 
     // Reference to target model's embedding table (shared, not owned)
     __nv_bfloat16* target_embed_w_ = nullptr;
+    uint8_t* target_embed_w_int4_ = nullptr;
+    __nv_bfloat16* target_embed_s_ = nullptr;
+    bool is_embed_int4_ = false;
 
     bool load_mtp_weights(const void* mapped_data, const json& tensor_map,
-                          __nv_bfloat16* embed_w, __nv_bfloat16* full_lm_head,
-                          int full_vocab,
+                          __nv_bfloat16* embed_w, uint8_t* embed_w_int4, __nv_bfloat16* embed_s, bool is_embed_int4,
+                          __nv_bfloat16* full_lm_head, int full_vocab,
                           const std::string& model_dir, cudaStream_t stream) {
         full_vocab_size_ = full_vocab;
         target_embed_w_ = embed_w;
+        target_embed_w_int4_ = embed_w_int4;
+        target_embed_s_ = embed_s;
+        is_embed_int4_ = is_embed_int4;
         full_lm_head_w_ = full_lm_head;
 
         auto load_t = [&](GPUTensor& gpu, const std::string& name) -> bool {
@@ -2402,7 +2414,11 @@ public:
         // 2. Embed the last token and norm it
         int32_t tok = last_token_id;
         CUDA_CHECK(cudaMemcpyAsync(buf_mtp_argmax_.i32(), &tok, sizeof(int32_t), cudaMemcpyHostToDevice, stream));
-        embedding_cuda(buf_mtp_embed_.bf16(), target_embed_w_, buf_mtp_argmax_.i32(), 1, hidden_size_, stream);
+        if (is_embed_int4_) {
+            embedding_int4_cuda(buf_mtp_embed_.bf16(), target_embed_w_int4_, target_embed_s_, buf_mtp_argmax_.i32(), 1, hidden_size_, stream);
+        } else {
+            embedding_cuda(buf_mtp_embed_.bf16(), target_embed_w_, buf_mtp_argmax_.i32(), 1, hidden_size_, stream);
+        }
         rms_norm_one_centered_cuda(buf_mtp_embed_.bf16(), buf_mtp_embed_.bf16(),
                                    mtp_pre_fc_norm_embed_w_.bf16(), hidden_size_, rms_eps_, stream);
 
@@ -2679,7 +2695,7 @@ public:
     // ── Resident GPU tensors (loaded at startup) ────────────────────────────
 
     // Embedding & head
-    GPUTensor embed_weight_;   // [vocab_size, hidden_size] BF16
+    GPUTensor embed_weight_, embed_weight_scale_;   // [vocab_size, hidden_size] BF16 or INT4
     GPUTensor head_weight_, head_weight_scale_; // [vocab_size, hidden_size] (BF16 or INT4 for logits)
     GPUTensor norm_weight_;    // [hidden_size] BF16
 
@@ -3426,7 +3442,11 @@ public:
 
         if (cfg_.architecture == ModelArch::QWEN) {
             // 1. Standard Embedding lookup
-            embedding_cuda(buf_hidden_.bf16(), embed_weight_.bf16(), buf_input_token_.i32(), 1, dim, main_stream_);
+            if (embed_weight_.dtype == "int4") {
+                embedding_int4_cuda(buf_hidden_.bf16(), (uint8_t*)embed_weight_.data, embed_weight_scale_.bf16(), buf_input_token_.i32(), 1, dim, main_stream_);
+            } else {
+                embedding_cuda(buf_hidden_.bf16(), embed_weight_.bf16(), buf_input_token_.i32(), 1, dim, main_stream_);
+            }
 
             // 2. Process each layer
             for (int layer = 0; layer < cfg_.num_hidden_layers; layer++) {
@@ -3455,8 +3475,13 @@ public:
         }
 
         // 1 & 2. Embedding lookup and broadcast to HC copies: [1, dim] -> [hc, dim]
-        embedding_broadcast_device_id_cuda(buf_hidden_.bf16(), buf_hc_state_.bf16(),
-                                           embed_weight_.bf16(), buf_input_token_.i32(), dim, hc, main_stream_);
+        if (embed_weight_.dtype == "int4") {
+            embedding_int4_broadcast_device_id_cuda(buf_hidden_.bf16(), buf_hc_state_.bf16(),
+                                               (uint8_t*)embed_weight_.data, embed_weight_scale_.bf16(), buf_input_token_.i32(), dim, hc, main_stream_);
+        } else {
+            embedding_broadcast_device_id_cuda(buf_hidden_.bf16(), buf_hc_state_.bf16(),
+                                               embed_weight_.bf16(), buf_input_token_.i32(), dim, hc, main_stream_);
+        }
 
         // 3. Process each layer
         for (int layer = 0; layer < cfg_.num_hidden_layers; layer++) {
@@ -4500,9 +4525,15 @@ private:
         };
 
         // Load global tensors
-        if (!load_tensor(embed_weight_, "embed.weight")) {
-            if (!load_tensor(embed_weight_, "model.embed_tokens.weight")) {
-                load_tensor(embed_weight_, "model.language_model.embed_tokens.weight");
+        if (!load_quant_tensor(embed_weight_, embed_weight_scale_, "embed.weight")) {
+            if (!load_quant_tensor(embed_weight_, embed_weight_scale_, "model.embed_tokens.weight")) {
+                if (!load_quant_tensor(embed_weight_, embed_weight_scale_, "model.language_model.embed_tokens.weight")) {
+                    if (!load_tensor(embed_weight_, "embed.weight")) {
+                        if (!load_tensor(embed_weight_, "model.embed_tokens.weight")) {
+                            load_tensor(embed_weight_, "model.language_model.embed_tokens.weight");
+                        }
+                    }
+                }
             }
         }
         if (!load_quant_tensor(head_weight_, head_weight_scale_, "head.weight")) {
@@ -4841,7 +4872,11 @@ private:
                 if (head_weight_.dtype == "int4") {
                     LOG_WARN("MTP: Full lm_head is INT4, not supported for MTP yet — skipping MTP");
                 } else {
-                    mtp_drafter_.load_mtp_weights(mapped, tensor_map, embed_weight_.bf16(),
+                    mtp_drafter_.load_mtp_weights(mapped, tensor_map, 
+                                                  embed_weight_.dtype == "int4" ? nullptr : embed_weight_.bf16(),
+                                                  embed_weight_.dtype == "int4" ? (uint8_t*)embed_weight_.data : nullptr,
+                                                  embed_weight_scale_.bf16(),
+                                                  embed_weight_.dtype == "int4",
                                                   head_weight_.bf16(),
                                                   cfg_.vocab_size, mtp_model_dir, main_stream_);
                 }
@@ -5388,7 +5423,11 @@ private:
     void forward_token_batch_qwen_device_body(int position, int M) {
         int dim = cfg_.hidden_size;
         // 1. Embedding lookup for M tokens
-        embedding_cuda(buf_hidden_batch_.bf16(), embed_weight_.bf16(), buf_input_tokens_batch_.i32(), M, dim, main_stream_);
+        if (embed_weight_.dtype == "int4") {
+            embedding_int4_cuda(buf_hidden_batch_.bf16(), (uint8_t*)embed_weight_.data, embed_weight_scale_.bf16(), buf_input_tokens_batch_.i32(), M, dim, main_stream_);
+        } else {
+            embedding_cuda(buf_hidden_batch_.bf16(), embed_weight_.bf16(), buf_input_tokens_batch_.i32(), M, dim, main_stream_);
+        }
 
         // 2. Process each layer
         for (int layer = 0; layer < cfg_.num_hidden_layers; layer++) {

@@ -1,0 +1,57 @@
+{
+  "accounts.google.com": {
+    "ajs_anonymous_id": "f0631729-f969-4623-819f-7263e6b2ef06",
+    "li_alerts": "e30="
+  },
+  "be.linkedin.com": {
+    "ajs_anonymous_id": "f0631729-f969-4623-819f-7263e6b2ef06",
+    "li_alerts": "e30="
+  },
+  "google.be": {
+    "CONSENT": "PENDING+999",
+    "SOCS": "CAESHAgBEhJnd3NfMjAyNDA4MjAtMF9SQzIaAmVuIAEaBgiA_L20Bg"
+  },
+  "google.co.uk": {
+    "CONSENT": "PENDING+999",
+    "SOCS": "CAESHAgBEhJnd3NfMjAyNDA4MjAtMF9SQzIaAmVuIAEaBgiA_L20Bg"
+  },
+  "google.com": {
+    "CONSENT": "PENDING+999",
+    "SOCS": "CAESHAgBEhJnd3NfMjAyNDA4MjAtMF9SQzIaAmVuIAEaBgiA_L20Bg"
+  },
+  "google.de": {
+    "CONSENT": "PENDING+999",
+    "SOCS": "CAESHAgBEhJnd3NfMjAyNDA4MjAtMF9SQzIaAmVuIAEaBgiA_L20Bg"
+  },
+  "google.es": {
+    "CONSENT": "PENDING+999",
+    "SOCS": "CAESHAgBEhJnd3NfMjAyNDA4MjAtMF9SQzIaAmVuIAEaBgiA_L20Bg"
+  },
+  "google.fr": {
+    "CONSENT": "PENDING+999",
+    "SOCS": "CAESHAgBEhJnd3NfMjAyNDA4MjAtMF9SQzIaAmVuIAEaBgiA_L20Bg"
+  },
+  "google.it": {
+    "CONSENT": "PENDING+999",
+    "SOCS": "CAESHAgBEhJnd3NfMjAyNDA4MjAtMF9SQzIaAmVuIAEaBgiA_L20Bg"
+  },
+  "ps.azurewaf.microsoft.com": {
+    "ajs_anonymous_id": "f0631729-f969-4623-819f-7263e6b2ef06",
+    "li_alerts": "e30="
+  },
+  "searx.be": {
+    "ajs_anonymous_id": "f0631729-f969-4623-819f-7263e6b2ef06"
+  },
+  "static.licdn.com": {
+    "ajs_anonymous_id": "f0631729-f969-4623-819f-7263e6b2ef06",
+    "li_alerts": "e30="
+  },
+  "www.linkedin-ei.com": {
+    "ajs_anonymous_id": "f0631729-f969-4623-819f-7263e6b2ef06",
+    "li_alerts": "e30="
+  },
+  "youtube.com": {
+    "CONSENT": "PENDING+999",
+    "SOCS": "CAESHAgBEhJnd3NfMjAyNDA4MjAtMF9SQzIaAmVuIAEaBgiA_L20Bg"
+  }
+}

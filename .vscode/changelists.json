@@ -1,0 +1,16 @@
+{
+  "changelists": [
+    {
+      "name": "Default",
+      "files": [
+        "src/server_single.cpp",
+        "src/embedded_web.hpp",
+        "src/tool_exec.hpp",
+        "web/index.html",
+        "web/script.js",
+        ".vscode/changelists.json"
+      ]
+    }
+  ],
+  "active": "Default"
+}
