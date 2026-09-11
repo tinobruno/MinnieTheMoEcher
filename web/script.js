@@ -140,6 +140,8 @@ sendBtn.addEventListener('click', () => {
 
 function clearChat() {
     stopGeneration();
+    const apiBase = getApiBase();
+    fetch(`${apiBase}/api/kv/reset`, { method: 'POST' }).catch(() => { });
     chatHistory = [];
     sessionStats = {
         totalTurns: 0,
@@ -1379,6 +1381,7 @@ let agenticSettings = {
         edit_file: true,
         execute_command: true,
         web_search: true,
+        youtube_search: true,
         google_search: true,
         fetch_url: true
     },
@@ -1839,7 +1842,7 @@ function initAgenticSettingsUI() {
     const masterWebToggle = document.getElementById('tool-master-web');
     const masterLocalToggle = document.getElementById('tool-master-local');
 
-    const webToolNames = ['web_search', 'fetch_url', 'google_search'];
+    const webToolNames = ['web_search', 'youtube_search', 'fetch_url', 'google_search'];
     const localToolNames = ['read_file', 'write_file', 'edit_file', 'execute_command'];
 
     const toolCheckboxes = {
@@ -1848,6 +1851,7 @@ function initAgenticSettingsUI() {
         edit_file: document.getElementById('tool-enable-edit'),
         execute_command: document.getElementById('tool-enable-command'),
         web_search: document.getElementById('tool-enable-web-search'),
+        youtube_search: document.getElementById('tool-enable-youtube-search'),
         google_search: document.getElementById('tool-enable-google-search'),
         fetch_url: document.getElementById('tool-enable-fetch')
     };
@@ -2016,10 +2020,10 @@ function removeAuthorizedPath(idx) {
 // Built-in tool definitions builder (sends lightweight tool name list to backend)
 function getActiveToolsPayload() {
     const isWebRetrieval = webRetrievalEnabled ? webRetrievalEnabled.checked : true;
-    const knownTools = ['web_search', 'google_search', 'fetch_url', 'read_file', 'write_file', 'edit_file', 'execute_command'];
+    const knownTools = ['web_search', 'youtube_search', 'google_search', 'fetch_url', 'read_file', 'write_file', 'edit_file', 'execute_command'];
 
     const activeList = knownTools.filter(name => {
-        if ((name === 'web_search' || name === 'google_search' || name === 'fetch_url') && !isWebRetrieval) {
+        if ((name === 'web_search' || name === 'youtube_search' || name === 'google_search' || name === 'fetch_url') && !isWebRetrieval) {
             return false;
         }
         return agenticSettings.tools[name] !== false;
@@ -2970,7 +2974,7 @@ async function sendMessage() {
             };
 
             if (activeTools.length > 0) {
-                const allTools = ['web_search', 'google_search', 'fetch_url', 'read_file', 'write_file', 'edit_file', 'execute_command'];
+                const allTools = ['web_search', 'youtube_search', 'google_search', 'fetch_url', 'read_file', 'write_file', 'edit_file', 'execute_command'];
                 if (activeTools.length === allTools.length && activeTools.every((t, i) => t === allTools[i])) {
                     payload.tools = "default";
                 } else {
@@ -3180,7 +3184,12 @@ async function sendMessage() {
 
                     try {
                         const parsedArgs = typeof tc.arguments === 'string' ? JSON.parse(tc.arguments) : tc.arguments;
-                        if (tc.name === 'web_search' || tc.name === 'google_search') {
+                        if (tc.name === 'youtube_search') {
+                            toolTarget = parsedArgs.query || '';
+                            actionLabel = 'YouTube Searching';
+                            doneIcon = 'smart_display';
+                            completedLabel = 'YouTube Searched';
+                        } else if (tc.name === 'web_search' || tc.name === 'google_search') {
                             toolTarget = parsedArgs.query || '';
                             const prov = agenticSettings.searchProvider || 'web';
                             let provName = 'Web';

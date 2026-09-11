@@ -3522,7 +3522,11 @@ public:
             if (lw.comp_kv_cache.data) {
                 if (!snap.snap_comp_kv_cache.data) snap.snap_comp_kv_cache.alloc(lw.comp_kv_cache.size_bytes);
                 CUDA_CHECK(cudaMemcpyAsync(snap.snap_comp_kv_cache.data, lw.comp_kv_cache.data, lw.comp_kv_cache.size_bytes, cudaMemcpyDeviceToDevice, main_stream_));
-                snap.comp_kv_count = lw.comp_kv_count;
+                if (lw.d_comp_kv_count.data) {
+                    CUDA_CHECK(cudaMemcpyAsync(&snap.comp_kv_count, lw.d_comp_kv_count.data, sizeof(int32_t), cudaMemcpyDeviceToHost, main_stream_));
+                } else {
+                    snap.comp_kv_count = lw.comp_kv_count;
+                }
             }
             if (lw.comp_kv_state.data) {
                 if (!snap.snap_comp_kv_state.data) snap.snap_comp_kv_state.alloc(lw.comp_kv_state.size_bytes);
@@ -7186,9 +7190,7 @@ static std::vector<int> apply_chat_template(const json& messages, const BPEToken
 
     bool has_system = (!messages.empty() && messages[0].value("role", "") == "system");
     if (!has_system && has_tools) {
-        std::string default_sys = (tok.get_token_id("<｜User｜>") >= 0)
-                                      ? "You are DeepSeek-V4, a helpful AI assistant with tool calling capabilities."
-                                      : "You are a helpful assistant";
+        std::string default_sys = "You are a helpful assistant";
         std::string sys_text = default_sys + tools_system_prompt;
         auto enc = tok.encode(sys_text);
         result.insert(result.end(), enc.begin(), enc.end());

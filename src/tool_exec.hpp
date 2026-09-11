@@ -216,6 +216,7 @@ inline json get_search_settings() {
     std::lock_guard<std::mutex> lock(g_config_mutex);
     json j;
     j["provider"] = g_search_provider;
+    j["search_provider"] = g_search_provider;
     j["tavily_api_key"] = g_tavily_api_key;
     j["brave_api_key"] = g_brave_api_key;
     j["serper_api_key"] = g_serper_api_key;
