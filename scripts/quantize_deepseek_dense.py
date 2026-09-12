@@ -156,9 +156,7 @@ def quantize_deepseek_dense(
         for t_name, meta in dense_tensors.items():
             processed_count += 1
 
-            # If this is a scale tensor belonging to an FP8 weight, it will be superseded by the INT4 scale
-            if t_name in scale_to_weight:
-                continue
+            # We will conditionally skip scale tensors later depending on whether their parent is quantized
 
             shape = meta.get("shape", [])
             dtype = meta.get("dtype", "BF16")
@@ -173,11 +171,29 @@ def quantize_deepseek_dense(
             is_embed_or_head = ("embed" in t_name or "head" in t_name) and is_2d_projection
             is_indexer = ("indexer.wq_b.weight" in t_name)
 
-            should_quantize = (is_fp8_weight and is_2d_projection)
-            if not quantize_indexer and is_indexer:
-                should_quantize = False
-            if quantize_embeddings and is_embed_or_head:
-                should_quantize = True
+            is_scale_for_fp8 = t_name in scale_to_weight
+            
+            should_quantize = False
+            if not is_scale_for_fp8:
+                should_quantize = (is_fp8_weight and is_2d_projection)
+                if not quantize_indexer and is_indexer:
+                    should_quantize = False
+                if quantize_embeddings and is_embed_or_head:
+                    should_quantize = True
+
+            # Determine if we should drop this scale tensor because its parent is quantized
+            if is_scale_for_fp8:
+                parent_weight_name = scale_to_weight[t_name]
+                parent_is_indexer = ("indexer.wq_b.weight" in parent_weight_name)
+                parent_is_embed_or_head = ("embed" in parent_weight_name or "head" in parent_weight_name) and is_2d_projection
+                parent_should_quantize = True # It is an fp8 weight, so default True
+                if not quantize_indexer and parent_is_indexer:
+                    parent_should_quantize = False
+                if quantize_embeddings and parent_is_embed_or_head:
+                    parent_should_quantize = True
+                
+                if parent_should_quantize:
+                    continue # Skip scale tensor, it will be superseded by INT4 scale
 
             if should_quantize:
                 # 1. Recover float32 weight matrix
