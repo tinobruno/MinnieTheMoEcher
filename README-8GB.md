@@ -16,7 +16,6 @@ Instead of using INT4 for embeddings (which causes massive precision loss and ha
 - **Savings**: ~1.06 GB VRAM.
 - **Accuracy**: Minimal degradation. FP8 preserves the precision of these highly sensitive layers much better than INT4.
 - **Performance**: Can slightly increase generation speed (`tok/s`), as it cuts the massive memory bandwidth requirement of the final logit computation in half.
-
 ### 2. Indexer Quantization
 The DeepSeek V4 indexer layers can be selectively quantized. In earlier setups, `--no-indexer-quant` was required to avoid an out-of-bounds illegal memory access when indexers were quantized (or skipped). Now that the engine properly supports non-quantized indexers (BF16 fallback path in Q4 inference) without crashing, we can optionally quantize them to FP8 to save even more memory on the attention projection layers.
 - **Savings**: Modest (depends on the indexer size), but helps.

@@ -2931,6 +2931,61 @@ public:
     std::vector<float> probs_host_;
     __nv_bfloat16* logits_bf16_host_ = nullptr;
 
+    // Batched Prefill Buffers & State for DeepSeek V4
+    struct PrefillBatchBuffers {
+        GPUTensor buf_tokens;
+        GPUTensor buf_pos;
+        GPUTensor buf_hidden;
+        GPUTensor buf_hc_state;
+        GPUTensor buf_hc_after_attn;
+        GPUTensor buf_hc_mixes;
+        GPUTensor buf_hc_pre;
+        GPUTensor buf_hc_post;
+        GPUTensor buf_hc_comb;
+        GPUTensor buf_lora;
+        GPUTensor buf_q;
+        GPUTensor buf_kv;
+        GPUTensor buf_attn_out;
+        GPUTensor buf_scores_bf16;
+        GPUTensor buf_topk_idx;
+        GPUTensor buf_topk_vals;
+        GPUTensor buf_gate;
+        GPUTensor buf_down;
+        GPUTensor buf_shared_gate;
+        GPUTensor buf_shared_up;
+        GPUTensor buf_shared_down;
+
+        void alloc(int M, int dim, int hc, int q_lora, int o_lora, int o_groups, int n_heads, int head_dim_val, int top_k, int moe_inter, int n_experts) {
+            int max_lora = std::max(q_lora, o_groups * o_lora);
+            buf_tokens.alloc(M * sizeof(int32_t));
+            buf_pos.alloc(M * sizeof(int32_t));
+            buf_hidden.alloc((size_t)M * dim * sizeof(__nv_bfloat16));
+            buf_hc_state.alloc((size_t)M * (hc * dim) * sizeof(__nv_bfloat16));
+            buf_hc_after_attn.alloc((size_t)M * (hc * dim) * sizeof(__nv_bfloat16));
+            buf_hc_mixes.alloc((size_t)M * ((2 + hc) * hc) * sizeof(float));
+            buf_hc_pre.alloc((size_t)M * hc * sizeof(float));
+            buf_hc_post.alloc((size_t)M * hc * sizeof(float));
+            buf_hc_comb.alloc((size_t)M * (hc * hc) * sizeof(float));
+            buf_lora.alloc((size_t)M * max_lora * sizeof(__nv_bfloat16));
+            buf_q.alloc((size_t)M * (n_heads * head_dim_val) * sizeof(__nv_bfloat16));
+            buf_kv.alloc((size_t)M * head_dim_val * sizeof(__nv_bfloat16));
+            buf_attn_out.alloc((size_t)M * (n_heads * head_dim_val) * sizeof(__nv_bfloat16));
+            buf_scores_bf16.alloc((size_t)M * n_experts * sizeof(__nv_bfloat16));
+            buf_topk_idx.alloc((size_t)M * top_k * sizeof(int32_t));
+            buf_topk_vals.alloc((size_t)M * top_k * sizeof(float));
+            buf_gate.alloc((size_t)M * (top_k * moe_inter) * sizeof(__nv_bfloat16));
+            buf_down.alloc((size_t)M * (top_k * dim) * sizeof(__nv_bfloat16));
+            buf_shared_gate.alloc((size_t)M * moe_inter * sizeof(__nv_bfloat16));
+            buf_shared_up.alloc((size_t)M * moe_inter * sizeof(__nv_bfloat16));
+            buf_shared_down.alloc((size_t)M * dim * sizeof(__nv_bfloat16));
+        }
+    };
+
+    PrefillBatchBuffers prefill_bufs_;
+    std::string batched_prefill_mode_ = "auto";
+    bool enable_batched_prefill_ = false;
+    int prefill_chunk_size_ = 512;
+
     ~MoecherEngine() {
         if (h_prefill_tok_) {
             cudaFreeHost(h_prefill_tok_);
@@ -3229,6 +3284,7 @@ public:
 
         apply_l2_cache_persistence();
         init_cuda_graph();
+        init_batched_prefill();
 
         LOG_INFO("Model loaded successfully");
         return true;
@@ -3382,6 +3438,96 @@ public:
         if (qwen_draft_.loaded_) {
             qwen_draft_.init_cuda_graph(main_stream_);
         }
+    }
+
+    void init_batched_prefill() {
+        if (cfg_.architecture != ModelArch::DEEPSEEK_V4) {
+            enable_batched_prefill_ = false;
+            return;
+        }
+        if (batched_prefill_mode_ == "off") {
+            enable_batched_prefill_ = false;
+            LOG_INFO("[Prefill] Batched prefill explicitly disabled via CLI (--batched-prefill off).");
+            return;
+        }
+
+        // Tier 1: Check all-resident MoE topology
+        bool all_res = expert_loader_.all_resident(cfg_.num_hidden_layers);
+        if (!all_res) {
+            if (batched_prefill_mode_ == "on") {
+                LOG_WARN("[Prefill] Warning: --batched-prefill on requested but experts are not all resident in VRAM. Forcing safe sequential prefill to prevent cache thrashing.");
+            } else {
+                LOG_INFO("[Prefill] Constrained VRAM detected (experts are offloaded). Batched prefill disabled (using safe sequential prefill).");
+            }
+            enable_batched_prefill_ = false;
+            return;
+        }
+
+        // Tier 2: Check available VRAM headroom
+        size_t free_bytes = 0, total_bytes = 0;
+        cudaError_t mem_err = cudaMemGetInfo(&free_bytes, &total_bytes);
+        if (mem_err != cudaSuccess) {
+            enable_batched_prefill_ = false;
+            LOG_WARN("[Prefill] cudaMemGetInfo failed. Disabling batched prefill.");
+            return;
+        }
+
+        int M = prefill_chunk_size_;
+        int dim = cfg_.hidden_size;
+        int hc = cfg_.hc_mult;
+        int q_lora = cfg_.q_lora_rank;
+        int o_lora = cfg_.o_lora_rank;
+        int o_groups = cfg_.o_groups;
+        int max_lora = std::max(q_lora, o_groups * o_lora);
+        int n_heads = cfg_.num_attention_heads;
+        int head_dim_val = cfg_.head_dim;
+        int top_k = cfg_.num_experts_per_tok;
+        int moe_inter = cfg_.moe_intermediate_size;
+        int n_experts = cfg_.n_routed_experts;
+
+        size_t req_bytes = 0;
+        req_bytes += (size_t)M * sizeof(int32_t); // tokens
+        req_bytes += (size_t)M * sizeof(int32_t); // pos
+        req_bytes += (size_t)M * dim * sizeof(__nv_bfloat16); // hidden
+        req_bytes += (size_t)M * (hc * dim) * sizeof(__nv_bfloat16); // hc_state
+        req_bytes += (size_t)M * (hc * dim) * sizeof(__nv_bfloat16); // hc_after_attn
+        req_bytes += (size_t)M * ((2 + hc) * hc) * sizeof(float); // hc_mixes
+        req_bytes += (size_t)M * hc * sizeof(float); // hc_pre
+        req_bytes += (size_t)M * hc * sizeof(float); // hc_post
+        req_bytes += (size_t)M * (hc * hc) * sizeof(float); // hc_comb
+        req_bytes += (size_t)M * max_lora * sizeof(__nv_bfloat16); // lora
+        req_bytes += (size_t)M * (n_heads * head_dim_val) * sizeof(__nv_bfloat16); // q
+        req_bytes += (size_t)M * head_dim_val * sizeof(__nv_bfloat16); // kv
+        req_bytes += (size_t)M * (n_heads * head_dim_val) * sizeof(__nv_bfloat16); // attn_out
+        req_bytes += (size_t)M * n_experts * sizeof(__nv_bfloat16); // scores_bf16
+        req_bytes += (size_t)M * top_k * sizeof(int32_t); // topk_idx
+        req_bytes += (size_t)M * top_k * sizeof(float); // topk_vals
+        req_bytes += (size_t)M * (top_k * moe_inter) * sizeof(__nv_bfloat16); // gate
+        req_bytes += (size_t)M * (top_k * dim) * sizeof(__nv_bfloat16); // down
+        req_bytes += (size_t)M * moe_inter * sizeof(__nv_bfloat16); // shared_gate
+        req_bytes += (size_t)M * moe_inter * sizeof(__nv_bfloat16); // shared_up
+        req_bytes += (size_t)M * dim * sizeof(__nv_bfloat16); // shared_down
+
+        constexpr size_t SAFETY_MARGIN_BYTES = 512 * 1024 * 1024ULL; // 512 MB
+        if (free_bytes < req_bytes + SAFETY_MARGIN_BYTES) {
+            LOG_WARN("[Prefill] Insufficient free VRAM for batched prefill (required: %.1f MB, free: %.1f MB). Using safe sequential prefill.",
+                     (double)req_bytes / (1024.0 * 1024.0), (double)free_bytes / (1024.0 * 1024.0));
+            enable_batched_prefill_ = false;
+            return;
+        }
+
+        // Allocate GPU buffers
+        prefill_bufs_.alloc(M, dim, hc, q_lora, o_lora, o_groups, n_heads, head_dim_val, top_k, moe_inter, n_experts);
+
+        // Allocate pinned host buffers
+        if (!h_prefill_tok_) {
+            CUDA_CHECK(cudaMallocHost(&h_prefill_tok_, M * sizeof(int32_t)));
+            CUDA_CHECK(cudaMallocHost(&h_prefill_pos_, M * sizeof(int32_t)));
+        }
+
+        enable_batched_prefill_ = true;
+        LOG_INFO("[Prefill] Batched prefill enabled (chunk_size=%d, allocated=%.1f MB, all-resident mode).",
+                 M, (double)req_bytes / (1024.0 * 1024.0));
     }
 
     // ── Forward pass for a single token (decode mode) ───────────────────────
@@ -3727,14 +3873,18 @@ public:
             }
         } else {
             // ModelArch::DEEPSEEK_V4
-            for (size_t i = 0; i < prefix_tokens.size(); i++) {
-                if (graph_captured_) {
-                    CUDA_CHECK(cudaMemcpyAsync(buf_track_flag_.i32(), h_single_flag_, sizeof(int32_t), cudaMemcpyHostToDevice, main_stream_));
-                    CUDA_CHECK(cudaMemcpyAsync(buf_input_token_.i32(), &h_prefill_tok_[i], sizeof(int32_t), cudaMemcpyHostToDevice, main_stream_));
-                    CUDA_CHECK(cudaMemcpyAsync(buf_input_pos_.i32(), &h_prefill_pos_[i], sizeof(int32_t), cudaMemcpyHostToDevice, main_stream_));
-                    CUDA_CHECK(cudaGraphLaunch(graph_exec_, main_stream_));
-                } else {
-                    forward_token_eager(prefix_tokens[i], (int)i);
+            if (enable_batched_prefill_ && prefix_tokens.size() > 1) {
+                prefill_prompt_batched_deepseek(prefix_tokens);
+            } else {
+                for (size_t i = 0; i < prefix_tokens.size(); i++) {
+                    if (graph_captured_) {
+                        CUDA_CHECK(cudaMemcpyAsync(buf_track_flag_.i32(), h_single_flag_, sizeof(int32_t), cudaMemcpyHostToDevice, main_stream_));
+                        CUDA_CHECK(cudaMemcpyAsync(buf_input_token_.i32(), &h_prefill_tok_[i], sizeof(int32_t), cudaMemcpyHostToDevice, main_stream_));
+                        CUDA_CHECK(cudaMemcpyAsync(buf_input_pos_.i32(), &h_prefill_pos_[i], sizeof(int32_t), cudaMemcpyHostToDevice, main_stream_));
+                        CUDA_CHECK(cudaGraphLaunch(graph_exec_, main_stream_));
+                    } else {
+                        forward_token_eager(prefix_tokens[i], (int)i);
+                    }
                 }
             }
         }
@@ -3791,7 +3941,6 @@ public:
                 for (size_t i = 0; i < sys_len; i++) {
                     if (prompt[i] != system_kv_snapshot_.tokens[i]) {
                         sys_matches = false;
-                        break;
                     }
                 }
                 if (sys_matches) {
@@ -3897,14 +4046,18 @@ public:
                 }
             } else {
                 // ModelArch::DEEPSEEK_V4
-                for (size_t i = prefix_len; i < prompt.size(); i++) {
-                    if (graph_captured_) {
-                        CUDA_CHECK(cudaMemcpyAsync(buf_track_flag_.i32(), h_single_flag_, sizeof(int32_t), cudaMemcpyHostToDevice, main_stream_));
-                        CUDA_CHECK(cudaMemcpyAsync(buf_input_token_.i32(), &h_prefill_tok_[i], sizeof(int32_t), cudaMemcpyHostToDevice, main_stream_));
-                        CUDA_CHECK(cudaMemcpyAsync(buf_input_pos_.i32(), &h_prefill_pos_[i], sizeof(int32_t), cudaMemcpyHostToDevice, main_stream_));
-                        CUDA_CHECK(cudaGraphLaunch(graph_exec_, main_stream_));
-                    } else {
-                        forward_token_eager(prompt[i], (int)i);
+                if (enable_batched_prefill_ && prefix_len == 0 && prompt.size() > 1) {
+                    prefill_prompt_batched_deepseek(prompt);
+                } else {
+                    for (size_t i = prefix_len; i < prompt.size(); i++) {
+                        if (graph_captured_) {
+                            CUDA_CHECK(cudaMemcpyAsync(buf_track_flag_.i32(), h_single_flag_, sizeof(int32_t), cudaMemcpyHostToDevice, main_stream_));
+                            CUDA_CHECK(cudaMemcpyAsync(buf_input_token_.i32(), &h_prefill_tok_[i], sizeof(int32_t), cudaMemcpyHostToDevice, main_stream_));
+                            CUDA_CHECK(cudaMemcpyAsync(buf_input_pos_.i32(), &h_prefill_pos_[i], sizeof(int32_t), cudaMemcpyHostToDevice, main_stream_));
+                            CUDA_CHECK(cudaGraphLaunch(graph_exec_, main_stream_));
+                        } else {
+                            forward_token_eager(prompt[i], (int)i);
+                        }
                     }
                 }
             }
@@ -5147,7 +5300,7 @@ private:
     // All state updates, pooling, RMSNorm, RoPE, and counter increments are
     // executed inside GPU kernels, enabling full CUDA Graph capture and replay.
 
-    void forward_compressor(int layer_id) {
+    void forward_compressor_step(int layer_id, const __nv_bfloat16* tok_hidden, const int32_t* d_pos) {
         auto& lw = layers_[layer_id];
         int ratio = cfg_.layer_compress_ratio(layer_id);
         if (ratio <= 0) return;
@@ -5161,9 +5314,9 @@ private:
 
         // 1. Attention Compressor Projections: [proj_dim] = wkv @ hidden, wgate @ hidden
         gemv_bf16_cuda(buf_comp_proj_.f32(), lw.comp_wkv.bf16(),
-                       buf_hidden_.bf16(), proj_dim, dim, main_stream_);
+                       tok_hidden, proj_dim, dim, main_stream_);
         gemv_bf16_cuda(buf_comp_out_.f32(), lw.comp_wgate.bf16(),
-                       buf_hidden_.bf16(), proj_dim, dim, main_stream_);
+                       tok_hidden, proj_dim, dim, main_stream_);
 
         // 2. Indexer Compressor Projections: [256] = indexer_comp_wkv @ hidden, indexer_comp_wgate @ hidden
         const float* idx_proj_kv = nullptr;
@@ -5171,16 +5324,16 @@ private:
         if (ratio == 4 && lw.indexer_comp_wkv.data) {
             int idx_proj_dim = 256;
             gemv_bf16_cuda(buf_indexer_proj_kv_.f32(), lw.indexer_comp_wkv.bf16(),
-                           buf_hidden_.bf16(), idx_proj_dim, dim, main_stream_);
+                           tok_hidden, idx_proj_dim, dim, main_stream_);
             gemv_bf16_cuda(buf_indexer_proj_gate_.f32(), lw.indexer_comp_wgate.bf16(),
-                           buf_hidden_.bf16(), idx_proj_dim, dim, main_stream_);
+                           tok_hidden, idx_proj_dim, dim, main_stream_);
             idx_proj_kv = buf_indexer_proj_kv_.f32();
             idx_proj_gate = buf_indexer_proj_gate_.f32();
         }
 
         // 3. Launch 100% device-driven compressor step kernel
         compressor_device_step_cuda(
-            buf_input_pos_.i32(),
+            d_pos,
             lw.d_comp_kv_count.i32(),
             buf_comp_proj_.f32(),
             buf_comp_out_.f32(),
@@ -5202,6 +5355,10 @@ private:
             lw.indexer_comp_norm.bf16(),
             lw.indexer_comp_kv_cache.bf16(),
             main_stream_);
+    }
+
+    void forward_compressor(int layer_id) {
+        forward_compressor_step(layer_id, buf_hidden_.bf16(), buf_input_pos_.i32());
     }
 
     // ── Forward one layer (Qwen / Llama GQA + SwiGLU) ───────────────────────
@@ -6269,6 +6426,310 @@ private:
             gemv_bf16_cuda(buf_logits_.f32(), head_weight_.bf16(), buf_hidden_.bf16(), vocab, dim, main_stream_);
         }
         argmax_f32_cuda(buf_argmax_out_.i32(), buf_logits_.f32(), vocab, main_stream_);
+    }
+
+    // ── Batched Prefill for DeepSeek V4 Flash MoE (All-Resident Mode) ────────
+    void prefill_prompt_batched_deepseek(const std::vector<int>& prompt) {
+        if (prompt.empty()) return;
+        if (prompt.size() <= 1) {
+            for (size_t i = 0; i < prompt.size(); i++) {
+                forward_token(prompt[i], (int)i);
+            }
+            CUDA_CHECK(cudaStreamSynchronize(main_stream_));
+            return;
+        }
+
+        int total_tokens = (int)prompt.size();
+        int chunk_size = prefill_chunk_size_;
+        auto t_start = std::chrono::high_resolution_clock::now();
+
+        int dim = cfg_.hidden_size;
+        int hc = cfg_.hc_mult;
+        int hc_dim = hc * dim;
+        int mix_size = (2 + hc) * hc;
+        int q_lora = cfg_.q_lora_rank;
+        int n_heads = cfg_.num_attention_heads;
+        int head_dim_val = cfg_.head_dim;
+        int rope_dim = cfg_.qk_rope_head_dim;
+        int o_lora = cfg_.o_lora_rank;
+        int o_groups = cfg_.o_groups;
+        int window = cfg_.sliding_window;
+        int heads_per_group = n_heads / o_groups; // 64 / 8 = 8
+        int hpg_dim = heads_per_group * head_dim_val; // 8 * 512 = 4096
+        int moe_inter = cfg_.moe_intermediate_size;
+        int n_experts = cfg_.n_routed_experts;
+        int top_k = cfg_.num_experts_per_tok;
+        float scale = 1.0f / sqrtf((float)head_dim_val);
+        int max_combined = window + cfg_.max_compressed_entries;
+
+        for (int start = 0; start < total_tokens; start += chunk_size) {
+            int M = std::min(chunk_size, total_tokens - start);
+            int position = start;
+            bool is_last_chunk = (start + M == total_tokens);
+
+            // 1. Copy tokens and positions to pinned host buffers, then async DMA to device
+            for (int m = 0; m < M; m++) {
+                h_prefill_tok_[m] = prompt[start + m];
+                h_prefill_pos_[m] = position + m;
+            }
+            CUDA_CHECK(cudaMemcpyAsync(prefill_bufs_.buf_tokens.i32(), h_prefill_tok_,
+                                       M * sizeof(int32_t), cudaMemcpyHostToDevice, main_stream_));
+            CUDA_CHECK(cudaMemcpyAsync(prefill_bufs_.buf_pos.i32(), h_prefill_pos_,
+                                       M * sizeof(int32_t), cudaMemcpyHostToDevice, main_stream_));
+
+            // 2. Embedding lookup and broadcast to HC copies: [M, dim] and [M, hc * dim]
+            embedding_broadcast_batch_cuda(
+                prefill_bufs_.buf_hidden.bf16(),
+                prefill_bufs_.buf_hc_state.bf16(),
+                embed_weight_.bf16(),
+                prefill_bufs_.buf_tokens.i32(),
+                M, dim, hc, main_stream_);
+
+            // 3. Process each layer
+            for (int layer_id = 0; layer_id < cfg_.num_hidden_layers; layer_id++) {
+                auto& lw = layers_[layer_id];
+
+                // ── HC pre for attention + Attention norm (fused into 1 pass) ──
+                gemv_hc_pre_norm_batch_cuda(prefill_bufs_.buf_hc_mixes.f32(),
+                                            prefill_bufs_.buf_hc_state.bf16(),
+                                            lw.hc_attn_fn.f32(),
+                                            M, mix_size, hc_dim, cfg_.hc_eps, main_stream_);
+
+                hc_split_sinkhorn_batch_cuda(prefill_bufs_.buf_hc_pre.f32(),
+                                             prefill_bufs_.buf_hc_post.f32(),
+                                             prefill_bufs_.buf_hc_comb.f32(),
+                                             prefill_bufs_.buf_hc_mixes.f32(),
+                                             lw.hc_attn_scale.f32(),
+                                             lw.hc_attn_base.f32(),
+                                             M, hc, cfg_.hc_sinkhorn_iters, cfg_.hc_eps, main_stream_);
+
+                hc_pre_weighted_add_norm_batch_cuda(prefill_bufs_.buf_hidden.bf16(),
+                                                    prefill_bufs_.buf_hc_state.bf16(),
+                                                    prefill_bufs_.buf_hc_pre.f32(),
+                                                    lw.attn_norm_w.bf16(),
+                                                    M, dim, hc, cfg_.rms_norm_eps, main_stream_);
+
+                // ── Attention Q & KV Projections (batched via cuBLAS FP8 Tensor Cores) ──
+                gemm_fp8_dequant(prefill_bufs_.buf_lora.bf16(), M, q_lora, dim,
+                                 prefill_bufs_.buf_hidden.bf16(),
+                                 lw.wq_a_w.u8(), lw.wq_a_s.u8(), 128, main_stream_);
+
+                rms_norm_cuda_batched(prefill_bufs_.buf_lora.bf16(), prefill_bufs_.buf_lora.bf16(),
+                                      lw.q_norm_w.bf16(), M, q_lora, cfg_.rms_norm_eps, main_stream_);
+
+                gemm_fp8_dequant(prefill_bufs_.buf_q.bf16(), M, n_heads * head_dim_val, q_lora,
+                                 prefill_bufs_.buf_lora.bf16(),
+                                 lw.wq_b_w.u8(), lw.wq_b_s.u8(), 128, main_stream_);
+
+                gemm_fp8_dequant(prefill_bufs_.buf_kv.bf16(), M, head_dim_val, dim,
+                                 prefill_bufs_.buf_hidden.bf16(),
+                                 lw.wkv_w.u8(), lw.wkv_s.u8(), 128, main_stream_);
+
+                rms_norm_cuda_batched(prefill_bufs_.buf_kv.bf16(), prefill_bufs_.buf_kv.bf16(),
+                                      lw.kv_norm_w.bf16(), M, head_dim_val, cfg_.rms_norm_eps, main_stream_);
+
+                // ── Causal Attention loop across the M tokens ──
+                bool is_compressed = (layer_id < (int)cfg_.compress_ratios.size() &&
+                                      cfg_.compress_ratios[layer_id] > 0);
+                float* layer_rope_freqs = is_compressed ? rope_freqs_compressed_.f32()
+                                                        : rope_freqs_.f32();
+                int ratio = cfg_.layer_compress_ratio(layer_id);
+
+                for (int m = 0; m < M; m++) {
+                    const int32_t* d_pos = prefill_bufs_.buf_pos.i32() + m;
+                    __nv_bfloat16* tok_kv = prefill_bufs_.buf_kv.bf16() + (size_t)m * head_dim_val;
+                    const __nv_bfloat16* tok_hidden = prefill_bufs_.buf_hidden.bf16() + (size_t)m * dim;
+                    const __nv_bfloat16* tok_lora = prefill_bufs_.buf_lora.bf16() + (size_t)m * q_lora;
+                    const __nv_bfloat16* tok_q = prefill_bufs_.buf_q.bf16() + (size_t)m * (n_heads * head_dim_val);
+                    __nv_bfloat16* tok_attn_out = prefill_bufs_.buf_attn_out.bf16() + (size_t)m * (n_heads * head_dim_val);
+
+                    // 1. RoPE and store KV into ring-buffer
+                    rope_device_pos_cuda(tok_kv, 1, head_dim_val, rope_dim,
+                                         d_pos, layer_rope_freqs, false, main_stream_);
+                    store_kv_device_pos_cuda(lw.kv_cache.bf16(), tok_kv,
+                                             d_pos, window, head_dim_val, main_stream_);
+
+                    // 2. KV Compressor step
+                    if (ratio > 0) {
+                        forward_compressor_step(layer_id, tok_hidden, d_pos);
+                    }
+
+                    // 3. Indexer (for CSA ratio=4 layers)
+                    uint8_t* comp_mask_ptr = nullptr;
+                    if (ratio == 4 && lw.indexer_wq_b_w.data) {
+                        int idx_head_dim = 128;
+                        int idx_heads = 64;
+                        int idx_q_dim = idx_heads * idx_head_dim; // 8192
+
+                        gemv_fp8_cuda(buf_indexer_q_.bf16(), tok_lora,
+                                      lw.indexer_wq_b_w.u8(), lw.indexer_wq_b_s.u8(),
+                                      idx_q_dim, q_lora, 128, main_stream_);
+
+                        rope_device_pos_cuda(buf_indexer_q_.bf16(), idx_heads, idx_head_dim, rope_dim,
+                                             d_pos, layer_rope_freqs, false, main_stream_);
+
+                        gemv_bf16_cuda(buf_indexer_weights_f32_.f32(), lw.indexer_weights_proj.bf16(),
+                                       tok_hidden, idx_heads, dim, main_stream_);
+
+                        int max_comp_entries = cfg_.max_compressed_entries > 0 ? cfg_.max_compressed_entries : 2048;
+                        indexer_score_and_mask_cuda(
+                            buf_indexer_mask_.u8(),
+                            buf_indexer_scores_.f32(),
+                            lw.indexer_comp_kv_cache.bf16(),
+                            buf_indexer_q_.bf16(),
+                            buf_indexer_weights_f32_.f32(),
+                            lw.d_comp_kv_count.i32(),
+                            max_comp_entries,
+                            512,
+                            main_stream_);
+
+                        comp_mask_ptr = buf_indexer_mask_.u8();
+                    }
+
+                    // 4. Flash-MLA Attention
+                    mla_attention_fused_cuda(
+                        tok_q, lw.kv_cache.bf16(), lw.comp_kv_cache.bf16(), lw.attn_sink.f32(),
+                        tok_attn_out, d_pos, lw.d_comp_kv_count.i32(),
+                        layer_rope_freqs, max_combined, head_dim_val, rope_dim, scale,
+                        cfg_.rms_norm_eps, comp_mask_ptr, window, main_stream_);
+                }
+
+                // ── Output projection (wo_a and wo_b) ──
+                gemv_fp8_grouped_batch_cuda(prefill_bufs_.buf_lora.bf16(),
+                                            prefill_bufs_.buf_attn_out.bf16(),
+                                            lw.wo_a_w.u8(), lw.wo_a_s.u8(),
+                                            M, o_lora, hpg_dim, o_groups, 128, main_stream_);
+
+                gemm_fp8_dequant(prefill_bufs_.buf_hidden.bf16(), M, dim, o_groups * o_lora,
+                                 prefill_bufs_.buf_lora.bf16(),
+                                 lw.wo_b_w.u8(), lw.wo_b_s.u8(), 128, main_stream_);
+
+                // ── HC post for attention: reads buf_hc_state, writes to buf_hc_after_attn ──
+                hc_post_update_batch_cuda(prefill_bufs_.buf_hc_after_attn.bf16(),
+                                          prefill_bufs_.buf_hidden.bf16(),
+                                          prefill_bufs_.buf_hc_state.bf16(),
+                                          prefill_bufs_.buf_hc_post.f32(),
+                                          prefill_bufs_.buf_hc_comb.f32(),
+                                          M, dim, hc, main_stream_);
+
+                // ── HC pre for FFN + FFN norm (reads buf_hc_after_attn, writes to buf_hidden) ──
+                gemv_hc_pre_norm_batch_cuda(prefill_bufs_.buf_hc_mixes.f32(),
+                                            prefill_bufs_.buf_hc_after_attn.bf16(),
+                                            lw.hc_ffn_fn.f32(),
+                                            M, mix_size, hc_dim, cfg_.hc_eps, main_stream_);
+
+                hc_split_sinkhorn_batch_cuda(prefill_bufs_.buf_hc_pre.f32(),
+                                             prefill_bufs_.buf_hc_post.f32(),
+                                             prefill_bufs_.buf_hc_comb.f32(),
+                                             prefill_bufs_.buf_hc_mixes.f32(),
+                                             lw.hc_ffn_scale.f32(),
+                                             lw.hc_ffn_base.f32(),
+                                             M, hc, cfg_.hc_sinkhorn_iters, cfg_.hc_eps, main_stream_);
+
+                hc_pre_weighted_add_norm_batch_cuda(prefill_bufs_.buf_hidden.bf16(),
+                                                    prefill_bufs_.buf_hc_after_attn.bf16(),
+                                                    prefill_bufs_.buf_hc_pre.f32(),
+                                                    lw.ffn_norm_w.bf16(),
+                                                    M, dim, hc, cfg_.rms_norm_eps, main_stream_);
+
+                // ── MoE Routing across M tokens ──
+                if (layer_id < cfg_.n_hash_layers) {
+                    moe_route_hash_device_id_batch_cuda(
+                        prefill_bufs_.buf_topk_idx.i32(),
+                        prefill_bufs_.buf_topk_vals.f32(),
+                        lw.tid2eid.i64(),
+                        prefill_bufs_.buf_tokens.i32(),
+                        M, top_k, cfg_.routed_scaling_factor,
+                        main_stream_);
+                } else {
+                    gemm_bf16(prefill_bufs_.buf_scores_bf16.bf16(), M, n_experts, dim,
+                              prefill_bufs_.buf_hidden.bf16(), lw.gate_w.bf16());
+
+                    moe_route_top6_from_bf16_batch_cuda(
+                        prefill_bufs_.buf_topk_idx.i32(),
+                        prefill_bufs_.buf_topk_vals.f32(),
+                        prefill_bufs_.buf_scores_bf16.bf16(),
+                        lw.gate_bias.f32(),
+                        M, n_experts, top_k, cfg_.routed_scaling_factor,
+                        main_stream_);
+                }
+
+                // ── Shared Expert (batched FP8 Tensor Cores) ──
+                gemm_fp8_dequant(prefill_bufs_.buf_shared_gate.bf16(), M, moe_inter, dim,
+                                 prefill_bufs_.buf_hidden.bf16(),
+                                 lw.shared_w1_w.u8(), lw.shared_w1_s.u8(), 128, main_stream_);
+
+                gemm_fp8_dequant(prefill_bufs_.buf_shared_up.bf16(), M, moe_inter, dim,
+                                 prefill_bufs_.buf_hidden.bf16(),
+                                 lw.shared_w3_w.u8(), lw.shared_w3_s.u8(), 128, main_stream_);
+
+                silu_mul_cuda(prefill_bufs_.buf_shared_gate.bf16(),
+                              prefill_bufs_.buf_shared_gate.bf16(),
+                              prefill_bufs_.buf_shared_up.bf16(),
+                              M * moe_inter, cfg_.swiglu_limit, main_stream_);
+
+                gemm_fp8_dequant(prefill_bufs_.buf_shared_down.bf16(), M, dim, moe_inter,
+                                 prefill_bufs_.buf_shared_gate.bf16(),
+                                 lw.shared_w2_w.u8(), lw.shared_w2_s.u8(), 128, main_stream_);
+
+                // ── Routed Experts (Resident MoE) ──
+                const void* const* flat_ptrs = expert_loader_.flat_vram_ptrs_gpu();
+                auto& w1_info = expert_parts_["w1.weight"];
+                auto& w3_info = expert_parts_["w3.weight"];
+                auto& w2_info = expert_parts_["w2.weight"];
+
+                gemv_iq2_xxs_moe_swiglu_fused_batch_cuda(
+                    prefill_bufs_.buf_gate.bf16(),
+                    prefill_bufs_.buf_hidden.bf16(),
+                    w1_info.offset_in_block, w3_info.offset_in_block,
+                    moe_inter, dim, cfg_.swiglu_limit,
+                    prefill_bufs_.buf_topk_idx.i32(),
+                    flat_ptrs, layer_id, n_experts, M, main_stream_);
+
+                gemv_q2_k_moe_batch_cuda(
+                    prefill_bufs_.buf_down.bf16(),
+                    prefill_bufs_.buf_gate.bf16(),
+                    prefill_bufs_.buf_topk_idx.i32(),
+                    flat_ptrs, layer_id, n_experts,
+                    w2_info.offset_in_block,
+                    dim, moe_inter, M, main_stream_);
+
+                // ── Fused Accumulation (routed experts + shared expert) ──
+                fused_moe_accum_dynamic_batch_cuda(
+                    prefill_bufs_.buf_hidden.bf16(),
+                    prefill_bufs_.buf_down.bf16(),
+                    prefill_bufs_.buf_topk_vals.f32(),
+                    prefill_bufs_.buf_shared_down.bf16(),
+                    dim, M, main_stream_);
+
+                // ── HC post for FFN: reads buf_hc_after_attn, writes to buf_hc_state ──
+                hc_post_update_batch_cuda(prefill_bufs_.buf_hc_state.bf16(),
+                                          prefill_bufs_.buf_hidden.bf16(),
+                                          prefill_bufs_.buf_hc_after_attn.bf16(),
+                                          prefill_bufs_.buf_hc_post.f32(),
+                                          prefill_bufs_.buf_hc_comb.f32(),
+                                          M, dim, hc, main_stream_);
+            } // end layer loop
+
+            // 4. If this is the last chunk, prepare logits for the last token
+            if (is_last_chunk) {
+                CUDA_CHECK(cudaMemcpyAsync(buf_hc_state_.bf16(),
+                                           prefill_bufs_.buf_hc_state.bf16() + (size_t)(M - 1) * (hc * dim),
+                                           hc * dim * sizeof(__nv_bfloat16),
+                                           cudaMemcpyDeviceToDevice, main_stream_));
+                hc_head_reduce();
+                rms_norm_cuda(buf_hidden_.bf16(), buf_hidden_.bf16(),
+                              norm_weight_.bf16(), dim, cfg_.rms_norm_eps, main_stream_);
+                compute_logits();
+            }
+        } // end chunk loop
+
+        CUDA_CHECK(cudaStreamSynchronize(main_stream_));
+        auto t_end = std::chrono::high_resolution_clock::now();
+        double elapsed_sec = std::chrono::duration<double>(t_end - t_start).count();
+        double tok_per_sec = (elapsed_sec > 0.0) ? ((double)total_tokens / elapsed_sec) : 0.0;
+        LOG_INFO("[PREFILL STATS] %d prompt tokens prefilled in %.3fs -> %.2f tok/s (batched chunk_size=%d)",
+                 total_tokens, elapsed_sec, tok_per_sec, chunk_size);
     }
 
     // ── Sample from logits ──────────────────────────────────────────────────
@@ -10051,6 +10512,8 @@ int main(int argc, char** argv) {
     int proxy_port = 8002;
     bool enable_forward_proxy = true;
     bool enable_system_proxy = false;
+    std::string batched_prefill_mode = "auto";
+    int prefill_chunk_size = 512;
 
     for (int i = 1; i < argc; i++) {
         if ((std::string(argv[i]) == "--manifest" || std::string(argv[i]) == "-m") && i + 1 < argc) {
@@ -10128,6 +10591,12 @@ int main(int argc, char** argv) {
                    std::string(argv[i]) == "-reset-track") {
             g_track_reset = true;
             g_track_experts = true;
+        } else if ((std::string(argv[i]) == "--batched-prefill") && i + 1 < argc) {
+            batched_prefill_mode = argv[++i];
+        } else if (std::string(argv[i]) == "--no-batched-prefill") {
+            batched_prefill_mode = "off";
+        } else if (std::string(argv[i]) == "--prefill-chunk-size" && i + 1 < argc) {
+            prefill_chunk_size = std::stoi(argv[++i]);
         }
     }
 
@@ -10140,6 +10609,8 @@ int main(int argc, char** argv) {
     LOG_INFO("Server-side tool execution: %s (headless-browsing: %s)", g_server_exec ? "enabled" : "disabled", g_headless_browsing ? "enabled" : "disabled");
 
     MoecherEngine engine;
+    engine.batched_prefill_mode_ = batched_prefill_mode;
+    engine.prefill_chunk_size_ = prefill_chunk_size;
     engine.enable_pld_ = enable_pld;
     engine.pld_draft_tokens_ = pld_draft_tokens;
     LOG_INFO("Prompt-Lookup Drafting (PLD): %s (draft_tokens=%d)", enable_pld ? "enabled" : "disabled", pld_draft_tokens);

@@ -54,3 +54,5 @@ __pycache__/
 *.pyc
 dist*/
 *.zip
+tmp/
+.moecher_config.json
