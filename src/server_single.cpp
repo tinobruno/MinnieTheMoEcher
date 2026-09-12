@@ -3649,8 +3649,8 @@ public:
         }
     }
 
-    // ── Pinned System KV Cache Snapshot (for 0ms System Prefix Reuse) ───────
-    struct SystemKVSnapshot {
+    // ── Pinned System and Rolling Turn KV Cache Snapshots ───────────────────
+    struct KVSnapshot {
         bool valid = false;
         std::vector<int> tokens;
 
@@ -3675,143 +3675,150 @@ public:
 
         GPUTensor snap_hc_state;
         GPUTensor snap_hc_after_attn;
-    } system_kv_snapshot_;
+    };
 
-    void snapshot_system_kv(const std::vector<int>& tokens) {
+    KVSnapshot system_kv_snapshot_;
+    KVSnapshot turn_kv_snapshot_;
+
+    void snapshot_kv(KVSnapshot& snap, const std::vector<int>& tokens) {
         if (tokens.empty()) return;
-        system_kv_snapshot_.tokens = tokens;
-        system_kv_snapshot_.layers.resize(cfg_.num_hidden_layers);
+        snap.tokens = tokens;
+        snap.layers.resize(cfg_.num_hidden_layers);
 
         for (int l = 0; l < cfg_.num_hidden_layers; l++) {
             auto& lw = layers_[l];
-            auto& snap = system_kv_snapshot_.layers[l];
+            auto& l_snap = snap.layers[l];
 
             if (lw.kv_cache.data) {
-                if (!snap.snap_kv_cache.data) snap.snap_kv_cache.alloc(lw.kv_cache.size_bytes);
-                CUDA_CHECK(cudaMemcpyAsync(snap.snap_kv_cache.data, lw.kv_cache.data, lw.kv_cache.size_bytes, cudaMemcpyDeviceToDevice, main_stream_));
+                if (!l_snap.snap_kv_cache.data) l_snap.snap_kv_cache.alloc(lw.kv_cache.size_bytes);
+                CUDA_CHECK(cudaMemcpyAsync(l_snap.snap_kv_cache.data, lw.kv_cache.data, lw.kv_cache.size_bytes, cudaMemcpyDeviceToDevice, main_stream_));
             }
             if (lw.comp_kv_cache.data) {
-                if (!snap.snap_comp_kv_cache.data) snap.snap_comp_kv_cache.alloc(lw.comp_kv_cache.size_bytes);
-                CUDA_CHECK(cudaMemcpyAsync(snap.snap_comp_kv_cache.data, lw.comp_kv_cache.data, lw.comp_kv_cache.size_bytes, cudaMemcpyDeviceToDevice, main_stream_));
+                if (!l_snap.snap_comp_kv_cache.data) l_snap.snap_comp_kv_cache.alloc(lw.comp_kv_cache.size_bytes);
+                CUDA_CHECK(cudaMemcpyAsync(l_snap.snap_comp_kv_cache.data, lw.comp_kv_cache.data, lw.comp_kv_cache.size_bytes, cudaMemcpyDeviceToDevice, main_stream_));
                 if (lw.d_comp_kv_count.data) {
-                    CUDA_CHECK(cudaMemcpyAsync(&snap.comp_kv_count, lw.d_comp_kv_count.data, sizeof(int32_t), cudaMemcpyDeviceToHost, main_stream_));
+                    CUDA_CHECK(cudaMemcpyAsync(&l_snap.comp_kv_count, lw.d_comp_kv_count.data, sizeof(int32_t), cudaMemcpyDeviceToHost, main_stream_));
                 } else {
-                    snap.comp_kv_count = lw.comp_kv_count;
+                    l_snap.comp_kv_count = lw.comp_kv_count;
                 }
             }
             if (lw.comp_kv_state.data) {
-                if (!snap.snap_comp_kv_state.data) snap.snap_comp_kv_state.alloc(lw.comp_kv_state.size_bytes);
-                CUDA_CHECK(cudaMemcpyAsync(snap.snap_comp_kv_state.data, lw.comp_kv_state.data, lw.comp_kv_state.size_bytes, cudaMemcpyDeviceToDevice, main_stream_));
+                if (!l_snap.snap_comp_kv_state.data) l_snap.snap_comp_kv_state.alloc(lw.comp_kv_state.size_bytes);
+                CUDA_CHECK(cudaMemcpyAsync(l_snap.snap_comp_kv_state.data, lw.comp_kv_state.data, lw.comp_kv_state.size_bytes, cudaMemcpyDeviceToDevice, main_stream_));
             }
             if (lw.comp_score_state.data) {
-                if (!snap.snap_comp_score_state.data) snap.snap_comp_score_state.alloc(lw.comp_score_state.size_bytes);
-                CUDA_CHECK(cudaMemcpyAsync(snap.snap_comp_score_state.data, lw.comp_score_state.data, lw.comp_score_state.size_bytes, cudaMemcpyDeviceToDevice, main_stream_));
+                if (!l_snap.snap_comp_score_state.data) l_snap.snap_comp_score_state.alloc(lw.comp_score_state.size_bytes);
+                CUDA_CHECK(cudaMemcpyAsync(l_snap.snap_comp_score_state.data, lw.comp_score_state.data, lw.comp_score_state.size_bytes, cudaMemcpyDeviceToDevice, main_stream_));
             }
             if (lw.indexer_comp_kv_cache.data) {
-                if (!snap.snap_indexer_comp_kv_cache.data) snap.snap_indexer_comp_kv_cache.alloc(lw.indexer_comp_kv_cache.size_bytes);
-                CUDA_CHECK(cudaMemcpyAsync(snap.snap_indexer_comp_kv_cache.data, lw.indexer_comp_kv_cache.data, lw.indexer_comp_kv_cache.size_bytes, cudaMemcpyDeviceToDevice, main_stream_));
+                if (!l_snap.snap_indexer_comp_kv_cache.data) l_snap.snap_indexer_comp_kv_cache.alloc(lw.indexer_comp_kv_cache.size_bytes);
+                CUDA_CHECK(cudaMemcpyAsync(l_snap.snap_indexer_comp_kv_cache.data, lw.indexer_comp_kv_cache.data, lw.indexer_comp_kv_cache.size_bytes, cudaMemcpyDeviceToDevice, main_stream_));
             }
             if (lw.indexer_comp_kv_state.data) {
-                if (!snap.snap_indexer_comp_kv_state.data) snap.snap_indexer_comp_kv_state.alloc(lw.indexer_comp_kv_state.size_bytes);
-                CUDA_CHECK(cudaMemcpyAsync(snap.snap_indexer_comp_kv_state.data, lw.indexer_comp_kv_state.data, lw.indexer_comp_kv_state.size_bytes, cudaMemcpyDeviceToDevice, main_stream_));
+                if (!l_snap.snap_indexer_comp_kv_state.data) l_snap.snap_indexer_comp_kv_state.alloc(lw.indexer_comp_kv_state.size_bytes);
+                CUDA_CHECK(cudaMemcpyAsync(l_snap.snap_indexer_comp_kv_state.data, lw.indexer_comp_kv_state.data, lw.indexer_comp_kv_state.size_bytes, cudaMemcpyDeviceToDevice, main_stream_));
             }
             if (lw.indexer_comp_score_state.data) {
-                if (!snap.snap_indexer_comp_score_state.data) snap.snap_indexer_comp_score_state.alloc(lw.indexer_comp_score_state.size_bytes);
-                CUDA_CHECK(cudaMemcpyAsync(snap.snap_indexer_comp_score_state.data, lw.indexer_comp_score_state.data, lw.indexer_comp_score_state.size_bytes, cudaMemcpyDeviceToDevice, main_stream_));
+                if (!l_snap.snap_indexer_comp_score_state.data) l_snap.snap_indexer_comp_score_state.alloc(lw.indexer_comp_score_state.size_bytes);
+                CUDA_CHECK(cudaMemcpyAsync(l_snap.snap_indexer_comp_score_state.data, lw.indexer_comp_score_state.data, lw.indexer_comp_score_state.size_bytes, cudaMemcpyDeviceToDevice, main_stream_));
             }
 
             // Qwen
             if (lw.k_cache_gqa.data) {
-                if (!snap.snap_k_cache_gqa.data) snap.snap_k_cache_gqa.alloc(lw.k_cache_gqa.size_bytes);
-                CUDA_CHECK(cudaMemcpyAsync(snap.snap_k_cache_gqa.data, lw.k_cache_gqa.data, lw.k_cache_gqa.size_bytes, cudaMemcpyDeviceToDevice, main_stream_));
+                if (!l_snap.snap_k_cache_gqa.data) l_snap.snap_k_cache_gqa.alloc(lw.k_cache_gqa.size_bytes);
+                CUDA_CHECK(cudaMemcpyAsync(l_snap.snap_k_cache_gqa.data, lw.k_cache_gqa.data, lw.k_cache_gqa.size_bytes, cudaMemcpyDeviceToDevice, main_stream_));
             }
             if (lw.v_cache_gqa.data) {
-                if (!snap.snap_v_cache_gqa.data) snap.snap_v_cache_gqa.alloc(lw.v_cache_gqa.size_bytes);
-                CUDA_CHECK(cudaMemcpyAsync(snap.snap_v_cache_gqa.data, lw.v_cache_gqa.data, lw.v_cache_gqa.size_bytes, cudaMemcpyDeviceToDevice, main_stream_));
+                if (!l_snap.snap_v_cache_gqa.data) l_snap.snap_v_cache_gqa.alloc(lw.v_cache_gqa.size_bytes);
+                CUDA_CHECK(cudaMemcpyAsync(l_snap.snap_v_cache_gqa.data, lw.v_cache_gqa.data, lw.v_cache_gqa.size_bytes, cudaMemcpyDeviceToDevice, main_stream_));
             }
             if (lw.ssm_state.data) {
-                if (!snap.snap_ssm_state.data) snap.snap_ssm_state.alloc(lw.ssm_state.size_bytes);
-                CUDA_CHECK(cudaMemcpyAsync(snap.snap_ssm_state.data, lw.ssm_state.data, lw.ssm_state.size_bytes, cudaMemcpyDeviceToDevice, main_stream_));
+                if (!l_snap.snap_ssm_state.data) l_snap.snap_ssm_state.alloc(lw.ssm_state.size_bytes);
+                CUDA_CHECK(cudaMemcpyAsync(l_snap.snap_ssm_state.data, lw.ssm_state.data, lw.ssm_state.size_bytes, cudaMemcpyDeviceToDevice, main_stream_));
             }
             if (lw.conv_state.data) {
-                if (!snap.snap_conv_state.data) snap.snap_conv_state.alloc(lw.conv_state.size_bytes);
-                CUDA_CHECK(cudaMemcpyAsync(snap.snap_conv_state.data, lw.conv_state.data, lw.conv_state.size_bytes, cudaMemcpyDeviceToDevice, main_stream_));
+                if (!l_snap.snap_conv_state.data) l_snap.snap_conv_state.alloc(lw.conv_state.size_bytes);
+                CUDA_CHECK(cudaMemcpyAsync(l_snap.snap_conv_state.data, lw.conv_state.data, lw.conv_state.size_bytes, cudaMemcpyDeviceToDevice, main_stream_));
             }
         }
 
         if (buf_hc_state_.data) {
-            if (!system_kv_snapshot_.snap_hc_state.data) system_kv_snapshot_.snap_hc_state.alloc(buf_hc_state_.size_bytes);
-            CUDA_CHECK(cudaMemcpyAsync(system_kv_snapshot_.snap_hc_state.data, buf_hc_state_.data, buf_hc_state_.size_bytes, cudaMemcpyDeviceToDevice, main_stream_));
+            if (!snap.snap_hc_state.data) snap.snap_hc_state.alloc(buf_hc_state_.size_bytes);
+            CUDA_CHECK(cudaMemcpyAsync(snap.snap_hc_state.data, buf_hc_state_.data, buf_hc_state_.size_bytes, cudaMemcpyDeviceToDevice, main_stream_));
         }
         if (buf_hc_after_attn_.data) {
-            if (!system_kv_snapshot_.snap_hc_after_attn.data) system_kv_snapshot_.snap_hc_after_attn.alloc(buf_hc_after_attn_.size_bytes);
-            CUDA_CHECK(cudaMemcpyAsync(system_kv_snapshot_.snap_hc_after_attn.data, buf_hc_after_attn_.data, buf_hc_after_attn_.size_bytes, cudaMemcpyDeviceToDevice, main_stream_));
+            if (!snap.snap_hc_after_attn.data) snap.snap_hc_after_attn.alloc(buf_hc_after_attn_.size_bytes);
+            CUDA_CHECK(cudaMemcpyAsync(snap.snap_hc_after_attn.data, buf_hc_after_attn_.data, buf_hc_after_attn_.size_bytes, cudaMemcpyDeviceToDevice, main_stream_));
         }
 
         CUDA_CHECK(cudaStreamSynchronize(main_stream_));
-        system_kv_snapshot_.valid = true;
+        snap.valid = true;
+    }
+
+    void snapshot_system_kv(const std::vector<int>& tokens) {
+        snapshot_kv(system_kv_snapshot_, tokens);
         LOG_INFO("Pinned System KV Cache snapshot created (%zu tokens across %d layers).",
                  tokens.size(), cfg_.num_hidden_layers);
     }
 
-    void restore_system_kv() {
-        if (!system_kv_snapshot_.valid) return;
+    void restore_kv(const KVSnapshot& snap) {
+        if (!snap.valid) return;
 
         for (int l = 0; l < cfg_.num_hidden_layers; l++) {
             auto& lw = layers_[l];
-            const auto& snap = system_kv_snapshot_.layers[l];
+            const auto& l_snap = snap.layers[l];
 
-            if (lw.kv_cache.data && snap.snap_kv_cache.data) {
-                CUDA_CHECK(cudaMemcpyAsync(lw.kv_cache.data, snap.snap_kv_cache.data, lw.kv_cache.size_bytes, cudaMemcpyDeviceToDevice, main_stream_));
+            if (lw.kv_cache.data && l_snap.snap_kv_cache.data) {
+                CUDA_CHECK(cudaMemcpyAsync(lw.kv_cache.data, l_snap.snap_kv_cache.data, lw.kv_cache.size_bytes, cudaMemcpyDeviceToDevice, main_stream_));
             }
-            if (lw.comp_kv_cache.data && snap.snap_comp_kv_cache.data) {
-                CUDA_CHECK(cudaMemcpyAsync(lw.comp_kv_cache.data, snap.snap_comp_kv_cache.data, lw.comp_kv_cache.size_bytes, cudaMemcpyDeviceToDevice, main_stream_));
-                lw.comp_kv_count = snap.comp_kv_count;
+            if (lw.comp_kv_cache.data && l_snap.snap_comp_kv_cache.data) {
+                CUDA_CHECK(cudaMemcpyAsync(lw.comp_kv_cache.data, l_snap.snap_comp_kv_cache.data, lw.comp_kv_cache.size_bytes, cudaMemcpyDeviceToDevice, main_stream_));
+                lw.comp_kv_count = l_snap.comp_kv_count;
                 if (lw.d_comp_kv_count.data) {
-                    int32_t val = snap.comp_kv_count;
+                    int32_t val = l_snap.comp_kv_count;
                     CUDA_CHECK(cudaMemcpyAsync(lw.d_comp_kv_count.data, &val, sizeof(int32_t), cudaMemcpyHostToDevice, main_stream_));
                 }
                 if (lw.d_attn_cache_len.data) {
-                    int32_t val = (int32_t)system_kv_snapshot_.tokens.size();
+                    int32_t val = (int32_t)snap.tokens.size();
                     CUDA_CHECK(cudaMemcpyAsync(lw.d_attn_cache_len.data, &val, sizeof(int32_t), cudaMemcpyHostToDevice, main_stream_));
                 }
             }
-            if (lw.comp_kv_state.data && snap.snap_comp_kv_state.data) {
-                CUDA_CHECK(cudaMemcpyAsync(lw.comp_kv_state.data, snap.snap_comp_kv_state.data, lw.comp_kv_state.size_bytes, cudaMemcpyDeviceToDevice, main_stream_));
+            if (lw.comp_kv_state.data && l_snap.snap_comp_kv_state.data) {
+                CUDA_CHECK(cudaMemcpyAsync(lw.comp_kv_state.data, l_snap.snap_comp_kv_state.data, lw.comp_kv_state.size_bytes, cudaMemcpyDeviceToDevice, main_stream_));
             }
-            if (lw.comp_score_state.data && snap.snap_comp_score_state.data) {
-                CUDA_CHECK(cudaMemcpyAsync(lw.comp_score_state.data, snap.snap_comp_score_state.data, lw.comp_score_state.size_bytes, cudaMemcpyDeviceToDevice, main_stream_));
+            if (lw.comp_score_state.data && l_snap.snap_comp_score_state.data) {
+                CUDA_CHECK(cudaMemcpyAsync(lw.comp_score_state.data, l_snap.snap_comp_score_state.data, lw.comp_score_state.size_bytes, cudaMemcpyDeviceToDevice, main_stream_));
             }
-            if (lw.indexer_comp_kv_cache.data && snap.snap_indexer_comp_kv_cache.data) {
-                CUDA_CHECK(cudaMemcpyAsync(lw.indexer_comp_kv_cache.data, snap.snap_indexer_comp_kv_cache.data, lw.indexer_comp_kv_cache.size_bytes, cudaMemcpyDeviceToDevice, main_stream_));
+            if (lw.indexer_comp_kv_cache.data && l_snap.snap_indexer_comp_kv_cache.data) {
+                CUDA_CHECK(cudaMemcpyAsync(lw.indexer_comp_kv_cache.data, l_snap.snap_indexer_comp_kv_cache.data, lw.indexer_comp_kv_cache.size_bytes, cudaMemcpyDeviceToDevice, main_stream_));
             }
-            if (lw.indexer_comp_kv_state.data && snap.snap_indexer_comp_kv_state.data) {
-                CUDA_CHECK(cudaMemcpyAsync(lw.indexer_comp_kv_state.data, snap.snap_indexer_comp_kv_state.data, lw.indexer_comp_kv_state.size_bytes, cudaMemcpyDeviceToDevice, main_stream_));
+            if (lw.indexer_comp_kv_state.data && l_snap.snap_indexer_comp_kv_state.data) {
+                CUDA_CHECK(cudaMemcpyAsync(lw.indexer_comp_kv_state.data, l_snap.snap_indexer_comp_kv_state.data, lw.indexer_comp_kv_state.size_bytes, cudaMemcpyDeviceToDevice, main_stream_));
             }
-            if (lw.indexer_comp_score_state.data && snap.snap_indexer_comp_score_state.data) {
-                CUDA_CHECK(cudaMemcpyAsync(lw.indexer_comp_score_state.data, snap.snap_indexer_comp_score_state.data, lw.indexer_comp_score_state.size_bytes, cudaMemcpyDeviceToDevice, main_stream_));
+            if (lw.indexer_comp_score_state.data && l_snap.snap_indexer_comp_score_state.data) {
+                CUDA_CHECK(cudaMemcpyAsync(lw.indexer_comp_score_state.data, l_snap.snap_indexer_comp_score_state.data, lw.indexer_comp_score_state.size_bytes, cudaMemcpyDeviceToDevice, main_stream_));
             }
 
             // Qwen
-            if (lw.k_cache_gqa.data && snap.snap_k_cache_gqa.data) {
-                CUDA_CHECK(cudaMemcpyAsync(lw.k_cache_gqa.data, snap.snap_k_cache_gqa.data, lw.k_cache_gqa.size_bytes, cudaMemcpyDeviceToDevice, main_stream_));
+            if (lw.k_cache_gqa.data && l_snap.snap_k_cache_gqa.data) {
+                CUDA_CHECK(cudaMemcpyAsync(lw.k_cache_gqa.data, l_snap.snap_k_cache_gqa.data, lw.k_cache_gqa.size_bytes, cudaMemcpyDeviceToDevice, main_stream_));
             }
-            if (lw.v_cache_gqa.data && snap.snap_v_cache_gqa.data) {
-                CUDA_CHECK(cudaMemcpyAsync(lw.v_cache_gqa.data, snap.snap_v_cache_gqa.data, lw.v_cache_gqa.size_bytes, cudaMemcpyDeviceToDevice, main_stream_));
+            if (lw.v_cache_gqa.data && l_snap.snap_v_cache_gqa.data) {
+                CUDA_CHECK(cudaMemcpyAsync(lw.v_cache_gqa.data, l_snap.snap_v_cache_gqa.data, lw.v_cache_gqa.size_bytes, cudaMemcpyDeviceToDevice, main_stream_));
             }
-            if (lw.ssm_state.data && snap.snap_ssm_state.data) {
-                CUDA_CHECK(cudaMemcpyAsync(lw.ssm_state.data, snap.snap_ssm_state.data, lw.ssm_state.size_bytes, cudaMemcpyDeviceToDevice, main_stream_));
+            if (lw.ssm_state.data && l_snap.snap_ssm_state.data) {
+                CUDA_CHECK(cudaMemcpyAsync(lw.ssm_state.data, l_snap.snap_ssm_state.data, lw.ssm_state.size_bytes, cudaMemcpyDeviceToDevice, main_stream_));
             }
-            if (lw.conv_state.data && snap.snap_conv_state.data) {
-                CUDA_CHECK(cudaMemcpyAsync(lw.conv_state.data, snap.snap_conv_state.data, lw.conv_state.size_bytes, cudaMemcpyDeviceToDevice, main_stream_));
+            if (lw.conv_state.data && l_snap.snap_conv_state.data) {
+                CUDA_CHECK(cudaMemcpyAsync(lw.conv_state.data, l_snap.snap_conv_state.data, lw.conv_state.size_bytes, cudaMemcpyDeviceToDevice, main_stream_));
             }
         }
 
-        if (buf_hc_state_.data && system_kv_snapshot_.snap_hc_state.data) {
-            CUDA_CHECK(cudaMemcpyAsync(buf_hc_state_.data, system_kv_snapshot_.snap_hc_state.data, buf_hc_state_.size_bytes, cudaMemcpyDeviceToDevice, main_stream_));
+        if (buf_hc_state_.data && snap.snap_hc_state.data) {
+            CUDA_CHECK(cudaMemcpyAsync(buf_hc_state_.data, snap.snap_hc_state.data, buf_hc_state_.size_bytes, cudaMemcpyDeviceToDevice, main_stream_));
         }
-        if (buf_hc_after_attn_.data && system_kv_snapshot_.snap_hc_after_attn.data) {
-            CUDA_CHECK(cudaMemcpyAsync(buf_hc_after_attn_.data, system_kv_snapshot_.snap_hc_after_attn.data, buf_hc_after_attn_.size_bytes, cudaMemcpyDeviceToDevice, main_stream_));
+        if (buf_hc_after_attn_.data && snap.snap_hc_after_attn.data) {
+            CUDA_CHECK(cudaMemcpyAsync(buf_hc_after_attn_.data, snap.snap_hc_after_attn.data, buf_hc_after_attn_.size_bytes, cudaMemcpyDeviceToDevice, main_stream_));
         }
 
         if (qwen_draft_.loaded_) {
@@ -3821,7 +3828,11 @@ public:
             mtp_drafter_.reset_kv_cache(main_stream_);
         }
 
-        cached_tokens_ = system_kv_snapshot_.tokens;
+        cached_tokens_ = snap.tokens;
+    }
+
+    void restore_system_kv() {
+        restore_kv(system_kv_snapshot_);
     }
 
     // ── Prefill Prompt Prefix without Generation (for Startup KV Cache Pre-warming) ──
@@ -3933,7 +3944,28 @@ public:
             prefix_len = 0;
         }
 
-        // If continuous prefix matching failed, check if prompt starts with the pinned System KV snapshot!
+        // If continuous prefix matching failed, check if prompt starts with the rolling Turn KV snapshot!
+        if (!can_reuse_prefix && turn_kv_snapshot_.valid && !turn_kv_snapshot_.tokens.empty()) {
+            size_t turn_len = turn_kv_snapshot_.tokens.size();
+            if (prompt.size() >= turn_len) {
+                bool turn_matches = true;
+                for (size_t i = 0; i < turn_len; i++) {
+                    if (prompt[i] != turn_kv_snapshot_.tokens[i]) {
+                        turn_matches = false;
+                        break;
+                    }
+                }
+                if (turn_matches) {
+                    restore_kv(turn_kv_snapshot_);
+                    prefix_len = turn_len;
+                    can_reuse_prefix = true;
+                    LOG_INFO("Restored rolling Turn KV Cache snapshot of %zu tokens (<0.1ms). Skipping prefill 0..%zu, evaluating %zu..%zu",
+                             turn_len, turn_len > 0 ? turn_len - 1 : 0, turn_len, prompt.size() - 1);
+                }
+            }
+        }
+
+        // If turn snapshot matching failed, check if prompt starts with the pinned System KV snapshot!
         if (!can_reuse_prefix && system_kv_snapshot_.valid && !system_kv_snapshot_.tokens.empty()) {
             size_t sys_len = system_kv_snapshot_.tokens.size();
             if (prompt.size() >= sys_len) {
@@ -3941,6 +3973,7 @@ public:
                 for (size_t i = 0; i < sys_len; i++) {
                     if (prompt[i] != system_kv_snapshot_.tokens[i]) {
                         sys_matches = false;
+                        break;
                     }
                 }
                 if (sys_matches) {
@@ -4046,8 +4079,9 @@ public:
                 }
             } else {
                 // ModelArch::DEEPSEEK_V4
-                if (enable_batched_prefill_ && prefix_len == 0 && prompt.size() > 1) {
-                    prefill_prompt_batched_deepseek(prompt);
+                size_t remaining = (prompt.size() > prefix_len) ? (prompt.size() - prefix_len) : 0;
+                if (enable_batched_prefill_ && remaining > 1) {
+                    prefill_prompt_batched_deepseek(prompt, (int)prefix_len);
                 } else {
                     for (size_t i = prefix_len; i < prompt.size(); i++) {
                         if (graph_captured_) {
@@ -4612,6 +4646,7 @@ public:
         }
 
         cached_tokens_ = history;
+        snapshot_kv(turn_kv_snapshot_, history);
         return result;
     }
 
@@ -6429,10 +6464,12 @@ private:
     }
 
     // ── Batched Prefill for DeepSeek V4 Flash MoE (All-Resident Mode) ────────
-    void prefill_prompt_batched_deepseek(const std::vector<int>& prompt) {
+    void prefill_prompt_batched_deepseek(const std::vector<int>& prompt, int start_offset = 0) {
         if (prompt.empty()) return;
-        if (prompt.size() <= 1) {
-            for (size_t i = 0; i < prompt.size(); i++) {
+        int remaining_tokens = (int)prompt.size() - start_offset;
+        if (remaining_tokens <= 0) return;
+        if (remaining_tokens <= 1) {
+            for (size_t i = (size_t)start_offset; i < prompt.size(); i++) {
                 forward_token(prompt[i], (int)i);
             }
             CUDA_CHECK(cudaStreamSynchronize(main_stream_));
@@ -6462,7 +6499,7 @@ private:
         float scale = 1.0f / sqrtf((float)head_dim_val);
         int max_combined = window + cfg_.max_compressed_entries;
 
-        for (int start = 0; start < total_tokens; start += chunk_size) {
+        for (int start = start_offset; start < total_tokens; start += chunk_size) {
             int M = std::min(chunk_size, total_tokens - start);
             int position = start;
             bool is_last_chunk = (start + M == total_tokens);
@@ -6727,9 +6764,10 @@ private:
         CUDA_CHECK(cudaStreamSynchronize(main_stream_));
         auto t_end = std::chrono::high_resolution_clock::now();
         double elapsed_sec = std::chrono::duration<double>(t_end - t_start).count();
-        double tok_per_sec = (elapsed_sec > 0.0) ? ((double)total_tokens / elapsed_sec) : 0.0;
-        LOG_INFO("[PREFILL STATS] %d prompt tokens prefilled in %.3fs -> %.2f tok/s (batched chunk_size=%d)",
-                 total_tokens, elapsed_sec, tok_per_sec, chunk_size);
+        size_t evaluated_tokens = (total_tokens > start_offset) ? (size_t)(total_tokens - start_offset) : 0;
+        double tok_per_sec = (elapsed_sec > 0.0 && evaluated_tokens > 0) ? ((double)evaluated_tokens / elapsed_sec) : 0.0;
+        LOG_INFO("[PREFILL STATS] %zu prompt tokens prefilled in %.3fs -> %.2f tok/s (batched chunk_size=%d, offset=%d)",
+                 evaluated_tokens, elapsed_sec, tok_per_sec, chunk_size, start_offset);
     }
 
     // ── Sample from logits ──────────────────────────────────────────────────
@@ -9314,6 +9352,7 @@ static void run_server(MoecherEngine& engine, int port, int default_thinking_bud
 
     svr.Post("/api/kv/reset", [&engine](const httplib::Request&, httplib::Response& res) {
         res.set_header("Access-Control-Allow-Origin", "*");
+        engine.turn_kv_snapshot_.valid = false;
         if (engine.system_kv_snapshot_.valid) {
             engine.restore_system_kv();
             LOG_INFO("[KV RESET] Restored pinned System KV snapshot of %zu tokens (ready for fresh conversation with 0ms prefill).",
@@ -9334,6 +9373,7 @@ static void run_server(MoecherEngine& engine, int port, int default_thinking_bud
 
     svr.Get("/api/kv/reset", [&engine](const httplib::Request&, httplib::Response& res) {
         res.set_header("Access-Control-Allow-Origin", "*");
+        engine.turn_kv_snapshot_.valid = false;
         if (engine.system_kv_snapshot_.valid) {
             engine.restore_system_kv();
         } else {
