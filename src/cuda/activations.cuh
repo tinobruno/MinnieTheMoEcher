@@ -799,5 +799,85 @@ void quantize_bf16_to_int4_symmetric_cuda(
     int N, int K,
     cudaStream_t stream = 0);
 
+// ── DeepSeek V4 Batched Prefill CUDA Kernels ──────────────────────────────────
+void embedding_broadcast_batch_cuda(
+    __nv_bfloat16* hidden, __nv_bfloat16* hc_state,
+    const __nv_bfloat16* table, const int32_t* d_tokens,
+    int M, int dim, int hc,
+    cudaStream_t stream = 0);
+
+void gemv_hc_pre_norm_batch_cuda(
+    float* mixes, const __nv_bfloat16* hc_state,
+    const float* hc_fn, int M, int mix_size, int hc_dim, float eps,
+    cudaStream_t stream = 0);
+
+void hc_split_sinkhorn_batch_cuda(
+    float* pre, float* post, float* comb,
+    const float* mixes, const float* scale,
+    const float* base, int M, int hc_mult,
+    int sinkhorn_iters, float eps,
+    cudaStream_t stream = 0);
+
+void hc_pre_weighted_add_norm_batch_cuda(
+    __nv_bfloat16* out, const __nv_bfloat16* hc_state, const float* pre_weights,
+    const __nv_bfloat16* norm_weight, int M, int dim, int hc, float eps,
+    cudaStream_t stream = 0);
+
+void hc_post_update_batch_cuda(
+    __nv_bfloat16* hc_state, const __nv_bfloat16* hidden,
+    const __nv_bfloat16* hc_residual, const float* post_weights,
+    const float* comb_weights, int M, int dim, int hc,
+    cudaStream_t stream = 0);
+
+void gemv_fp8_grouped_batch_cuda(
+    __nv_bfloat16* out, const __nv_bfloat16* vec,
+    const uint8_t* weight, const uint8_t* scale,
+    int M, int N, int K, int groups, int block_size,
+    cudaStream_t stream = 0);
+
+void moe_route_top6_from_bf16_batch_cuda(
+    int32_t* topk_ids,
+    float* topk_weights,
+    const __nv_bfloat16* scores_bf16,
+    const float* gate_bias,
+    int M, int n_experts, int top_k, float routed_scaling_factor,
+    cudaStream_t stream = 0);
+
+void moe_route_hash_device_id_batch_cuda(
+    int32_t* topk_ids,
+    float* topk_weights,
+    const int64_t* tid2eid_table,
+    const int32_t* d_tokens,
+    int M, int top_k, float routed_scaling_factor,
+    cudaStream_t stream = 0);
+
+void gemv_iq2_xxs_moe_swiglu_fused_batch_cuda(
+    __nv_bfloat16* gate_buf,
+    const __nv_bfloat16* vec,
+    int w1_offset, int w3_offset,
+    int N, int K, float swiglu_limit,
+    const int32_t* topk_ids,
+    const void* const* flat_expert_ptrs,
+    int layer_id, int n_experts, int M,
+    cudaStream_t stream = 0);
+
+void gemv_q2_k_moe_batch_cuda(
+    __nv_bfloat16* down_buf,
+    const __nv_bfloat16* gate_buf,
+    const int32_t* topk_ids,
+    const void* const* flat_expert_ptrs,
+    int layer_id, int n_experts,
+    int w2_offset, int N, int K, int M,
+    cudaStream_t stream = 0);
+
+void fused_moe_accum_dynamic_batch_cuda(
+    __nv_bfloat16* accum,
+    const __nv_bfloat16* down_buf,
+    const float* topk_weights,
+    const __nv_bfloat16* shared_down,
+    int dim, int M,
+    cudaStream_t stream = 0);
+
+
 
 

@@ -34,28 +34,29 @@ __device__ __forceinline__ __nv_bfloat162 to_bf162_float2(const float2& v) {
     return t;
 }
 
+// FP8 E4M3 and E8M0 conversions (bitcast-based v2)
+__device__ __forceinline__ float fp8_e4m3_to_float_v2(uint8_t val) {
+    if (val == 0) return 0.0f;
+    uint32_t sign = (uint32_t)(val & 0x80) << 24;
+    uint32_t exp  = (uint32_t)(val & 0x78) >> 3;
+    uint32_t mant = (uint32_t)(val & 0x07);
+    uint32_t f_exp = exp + 120;
+    uint32_t res = sign | (f_exp << 23) | (mant << 20);
+    return __uint_as_float(res);
+}
+
+__device__ __forceinline__ float e8m0_to_float_v2(uint8_t val) {
+    return __uint_as_float((uint32_t)val << 23);
+}
+
 // E8M0 (unsigned exponent only) -> float multiplier
-// E8M0 has 8-bit exponent with bias 127, no mantissa: value = 2^(e-127)
 __device__ __forceinline__ float e8m0_to_float(uint8_t bits) {
-    if (bits == 0xFF) return 0.0f;
-    return exp2f((float)bits - 127.0f);
+    return e8m0_to_float_v2(bits);
 }
 
 // FP8 E4M3 -> float
-// sign(1) | exponent(4) | mantissa(3), bias=7
 __device__ __forceinline__ float fp8_e4m3_to_float(uint8_t bits) {
-    uint32_t sign = (bits >> 7) & 1;
-    uint32_t exp  = (bits >> 3) & 0xF;
-    uint32_t mant = bits & 0x7;
-    float val;
-    if (exp == 0) {
-        val = ldexpf((float)mant, -9);
-    } else if (exp == 15 && mant == 7) {
-        val = __int_as_float(0x7FC00000);
-    } else {
-        val = ldexpf(1.0f + (float)mant / 8.0f, (int)exp - 7);
-    }
-    return sign ? -val : val;
+    return fp8_e4m3_to_float_v2(bits);
 }
 
 // float -> FP8 E4M3
@@ -1385,20 +1386,7 @@ void combine_kv_cuda(
     combine_kv_kernel<<<blocks, threads, 0, stream>>>(out, raw_kv, raw_len, comp_kv, comp_len, head_dim);
 }
 
-// FP8 GEMV Kernel
-__device__ inline float fp8_e4m3_to_float_v2(uint8_t val) {
-    if (val == 0) return 0.0f;
-    uint32_t sign = (uint32_t)(val & 0x80) << 24;
-    uint32_t exp  = (uint32_t)(val & 0x78) >> 3;
-    uint32_t mant = (uint32_t)(val & 0x07);
-    uint32_t f_exp = exp + 120;
-    uint32_t res = sign | (f_exp << 23) | (mant << 20);
-    return __uint_as_float(res);
-}
-
-__device__ inline float e8m0_to_float_v2(uint8_t val) {
-    return __uint_as_float((uint32_t)val << 23);
-}
+// FP8 GEMV Kernel (uses fp8_e4m3_to_float_v2 and e8m0_to_float_v2 defined above)
 
 // ── Hardware Asynchronous Copy (cp.async) Primitives ──────────────────────────
 __device__ __forceinline__ void cp_async_16_bytes(void* smem_dst, const void* gmem_src) {
@@ -6381,4 +6369,970 @@ void quantize_bf16_to_int4_symmetric_cuda(
     quantize_bf16_to_int4_symmetric_kernel<<<grid, threads, 0, stream>>>(
         out_packed, out_scale, in_bf16, N, K);
 }
+
+// ════════════════════════════════════════════════════════════════════════════════
+//  DeepSeek V4 Batched Prefill CUDA Kernels
+// ════════════════════════════════════════════════════════════════════════════════
+
+__global__ void embedding_broadcast_batch_kernel(
+    __nv_bfloat16* __restrict__ hidden, // [M, dim]
+    __nv_bfloat16* __restrict__ hc_state, // [M, hc * dim]
+    const __nv_bfloat16* __restrict__ table, // [vocab, dim]
+    const int32_t* __restrict__ d_tokens, // [M]
+    int M, int dim, int hc)
+{
+    int t = blockIdx.y;
+    int d = blockIdx.x * blockDim.x + threadIdx.x;
+    if (d >= dim || t >= M) return;
+
+    int token_id = d_tokens[t];
+    __nv_bfloat16 val = table[(size_t)token_id * dim + d];
+    hidden[(size_t)t * dim + d] = val;
+    for (int h = 0; h < hc; h++) {
+        hc_state[(size_t)t * (hc * dim) + (size_t)h * dim + d] = val;
+    }
+}
+
+void embedding_broadcast_batch_cuda(
+    __nv_bfloat16* hidden, __nv_bfloat16* hc_state,
+    const __nv_bfloat16* table, const int32_t* d_tokens,
+    int M, int dim, int hc,
+    cudaStream_t stream)
+{
+    int threads = 256;
+    dim3 grid((dim + threads - 1) / threads, M);
+    embedding_broadcast_batch_kernel<<<grid, threads, 0, stream>>>(
+        hidden, hc_state, table, d_tokens, M, dim, hc);
+}
+
+__global__ void gemv_hc_pre_norm_batch_kernel(
+    float* __restrict__ mixes, // [M, mix_size]
+    const __nv_bfloat16* __restrict__ hc_state, // [M, hc_dim]
+    const float* __restrict__ hc_fn, // [mix_size, hc_dim]
+    int mix_size, int hc_dim, float eps)
+{
+    int row = blockIdx.x;
+    int t = blockIdx.y;
+    if (row >= mix_size) return;
+
+    int tid = threadIdx.x;
+    const __nv_bfloat16* tok_hc = hc_state + (size_t)t * hc_dim;
+
+    // Step 1: Compute sum of squares across tok_hc
+    float sum_sq = 0.0f;
+    const uint4* hc_vec8 = reinterpret_cast<const uint4*>(tok_hc);
+    int n_vec8 = hc_dim / 8;
+    for (int i = tid; i < n_vec8; i += blockDim.x) {
+        uint4 u = hc_vec8[i];
+        float2 f0 = to_float2_bf162(*reinterpret_cast<const __nv_bfloat162*>(&u.x));
+        float2 f1 = to_float2_bf162(*reinterpret_cast<const __nv_bfloat162*>(&u.y));
+        float2 f2 = to_float2_bf162(*reinterpret_cast<const __nv_bfloat162*>(&u.z));
+        float2 f3 = to_float2_bf162(*reinterpret_cast<const __nv_bfloat162*>(&u.w));
+        sum_sq += f0.x * f0.x + f0.y * f0.y + f1.x * f1.x + f1.y * f1.y +
+                  f2.x * f2.x + f2.y * f2.y + f3.x * f3.x + f3.y * f3.y;
+    }
+    #pragma unroll
+    for (int offset = 16; offset > 0; offset /= 2)
+        sum_sq += __shfl_down_sync(0xffffffff, sum_sq, offset);
+
+    __shared__ float s_sq[32];
+    int lane = tid & 31;
+    int warp = tid >> 5;
+    if (lane == 0) s_sq[warp] = sum_sq;
+    __syncthreads();
+
+    float b_sq = (lane < (blockDim.x / 32)) ? s_sq[lane] : 0.0f;
+    if (warp == 0) {
+        #pragma unroll
+        for (int offset = 16; offset > 0; offset /= 2)
+            b_sq += __shfl_down_sync(0xffffffff, b_sq, offset);
+        if (lane == 0) s_sq[0] = rsqrtf(b_sq / (float)hc_dim + eps);
+    }
+    __syncthreads();
+    float rsqrt_val = s_sq[0];
+
+    // Step 2: Dot product with row of hc_fn
+    const float4* fn_vec4 = reinterpret_cast<const float4*>(hc_fn + (size_t)row * hc_dim);
+    const uint2* hc_vec4 = reinterpret_cast<const uint2*>(tok_hc);
+    int n_vec4 = hc_dim / 4;
+    float sum = 0.0f;
+    for (int i = tid; i < n_vec4; i += blockDim.x) {
+        float4 fn4 = fn_vec4[i];
+        uint2 u = hc_vec4[i];
+        float2 f0 = to_float2_bf162(*reinterpret_cast<const __nv_bfloat162*>(&u.x));
+        float2 f1 = to_float2_bf162(*reinterpret_cast<const __nv_bfloat162*>(&u.y));
+        sum += fn4.x * (f0.x * rsqrt_val) + fn4.y * (f0.y * rsqrt_val) +
+               fn4.z * (f1.x * rsqrt_val) + fn4.w * (f1.y * rsqrt_val);
+    }
+
+    #pragma unroll
+    for (int offset = 16; offset > 0; offset /= 2)
+        sum += __shfl_down_sync(0xffffffff, sum, offset);
+
+    __shared__ float s_sum[32];
+    if (lane == 0) s_sum[warp] = sum;
+    __syncthreads();
+
+    if (warp == 0) {
+        float bsum = (lane < (blockDim.x / 32)) ? s_sum[lane] : 0.0f;
+        #pragma unroll
+        for (int offset = 16; offset > 0; offset /= 2)
+            bsum += __shfl_down_sync(0xffffffff, bsum, offset);
+        if (lane == 0) mixes[(size_t)t * mix_size + row] = bsum;
+    }
+}
+
+void gemv_hc_pre_norm_batch_cuda(
+    float* mixes, const __nv_bfloat16* hc_state,
+    const float* hc_fn, int M, int mix_size, int hc_dim, float eps, cudaStream_t stream)
+{
+    dim3 grid(mix_size, M);
+    gemv_hc_pre_norm_batch_kernel<<<grid, 256, 0, stream>>>(mixes, hc_state, hc_fn, mix_size, hc_dim, eps);
+}
+
+__global__ void hc_split_sinkhorn_batch_kernel(
+    float* __restrict__ pre, // [M, hc]
+    float* __restrict__ post, // [M, hc]
+    float* __restrict__ comb, // [M, hc * hc]
+    const float* __restrict__ mixes, // [M, mix_size]
+    const float* __restrict__ scale, // [3]
+    const float* __restrict__ base,  // [mix_size]
+    int hc, int sinkhorn_iters, float eps)
+{
+    int t = blockIdx.x;
+    int tid = threadIdx.x;
+    const float* tok_mixes = mixes + (size_t)t * ((2 + hc) * hc);
+    float* tok_pre = pre + (size_t)t * hc;
+    float* tok_post = post + (size_t)t * hc;
+    float* tok_comb = comb + (size_t)t * (hc * hc);
+
+    // Pre
+    if (tid < hc) {
+        float v = tok_mixes[tid] * scale[0] + base[tid];
+        tok_pre[tid] = 1.0f / (1.0f + expf(-v)) + eps;
+    }
+    // Post
+    if (tid >= hc && tid < 2 * hc) {
+        int i = tid - hc;
+        float v = tok_mixes[hc + i] * scale[1] + base[hc + i];
+        tok_post[i] = 2.0f / (1.0f + expf(-v));
+    }
+
+    __shared__ float s_comb[64];
+    __shared__ float s_row_sum[8];
+    __shared__ float s_col_sum[8];
+
+    // Comb logits
+    if (tid < hc * hc) {
+        int r = tid / hc;
+        int c = tid % hc;
+        float v = tok_mixes[2 * hc + r * hc + c] * scale[2] + base[2 * hc + r * hc + c];
+        s_comb[r * hc + c] = v;
+    }
+    __syncthreads();
+
+    // Row max & softmax
+    if (tid < hc) {
+        int r = tid;
+        float max_val = -1e38f;
+        for (int c = 0; c < hc; c++) {
+            max_val = fmaxf(max_val, s_comb[r * hc + c]);
+        }
+        float row_sum = 0.0f;
+        for (int c = 0; c < hc; c++) {
+            float e = expf(s_comb[r * hc + c] - max_val);
+            s_comb[r * hc + c] = e;
+            row_sum += e;
+        }
+        for (int c = 0; c < hc; c++) {
+            s_comb[r * hc + c] = (s_comb[r * hc + c] / row_sum) + eps;
+        }
+    }
+    __syncthreads();
+
+    // Col normalize
+    if (tid < hc) {
+        int c = tid;
+        float col_sum = 0.0f;
+        for (int r = 0; r < hc; r++) {
+            col_sum += s_comb[r * hc + c];
+        }
+        float inv = 1.0f / (col_sum + eps);
+        for (int r = 0; r < hc; r++) {
+            s_comb[r * hc + c] *= inv;
+        }
+    }
+    __syncthreads();
+
+    // Sinkhorn loop
+    for (int iter = 0; iter < sinkhorn_iters - 1; iter++) {
+        // Row norm
+        if (tid < hc) {
+            int r = tid;
+            float row_sum = 0.0f;
+            for (int c = 0; c < hc; c++) {
+                row_sum += s_comb[r * hc + c];
+            }
+            float inv = 1.0f / (row_sum + eps);
+            s_row_sum[r] = inv;
+        }
+        __syncthreads();
+        if (tid < hc * hc) {
+            int r = tid / hc;
+            int c = tid % hc;
+            s_comb[r * hc + c] *= s_row_sum[r];
+        }
+        __syncthreads();
+
+        // Col norm
+        if (tid < hc) {
+            int c = tid;
+            float col_sum = 0.0f;
+            for (int r = 0; r < hc; r++) {
+                col_sum += s_comb[r * hc + c];
+            }
+            float inv = 1.0f / (col_sum + eps);
+            s_col_sum[c] = inv;
+        }
+        __syncthreads();
+        if (tid < hc * hc) {
+            int r = tid / hc;
+            int c = tid % hc;
+            s_comb[r * hc + c] *= s_col_sum[c];
+        }
+        __syncthreads();
+    }
+
+    if (tid < hc * hc) {
+        tok_comb[tid] = s_comb[tid];
+    }
+}
+
+void hc_split_sinkhorn_batch_cuda(
+    float* pre, float* post, float* comb,
+    const float* mixes, const float* scale,
+    const float* base, int M, int hc_mult,
+    int sinkhorn_iters, float eps,
+    cudaStream_t stream)
+{
+    hc_split_sinkhorn_batch_kernel<<<M, 32, 0, stream>>>(
+        pre, post, comb, mixes, scale, base, hc_mult, sinkhorn_iters, eps);
+}
+
+__global__ void hc_pre_weighted_add_norm_batch_kernel(
+    __nv_bfloat16* __restrict__ out, // [M, dim]
+    const __nv_bfloat16* __restrict__ hc_state, // [M, hc * dim]
+    const float* __restrict__ pre_weights, // [M, hc]
+    const __nv_bfloat16* __restrict__ norm_weight, // [dim]
+    int dim, int hc, float eps)
+{
+    int t = blockIdx.x;
+    int tid = threadIdx.x;
+    extern __shared__ float sdata[];
+
+    const __nv_bfloat16* tok_hc = hc_state + (size_t)t * (hc * dim);
+    const float* tok_pre = pre_weights + (size_t)t * hc;
+    __nv_bfloat16* tok_out = out + (size_t)t * dim;
+
+    const __nv_bfloat16* s0 = tok_hc;
+    const __nv_bfloat16* s1 = tok_hc + dim;
+    const __nv_bfloat16* s2 = tok_hc + 2 * dim;
+    const __nv_bfloat16* s3 = tok_hc + 3 * dim;
+
+    float w0 = tok_pre[0];
+    float w1 = tok_pre[1];
+    float w2 = tok_pre[2];
+    float w3 = tok_pre[3];
+
+    float sum_sq = 0.0f;
+    float reg_y[4];
+    int idx[4];
+
+    #pragma unroll
+    for (int k = 0; k < 4; k++) {
+        int i = tid + k * blockDim.x;
+        idx[k] = i;
+        if (i < dim) {
+            float f0 = __bfloat162float(s0[i]);
+            float f1 = __bfloat162float(s1[i]);
+            float f2 = __bfloat162float(s2[i]);
+            float f3 = __bfloat162float(s3[i]);
+            float y = w0 * f0 + w1 * f1 + w2 * f2 + w3 * f3;
+            reg_y[k] = y;
+            sum_sq += y * y;
+        } else {
+            reg_y[k] = 0.0f;
+        }
+    }
+
+    #pragma unroll
+    for (int offset = 16; offset > 0; offset >>= 1)
+        sum_sq += __shfl_down_sync(0xFFFFFFFF, sum_sq, offset);
+
+    int lane = tid & 31;
+    int warp = tid >> 5;
+    if (lane == 0) sdata[warp] = sum_sq;
+    __syncthreads();
+
+    if (warp == 0) {
+        sum_sq = (lane < (blockDim.x >> 5)) ? sdata[lane] : 0.0f;
+        #pragma unroll
+        for (int offset = 16; offset > 0; offset >>= 1)
+            sum_sq += __shfl_down_sync(0xFFFFFFFF, sum_sq, offset);
+        if (lane == 0) sdata[0] = sum_sq;
+    }
+    __syncthreads();
+
+    float rsqrt_val = rsqrtf(sdata[0] / (float)dim + eps);
+
+    #pragma unroll
+    for (int k = 0; k < 4; k++) {
+        int i = idx[k];
+        if (i < dim) {
+            float w = __bfloat162float(norm_weight[i]);
+            tok_out[i] = __float2bfloat16(reg_y[k] * rsqrt_val * w);
+        }
+    }
+}
+
+void hc_pre_weighted_add_norm_batch_cuda(
+    __nv_bfloat16* out, const __nv_bfloat16* hc_state, const float* pre_weights,
+    const __nv_bfloat16* norm_weight, int M, int dim, int hc, float eps, cudaStream_t stream)
+{
+    int threads = min(1024, ((dim + 31) / 32) * 32);
+    int shared = (threads / 32) * sizeof(float);
+    hc_pre_weighted_add_norm_batch_kernel<<<M, threads, shared, stream>>>(
+        out, hc_state, pre_weights, norm_weight, dim, hc, eps);
+}
+
+__global__ void hc_post_update_batch_kernel(
+    __nv_bfloat16* __restrict__ hc_state, // [M, hc * dim]
+    const __nv_bfloat16* __restrict__ hidden, // [M, dim]
+    const __nv_bfloat16* __restrict__ hc_residual, // [M, hc * dim]
+    const float* __restrict__ post_weights, // [M, hc]
+    const float* __restrict__ comb_weights, // [M, hc * hc]
+    int dim, int hc)
+{
+    int t = blockIdx.y;
+    int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    if (idx * 8 >= dim) return;
+
+    const __nv_bfloat16* tok_hidden = hidden + (size_t)t * dim;
+    const __nv_bfloat16* tok_res = hc_residual + (size_t)t * (hc * dim);
+    __nv_bfloat16* tok_hc = hc_state + (size_t)t * (hc * dim);
+    const float* tok_post = post_weights + (size_t)t * hc;
+    const float* tok_comb = comb_weights + (size_t)t * (hc * hc);
+
+    uint4 h_u4 = reinterpret_cast<const uint4*>(tok_hidden)[idx];
+    float2 h0 = to_float2_bf162(*reinterpret_cast<const __nv_bfloat162*>(&h_u4.x));
+    float2 h1 = to_float2_bf162(*reinterpret_cast<const __nv_bfloat162*>(&h_u4.y));
+    float2 h2 = to_float2_bf162(*reinterpret_cast<const __nv_bfloat162*>(&h_u4.z));
+    float2 h3 = to_float2_bf162(*reinterpret_cast<const __nv_bfloat162*>(&h_u4.w));
+
+    float2 r0[4], r1[4], r2[4], r3[4];
+    #pragma unroll
+    for (int j = 0; j < 4; j++) {
+        uint4 res_u4 = reinterpret_cast<const uint4*>(tok_res + (size_t)j * dim)[idx];
+        r0[j] = to_float2_bf162(*reinterpret_cast<const __nv_bfloat162*>(&res_u4.x));
+        r1[j] = to_float2_bf162(*reinterpret_cast<const __nv_bfloat162*>(&res_u4.y));
+        r2[j] = to_float2_bf162(*reinterpret_cast<const __nv_bfloat162*>(&res_u4.z));
+        r3[j] = to_float2_bf162(*reinterpret_cast<const __nv_bfloat162*>(&res_u4.w));
+    }
+
+    #pragma unroll
+    for (int i = 0; i < 4; i++) {
+        float p_i = tok_post[i];
+        float c_0i = tok_comb[0 * hc + i];
+        float c_1i = tok_comb[1 * hc + i];
+        float c_2i = tok_comb[2 * hc + i];
+        float c_3i = tok_comb[3 * hc + i];
+
+        float2 out0, out1, out2, out3;
+        out0.x = p_i * h0.x + c_0i * r0[0].x + c_1i * r0[1].x + c_2i * r0[2].x + c_3i * r0[3].x;
+        out0.y = p_i * h0.y + c_0i * r0[0].y + c_1i * r0[1].y + c_2i * r0[2].y + c_3i * r0[3].y;
+
+        out1.x = p_i * h1.x + c_0i * r1[0].x + c_1i * r1[1].x + c_2i * r1[2].x + c_3i * r1[3].x;
+        out1.y = p_i * h1.y + c_0i * r1[0].y + c_1i * r1[1].y + c_2i * r1[2].y + c_3i * r1[3].y;
+
+        out2.x = p_i * h2.x + c_0i * r2[0].x + c_1i * r2[1].x + c_2i * r2[2].x + c_3i * r2[3].x;
+        out2.y = p_i * h2.y + c_0i * r2[0].y + c_1i * r2[1].y + c_2i * r2[2].y + c_3i * r2[3].y;
+
+        out3.x = p_i * h3.x + c_0i * r3[0].x + c_1i * r3[1].x + c_2i * r3[2].x + c_3i * r3[3].x;
+        out3.y = p_i * h3.y + c_0i * r3[0].y + c_1i * r3[1].y + c_2i * r3[2].y + c_3i * r3[3].y;
+
+        uint4 out_u4;
+        *reinterpret_cast<__nv_bfloat162*>(&out_u4.x) = to_bf162_float2(out0);
+        *reinterpret_cast<__nv_bfloat162*>(&out_u4.y) = to_bf162_float2(out1);
+        *reinterpret_cast<__nv_bfloat162*>(&out_u4.z) = to_bf162_float2(out2);
+        *reinterpret_cast<__nv_bfloat162*>(&out_u4.w) = to_bf162_float2(out3);
+
+        reinterpret_cast<uint4*>(tok_hc + (size_t)i * dim)[idx] = out_u4;
+    }
+}
+
+void hc_post_update_batch_cuda(
+    __nv_bfloat16* hc_state, const __nv_bfloat16* hidden,
+    const __nv_bfloat16* hc_residual, const float* post_weights,
+    const float* comb_weights, int M, int dim, int hc,
+    cudaStream_t stream)
+{
+    int threads = 256;
+    dim3 grid(((dim + 7) / 8 + threads - 1) / threads, M);
+    hc_post_update_batch_kernel<<<grid, threads, 0, stream>>>(
+        hc_state, hidden, hc_residual, post_weights, comb_weights, dim, hc);
+}
+
+__global__ void gemv_fp8_grouped_batch_kernel(
+    __nv_bfloat16* __restrict__ out, // [M, groups * N]
+    const __nv_bfloat16* __restrict__ vec, // [M, groups * K]
+    const uint8_t* __restrict__ weight, // [groups * N, K]
+    const uint8_t* __restrict__ scale,
+    int N, int K, int groups, int block_size)
+{
+    __shared__ uint4 s_vec[2][64];
+    __shared__ float s_fp8_lut[256];
+
+    int tid = threadIdx.y * 32 + threadIdx.x;
+    if (tid < 256) {
+        s_fp8_lut[tid] = fp8_e4m3_to_float_v2((uint8_t)tid);
+    }
+
+    int t = blockIdx.z;
+    int group = blockIdx.y;
+    int row = blockIdx.x * blockDim.y + threadIdx.y;
+
+    const __nv_bfloat16* g_vec = vec + (size_t)t * (groups * K) + (size_t)group * K;
+    __nv_bfloat16* g_out = out + (size_t)t * (groups * N) + (size_t)group * N;
+
+    if (tid < 64) {
+        cp_async_16_bytes((uint4*)s_vec[0] + tid, (const uint4*)g_vec + tid);
+    }
+    cp_async_commit_group();
+    cp_async_wait_all();
+    __syncthreads();
+
+    if (row >= N || group >= groups) return;
+
+    int lane = threadIdx.x;
+    float sum = 0.0f;
+    int scale_cols = (K + block_size - 1) / block_size;
+    int scale_rows_per_group = (N + block_size - 1) / block_size;
+    int br = row / block_size;
+
+    const uint8_t* g_weight = weight + (size_t)group * N * K;
+    const uint8_t* g_scale = scale + (size_t)group * scale_rows_per_group * scale_cols;
+
+    const uint4* w_vec16 = reinterpret_cast<const uint4*>(&g_weight[(size_t)row * K]);
+
+    int n_tiles = K / 512;
+    for (int tile = 0; tile < n_tiles; tile++) {
+        int curr_stage = tile & 1;
+        int next_stage = (tile + 1) & 1;
+
+        if (tile + 1 < n_tiles && tid < 64) {
+            cp_async_16_bytes((uint4*)s_vec[next_stage] + tid,
+                              (const uint4*)(g_vec + ((tile + 1) << 9)) + tid);
+            cp_async_commit_group();
+        }
+
+        int chunk = (tile << 5) + lane;
+        int logical_col = chunk * 16;
+        int bc = logical_col / block_size;
+        float s_val = e8m0_to_float_v2(g_scale[br * scale_cols + bc]);
+
+        uint4 w16 = w_vec16[chunk];
+        const uint4* s_a_vec4 = reinterpret_cast<const uint4*>(s_vec[curr_stage]);
+        uint4 a8_0 = s_a_vec4[(lane << 1)];
+        uint4 a8_1 = s_a_vec4[(lane << 1) + 1];
+
+        float2 f0 = to_float2_bf162(*reinterpret_cast<const __nv_bfloat162*>(&a8_0.x));
+        float2 f1 = to_float2_bf162(*reinterpret_cast<const __nv_bfloat162*>(&a8_0.y));
+        float2 f2 = to_float2_bf162(*reinterpret_cast<const __nv_bfloat162*>(&a8_0.z));
+        float2 f3 = to_float2_bf162(*reinterpret_cast<const __nv_bfloat162*>(&a8_0.w));
+
+        float2 f4 = to_float2_bf162(*reinterpret_cast<const __nv_bfloat162*>(&a8_1.x));
+        float2 f5 = to_float2_bf162(*reinterpret_cast<const __nv_bfloat162*>(&a8_1.y));
+        float2 f6 = to_float2_bf162(*reinterpret_cast<const __nv_bfloat162*>(&a8_1.z));
+        float2 f7 = to_float2_bf162(*reinterpret_cast<const __nv_bfloat162*>(&a8_1.w));
+
+        float chunk_sum = 0.0f;
+        chunk_sum += s_fp8_lut[(w16.x) & 0xFF] * f0.x;
+        chunk_sum += s_fp8_lut[(w16.x >> 8) & 0xFF] * f0.y;
+        chunk_sum += s_fp8_lut[(w16.x >> 16) & 0xFF] * f1.x;
+        chunk_sum += s_fp8_lut[(w16.x >> 24) & 0xFF] * f1.y;
+
+        chunk_sum += s_fp8_lut[(w16.y) & 0xFF] * f2.x;
+        chunk_sum += s_fp8_lut[(w16.y >> 8) & 0xFF] * f2.y;
+        chunk_sum += s_fp8_lut[(w16.y >> 16) & 0xFF] * f3.x;
+        chunk_sum += s_fp8_lut[(w16.y >> 24) & 0xFF] * f3.y;
+
+        chunk_sum += s_fp8_lut[(w16.z) & 0xFF] * f4.x;
+        chunk_sum += s_fp8_lut[(w16.z >> 8) & 0xFF] * f4.y;
+        chunk_sum += s_fp8_lut[(w16.z >> 16) & 0xFF] * f5.x;
+        chunk_sum += s_fp8_lut[(w16.z >> 24) & 0xFF] * f5.y;
+
+        chunk_sum += s_fp8_lut[(w16.w) & 0xFF] * f6.x;
+        chunk_sum += s_fp8_lut[(w16.w >> 8) & 0xFF] * f6.y;
+        chunk_sum += s_fp8_lut[(w16.w >> 16) & 0xFF] * f7.x;
+        chunk_sum += s_fp8_lut[(w16.w >> 24) & 0xFF] * f7.y;
+
+        sum += chunk_sum * s_val;
+
+        if (tile + 1 < n_tiles) {
+            cp_async_wait_all();
+            __syncthreads();
+        }
+    }
+
+    #pragma unroll
+    for (int offset = 16; offset > 0; offset /= 2)
+        sum += __shfl_down_sync(0xffffffff, sum, offset);
+
+    if (lane == 0) {
+        g_out[row] = __float2bfloat16(sum);
+    }
+}
+
+void gemv_fp8_grouped_batch_cuda(
+    __nv_bfloat16* out, const __nv_bfloat16* vec,
+    const uint8_t* weight, const uint8_t* scale,
+    int M, int N, int K, int groups, int block_size,
+    cudaStream_t stream)
+{
+    dim3 threads(32, 8);
+    dim3 blocks((N + 7) / 8, groups, M);
+    gemv_fp8_grouped_batch_kernel<<<blocks, threads, 0, stream>>>(
+        out, vec, weight, scale, N, K, groups, block_size);
+}
+
+__global__ void moe_route_top6_from_bf16_batch_kernel(
+    int32_t* __restrict__ topk_ids,
+    float* __restrict__ topk_weights,
+    const __nv_bfloat16* __restrict__ scores_bf16,
+    const float* __restrict__ gate_bias,
+    int n_experts, int top_k, float routed_scaling_factor)
+{
+    __shared__ float s_probs[256];
+    __shared__ float s_scores[256];
+    __shared__ int   s_indices[256];
+
+    int t = blockIdx.x;
+    int tid = threadIdx.x;
+
+    const __nv_bfloat16* tok_scores = scores_bf16 + (size_t)t * n_experts;
+    int32_t* tok_ids = topk_ids + (size_t)t * top_k;
+    float* tok_weights = topk_weights + (size_t)t * top_k;
+
+    if (tid < n_experts) {
+        float raw = __bfloat162float(tok_scores[tid]);
+        float sp = (raw > 20.0f) ? raw : ((raw < -20.0f) ? expf(raw) : log1pf(expf(raw)));
+        float prob = sqrtf(sp);
+        s_probs[tid] = prob;
+        s_scores[tid] = prob + (gate_bias ? gate_bias[tid] : 0.0f);
+        s_indices[tid] = tid;
+    } else {
+        s_probs[tid] = 0.0f;
+        s_scores[tid] = -1e38f;
+        s_indices[tid] = -1;
+    }
+    __syncthreads();
+
+    if (tid == 0) {
+        for (int i = 0; i < top_k; i++) {
+            int max_idx = i;
+            float max_val = s_scores[i];
+            for (int j = i + 1; j < n_experts; j++) {
+                if (s_scores[j] > max_val) {
+                    max_val = s_scores[j];
+                    max_idx = j;
+                }
+            }
+            float tmp_s = s_scores[i]; s_scores[i] = s_scores[max_idx]; s_scores[max_idx] = tmp_s;
+            float tmp_p = s_probs[i];  s_probs[i]  = s_probs[max_idx];  s_probs[max_idx]  = tmp_p;
+            int   tmp_id = s_indices[i]; s_indices[i] = s_indices[max_idx]; s_indices[max_idx] = tmp_id;
+        }
+
+        float weight_sum = 0.0f;
+        for (int k = 0; k < top_k; k++) {
+            weight_sum += s_probs[k];
+        }
+        if (weight_sum < 6.103515625e-5f) weight_sum = 6.103515625e-5f;
+
+        for (int k = 0; k < top_k; k++) {
+            tok_ids[k] = s_indices[k];
+            tok_weights[k] = (s_probs[k] / weight_sum) * routed_scaling_factor;
+        }
+    }
+}
+
+void moe_route_top6_from_bf16_batch_cuda(
+    int32_t* topk_ids,
+    float* topk_weights,
+    const __nv_bfloat16* scores_bf16,
+    const float* gate_bias,
+    int M, int n_experts, int top_k, float routed_scaling_factor,
+    cudaStream_t stream)
+{
+    moe_route_top6_from_bf16_batch_kernel<<<M, 256, 0, stream>>>(
+        topk_ids, topk_weights, scores_bf16, gate_bias, n_experts, top_k, routed_scaling_factor);
+}
+
+__global__ void moe_route_hash_device_id_batch_kernel(
+    int32_t* __restrict__ topk_ids,
+    float* __restrict__ topk_weights,
+    const int64_t* __restrict__ tid2eid_table,
+    const int32_t* __restrict__ d_tokens,
+    int top_k, float routed_scaling_factor)
+{
+    int t = blockIdx.x;
+    int tid = threadIdx.x;
+    if (tid == 0) {
+        int token_id = d_tokens[t];
+        const int64_t* eid_ptr = tid2eid_table ? (tid2eid_table + (size_t)token_id * top_k) : nullptr;
+        float w = routed_scaling_factor / (float)top_k;
+        for (int k = 0; k < top_k; k++) {
+            topk_ids[(size_t)t * top_k + k] = eid_ptr ? (int32_t)eid_ptr[k] : -1;
+            topk_weights[(size_t)t * top_k + k] = w;
+        }
+    }
+}
+
+void moe_route_hash_device_id_batch_cuda(
+    int32_t* topk_ids,
+    float* topk_weights,
+    const int64_t* tid2eid_table,
+    const int32_t* d_tokens,
+    int M, int top_k, float routed_scaling_factor,
+    cudaStream_t stream)
+{
+    moe_route_hash_device_id_batch_kernel<<<M, 32, 0, stream>>>(
+        topk_ids, topk_weights, tid2eid_table, d_tokens, top_k, routed_scaling_factor);
+}
+
+__global__ void gemv_iq2_xxs_moe_swiglu_fused_batch_kernel(
+    __nv_bfloat16* __restrict__ gate_buf, // [M, 6 * moe_inter]
+    const __nv_bfloat16* __restrict__ vec, // [M, dim]
+    int w1_offset, int w3_offset,
+    int N, int K, float swiglu_limit,
+    const int32_t* __restrict__ topk_ids, // [M, 6]
+    const void* const* __restrict__ flat_expert_ptrs,
+    int layer_id, int n_experts)
+{
+    __shared__ uint64_t s_grid[256];
+    __shared__ uint8_t s_signs[128];
+    __shared__ __nv_bfloat16 s_vec[2][256];
+    __shared__ uint16_t s_qs1[8][32];
+    __shared__ uint16_t s_qs3[8][32];
+
+    int tid = threadIdx.y * 32 + threadIdx.x;
+    s_grid[tid] = c_iq2xxs_grid[tid];
+    if (tid < 128) s_signs[tid] = c_ksigns_iq2xs[tid];
+
+    int t = blockIdx.z;
+    int k = blockIdx.y;
+    int row = blockIdx.x * blockDim.y + threadIdx.y;
+
+    const __nv_bfloat16* tok_vec = vec + (size_t)t * K;
+
+    if (tid < 32) {
+        cp_async_16_bytes((uint4*)s_vec[0] + tid, (const uint4*)tok_vec + tid);
+    }
+    cp_async_commit_group();
+    cp_async_wait_all();
+    __syncthreads();
+
+    if (row >= N || k >= 6) return;
+
+    const void* p = nullptr;
+    if (flat_expert_ptrs && topk_ids) {
+        int eid = topk_ids[(size_t)t * 6 + k];
+        if (eid >= 0 && eid < n_experts) {
+            p = flat_expert_ptrs[(size_t)layer_id * n_experts + eid];
+        }
+    }
+    if (!p) return;
+
+    const uint8_t* block = (const uint8_t*)p;
+    const block_iq2_xxs* w1 = (const block_iq2_xxs*)(block + w1_offset);
+    const block_iq2_xxs* w3 = (const block_iq2_xxs*)(block + w3_offset);
+
+    int lane = threadIdx.x;
+    int warp_id = threadIdx.y;
+    int n_blocks = K / 256;
+    const block_iq2_xxs* row_w1 = w1 + row * n_blocks;
+    const block_iq2_xxs* row_w3 = w3 + row * n_blocks;
+
+    int l = lane / 8;
+    int j = lane % 8;
+    uint8_t kmask = 1 << j;
+
+    float sum1 = 0.0f;
+    float sum3 = 0.0f;
+
+    for (int b = 0; b < n_blocks; b++) {
+        int curr_stage = b & 1;
+        int next_stage = (b + 1) & 1;
+
+        if (b + 1 < n_blocks && tid < 32) {
+            cp_async_16_bytes((uint4*)s_vec[next_stage] + tid,
+                              (const uint4*)(tok_vec + ((b + 1) << 8)) + tid);
+            cp_async_commit_group();
+        }
+
+        const block_iq2_xxs* blk1 = &row_w1[b];
+        const block_iq2_xxs* blk3 = &row_w3[b];
+
+        float d1 = (lane == 0) ? __half2float(blk1->d) : 0.0f;
+        float d3 = (lane == 0) ? __half2float(blk3->d) : 0.0f;
+        d1 = __shfl_sync(0xffffffff, d1, 0);
+        d3 = __shfl_sync(0xffffffff, d3, 0);
+
+        s_qs1[warp_id][lane] = blk1->qs[lane];
+        s_qs3[warp_id][lane] = blk3->qs[lane];
+        __syncwarp();
+
+        #pragma unroll 4
+        for (int ib32 = 0; ib32 < 8; ib32++) {
+            int q_off = ib32 * 4;
+
+            uint32_t aux0_1 = *reinterpret_cast<const uint32_t*>(&s_qs1[warp_id][q_off + 0]);
+            uint32_t aux1_1 = *reinterpret_cast<const uint32_t*>(&s_qs1[warp_id][q_off + 2]);
+            uint32_t aux0_3 = *reinterpret_cast<const uint32_t*>(&s_qs3[warp_id][q_off + 0]);
+            uint32_t aux1_3 = *reinterpret_cast<const uint32_t*>(&s_qs3[warp_id][q_off + 2]);
+
+            float db1 = d1 * (0.5f + (aux1_1 >> 28)) * 0.25f;
+            float db3 = d3 * (0.5f + (aux1_3 >> 28)) * 0.25f;
+
+            uint8_t g_idx1 = (aux0_1 >> (8 * l)) & 0xFF;
+            uint8_t s_idx1 = (aux1_1 >> (7 * l)) & 0x7F;
+            uint64_t g_val1 = s_grid[g_idx1];
+            uint8_t s_val1 = s_signs[s_idx1];
+            uint8_t byte1 = (g_val1 >> (8 * j)) & 0xFF;
+            float sign1 = (s_val1 & kmask) ? -1.0f : 1.0f;
+            float weight1 = db1 * (float)byte1 * sign1;
+
+            uint8_t g_idx3 = (aux0_3 >> (8 * l)) & 0xFF;
+            uint8_t s_idx3 = (aux1_3 >> (7 * l)) & 0x7F;
+            uint64_t g_val3 = s_grid[g_idx3];
+            uint8_t s_val3 = s_signs[s_idx3];
+            uint8_t byte3 = (g_val3 >> (8 * j)) & 0xFF;
+            float sign3 = (s_val3 & kmask) ? -1.0f : 1.0f;
+            float weight3 = db3 * (float)byte3 * sign3;
+
+            int col_in_block = (ib32 << 5) + lane;
+            float a = __bfloat162float(s_vec[curr_stage][col_in_block]);
+            sum1 += weight1 * a;
+            sum3 += weight3 * a;
+        }
+
+        if (b + 1 < n_blocks) {
+            cp_async_wait_all();
+            __syncthreads();
+        }
+    }
+
+    #pragma unroll
+    for (int offset = 16; offset > 0; offset /= 2) {
+        sum1 += __shfl_down_sync(0xffffffff, sum1, offset);
+        sum3 += __shfl_down_sync(0xffffffff, sum3, offset);
+    }
+
+    if (lane == 0) {
+        float g = sum1;
+        float u = sum3;
+        if (swiglu_limit > 0.0f) {
+            g = fminf(g, swiglu_limit);
+            u = fminf(fmaxf(u, -swiglu_limit), swiglu_limit);
+        }
+        float silu_g = g / (1.0f + expf(-g));
+        gate_buf[(size_t)t * (6 * N) + k * N + row] = __float2bfloat16(silu_g * u);
+    }
+}
+
+void gemv_iq2_xxs_moe_swiglu_fused_batch_cuda(
+    __nv_bfloat16* gate_buf,
+    const __nv_bfloat16* vec,
+    int w1_offset, int w3_offset,
+    int N, int K, float swiglu_limit,
+    const int32_t* topk_ids,
+    const void* const* flat_expert_ptrs,
+    int layer_id, int n_experts, int M,
+    cudaStream_t stream)
+{
+    dim3 threads(32, 8);
+    dim3 blocks((N + 7) / 8, 6, M);
+    gemv_iq2_xxs_moe_swiglu_fused_batch_kernel<<<blocks, threads, 0, stream>>>(
+        gate_buf, vec, w1_offset, w3_offset, N, K, swiglu_limit,
+        topk_ids, flat_expert_ptrs, layer_id, n_experts);
+}
+
+__global__ void gemv_q2_k_moe_batch_kernel(
+    __nv_bfloat16* __restrict__ down_buf, // [M, 6 * dim]
+    const __nv_bfloat16* __restrict__ gate_buf, // [M, 6 * moe_inter]
+    const int32_t* __restrict__ topk_ids, // [M, 6]
+    const void* const* __restrict__ flat_expert_ptrs,
+    int layer_id, int n_experts,
+    int w2_offset,
+    int N, int K)
+{
+    __shared__ __nv_bfloat16 s_gate[2][256];
+    __shared__ uint8_t s_scales[8][16];
+
+    int tid = threadIdx.y * 32 + threadIdx.x;
+    int t = blockIdx.z;
+    int k = blockIdx.y;
+    int row = blockIdx.x * blockDim.y + threadIdx.y;
+
+    const __nv_bfloat16* k_gate = gate_buf + (size_t)t * (6 * K) + (size_t)k * K;
+
+    if (tid < 32) {
+        cp_async_16_bytes((uint4*)s_gate[0] + tid, (const uint4*)k_gate + tid);
+    }
+    cp_async_commit_group();
+    cp_async_wait_all();
+    __syncthreads();
+
+    if (row >= N || k >= 6) return;
+
+    const void* p = nullptr;
+    if (flat_expert_ptrs && topk_ids) {
+        int eid = topk_ids[(size_t)t * 6 + k];
+        if (eid >= 0 && eid < n_experts) {
+            p = flat_expert_ptrs[(size_t)layer_id * n_experts + eid];
+        }
+    }
+    if (!p) return;
+
+    const uint8_t* block = (const uint8_t*)p;
+    const block_q2_K* w2 = (const block_q2_K*)(block + w2_offset);
+
+    int lane = threadIdx.x;
+    int warp_id = threadIdx.y;
+    int n_blocks = K / 256;
+    const block_q2_K* row_w2 = w2 + row * n_blocks;
+
+    int lane_half = lane >> 4;
+    float sum = 0.0f;
+
+    for (int b = 0; b < n_blocks; b++) {
+        int curr_stage = b & 1;
+        int next_stage = (b + 1) & 1;
+
+        if (b + 1 < n_blocks && tid < 32) {
+            cp_async_16_bytes((uint4*)s_gate[next_stage] + tid,
+                              (const uint4*)(k_gate + ((b + 1) << 8)) + tid);
+            cp_async_commit_group();
+        }
+
+        const block_q2_K* blk = &row_w2[b];
+
+        float d = (lane == 0) ? __half2float(blk->d) : 0.0f;
+        float dmin = (lane == 0) ? __half2float(blk->dmin) : 0.0f;
+        d = __shfl_sync(0xffffffff, d, 0);
+        dmin = __shfl_sync(0xffffffff, dmin, 0);
+
+        if (lane < 16) {
+            s_scales[warp_id][lane] = blk->scales[lane];
+        }
+        __syncwarp();
+
+        uint8_t q0 = blk->qs[lane];
+        uint8_t q1 = blk->qs[32 + lane];
+
+        #pragma unroll 4
+        for (int iter = 0; iter < 4; iter++) {
+            uint8_t q = (q0 >> (iter * 2)) & 0x03;
+            uint8_t sc = s_scales[warp_id][(iter * 2) + lane_half];
+            float dl = d * (float)(sc & 0x0F);
+            float ml = dmin * (float)(sc >> 4);
+            float w = dl * (float)q - ml;
+
+            int col_in_block = (iter << 5) + lane;
+            float a = __bfloat162float(s_gate[curr_stage][col_in_block]);
+            sum += w * a;
+        }
+
+        #pragma unroll 4
+        for (int iter = 0; iter < 4; iter++) {
+            uint8_t q = (q1 >> (iter * 2)) & 0x03;
+            uint8_t sc = s_scales[warp_id][8 + (iter * 2) + lane_half];
+            float dl = d * (float)(sc & 0x0F);
+            float ml = dmin * (float)(sc >> 4);
+            float w = dl * (float)q - ml;
+
+            int col_in_block = 128 + (iter << 5) + lane;
+            float a = __bfloat162float(s_gate[curr_stage][col_in_block]);
+            sum += w * a;
+        }
+
+        if (b + 1 < n_blocks) {
+            cp_async_wait_all();
+            __syncthreads();
+        }
+    }
+
+    #pragma unroll
+    for (int offset = 16; offset > 0; offset /= 2) {
+        sum += __shfl_down_sync(0xffffffff, sum, offset);
+    }
+
+    if (lane == 0) {
+        down_buf[(size_t)t * (6 * N) + k * N + row] = __float2bfloat16(sum);
+    }
+}
+
+void gemv_q2_k_moe_batch_cuda(
+    __nv_bfloat16* down_buf,
+    const __nv_bfloat16* gate_buf,
+    const int32_t* topk_ids,
+    const void* const* flat_expert_ptrs,
+    int layer_id, int n_experts,
+    int w2_offset, int N, int K, int M,
+    cudaStream_t stream)
+{
+    dim3 threads(32, 8);
+    dim3 blocks((N + 7) / 8, 6, M);
+    gemv_q2_k_moe_batch_kernel<<<blocks, threads, 0, stream>>>(
+        down_buf, gate_buf, topk_ids, flat_expert_ptrs,
+        layer_id, n_experts, w2_offset, N, K);
+}
+
+__global__ void fused_moe_accum_dynamic_batch_kernel(
+    __nv_bfloat16* __restrict__ accum, // [M, dim]
+    const __nv_bfloat16* __restrict__ down_buf, // [M, 6 * dim]
+    const float* __restrict__ topk_weights,     // [M, 6]
+    const __nv_bfloat16* __restrict__ shared_down, // [M, dim]
+    int dim)
+{
+    int t = blockIdx.y;
+    int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    if (idx >= dim) return;
+
+    const __nv_bfloat16* tok_shared = shared_down ? (shared_down + (size_t)t * dim) : nullptr;
+    const __nv_bfloat16* tok_down = down_buf + (size_t)t * (6 * dim);
+    const float* tok_weights = topk_weights + (size_t)t * 6;
+
+    float sum = tok_shared ? __bfloat162float(tok_shared[idx]) : 0.0f;
+    #pragma unroll
+    for (int k = 0; k < 6; k++) {
+        float w = tok_weights[k];
+        sum += __bfloat162float(tok_down[k * dim + idx]) * w;
+    }
+    accum[(size_t)t * dim + idx] = __float2bfloat16(sum);
+}
+
+void fused_moe_accum_dynamic_batch_cuda(
+    __nv_bfloat16* accum,
+    const __nv_bfloat16* down_buf,
+    const float* topk_weights,
+    const __nv_bfloat16* shared_down,
+    int dim, int M,
+    cudaStream_t stream)
+{
+    int threads = 256;
+    dim3 blocks((dim + threads - 1) / threads, M);
+    fused_moe_accum_dynamic_batch_kernel<<<blocks, threads, 0, stream>>>(
+        accum, down_buf, topk_weights, shared_down, dim);
+}
+
 
