@@ -19,7 +19,6 @@ import time
 import argparse
 from pathlib import Path
 
-import torch
 import numpy as np
 
 # ── FP8 E4M3 + E8M0 Dequantization Helpers ─────────────────────────────────────
@@ -96,10 +95,11 @@ def quantize_matrix_int4_block32(tensor_f32: np.ndarray, block_size: int = 32):
     u_odd = u[:, 1::2]
     packed = (u_even | (u_odd << 4)).tobytes()
 
-    # Scale in BF16 bytes
+    # Scale in BF16 bytes (round-to-nearest-even float32 to bfloat16 in numpy)
     scale_f32 = scale.squeeze(-1).astype(np.float32)
-    scale_bf16 = torch.from_numpy(scale_f32).to(torch.bfloat16)
-    scale_bytes = scale_bf16.view(torch.int16).numpy().tobytes()
+    u32 = scale_f32.view(np.uint32)
+    u32_round = u32 + (((u32 >> 16) & 1) + 0x7FFF)
+    scale_bytes = (u32_round >> 16).astype(np.uint16).tobytes()
 
     return packed, scale_bytes
 
@@ -210,9 +210,9 @@ def quantize_deepseek_dense(
                         weight_u8 = np.frombuffer(raw_data, dtype=np.uint8)
                         w_f32 = fp8_e4m3_to_float(weight_u8).reshape(shape)
                 elif dtype == "BF16":
-                    # Convert raw BF16 bytes to torch then numpy
-                    w_t = torch.frombuffer(bytearray(raw_data), dtype=torch.bfloat16).reshape(shape)
-                    w_f32 = w_t.to(torch.float32).numpy()
+                    # Convert raw BF16 bytes to float32 in numpy
+                    u16 = np.frombuffer(raw_data, dtype=np.uint16)
+                    w_f32 = (u16.astype(np.uint32) << 16).view(np.float32).reshape(shape)
                 else:
                     w_f32 = np.frombuffer(raw_data, dtype=np.float32).reshape(shape)
 

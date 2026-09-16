@@ -21,6 +21,13 @@
 #include <fcntl.h>
 #include <poll.h>
 #include <signal.h>
+#else
+#include <io.h>
+#include <process.h>
+#ifndef _PID_T_DEFINED
+#define _PID_T_DEFINED
+typedef int pid_t;
+#endif
 #endif
 
 namespace moecher {

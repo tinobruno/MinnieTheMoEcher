@@ -1863,13 +1863,11 @@ __global__ void gemv_int4_kernel(
     int N, int K)
 {
     int row = blockIdx.x * 4 + (threadIdx.y);
-    if (row >= N) return;
-
     int tid = threadIdx.x; // 0..63
-    int num_blocks = K / 32;
+    int num_blocks = (row < N) ? (K / 32) : 0;
 
-    const __nv_bfloat16* row_scales = scale + (row * num_blocks);
-    const uint4* w_vec16 = reinterpret_cast<const uint4*>(&weight[row * (K / 2)]);
+    const __nv_bfloat16* row_scales = (row < N) ? (scale + (row * num_blocks)) : nullptr;
+    const uint4* w_vec16 = (row < N) ? reinterpret_cast<const uint4*>(&weight[row * (K / 2)]) : nullptr;
     const uint4* a_vec16 = reinterpret_cast<const uint4*>(vec);
 
     float sum = 0.0f;
@@ -1941,7 +1939,7 @@ __global__ void gemv_int4_kernel(
         sum = (lane < 2) ? s_sum[threadIdx.y][lane] : 0.0f;
         sum += __shfl_down_sync(0xffffffff, sum, 1);
 
-        if (lane == 0) {
+        if (lane == 0 && row < N) {
             if constexpr (ACCUM_RESIDUAL) {
                 float existing = __bfloat162float(out[row]);
                 out[row] = __float2bfloat16(existing + sum);
@@ -1994,13 +1992,11 @@ __global__ void gemm_int4_batch_kernel(
     int N, int K, int M)
 {
     int row = blockIdx.x * 2 + (threadIdx.y);
-    if (row >= N) return;
-
     int tid = threadIdx.x; // 0..127
-    int num_blocks = K / 32;
+    int num_blocks = (row < N) ? (K / 32) : 0;
 
-    const __nv_bfloat16* row_scales = scale + (row * num_blocks);
-    const uint4* w_vec16 = reinterpret_cast<const uint4*>(&weight[row * (K / 2)]);
+    const __nv_bfloat16* row_scales = (row < N) ? (scale + (row * num_blocks)) : nullptr;
+    const uint4* w_vec16 = (row < N) ? reinterpret_cast<const uint4*>(&weight[row * (K / 2)]) : nullptr;
 
     float sum[MAX_M] = {0.0f};
 
@@ -2092,7 +2088,7 @@ __global__ void gemm_int4_batch_kernel(
                 for (int offset = 2; offset > 0; offset /= 2)
                     total += __shfl_down_sync(0xffffffff, total, offset);
 
-                if (lane == 0) {
+                if (lane == 0 && row < N) {
                     if constexpr (std::is_same_v<TOut, float>) {
                         out[m * N + row] = total;
                     } else {
@@ -2167,15 +2163,13 @@ __global__ void gemv_int4_swiglu_fused_kernel(
     int N, int K, float swiglu_limit)
 {
     int row = blockIdx.x * 4 + (threadIdx.y);
-    if (row >= N) return;
-
     int tid = threadIdx.x; // 0..63
-    int num_blocks = K / 32;
+    int num_blocks = (row < N) ? (K / 32) : 0;
 
-    const __nv_bfloat16* gate_row_scales = gate_scale + (row * num_blocks);
-    const __nv_bfloat16* up_row_scales = up_scale + (row * num_blocks);
-    const uint4* g_vec16 = reinterpret_cast<const uint4*>(&gate_weight[row * (K / 2)]);
-    const uint4* u_vec16 = reinterpret_cast<const uint4*>(&up_weight[row * (K / 2)]);
+    const __nv_bfloat16* gate_row_scales = (row < N) ? (gate_scale + (row * num_blocks)) : nullptr;
+    const __nv_bfloat16* up_row_scales = (row < N) ? (up_scale + (row * num_blocks)) : nullptr;
+    const uint4* g_vec16 = (row < N) ? reinterpret_cast<const uint4*>(&gate_weight[row * (K / 2)]) : nullptr;
+    const uint4* u_vec16 = (row < N) ? reinterpret_cast<const uint4*>(&up_weight[row * (K / 2)]) : nullptr;
     const uint4* a_vec16 = reinterpret_cast<const uint4*>(vec);
 
     float sum_g = 0.0f;
@@ -2279,7 +2273,7 @@ __global__ void gemv_int4_swiglu_fused_kernel(
         sum_g += __shfl_down_sync(0xffffffff, sum_g, 1);
         sum_u += __shfl_down_sync(0xffffffff, sum_u, 1);
 
-        if (lane == 0) {
+        if (lane == 0 && row < N) {
             float g = sum_g;
             float u = sum_u;
             if (swiglu_limit > 0.0f) {
@@ -2306,15 +2300,13 @@ __global__ void gemm_int4_swiglu_fused_batch_kernel(
     int N, int K, int M, float swiglu_limit)
 {
     int row = blockIdx.x * 2 + (threadIdx.y);
-    if (row >= N) return;
-
     int tid = threadIdx.x; // 0..127
-    int num_blocks = K / 32;
+    int num_blocks = (row < N) ? (K / 32) : 0;
 
-    const __nv_bfloat16* gate_row_scales = gate_scale + (row * num_blocks);
-    const __nv_bfloat16* up_row_scales = up_scale + (row * num_blocks);
-    const uint4* g_vec16 = reinterpret_cast<const uint4*>(&gate_weight[row * (K / 2)]);
-    const uint4* u_vec16 = reinterpret_cast<const uint4*>(&up_weight[row * (K / 2)]);
+    const __nv_bfloat16* gate_row_scales = (row < N) ? (gate_scale + (row * num_blocks)) : nullptr;
+    const __nv_bfloat16* up_row_scales = (row < N) ? (up_scale + (row * num_blocks)) : nullptr;
+    const uint4* g_vec16 = (row < N) ? reinterpret_cast<const uint4*>(&gate_weight[row * (K / 2)]) : nullptr;
+    const uint4* u_vec16 = (row < N) ? reinterpret_cast<const uint4*>(&up_weight[row * (K / 2)]) : nullptr;
 
     float sum_g[MAX_M] = {0.0f};
     float sum_u[MAX_M] = {0.0f};
@@ -2441,7 +2433,7 @@ __global__ void gemm_int4_swiglu_fused_batch_kernel(
                     u += __shfl_down_sync(0xffffffff, u, offset);
                 }
 
-                if (lane == 0) {
+                if (lane == 0 && row < N) {
                     if (swiglu_limit > 0.0f) {
                         g = fminf(g, swiglu_limit);
                         u = fminf(fmaxf(u, -swiglu_limit), swiglu_limit);

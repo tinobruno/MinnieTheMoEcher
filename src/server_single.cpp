@@ -3514,6 +3514,14 @@ public:
             return;
         }
 
+        // Tier 0: INT4 Dense model check (batched prefill is currently specialized for FP8 dense weights)
+        bool has_int4_dense = (layers_.size() > 0 && layers_[0].wq_a_w.dtype == "int4") || (embed_weight_.dtype == "int4");
+        if (has_int4_dense) {
+            LOG_INFO("[Prefill] INT4 dense model detected. Using CUDA Graph accelerated sequential prefill.");
+            enable_batched_prefill_ = false;
+            return;
+        }
+
         // Tier 1: Check all-resident MoE topology
         bool all_res = expert_loader_.all_resident(cfg_.num_hidden_layers);
         if (!all_res) {
@@ -5177,6 +5185,11 @@ private:
             (size_t)cfg_.intermediate_size,
             (size_t)17408
         });
+        size_t max_down = std::max({
+            (size_t)(top_k + 1) * dim,
+            (size_t)cfg_.intermediate_size,
+            (size_t)dim
+        });
         size_t max_q_dim = std::max({
             (size_t)n_heads * head_dim_val,
             (size_t)12288,
@@ -5195,7 +5208,7 @@ private:
         }) * sizeof(__nv_bfloat16));
         buf_gate_.alloc(max_inter * sizeof(__nv_bfloat16));
         buf_up_.alloc(max_inter * sizeof(__nv_bfloat16));
-        buf_down_.alloc(max_inter * sizeof(__nv_bfloat16));
+        buf_down_.alloc(max_down * sizeof(__nv_bfloat16));
         buf_expert_out_.alloc(dim * sizeof(__nv_bfloat16));
         buf_moe_accum_.alloc(dim * sizeof(__nv_bfloat16));
         buf_dequant_.alloc(128 * 1024 * 1024);  // 128 MB for largest dequant
@@ -6685,9 +6698,15 @@ private:
                         int idx_heads = 64;
                         int idx_q_dim = idx_heads * idx_head_dim; // 8192
 
-                        gemv_fp8_cuda(buf_indexer_q_.bf16(), tok_lora,
-                                      lw.indexer_wq_b_w.u8(), lw.indexer_wq_b_s.u8(),
-                                      idx_q_dim, q_lora, 128, main_stream_);
+                        if (lw.indexer_wq_b_w.dtype == "int4") {
+                            gemv_int4_cuda(buf_indexer_q_.bf16(), tok_lora,
+                                           (const uint8_t*)lw.indexer_wq_b_w.data, lw.indexer_wq_b_s.bf16(),
+                                           idx_q_dim, q_lora, main_stream_);
+                        } else {
+                            gemv_fp8_cuda(buf_indexer_q_.bf16(), tok_lora,
+                                          lw.indexer_wq_b_w.u8(), lw.indexer_wq_b_s.u8(),
+                                          idx_q_dim, q_lora, 128, main_stream_);
+                        }
 
                         rope_device_pos_cuda(buf_indexer_q_.bf16(), idx_heads, idx_head_dim, rope_dim,
                                              d_pos, layer_rope_freqs, false, main_stream_);
