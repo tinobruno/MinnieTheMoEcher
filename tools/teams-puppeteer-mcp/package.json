@@ -1,0 +1,29 @@
+{
+  "name": "@tinobruno/teams-puppeteer-mcp",
+  "version": "1.0.0",
+  "description": "High-performance Model Context Protocol (MCP) server for direct Microsoft Teams chat automation and unread message monitoring using Puppeteer",
+  "main": "index.js",
+  "type": "module",
+  "bin": {
+    "teams-puppeteer-mcp": "./index.js"
+  },
+  "scripts": {
+    "start": "node index.js"
+  },
+  "keywords": [
+    "mcp",
+    "model-context-protocol",
+    "microsoft-teams",
+    "teams",
+    "puppeteer",
+    "ai-agent",
+    "claude",
+    "cursor"
+  ],
+  "author": "Agatino Fabio Bruno",
+  "license": "MIT",
+  "dependencies": {
+    "@modelcontextprotocol/sdk": "^1.6.1",
+    "puppeteer": "^24.3.1"
+  }
+}

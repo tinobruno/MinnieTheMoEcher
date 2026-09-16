@@ -56,3 +56,6 @@ dist*/
 *.zip
 tmp/
 .moecher_config.json
+mcp_servers.json
+node_modules/
+calcolatrice/

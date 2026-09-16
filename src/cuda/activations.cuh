@@ -591,6 +591,8 @@ void store_kv_device_pos_cuda(
     const int32_t* d_position, int window, int head_dim,
     cudaStream_t stream = 0);
 
+void init_mla_dynamic_shared_memory();
+
 void mla_attention_fused_cuda(
     const __nv_bfloat16* raw_q,
     const __nv_bfloat16* raw_kv,
@@ -632,6 +634,7 @@ void compressor_device_step_cuda(
     const float* idx_ape = nullptr,
     const __nv_bfloat16* idx_norm = nullptr,
     __nv_bfloat16* idx_comp_kv_cache = nullptr,
+    int max_comp = 0,
     cudaStream_t stream = 0);
 
 void indexer_score_and_mask_cuda(

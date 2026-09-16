@@ -1154,11 +1154,7 @@ void mla_attention_cuda(
     int n_threads = 256;
     size_t smem_bytes = cache_len * sizeof(float);
     if (smem_bytes > 49152) {
-        static bool s_smem_configured = false;
-        if (!s_smem_configured) {
-            cudaFuncSetAttribute(mla_attention_kernel, cudaFuncAttributeMaxDynamicSharedMemorySize, 98304);
-            s_smem_configured = true;
-        }
+        init_mla_dynamic_shared_memory();
     }
     mla_attention_kernel<<<n_heads, n_threads, smem_bytes, stream>>>(
         q, kv, attn_sink, out, cache_len, head_dim, scale
@@ -4261,8 +4257,11 @@ __global__ void mla_attention_fused_kernel(
         sum0 += sc * kv_val.x;
         sum1 += sc * kv_val.y;
     }
+    int safe_comp = n_comp;
+    if (n_raw + safe_comp > max_cache_len) safe_comp = max_cache_len - n_raw;
+    if (safe_comp < 0) safe_comp = 0;
     #pragma unroll 4
-    for (int t = 0; t < n_comp; t++) {
+    for (int t = 0; t < safe_comp; t++) {
         float sc = scores[n_raw + t];
         const __nv_bfloat162* kv_pairs = reinterpret_cast<const __nv_bfloat162*>(comp_kv + (size_t)t * head_dim);
         float2 kv_val = to_float2_bf162(kv_pairs[tid]);
@@ -4292,6 +4291,37 @@ __global__ void mla_attention_fused_kernel(
     out[h * head_dim + tid * 2 + 1] = float_to_bf16(s_out[tid * 2 + 1]);
 }
 
+void init_mla_dynamic_shared_memory() {
+    static bool s_configured = false;
+    if (s_configured) return;
+    int dev = 0;
+    if (cudaGetDevice(&dev) != cudaSuccess) return;
+    cudaDeviceProp prop;
+    if (cudaGetDeviceProperties(&prop, dev) != cudaSuccess) return;
+
+    cudaFuncAttributes attr;
+    if (cudaFuncGetAttributes(&attr, mla_attention_kernel) == cudaSuccess) {
+        size_t max_allowed = (prop.sharedMemPerBlockOptin > attr.sharedSizeBytes) ?
+                             (prop.sharedMemPerBlockOptin - attr.sharedSizeBytes) : 0;
+        if (max_allowed > 49152) {
+            cudaFuncSetAttribute(mla_attention_kernel,
+                                 cudaFuncAttributeMaxDynamicSharedMemorySize,
+                                 (int)max_allowed);
+        }
+    }
+
+    if (cudaFuncGetAttributes(&attr, mla_attention_fused_kernel) == cudaSuccess) {
+        size_t max_allowed = (prop.sharedMemPerBlockOptin > attr.sharedSizeBytes) ?
+                             (prop.sharedMemPerBlockOptin - attr.sharedSizeBytes) : 0;
+        if (max_allowed > 49152) {
+            cudaFuncSetAttribute(mla_attention_fused_kernel,
+                                 cudaFuncAttributeMaxDynamicSharedMemorySize,
+                                 (int)max_allowed);
+        }
+    }
+    s_configured = true;
+}
+
 void mla_attention_fused_cuda(
     const __nv_bfloat16* raw_q,
     const __nv_bfloat16* raw_kv,
@@ -4313,11 +4343,7 @@ void mla_attention_fused_cuda(
     int n_threads = 256;
     size_t smem_bytes = max_cache_len * sizeof(float);
     if (smem_bytes > 49152) {
-        static bool s_smem_fused_configured = false;
-        if (!s_smem_fused_configured) {
-            cudaFuncSetAttribute(mla_attention_fused_kernel, cudaFuncAttributeMaxDynamicSharedMemorySize, 98304);
-            s_smem_fused_configured = true;
-        }
+        init_mla_dynamic_shared_memory();
     }
     int n_heads = 64;
     mla_attention_fused_kernel<<<n_heads, n_threads, smem_bytes, stream>>>(
@@ -4352,7 +4378,8 @@ __global__ void compressor_device_step_kernel(
     float* __restrict__ idx_score_state,
     const float* __restrict__ idx_ape,
     const __nv_bfloat16* __restrict__ idx_norm,
-    __nv_bfloat16* __restrict__ idx_comp_kv_cache)
+    __nv_bfloat16* __restrict__ idx_comp_kv_cache,
+    int max_comp)
 {
     int pos = *d_position;
     int pos_mod = pos % ratio;
@@ -4453,6 +4480,8 @@ __global__ void compressor_device_step_kernel(
 
     // 6. Attention RoPE (applied to tail rope_dim = 64)
     int comp_pos = pos + 1 - ratio;
+    if (comp_pos >= 65536) comp_pos = 65535;
+    if (comp_pos < 0) comp_pos = 0;
     int half_rope = rope_dim / 2;
     if (threadIdx.x < half_rope) {
         int pair_id = threadIdx.x;
@@ -4468,8 +4497,10 @@ __global__ void compressor_device_step_kernel(
 
     // 7. Store Attention Compressed Entry & Shift State
     int comp_idx = *d_comp_count;
-    for (int j = threadIdx.x; j < head_dim; j += blockDim.x) {
-        comp_kv_cache[(size_t)comp_idx * head_dim + j] = float_to_bf16(s_normed[j]);
+    if (max_comp <= 0 || comp_idx < max_comp) {
+        for (int j = threadIdx.x; j < head_dim; j += blockDim.x) {
+            comp_kv_cache[(size_t)comp_idx * head_dim + j] = float_to_bf16(s_normed[j]);
+        }
     }
     if (overlap) {
         int half_elements = ratio * proj_dim;
@@ -4549,8 +4580,10 @@ __global__ void compressor_device_step_kernel(
         __syncthreads();
 
         if (threadIdx.x < idx_head_dim) {
-            int j = threadIdx.x;
-            idx_comp_kv_cache[(size_t)comp_idx * idx_head_dim + j] = float_to_bf16(s_idx_normed[j]);
+            if (max_comp <= 0 || comp_idx < max_comp) {
+                int j = threadIdx.x;
+                idx_comp_kv_cache[(size_t)comp_idx * idx_head_dim + j] = float_to_bf16(s_idx_normed[j]);
+            }
         }
         int idx_half_elements = ratio * idx_proj_dim;
         for (int i = threadIdx.x; i < idx_half_elements; i += blockDim.x) {
@@ -4562,7 +4595,9 @@ __global__ void compressor_device_step_kernel(
 
     // 9. Increment Device Compressed Entry Counter
     if (threadIdx.x == 0) {
-        *d_comp_count += 1;
+        if (max_comp <= 0 || *d_comp_count < max_comp) {
+            *d_comp_count += 1;
+        }
     }
 }
 
@@ -4588,6 +4623,7 @@ void compressor_device_step_cuda(
     const float* idx_ape,
     const __nv_bfloat16* idx_norm,
     __nv_bfloat16* idx_comp_kv_cache,
+    int max_comp,
     cudaStream_t stream)
 {
     compressor_device_step_kernel<<<1, 256, 0, stream>>>(
@@ -4598,7 +4634,8 @@ void compressor_device_step_cuda(
         ratio, head_dim, rope_dim, rms_norm_eps,
         idx_proj_kv, idx_proj_gate,
         idx_kv_state, idx_score_state, idx_ape, idx_norm,
-        idx_comp_kv_cache);
+        idx_comp_kv_cache,
+        max_comp);
 }
 
 // ════════════════════════════════════════════════════════════════════════════════

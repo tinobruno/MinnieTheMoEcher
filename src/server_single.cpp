@@ -11,6 +11,7 @@
 #include "thread_pool.h"
 #include "embedded_web.hpp"
 #include "tool_exec.hpp"
+#include "mcp_client.hpp"
 
 #include <cstdio>
 #include <cstdlib>
@@ -105,6 +106,7 @@ bool g_track_reset = false;
 bool g_enable_tools = true;
 bool g_server_exec = true;
 bool g_headless_browsing = false;
+int g_max_tool_rounds = 10;
 static std::atomic<bool> g_stop_requested{false};
 
 
@@ -143,6 +145,8 @@ enum class ModelArch { DEEPSEEK_V4, QWEN };
 
 struct ModelConfig {
     ModelArch architecture = ModelArch::DEEPSEEK_V4;
+    std::string model_name = "";
+    std::string model_id = "";
     int vocab_size = 129280;
     int hidden_size = 4096;
     int num_hidden_layers = 43;
@@ -167,7 +171,7 @@ struct ModelConfig {
     int original_seq_len = 65536;
     int sliding_window = 128;
     int window_size = 128;              // raw attention window per layer (paper: 128)
-    int max_seq_len = 32768;           // max sequence context length
+    int max_seq_len = 65536;           // max sequence context length (default: 64k)
     std::string scoring_func = "sqrtsoftplus";
     float routed_scaling_factor = 1.5f;
     float swiglu_limit = 10.0f;
@@ -198,6 +202,10 @@ struct ModelConfig {
                 architecture = ModelArch::DEEPSEEK_V4;
             }
         }
+        get(model_name, "model_name");
+        get(model_id, "model_id");
+        if (model_name.empty()) get(model_name, "name");
+        if (model_id.empty()) get(model_id, "id");
         get(vocab_size, "vocab_size");
         get(hidden_size, "hidden_size");
         get(num_hidden_layers, "num_hidden_layers");
@@ -2573,6 +2581,41 @@ public:
     ModelConfig cfg_;
     BPETokenizer tokenizer_;
     std::string model_dir_;
+    std::string manifest_path_;
+
+    std::string get_model_id() const {
+        if (!cfg_.model_id.empty()) return cfg_.model_id;
+        if (cfg_.architecture == ModelArch::QWEN) {
+            if (model_dir_.find("q4") != std::string::npos || manifest_path_.find("q4") != std::string::npos) {
+                return "qwen3.8-27b-q4";
+            }
+            return "qwen3.8-27b";
+        }
+        if (model_dir_.find("coder") != std::string::npos || manifest_path_.find("coder") != std::string::npos) {
+            return "deepseek-coder-v2-lite";
+        }
+        if (model_dir_.find("q4") != std::string::npos || manifest_path_.find("q4") != std::string::npos) {
+            return "deepseek-v4-flash-q4";
+        }
+        return "deepseek-v4-flash";
+    }
+
+    std::string get_model_display_name() const {
+        if (!cfg_.model_name.empty()) return cfg_.model_name;
+        if (cfg_.architecture == ModelArch::QWEN) {
+            if (model_dir_.find("q4") != std::string::npos || manifest_path_.find("q4") != std::string::npos) {
+                return "Qwen 3.8 27B Q4";
+            }
+            return "Qwen 3.8 27B";
+        }
+        if (model_dir_.find("coder") != std::string::npos || manifest_path_.find("coder") != std::string::npos) {
+            return "DeepSeek Coder V2 Lite";
+        }
+        if (model_dir_.find("q4") != std::string::npos || manifest_path_.find("q4") != std::string::npos) {
+            return "DeepSeek V4-Flash Q4";
+        }
+        return "DeepSeek V4-Flash";
+    }
     
     // Qwen 3.8 2B Neural Speculative Draft Engine (legacy)
     QwenDraftEngine2B qwen_draft_;
@@ -3077,7 +3120,9 @@ public:
     // ── Load model from manifest ────────────────────────────────────────────
 
     bool load(const std::string& manifest_path, float max_vram_gb = 0.0f, float dram_cache_gb = 0.0f,
-              const std::string& expert_dtype_override = "", bool buffered_io = false) {
+              const std::string& expert_dtype_override = "", bool buffered_io = false,
+              int max_seq_len_override = 0) {
+        manifest_path_ = manifest_path;
         LOG_INFO("Loading manifest: %s", manifest_path.c_str());
 
         std::ifstream f(manifest_path);
@@ -3087,12 +3132,28 @@ public:
 
         // Parse config
         cfg_.from_json(manifest["model_config"]);
+        if (max_seq_len_override > 0) {
+            cfg_.max_seq_len = max_seq_len_override;
+            cfg_.max_compressed_entries = 0;
+            for (int r : cfg_.compress_ratios) {
+                if (r > 0) {
+                    int entries = cfg_.max_seq_len / r + 2;
+                    if (entries > cfg_.max_compressed_entries) cfg_.max_compressed_entries = entries;
+                }
+            }
+        }
+        if (cfg_.model_name.empty() && manifest.contains("model_name")) {
+            cfg_.model_name = manifest["model_name"].get<std::string>();
+        }
+        if (cfg_.model_id.empty() && manifest.contains("model_id")) {
+            cfg_.model_id = manifest["model_id"].get<std::string>();
+        }
         if (!expert_dtype_override.empty()) {
             cfg_.expert_dtype = expert_dtype_override;
         }
-        LOG_INFO("Model: %d layers, %d experts, %d active, hidden=%d, dtype=%s",
+        LOG_INFO("Model: %d layers, %d experts, %d active, hidden=%d, dtype=%s, max_seq_len=%d",
                  cfg_.num_hidden_layers, cfg_.n_routed_experts,
-                 cfg_.num_experts_per_tok, cfg_.hidden_size, cfg_.expert_dtype.c_str());
+                 cfg_.num_experts_per_tok, cfg_.hidden_size, cfg_.expert_dtype.c_str(), cfg_.max_seq_len);
 
         std::filesystem::path manifest_p(manifest_path);
         std::filesystem::path base_dir = manifest_p.parent_path();
@@ -3181,7 +3242,8 @@ public:
         size_t vram_free_after_dense;
         CUDA_CHECK(cudaMemGetInfo(&vram_free_after_dense, &vram_total));
         size_t total_experts_bytes = (size_t)expert_n_layers * expert_n_experts * expert_block_size;
-        size_t cache_budget = vram_free_after_dense > (1ULL * 1024 * 1024 * 1024) ? (vram_free_after_dense - 1ULL * 1024 * 1024 * 1024) : vram_free_after_dense;
+        size_t vram_reserve = 4ULL * 1024 * 1024 * 1024; // reserve 4GB for KV cache snapshots, activations and CUDA graphs
+        size_t cache_budget = vram_free_after_dense > vram_reserve ? (vram_free_after_dense - vram_reserve) : vram_free_after_dense;
         
         if (max_vram_gb > 0.0f) {
             size_t max_vram_bytes = (size_t)(max_vram_gb * 1024.0 * 1024.0 * 1024.0);
@@ -3381,6 +3443,7 @@ public:
     }
 
     void init_cuda_graph() {
+        init_mla_dynamic_shared_memory();
         if (cfg_.architecture != ModelArch::QWEN && !expert_loader_.all_resident(cfg_.num_hidden_layers)) {
             LOG_INFO("Running in eager mode for decode verification.");
             graph_captured_ = false;
@@ -3913,7 +3976,7 @@ public:
 
     // ── Generate tokens ─────────────────────────────────────────────────────
 
-    std::string generate(const std::vector<int>& prompt, int max_tokens = 512,
+    std::string generate(const std::vector<int>& prompt_in, int max_tokens = 512,
                          float temperature = 1.0f,
                          std::function<bool(const std::string&,bool)> on_token = nullptr,
                          float repetition_penalty = 1.0f,
@@ -3922,6 +3985,15 @@ public:
                          float top_p = 0.95f,
                          float min_p = 0.0f,
                          int top_k = 1024) {
+        // Ensure prompt fits within max_seq_len (defense-in-depth safety clamp)
+        std::vector<int> prompt = prompt_in;
+        if (prompt.size() > (size_t)cfg_.max_seq_len) {
+            LOG_WARN("[Engine] Prompt size (%zu) exceeds max_seq_len (%d). Clamping prompt to context limit.",
+                     prompt.size(), cfg_.max_seq_len);
+            size_t excess = prompt.size() - (size_t)cfg_.max_seq_len;
+            prompt.erase(prompt.begin(), prompt.begin() + excess);
+        }
+
         // Reset debug flags for this request
         dbg_first_token_ = false;
         dbg_hc_pre_call_ = 0;
@@ -3949,9 +4021,11 @@ public:
             size_t turn_len = turn_kv_snapshot_.tokens.size();
             if (prompt.size() >= turn_len) {
                 bool turn_matches = true;
+                size_t first_diff = turn_len;
                 for (size_t i = 0; i < turn_len; i++) {
                     if (prompt[i] != turn_kv_snapshot_.tokens[i]) {
                         turn_matches = false;
+                        first_diff = i;
                         break;
                     }
                 }
@@ -3961,7 +4035,12 @@ public:
                     can_reuse_prefix = true;
                     LOG_INFO("Restored rolling Turn KV Cache snapshot of %zu tokens (<0.1ms). Skipping prefill 0..%zu, evaluating %zu..%zu",
                              turn_len, turn_len > 0 ? turn_len - 1 : 0, turn_len, prompt.size() - 1);
+                } else {
+                    LOG_INFO("Turn KV snapshot mismatch: prompt size %zu, snapshot size %zu, first diff at index %zu (prompt[%zu]=%d, snapshot[%zu]=%d)",
+                             prompt.size(), turn_len, first_diff, first_diff, prompt[first_diff], first_diff, turn_kv_snapshot_.tokens[first_diff]);
                 }
+            } else {
+                LOG_INFO("Turn KV snapshot skipped: prompt size %zu < snapshot size %zu", prompt.size(), turn_len);
             }
         }
 
@@ -3970,9 +4049,11 @@ public:
             size_t sys_len = system_kv_snapshot_.tokens.size();
             if (prompt.size() >= sys_len) {
                 bool sys_matches = true;
+                size_t first_diff = sys_len;
                 for (size_t i = 0; i < sys_len; i++) {
                     if (prompt[i] != system_kv_snapshot_.tokens[i]) {
                         sys_matches = false;
+                        first_diff = i;
                         break;
                     }
                 }
@@ -3982,7 +4063,12 @@ public:
                     can_reuse_prefix = true;
                     LOG_INFO("Restored pinned System KV Cache snapshot of %zu tokens (<0.1ms). Skipping system prefill 0..%zu, evaluating %zu..%zu",
                              sys_len, sys_len > 0 ? sys_len - 1 : 0, sys_len, prompt.size() - 1);
+                } else {
+                    LOG_INFO("System KV snapshot mismatch: prompt size %zu, snapshot size %zu, first diff at index %zu (prompt[%zu]=%d, snapshot[%zu]=%d)",
+                             prompt.size(), sys_len, first_diff, first_diff, prompt[first_diff], first_diff, system_kv_snapshot_.tokens[first_diff]);
                 }
+            } else {
+                LOG_INFO("System KV snapshot skipped: prompt size %zu < snapshot size %zu", prompt.size(), sys_len);
             }
         }
 
@@ -5389,6 +5475,7 @@ private:
             lw.indexer_comp_ape.f32(),
             lw.indexer_comp_norm.bf16(),
             lw.indexer_comp_kv_cache.bf16(),
+            (cfg_.max_seq_len / ratio + 2),
             main_stream_);
     }
 
@@ -7419,7 +7506,7 @@ static json resolve_canonical_tools(const json& tools_input) {
             {"type", "function"},
             {"function", {
                 {"name", "web_search"},
-                {"description", "Search the live web or find YouTube media. Found YouTube video links will automatically play in the user's preview panel."},
+                {"description", "Search the live web for facts, documentation, news, websites, articles, and general information."},
                 {"parameters", {
                     {"type", "object"},
                     {"properties", {
@@ -7595,7 +7682,8 @@ static std::vector<int> apply_chat_template(const json& messages, const BPEToken
             "{\"name\": \"<function-name>\", \"arguments\": <args-json-object>}\n"
             "</tool_call>\n\n"
             "## Tool Usage Instructions:\n"
-            "- CRITICAL RULE: When the user asks to search the web, search Google, look up facts, recent news, people, documentation, code, or websites, you MUST immediately invoke the `web_search` tool.\n"
+            "- CRITICAL RULE: When the user asks to search (e.g. 'search <query>', 'who is <person>', 'what is <topic>', search Google, look up facts, recent news, people, documentation, code, or websites), you MUST immediately invoke the `web_search` tool.\n"
+            "- CRITICAL DISAMBIGUATION: ONLY invoke `youtube_search` when the user EXPLICITLY asks to play, watch, or listen to media, or explicitly asks for a video/song (e.g. 'play ...', 'listen to ...', 'watch ...', 'youtube ...', 'song ...', 'music video ...'). NEVER invoke `youtube_search` for queries starting with 'search' or seeking information about people/topics even if earlier turns were about music.\n"
             "- When the user provides a specific URL or asks to inspect, fetch, or browse a website, invoke the `fetch_url` tool.\n"
             "- When the user asks to read, write, or edit local files, invoke `read_file`, `write_file`, or `edit_file`.\n"
             "- When the user asks to run terminal commands or inspect system state, invoke `execute_command`.\n"
@@ -7609,10 +7697,11 @@ static std::vector<int> apply_chat_template(const json& messages, const BPEToken
             "## Media Playback & Web Preview Integration:\n"
             "You are integrated with an interactive client-side HTML Preview Panel that displays web pages and plays YouTube videos with autoplay.\n"
             "- When the user asks to play music, a song, or a video (e.g. 'play ...', 'listen to ...', 'watch ...'):\n"
-            "  1. Use `web_search` to search for the song on YouTube (e.g. query='<song title> youtube').\n"
-            "  2. Find the direct YouTube watch URL from the results (e.g. 'https://www.youtube.com/watch?v=...').\n"
-            "  3. Call `fetch_url` on that direct YouTube URL in the next turn.\n"
-            "  4. Fetching the YouTube URL automatically opens the player in the user's preview panel and starts autoplay. Inform the user that the video is now playing in the preview panel!\n";
+            "  1. Invoke the `youtube_search` tool directly (e.g. query='<song or artist name>').\n"
+            "  2. Direct YouTube search immediately returns the video and automatically opens the player in the user's preview panel with autoplay! Inform the user that the song/video is now playing in the preview panel.\n"
+            "  3. CRITICAL: Once the video is found, DO NOT invoke `fetch_url` or any other tool on YouTube URLs or watch pages. The video is already rendered and playing in the frontend preview panel.\n"
+            "  4. If `youtube_search` is not available, invoke `web_search` as a fallback.\n"
+            "- For any query that says 'search ...' or asks who/what something is, ALWAYS use `web_search`.\n";
     }
 
     int IM_START = tok.get_token_id("<|im_start|>");
@@ -8507,7 +8596,489 @@ static void set_windows_system_proxy(bool enable, const std::string& proxy_serve
 // ════════════════════════════════════════════════════════════════════════════════
 
 static std::mutex g_engine_mutex;  // serialize inference requests
+static std::atomic<bool> g_engine_busy{false}; // active request lock
+
+struct EngineBusyGuard {
+    bool locked = false;
+    EngineBusyGuard() {
+        bool expected = false;
+        locked = g_engine_busy.compare_exchange_strong(expected, true);
+    }
+    ~EngineBusyGuard() {
+        if (locked) {
+            g_engine_busy.store(false);
+        }
+    }
+    bool is_locked() const { return locked; }
+};
+
 static int g_request_counter = 0;  // for unique request IDs
+static json s_last_conv_messages = json::array();
+
+static std::vector<int> build_continuation_prompt(
+    const MoecherEngine& engine,
+    const std::vector<json>& new_messages,
+    bool enable_thinking,
+    const std::string& reasoning_effort)
+{
+    const auto& tok = engine.tokenizer_;
+    std::vector<int> result = engine.turn_kv_snapshot_.tokens;
+
+    if (engine.cfg_.architecture == ModelArch::QWEN) {
+        int IM_START = tok.get_token_id("<|im_start|>");
+        int IM_END = tok.get_token_id("<|im_end|>");
+        auto nl = tok.encode("\n");
+        result.push_back(IM_END);
+        result.insert(result.end(), nl.begin(), nl.end());
+        for (const auto& msg : new_messages) {
+            std::string role = msg.value("role", "user");
+            std::string content = msg.value("content", "");
+            result.push_back(IM_START);
+            if (role == "tool" || role == "function") {
+                auto u_enc = tok.encode("user\n<tool_response>\n" + content + "\n</tool_response>");
+                result.insert(result.end(), u_enc.begin(), u_enc.end());
+            } else {
+                auto u_enc = tok.encode("user\n" + content);
+                result.insert(result.end(), u_enc.begin(), u_enc.end());
+            }
+            result.push_back(IM_END);
+            result.insert(result.end(), nl.begin(), nl.end());
+        }
+        result.push_back(IM_START);
+        auto asst_enc = tok.encode("assistant\n");
+        result.insert(result.end(), asst_enc.begin(), asst_enc.end());
+        if (enable_thinking) {
+            auto th_enc = tok.encode("<think>\n");
+            result.insert(result.end(), th_enc.begin(), th_enc.end());
+        } else {
+            auto th_enc = tok.encode("<think>\n\n</think>\n");
+            result.insert(result.end(), th_enc.begin(), th_enc.end());
+        }
+    } else {
+        // DeepSeek V4
+        int EOS = tok.get_token_id("<｜end of sentence｜>");
+        if (EOS < 0) EOS = tok.get_token_id("<｜end\xe2\x96\x81of\xe2\x96\x81sentence｜>");
+        if (EOS < 1) EOS = 1;
+
+        int USER = tok.get_token_id("<｜User｜>");
+        if (USER < 0) USER = 128803;
+
+        int ASSISTANT = tok.get_token_id("<｜Assistant｜>");
+        if (ASSISTANT < 0) ASSISTANT = 128804;
+
+        int THINK_BEGIN = tok.get_token_id("<think>");
+        if (THINK_BEGIN < 0) THINK_BEGIN = 128821;
+
+        int THINK_END = tok.get_token_id("</think>");
+        if (THINK_END < 0) THINK_END = 128822;
+
+        result.push_back(EOS);
+        for (const auto& msg : new_messages) {
+            std::string role = msg.value("role", "user");
+            std::string content = msg.value("content", "");
+            result.push_back(USER);
+            if (role == "tool" || role == "function") {
+                auto enc = tok.encode("<tool_response>\n" + content + "\n</tool_response>");
+                result.insert(result.end(), enc.begin(), enc.end());
+            } else {
+                auto enc = tok.encode(content);
+                result.insert(result.end(), enc.begin(), enc.end());
+            }
+        }
+        result.push_back(ASSISTANT);
+        if (enable_thinking) {
+            result.push_back(THINK_BEGIN);
+        } else {
+            result.push_back(THINK_BEGIN);
+            result.push_back(THINK_END);
+        }
+    }
+    return result;
+}
+
+static bool check_and_build_continuation(
+    const MoecherEngine& engine,
+    const json& current_messages,
+    const json& last_conv_messages,
+    bool enable_thinking,
+    const std::string& reasoning_effort,
+    std::vector<int>& out_prompt)
+{
+    if (!engine.turn_kv_snapshot_.valid || engine.turn_kv_snapshot_.tokens.empty()) {
+        return false;
+    }
+    if (last_conv_messages.empty() || current_messages.size() <= last_conv_messages.size()) {
+        return false;
+    }
+
+    size_t prev_len = last_conv_messages.size();
+    // Check if the previous messages match in role
+    for (size_t i = 0; i < prev_len; i++) {
+        std::string cur_role = current_messages[i].value("role", "");
+        std::string last_role = last_conv_messages[i].value("role", "");
+        if (cur_role != last_role) {
+            return false;
+        }
+    }
+
+    // Check if previous assistant message matches
+    if (prev_len > 0) {
+        std::string cur_asst = current_messages[prev_len - 1].value("content", "");
+        std::string last_asst = last_conv_messages[prev_len - 1].value("content", "");
+        if (!cur_asst.empty() && !last_asst.empty() && cur_asst != last_asst) {
+            return false;
+        }
+    }
+
+    // Collect new messages (user / tool)
+    std::vector<json> new_msgs;
+    for (size_t i = prev_len; i < current_messages.size(); i++) {
+        std::string role = current_messages[i].value("role", "");
+        if (role != "user" && role != "tool" && role != "function") {
+            return false;
+        }
+        new_msgs.push_back(current_messages[i]);
+    }
+
+    if (new_msgs.empty()) return false;
+
+    out_prompt = build_continuation_prompt(engine, new_msgs, enable_thinking, reasoning_effort);
+    return true;
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Context Window Pruning: Evict oldest turns when context limit is approached
+// ─────────────────────────────────────────────────────────────────────────────
+static json prune_messages_to_fit(
+    const json& messages,
+    const BPETokenizer& tok,
+    int max_allowed_tokens,
+    bool enable_thinking,
+    const std::string& reasoning_effort,
+    const json& tools)
+{
+    json pruned = messages;
+    if (pruned.empty()) return pruned;
+
+    std::vector<int> test_prompt = apply_chat_template(pruned, tok, enable_thinking, reasoning_effort, tools);
+    if (test_prompt.size() <= (size_t)max_allowed_tokens) {
+        return pruned;
+    }
+
+    LOG_WARN("[Context] Prompt length (%zu) exceeds context budget (%d). Pruning older turns...",
+             test_prompt.size(), max_allowed_tokens);
+
+    bool has_system = (pruned[0].value("role", "") == "system");
+    size_t min_idx = has_system ? 1 : 0;
+
+    // Prune oldest non-system messages
+    while (pruned.size() > min_idx + 2) {
+        pruned.erase(min_idx);
+        test_prompt = apply_chat_template(pruned, tok, enable_thinking, reasoning_effort, tools);
+        if (test_prompt.size() <= (size_t)max_allowed_tokens) {
+            LOG_INFO("[Context] Pruning complete: retained %zu messages, prompt length %zu / %d",
+                     pruned.size(), test_prompt.size(), max_allowed_tokens);
+            return pruned;
+        }
+    }
+
+    // If still too long, truncate oversized individual messages (e.g. huge file reads)
+    while (test_prompt.size() > (size_t)max_allowed_tokens) {
+        size_t largest_idx = 0;
+        size_t largest_len = 0;
+        for (size_t i = min_idx; i < pruned.size(); i++) {
+            std::string content = pruned[i].value("content", "");
+            if (content.size() > largest_len) {
+                largest_len = content.size();
+                largest_idx = i;
+            }
+        }
+        if (largest_len < 300) break; // Cannot truncate safely further
+
+        std::string content = pruned[largest_idx].value("content", "");
+        size_t keep_len = (content.size() * 3) / 4;
+        std::string notice = "\n[... Content truncated to fit context window ...]\n";
+        if (keep_len > notice.size()) {
+            pruned[largest_idx]["content"] = content.substr(0, keep_len - notice.size()) + notice;
+        } else {
+            pruned[largest_idx]["content"] = notice;
+        }
+        test_prompt = apply_chat_template(pruned, tok, enable_thinking, reasoning_effort, tools);
+    }
+
+    LOG_INFO("[Context] Pruning finished: final prompt length %zu / %d",
+             test_prompt.size(), max_allowed_tokens);
+    return pruned;
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// ToolTagStreamFilter: On-demand lookahead interceptor for streaming tool calls
+// ─────────────────────────────────────────────────────────────────────────────
+struct ToolTagStreamFilter {
+    enum class State {
+        STREAMING,
+        BUFFERING_TAG,
+        BUFFERING_TOOL
+    };
+
+    State state = State::STREAMING;
+    std::string tag_candidate;
+    std::string tool_buffer;
+    std::string streamed_clean_text;
+    bool in_tool_calls_container = false;
+
+    bool feed(const std::string& text, const std::function<bool(const std::string&)>& emit_cb) {
+        std::string safe_chunk;
+        for (char c : text) {
+            if (state == State::STREAMING) {
+                if (c == '<') {
+                    state = State::BUFFERING_TAG;
+                    tag_candidate.clear();
+                    tag_candidate.push_back(c);
+                } else {
+                    safe_chunk.push_back(c);
+                }
+            } else if (state == State::BUFFERING_TAG) {
+                tag_candidate.push_back(c);
+
+                if (c == '>') {
+                    // Tag candidate is complete
+                    if (is_opening_tool_tag(tag_candidate)) {
+                        state = State::BUFFERING_TOOL;
+                        if (is_container_tool_tag(tag_candidate)) {
+                            in_tool_calls_container = true;
+                        }
+                        tool_buffer = tag_candidate;
+                        tag_candidate.clear();
+                    } else if (is_closing_or_standalone_tool_tag(tag_candidate)) {
+                        // Stray / standalone tool tag (e.g. </tool_call>, <｜tool sep｜>, </｜DSML...>)
+                        state = State::STREAMING;
+                        tag_candidate.clear();
+                    } else if (is_tool_tag_prefix(tag_candidate)) {
+                        // Matched tool syntax
+                        state = State::BUFFERING_TOOL;
+                        tool_buffer = tag_candidate;
+                        tag_candidate.clear();
+                    } else {
+                        // Normal HTML tag that happened to complete
+                        safe_chunk += tag_candidate;
+                        tag_candidate.clear();
+                        state = State::STREAMING;
+                    }
+                } else if (is_tool_tag_prefix(tag_candidate)) {
+                    // Still potentially a tool call tag, continue buffering
+                } else {
+                    // Diverged from tool tag syntax (e.g. <div>, <html>, <=, <!DOCTYPE)
+                    if (c == '<') {
+                        std::string prev = tag_candidate.substr(0, tag_candidate.size() - 1);
+                        safe_chunk += prev;
+                        tag_candidate = "<";
+                    } else {
+                        safe_chunk += tag_candidate;
+                        tag_candidate.clear();
+                        state = State::STREAMING;
+                    }
+                }
+            } else if (state == State::BUFFERING_TOOL) {
+                tool_buffer.push_back(c);
+                if (in_tool_calls_container) {
+                    if (ends_with_container_closing(tool_buffer)) {
+                        state = State::STREAMING;
+                        tool_buffer.clear();
+                        in_tool_calls_container = false;
+                    }
+                } else {
+                    if (ends_with_tool_closing(tool_buffer)) {
+                        state = State::STREAMING;
+                        tool_buffer.clear();
+                    }
+                }
+            }
+        }
+        if (!safe_chunk.empty()) {
+            streamed_clean_text += safe_chunk;
+            return emit_cb(safe_chunk);
+        }
+        return true;
+    }
+
+    bool flush_remaining(const std::function<bool(const std::string&)>& emit_cb) {
+        if (state == State::BUFFERING_TAG && !tag_candidate.empty()) {
+            std::string to_flush = tag_candidate;
+            tag_candidate.clear();
+            state = State::STREAMING;
+            // If it's a lonely '<' or '</', flush it.
+            // If it's an uncompleted tool/DSML tag (e.g. "<tool_call" or "<｜DSML" or "< DSML"), suppress it!
+            if (to_flush == "<" || to_flush == "</" || !is_tool_tag_prefix(to_flush)) {
+                streamed_clean_text += to_flush;
+                return emit_cb(to_flush);
+            }
+        }
+        state = State::STREAMING;
+        tool_buffer.clear();
+        in_tool_calls_container = false;
+        return true;
+    }
+
+private:
+    static std::string to_lower_ascii(const std::string& s) {
+        std::string res = s;
+        for (char& ch : res) {
+            if (ch >= 'A' && ch <= 'Z') ch = ch + ('a' - 'A');
+        }
+        return res;
+    }
+
+    static bool is_tool_tag_prefix(const std::string& s) {
+        if (s.empty()) return false;
+        if (s[0] != '<') return false;
+
+        size_t idx = 1;
+        if (idx < s.size() && s[idx] == '/') idx++;
+        while (idx < s.size() && s[idx] == ' ') idx++;
+
+        std::string rem = s.substr(idx);
+        if (rem.empty()) return true;
+
+        std::string rem_lower = to_lower_ascii(rem);
+
+        static const std::vector<std::string> roots = {
+            "tool_call",
+            "tool_calls",
+            "tools",
+            "tool",
+            "function_call",
+            "call",
+            "\xef\xbd\x9ctool call begin\xef\xbd\x9c",
+            "\xef\xbd\x9ctool call end\xef\xbd\x9c",
+            "\xef\xbd\x9ctool sep\xef\xbd\x9c",
+            "\xef\xbd\x9ctool outputs begin\xef\xbd\x9c",
+            "\xef\xbd\x9ctool outputs end\xef\xbd\x9c",
+            "|tool call begin|",
+            "|tool call end|",
+            "|tool sep|",
+            "|tool outputs begin|",
+            "|tool outputs end|",
+            "\xef\xbd\x9c" "dsml\xef\xbd\x9c" "tool_calls",
+            "\xef\xbd\x9c" "dsml\xef\xbd\x9c" "invoke",
+            "\xef\xbd\x9c" "dsml\xef\xbd\x9c" "parameter",
+            "\xef\xbd\x9c" "dsml",
+            "|dsml|tool_calls",
+            "|dsml|invoke",
+            "|dsml|parameter",
+            "|dsml",
+            "dsml:tool_calls",
+            "dsml_tool_calls",
+            "dsml:invoke",
+            "dsml invoke",
+            "dsml:parameter",
+            "dsml"
+        };
+
+        for (const auto& root : roots) {
+            if (rem_lower.size() <= root.size()) {
+                if (root.compare(0, rem_lower.size(), rem_lower) == 0) return true;
+            } else {
+                if (rem_lower.compare(0, root.size(), root) == 0) return true;
+            }
+        }
+
+        if (rem.size() == 1 && (unsigned char)rem[0] == 0xEF) return true;
+        if (rem.size() == 2 && (unsigned char)rem[0] == 0xEF && (unsigned char)rem[1] == 0xBD) return true;
+
+        return false;
+    }
+
+    static bool is_opening_tool_tag(const std::string& s) {
+        std::string lower = to_lower_ascii(s);
+        if (lower.find("</") != std::string::npos) return false;
+        if (lower.find("end") != std::string::npos) return false;
+        if (lower.find("sep") != std::string::npos) return false;
+
+        if (lower.find("tool_call") != std::string::npos) return true;
+        if (lower.find("tool_calls") != std::string::npos) return true;
+        if (lower.find("tools") != std::string::npos) return true;
+        if (lower.find("tool call begin") != std::string::npos) return true;
+        if (lower.find("dsml") != std::string::npos) return true;
+        if (lower.find("function_call") != std::string::npos) return true;
+        if (lower.find("<call") != std::string::npos) return true;
+        if (lower.find("<tool>") != std::string::npos || lower.find("<tool ") != std::string::npos) return true;
+
+        return false;
+    }
+
+    static bool is_container_tool_tag(const std::string& s) {
+        std::string lower = to_lower_ascii(s);
+        if (lower.find("tool_calls") != std::string::npos) return true;
+        if (lower.find("<tools>") != std::string::npos || lower.find("<tools ") != std::string::npos) return true;
+        return false;
+    }
+
+    static bool is_closing_or_standalone_tool_tag(const std::string& s) {
+        std::string lower = to_lower_ascii(s);
+        if (lower.find("end") != std::string::npos) return true;
+        if (lower.find("sep") != std::string::npos) return true;
+        if (lower.find("</tool") != std::string::npos) return true;
+        if (lower.find("</dsml") != std::string::npos) return true;
+        if (lower.find("</\xef\xbd\x9c" "dsml") != std::string::npos) return true;
+        if (lower.find("</|dsml") != std::string::npos) return true;
+        if (lower.find("</call>") != std::string::npos) return true;
+        if (lower.find("</function_call>") != std::string::npos) return true;
+        return false;
+    }
+
+    static bool ends_with(const std::string& s, const std::string& suffix) {
+        return s.size() >= suffix.size() && s.compare(s.size() - suffix.size(), suffix.size(), suffix) == 0;
+    }
+
+    static bool ends_with_container_closing(const std::string& s) {
+        std::string lower = to_lower_ascii(s);
+        static const std::vector<std::string> closings = {
+            "</tool_calls>",
+            "</tools>",
+            "</\xef\xbd\x9c" "dsml\xef\xbd\x9c" "tool_calls>",
+            "</|dsml|tool_calls>",
+            "</dsml:tool_calls>",
+            "</dsml_tool_calls>",
+            "</dsml>",
+            "</think>"
+        };
+        for (const auto& c : closings) {
+            if (ends_with(lower, c)) return true;
+        }
+        return false;
+    }
+
+    static bool ends_with_tool_closing(const std::string& s) {
+        std::string lower = to_lower_ascii(s);
+        static const std::vector<std::string> closings = {
+            "</tool_call>",
+            "</tool_calls>",
+            "</tools>",
+            "</tool>",
+            "</function_call>",
+            "</call>",
+            "<\xef\xbd\x9ctool call end\xef\xbd\x9c>",
+            "<|tool call end|>",
+            "<\xef\xbd\x9ctool outputs end\xef\xbd\x9c>",
+            "<|tool outputs end|>",
+            "</\xef\xbd\x9c" "dsml\xef\xbd\x9c" "tool_calls>",
+            "</|dsml|tool_calls>",
+            "</\xef\xbd\x9c" "dsml\xef\xbd\x9c" "invoke>",
+            "</|dsml|invoke>",
+            "</\xef\xbd\x9c" "dsml\xef\xbd\x9c" "parameter>",
+            "</|dsml|parameter>",
+            "</dsml:tool_calls>",
+            "</dsml_tool_calls>",
+            "</dsml>",
+            "</think>"
+        };
+        for (const auto& c : closings) {
+            if (ends_with(lower, c)) return true;
+        }
+        return false;
+    }
+};
 
 static void run_server(MoecherEngine& engine, int port, int default_thinking_budget = 4096, int proxy_port = 8002, bool enable_forward_proxy = true, bool enable_system_proxy = false) {
     httplib::Server svr;
@@ -8516,6 +9087,8 @@ static void run_server(MoecherEngine& engine, int port, int default_thinking_bud
     if (enable_forward_proxy) {
         moecher::proxy::start_forward_proxy(proxy_port);
     }
+
+    // Note: MCP (Model Context Protocol) Manager was initialized prior to pre-warming in main()
 
 #ifdef _WIN32
     if (enable_system_proxy) {
@@ -9215,7 +9788,12 @@ static void run_server(MoecherEngine& engine, int port, int default_thinking_bud
             auto doc = moecher::tooling::search_youtube_direct(query, num_results);
             if (doc.clean_text.empty()) {
                 // Fall back to configured search engine if direct YouTube gave 0 results
-                doc = moecher::tooling::web_search_full(query, num_results);
+                std::string api_key = args.value("api_key", "");
+                if (api_key.empty() && args.contains("tavily_api_key")) {
+                    api_key = args.value("tavily_api_key", "");
+                }
+                std::string provider = args.value("provider", "");
+                doc = moecher::tooling::web_search_full(query, num_results, "", provider, api_key);
             }
             output = doc.clean_text;
             resp_data["retrieved_document"] = {
@@ -9230,7 +9808,13 @@ static void run_server(MoecherEngine& engine, int port, int default_thinking_bud
             std::string site = args.value("site", "");
             std::string provider = args.value("provider", "");
             std::string api_key = args.value("api_key", "");
+            if (api_key.empty() && args.contains("tavily_api_key")) {
+                api_key = args.value("tavily_api_key", "");
+            }
             std::string cx = args.value("cx", "");
+            if (cx.empty() && args.contains("google_search_cx")) {
+                cx = args.value("google_search_cx", "");
+            }
             std::string searx_url = args.value("searxng_url", "");
             auto doc = moecher::tooling::web_search_full(query, num_results, site, provider, api_key, cx, searx_url);
             output = doc.clean_text;
@@ -9254,6 +9838,8 @@ static void run_server(MoecherEngine& engine, int port, int default_thinking_bud
                 {"html", doc.raw_html},
                 {"snippet", (doc.clean_text.size() > 300 ? doc.clean_text.substr(0, 300) + "..." : doc.clean_text)}
             };
+        } else if (moecher::mcp::MCPManager::instance().has_tool(tool_name)) {
+            output = moecher::mcp::MCPManager::instance().call_tool(tool_name, args, timeout_ms);
         } else {
             output = "[Unknown tool: " + tool_name + "]";
         }
@@ -9352,6 +9938,10 @@ static void run_server(MoecherEngine& engine, int port, int default_thinking_bud
 
     svr.Post("/api/kv/reset", [&engine](const httplib::Request&, httplib::Response& res) {
         res.set_header("Access-Control-Allow-Origin", "*");
+        {
+            std::lock_guard<std::mutex> lock(g_engine_mutex);
+            s_last_conv_messages.clear();
+        }
         engine.turn_kv_snapshot_.valid = false;
         if (engine.system_kv_snapshot_.valid) {
             engine.restore_system_kv();
@@ -9373,6 +9963,10 @@ static void run_server(MoecherEngine& engine, int port, int default_thinking_bud
 
     svr.Get("/api/kv/reset", [&engine](const httplib::Request&, httplib::Response& res) {
         res.set_header("Access-Control-Allow-Origin", "*");
+        {
+            std::lock_guard<std::mutex> lock(g_engine_mutex);
+            s_last_conv_messages.clear();
+        }
         engine.turn_kv_snapshot_.valid = false;
         if (engine.system_kv_snapshot_.valid) {
             engine.restore_system_kv();
@@ -9404,16 +9998,48 @@ static void run_server(MoecherEngine& engine, int port, int default_thinking_bud
     });
 
     svr.Get("/v1/models", [&engine](const httplib::Request&, httplib::Response& res) {
-        std::string model_id = (engine.cfg_.architecture == ModelArch::QWEN) ? "qwen3.8-27b-q4" : "deepseek-v4-flash";
+        std::string model_id = engine.get_model_id();
+        std::string display_name = engine.get_model_display_name();
+        std::string arch_desc = (engine.cfg_.architecture == ModelArch::QWEN)
+            ? "DeltaNet Linear Attention + MTP Speculative Decoding"
+            : (model_id.find("coder") != std::string::npos
+                ? "MoE Coder (64 Experts)"
+                : "Sparse MoE (11,008 Experts) + MLA Latent Attention");
         json body = {
             {"object", "list"},
             {"data", {
                 {
                     {"id", model_id},
+                    {"name", display_name},
+                    {"display_name", display_name},
                     {"object", "model"},
-                    {"owned_by", "moecher"}
+                    {"owned_by", "moecher"},
+                    {"architecture", arch_desc},
+                    {"max_context_length", engine.cfg_.max_seq_len},
+                    {"active", true}
                 }
             }}
+        };
+        res.set_content(body.dump(), "application/json");
+    });
+
+    svr.Get("/api/model", [&engine](const httplib::Request&, httplib::Response& res) {
+        std::string model_id = engine.get_model_id();
+        std::string display_name = engine.get_model_display_name();
+        std::string arch_desc = (engine.cfg_.architecture == ModelArch::QWEN)
+            ? "DeltaNet Linear Attention + MTP Speculative Decoding"
+            : (model_id.find("coder") != std::string::npos
+                ? "MoE Coder (64 Experts)"
+                : "Sparse MoE (11,008 Experts) + MLA Latent Attention");
+        json body = {
+            {"id", model_id},
+            {"name", display_name},
+            {"display_name", display_name},
+            {"architecture", arch_desc},
+            {"max_context_length", engine.cfg_.max_seq_len},
+            {"vocab_size", engine.cfg_.vocab_size},
+            {"max_tool_rounds", g_max_tool_rounds},
+            {"active", true}
         };
         res.set_content(body.dump(), "application/json");
     });
@@ -9428,9 +10054,232 @@ static void run_server(MoecherEngine& engine, int port, int default_thinking_bud
         res.set_content(profile.dump(), "application/json");
     });
 
+    // ── MCP (Model Context Protocol) API Endpoints ──────────────────────────────
+    svr.Get("/v1/mcp/servers", [](const httplib::Request&, httplib::Response& res) {
+        res.set_header("Access-Control-Allow-Origin", "*");
+        json servers = moecher::mcp::MCPManager::instance().get_servers_status_json();
+        json body = {
+            {"object", "list"},
+            {"data", servers}
+        };
+        res.set_content(body.dump(), "application/json");
+    });
+    svr.Options("/v1/mcp/servers", [](const httplib::Request&, httplib::Response& res) {
+        res.set_header("Access-Control-Allow-Origin", "*");
+        res.set_header("Access-Control-Allow-Methods", "GET, POST, DELETE, OPTIONS");
+        res.set_header("Access-Control-Allow-Headers", "*");
+        res.status = 204;
+    });
+
+    svr.Get("/v1/mcp/registry/search", [](const httplib::Request& req, httplib::Response& res) {
+        res.set_header("Access-Control-Allow-Origin", "*");
+        std::string query = req.get_param_value("q");
+        if (query.empty()) {
+            query = req.get_param_value("search");
+        }
+
+        // If user pasted a URL like https://registry.modelcontextprotocol.io/?q=teams
+        if (query.find("?q=") != std::string::npos) {
+            size_t qpos = query.find("?q=");
+            query = query.substr(qpos + 3);
+            size_t amp = query.find('&');
+            if (amp != std::string::npos) query = query.substr(0, amp);
+        } else if (query.find("&q=") != std::string::npos) {
+            size_t qpos = query.find("&q=");
+            query = query.substr(qpos + 3);
+            size_t amp = query.find('&');
+            if (amp != std::string::npos) query = query.substr(0, amp);
+        }
+
+        std::string target_url;
+        if (!query.empty()) {
+            std::string encoded_q;
+            for (char c : query) {
+                if (isalnum((unsigned char)c) || c == '-' || c == '_' || c == '.' || c == '~') {
+                    encoded_q += c;
+                } else if (c == ' ') {
+                    encoded_q += "%20";
+                } else {
+                    char hex[4];
+                    snprintf(hex, sizeof(hex), "%%%02X", (unsigned char)c);
+                    encoded_q += hex;
+                }
+            }
+            target_url = "https://registry.modelcontextprotocol.io/v0.1/servers?search=" + encoded_q + "&version=latest";
+        } else {
+            target_url = "https://registry.modelcontextprotocol.io/v0.1/servers?limit=30&version=latest";
+        }
+
+        std::string cmd = "curl -s -m 15 -H " + moecher::mcp::escape_shell_arg("Accept: application/json") + " " + moecher::mcp::escape_shell_arg(target_url);
+        std::string output = moecher::mcp::execute_curl_command(cmd, 15000);
+
+        if (output.empty()) {
+            res.status = 502;
+            res.set_content("{\"servers\":[],\"error\":\"Failed to reach registry.modelcontextprotocol.io\"}", "application/json");
+            return;
+        }
+
+        try {
+            auto parsed = json::parse(output);
+            res.set_content(parsed.dump(), "application/json");
+        } catch (...) {
+            res.status = 502;
+            res.set_content("{\"servers\":[],\"error\":\"Invalid JSON returned from registry\"}", "application/json");
+        }
+    });
+
+    svr.Options("/v1/mcp/registry/search", [](const httplib::Request&, httplib::Response& res) {
+        res.set_header("Access-Control-Allow-Origin", "*");
+        res.set_header("Access-Control-Allow-Methods", "GET, OPTIONS");
+        res.set_header("Access-Control-Allow-Headers", "*");
+        res.status = 204;
+    });
+
+    svr.Post("/v1/mcp/servers", [](const httplib::Request& req, httplib::Response& res) {
+        res.set_header("Access-Control-Allow-Origin", "*");
+        json body;
+        try { body = json::parse(req.body); }
+        catch (...) {
+            res.status = 400;
+            res.set_content("{\"error\":\"Invalid JSON\"}", "application/json");
+            return;
+        }
+        std::string s_id = body.value("id", "");
+        if (s_id.empty() && body.contains("server") && body["server"].is_object() && body["server"].contains("name")) {
+            std::string full_name = body["server"]["name"].get<std::string>();
+            size_t slash_pos = full_name.find_last_of('/');
+            s_id = (slash_pos != std::string::npos) ? full_name.substr(slash_pos + 1) : full_name;
+        } else if (s_id.empty() && body.contains("mcpServers") && body["mcpServers"].is_object() && !body["mcpServers"].empty()) {
+            s_id = body["mcpServers"].begin().key();
+        }
+        if (s_id.empty()) {
+            res.status = 400;
+            res.set_content("{\"error\":\"'id' is required or could not be determined from JSON manifest\"}", "application/json");
+            return;
+        }
+        std::string old_id = body.value("old_id", "");
+        if (!old_id.empty() && old_id != s_id) {
+            moecher::mcp::MCPManager::instance().remove_server(old_id);
+        }
+        auto cfg = moecher::mcp::MCPServerConfig::from_json(s_id, body);
+        bool ok = moecher::mcp::MCPManager::instance().add_or_update_server(cfg, cfg.enabled);
+        moecher::mcp::MCPManager::instance().save_config();
+        json resp = {
+            {"status", ok ? "ok" : "error"},
+            {"id", s_id},
+            {"servers", moecher::mcp::MCPManager::instance().get_servers_status_json()}
+        };
+        res.set_content(resp.dump(), "application/json");
+    });
+
+    svr.Delete("/v1/mcp/servers", [](const httplib::Request& req, httplib::Response& res) {
+        res.set_header("Access-Control-Allow-Origin", "*");
+        std::string s_id = req.get_param_value("id");
+        if (s_id.empty() && !req.body.empty()) {
+            try {
+                json body = json::parse(req.body);
+                s_id = body.value("id", "");
+            } catch (...) {}
+        }
+        if (s_id.empty()) {
+            res.status = 400;
+            res.set_content("{\"error\":\"'id' parameter is required\"}", "application/json");
+            return;
+        }
+        bool ok = moecher::mcp::MCPManager::instance().remove_server(s_id);
+        moecher::mcp::MCPManager::instance().save_config();
+        json resp = {
+            {"status", ok ? "ok" : "error"},
+            {"id", s_id},
+            {"servers", moecher::mcp::MCPManager::instance().get_servers_status_json()}
+        };
+        res.set_content(resp.dump(), "application/json");
+    });
+
+    svr.Post("/v1/mcp/servers/restart", [](const httplib::Request& req, httplib::Response& res) {
+        res.set_header("Access-Control-Allow-Origin", "*");
+        std::string s_id = req.get_param_value("id");
+        if (s_id.empty() && !req.body.empty()) {
+            try {
+                json body = json::parse(req.body);
+                s_id = body.value("id", "");
+            } catch (...) {}
+        }
+        if (s_id.empty()) {
+            res.status = 400;
+            res.set_content("{\"error\":\"'id' is required\"}", "application/json");
+            return;
+        }
+        bool ok = moecher::mcp::MCPManager::instance().restart_server(s_id);
+        json resp = {
+            {"status", ok ? "ok" : "error"},
+            {"id", s_id},
+            {"servers", moecher::mcp::MCPManager::instance().get_servers_status_json()}
+        };
+        res.set_content(resp.dump(), "application/json");
+    });
+    svr.Options("/v1/mcp/servers/restart", [](const httplib::Request&, httplib::Response& res) {
+        res.set_header("Access-Control-Allow-Origin", "*");
+        res.set_header("Access-Control-Allow-Methods", "POST, OPTIONS");
+        res.set_header("Access-Control-Allow-Headers", "*");
+        res.status = 204;
+    });
+
+    svr.Post("/v1/mcp/servers/toggle", [](const httplib::Request& req, httplib::Response& res) {
+        res.set_header("Access-Control-Allow-Origin", "*");
+        json body;
+        try { body = json::parse(req.body); } catch (...) {}
+        std::string s_id = body.value("id", req.get_param_value("id"));
+        bool enabled = body.value("enabled", true);
+        if (s_id.empty()) {
+            res.status = 400;
+            res.set_content("{\"error\":\"'id' is required\"}", "application/json");
+            return;
+        }
+        bool ok = moecher::mcp::MCPManager::instance().toggle_server(s_id, enabled);
+        moecher::mcp::MCPManager::instance().save_config();
+        json resp = {
+            {"status", ok ? "ok" : "error"},
+            {"id", s_id},
+            {"enabled", enabled},
+            {"servers", moecher::mcp::MCPManager::instance().get_servers_status_json()}
+        };
+        res.set_content(resp.dump(), "application/json");
+    });
+    svr.Options("/v1/mcp/servers/toggle", [](const httplib::Request&, httplib::Response& res) {
+        res.set_header("Access-Control-Allow-Origin", "*");
+        res.set_header("Access-Control-Allow-Methods", "POST, OPTIONS");
+        res.set_header("Access-Control-Allow-Headers", "*");
+        res.status = 204;
+    });
+
+    svr.Get("/v1/mcp/tools", [](const httplib::Request&, httplib::Response& res) {
+        res.set_header("Access-Control-Allow-Origin", "*");
+        json tools_schema = moecher::mcp::MCPManager::instance().get_openai_tools_schema();
+        json body = {
+            {"object", "list"},
+            {"data", tools_schema}
+        };
+        res.set_content(body.dump(), "application/json");
+    });
+    svr.Options("/v1/mcp/tools", [](const httplib::Request&, httplib::Response& res) {
+        res.set_header("Access-Control-Allow-Origin", "*");
+        res.set_header("Access-Control-Allow-Methods", "GET, OPTIONS");
+        res.set_header("Access-Control-Allow-Headers", "*");
+        res.status = 204;
+    });
+
     // Chat completions
     svr.Post("/v1/chat/completions",
         [&engine, default_thinking_budget](const httplib::Request& req, httplib::Response& res) {
+            auto busy_guard = std::make_shared<EngineBusyGuard>();
+            if (!busy_guard->is_locked()) {
+                LOG_WARN("Rejecting /v1/chat/completions: engine is currently busy processing another request");
+                res.status = 429;
+                res.set_content("{\"error\":{\"message\":\"Engine is currently busy processing another request. Please wait.\",\"type\":\"busy\",\"code\":429}}", "application/json");
+                return;
+            }
+
             g_stop_requested.store(false);
             auto start = std::chrono::steady_clock::now();
 
@@ -9514,6 +10363,11 @@ static void run_server(MoecherEngine& engine, int port, int default_thinking_bud
                 } else if (request.contains("enable_tools") && request["enable_tools"].is_boolean() && request["enable_tools"].get<bool>()) {
                     tools = resolve_canonical_tools("default");
                 }
+                // Append active MCP tools
+                json mcp_tools = moecher::mcp::MCPManager::instance().get_openai_tools_schema();
+                for (const auto& mt : mcp_tools) {
+                    tools.push_back(mt);
+                }
             }
 
             if (reasoning_effort == "none") {
@@ -9570,18 +10424,23 @@ static void run_server(MoecherEngine& engine, int port, int default_thinking_bud
             }
             bool do_server_exec = g_server_exec && (!client_tool_exec || g_headless_browsing);
 
-            LOG_INFO("Reasoning effort: %s, Thinking: %s, Thinking budget: %d, Tools: %zu, Server-Exec: %s (client_tool_exec: %s, headless: %s), Timeout: %dms",
+            int req_max_tool_rounds = g_max_tool_rounds;
+            if (request.contains("max_tool_rounds") && request["max_tool_rounds"].is_number_integer()) {
+                req_max_tool_rounds = std::max(1, request["max_tool_rounds"].get<int>());
+            }
+
+            LOG_INFO("Reasoning effort: %s, Thinking: %s, Thinking budget: %d, Tools: %zu, Server-Exec: %s (client_tool_exec: %s, headless: %s), Max-Tool-Rounds: %d, Timeout: %dms",
                      reasoning_effort.c_str(), enable_thinking ? "enabled" : "disabled", max_thinking_tokens,
-                     tools.size(), (do_server_exec ? "enabled" : "disabled"), client_tool_exec ? "true" : "false", g_headless_browsing ? "true" : "false", execution_timeout_ms);
+                     tools.size(), (do_server_exec ? "enabled" : "disabled"), client_tool_exec ? "true" : "false", g_headless_browsing ? "true" : "false", req_max_tool_rounds, execution_timeout_ms);
 
             std::string req_id = "chatcmpl-moecher-" + std::to_string(++g_request_counter);
-            std::string model_id = (engine.cfg_.architecture == ModelArch::QWEN) ? "qwen3.8-27b-q4" : "deepseek-v4-flash";
+            std::string model_id = engine.get_model_id();
 
             if (stream) {
                 // SSE streaming
                 res.set_chunked_content_provider(
                     "text/event-stream",
-                    [&engine, messages, tools, max_tokens, temperature, req_id, repetition_penalty, enable_thinking, max_thinking_tokens, top_p, min_p, top_k, reasoning_effort, model_id, execution_timeout_ms, require_external_authorization, workspace_boundary_enforced, authorized_paths, do_server_exec](size_t offset, httplib::DataSink &sink) {
+                    [&engine, messages, tools, max_tokens, temperature, req_id, repetition_penalty, enable_thinking, max_thinking_tokens, top_p, min_p, top_k, reasoning_effort, model_id, execution_timeout_ms, require_external_authorization, workspace_boundary_enforced, authorized_paths, do_server_exec, req_max_tool_rounds, busy_guard](size_t offset, httplib::DataSink &sink) {
                         if (offset > 0) return false;
                         std::lock_guard<std::mutex> lock(g_engine_mutex);
 
@@ -9600,15 +10459,44 @@ static void run_server(MoecherEngine& engine, int port, int default_thinking_bud
                         sink.write(sse.data(), sse.size());
 
                         json current_messages = messages;
-                        int max_tool_rounds = (do_server_exec && !tools.empty() && g_enable_tools) ? 5 : 1;
+                        int max_tool_rounds = (do_server_exec && !tools.empty() && g_enable_tools) ? req_max_tool_rounds : 1;
                         std::string final_finish_reason = "stop";
+                        std::string last_completed_content;
+                        std::vector<json> round_new_tool_msgs;
+
+                        int max_allowed_prompt = engine.cfg_.max_seq_len - max_tokens;
+                        if (max_allowed_prompt < 1024) max_allowed_prompt = engine.cfg_.max_seq_len - 256;
 
                         for (int round = 0; round < max_tool_rounds; round++) {
-                            std::vector<int> prompt = apply_chat_template(current_messages, engine.tokenizer_, enable_thinking, reasoning_effort, tools);
-                            LOG_INFO("STREAM PROMPT [round %d] (len=%zu)", round + 1, prompt.size());
+                            std::vector<int> prompt;
+                            bool is_continuation = false;
+                            if (round == 0) {
+                                is_continuation = check_and_build_continuation(engine, current_messages, s_last_conv_messages, enable_thinking, reasoning_effort, prompt);
+                                if (is_continuation && prompt.size() > (size_t)max_allowed_prompt) {
+                                    LOG_WARN("[Context] Continuation prompt length (%zu) exceeds context budget (%d). Forcing sliding-window pruning.",
+                                             prompt.size(), max_allowed_prompt);
+                                    is_continuation = false;
+                                }
+                            } else if (round > 0 && !round_new_tool_msgs.empty()) {
+                                prompt = build_continuation_prompt(engine, round_new_tool_msgs, enable_thinking, reasoning_effort);
+                                is_continuation = true;
+                                if (prompt.size() > (size_t)max_allowed_prompt) {
+                                    LOG_WARN("[Context] Tool continuation length (%zu) exceeds context budget (%d). Forcing sliding-window pruning.",
+                                             prompt.size(), max_allowed_prompt);
+                                    is_continuation = false;
+                                }
+                                round_new_tool_msgs.clear();
+                            }
+                            if (!is_continuation) {
+                                current_messages = prune_messages_to_fit(current_messages, engine.tokenizer_, max_allowed_prompt, enable_thinking, reasoning_effort, tools);
+                                prompt = apply_chat_template(current_messages, engine.tokenizer_, enable_thinking, reasoning_effort, tools);
+                            }
+                            LOG_INFO("STREAM PROMPT [round %d] (len=%zu, continuation=%s)", round + 1, prompt.size(), is_continuation ? "true" : "false");
 
                             std::string round_content;
                             std::string round_reasoning;
+                            ToolTagStreamFilter content_filter;
+                            ToolTagStreamFilter reasoning_filter;
 
                             engine.generate(prompt, max_tokens, temperature, [&](const std::string& text, bool is_reasoning) -> bool {
                                 if (g_stop_requested.load()) return false;
@@ -9616,22 +10504,56 @@ static void run_server(MoecherEngine& engine, int port, int default_thinking_bud
 
                                 if (is_reasoning) {
                                     round_reasoning += text;
-                                    json delta_chunk = {
-                                        {"id", req_id},
-                                        {"object", "chat.completion.chunk"},
-                                        {"created", std::chrono::system_clock::to_time_t(std::chrono::system_clock::now())},
-                                        {"model", model_id},
-                                        {"choices", {{
-                                            {"index", 0},
-                                            {"delta", {{"reasoning_content", text}}},
-                                            {"finish_reason", nullptr}
-                                        }}}
-                                    };
-                                    std::string sse_chunk = "data: " + delta_chunk.dump(-1, ' ', false, json::error_handler_t::replace) + "\n\n";
-                                    return sink.write(sse_chunk.data(), sse_chunk.size()) && !g_stop_requested.load();
+                                    if (g_enable_tools && !tools.empty()) {
+                                        return reasoning_filter.feed(text, [&](const std::string& safe_text) -> bool {
+                                            json delta_chunk = {
+                                                {"id", req_id},
+                                                {"object", "chat.completion.chunk"},
+                                                {"created", std::chrono::system_clock::to_time_t(std::chrono::system_clock::now())},
+                                                {"model", model_id},
+                                                {"choices", {{
+                                                    {"index", 0},
+                                                    {"delta", {{"reasoning_content", safe_text}}},
+                                                    {"finish_reason", nullptr}
+                                                }}}
+                                            };
+                                            std::string sse_chunk = "data: " + delta_chunk.dump(-1, ' ', false, json::error_handler_t::replace) + "\n\n";
+                                            return sink.write(sse_chunk.data(), sse_chunk.size()) && !g_stop_requested.load();
+                                        });
+                                    } else {
+                                        json delta_chunk = {
+                                            {"id", req_id},
+                                            {"object", "chat.completion.chunk"},
+                                            {"created", std::chrono::system_clock::to_time_t(std::chrono::system_clock::now())},
+                                            {"model", model_id},
+                                            {"choices", {{
+                                                {"index", 0},
+                                                {"delta", {{"reasoning_content", text}}},
+                                                {"finish_reason", nullptr}
+                                            }}}
+                                        };
+                                        std::string sse_chunk = "data: " + delta_chunk.dump(-1, ' ', false, json::error_handler_t::replace) + "\n\n";
+                                        return sink.write(sse_chunk.data(), sse_chunk.size()) && !g_stop_requested.load();
+                                    }
                                 } else {
                                     round_content += text;
-                                    if (!g_enable_tools || tools.empty()) {
+                                    if (g_enable_tools && !tools.empty()) {
+                                        return content_filter.feed(text, [&](const std::string& safe_text) -> bool {
+                                            json delta_chunk = {
+                                                {"id", req_id},
+                                                {"object", "chat.completion.chunk"},
+                                                {"created", std::chrono::system_clock::to_time_t(std::chrono::system_clock::now())},
+                                                {"model", model_id},
+                                                {"choices", {{
+                                                    {"index", 0},
+                                                    {"delta", {{"content", safe_text}}},
+                                                    {"finish_reason", nullptr}
+                                                }}}
+                                            };
+                                            std::string sse_chunk = "data: " + delta_chunk.dump(-1, ' ', false, json::error_handler_t::replace) + "\n\n";
+                                            return sink.write(sse_chunk.data(), sse_chunk.size()) && !g_stop_requested.load();
+                                        });
+                                    } else {
                                         json delta_chunk = {
                                             {"id", req_id},
                                             {"object", "chat.completion.chunk"},
@@ -9646,11 +10568,43 @@ static void run_server(MoecherEngine& engine, int port, int default_thinking_bud
                                         std::string sse_chunk = "data: " + delta_chunk.dump(-1, ' ', false, json::error_handler_t::replace) + "\n\n";
                                         return sink.write(sse_chunk.data(), sse_chunk.size()) && !g_stop_requested.load();
                                     }
-                                    return true;
                                 }
                             }, repetition_penalty, enable_thinking, max_thinking_tokens, top_p, min_p, top_k);
 
                             final_finish_reason = engine.last_finish_reason_.empty() ? "stop" : engine.last_finish_reason_;
+
+                            if (g_enable_tools && !tools.empty()) {
+                                reasoning_filter.flush_remaining([&](const std::string& safe_text) -> bool {
+                                    json delta_chunk = {
+                                        {"id", req_id},
+                                        {"object", "chat.completion.chunk"},
+                                        {"created", std::chrono::system_clock::to_time_t(std::chrono::system_clock::now())},
+                                        {"model", model_id},
+                                        {"choices", {{
+                                            {"index", 0},
+                                            {"delta", {{"reasoning_content", safe_text}}},
+                                            {"finish_reason", nullptr}
+                                        }}}
+                                    };
+                                    std::string sse_chunk = "data: " + delta_chunk.dump(-1, ' ', false, json::error_handler_t::replace) + "\n\n";
+                                    return sink.write(sse_chunk.data(), sse_chunk.size()) && !g_stop_requested.load();
+                                });
+                                content_filter.flush_remaining([&](const std::string& safe_text) -> bool {
+                                    json delta_chunk = {
+                                        {"id", req_id},
+                                        {"object", "chat.completion.chunk"},
+                                        {"created", std::chrono::system_clock::to_time_t(std::chrono::system_clock::now())},
+                                        {"model", model_id},
+                                        {"choices", {{
+                                            {"index", 0},
+                                            {"delta", {{"content", safe_text}}},
+                                            {"finish_reason", nullptr}
+                                        }}}
+                                    };
+                                    std::string sse_chunk = "data: " + delta_chunk.dump(-1, ' ', false, json::error_handler_t::replace) + "\n\n";
+                                    return sink.write(sse_chunk.data(), sse_chunk.size()) && !g_stop_requested.load();
+                                });
+                            }
 
                             if (!g_enable_tools || tools.empty()) {
                                 break;
@@ -9660,17 +10614,29 @@ static void run_server(MoecherEngine& engine, int port, int default_thinking_bud
                             std::vector<moecher::tooling::ToolCall> round_tool_calls;
                             moecher::tooling::extract_tool_calls(round_content, clean_content, round_tool_calls);
 
-                            if (round_tool_calls.empty() && !round_reasoning.empty()) {
+                            if (!round_reasoning.empty()) {
                                 std::string clean_reasoning;
-                                moecher::tooling::extract_tool_calls(round_reasoning, clean_reasoning, round_tool_calls);
-                                if (!round_tool_calls.empty()) {
-                                    LOG_INFO("Extracted %zu tool call(s) from reasoning stream", round_tool_calls.size());
-                                    round_reasoning = clean_reasoning;
+                                std::vector<moecher::tooling::ToolCall> reasoning_calls;
+                                moecher::tooling::extract_tool_calls(round_reasoning, clean_reasoning, reasoning_calls);
+                                if (round_tool_calls.empty() && !reasoning_calls.empty()) {
+                                    LOG_INFO("Extracted %zu tool call(s) from reasoning stream", reasoning_calls.size());
+                                    round_tool_calls = reasoning_calls;
                                 }
+                                round_reasoning = clean_reasoning;
                             }
 
                             if (round_tool_calls.empty()) {
-                                if (!clean_content.empty()) {
+                                last_completed_content = clean_content;
+                                std::string unstreamed_content = clean_content;
+                                if (!content_filter.streamed_clean_text.empty()) {
+                                    if (clean_content.size() >= content_filter.streamed_clean_text.size() &&
+                                        clean_content.compare(0, content_filter.streamed_clean_text.size(), content_filter.streamed_clean_text) == 0) {
+                                        unstreamed_content = clean_content.substr(content_filter.streamed_clean_text.size());
+                                    } else if (clean_content.size() <= content_filter.streamed_clean_text.size()) {
+                                        unstreamed_content.clear();
+                                    }
+                                }
+                                if (!unstreamed_content.empty()) {
                                     json delta_chunk = {
                                         {"id", req_id},
                                         {"object", "chat.completion.chunk"},
@@ -9678,7 +10644,7 @@ static void run_server(MoecherEngine& engine, int port, int default_thinking_bud
                                         {"model", model_id},
                                         {"choices", {{
                                             {"index", 0},
-                                            {"delta", {{"content", clean_content}}},
+                                            {"delta", {{"content", unstreamed_content}}},
                                             {"finish_reason", nullptr}
                                         }}}
                                     };
@@ -9688,8 +10654,17 @@ static void run_server(MoecherEngine& engine, int port, int default_thinking_bud
                                 break;
                             }
 
-                            // Stream any leading text from model before tool call
-                            if (!clean_content.empty()) {
+                            // Stream any unstreamed leading text from model before tool call
+                            std::string unstreamed_intro = clean_content;
+                            if (!content_filter.streamed_clean_text.empty()) {
+                                if (clean_content.size() >= content_filter.streamed_clean_text.size() &&
+                                    clean_content.compare(0, content_filter.streamed_clean_text.size(), content_filter.streamed_clean_text) == 0) {
+                                    unstreamed_intro = clean_content.substr(content_filter.streamed_clean_text.size());
+                                } else if (clean_content.size() <= content_filter.streamed_clean_text.size()) {
+                                    unstreamed_intro.clear();
+                                }
+                            }
+                            if (!unstreamed_intro.empty()) {
                                 std::string field_name = enable_thinking ? "reasoning_content" : "content";
                                 json intro_chunk = {
                                     {"id", req_id},
@@ -9698,7 +10673,7 @@ static void run_server(MoecherEngine& engine, int port, int default_thinking_bud
                                     {"model", model_id},
                                     {"choices", {{
                                         {"index", 0},
-                                        {"delta", {{field_name, clean_content + "\n\n"}}},
+                                        {"delta", {{field_name, unstreamed_intro + "\n\n"}}},
                                         {"finish_reason", nullptr}
                                     }}}
                                 };
@@ -10225,21 +11200,88 @@ static void run_server(MoecherEngine& engine, int port, int default_thinking_bud
                                     };
                                     std::string sse_comp = "data: " + comp_chunk.dump(-1, ' ', false, json::error_handler_t::replace) + "\n\n";
                                     sink.write(sse_comp.data(), sse_comp.size());
+                                } else if (moecher::mcp::MCPManager::instance().has_tool(tc.name)) {
+                                    std::string s_id, raw_tname;
+                                    moecher::mcp::MCPManager::instance().has_tool(tc.name, &s_id, &raw_tname);
+                                    std::string active_card =
+                                        "\n\n<div class=\"tool-activity-block active mcp-tool\" id=\"tool-act-" + tc.id + "\">\n"
+                                        "  <span class=\"thinking-spinner\">progress_activity</span>\n"
+                                        "  <span class=\"tool-action-label\">[MCP: " + s_id + "] " + raw_tname + "</span>\n"
+                                        "  <span class=\"tool-target-subtle\">" + (tc.arguments.size() > 80 ? tc.arguments.substr(0, 80) + "..." : tc.arguments) + "</span>\n"
+                                        "</div>\n\n";
+
+                                    json info_chunk = {
+                                        {"id", req_id},
+                                        {"object", "chat.completion.chunk"},
+                                        {"created", std::chrono::system_clock::to_time_t(std::chrono::system_clock::now())},
+                                        {"model", model_id},
+                                        {"choices", {{
+                                            {"index", 0},
+                                            {"delta", {{tool_delta_field, active_card}}},
+                                            {"finish_reason", nullptr}
+                                        }}}
+                                    };
+                                    std::string sse_info = "data: " + info_chunk.dump(-1, ' ', false, json::error_handler_t::replace) + "\n\n";
+                                    sink.write(sse_info.data(), sse_info.size());
+
+                                    json parsed_args = json::object();
+                                    try { parsed_args = json::parse(tc.arguments); } catch (...) {}
+                                    LOG_INFO("Streaming Tool Exec: MCP [%s:%s]", s_id.c_str(), raw_tname.c_str());
+                                    exec_output = moecher::mcp::MCPManager::instance().call_tool(tc.name, parsed_args, execution_timeout_ms);
+
+                                    std::string completed_card =
+                                        "\n\n<div class=\"tool-activity-block completed mcp-tool\" id=\"tool-act-" + tc.id + "\">\n"
+                                        "  <span class=\"material-symbols-outlined tool-done-icon\">hub</span>\n"
+                                        "  <span class=\"tool-action-label\">[MCP: " + s_id + "] " + raw_tname + "</span>\n"
+                                        "  <span class=\"tool-target-subtle\">Completed</span>\n"
+                                        "</div>\n\n";
+
+                                    json comp_chunk = {
+                                        {"id", req_id},
+                                        {"object", "chat.completion.chunk"},
+                                        {"created", std::chrono::system_clock::to_time_t(std::chrono::system_clock::now())},
+                                        {"model", model_id},
+                                        {"choices", {{
+                                            {"index", 0},
+                                            {"delta", {{tool_delta_field, completed_card}}},
+                                            {"finish_reason", nullptr}
+                                        }}}
+                                    };
+                                    std::string sse_comp = "data: " + comp_chunk.dump(-1, ' ', false, json::error_handler_t::replace) + "\n\n";
+                                    sink.write(sse_comp.data(), sse_comp.size());
                                 } else {
                                     can_execute_all = false;
                                     break;
                                 }
 
-                                current_messages.push_back({
+                                json tool_reply = {
                                     {"role", "tool"},
                                     {"tool_call_id", tc.id},
                                     {"content", exec_output}
-                                });
+                                };
+                                current_messages.push_back(tool_reply);
+                                round_new_tool_msgs.push_back(tool_reply);
                             }
 
                             if (!can_execute_all) {
                                 final_finish_reason = "tool_calls";
                                 break;
+                            }
+
+                            if (round + 1 < max_tool_rounds) {
+                                json proc_chunk = {
+                                    {"id", req_id},
+                                    {"object", "chat.completion.chunk"},
+                                    {"created", std::chrono::system_clock::to_time_t(std::chrono::system_clock::now())},
+                                    {"model", model_id},
+                                    {"choices", {{
+                                        {"index", 0},
+                                        {"delta", {{"processing_status", "Encoding tool output & elaborating response"}}},
+                                        {"finish_reason", nullptr}
+                                    }}}
+                                };
+                                std::string sse_proc = "data: " + proc_chunk.dump(-1, ' ', false, json::error_handler_t::replace) + "\n\n";
+                                sink.write(sse_proc.data(), sse_proc.size());
                             }
                         }
 
@@ -10265,6 +11307,13 @@ static void run_server(MoecherEngine& engine, int port, int default_thinking_bud
                         sink.write("data: [DONE]\n\n", 14);
                         sink.done();
 
+                        // Save conversation state for turn continuation
+                        json conv_to_save = current_messages;
+                        if (conv_to_save.empty() || conv_to_save.back().value("role", "") != "assistant") {
+                            conv_to_save.push_back({{"role", "assistant"}, {"content", last_completed_content}});
+                        }
+                        s_last_conv_messages = conv_to_save;
+
                         if (g_track_experts && !engine.expert_freq_counts_.empty()) {
                             std::string fpath = engine.model_dir_.empty() ? "expert_freq.bin" : (engine.model_dir_ + "/expert_freq.bin");
                             engine.save_expert_freq(fpath);
@@ -10278,12 +11327,40 @@ static void run_server(MoecherEngine& engine, int port, int default_thinking_bud
                 std::vector<moecher::tooling::ToolCall> emitted_tool_calls;
                 json current_messages = messages;
                 std::string finish_reason = "stop";
+                std::vector<json> round_new_tool_msgs;
 
-                int max_tool_rounds = (do_server_exec && !tools.empty() && g_enable_tools) ? 5 : 1;
+                int max_tool_rounds = (do_server_exec && !tools.empty() && g_enable_tools) ? req_max_tool_rounds : 1;
+
+                int max_allowed_prompt = engine.cfg_.max_seq_len - max_tokens;
+                if (max_allowed_prompt < 1024) max_allowed_prompt = engine.cfg_.max_seq_len - 256;
 
                 for (int round = 0; round < max_tool_rounds; round++) {
-                    std::vector<int> prompt = apply_chat_template(current_messages, engine.tokenizer_, enable_thinking, reasoning_effort, tools);
-                    LOG_INFO("PROMPT [round %d] (len=%zu)", round + 1, prompt.size());
+                    std::vector<int> prompt;
+                    bool is_continuation = false;
+                    if (round == 0) {
+                        std::lock_guard<std::mutex> lock(g_engine_mutex);
+                        is_continuation = check_and_build_continuation(engine, current_messages, s_last_conv_messages, enable_thinking, reasoning_effort, prompt);
+                        if (is_continuation && prompt.size() > (size_t)max_allowed_prompt) {
+                            LOG_WARN("[Context] Continuation prompt length (%zu) exceeds context budget (%d). Forcing sliding-window pruning.",
+                                     prompt.size(), max_allowed_prompt);
+                            is_continuation = false;
+                        }
+                    } else if (round > 0 && !round_new_tool_msgs.empty()) {
+                        std::lock_guard<std::mutex> lock(g_engine_mutex);
+                        prompt = build_continuation_prompt(engine, round_new_tool_msgs, enable_thinking, reasoning_effort);
+                        is_continuation = true;
+                        if (prompt.size() > (size_t)max_allowed_prompt) {
+                            LOG_WARN("[Context] Tool continuation length (%zu) exceeds context budget (%d). Forcing sliding-window pruning.",
+                                     prompt.size(), max_allowed_prompt);
+                            is_continuation = false;
+                        }
+                        round_new_tool_msgs.clear();
+                    }
+                    if (!is_continuation) {
+                        current_messages = prune_messages_to_fit(current_messages, engine.tokenizer_, max_allowed_prompt, enable_thinking, reasoning_effort, tools);
+                        prompt = apply_chat_template(current_messages, engine.tokenizer_, enable_thinking, reasoning_effort, tools);
+                    }
+                    LOG_INFO("PROMPT [round %d] (len=%zu, continuation=%s)", round + 1, prompt.size(), is_continuation ? "true" : "false");
 
                     std::string response_text;
                     {
@@ -10432,16 +11509,25 @@ static void run_server(MoecherEngine& engine, int port, int default_thinking_bud
                             } catch (...) { cmd = tc.arguments; }
                             LOG_INFO("Executing built-in tool execute_command: %s (timeout=%dms)", cmd.c_str(), execution_timeout_ms);
                             exec_output = moecher::tooling::execute_system_command(cmd, execution_timeout_ms);
+                        } else if (moecher::mcp::MCPManager::instance().has_tool(tc.name)) {
+                            std::string s_id, raw_tname;
+                            moecher::mcp::MCPManager::instance().has_tool(tc.name, &s_id, &raw_tname);
+                            json parsed_args = json::object();
+                            try { parsed_args = json::parse(tc.arguments); } catch (...) {}
+                            LOG_INFO("Executing MCP tool: [%s:%s]", s_id.c_str(), raw_tname.c_str());
+                            exec_output = moecher::mcp::MCPManager::instance().call_tool(tc.name, parsed_args, execution_timeout_ms);
                         } else {
                             can_execute_all = false;
                             break;
                         }
 
-                        current_messages.push_back({
+                        json tool_reply = {
                             {"role", "tool"},
                             {"tool_call_id", tc.id},
                             {"content", exec_output}
-                        });
+                        };
+                        current_messages.push_back(tool_reply);
+                        round_new_tool_msgs.push_back(tool_reply);
                     }
 
                     if (!can_execute_all) {
@@ -10484,6 +11570,16 @@ static void run_server(MoecherEngine& engine, int port, int default_thinking_bud
                     }}
                 };
                 res.set_content(response.dump(-1, ' ', false, json::error_handler_t::replace), "application/json");
+
+                // Save conversation state for turn continuation
+                {
+                    std::lock_guard<std::mutex> lock(g_engine_mutex);
+                    json conv_to_save = current_messages;
+                    if (conv_to_save.empty() || conv_to_save.back().value("role", "") != "assistant") {
+                        conv_to_save.push_back({{"role", "assistant"}, {"content", final_response_text}});
+                    }
+                    s_last_conv_messages = conv_to_save;
+                }
             }
             auto end = std::chrono::steady_clock::now();
             auto elapsed_ms = std::chrono::duration<double, std::milli>(end - start).count();
@@ -10514,6 +11610,7 @@ static void run_server(MoecherEngine& engine, int port, int default_thinking_bud
     LOG_INFO("version 2.03");
     g_server_ready = true;
     svr.listen("0.0.0.0", port);
+    moecher::mcp::MCPManager::instance().stop_all();
 }
 
 // ════════════════════════════════════════════════════════════════════════════════
@@ -10554,9 +11651,23 @@ int main(int argc, char** argv) {
     bool enable_system_proxy = false;
     std::string batched_prefill_mode = "auto";
     int prefill_chunk_size = 512;
+    int max_seq_len_override = 0;
 
     for (int i = 1; i < argc; i++) {
-        if ((std::string(argv[i]) == "--manifest" || std::string(argv[i]) == "-m") && i + 1 < argc) {
+        if (std::string(argv[i]) == "--help" || std::string(argv[i]) == "-h") {
+            printf("Usage: %s [options]\n", argv[0]);
+            printf("  --manifest, -m <path>       Path to moecher_manifest.json\n");
+            printf("  --port, -p <port>           Server port (default: %d)\n", port);
+            printf("  --proxy-port, -pp <port>    Proxy port (default: %d)\n", proxy_port);
+            printf("  --max-vram, -V <gb>         Max VRAM budget in GB\n");
+            printf("  --dram-cache-gb <gb>        DRAM cache budget in GB\n");
+            printf("  --ctx, -c <tokens>          Max context length in tokens (default: 65536)\n");
+            printf("  --max-seq-len <tokens>      Alias for --ctx\n");
+            printf("  --budget <tokens>           Default thinking budget tokens\n");
+            printf("  --max-tool-rounds <n>       Max sequential tool execution rounds per turn (default: %d)\n", g_max_tool_rounds);
+            printf("  --help, -h                  Show this help message\n");
+            return 0;
+        } else if ((std::string(argv[i]) == "--manifest" || std::string(argv[i]) == "-m") && i + 1 < argc) {
             manifest_path = argv[++i];
         } else if ((std::string(argv[i]) == "--port" || std::string(argv[i]) == "-p") && i + 1 < argc) {
             port = std::stoi(argv[++i]);
@@ -10637,6 +11748,10 @@ int main(int argc, char** argv) {
             batched_prefill_mode = "off";
         } else if (std::string(argv[i]) == "--prefill-chunk-size" && i + 1 < argc) {
             prefill_chunk_size = std::stoi(argv[++i]);
+        } else if ((std::string(argv[i]) == "--ctx" || std::string(argv[i]) == "--max-seq-len" || std::string(argv[i]) == "-c") && i + 1 < argc) {
+            max_seq_len_override = std::stoi(argv[++i]);
+        } else if ((std::string(argv[i]) == "--max-tool-rounds" || std::string(argv[i]) == "--max-rounds") && i + 1 < argc) {
+            g_max_tool_rounds = std::max(1, std::stoi(argv[++i]));
         }
     }
 
@@ -10646,6 +11761,7 @@ int main(int argc, char** argv) {
     LOG_INFO("=== v2.05 ===");
     LOG_INFO("Default thinking token budget: %d", default_thinking_budget);
     LOG_INFO("Tool calling support: %s", g_enable_tools ? "enabled" : "disabled");
+    LOG_INFO("Max tool execution rounds: %d", g_max_tool_rounds);
     LOG_INFO("Server-side tool execution: %s (headless-browsing: %s)", g_server_exec ? "enabled" : "disabled", g_headless_browsing ? "enabled" : "disabled");
 
     MoecherEngine engine;
@@ -10655,7 +11771,7 @@ int main(int argc, char** argv) {
     engine.pld_draft_tokens_ = pld_draft_tokens;
     LOG_INFO("Prompt-Lookup Drafting (PLD): %s (draft_tokens=%d)", enable_pld ? "enabled" : "disabled", pld_draft_tokens);
 
-    if (!engine.load(manifest_path, max_vram_gb, dram_cache_gb, expert_dtype_override, buffered_io)) {
+    if (!engine.load(manifest_path, max_vram_gb, dram_cache_gb, expert_dtype_override, buffered_io, max_seq_len_override)) {
         LOG_ERROR("Failed to load model");
         return 1;
     }
@@ -10689,6 +11805,14 @@ int main(int argc, char** argv) {
         }
     }
 
+    // Initialize MCP (Model Context Protocol) Manager before pre-warming
+    auto& mcp_mgr = moecher::mcp::MCPManager::instance();
+    std::string mcp_config_file = moecher::tooling::get_workspace_directory() + "/mcp_servers.json";
+    mcp_mgr.set_config_path(mcp_config_file);
+    if (mcp_mgr.load_config()) {
+        mcp_mgr.start_all_enabled();
+    }
+
     // Pre-warm default system prompt and tooling into KV Cache for 0ms initial prefill latency
     if (g_enable_tools) {
         json default_messages = json::array({
@@ -10696,10 +11820,17 @@ int main(int argc, char** argv) {
             {{"role", "user"}, {"content", ""}}
         });
         json default_tools = resolve_canonical_tools("default");
+        json mcp_tools = mcp_mgr.get_openai_tools_schema();
+        for (const auto& mt : mcp_tools) {
+            default_tools.push_back(mt);
+        }
         std::vector<int> prompt = apply_chat_template(default_messages, engine.tokenizer_, true, "high", default_tools);
         int user_start = (engine.cfg_.architecture == ModelArch::QWEN)
                              ? engine.tokenizer_.get_token_id("<|im_start|>")
                              : engine.tokenizer_.get_token_id("<｜User｜>");
+        if (user_start < 0) {
+            user_start = (engine.cfg_.architecture == ModelArch::QWEN) ? 151644 : 128803;
+        }
         size_t sys_len = prompt.size();
         for (size_t i = 1; i < prompt.size(); i++) {
             if (prompt[i] == user_start) {
@@ -10709,7 +11840,8 @@ int main(int argc, char** argv) {
         }
         if (sys_len > 0) {
             std::vector<int> sys_tokens(prompt.begin(), prompt.begin() + sys_len);
-            LOG_INFO("Pre-warming startup KV Cache with default tooling system prompt (%zu tokens)...", sys_tokens.size());
+            LOG_INFO("Pre-warming startup KV Cache with default tooling system prompt (%zu tokens, %zu tools)...",
+                     sys_tokens.size(), default_tools.size());
             engine.prefill_prefix(sys_tokens);
             LOG_INFO("Startup KV Cache pre-warmed successfully (0ms latency ready for incoming queries).");
         }

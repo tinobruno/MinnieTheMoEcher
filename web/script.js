@@ -28,7 +28,10 @@ let sessionStats = {
     totalPromptTokens: 0,
     totalCompletionTokens: 0,
     totalTtftMs: 0,
-    totalDecodeTimeMs: 0
+    totalPrefillMs: 0,
+    totalDecodeTimeMs: 0,
+    totalToolTimeMs: 0,
+    totalToolCalls: 0
 };
 
 function updateStatsUI(lastStats) {
@@ -36,28 +39,42 @@ function updateStatsUI(lastStats) {
     const elLastPrefill = document.getElementById('stat-last-prefill');
     const elLastDecode = document.getElementById('stat-last-decode');
     const elLastTokens = document.getElementById('stat-last-tokens');
+    const elLastToolTime = document.getElementById('stat-last-tool-time');
+    const elLastToolCalls = document.getElementById('stat-last-tool-calls');
 
     const elAvgTtft = document.getElementById('stat-avg-ttft');
     const elAvgPrefill = document.getElementById('stat-avg-prefill');
     const elAvgDecode = document.getElementById('stat-avg-decode');
     const elTotalTokens = document.getElementById('stat-total-tokens');
+    const elAvgToolTime = document.getElementById('stat-avg-tool-time');
+    const elTotalToolCalls = document.getElementById('stat-total-tool-calls');
 
     if (lastStats) {
         if (elLastTtft) elLastTtft.textContent = `${lastStats.ttftSec.toFixed(2)}s`;
         if (elLastPrefill) elLastPrefill.textContent = lastStats.prefillTps > 0 ? `${lastStats.prefillTps.toFixed(1)} t/s` : '-';
         if (elLastDecode) elLastDecode.textContent = lastStats.decodeTps > 0 ? `${lastStats.decodeTps.toFixed(1)} t/s` : '-';
         if (elLastTokens) elLastTokens.textContent = `${lastStats.completionTokens} tok`;
+        if (elLastToolTime) {
+            elLastToolTime.textContent = lastStats.toolCalls > 0 ? `${lastStats.toolTimeSec.toFixed(2)}s` : '0.00s';
+        }
+        if (elLastToolCalls) {
+            elLastToolCalls.textContent = `${lastStats.toolCalls} call${lastStats.toolCalls === 1 ? '' : 's'}`;
+        }
     } else {
         if (elLastTtft) elLastTtft.textContent = '-';
         if (elLastPrefill) elLastPrefill.textContent = '-';
         if (elLastDecode) elLastDecode.textContent = '-';
         if (elLastTokens) elLastTokens.textContent = '-';
+        if (elLastToolTime) elLastToolTime.textContent = '-';
+        if (elLastToolCalls) elLastToolCalls.textContent = '-';
     }
 
     if (sessionStats.totalTurns > 0) {
         const avgTtftSec = (sessionStats.totalTtftMs / sessionStats.totalTurns) / 1000.0;
-        const totalPrefillSec = sessionStats.totalTtftMs / 1000.0;
+        const totalPrefillSec = (sessionStats.totalPrefillMs || sessionStats.totalTtftMs) / 1000.0;
         const totalDecodeSec = sessionStats.totalDecodeTimeMs / 1000.0;
+        const totalToolSec = (sessionStats.totalToolTimeMs || 0) / 1000.0;
+        const avgToolSecPerTurn = totalToolSec / sessionStats.totalTurns;
 
         const avgPrefillTps = (totalPrefillSec > 0 && sessionStats.totalPromptTokens > 0)
             ? (sessionStats.totalPromptTokens / totalPrefillSec)
@@ -69,12 +86,22 @@ function updateStatsUI(lastStats) {
         if (elAvgTtft) elAvgTtft.textContent = `${avgTtftSec.toFixed(2)}s`;
         if (elAvgPrefill) elAvgPrefill.textContent = avgPrefillTps > 0 ? `${avgPrefillTps.toFixed(1)} t/s` : '-';
         if (elAvgDecode) elAvgDecode.textContent = avgDecodeTps > 0 ? `${avgDecodeTps.toFixed(1)} t/s` : '-';
-        if (elTotalTokens) elTotalTokens.textContent = `${sessionStats.totalCompletionTokens} tok (${sessionStats.totalTurns} turns)`;
+        if (elTotalTokens) elTotalTokens.textContent = `${sessionStats.totalCompletionTokens} tok (${sessionStats.totalTurns} turn${sessionStats.totalTurns === 1 ? '' : 's'})`;
+        if (elAvgToolTime) {
+            elAvgToolTime.textContent = sessionStats.totalToolCalls > 0
+                ? `${totalToolSec.toFixed(2)}s (${avgToolSecPerTurn.toFixed(2)}s/t)`
+                : '0.00s';
+        }
+        if (elTotalToolCalls) {
+            elTotalToolCalls.textContent = `${sessionStats.totalToolCalls || 0} call${sessionStats.totalToolCalls === 1 ? '' : 's'}`;
+        }
     } else {
         if (elAvgTtft) elAvgTtft.textContent = '-';
         if (elAvgPrefill) elAvgPrefill.textContent = '-';
         if (elAvgDecode) elAvgDecode.textContent = '-';
         if (elTotalTokens) elTotalTokens.textContent = '-';
+        if (elAvgToolTime) elAvgToolTime.textContent = '-';
+        if (elTotalToolCalls) elTotalToolCalls.textContent = '-';
     }
 }
 
@@ -82,16 +109,28 @@ let isGenerating = false;
 
 function setGeneratingState(generating) {
     isGenerating = generating;
+    const previewBtn = document.getElementById('preview-btn-chatbar');
+    const inputBox = document.querySelector('.input-box');
+
     if (generating) {
         sendBtn.classList.add('stop-mode');
         sendBtn.innerHTML = '<span class="material-symbols-outlined">stop</span>';
         sendBtn.title = 'Stop generation';
         sendBtn.disabled = false;
+        chatInput.disabled = true;
+        chatInput.placeholder = 'Generating response...';
+        if (inputBox) inputBox.classList.add('disabled');
+        if (previewBtn) previewBtn.classList.add('hidden');
     } else {
         sendBtn.classList.remove('stop-mode');
         sendBtn.innerHTML = '<span class="material-symbols-outlined">send</span>';
         sendBtn.title = 'Send message';
+        chatInput.disabled = false;
+        chatInput.placeholder = 'Message Minnie...';
+        if (inputBox) inputBox.classList.remove('disabled');
         sendBtn.disabled = chatInput.value.trim() === '';
+        updateChatbarPreviewButtonVisibility();
+        chatInput.focus();
     }
 }
 
@@ -148,7 +187,10 @@ function clearChat() {
         totalPromptTokens: 0,
         totalCompletionTokens: 0,
         totalTtftMs: 0,
-        totalDecodeTimeMs: 0
+        totalPrefillMs: 0,
+        totalDecodeTimeMs: 0,
+        totalToolTimeMs: 0,
+        totalToolCalls: 0
     };
     updateStatsUI(null);
     messagesContainer.innerHTML = '';
@@ -183,8 +225,15 @@ const viewportFrame = document.getElementById('viewport-frame');
 const previewCanvas = document.getElementById('preview-canvas');
 const previewMaximizeBtn = document.getElementById('preview-maximize-btn');
 
+// Dedicated Settings Panel Elements
+const settingsPanel = document.getElementById('settings-panel');
+const settingsToggleBtn = document.getElementById('settings-toggle-btn');
+const settingsMaximizeBtn = document.getElementById('settings-maximize-btn');
+
 let isPreviewOpen = false;
 let isMaximized = false;
+let isSettingsOpen = false;
+let isSettingsMaximized = false;
 let currentHtmlCode = '';
 let consoleLogs = [];
 let activeConsoleFilter = 'all';
@@ -192,29 +241,35 @@ let activeConsoleFilter = 'all';
 // Initialize Panel State from localStorage
 function initPreviewPanel() {
     const savedWidth = localStorage.getItem('moecher_preview_width');
-    if (savedWidth && parseInt(savedWidth, 10) > 300) {
-        previewPanel.style.width = `${parseInt(savedWidth, 10)}px`;
-    } else {
-        previewPanel.style.width = '540px';
-    }
+    const panelWidth = (savedWidth && parseInt(savedWidth, 10) > 300) ? `${parseInt(savedWidth, 10)}px` : '540px';
+    if (previewPanel) previewPanel.style.width = panelWidth;
+    if (settingsPanel) settingsPanel.style.width = panelWidth;
 
     // Default closed unless explicitly opened
-    previewPanel.classList.add('collapsed');
-    resizerHandle.classList.add('hidden');
+    if (previewPanel) previewPanel.classList.add('collapsed');
+    if (settingsPanel) settingsPanel.classList.add('collapsed');
+    if (resizerHandle) resizerHandle.classList.add('hidden');
     if (previewToggleBtn) previewToggleBtn.classList.remove('active');
+    if (settingsToggleBtn) settingsToggleBtn.classList.remove('active');
     isPreviewOpen = false;
+    isSettingsOpen = false;
 
     setupResizer();
     setupTabs();
+    setupSettingsTabs();
     setupViewportControls();
     setupCodeEditor();
     setupConsoleListener();
 }
 
 function openPreviewPanel() {
+    // Mutual exclusivity: Close settings panel if open
+    if (isSettingsOpen) {
+        closeSettingsPanel();
+    }
     isPreviewOpen = true;
-    previewPanel.classList.remove('collapsed');
-    resizerHandle.classList.remove('hidden');
+    if (previewPanel) previewPanel.classList.remove('collapsed');
+    if (resizerHandle) resizerHandle.classList.remove('hidden');
     if (previewToggleBtn) previewToggleBtn.classList.add('active');
     localStorage.setItem('moecher_preview_open', 'true');
 }
@@ -222,8 +277,10 @@ function openPreviewPanel() {
 function closePreviewPanel() {
     isPreviewOpen = false;
     if (isMaximized) toggleMaximizePreview();
-    previewPanel.classList.add('collapsed');
-    resizerHandle.classList.add('hidden');
+    if (previewPanel) previewPanel.classList.add('collapsed');
+    if (!isSettingsOpen && resizerHandle) {
+        resizerHandle.classList.add('hidden');
+    }
     if (previewToggleBtn) previewToggleBtn.classList.remove('active');
     localStorage.setItem('moecher_preview_open', 'false');
 }
@@ -239,15 +296,74 @@ function togglePreviewPanel() {
 function toggleMaximizePreview() {
     isMaximized = !isMaximized;
     if (isMaximized) {
-        previewPanel.classList.add('maximized');
-        resizerHandle.classList.add('hidden');
-        previewMaximizeBtn.innerHTML = '<span class="material-symbols-outlined">fullscreen_exit</span>';
-        previewMaximizeBtn.title = 'Restore Panel Size';
+        if (previewPanel) previewPanel.classList.add('maximized');
+        if (resizerHandle) resizerHandle.classList.add('hidden');
+        if (previewMaximizeBtn) {
+            previewMaximizeBtn.innerHTML = '<span class="material-symbols-outlined">fullscreen_exit</span>';
+            previewMaximizeBtn.title = 'Restore Panel Size';
+        }
     } else {
-        previewPanel.classList.remove('maximized');
-        resizerHandle.classList.remove('hidden');
-        previewMaximizeBtn.innerHTML = '<span class="material-symbols-outlined">fullscreen</span>';
-        previewMaximizeBtn.title = 'Maximize Panel';
+        if (previewPanel) previewPanel.classList.remove('maximized');
+        if (resizerHandle) resizerHandle.classList.remove('hidden');
+        if (previewMaximizeBtn) {
+            previewMaximizeBtn.innerHTML = '<span class="material-symbols-outlined">fullscreen</span>';
+            previewMaximizeBtn.title = 'Maximize Panel';
+        }
+    }
+}
+
+// Dedicated Settings Panel Controls
+function openSettingsPanel(tabId = null) {
+    // Mutual exclusivity: Close HTML preview panel if open
+    if (isPreviewOpen) {
+        closePreviewPanel();
+    }
+    isSettingsOpen = true;
+    if (settingsPanel) settingsPanel.classList.remove('collapsed');
+    if (resizerHandle) resizerHandle.classList.remove('hidden');
+    if (settingsToggleBtn) settingsToggleBtn.classList.add('active');
+    if (tabId) {
+        switchSettingsTab(tabId);
+    }
+    localStorage.setItem('moecher_settings_open', 'true');
+}
+
+function closeSettingsPanel() {
+    isSettingsOpen = false;
+    if (isSettingsMaximized) toggleMaximizeSettings();
+    if (settingsPanel) settingsPanel.classList.add('collapsed');
+    if (settingsToggleBtn) settingsToggleBtn.classList.remove('active');
+    if (!isPreviewOpen && resizerHandle) {
+        resizerHandle.classList.add('hidden');
+    }
+    localStorage.setItem('moecher_settings_open', 'false');
+}
+
+function toggleSettingsPanel() {
+    if (isSettingsOpen) {
+        closeSettingsPanel();
+    } else {
+        openSettingsPanel();
+    }
+}
+
+function toggleMaximizeSettings() {
+    if (!settingsPanel) return;
+    isSettingsMaximized = !isSettingsMaximized;
+    if (isSettingsMaximized) {
+        settingsPanel.classList.add('maximized');
+        if (resizerHandle) resizerHandle.classList.add('hidden');
+        if (settingsMaximizeBtn) {
+            settingsMaximizeBtn.innerHTML = '<span class="material-symbols-outlined">fullscreen_exit</span>';
+            settingsMaximizeBtn.title = 'Restore Panel Size';
+        }
+    } else {
+        settingsPanel.classList.remove('maximized');
+        if (resizerHandle) resizerHandle.classList.remove('hidden');
+        if (settingsMaximizeBtn) {
+            settingsMaximizeBtn.innerHTML = '<span class="material-symbols-outlined">fullscreen</span>';
+            settingsMaximizeBtn.title = 'Maximize Panel';
+        }
     }
 }
 
@@ -260,9 +376,10 @@ function setupResizer() {
     function onMouseDown(e) {
         isDragging = true;
         startX = e.clientX;
-        startWidth = previewPanel.getBoundingClientRect().width;
+        const activePanel = isSettingsOpen ? settingsPanel : previewPanel;
+        startWidth = activePanel ? activePanel.getBoundingClientRect().width : 540;
         document.body.classList.add('resizing-active');
-        resizerHandle.classList.add('is-resizing');
+        if (resizerHandle) resizerHandle.classList.add('is-resizing');
 
         window.addEventListener('mousemove', onMouseMove);
         window.addEventListener('mouseup', onMouseUp);
@@ -273,20 +390,26 @@ function setupResizer() {
         if (!isDragging) return;
         const delta = startX - e.clientX;
         const newWidth = Math.min(Math.max(startWidth + delta, 320), window.innerWidth - 320);
-        previewPanel.style.width = `${newWidth}px`;
+        if (previewPanel) previewPanel.style.width = `${newWidth}px`;
+        if (settingsPanel) settingsPanel.style.width = `${newWidth}px`;
     }
 
     function onMouseUp() {
         if (!isDragging) return;
         isDragging = false;
         document.body.classList.remove('resizing-active');
-        resizerHandle.classList.remove('is-resizing');
-        localStorage.setItem('moecher_preview_width', parseInt(previewPanel.style.width, 10));
+        if (resizerHandle) resizerHandle.classList.remove('is-resizing');
+        const activePanel = isSettingsOpen ? settingsPanel : previewPanel;
+        if (activePanel) {
+            localStorage.setItem('moecher_preview_width', parseInt(activePanel.style.width, 10));
+        }
         window.removeEventListener('mousemove', onMouseMove);
         window.removeEventListener('mouseup', onMouseUp);
     }
 
-    resizerHandle.addEventListener('mousedown', onMouseDown);
+    if (resizerHandle) {
+        resizerHandle.addEventListener('mousedown', onMouseDown);
+    }
 }
 
 // Tabs
@@ -302,7 +425,7 @@ function setupTabs() {
 
 function switchPreviewTab(tabId) {
     document.querySelectorAll('.preview-tab').forEach(b => b.classList.remove('active'));
-    document.querySelectorAll('.tab-pane').forEach(p => p.classList.remove('active'));
+    document.querySelectorAll('.preview-panel .tab-pane').forEach(p => p.classList.remove('active'));
 
     const activeBtn = document.querySelector(`.preview-tab[data-tab="${tabId}"]`);
     const activePane = document.getElementById(tabId);
@@ -315,9 +438,30 @@ function switchPreviewTab(tabId) {
     }
 }
 
+// Dedicated Settings Tabs
+function setupSettingsTabs() {
+    const tabButtons = document.querySelectorAll('.settings-tab');
+    tabButtons.forEach(btn => {
+        btn.addEventListener('click', () => {
+            const targetTab = btn.getAttribute('data-tab');
+            switchSettingsTab(targetTab);
+        });
+    });
+}
+
+function switchSettingsTab(tabId) {
+    document.querySelectorAll('.settings-tab').forEach(b => b.classList.remove('active'));
+    document.querySelectorAll('.settings-tab-pane').forEach(p => p.classList.remove('active'));
+
+    const activeBtn = document.querySelector(`.settings-tab[data-tab="${tabId}"]`);
+    const activePane = document.getElementById(tabId);
+
+    if (activeBtn) activeBtn.classList.add('active');
+    if (activePane) activePane.classList.add('active');
+}
+
 function openAgenticSettingsTab() {
-    openPreviewPanel();
-    switchPreviewTab('tab-agentic');
+    openSettingsPanel('settings-tab-agentic');
 }
 
 // Viewport Emulation
@@ -369,9 +513,13 @@ function loadHtmlIntoPreview(htmlCode, autoSwitchTab = true) {
     if (ytMatch && (currentHtmlCode.includes('youtube-nocookie.com') || currentHtmlCode.includes('YouTube Video') || currentHtmlCode.includes('yt-container') || currentHtmlCode.includes('player'))) {
         const videoId = ytMatch[1];
         if (previewIframe) {
-            previewIframe.removeAttribute('srcdoc');
-            previewIframe.setAttribute('allow', 'accelerometer; autoplay; clipboard-write; encrypted-media; gyroscope; picture-in-picture; web-share');
-            previewIframe.src = `https://www.youtube-nocookie.com/embed/${videoId}?autoplay=1&enablejsapi=1&rel=0`;
+            const targetSrc = `https://www.youtube-nocookie.com/embed/${videoId}?autoplay=1&enablejsapi=1&rel=0`;
+            const currentSrc = previewIframe.src || '';
+            if (!currentSrc.includes(`/embed/${videoId}`)) {
+                previewIframe.removeAttribute('srcdoc');
+                previewIframe.setAttribute('allow', 'accelerometer; autoplay; clipboard-write; encrypted-media; gyroscope; picture-in-picture; web-share');
+                previewIframe.src = targetSrc;
+            }
         }
     } else {
         renderPreviewIframe(currentHtmlCode);
@@ -395,25 +543,14 @@ function loadHtmlIntoPreview(htmlCode, autoSwitchTab = true) {
     }
 }
 
-// Check if an HTML snippet is present in the conversation
-function hasHtmlSnippet() {
-    const codeBlocks = document.querySelectorAll('#messages-container pre code');
-    for (let i = codeBlocks.length - 1; i >= 0; i--) {
-        const code = codeBlocks[i].textContent || '';
-        const lang = (codeBlocks[i].className || '').toLowerCase();
-        if (isHtmlContent(code, lang)) {
-            return true;
-        }
-    }
-    if (currentHtmlCode && currentHtmlCode.trim().length > 0) {
-        return true;
-    }
-    return false;
-}
+// Extract HTML or previewable code specifically from the LAST assistant turn
+function getLastTurnPreviewCode() {
+    const allAssistantMsgs = document.querySelectorAll('#messages-container .message.assistant');
+    if (allAssistantMsgs.length === 0) return '';
+    const lastAssistantMsg = allAssistantMsgs[allAssistantMsgs.length - 1];
 
-// Find the most recent HTML / UI snippet across chat messages
-function getLatestHtmlCode() {
-    const codeBlocks = document.querySelectorAll('#messages-container pre code');
+    // Check code blocks in the last assistant turn
+    const codeBlocks = lastAssistantMsg.querySelectorAll('pre code');
     for (let i = codeBlocks.length - 1; i >= 0; i--) {
         const code = codeBlocks[i].textContent || '';
         const lang = (codeBlocks[i].className || '').toLowerCase();
@@ -421,10 +558,39 @@ function getLatestHtmlCode() {
             return code;
         }
     }
-    if (currentHtmlCode && currentHtmlCode.trim().length > 0) {
+
+    // Check for explicit preview banner in the last assistant turn
+    const banner = lastAssistantMsg.querySelector('.msg-html-banner');
+    if (banner && currentHtmlCode && currentHtmlCode.trim().length > 0) {
         return currentHtmlCode;
     }
+
+    // Check for interactive YouTube player link in the last assistant turn
+    const ytLink = lastAssistantMsg.querySelector('a[href*="youtube.com"], a[href*="youtu.be"]');
+    if (ytLink) {
+        const href = ytLink.getAttribute('href') || '';
+        const m = href.match(/(?:youtube\.com\/watch\?v=|youtu\.be\/|youtube\.com\/embed\/)([a-zA-Z0-9_-]{11})/i);
+        if (m) {
+            return createYouTubePlayerHtml(m[1], ytLink.textContent || 'YouTube Video');
+        }
+    }
+
     return '';
+}
+
+// Check if previewable content exists in the LAST assistant turn
+function hasLastTurnPreviewableContent() {
+    const code = getLastTurnPreviewCode();
+    return !!(code && code.trim().length > 0);
+}
+
+// Backward compatibility aliases
+function hasHtmlSnippet() {
+    return hasLastTurnPreviewableContent();
+}
+
+function getLatestHtmlCode() {
+    return getLastTurnPreviewCode();
 }
 
 // Extract HTML snippet specifically generated in the current assistant message
@@ -445,20 +611,20 @@ function getTurnHtmlCode(assistantMsgEl, rawText) {
     return '';
 }
 
-// Update visibility of the chat bar preview button (only show when HTML exists in response)
+// Update visibility of the chat bar preview button (only show when previewable content exists in the LAST assistant turn)
 function updateChatbarPreviewButtonVisibility() {
     const btn = document.getElementById('preview-btn-chatbar');
     if (!btn) return;
-    if (hasHtmlSnippet()) {
+    if (!isGenerating && hasLastTurnPreviewableContent()) {
         btn.classList.remove('hidden');
     } else {
         btn.classList.add('hidden');
     }
 }
 
-// Chatbar Preview Button Click Handler
+// Chatbar Preview Button Click Handler - strictly previews content from the LAST assistant turn
 function previewLatestHtmlSnippet() {
-    const code = getLatestHtmlCode();
+    const code = getLastTurnPreviewCode();
     if (code && code.trim().length > 0) {
         loadHtmlIntoPreview(code, true);
     } else {
@@ -1366,7 +1532,7 @@ let agenticSettings = {
     authorizedPaths: [],
     maxTurns: 8,
     compactToolOutputs: true,
-    omitPastReasoning: true,
+    omitPastReasoning: false,
     searchProvider: 'tavily',
     tavilyApiKey: '',
     searxngUrl: 'https://searx.be',
@@ -1395,10 +1561,35 @@ function isMediaSearchQuery(query) {
     const q = query.toLowerCase();
     const kw = [
         "youtube", "youtu.be", "video", "videos", "song", "songs", "music", "play", "listen",
-        "track", "tracks", "album", "clip", "clips", "audio", "soundtrack", "canto", "canzone",
-        "musica", "suona", "ascolta", "videoclip"
+        "track", "tracks", "album", "clip", "clips", "audio", "soundtrack", "ost", "theme",
+        "canto", "canzone", "canzoni", "musica", "suona", "ascolta", "videoclip", "trailer",
+        "teaser", "movie", "podcast", "live", "concert", "concerto", "remix", "cover", "lyrics",
+        "testo", "band", "singer", "artist", "cantante", "cantautore", "orchestra", "symphony",
+        "instrumental", "acoustic", "stream", "show", "performance", "discography", "chords",
+        "tab", "vlog", "gameplay", "tutorial", "walkthrough", "scene", "highlight", "highlights",
+        "documentary", "short", "shorts", "official video", "music video", "ep", "lp", "single"
     ];
-    return kw.some(k => q.includes(k));
+    if (kw.some(k => q.includes(k))) return true;
+
+    // Check if the user's latest prompt in the active turn was requesting media playback
+    if (Array.isArray(chatHistory) && chatHistory.length > 0) {
+        for (let i = chatHistory.length - 1; i >= 0; i--) {
+            const msg = chatHistory[i];
+            if (msg.role === 'user') {
+                const uContent = (msg.content || '').toLowerCase();
+                const mediaTriggers = [
+                    "play", "suona", "canzone", "song", "music", "musica", "listen", "ascolta",
+                    "fammi sentire", "fammi ascoltare", "metti la canzone", "metti il pezzo", "video", "youtube"
+                ];
+                if (mediaTriggers.some(t => uContent.includes(t))) {
+                    return true;
+                }
+                break;
+            }
+        }
+    }
+
+    return false;
 }
 
 function loadAgenticSettings() {
@@ -2223,7 +2414,7 @@ function resolveCaptchaPrompt(retried) {
 
 function buildOptimizedMessagesPayload() {
     const messagesToSend = [];
-    const sysPrompt = systemPromptInput ? systemPromptInput.value.trim() : '';
+    let sysPrompt = systemPromptInput ? systemPromptInput.value.trim() : '';
     if (sysPrompt) {
         messagesToSend.push({ role: 'system', content: sysPrompt });
     }
@@ -2255,8 +2446,9 @@ function buildOptimizedMessagesPayload() {
             cleanedMsg.reasoning_content = msg.reasoning_content;
         }
 
-        // Compact past bulky tool outputs from earlier turns
-        if (agenticSettings.compactToolOutputs !== false && !isCurrentActiveTurn) {
+        // Compact past bulky tool outputs from older turns (skip the immediate prior turn to preserve KV cache prefix)
+        const isImmediatePriorTurn = (idx >= historySlice.length - 3);
+        if (agenticSettings.compactToolOutputs !== false && !isCurrentActiveTurn && !isImmediatePriorTurn) {
             if (cleanedMsg.role === 'tool' || cleanedMsg.role === 'function') {
                 if (cleanedMsg.content && cleanedMsg.content.length > 250) {
                     cleanedMsg.content = cleanedMsg.content.slice(0, 250) + `\n... [Content compacted for context window: total ${cleanedMsg.content.length} chars]`;
@@ -2282,8 +2474,17 @@ function buildOptimizedMessagesPayload() {
 function stripToolCallsFromText(text) {
     if (!text) return '';
     let out = text;
-    out = out.replace(/<tool_call>[\s\S]*?<\/tool_call>/g, '');
-    out = out.replace(/<｜tool call begin｜>[\s\S]*?<｜tool call end｜>/g, '');
+    // Standard tool calls
+    out = out.replace(/<\s*tool_call>[\s\S]*?<\/\s*tool_call>/gi, '');
+    out = out.replace(/<\/?\s*tool_calls?>/gi, '');
+
+    // DeepSeek special tokens & DSML
+    out = out.replace(/<\s*[｜|]?tool call begin[｜|]>[\s\S]*?<\s*[｜|]?tool call end[｜|]>/gi, '');
+    out = out.replace(/<\s*[｜|]?DSML[｜|]?[^>]*>[\s\S]*?<\/\s*[｜|]?DSML[｜|]?[^>]*>/gi, '');
+    out = out.replace(/<\/?\s*[｜|]?DSML[｜|]?[^>]*>/gi, '');
+    out = out.replace(/<\s*[｜|]?tool (?:call begin|call end|sep|outputs begin|outputs end)[｜|]?>/gi, '');
+
+    // Raw function call JSON
     out = out.replace(/\{"name":\s*"[^"]+"[\s\S]*?\}/g, '');
     out = out.replace(/\{"function":\s*"[^"]+"[\s\S]*?\}/g, '');
     return out.trim();
@@ -2292,7 +2493,8 @@ function stripToolCallsFromText(text) {
 function isRawToolCallString(text) {
     if (!text) return false;
     const trimmed = text.trim();
-    if (trimmed.startsWith('<tool_call>') || trimmed.startsWith('<｜tool call begin｜>')) return true;
+    if (trimmed.startsWith('<tool_call>') || trimmed.startsWith('<｜tool call begin｜>') || trimmed.startsWith('<|tool call begin|>')) return true;
+    if (trimmed.startsWith('<｜DSML') || trimmed.startsWith('<|DSML') || trimmed.startsWith('<DSML') || trimmed.startsWith('< DSML') || trimmed.startsWith('< tool')) return true;
     if (trimmed.startsWith('{"name"') || trimmed.startsWith('{"function"') || trimmed.startsWith('{"name":') || trimmed.startsWith('{"function":')) return true;
     return false;
 }
@@ -2638,8 +2840,9 @@ function executeBrowserFetch(url, mode = 'text', pattern = '', maxChars = 4000) 
                 snippet: 'Interactive YouTube Player'
             };
             addRetrievedDocument(ytDoc);
+            // Defers preview playback until actual content streaming starts
             resolve({
-                output: `[Retrieved YouTube Video: https://www.youtube.com/watch?v=${videoId} | Video player registered for preview]`,
+                output: `[YouTube Video: https://www.youtube.com/watch?v=${videoId} | Video player registered for preview panel. Do not fetch web page.]`,
                 retrieved_document: ytDoc
             });
             return;
@@ -2759,7 +2962,17 @@ async function executeClientToolCall(tc, turnRetrievedDocs = null) {
             args = { query: tc.arguments };
         }
         const query = args.query || '';
-        const isMedia = (tc.name === 'youtube_search') || ((agenticSettings.fastMediaSearch !== false) && isMediaSearchQuery(query));
+        let isMedia = (tc.name === 'youtube_search') || ((agenticSettings.fastMediaSearch !== false) && isMediaSearchQuery(query));
+
+        // Disambiguate accidental youtube_search calls for general search requests (e.g. "search Tino Bruno", "who is ...")
+        if (tc.name === 'youtube_search' && !isMediaSearchQuery(query)) {
+            const latestUserMsg = (chatHistory.filter(m => m.role === 'user').slice(-1)[0]?.content || '').trim().toLowerCase();
+            const hasMediaKeywords = isMediaSearchQuery(latestUserMsg);
+            if (!hasMediaKeywords && (latestUserMsg.startsWith('search') || latestUserMsg.startsWith('cerca') || latestUserMsg.startsWith('who is') || latestUserMsg.startsWith('chi è') || latestUserMsg.startsWith('find'))) {
+                console.log('[Tool Dispatcher] Overriding accidental youtube_search -> web_search for general search query:', query);
+                isMedia = false;
+            }
+        }
 
         // 1. If fast media search is enabled or tool is youtube_search, try direct YouTube search first (0 API cost)
         if (isMedia) {
@@ -2774,18 +2987,26 @@ async function executeClientToolCall(tc, turnRetrievedDocs = null) {
                     })
                 });
                 const ytData = await ytRes.json();
-                if (ytData && ytData.output && ytData.retrieved_document && ytData.retrieved_document.url && ytData.retrieved_document.url.includes('youtube.com/watch')) {
-                    addRetrievedDocument(ytData.retrieved_document);
-                    if (turnRetrievedDocs) turnRetrievedDocs.push(ytData.retrieved_document);
+                if (ytData && ytData.output) {
+                    if (ytData.retrieved_document) {
+                        addRetrievedDocument(ytData.retrieved_document);
+                        if (turnRetrievedDocs) turnRetrievedDocs.push(ytData.retrieved_document);
+                        // Defers preview playback until actual content streaming starts
+                    }
                     return ytData.output;
                 }
             } catch (ytErr) {
-                console.warn('[YouTube Direct Search] Fallback to configured provider:', ytErr);
+                console.warn('[YouTube Direct Search] Execution error:', ytErr);
+            }
+
+            // Dedicated youtube_search tool should NEVER fall through to general web search provider (e.g. Tavily)
+            if (tc.name === 'youtube_search') {
+                return `No YouTube videos found for query: "${query}".`;
             }
         }
 
         const provider = args.provider || agenticSettings.searchProvider || 'tavily';
-        const tavilyKey = args.tavily_api_key || agenticSettings.tavilyApiKey || '';
+        const tavilyKey = args.tavily_api_key || args.api_key || agenticSettings.tavilyApiKey || '';
 
         // Direct JavaScript Tavily AI execution (SDK Equivalent: @tavily/core)
         if (provider === 'tavily' && tavilyKey) {
@@ -2805,6 +3026,7 @@ async function executeClientToolCall(tc, turnRetrievedDocs = null) {
 
         if (!args.provider && agenticSettings.searchProvider) args.provider = agenticSettings.searchProvider;
         if (!args.tavily_api_key && agenticSettings.tavilyApiKey) args.tavily_api_key = agenticSettings.tavilyApiKey;
+        if (!args.api_key && agenticSettings.tavilyApiKey) args.api_key = agenticSettings.tavilyApiKey;
         if (!args.searxng_url && agenticSettings.searxngUrl) args.searxng_url = agenticSettings.searxngUrl;
         if (!args.brave_api_key && agenticSettings.braveApiKey) args.brave_api_key = agenticSettings.braveApiKey;
         if (!args.serper_api_key && agenticSettings.serperApiKey) args.serper_api_key = agenticSettings.serperApiKey;
@@ -2865,6 +3087,10 @@ async function sendMessage() {
     const text = chatInput.value.trim();
     if (!text || isGenerating) return;
 
+    // Immediately hide inline preview button on sending a new message
+    const previewBtn = document.getElementById('preview-btn-chatbar');
+    if (previewBtn) previewBtn.classList.add('hidden');
+
     if (currentAbortController) {
         currentAbortController.abort();
     }
@@ -2908,11 +3134,18 @@ async function sendMessage() {
     const activeTools = getActiveToolsPayload();
 
     const startTime = performance.now();
-    let firstTokenTime = null;
     let totalPromptTokens = 0;
     let totalCompletionTokens = 0;
     let turnRetrievedDocs = [];
     let isReasoningDone = false;
+    let turnMediaPreviewLoaded = false;
+
+    // Engine performance & tool execution timing tracking
+    let round1TtftMs = null;
+    let totalPrefillMs = 0;
+    let totalDecodeMs = 0;
+    let turnToolTimeMs = 0;
+    let turnToolCallsCount = 0;
 
     const maxRounds = 6;
     let round = 0;
@@ -2944,10 +3177,12 @@ async function sendMessage() {
 
         while (round < maxRounds) {
             round++;
+            const roundStartTime = performance.now();
+            let roundFirstTokenTime = null;
             const messagesToSend = buildOptimizedMessagesPayload();
 
             const payload = {
-                model: "deepseek-v4-flash",
+                model: currentModelId || "deepseek-v4-flash",
                 messages: messagesToSend,
                 max_tokens: parseInt(tokensInput.value, 10),
                 temperature: parseFloat(tempSlider.value),
@@ -3046,6 +3281,26 @@ async function sendMessage() {
                                     showAuthPrompt(delta.authorization_required.tool, delta.authorization_required.path, delta.authorization_required.id);
                                 }
 
+                                if (delta.processing_status) {
+                                    const target = (reasoningContent && !isReasoningDone) ? reasoningContent : mainContent;
+                                    let procBadge = assistantMsgDiv.querySelector('#tool-proc-indicator');
+                                    if (!procBadge) {
+                                        procBadge = document.createElement('div');
+                                        procBadge.className = 'tool-activity-block active tool-processing-badge';
+                                        procBadge.id = 'tool-proc-indicator';
+                                        target.appendChild(procBadge);
+                                    }
+                                    procBadge.innerHTML = `
+                                        <span class="thinking-spinner">progress_activity</span>
+                                        <span class="tool-action-label">${escapeHtml(delta.processing_status)}</span>
+                                        <div class="elaboration-dots"><span></span><span></span><span></span></div>
+                                    `;
+                                    messagesContainer.scrollTo({
+                                        top: messagesContainer.scrollHeight,
+                                        behavior: 'smooth'
+                                    });
+                                }
+
                                 if (delta.tool_calls && Array.isArray(delta.tool_calls)) {
                                     for (const tc of delta.tool_calls) {
                                         const idx = tc.index !== undefined ? tc.index : roundToolCalls.length;
@@ -3061,7 +3316,15 @@ async function sendMessage() {
                                 }
 
                                 if (delta.reasoning_content !== undefined) {
-                                    if (firstTokenTime === null) firstTokenTime = performance.now();
+                                    const procBadge = assistantMsgDiv.querySelector('#tool-proc-indicator');
+                                    if (procBadge) procBadge.remove();
+
+                                    if (roundFirstTokenTime === null) {
+                                        roundFirstTokenTime = performance.now();
+                                        if (round1TtftMs === null) {
+                                            round1TtftMs = Math.max(0, roundFirstTokenTime - roundStartTime);
+                                        }
+                                    }
 
                                     const statusText = liveIndicator ? liveIndicator.querySelector('.status-msg-text') : null;
                                     if (statusText) statusText.textContent = 'Reasoning and analyzing query...';
@@ -3070,13 +3333,10 @@ async function sendMessage() {
                                         reasoningBlock = document.createElement('details');
                                         reasoningBlock.className = 'reasoning-block';
                                         reasoningBlock.open = true;
-
                                         const summary = document.createElement('summary');
                                         summary.innerHTML = '<span class="thinking-spinner">progress_activity</span> Thinking...';
-
                                         reasoningContent = document.createElement('div');
                                         reasoningContent.className = 'reasoning-content';
-
                                         reasoningBlock.appendChild(summary);
                                         reasoningBlock.appendChild(reasoningContent);
                                         assistantMsgDiv.querySelector('.msg-content').insertBefore(reasoningBlock, mainContent);
@@ -3101,11 +3361,31 @@ async function sendMessage() {
                                     if (!replaced) {
                                         roundReasoning += delta.reasoning_content;
                                     }
-                                    reasoningContent.innerHTML = marked.parse(roundReasoning);
+                                    reasoningContent.innerHTML = marked.parse(stripToolCallsFromText(roundReasoning));
                                 }
 
                                 if (delta.content !== undefined) {
-                                    if (firstTokenTime === null) firstTokenTime = performance.now();
+                                    const procBadge = assistantMsgDiv.querySelector('#tool-proc-indicator');
+                                    if (procBadge) procBadge.remove();
+
+                                    // If media was found by tools in this turn, launch preview and autoplay ONLY NOW (on content, not in reasoning)
+                                    if (!turnMediaPreviewLoaded && turnRetrievedDocs.length > 0) {
+                                        for (let i = turnRetrievedDocs.length - 1; i >= 0; i--) {
+                                            const d = turnRetrievedDocs[i];
+                                            if (d && d.html && (d.html.includes('youtube-nocookie.com') || d.html.includes('<video') || d.html.includes('<audio') || d.html.includes('YouTube Video'))) {
+                                                loadHtmlIntoPreview(d.html, true);
+                                                turnMediaPreviewLoaded = true;
+                                                break;
+                                            }
+                                        }
+                                    }
+
+                                    if (roundFirstTokenTime === null) {
+                                        roundFirstTokenTime = performance.now();
+                                        if (round1TtftMs === null) {
+                                            round1TtftMs = Math.max(0, roundFirstTokenTime - roundStartTime);
+                                        }
+                                    }
 
                                     if (liveIndicator && liveIndicator.parentElement) {
                                         liveIndicator.remove();
@@ -3155,9 +3435,17 @@ async function sendMessage() {
                 }
             }
 
+            const roundStreamEndTime = performance.now();
+            const roundPrefillMs = (roundFirstTokenTime !== null ? roundFirstTokenTime : roundStreamEndTime) - roundStartTime;
+            const roundDecodeMs = roundFirstTokenTime !== null ? Math.max(0, roundStreamEndTime - roundFirstTokenTime) : 0;
+            totalPrefillMs += roundPrefillMs;
+            totalDecodeMs += roundDecodeMs;
+
             const validToolCalls = roundToolCalls.filter(tc => tc && tc.name);
 
             if (validToolCalls.length > 0 && (roundFinishReason === 'tool_calls' || roundFinishReason === 'stop')) {
+                const toolExecStartTime = performance.now();
+                turnToolCallsCount += validToolCalls.length;
                 const cleanRoundContent = stripToolCallsFromText(roundContent);
                 if (cleanRoundContent.length > 0) {
                     renderMarkdownContent(cleanRoundContent, mainContent);
@@ -3184,13 +3472,21 @@ async function sendMessage() {
 
                     try {
                         const parsedArgs = typeof tc.arguments === 'string' ? JSON.parse(tc.arguments) : tc.arguments;
-                        if (tc.name === 'youtube_search') {
-                            toolTarget = parsedArgs.query || '';
+                        let isDirectMedia = (tc.name === 'youtube_search') || ((tc.name === 'web_search' || tc.name === 'google_search') && (agenticSettings.fastMediaSearch !== false) && isMediaSearchQuery(queryStr));
+                        if (tc.name === 'youtube_search' && !isMediaSearchQuery(queryStr)) {
+                            const latestUserMsg = (chatHistory.filter(m => m.role === 'user').slice(-1)[0]?.content || '').trim().toLowerCase();
+                            const hasMediaKeywords = isMediaSearchQuery(latestUserMsg);
+                            if (!hasMediaKeywords && (latestUserMsg.startsWith('search') || latestUserMsg.startsWith('cerca') || latestUserMsg.startsWith('who is') || latestUserMsg.startsWith('chi è') || latestUserMsg.startsWith('find'))) {
+                                isDirectMedia = false;
+                            }
+                        }
+                        if (isDirectMedia) {
+                            toolTarget = queryStr;
                             actionLabel = 'YouTube Searching';
                             doneIcon = 'smart_display';
                             completedLabel = 'YouTube Searched';
-                        } else if (tc.name === 'web_search' || tc.name === 'google_search') {
-                            toolTarget = parsedArgs.query || '';
+                        } else if (tc.name === 'web_search' || tc.name === 'google_search' || tc.name === 'youtube_search') {
+                            toolTarget = queryStr;
                             const prov = agenticSettings.searchProvider || 'web';
                             let provName = 'Web';
                             if (prov === 'tavily') provName = 'Tavily';
@@ -3226,6 +3522,21 @@ async function sendMessage() {
                             actionLabel = 'Running command';
                             doneIcon = 'terminal';
                             completedLabel = 'Executed';
+                        } else if (tc.name && tc.name.startsWith('mcp__')) {
+                            const parts = tc.name.split('__');
+                            const sId = parts[1] || 'mcp';
+                            const rawTName = parts.slice(2).join('__') || tc.name;
+                            toolTarget = typeof parsedArgs === 'object' ? JSON.stringify(parsedArgs) : String(parsedArgs || '');
+                            if (toolTarget.length > 80) toolTarget = toolTarget.substring(0, 80) + '...';
+                            actionLabel = `[MCP: ${sId}] ${rawTName}`;
+                            doneIcon = 'hub';
+                            completedLabel = `[MCP: ${sId}] Completed`;
+                        } else if (tc.name) {
+                            toolTarget = typeof parsedArgs === 'object' ? JSON.stringify(parsedArgs) : String(parsedArgs || '');
+                            if (toolTarget.length > 80) toolTarget = toolTarget.substring(0, 80) + '...';
+                            actionLabel = `Calling ${tc.name}`;
+                            doneIcon = 'build';
+                            completedLabel = `Executed ${tc.name}`;
                         }
                     } catch (e) {
                         toolTarget = tc.arguments || '';
@@ -3259,6 +3570,28 @@ async function sendMessage() {
                         content: toolOutput
                     });
                 }
+
+                const toolExecEndTime = performance.now();
+                turnToolTimeMs += Math.max(0, toolExecEndTime - toolExecStartTime);
+
+                // Show active elaboration badge while the backend prefill/encodes the tool output into KV cache
+                const activeToolTargetContainer = (reasoningContent && !isReasoningDone) ? reasoningContent : mainContent;
+                let procBadge = assistantMsgDiv.querySelector('#tool-proc-indicator');
+                if (!procBadge) {
+                    procBadge = document.createElement('div');
+                    procBadge.className = 'tool-activity-block active tool-processing-badge';
+                    procBadge.id = 'tool-proc-indicator';
+                    activeToolTargetContainer.appendChild(procBadge);
+                }
+                procBadge.innerHTML = `
+                    <span class="thinking-spinner">progress_activity</span>
+                    <span class="tool-action-label">Encoding tool output &amp; elaborating response</span>
+                    <div class="elaboration-dots"><span></span><span></span><span></span></div>
+                `;
+                messagesContainer.scrollTo({
+                    top: messagesContainer.scrollHeight,
+                    behavior: 'smooth'
+                });
 
                 continue;
             }
@@ -3347,31 +3680,38 @@ async function sendMessage() {
             break;
         }
 
-        const endTime = performance.now();
-        if (firstTokenTime === null) firstTokenTime = endTime;
-        const ttftMs = firstTokenTime - startTime;
-        const decodeTimeMs = Math.max(0, endTime - firstTokenTime);
+        const ttftMs = (round1TtftMs !== null ? round1TtftMs : totalPrefillMs);
         const ttftSec = ttftMs / 1000.0;
-        const decodeSec = decodeTimeMs / 1000.0;
+        const prefillSec = totalPrefillMs / 1000.0;
+        const decodeSec = totalDecodeMs / 1000.0;
+        const toolTimeSec = turnToolTimeMs / 1000.0;
 
         const actualCompletionTokens = totalCompletionTokens > 0 ? totalCompletionTokens : 1;
-        const prefillTps = (ttftSec > 0 && totalPromptTokens > 0) ? (totalPromptTokens / ttftSec) : 0.0;
-        const decodeTps = (decodeSec > 0 && actualCompletionTokens > 1) ? ((actualCompletionTokens - 1) / decodeSec) : 0.0;
+        const prefillTps = (prefillSec > 0 && totalPromptTokens > 0) ? (totalPromptTokens / prefillSec) : 0.0;
+        const decodeTps = (decodeSec > 0 && actualCompletionTokens > 1) 
+            ? ((actualCompletionTokens - 1) / decodeSec) 
+            : (decodeSec > 0 ? (actualCompletionTokens / decodeSec) : 0.0);
 
         const lastStats = {
             ttftSec,
+            prefillSec,
             decodeSec,
             promptTokens: totalPromptTokens,
             completionTokens: actualCompletionTokens,
             prefillTps,
-            decodeTps
+            decodeTps,
+            toolTimeSec,
+            toolCalls: turnToolCallsCount
         };
 
         sessionStats.totalTurns++;
         sessionStats.totalPromptTokens += totalPromptTokens;
         sessionStats.totalCompletionTokens += actualCompletionTokens;
         sessionStats.totalTtftMs += ttftMs;
-        sessionStats.totalDecodeTimeMs += decodeTimeMs;
+        sessionStats.totalPrefillMs += totalPrefillMs;
+        sessionStats.totalDecodeTimeMs += totalDecodeMs;
+        sessionStats.totalToolTimeMs += turnToolTimeMs;
+        sessionStats.totalToolCalls += turnToolCallsCount;
 
         updateStatsUI(lastStats);
 
@@ -3400,12 +3740,15 @@ async function sendMessage() {
         setGeneratingState(false);
         const liveEl = assistantMsgDiv.querySelector('#live-status-indicator');
         if (liveEl && liveEl.parentElement) liveEl.remove();
+        const procEl = assistantMsgDiv.querySelector('#tool-proc-indicator');
+        if (procEl && procEl.parentElement) procEl.remove();
         if (reasoningBlock) {
             const summary = reasoningBlock.querySelector('summary');
             if (summary && summary.querySelector('.thinking-spinner')) {
                 summary.innerHTML = 'Thought process';
             }
         }
+        updateChatbarPreviewButtonVisibility();
         fetchExpertProfile();
     }
 }
@@ -3632,10 +3975,1251 @@ function initProxyServiceWorker() {
     }
 }
 
+// ── Model Selector & Dropdown ──────────────────────────────────────────────────
+
+let currentModelId = "deepseek-v4-flash";
+let currentModelName = "DeepSeek V4-Flash";
+let currentModelData = null;
+
+async function initModelSelector() {
+    const selectorEl = document.getElementById('model-selector');
+    const dropdownEl = document.getElementById('model-dropdown');
+    const modelNameEl = document.getElementById('model-name');
+    const dropdownModelName = document.getElementById('dropdown-model-name');
+    const dropdownModelArch = document.getElementById('dropdown-model-arch');
+    const dropdownModelId = document.getElementById('dropdown-model-id');
+    const dropdownModelCtx = document.getElementById('dropdown-model-ctx');
+
+    if (!selectorEl || !modelNameEl) return;
+
+    async function fetchModelInfo() {
+        try {
+            const res = await fetch(`${getApiBase()}/v1/models`);
+            if (!res.ok) throw new Error(`HTTP ${res.status}`);
+            const data = await res.json();
+            if (data && data.data && data.data.length > 0) {
+                const active = data.data.find(m => m.active) || data.data[0];
+                if (active) {
+                    currentModelId = active.id;
+                    currentModelName = active.display_name || active.name || active.id;
+                    currentModelData = active;
+
+                    modelNameEl.textContent = currentModelName;
+                    if (dropdownModelName) dropdownModelName.textContent = currentModelName;
+                    if (dropdownModelId) dropdownModelId.textContent = active.id;
+                    if (dropdownModelArch && active.architecture) dropdownModelArch.textContent = active.architecture;
+                    if (dropdownModelCtx && active.max_context_length) {
+                        dropdownModelCtx.textContent = `${Number(active.max_context_length).toLocaleString()} ctx`;
+                    }
+                }
+            }
+        } catch (e) {
+            console.debug('[Model] Could not fetch active model from /v1/models:', e);
+        }
+    }
+
+    // Toggle dropdown
+    selectorEl.addEventListener('click', (e) => {
+        e.stopPropagation();
+        if (!dropdownEl) return;
+        const isHidden = dropdownEl.classList.contains('hidden');
+        if (isHidden) {
+            dropdownEl.classList.remove('hidden');
+            selectorEl.classList.add('open');
+            fetchModelInfo();
+        } else {
+            dropdownEl.classList.add('hidden');
+            selectorEl.classList.remove('open');
+        }
+    });
+
+    selectorEl.addEventListener('keydown', (e) => {
+        if (e.key === 'Enter' || e.key === ' ') {
+            e.preventDefault();
+            selectorEl.click();
+        } else if (e.key === 'Escape' && dropdownEl && !dropdownEl.classList.contains('hidden')) {
+            dropdownEl.classList.add('hidden');
+            selectorEl.classList.remove('open');
+        }
+    });
+
+    document.addEventListener('click', (e) => {
+        if (dropdownEl && !dropdownEl.classList.contains('hidden')) {
+            if (!dropdownEl.contains(e.target) && !selectorEl.contains(e.target)) {
+                dropdownEl.classList.add('hidden');
+                selectorEl.classList.remove('open');
+            }
+        }
+    });
+
+    // Initial fetch
+    await fetchModelInfo();
+}
+
+// ── MCP (Model Context Protocol) UI Management ────────────────────────────────
+
+let mcpServersList = [];
+
+async function fetchMCPServers() {
+    try {
+        const res = await fetch(`${getApiBase()}/v1/mcp/servers`);
+        if (!res.ok) throw new Error(`HTTP ${res.status}`);
+        const data = await res.json();
+        if (data && data.data) {
+            mcpServersList = data.data;
+            renderMCPServers(mcpServersList);
+        }
+    } catch (e) {
+        console.debug('[MCP UI] Could not fetch servers:', e);
+    }
+}
+
+function renderMCPServers(servers) {
+    const listEl = document.getElementById('mcp-server-list');
+    const activeCountEl = document.getElementById('mcp-active-servers-count');
+    const totalToolsEl = document.getElementById('mcp-total-tools-count');
+
+    if (!listEl) return;
+
+    let activeCount = 0;
+    let totalTools = 0;
+
+    servers.forEach(s => {
+        if (s.running) activeCount++;
+        totalTools += (s.tools_count || (s.tools ? s.tools.length : 0));
+    });
+
+    if (activeCountEl) activeCountEl.textContent = String(activeCount);
+    if (totalToolsEl) totalToolsEl.textContent = String(totalTools);
+
+    if (!servers || servers.length === 0) {
+        listEl.innerHTML = `
+            <div class="mcp-empty-state">
+                <span class="material-symbols-outlined" style="font-size: 32px; color: var(--text-muted); opacity: 0.6;">dns</span>
+                <p>No MCP servers configured yet.</p>
+                <span style="font-size: 11px; color: var(--text-muted);">Click "Add Server" to connect standard MCP servers (Filesystem, SQLite, Memory, GitHub, etc.)</span>
+            </div>
+        `;
+        return;
+    }
+
+    let html = '';
+    for (const s of servers) {
+        const statusClass = !s.enabled ? 'disabled' : (s.running ? 'running' : 'stopped');
+        const statusTitle = !s.enabled ? 'Disabled' : (s.running ? (s.pid > 0 ? `Running (PID ${s.pid})` : 'Connected (Remote)') : (s.error ? `Error: ${s.error}` : 'Stopped'));
+        const argsStr = Array.isArray(s.args) ? s.args.join(' ') : String(s.args || '');
+        const fullCmd = s.url ? `[${s.transport_type || 'streamable-http'}] ${s.url}` : `${s.command} ${argsStr}`.trim();
+        const tools = s.tools || [];
+
+        let toolsHtml = '';
+        if (tools.length > 0) {
+            toolsHtml = `
+                <div class="mcp-server-tools-section">
+                    <div class="mcp-tools-label">
+                        <span class="material-symbols-outlined" style="font-size: 14px;">build</span>
+                        <span>Exposed Tools (${tools.length})</span>
+                    </div>
+                    <div class="mcp-tools-grid">
+                        ${tools.map(t => `<span class="mcp-tool-pill" title="${escapeHtml(t.description || '')}">${escapeHtml(t.name)}</span>`).join('')}
+                    </div>
+                </div>
+            `;
+        }
+
+        html += `
+            <div class="mcp-server-card ${statusClass}" id="mcp-card-${escapeHtml(s.id)}" onclick="editMCPServer('${escapeHtml(s.id)}')" title="Click to view or edit server parameters">
+                <div class="mcp-server-header">
+                    <div class="mcp-server-title-group">
+                        <span class="mcp-status-dot ${statusClass}" title="${escapeHtml(statusTitle)}"></span>
+                        <span class="mcp-server-name">${escapeHtml(s.id)}</span>
+                        ${s.running && s.pid > 0 ? `<span class="mcp-server-pid">PID ${s.pid}</span>` : (s.running && s.url ? `<span class="mcp-server-pid" style="color: #93c5fd; background: rgba(59, 130, 246, 0.15);">Remote</span>` : '')}
+                        ${s.error ? `<span class="mcp-server-pid" style="color: #fca5a5; background: rgba(239, 68, 68, 0.15);" title="${escapeHtml(s.error)}">Error</span>` : ''}
+                    </div>
+                    <div class="mcp-server-actions">
+                        <button type="button" class="mcp-action-icon-btn edit" onclick="event.stopPropagation(); editMCPServer('${escapeHtml(s.id)}')" title="Edit Parameters & Settings">
+                            <span class="material-symbols-outlined" style="font-size: 16px;">tune</span>
+                        </button>
+                        <button type="button" class="mcp-action-icon-btn" onclick="event.stopPropagation(); restartMCPServer('${escapeHtml(s.id)}')" title="Restart Server">
+                            <span class="material-symbols-outlined" style="font-size: 16px;">restart_alt</span>
+                        </button>
+                        <input type="checkbox" class="agentic-toggle" ${s.enabled ? 'checked' : ''} onclick="event.stopPropagation();" onchange="toggleMCPServer('${escapeHtml(s.id)}', this.checked)" title="${s.enabled ? 'Disable Server' : 'Enable Server'}">
+                        <button type="button" class="mcp-action-icon-btn delete" onclick="event.stopPropagation(); deleteMCPServer('${escapeHtml(s.id)}')" title="Delete Server">
+                            <span class="material-symbols-outlined" style="font-size: 16px;">delete</span>
+                        </button>
+                    </div>
+                </div>
+                ${s.description ? `<div class="mcp-server-desc">${escapeHtml(s.description)}</div>` : ''}
+                <div class="mcp-server-cmd" title="${escapeHtml(fullCmd)}">${escapeHtml(fullCmd)}</div>
+                ${toolsHtml}
+                <div class="mcp-card-footer-hint">
+                    <span class="material-symbols-outlined" style="font-size: 13px;">tune</span>
+                    <span>Click card to configure parameters</span>
+                </div>
+            </div>
+        `;
+    }
+
+    listEl.innerHTML = html;
+}
+
+async function refreshMCPServersUI() {
+    await fetchMCPServers();
+}
+
+async function toggleMCPServer(id, enabled) {
+    try {
+        const res = await fetch(`${getApiBase()}/v1/mcp/servers/toggle`, {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ id, enabled })
+        });
+        const data = await res.json();
+        if (data && data.servers) {
+            mcpServersList = data.servers;
+            renderMCPServers(mcpServersList);
+        } else {
+            await fetchMCPServers();
+        }
+    } catch (e) {
+        console.error('[MCP UI] Error toggling server:', e);
+        await fetchMCPServers();
+    }
+}
+
+async function restartMCPServer(id) {
+    try {
+        const res = await fetch(`${getApiBase()}/v1/mcp/servers/restart`, {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ id })
+        });
+        const data = await res.json();
+        if (data && data.servers) {
+            mcpServersList = data.servers;
+            renderMCPServers(mcpServersList);
+        } else {
+            await fetchMCPServers();
+        }
+    } catch (e) {
+        console.error('[MCP UI] Error restarting server:', e);
+        await fetchMCPServers();
+    }
+}
+
+async function deleteMCPServer(id) {
+    if (!confirm(`Are you sure you want to remove MCP server '${id}'?`)) return;
+    try {
+        const res = await fetch(`${getApiBase()}/v1/mcp/servers?id=${encodeURIComponent(id)}`, {
+            method: 'DELETE'
+        });
+        const data = await res.json();
+        if (data && data.servers) {
+            mcpServersList = data.servers;
+            renderMCPServers(mcpServersList);
+        } else {
+            await fetchMCPServers();
+        }
+    } catch (e) {
+        console.error('[MCP UI] Error deleting server:', e);
+        await fetchMCPServers();
+    }
+}
+
+let currentMCPModalMode = 'form';
+let currentParsedMCPConfig = null;
+
+const SAMPLE_TEAMS_MCP_JSON = `{
+  "server": {
+    "$schema": "https://static.modelcontextprotocol.io/schemas/2025-10-17/server.schema.json",
+    "name": "com.microsoft/workiq-teamsserver",
+    "description": "Manage Microsoft Teams chats, channels, users, and messages via Graph API.",
+    "title": "Work IQ Teams MCP Server",
+    "repository": {
+      "url": "https://github.com/bap-microsoft/MCP-Platform/",
+      "source": "github"
+    },
+    "version": "1.0.0",
+    "remotes": [
+      {
+        "type": "streamable-http",
+        "url": "https://agent365.svc.cloud.microsoft/agents/tenants/{tenant_id}/servers/mcp_TeamsServer",
+        "variables": {
+          "tenant_id": {
+            "description": "Microsoft Entra tenant ID",
+            "isRequired": true
+          }
+        }
+      }
+    ]
+  },
+  "_meta": {
+    "io.modelcontextprotocol.registry/official": {
+      "status": "active",
+      "statusChangedAt": "2026-03-25T09:26:37.371959Z",
+      "publishedAt": "2026-03-25T09:26:37.371959Z",
+      "updatedAt": "2026-03-25T09:26:37.371959Z",
+      "isLatest": true
+    }
+  }
+}`;
+
+let currentRegistryServers = [];
+let searchRegistryDebounceTimer = null;
+
+function switchMCPModalMode(mode) {
+    currentMCPModalMode = mode;
+    const searchTabBtn = document.getElementById('mcp-tab-btn-search');
+    const formTabBtn = document.getElementById('mcp-tab-btn-form');
+    const jsonTabBtn = document.getElementById('mcp-tab-btn-json');
+    const searchPane = document.getElementById('mcp-modal-search-pane');
+    const formPane = document.getElementById('mcp-modal-form-pane');
+    const jsonPane = document.getElementById('mcp-modal-json-pane');
+    const jsonInput = document.getElementById('mcp-server-json-input');
+    const saveBtn = document.getElementById('mcp-save-btn');
+
+    // Reset tab active states
+    if (searchTabBtn) searchTabBtn.classList.remove('active');
+    if (formTabBtn) formTabBtn.classList.remove('active');
+    if (jsonTabBtn) jsonTabBtn.classList.remove('active');
+
+    // Reset pane display states
+    if (searchPane) searchPane.style.display = 'none';
+    if (formPane) formPane.style.display = 'none';
+    if (jsonPane) jsonPane.style.display = 'none';
+
+    if (mode === 'search') {
+        if (searchTabBtn) searchTabBtn.classList.add('active');
+        if (searchPane) searchPane.style.display = 'block';
+        if (saveBtn) saveBtn.style.display = 'none';
+
+        // Auto trigger search if container is empty
+        const resultsContainer = document.getElementById('mcp-registry-results-container');
+        if (resultsContainer && resultsContainer.children.length === 0) {
+            performMCPRegistrySearch();
+        }
+    } else if (mode === 'json') {
+        if (jsonTabBtn) jsonTabBtn.classList.add('active');
+        if (jsonPane) jsonPane.style.display = 'block';
+        if (saveBtn) saveBtn.style.display = 'inline-flex';
+
+        // If json input is empty, populate from form fields
+        if (jsonInput && !jsonInput.value.trim()) {
+            const id = document.getElementById('mcp-server-id-input')?.value.trim() || 'custom-server';
+            const transport = document.getElementById('mcp-transport-type-select')?.value || 'stdio';
+            const cmd = document.getElementById('mcp-server-cmd-input')?.value.trim() || '';
+            const rawArgs = document.getElementById('mcp-server-args-input')?.value.trim() || '';
+            const url = document.getElementById('mcp-server-url-input')?.value.trim() || '';
+            const desc = document.getElementById('mcp-server-desc-input')?.value.trim() || '';
+            let args = [];
+            if (rawArgs.startsWith('[') && rawArgs.endsWith(']')) {
+                try { args = JSON.parse(rawArgs); } catch (e) { args = rawArgs.split(/\s+/).filter(Boolean); }
+            } else if (rawArgs) {
+                args = rawArgs.split(/\s+/).filter(Boolean);
+            }
+
+            let env = {};
+            try {
+                const rawEnv = document.getElementById('mcp-server-env-input')?.value.trim();
+                if (rawEnv) env = JSON.parse(rawEnv);
+            } catch (e) {}
+
+            let sampleObj;
+            if (transport === 'streamable-http' || transport === 'sse' || url) {
+                sampleObj = {
+                    server: {
+                        name: id,
+                        title: desc || id,
+                        description: desc,
+                        remotes: [
+                            {
+                                type: transport,
+                                url: url || "https://..."
+                            }
+                        ]
+                    }
+                };
+            } else {
+                sampleObj = {
+                    mcpServers: {
+                        [id]: {
+                            command: cmd || "npx",
+                            args: args.length > 0 ? args : ["-y", "@modelcontextprotocol/server-filesystem", "."],
+                            env: env,
+                            description: desc
+                        }
+                    }
+                };
+            }
+            jsonInput.value = JSON.stringify(sampleObj, null, 2);
+        }
+        onMCPJsonInputChange();
+    } else {
+        // mode === 'form'
+        if (formTabBtn) formTabBtn.classList.add('active');
+        if (formPane) formPane.style.display = 'block';
+        if (saveBtn) saveBtn.style.display = 'inline-flex';
+
+        // If JSON input has valid parsed data, sync to form fields
+        if (currentParsedMCPConfig) {
+            populateFormFromParsedMCP(currentParsedMCPConfig);
+        }
+    }
+}
+
+async function performMCPRegistrySearch(query) {
+    const searchInput = document.getElementById('mcp-registry-search-input');
+    const statusEl = document.getElementById('mcp-registry-search-status');
+    const statusTextEl = document.getElementById('mcp-registry-search-text');
+    const statusIconEl = document.getElementById('mcp-registry-search-icon');
+    const container = document.getElementById('mcp-registry-results-container');
+
+    if (query === undefined) {
+        query = searchInput ? searchInput.value.trim() : '';
+    } else if (searchInput && searchInput.value !== query) {
+        searchInput.value = query;
+    }
+
+    // If user pasted a full URL from registry.modelcontextprotocol.io
+    if (query.includes('?q=')) {
+        query = query.split('?q=')[1].split('&')[0];
+    } else if (query.includes('&q=')) {
+        query = query.split('&q=')[1].split('&')[0];
+    } else if (query.startsWith('http')) {
+        try {
+            const urlObj = new URL(query);
+            query = urlObj.searchParams.get('q') || urlObj.searchParams.get('search') || '';
+        } catch (e) {}
+    }
+    query = decodeURIComponent(query).trim();
+
+    if (statusEl) {
+        statusEl.style.display = 'flex';
+        statusEl.className = 'mcp-json-status info';
+        if (statusIconEl) statusIconEl.textContent = 'progress_activity';
+        if (statusTextEl) statusTextEl.textContent = query 
+            ? `Searching registry for "${query}"...` 
+            : 'Loading featured MCP servers from registry...';
+    }
+
+    try {
+        const res = await fetch(`${getApiBase()}/v1/mcp/registry/search?q=${encodeURIComponent(query)}`);
+        if (!res.ok) {
+            if (res.status === 404) {
+                throw new Error(`Server endpoint /v1/mcp/registry/search returned HTTP 404. Please restart the backend server with the newly built binary.`);
+            }
+            throw new Error(`Registry search service responded with HTTP ${res.status}`);
+        }
+        const data = await res.json();
+        const servers = data.servers || (Array.isArray(data) ? data : []);
+        currentRegistryServers = servers;
+
+        if (statusEl) {
+            statusEl.className = 'mcp-json-status valid';
+            if (statusIconEl) statusIconEl.textContent = 'check_circle';
+            if (statusTextEl) {
+                statusTextEl.textContent = `Found ${servers.length} server${servers.length === 1 ? '' : 's'} in registry${query ? ` matching "${query}"` : ''}`;
+            }
+        }
+
+        renderMCPRegistryResults(servers);
+    } catch (e) {
+        console.error('[MCP Registry Search Error]', e);
+        if (statusEl) {
+            statusEl.className = 'mcp-json-status error';
+            if (statusIconEl) statusIconEl.textContent = 'error';
+            if (statusTextEl) statusTextEl.textContent = `Search error: ${e.message}. Check network connection.`;
+        }
+        if (container) {
+            container.innerHTML = `
+                <div style="text-align: center; padding: 20px; color: #f87171; font-size: 12px;">
+                    Failed to contact registry.modelcontextprotocol.io (${escapeHtml(e.message)}).
+                    <div style="margin-top: 8px;">
+                        <button type="button" class="editor-btn" onclick="performMCPRegistrySearch()" style="font-size: 11px;">Retry</button>
+                    </div>
+                </div>
+            `;
+        }
+    }
+}
+
+function onMCPRegistrySearchInput() {
+    clearTimeout(searchRegistryDebounceTimer);
+    searchRegistryDebounceTimer = setTimeout(() => {
+        performMCPRegistrySearch();
+    }, 350);
+}
+
+function searchRegistryTag(tag) {
+    const input = document.getElementById('mcp-registry-search-input');
+    if (input) input.value = tag;
+    performMCPRegistrySearch(tag);
+}
+
+function renderMCPRegistryResults(servers) {
+    const container = document.getElementById('mcp-registry-results-container');
+    if (!container) return;
+
+    if (!Array.isArray(servers) || servers.length === 0) {
+        container.innerHTML = `
+            <div style="text-align: center; padding: 28px 16px; color: var(--text-muted);">
+                <span class="material-symbols-outlined" style="font-size: 36px; opacity: 0.5; margin-bottom: 6px;">search_off</span>
+                <p style="font-size: 13px; margin: 0 0 4px; color: var(--text-secondary);">No MCP servers found.</p>
+                <span style="font-size: 11px;">Try searching for popular servers like "teams", "github", "filesystem", "sqlite", or "fetch".</span>
+            </div>
+        `;
+        return;
+    }
+
+    let html = '';
+    servers.forEach((item, index) => {
+        const s = item.server || item;
+        const meta = item._meta || {};
+        const title = s.title || s.name || 'Unnamed Server';
+        const name = s.name || '';
+        const desc = s.description || 'No description provided';
+        const version = s.version ? `v${s.version}` : '';
+
+        // Determine transport badges
+        let badgesHtml = '';
+        if (Array.isArray(s.remotes) && s.remotes.length > 0) {
+            s.remotes.forEach(r => {
+                const t = r.type || 'remote';
+                const cls = t === 'streamable-http' ? 'http' : (t === 'sse' ? 'sse' : 'http');
+                badgesHtml += `<span class="mcp-badge-transport ${cls}">${escapeHtml(t)}</span>`;
+            });
+        }
+        if (Array.isArray(s.packages) && s.packages.length > 0) {
+            s.packages.forEach(p => {
+                const reg = (p.registryType || 'cli').toLowerCase();
+                badgesHtml += `<span class="mcp-badge-transport stdio">${escapeHtml(reg)}</span>`;
+            });
+        }
+        if (!badgesHtml) {
+            badgesHtml = `<span class="mcp-badge-transport stdio">stdio</span>`;
+        }
+
+        const repoUrl = s.repository?.url || '';
+        const repoHtml = repoUrl ? `
+            <a href="${escapeHtml(repoUrl)}" target="_blank" rel="noopener noreferrer" class="mcp-reg-link" title="Open repository in new tab">
+                <span class="material-symbols-outlined" style="font-size: 13px;">open_in_new</span>
+                <span>GitHub / Repo</span>
+            </a>
+        ` : '<span></span>';
+
+        html += `
+            <div class="mcp-registry-card" id="mcp-reg-card-${index}">
+                <div class="mcp-registry-card-header">
+                    <div>
+                        <span class="mcp-reg-title">${escapeHtml(title)}</span>
+                        ${version ? `<span style="font-size: 10px; color: var(--text-muted); margin-left: 6px; font-family: monospace;">${escapeHtml(version)}</span>` : ''}
+                        <div class="mcp-reg-name">${escapeHtml(name)}</div>
+                    </div>
+                    <div class="mcp-reg-badges">
+                        ${badgesHtml}
+                    </div>
+                </div>
+                <div class="mcp-reg-desc">${escapeHtml(desc)}</div>
+                <div class="mcp-reg-footer">
+                    ${repoHtml}
+                    <button type="button" class="mcp-reg-select-btn" onclick="selectMCPRegistryServer(${index})" title="Configure and install this server">
+                        <span class="material-symbols-outlined" style="font-size: 14px;">check_circle</span>
+                        <span>Select & Configure</span>
+                    </button>
+                </div>
+            </div>
+        `;
+    });
+
+    container.innerHTML = html;
+}
+
+function selectMCPRegistryServer(index) {
+    if (!currentRegistryServers || !currentRegistryServers[index]) return;
+    const item = currentRegistryServers[index];
+
+    // Create complete official registry manifest structure
+    const manifest = {
+        server: item.server || item,
+        _meta: item._meta || {
+            "io.modelcontextprotocol.registry/official": {
+                "status": "active"
+            }
+        }
+    };
+
+    // Populate JSON input
+    const jsonInput = document.getElementById('mcp-server-json-input');
+    if (jsonInput) {
+        jsonInput.value = JSON.stringify(manifest, null, 2);
+    }
+
+    // Trigger parse & update UI
+    onMCPJsonInputChange();
+
+    // Also sync to Form fields
+    if (currentParsedMCPConfig) {
+        populateFormFromParsedMCP(currentParsedMCPConfig);
+    }
+
+    // Check if this server has variables that need filling (e.g. {tenant_id})
+    const hasVariables = currentParsedMCPConfig && Object.keys(currentParsedMCPConfig.variables || {}).length > 0;
+    
+    // Switch to JSON tab so user can review parameters & fill template variables
+    switchMCPModalMode('json');
+
+    // If variables exist, scroll to variables container and focus first input
+    if (hasVariables) {
+        const varsContainer = document.getElementById('mcp-json-variables-container');
+        if (varsContainer) {
+            varsContainer.scrollIntoView({ behavior: 'smooth', block: 'nearest' });
+            const firstVarKey = Object.keys(currentParsedMCPConfig.variables)[0];
+            const firstInput = document.getElementById(`mcp-var-val-${firstVarKey}`);
+            if (firstInput) setTimeout(() => firstInput.focus(), 150);
+        }
+    }
+}
+
+function openSearchMCPServerModal(query = '') {
+    openAddMCPServerModal();
+    switchMCPModalMode('search');
+    const searchInput = document.getElementById('mcp-registry-search-input');
+    if (searchInput) {
+        if (query) searchInput.value = query;
+        searchInput.focus();
+    }
+    performMCPRegistrySearch(query);
+}
+
+function onMCPTransportTypeChange() {
+    const transport = document.getElementById('mcp-transport-type-select').value;
+    const cmdGroup = document.getElementById('mcp-server-cmd-group');
+    const argsGroup = document.getElementById('mcp-server-args-group');
+    const urlGroup = document.getElementById('mcp-server-url-group');
+
+    if (transport === 'streamable-http' || transport === 'sse') {
+        if (cmdGroup) cmdGroup.style.display = 'none';
+        if (argsGroup) argsGroup.style.display = 'none';
+        if (urlGroup) urlGroup.style.display = 'block';
+    } else {
+        if (cmdGroup) cmdGroup.style.display = 'block';
+        if (argsGroup) argsGroup.style.display = 'block';
+        if (urlGroup) urlGroup.style.display = 'none';
+    }
+}
+
+function pasteSampleTeamsMCPJson() {
+    const jsonInput = document.getElementById('mcp-server-json-input');
+    if (!jsonInput) return;
+    jsonInput.value = SAMPLE_TEAMS_MCP_JSON;
+    onMCPJsonInputChange();
+}
+
+function formatMCPJsonInput() {
+    const jsonInput = document.getElementById('mcp-server-json-input');
+    if (!jsonInput || !jsonInput.value.trim()) return;
+    try {
+        const obj = JSON.parse(jsonInput.value);
+        jsonInput.value = JSON.stringify(obj, null, 2);
+        onMCPJsonInputChange();
+    } catch (e) {
+        alert('Invalid JSON syntax: ' + e.message);
+    }
+}
+
+function clearMCPJsonInput() {
+    const jsonInput = document.getElementById('mcp-server-json-input');
+    if (jsonInput) jsonInput.value = '';
+    const statusEl = document.getElementById('mcp-json-status');
+    if (statusEl) statusEl.style.display = 'none';
+    const varsContainer = document.getElementById('mcp-json-variables-container');
+    if (varsContainer) varsContainer.style.display = 'none';
+    currentParsedMCPConfig = null;
+}
+
+function parseMCPConfig(rawText) {
+    const raw = JSON.parse(rawText);
+    let id = '';
+    let name = '';
+    let title = '';
+    let description = '';
+    let command = '';
+    let args = [];
+    let url = '';
+    let transport_type = 'stdio';
+    let env = {};
+    let variables = {};
+    let detectedType = 'Standard MCP Config';
+
+    // Case 1: Official Registry Manifest Schema (server.schema.json)
+    if (raw && typeof raw === 'object' && raw.server && typeof raw.server === 'object') {
+        detectedType = 'Official Registry Manifest (server.schema.json)';
+        const s = raw.server;
+        name = s.name || '';
+        title = s.title || '';
+        description = s.description || title || '';
+        id = name ? (name.includes('/') ? name.split('/').pop() : name) : 'mcp-server';
+
+        if (Array.isArray(s.remotes) && s.remotes.length > 0) {
+            const rem = s.remotes[0];
+            transport_type = rem.type || 'streamable-http';
+            url = rem.url || '';
+            if (rem.variables && typeof rem.variables === 'object') {
+                variables = Object.assign({}, rem.variables);
+            }
+            if (rem.headers && typeof rem.headers === 'object') {
+                env = Object.assign({}, rem.headers);
+            }
+        } else if (Array.isArray(s.packages) && s.packages.length > 0) {
+            const pkg = s.packages[0];
+            const regType = (pkg.registryType || '').toLowerCase();
+            const ident = pkg.identifier || '';
+            if (regType === 'npm') {
+                command = 'npx';
+                args = ['-y', ident];
+            } else if (regType === 'pypi') {
+                command = 'uvx';
+                args = [ident];
+            } else {
+                command = ident || 'npx';
+            }
+            if (Array.isArray(pkg.packageArguments)) {
+                args = args.concat(pkg.packageArguments);
+            }
+            if (pkg.environmentVariables && typeof pkg.environmentVariables === 'object') {
+                env = Object.assign({}, pkg.environmentVariables);
+            }
+            transport_type = 'stdio';
+        }
+        if (s.command) command = s.command;
+        if (Array.isArray(s.args)) args = s.args;
+        if (s.env && typeof s.env === 'object') env = Object.assign(env, s.env);
+    }
+    // Case 2: Claude Desktop / Cursor mcpServers format
+    else if (raw && typeof raw === 'object' && raw.mcpServers && typeof raw.mcpServers === 'object') {
+        detectedType = 'Claude / Cursor Config (mcpServers)';
+        const keys = Object.keys(raw.mcpServers);
+        if (keys.length > 0) {
+            id = keys[0];
+            const s = raw.mcpServers[id];
+            command = s.command || '';
+            args = Array.isArray(s.args) ? s.args : [];
+            url = s.url || '';
+            transport_type = s.transport || s.transport_type || (url ? 'streamable-http' : 'stdio');
+            description = s.description || '';
+            if (s.env && typeof s.env === 'object') env = s.env;
+        }
+    }
+    // Case 3: Direct single server object
+    else if (raw && typeof raw === 'object') {
+        detectedType = 'Single Server Configuration';
+        id = raw.id || raw.name || 'custom-server';
+        command = raw.command || '';
+        args = Array.isArray(raw.args) ? raw.args : [];
+        url = raw.url || '';
+        transport_type = raw.transport_type || raw.transport || (url ? 'streamable-http' : 'stdio');
+        description = raw.description || raw.title || '';
+        if (raw.env && typeof raw.env === 'object') env = raw.env;
+        if (raw.variables && typeof raw.variables === 'object') variables = Object.assign({}, raw.variables);
+    }
+
+    // Also scan url for any template variables {var_name}
+    if (url) {
+        const matches = url.match(/\{([a-zA-Z0-9_-]+)\}/g);
+        if (matches) {
+            matches.forEach(m => {
+                const varName = m.slice(1, -1);
+                if (!variables[varName]) {
+                    variables[varName] = { description: `Value for {${varName}} in remote URL`, isRequired: true };
+                }
+            });
+        }
+    }
+
+    return {
+        raw,
+        id,
+        name,
+        title,
+        description,
+        command,
+        args,
+        url,
+        transport_type,
+        env,
+        variables,
+        detectedType
+    };
+}
+
+function onMCPJsonInputChange() {
+    const jsonInput = document.getElementById('mcp-server-json-input');
+    const statusEl = document.getElementById('mcp-json-status');
+    const statusTextEl = document.getElementById('mcp-json-status-text');
+    const statusIconEl = document.getElementById('mcp-json-status-icon');
+    const varsContainer = document.getElementById('mcp-json-variables-container');
+    const varsFieldsEl = document.getElementById('mcp-json-variables-fields');
+
+    if (!jsonInput) return;
+    const text = jsonInput.value.trim();
+    if (!text) {
+        if (statusEl) statusEl.style.display = 'none';
+        if (varsContainer) varsContainer.style.display = 'none';
+        currentParsedMCPConfig = null;
+        return;
+    }
+
+    try {
+        const parsed = parseMCPConfig(text);
+        currentParsedMCPConfig = parsed;
+
+        if (statusEl) {
+            statusEl.style.display = 'flex';
+            statusEl.className = 'mcp-json-status valid';
+            if (statusIconEl) statusIconEl.textContent = 'check_circle';
+            const transportLabel = parsed.url ? `${parsed.transport_type}` : 'CLI stdio';
+            statusTextEl.textContent = `Valid ${parsed.detectedType}: "${parsed.id || 'unnamed'}" [${transportLabel}]`;
+        }
+
+        // Render URL variables container if variables exist
+        const varKeys = Object.keys(parsed.variables || {});
+        if (varKeys.length > 0) {
+            if (varsContainer) varsContainer.style.display = 'block';
+            let varsHtml = '';
+            for (const key of varKeys) {
+                const meta = parsed.variables[key] || {};
+                const desc = meta.description || key;
+                const reqBadge = meta.isRequired ? '<span style="color:#f87171; margin-left:3px;">*</span>' : '';
+                varsHtml += `
+                    <div class="mcp-var-input-row" style="margin-bottom: 8px;">
+                        <label style="display:block; font-size:11px; color:#c4b5fd; font-family:monospace; margin-bottom: 2px;">
+                            {${escapeHtml(key)}}${reqBadge} <span style="color:var(--text-muted); font-family:var(--font-body); font-size:11px;">(${escapeHtml(desc)})</span>
+                        </label>
+                        <input type="text" id="mcp-var-val-${escapeHtml(key)}" class="agentic-text-field" placeholder="Enter ${escapeHtml(key)}..." oninput="updateMCPResolvedUrl()" style="font-family:monospace; font-size:12px; padding: 6px 8px;">
+                    </div>
+                `;
+            }
+            if (varsFieldsEl) varsFieldsEl.innerHTML = varsHtml;
+            updateMCPResolvedUrl();
+        } else {
+            if (varsContainer) varsContainer.style.display = 'none';
+        }
+    } catch (e) {
+        currentParsedMCPConfig = null;
+        if (statusEl) {
+            statusEl.style.display = 'flex';
+            statusEl.className = 'mcp-json-status error';
+            if (statusIconEl) statusIconEl.textContent = 'error';
+            statusTextEl.textContent = `JSON Error: ${e.message}`;
+        }
+        if (varsContainer) varsContainer.style.display = 'none';
+    }
+}
+
+function updateMCPResolvedUrl() {
+    if (!currentParsedMCPConfig || !currentParsedMCPConfig.url) return;
+    const previewBox = document.getElementById('mcp-json-resolved-preview-box');
+    const previewText = document.getElementById('mcp-json-resolved-url-text');
+    if (!previewBox || !previewText) return;
+
+    let resolvedUrl = currentParsedMCPConfig.url;
+    const varKeys = Object.keys(currentParsedMCPConfig.variables || {});
+    for (const key of varKeys) {
+        const input = document.getElementById(`mcp-var-val-${key}`);
+        const val = input ? input.value.trim() : '';
+        const replacement = val || `{${key}}`;
+        resolvedUrl = resolvedUrl.split(`{${key}}`).join(replacement);
+    }
+
+    previewText.textContent = resolvedUrl;
+    previewBox.style.display = 'block';
+}
+
+function populateFormFromParsedMCP(parsed) {
+    if (!parsed) return;
+    const idInput = document.getElementById('mcp-server-id-input');
+    const transportSelect = document.getElementById('mcp-transport-type-select');
+    const cmdInput = document.getElementById('mcp-server-cmd-input');
+    const argsInput = document.getElementById('mcp-server-args-input');
+    const urlInput = document.getElementById('mcp-server-url-input');
+    const envInput = document.getElementById('mcp-server-env-input');
+    const descInput = document.getElementById('mcp-server-desc-input');
+
+    if (idInput) idInput.value = parsed.id || '';
+    if (transportSelect) {
+        transportSelect.value = parsed.transport_type || (parsed.url ? 'streamable-http' : 'stdio');
+        onMCPTransportTypeChange();
+    }
+    if (cmdInput) cmdInput.value = parsed.command || '';
+    if (argsInput) argsInput.value = Array.isArray(parsed.args) ? parsed.args.join(' ') : '';
+    if (urlInput) urlInput.value = parsed.url || '';
+    if (envInput) envInput.value = (parsed.env && Object.keys(parsed.env).length > 0) ? JSON.stringify(parsed.env, null, 2) : '';
+    if (descInput) descInput.value = parsed.description || parsed.title || '';
+}
+
+let editingMCPServerId = null;
+
+function editMCPServer(id) {
+    const s = mcpServersList.find(x => x.id === id);
+    if (!s) {
+        console.warn('[MCP UI] Server not found for editing:', id);
+        return;
+    }
+
+    editingMCPServerId = s.id;
+    const modal = document.getElementById('mcp-server-modal');
+    if (!modal) return;
+
+    // Update modal header
+    const titleEl = document.getElementById('mcp-modal-title');
+    const subEl = modal.querySelector('.modal-sub');
+    if (titleEl) titleEl.textContent = `Configure MCP Server: ${s.id}`;
+    if (subEl) subEl.textContent = `Edit parameters, command arguments, remote URL, or environment variables`;
+
+    // Populate Form Fields
+    const idInput = document.getElementById('mcp-server-id-input');
+    const transportSelect = document.getElementById('mcp-transport-type-select');
+    const cmdInput = document.getElementById('mcp-server-cmd-input');
+    const argsInput = document.getElementById('mcp-server-args-input');
+    const urlInput = document.getElementById('mcp-server-url-input');
+    const envInput = document.getElementById('mcp-server-env-input');
+    const descInput = document.getElementById('mcp-server-desc-input');
+    const enabledInput = document.getElementById('mcp-server-enabled-input');
+
+    if (idInput) idInput.value = s.id || '';
+    if (transportSelect) {
+        transportSelect.value = s.transport_type || (s.url ? 'streamable-http' : 'stdio');
+        onMCPTransportTypeChange();
+    }
+    if (cmdInput) cmdInput.value = s.command || '';
+    if (argsInput) {
+        if (Array.isArray(s.args)) {
+            argsInput.value = s.args.join(' ');
+        } else {
+            argsInput.value = s.args || '';
+        }
+    }
+    if (urlInput) urlInput.value = s.url || '';
+    if (envInput) {
+        if (s.env && typeof s.env === 'object' && Object.keys(s.env).length > 0) {
+            envInput.value = JSON.stringify(s.env, null, 2);
+        } else {
+            envInput.value = '';
+        }
+    }
+    if (descInput) descInput.value = s.description || '';
+    if (enabledInput) enabledInput.checked = s.enabled ?? true;
+
+    // Match preset if known, otherwise custom
+    const presetSelect = document.getElementById('mcp-preset-select');
+    if (presetSelect) {
+        if (s.id === 'filesystem' || (s.command === 'npx' && String(s.args).includes('server-filesystem'))) {
+            presetSelect.value = 'filesystem';
+        } else if (s.id === 'sqlite' || String(s.args).includes('mcp-server-sqlite')) {
+            presetSelect.value = 'sqlite';
+        } else if (s.id === 'fetch' || String(s.args).includes('mcp-server-fetch')) {
+            presetSelect.value = 'fetch';
+        } else if (s.id === 'git' || String(s.args).includes('mcp-server-git')) {
+            presetSelect.value = 'git';
+        } else if (s.id === 'memory' || String(s.args).includes('server-memory')) {
+            presetSelect.value = 'memory';
+        } else {
+            presetSelect.value = 'custom';
+        }
+    }
+
+    // Populate Raw JSON editor
+    let sampleObj;
+    if (s.transport_type === 'streamable-http' || s.transport_type === 'sse' || s.url) {
+        sampleObj = {
+            server: {
+                name: s.id,
+                title: s.description || s.id,
+                description: s.description || '',
+                remotes: [
+                    {
+                        type: s.transport_type || 'streamable-http',
+                        url: s.url || ''
+                    }
+                ]
+            }
+        };
+        if (s.env && typeof s.env === 'object' && Object.keys(s.env).length > 0) {
+            sampleObj.server.remotes[0].headers = s.env;
+        }
+    } else {
+        let cleanArgs = [];
+        if (Array.isArray(s.args)) {
+            cleanArgs = s.args;
+        } else if (s.args) {
+            cleanArgs = String(s.args).split(/\s+/).filter(Boolean);
+        }
+        sampleObj = {
+            mcpServers: {
+                [s.id]: {
+                    command: s.command || 'npx',
+                    args: cleanArgs,
+                    env: s.env || {},
+                    description: s.description || ''
+                }
+            }
+        };
+    }
+
+    const jsonInput = document.getElementById('mcp-server-json-input');
+    if (jsonInput) {
+        jsonInput.value = JSON.stringify(sampleObj, null, 2);
+    }
+    onMCPJsonInputChange();
+
+    // Update Save button text
+    const saveBtn = document.getElementById('mcp-save-btn');
+    if (saveBtn) {
+        saveBtn.innerHTML = `
+            <span class="material-symbols-outlined" style="font-size: 16px;">save</span>
+            <span>Save & Reconnect</span>
+        `;
+    }
+
+    // Start in Form mode
+    switchMCPModalMode('form');
+    modal.style.display = 'flex';
+}
+
+function openAddMCPServerModal() {
+    editingMCPServerId = null;
+    const modal = document.getElementById('mcp-server-modal');
+    if (!modal) return;
+
+    // Reset title and subtitle
+    const titleEl = document.getElementById('mcp-modal-title');
+    const subEl = modal.querySelector('.modal-sub');
+    if (titleEl) titleEl.textContent = 'Configure MCP Server';
+    if (subEl) subEl.textContent = 'Add a Model Context Protocol tool server (Local CLI or Remote Streamable-HTTP)';
+
+    // Reset save button text
+    const saveBtn = document.getElementById('mcp-save-btn');
+    if (saveBtn) {
+        saveBtn.innerHTML = `
+            <span class="material-symbols-outlined" style="font-size: 16px;">save</span>
+            <span>Save & Connect</span>
+        `;
+    }
+
+    document.getElementById('mcp-preset-select').value = 'custom';
+    document.getElementById('mcp-transport-type-select').value = 'stdio';
+    onMCPTransportTypeChange();
+    document.getElementById('mcp-server-id-input').value = '';
+    document.getElementById('mcp-server-cmd-input').value = '';
+    document.getElementById('mcp-server-args-input').value = '';
+    document.getElementById('mcp-server-url-input').value = '';
+    document.getElementById('mcp-server-env-input').value = '';
+    document.getElementById('mcp-server-desc-input').value = '';
+    document.getElementById('mcp-server-enabled-input').checked = true;
+    clearMCPJsonInput();
+    switchMCPModalMode('form');
+    modal.style.display = 'flex';
+}
+
+function closeAddMCPServerModal() {
+    editingMCPServerId = null;
+    const modal = document.getElementById('mcp-server-modal');
+    if (modal) modal.style.display = 'none';
+}
+
+function onMCPPresetSelect() {
+    const preset = document.getElementById('mcp-preset-select').value;
+    if (preset === 'search-registry') {
+        switchMCPModalMode('search');
+        return;
+    }
+    if (preset === 'json-custom') {
+        switchMCPModalMode('json');
+        const jsonInput = document.getElementById('mcp-server-json-input');
+        if (jsonInput && !jsonInput.value.trim()) {
+            pasteSampleTeamsMCPJson();
+        }
+        return;
+    }
+
+    switchMCPModalMode('form');
+    const idInput = document.getElementById('mcp-server-id-input');
+    const transportSelect = document.getElementById('mcp-transport-type-select');
+    const cmdInput = document.getElementById('mcp-server-cmd-input');
+    const argsInput = document.getElementById('mcp-server-args-input');
+    const urlInput = document.getElementById('mcp-server-url-input');
+    const envInput = document.getElementById('mcp-server-env-input');
+    const descInput = document.getElementById('mcp-server-desc-input');
+
+    if (transportSelect) {
+        transportSelect.value = 'stdio';
+        onMCPTransportTypeChange();
+    }
+    if (urlInput) urlInput.value = '';
+
+    if (preset === 'filesystem') {
+        idInput.value = 'filesystem';
+        cmdInput.value = 'npx';
+        argsInput.value = '-y @modelcontextprotocol/server-filesystem .';
+        descInput.value = 'Workspace filesystem operations via official MCP server';
+    } else if (preset === 'sqlite') {
+        idInput.value = 'sqlite';
+        cmdInput.value = 'uvx';
+        argsInput.value = 'mcp-server-sqlite --db-path ./database.db';
+        descInput.value = 'SQLite database querying and schema inspection';
+    } else if (preset === 'fetch') {
+        idInput.value = 'fetch';
+        cmdInput.value = 'uvx';
+        argsInput.value = 'mcp-server-fetch';
+        descInput.value = 'Web page fetching and Markdown conversion';
+    } else if (preset === 'git') {
+        idInput.value = 'git';
+        cmdInput.value = 'uvx';
+        argsInput.value = 'mcp-server-git --repository .';
+        descInput.value = 'Git repository version control and commits';
+    } else if (preset === 'memory') {
+        idInput.value = 'memory';
+        cmdInput.value = 'npx';
+        argsInput.value = '-y @modelcontextprotocol/server-memory';
+        descInput.value = 'Knowledge graph memory server';
+    }
+}
+
+async function saveMCPServerForm() {
+    let payload = null;
+
+    if (currentMCPModalMode === 'json') {
+        const jsonInput = document.getElementById('mcp-server-json-input');
+        const rawText = jsonInput ? jsonInput.value.trim() : '';
+        if (!rawText) {
+            alert('Please paste or enter an MCP configuration JSON.');
+            return;
+        }
+
+        let parsed;
+        try {
+            parsed = parseMCPConfig(rawText);
+        } catch (e) {
+            alert('Invalid JSON syntax: ' + e.message);
+            return;
+        }
+
+        let finalUrl = parsed.url;
+        // Resolve variables
+        const varKeys = Object.keys(parsed.variables || {});
+        for (const key of varKeys) {
+            const meta = parsed.variables[key] || {};
+            const input = document.getElementById(`mcp-var-val-${key}`);
+            const val = input ? input.value.trim() : '';
+            if (meta.isRequired && !val) {
+                alert(`Please provide a value for required variable: {${key}} (${meta.description || key})`);
+                if (input) input.focus();
+                return;
+            }
+            if (val) {
+                finalUrl = finalUrl.split(`{${key}}`).join(val);
+            }
+        }
+
+        const id = parsed.id || 'mcp-server';
+        payload = {
+            id,
+            command: parsed.command || '',
+            args: parsed.args || [],
+            url: finalUrl || '',
+            transport_type: parsed.transport_type || (finalUrl ? 'streamable-http' : 'stdio'),
+            env: parsed.env || {},
+            description: parsed.description || parsed.title || '',
+            enabled: document.getElementById('mcp-server-enabled-input')?.checked ?? true
+        };
+    } else {
+        const id = document.getElementById('mcp-server-id-input').value.trim();
+        const transport = document.getElementById('mcp-transport-type-select').value;
+        const cmd = document.getElementById('mcp-server-cmd-input').value.trim();
+        const rawArgs = document.getElementById('mcp-server-args-input').value.trim();
+        const url = document.getElementById('mcp-server-url-input').value.trim();
+        const rawEnv = document.getElementById('mcp-server-env-input').value.trim();
+        const desc = document.getElementById('mcp-server-desc-input').value.trim();
+        const enabled = document.getElementById('mcp-server-enabled-input')?.checked ?? true;
+
+        if (!id) {
+            alert('Server ID / Name is required.');
+            return;
+        }
+
+        if (transport === 'streamable-http' || transport === 'sse') {
+            if (!url) {
+                alert('Remote Server URL is required for remote transport.');
+                return;
+            }
+        } else {
+            if (!cmd) {
+                alert('Command is required for local stdio transport.');
+                return;
+            }
+        }
+
+        let args = [];
+        if (rawArgs.startsWith('[') && rawArgs.endsWith(']')) {
+            try { args = JSON.parse(rawArgs); } catch (e) { args = rawArgs.split(/\s+/).filter(Boolean); }
+        } else if (rawArgs) {
+            args = rawArgs.split(/\s+/).filter(Boolean);
+        }
+
+        let env = {};
+        if (rawEnv) {
+            try {
+                env = JSON.parse(rawEnv);
+            } catch (e) {
+                console.warn('[MCP UI] Invalid JSON for env, ignoring');
+            }
+        }
+
+        payload = {
+            id,
+            command: cmd,
+            args,
+            url: (transport === 'streamable-http' || transport === 'sse') ? url : '',
+            transport_type: transport,
+            env,
+            description: desc,
+            enabled
+        };
+    }
+
+    if (editingMCPServerId) {
+        payload.old_id = editingMCPServerId;
+    }
+
+    try {
+        const res = await fetch(`${getApiBase()}/v1/mcp/servers`, {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify(payload)
+        });
+        const data = await res.json();
+        closeAddMCPServerModal();
+        if (data && data.servers) {
+            mcpServersList = data.servers;
+            renderMCPServers(mcpServersList);
+        } else {
+            await fetchMCPServers();
+        }
+    } catch (e) {
+        alert(`Failed to save MCP server: ${e.message}`);
+    }
+}
+
+function initMCPUI() {
+    fetchMCPServers();
+}
+
 // Run initialization on DOM load
 document.addEventListener('DOMContentLoaded', () => {
     initProxyServiceWorker();
     initPreviewPanel();
     initExpertProfileUI();
     initAgenticSettingsUI();
+    initModelSelector();
+    initMCPUI();
 });
+

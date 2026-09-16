@@ -16,6 +16,7 @@
 #include <mutex>
 #include <unordered_set>
 #include <unordered_map>
+#include <regex>
 #include <nlohmann/json.hpp>
 
 #if defined(_WIN32) || defined(_WIN64)
@@ -2113,7 +2114,7 @@ inline RetrievedDocument fetch_url_full(const std::string& raw_url, int timeout_
         std::string title = "YouTube Video (" + direct_yt_id + ")";
         doc.title = title;
         doc.raw_html = generate_youtube_preview_html(direct_yt_id, title, "", "", doc.url);
-        doc.clean_text = "[YouTube video loaded in preview player: https://www.youtube.com/watch?v=" + direct_yt_id + "]";
+        doc.clean_text = "[YouTube Player Active: " + doc.url + " | Video is already loaded and playing in preview panel. Do not fetch web page.]";
         return doc;
     }
 
@@ -2794,16 +2795,24 @@ inline RetrievedDocument search_youtube_direct(const std::string& clean_q, int m
         return doc;
     }
 
-    std::string text_out = "[Direct YouTube Search: \"" + clean_q + "\"]\n\n";
-    for (size_t i = 0; i < videos.size(); ++i) {
-        text_out += std::to_string(i + 1) + ". [" + videos[i].title + "](https://www.youtube.com/watch?v=" + videos[i].vid + ")\n";
-        if (!videos[i].channel.empty()) text_out += "   Channel: " + videos[i].channel + "\n";
-        if (!videos[i].duration.empty()) text_out += "   Duration: " + videos[i].duration + "\n";
-    }
-
     const auto& top = videos[0];
     doc.url = "https://www.youtube.com/watch?v=" + top.vid;
     doc.title = top.title;
+
+    std::string text_out = "[YouTube Playback Started]\n"
+                           "Playing: \"" + top.title + "\"\n"
+                           "Channel: " + (top.channel.empty() ? "YouTube" : top.channel) + (top.duration.empty() ? "" : " | Duration: " + top.duration) + "\n"
+                           "Direct URL: https://www.youtube.com/watch?v=" + top.vid + "\n\n"
+                           "Status: The interactive video player is already loaded and playing in the user's preview panel with autoplay.\n"
+                           "CRITICAL: DO NOT invoke fetch_url or any other tool on this YouTube link. The video is already active.\n"
+                           "Simply answer the user conversationally and confirm that the video is now playing in the preview panel.\n";
+    if (videos.size() > 1) {
+        text_out += "\nAlternative Matches Found:\n";
+        for (size_t i = 1; i < videos.size(); ++i) {
+            text_out += std::to_string(i + 1) + ". " + videos[i].title + (!videos[i].channel.empty() ? (" (" + videos[i].channel + ")") : "") + "\n";
+        }
+    }
+
     doc.clean_text = text_out;
     doc.raw_html = generate_youtube_preview_html(top.vid, top.title, text_out, top.channel, doc.url);
 
@@ -3567,6 +3576,169 @@ inline bool try_parse_tool_json(const std::string& str, ToolCall& tc, int idx) {
     }
 }
 
+inline std::string to_lower_ascii(const std::string& s) {
+    std::string res = s;
+    for (char& ch : res) {
+        if (ch >= 'A' && ch <= 'Z') ch = ch + ('a' - 'A');
+    }
+    return res;
+}
+
+inline std::string scrub_dsml_and_tool_tags(const std::string& text) {
+    std::string out = text;
+
+    // 1. Remove known container blocks: <tag>...</tag>
+    static const std::vector<std::pair<std::string, std::string>> container_blocks = {
+        {"<\xef\xbd\x9c" "dsml\xef\xbd\x9c" "tool_calls>", "</\xef\xbd\x9c" "dsml\xef\xbd\x9c" "tool_calls>"},
+        {"<|dsml|tool_calls>", "</|dsml|tool_calls>"},
+        {"<dsml:tool_calls>", "</dsml:tool_calls>"},
+        {"<dsml_tool_calls>", "</dsml_tool_calls>"},
+        {"<dsml>", "</dsml>"},
+        {"<tool_call>", "</tool_call>"},
+        {"<tool_calls>", "</tool_calls>"},
+        {"<\xef\xbd\x9c" "tool call begin\xef\xbd\x9c>", "<\xef\xbd\x9c" "tool call end\xef\xbd\x9c>"},
+        {"<|tool call begin|>", "<|tool call end|>"}
+    };
+
+    for (const auto& pair : container_blocks) {
+        size_t pos = 0;
+        while (true) {
+            std::string lower = to_lower_ascii(out);
+            size_t start = lower.find(pair.first, pos);
+            if (start == std::string::npos) break;
+            size_t end = lower.find(pair.second, start + pair.first.size());
+            if (end != std::string::npos) {
+                out.erase(start, (end + pair.second.size()) - start);
+            } else {
+                out.erase(start);
+                break;
+            }
+            pos = start;
+        }
+    }
+
+    // 2. Remove any remaining DSML or tool tags (e.g. <｜DSML｜invoke...>, </｜DSML｜invoke>, < DSML...>, <｜tool sep｜>, etc.)
+    size_t i = 0;
+    while (i < out.size()) {
+        if (out[i] == '<') {
+            size_t close = out.find('>', i);
+            if (close != std::string::npos) {
+                std::string tag = out.substr(i, close - i + 1);
+                std::string tag_lower = to_lower_ascii(tag);
+                if (tag_lower.find("dsml") != std::string::npos ||
+                    tag_lower.find("tool_call") != std::string::npos ||
+                    tag_lower.find("tool call") != std::string::npos ||
+                    tag_lower.find("tool sep") != std::string::npos ||
+                    tag_lower.find("tool outputs") != std::string::npos) {
+                    out.erase(i, close - i + 1);
+                    continue;
+                }
+            }
+        }
+        i++;
+    }
+
+    // Trim trailing/leading whitespace and stray braces
+    size_t f = out.find_first_not_of(" \t\n\r");
+    size_t l = out.find_last_not_of(" \t\n\r");
+    if (f != std::string::npos && l != std::string::npos) {
+        std::string trimmed = out.substr(f, l - f + 1);
+        while (!trimmed.empty() && (trimmed.back() == '}' || trimmed.back() == '`')) {
+            trimmed.pop_back();
+            size_t nb = trimmed.find_last_not_of(" \t\n\r");
+            if (nb != std::string::npos) trimmed = trimmed.substr(0, nb + 1);
+            else { trimmed.clear(); break; }
+        }
+        return trimmed;
+    }
+    return "";
+}
+
+inline bool parse_dsml_tool_calls(
+    const std::string& text,
+    std::string& out_clean,
+    std::vector<ToolCall>& out_calls,
+    int& call_idx
+) {
+    try {
+        std::regex invoke_re(
+            "<[\\s\xef\xbd\x9c|]*DSML[\xef\xbd\x9c|]*invoke[^>]*name=[\"']([^\"']+)[\"'][^>]*>([\\s\\S]*?)<\\/[\\s\xef\xbd\x9c|]*DSML[\xef\xbd\x9c|]*invoke>",
+            std::regex_constants::icase
+        );
+
+        std::regex param_re(
+            "<[\\s\xef\xbd\x9c|]*DSML[\xef\xbd\x9c|]*parameter[^>]*name=[\"']([^\"']+)[\"'][^>]*>([\\s\\S]*?)<\\/[\\s\xef\xbd\x9c|]*DSML[\xef\xbd\x9c|]*parameter>",
+            std::regex_constants::icase
+        );
+
+        auto words_begin = std::sregex_iterator(text.begin(), text.end(), invoke_re);
+        auto words_end = std::sregex_iterator();
+
+        for (std::sregex_iterator i = words_begin; i != words_end; ++i) {
+            std::smatch match = *i;
+            std::string fn_name = match[1].str();
+            std::string invoke_body = match[2].str();
+
+            nlohmann::json args = nlohmann::json::object();
+            auto p_begin = std::sregex_iterator(invoke_body.begin(), invoke_body.end(), param_re);
+            auto p_end = std::sregex_iterator();
+            bool found_param = false;
+
+            for (std::sregex_iterator p = p_begin; p != p_end; ++p) {
+                found_param = true;
+                std::smatch p_match = *p;
+                std::string p_name = p_match[1].str();
+                std::string p_val = p_match[2].str();
+
+                if (p_val == "true") args[p_name] = true;
+                else if (p_val == "false") args[p_name] = false;
+                else if (p_val == "null") args[p_name] = nullptr;
+                else {
+                    try {
+                        if (!p_val.empty() && (p_val[0] == '{' || p_val[0] == '[' || isdigit(p_val[0]) || (p_val[0] == '-' && p_val.size() > 1 && isdigit(p_val[1])))) {
+                            args[p_name] = nlohmann::json::parse(p_val);
+                        } else {
+                            args[p_name] = p_val;
+                        }
+                    } catch (...) {
+                        args[p_name] = p_val;
+                    }
+                }
+            }
+
+            if (!found_param) {
+                std::string trimmed_body = invoke_body;
+                size_t fb = trimmed_body.find_first_not_of(" \t\n\r");
+                size_t lb = trimmed_body.find_last_not_of(" \t\n\r");
+                if (fb != std::string::npos && lb != std::string::npos) {
+                    trimmed_body = trimmed_body.substr(fb, lb - fb + 1);
+                }
+                if (!trimmed_body.empty() && trimmed_body.front() == '{' && trimmed_body.back() == '}') {
+                    try {
+                        args = nlohmann::json::parse(trimmed_body);
+                    } catch (...) {
+                        args = nlohmann::json::object();
+                    }
+                }
+            }
+
+            ToolCall tc;
+            tc.id = "call_" + std::to_string(++call_idx) + "_" + std::to_string(std::chrono::steady_clock::now().time_since_epoch().count() % 1000000);
+            tc.type = "function";
+            tc.name = fn_name;
+            tc.arguments = args.dump();
+            out_calls.push_back(tc);
+        }
+
+        if (!out_calls.empty()) {
+            out_clean = scrub_dsml_and_tool_tags(text);
+            return true;
+        }
+    } catch (...) {}
+
+    return false;
+}
+
 inline void extract_tool_calls(
     const std::string& response_text,
     std::string& out_clean_content,
@@ -3609,24 +3781,29 @@ inline void extract_tool_calls(
         }
 
         clean_acc.append(response_text, last_end, response_text.size() - last_end);
-        // Clean trailing stray braces or backticks
-        while (!clean_acc.empty() && (clean_acc.back() == '}' || clean_acc.back() == '`' || clean_acc.back() == ' ' || clean_acc.back() == '\n' || clean_acc.back() == '\r')) {
-            clean_acc.pop_back();
-        }
-        out_clean_content = clean_acc;
+        out_clean_content = scrub_dsml_and_tool_tags(clean_acc);
         if (!out_tool_calls.empty()) return;
     }
 
-    // 2. Check DeepSeek DSML tokens: <｜tool call begin｜> ... <｜tool call end｜>
+    // 2. Check DeepSeek DSML tokens: <｜tool call begin｜> ... <｜tool call end｜> (or ASCII pipes)
     std::string dsml_start = "<｜tool call begin｜>";
     std::string dsml_end = "<｜tool call end｜>";
     size_t dsml_pos = response_text.find(dsml_start);
+    if (dsml_pos == std::string::npos) {
+        dsml_start = "<|tool call begin|>";
+        dsml_end = "<|tool call end|>";
+        dsml_pos = response_text.find(dsml_start);
+    }
     if (dsml_pos != std::string::npos) {
         size_t dsml_pos_end = response_text.find(dsml_end, dsml_pos);
         if (dsml_pos_end != std::string::npos) {
             std::string dsml_block = response_text.substr(dsml_pos + dsml_start.size(), dsml_pos_end - (dsml_pos + dsml_start.size()));
             std::string sep = "<｜tool sep｜>";
             size_t sep1 = dsml_block.find(sep);
+            if (sep1 == std::string::npos) {
+                sep = "<|tool sep|>";
+                sep1 = dsml_block.find(sep);
+            }
             if (sep1 != std::string::npos) {
                 size_t sep2 = dsml_block.find(sep, sep1 + sep.size());
                 if (sep2 != std::string::npos) {
@@ -3638,14 +3815,20 @@ inline void extract_tool_calls(
                     tc.name = fn_name;
                     tc.arguments = fn_args;
                     out_tool_calls.push_back(tc);
-                    out_clean_content = response_text.substr(0, dsml_pos);
+                    out_clean_content = scrub_dsml_and_tool_tags(response_text.substr(0, dsml_pos));
                     return;
                 }
             }
         }
     }
 
-    // 3. Scan for any embedded JSON object { ... } containing "name" or "function"
+    // 3. Check DeepSeek DSML <[｜|]?DSML[｜|]?invoke name="...">
+    if (parse_dsml_tool_calls(response_text, out_clean_content, out_tool_calls, call_idx)) {
+        out_clean_content = scrub_dsml_and_tool_tags(out_clean_content);
+        return;
+    }
+
+    // 4. Scan for any embedded JSON object { ... } containing "name" or "function"
     std::string text = response_text;
     std::string remaining;
     size_t scan_idx = 0;
@@ -3720,6 +3903,7 @@ inline void extract_tool_calls(
             out_clean_content.clear();
         }
     }
+    out_clean_content = scrub_dsml_and_tool_tags(out_clean_content);
 }
 
 } // namespace tooling
