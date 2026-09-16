@@ -11282,6 +11282,26 @@ static void run_server(MoecherEngine& engine, int port, int default_thinking_bud
                                 };
                                 std::string sse_proc = "data: " + proc_chunk.dump(-1, ' ', false, json::error_handler_t::replace) + "\n\n";
                                 sink.write(sse_proc.data(), sse_proc.size());
+                            } else {
+                                LOG_WARN("Tool execution reached max rounds limit (%d). Halting loop and notifying user.", max_tool_rounds);
+                                std::string warn_msg = "\n\n> ⚠️ **Maximum tool execution rounds reached (" + std::to_string(max_tool_rounds) + "/" + std::to_string(max_tool_rounds) + ").** Execution stopped.";
+                                json warn_chunk = {
+                                    {"id", req_id},
+                                    {"object", "chat.completion.chunk"},
+                                    {"created", std::chrono::system_clock::to_time_t(std::chrono::system_clock::now())},
+                                    {"model", model_id},
+                                    {"choices", {{
+                                        {"index", 0},
+                                        {"delta", {
+                                            {"content", warn_msg},
+                                            {"tool_limit_reached", true},
+                                            {"max_tool_rounds", max_tool_rounds}
+                                        }},
+                                        {"finish_reason", nullptr}
+                                    }}}
+                                };
+                                std::string sse_warn = "data: " + warn_chunk.dump(-1, ' ', false, json::error_handler_t::replace) + "\n\n";
+                                sink.write(sse_warn.data(), sse_warn.size());
                             }
                         }
 
@@ -11534,6 +11554,11 @@ static void run_server(MoecherEngine& engine, int port, int default_thinking_bud
                         finish_reason = "tool_calls";
                         break;
                     }
+                }
+
+                if (do_server_exec && !emitted_tool_calls.empty() && finish_reason != "tool_calls") {
+                    LOG_WARN("Tool execution reached max rounds limit (%d).", req_max_tool_rounds);
+                    final_response_text += "\n\n> ⚠️ **Maximum tool execution rounds reached (" + std::to_string(req_max_tool_rounds) + "/" + std::to_string(req_max_tool_rounds) + ").** Execution stopped.";
                 }
 
                 json choice = {

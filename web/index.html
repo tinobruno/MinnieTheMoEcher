@@ -102,6 +102,14 @@
                 </div>
 
                 <div class="setting-item">
+                    <label title="Maximum autonomous tool execution rounds per turn">Max Tool Rounds</label>
+                    <div class="slider-container">
+                        <input type="range" id="sidebar-max-tool-rounds-slider" min="1" max="50" step="1" value="10">
+                        <span id="sidebar-max-tool-rounds-val">10</span>
+                    </div>
+                </div>
+
+                <div class="setting-item">
                     <label class="checkbox-label" title="Truncate bulky raw HTML / file dumps from earlier conversation turns">
                         <input type="checkbox" id="sidebar-compact-tools" checked>
                         Compact Prior Tool Outputs
@@ -494,6 +502,26 @@
                                 </div>
                             </div>
                             <div class="agentic-hint">Default: 60 seconds (1 minute). Set up to 600s for large compilations.</div>
+                        </div>
+
+                        <div class="agentic-card">
+                            <div class="agentic-card-header">
+                                <span class="material-symbols-outlined agentic-card-icon">repeat</span>
+                                <div class="agentic-card-title-group">
+                                    <h4>Max Tool Execution Rounds</h4>
+                                    <p class="agentic-subtitle">Maximum sequential tool execution turns per request</p>
+                                </div>
+                            </div>
+                            <div class="agentic-control-row">
+                                <div class="slider-container" style="flex:1;">
+                                    <input type="range" id="agentic-max-rounds-slider" min="1" max="50" step="1" value="10">
+                                </div>
+                                <div class="agentic-num-badge">
+                                    <input type="number" id="agentic-max-rounds-input" min="1" max="100" value="10" class="agentic-num-field">
+                                    <span>rounds</span>
+                                </div>
+                            </div>
+                            <div class="agentic-hint">Default: 10 rounds. Controls how many consecutive tool calls the model can execute before pausing.</div>
                         </div>
 
                         <div class="agentic-card">

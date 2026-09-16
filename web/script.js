@@ -1531,6 +1531,7 @@ let agenticSettings = {
     requireAuth: true,
     authorizedPaths: [],
     maxTurns: 8,
+    maxToolRounds: 10,
     compactToolOutputs: true,
     omitPastReasoning: false,
     searchProvider: 'tavily',
@@ -1606,6 +1607,9 @@ function loadAgenticSettings() {
         const savedMaxTurns = localStorage.getItem('moecher_agentic_max_turns');
         if (savedMaxTurns !== null) agenticSettings.maxTurns = parseInt(savedMaxTurns, 10);
 
+        const savedMaxToolRounds = localStorage.getItem('moecher_agentic_max_tool_rounds');
+        if (savedMaxToolRounds !== null) agenticSettings.maxToolRounds = parseInt(savedMaxToolRounds, 10) || 10;
+
         const savedCompactTools = localStorage.getItem('moecher_agentic_compact_tools');
         if (savedCompactTools !== null) agenticSettings.compactToolOutputs = savedCompactTools === 'true';
 
@@ -1657,6 +1661,7 @@ function saveAgenticSettings() {
         localStorage.setItem('moecher_agentic_boundary', agenticSettings.boundaryEnforced);
         localStorage.setItem('moecher_agentic_require_auth', agenticSettings.requireAuth);
         localStorage.setItem('moecher_agentic_max_turns', agenticSettings.maxTurns);
+        localStorage.setItem('moecher_agentic_max_tool_rounds', agenticSettings.maxToolRounds || 10);
         localStorage.setItem('moecher_agentic_compact_tools', agenticSettings.compactToolOutputs);
         localStorage.setItem('moecher_agentic_omit_reasoning', agenticSettings.omitPastReasoning);
         localStorage.setItem('moecher_search_provider', agenticSettings.searchProvider || 'tavily');
@@ -1970,6 +1975,38 @@ function initAgenticSettingsUI() {
     }
     if (sideMaxTurnsSlider) {
         sideMaxTurnsSlider.addEventListener('input', (e) => updateMaxTurnsUI(parseInt(e.target.value, 10)));
+    }
+
+    // Max Tool Rounds UI (Right Panel & Left Sidebar sync)
+    const maxRoundsSlider = document.getElementById('agentic-max-rounds-slider');
+    const maxRoundsInput = document.getElementById('agentic-max-rounds-input');
+    const sideMaxRoundsSlider = document.getElementById('sidebar-max-tool-rounds-slider');
+    const sideMaxRoundsVal = document.getElementById('sidebar-max-tool-rounds-val');
+
+    const updateMaxToolRoundsUI = (val) => {
+        agenticSettings.maxToolRounds = val;
+        if (maxRoundsSlider) maxRoundsSlider.value = Math.min(val, 50);
+        if (maxRoundsInput) maxRoundsInput.value = val;
+        if (sideMaxRoundsSlider) sideMaxRoundsSlider.value = Math.min(val, 50);
+        if (sideMaxRoundsVal) sideMaxRoundsVal.textContent = val;
+        saveAgenticSettings();
+    };
+
+    updateMaxToolRoundsUI(agenticSettings.maxToolRounds || 10);
+
+    if (maxRoundsSlider) {
+        maxRoundsSlider.addEventListener('input', (e) => updateMaxToolRoundsUI(parseInt(e.target.value, 10)));
+    }
+    if (maxRoundsInput) {
+        maxRoundsInput.addEventListener('input', (e) => {
+            let val = parseInt(e.target.value, 10);
+            if (isNaN(val) || val < 1) val = 1;
+            if (val > 100) val = 100;
+            updateMaxToolRoundsUI(val);
+        });
+    }
+    if (sideMaxRoundsSlider) {
+        sideMaxRoundsSlider.addEventListener('input', (e) => updateMaxToolRoundsUI(parseInt(e.target.value, 10)));
     }
 
     // Compact Tools Toggles
@@ -3147,7 +3184,7 @@ async function sendMessage() {
     let turnToolTimeMs = 0;
     let turnToolCallsCount = 0;
 
-    const maxRounds = 6;
+    const maxRounds = agenticSettings.maxToolRounds || 10;
     let round = 0;
 
     try {
@@ -3197,6 +3234,7 @@ async function sendMessage() {
                 workspace_boundary_enforced: agenticSettings.boundaryEnforced !== false,
                 require_external_authorization: agenticSettings.requireAuth !== false,
                 authorized_paths: agenticSettings.authorizedPaths || [],
+                max_tool_rounds: agenticSettings.maxToolRounds || 10,
                 client_tool_execution: true,
                 client_context: {
                     user_agent: clientUa,
@@ -3279,6 +3317,12 @@ async function sendMessage() {
 
                                 if (delta.authorization_required) {
                                     showAuthPrompt(delta.authorization_required.tool, delta.authorization_required.path, delta.authorization_required.id);
+                                }
+
+                                if (delta.tool_limit_reached || delta.tool_warning) {
+                                    const procBadge = assistantMsgDiv.querySelector('#tool-proc-indicator');
+                                    if (procBadge) procBadge.remove();
+                                    showToast(delta.tool_warning || `Maximum tool execution rounds reached (${delta.max_tool_rounds || 10}).`);
                                 }
 
                                 if (delta.processing_status) {
