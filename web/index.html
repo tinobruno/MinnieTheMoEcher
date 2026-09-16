@@ -28,101 +28,11 @@
                     <span class="material-symbols-outlined">delete_sweep</span>
                     <span>Clear History</span>
                 </button>
+                <button class="action-btn settings-nav-btn" onclick="openSettingsPanel()" title="Open Settings & Configuration">
+                    <span class="material-symbols-outlined">tune</span>
+                    <span>Settings</span>
+                </button>
             </div>
-            
-            <details class="settings-section" open>
-                <summary>Settings</summary>
-                
-                <div class="setting-item">
-                    <label for="system-prompt">System Prompt</label>
-                    <textarea id="system-prompt" class="textarea-input" rows="3" placeholder="System instructions...">You are a helpful assistant</textarea>
-                </div>
-
-                <div class="setting-item">
-                    <label>Temperature</label>
-                    <div class="slider-container">
-                        <input type="range" id="temp-slider" min="0" max="1" step="0.1" value="1.0">
-                        <span id="temp-val">1.0</span>
-                    </div>
-                </div>
-                
-                <div class="setting-item">
-                    <label>Max Tokens</label>
-                    <input type="number" id="tokens-input" value="2048" class="num-input">
-                </div>
-
-                <div class="setting-item">
-                    <label>Reasoning Effort</label>
-                    <select id="reasoning-effort" class="select-input">
-                        <option value="none">None (Direct Answer)</option>
-                        <option value="low">Low</option>
-                        <option value="medium">Medium</option>
-                        <option value="high" selected>High</option>
-                        <option value="xhigh">Very High</option>
-                        <option value="max">Max</option>
-                    </select>
-                </div>
-
-                <div class="setting-item">
-                    <label>Thinking Budget (Tokens)</label>
-                    <input type="number" id="thinking-budget" value="4096" min="0" max="32768" step="128" class="num-input">
-                </div>
-                
-                <div class="setting-item">
-                    <label class="checkbox-label">
-                        <input type="checkbox" id="thinking-enabled" checked>
-                        Enable Thinking
-                    </label>
-                </div>
-
-                <div class="setting-item">
-                    <label class="checkbox-label" title="Enable model to fetch and read content from web URLs (fetch_url)">
-                        <input type="checkbox" id="web-retrieval-enabled" checked>
-                        Web Retrieval
-                    </label>
-                </div>
-
-                <div class="setting-item">
-                    <label class="checkbox-label" title="When querying music or videos, search YouTube directly with zero API cost and instant playback">
-                        <input type="checkbox" id="sidebar-fast-media-search" checked onchange="syncFastMediaSearchToggle(this.checked)">
-                        Fast Media / YouTube (0 Cost)
-                    </label>
-                </div>
-            </details>
-
-            <details class="settings-section" open>
-                <summary>Context & History Optimization</summary>
-
-                <div class="setting-item">
-                    <label>Max History Turns</label>
-                    <div class="slider-container">
-                        <input type="range" id="sidebar-max-turns-slider" min="0" max="32" step="2" value="8">
-                        <span id="sidebar-max-turns-val">8</span>
-                    </div>
-                </div>
-
-                <div class="setting-item">
-                    <label title="Maximum autonomous tool execution rounds per turn">Max Tool Rounds</label>
-                    <div class="slider-container">
-                        <input type="range" id="sidebar-max-tool-rounds-slider" min="1" max="50" step="1" value="10">
-                        <span id="sidebar-max-tool-rounds-val">10</span>
-                    </div>
-                </div>
-
-                <div class="setting-item">
-                    <label class="checkbox-label" title="Truncate bulky raw HTML / file dumps from earlier conversation turns">
-                        <input type="checkbox" id="sidebar-compact-tools" checked>
-                        Compact Prior Tool Outputs
-                    </label>
-                </div>
-
-                <div class="setting-item">
-                    <label class="checkbox-label" title="Do not re-send internal thinking traces from earlier turns into subsequent prompts">
-                        <input type="checkbox" id="sidebar-omit-reasoning" checked>
-                        Omit Past Reasoning
-                    </label>
-                </div>
-            </details>
 
             <details class="stats-section" open>
                 <summary>Performance Stats</summary>
@@ -149,6 +59,14 @@
                             <span class="stat-label">Tokens</span>
                             <span class="stat-value" id="stat-last-tokens">-</span>
                         </div>
+                        <div class="stat-card">
+                            <span class="stat-label">Tool Time</span>
+                            <span class="stat-value" id="stat-last-tool-time">-</span>
+                        </div>
+                        <div class="stat-card">
+                            <span class="stat-label">Tool Calls</span>
+                            <span class="stat-value" id="stat-last-tool-calls">-</span>
+                        </div>
                     </div>
                 </div>
 
@@ -173,6 +91,14 @@
                         <div class="stat-card">
                             <span class="stat-label">Total Generated</span>
                             <span class="stat-value" id="stat-total-tokens">-</span>
+                        </div>
+                        <div class="stat-card">
+                            <span class="stat-label">Total Tool Time</span>
+                            <span class="stat-value" id="stat-avg-tool-time">-</span>
+                        </div>
+                        <div class="stat-card">
+                            <span class="stat-label">Total Tool Calls</span>
+                            <span class="stat-value" id="stat-total-tool-calls">-</span>
                         </div>
                     </div>
                 </div>
@@ -249,13 +175,35 @@
         <main class="chat-main">
             <!-- Header -->
             <header class="topbar">
-                <div class="model-selector">
-                    <span>DeepSeek V4-Flash</span>
-                    <span class="material-symbols-outlined">expand_more</span>
+                <div class="model-selector-wrapper">
+                    <div class="model-selector" id="model-selector" role="button" tabindex="0" title="Loaded Model Profile">
+                        <span id="model-name">Loading model...</span>
+                        <span class="material-symbols-outlined dropdown-arrow" id="model-dropdown-arrow">expand_more</span>
+                    </div>
+                    <div class="model-dropdown hidden" id="model-dropdown">
+                        <div class="model-dropdown-header">
+                            <span class="material-symbols-outlined header-icon">memory</span>
+                            <span>Active Model Profile</span>
+                        </div>
+                        <div class="model-item active" id="model-item-card">
+                            <div class="model-item-main">
+                                <div class="model-item-title-row">
+                                    <span class="model-item-title" id="dropdown-model-name">DeepSeek V4-Flash</span>
+                                    <span class="model-badge-active"><span class="badge-dot"></span>Loaded</span>
+                                </div>
+                                <div class="model-item-desc" id="dropdown-model-arch">MoE Architecture</div>
+                                <div class="model-item-meta">
+                                    <span class="meta-tag" id="dropdown-model-id">deepseek-v4-flash</span>
+                                    <span class="meta-tag" id="dropdown-model-ctx">32,768 ctx</span>
+                                </div>
+                            </div>
+                            <span class="material-symbols-outlined check-icon">check_circle</span>
+                        </div>
+                    </div>
                 </div>
                 <div class="topbar-actions">
-                    <button class="topbar-icon-btn agentic-toggle-btn" id="agentic-toggle-btn" onclick="openAgenticSettingsTab()" title="Open Agentic Settings & Security Guardrails">
-                        <span class="material-symbols-outlined">shield_person</span>
+                    <button class="topbar-icon-btn settings-toggle-btn" id="settings-toggle-btn" onclick="toggleSettingsPanel()" title="Toggle Settings Panel">
+                        <span class="material-symbols-outlined">tune</span>
                     </button>
                     <button class="topbar-icon-btn preview-toggle-btn" id="preview-toggle-btn" onclick="togglePreviewPanel()" title="Toggle HTML Preview Panel">
                         <span class="material-symbols-outlined">preview</span>
@@ -328,10 +276,6 @@
                         <span class="material-symbols-outlined">terminal</span>
                         <span>Console</span>
                         <span class="console-count-badge" id="console-error-badge" style="display:none;">0</span>
-                    </button>
-                    <button class="preview-tab" data-tab="tab-agentic" title="Agentic Settings & Security Guardrails">
-                        <span class="material-symbols-outlined">shield_person</span>
-                        <span>Agentic Settings</span>
                     </button>
                 </div>
 
@@ -468,9 +412,157 @@
                     </div>
                 </div>
 
-                <!-- Agentic Settings Tab Pane -->
-                <div class="tab-pane" id="tab-agentic">
-                    <div class="agentic-settings-scroll">
+            </div>
+        </aside>
+
+        <!-- Dedicated Settings & Configuration Panel -->
+        <aside class="settings-panel collapsed" id="settings-panel">
+            <div class="settings-header">
+                <div class="settings-title-area">
+                    <span class="material-symbols-outlined settings-logo-icon">tune</span>
+                    <span class="settings-title">Settings</span>
+                </div>
+                <div class="settings-tabs">
+                    <button class="settings-tab active" data-tab="settings-tab-general" title="General & Inference Settings">
+                        <span class="material-symbols-outlined tab-icon">tune</span>
+                        <span>General & Inference</span>
+                    </button>
+                    <button class="settings-tab" data-tab="settings-tab-agentic" title="Agentic Guardrails & Tools">
+                        <span class="material-symbols-outlined tab-icon">shield_person</span>
+                        <span>Agentic & Tools</span>
+                    </button>
+                </div>
+                <div class="settings-actions">
+                    <button class="settings-tool-btn" id="settings-maximize-btn" onclick="toggleMaximizeSettings()" title="Maximize / Restore Panel">
+                        <span class="material-symbols-outlined">fullscreen</span>
+                    </button>
+                    <button class="settings-tool-btn close-btn" onclick="closeSettingsPanel()" title="Close Settings Panel">
+                        <span class="material-symbols-outlined">close</span>
+                    </button>
+                </div>
+            </div>
+
+            <!-- Settings Content -->
+            <div class="settings-content">
+                <!-- Tab 1: General & Inference Settings -->
+                <div class="settings-tab-pane active" id="settings-tab-general">
+                    <div class="settings-scroll-area">
+                        <!-- Inference & Model Parameters Card -->
+                        <div class="agentic-card">
+                            <div class="agentic-card-header">
+                                <span class="material-symbols-outlined agentic-card-icon" style="color: #38bdf8;">psychology</span>
+                                <div class="agentic-card-title-group">
+                                    <h4>Inference & Model Parameters</h4>
+                                    <p class="agentic-subtitle">Sampling, temperature, thinking budgets, and system instructions</p>
+                                </div>
+                            </div>
+                            
+                            <div class="setting-item" style="margin-top: 10px;">
+                                <label for="system-prompt">System Prompt</label>
+                                <textarea id="system-prompt" class="textarea-input" rows="3" placeholder="System instructions...">You are a helpful assistant</textarea>
+                            </div>
+
+                            <div class="setting-item">
+                                <label>Temperature</label>
+                                <div class="slider-container">
+                                    <input type="range" id="temp-slider" min="0" max="1" step="0.1" value="1.0">
+                                    <span id="temp-val">1.0</span>
+                                </div>
+                            </div>
+                            
+                            <div class="setting-item">
+                                <label>Max Tokens</label>
+                                <input type="number" id="tokens-input" value="2048" class="num-input">
+                            </div>
+
+                            <div class="setting-item">
+                                <label>Reasoning Effort</label>
+                                <select id="reasoning-effort" class="select-input">
+                                    <option value="none">None (Direct Answer)</option>
+                                    <option value="low">Low</option>
+                                    <option value="medium">Medium</option>
+                                    <option value="high" selected>High</option>
+                                    <option value="xhigh">Very High</option>
+                                    <option value="max">Max</option>
+                                </select>
+                            </div>
+
+                            <div class="setting-item">
+                                <label>Thinking Budget (Tokens)</label>
+                                <input type="number" id="thinking-budget" value="4096" min="0" max="32768" step="128" class="num-input">
+                            </div>
+                            
+                            <div class="setting-item">
+                                <label class="checkbox-label">
+                                    <input type="checkbox" id="thinking-enabled" checked>
+                                    Enable Thinking
+                                </label>
+                            </div>
+
+                            <div class="setting-item">
+                                <label class="checkbox-label" title="Enable model to fetch and read content from web URLs (fetch_url)">
+                                    <input type="checkbox" id="web-retrieval-enabled" checked>
+                                    Web Retrieval
+                                </label>
+                            </div>
+
+                            <div class="setting-item">
+                                <label class="checkbox-label" title="When querying music or videos, search YouTube directly with zero API cost and instant playback">
+                                    <input type="checkbox" id="sidebar-fast-media-search" checked onchange="syncFastMediaSearchToggle(this.checked)">
+                                    Fast Media / YouTube (0 Cost)
+                                </label>
+                            </div>
+                        </div>
+
+                        <!-- Context & History Optimization Card -->
+                        <div class="agentic-card">
+                            <div class="agentic-card-header">
+                                <span class="material-symbols-outlined agentic-card-icon" style="color: #a78bfa;">history_edu</span>
+                                <div class="agentic-card-title-group">
+                                    <h4>Context & History Optimization</h4>
+                                    <p class="agentic-subtitle">Manage prompt history window and compact past tool responses</p>
+                                </div>
+                            </div>
+                            <div class="agentic-control-row">
+                                <div class="agentic-slider-wrapper">
+                                    <label for="agentic-max-turns-slider">Max History Turns</label>
+                                    <input type="range" id="agentic-max-turns-slider" min="0" max="32" step="2" value="8">
+                                </div>
+                                <div class="agentic-num-badge">
+                                    <input type="number" id="agentic-max-turns-input" min="0" max="64" value="8" class="agentic-num-field">
+                                    <span class="agentic-unit">turns</span>
+                                </div>
+                            </div>
+                            <!-- Alias inputs for backwards compatibility -->
+                            <input type="range" id="sidebar-max-turns-slider" min="0" max="32" step="2" value="8" style="display:none;">
+                            <span id="sidebar-max-turns-val" style="display:none;">8</span>
+                            <div class="agentic-hint">Limits dialogue history sent in prompts (0 = Unlimited). Prevents prefill slowdown across long chats.</div>
+                            
+                            <div class="agentic-toggle-group" style="margin-top: 14px;">
+                                <label class="agentic-switch-row">
+                                    <div class="agentic-switch-info">
+                                        <span class="agentic-switch-label">Compact Prior Tool Outputs</span>
+                                        <span class="agentic-switch-sub">Truncate bulky raw HTML / file dumps from earlier turns</span>
+                                    </div>
+                                    <input type="checkbox" id="agentic-compact-tools" class="agentic-toggle" checked>
+                                </label>
+                                <input type="checkbox" id="sidebar-compact-tools" style="display:none;" checked>
+                                <label class="agentic-switch-row">
+                                    <div class="agentic-switch-info">
+                                        <span class="agentic-switch-label">Omit Past Reasoning from History</span>
+                                        <span class="agentic-switch-sub">Strip internal thinking traces (Keep unchecked for 0ms KV Cache reuse)</span>
+                                    </div>
+                                    <input type="checkbox" id="agentic-omit-reasoning" class="agentic-toggle">
+                                </label>
+                                <input type="checkbox" id="sidebar-omit-reasoning" style="display:none;">
+                            </div>
+                        </div>
+                    </div>
+                </div>
+
+                <!-- Tab 2: Agentic & Tools -->
+                <div class="settings-tab-pane" id="settings-tab-agentic">
+                    <div class="settings-scroll-area">
                         <div class="agentic-card">
                             <div class="agentic-card-header">
                                 <span class="material-symbols-outlined agentic-card-icon">folder_open</span>
@@ -506,22 +598,22 @@
 
                         <div class="agentic-card">
                             <div class="agentic-card-header">
-                                <span class="material-symbols-outlined agentic-card-icon">repeat</span>
+                                <span class="material-symbols-outlined agentic-card-icon">sync_saved_locally</span>
                                 <div class="agentic-card-title-group">
-                                    <h4>Max Tool Execution Rounds</h4>
-                                    <p class="agentic-subtitle">Maximum sequential tool execution turns per request</p>
+                                    <h4>Max Tool Rounds per Turn</h4>
+                                    <p class="agentic-subtitle">Maximum sequential tool calls/steps before returning to prompt</p>
                                 </div>
                             </div>
                             <div class="agentic-control-row">
                                 <div class="slider-container" style="flex:1;">
-                                    <input type="range" id="agentic-max-rounds-slider" min="1" max="50" step="1" value="10">
+                                    <input type="range" id="agentic-max-rounds-slider" min="1" max="30" step="1" value="10">
                                 </div>
                                 <div class="agentic-num-badge">
-                                    <input type="number" id="agentic-max-rounds-input" min="1" max="100" value="10" class="agentic-num-field">
+                                    <input type="number" id="agentic-max-rounds-input" min="1" max="50" value="10" class="agentic-num-field">
                                     <span>rounds</span>
                                 </div>
                             </div>
-                            <div class="agentic-hint">Default: 10 rounds. Controls how many consecutive tool calls the model can execute before pausing.</div>
+                            <div class="agentic-hint">Default: 10 rounds. Configurable via CLI (--max-tool-rounds). Prevents runaway loops while allowing deep multi-step research.</div>
                         </div>
 
                         <div class="agentic-card">
@@ -561,44 +653,6 @@
                                 <div class="agentic-path-tags" id="agentic-path-tags">
                                     <!-- Dynamic chips -->
                                 </div>
-                            </div>
-                        </div>
-
-                        <div class="agentic-card">
-                            <div class="agentic-card-header">
-                                <span class="material-symbols-outlined agentic-card-icon">history_edu</span>
-                                <div class="agentic-card-title-group">
-                                    <h4>Context & History Optimization</h4>
-                                    <p class="agentic-subtitle">Manage prompt history window and compact past tool responses</p>
-                                </div>
-                            </div>
-                            <div class="agentic-control-row">
-                                <div class="agentic-slider-wrapper">
-                                    <label for="agentic-max-turns-slider">Max History Turns</label>
-                                    <input type="range" id="agentic-max-turns-slider" min="2" max="32" step="2" value="8">
-                                </div>
-                                <div class="agentic-num-badge">
-                                    <input type="number" id="agentic-max-turns-input" min="0" max="64" value="8" class="agentic-num-field">
-                                    <span class="agentic-unit">turns</span>
-                                </div>
-                            </div>
-                            <div class="agentic-hint">Limits dialogue history sent in prompts (0 = Unlimited). Prevents prefill slowdown across long chats.</div>
-                            
-                            <div class="agentic-toggle-group" style="margin-top: 14px;">
-                                <label class="agentic-switch-row">
-                                    <div class="agentic-switch-info">
-                                        <span class="agentic-switch-label">Compact Prior Tool Outputs</span>
-                                        <span class="agentic-switch-sub">Truncate bulky raw HTML / file dumps from earlier turns</span>
-                                    </div>
-                                    <input type="checkbox" id="agentic-compact-tools" class="agentic-toggle" checked>
-                                </label>
-                                <label class="agentic-switch-row">
-                                    <div class="agentic-switch-info">
-                                        <span class="agentic-switch-label">Omit Past Reasoning from History</span>
-                                        <span class="agentic-switch-sub">Do not resend internal thinking traces from earlier turns</span>
-                                    </div>
-                                    <input type="checkbox" id="agentic-omit-reasoning" class="agentic-toggle" checked>
-                                </label>
                             </div>
                         </div>
 
@@ -722,7 +776,7 @@
                                     <div class="setting-field-group">
                                         <label class="agentic-section-label" for="tavily-api-key-input">Tavily API Key</label>
                                         <div style="display: flex; gap: 8px; align-items: center;">
-                                            <input type="password" id="tavily-api-key-input" placeholder="tvly-..." class="agentic-text-field" style="flex: 1; font-family: monospace;">
+                                             <input type="password" id="tavily-api-key-input" placeholder="tvly-..." class="agentic-text-field" style="flex: 1; font-family: monospace;">
                                             <button type="button" class="editor-btn" onclick="toggleKeyVisibility('tavily-api-key-input', 'tavily-key-visibility-icon')" title="Show/Hide Key" style="padding: 6px 10px;">
                                                 <span class="material-symbols-outlined" id="tavily-key-visibility-icon" style="font-size: 18px;">visibility</span>
                                             </button>
@@ -806,10 +860,244 @@
                                 </div>
                             </div>
                         </div>
+
+                        <!-- MCP (Model Context Protocol) Servers Card -->
+                        <div class="agentic-card" id="mcp-servers-card">
+                            <div class="agentic-card-header" style="justify-content: space-between; align-items: center;">
+                                <div style="display: flex; align-items: center; gap: 12px;">
+                                    <span class="material-symbols-outlined agentic-card-icon" style="color: #a78bfa;">extension</span>
+                                    <div class="agentic-card-title-group">
+                                        <h4>MCP Servers (Model Context Protocol)</h4>
+                                        <p class="agentic-subtitle">Connect external tool servers over standard JSON-RPC 2.0 (Filesystem, SQLite, GitHub, Fetch, etc.)</p>
+                                    </div>
+                                </div>
+                                <div style="display: flex; gap: 8px; align-items: center;">
+                                    <button type="button" class="editor-btn" onclick="openSearchMCPServerModal()" title="Search Official MCP Registry (registry.modelcontextprotocol.io)" style="background: rgba(59, 130, 246, 0.15); border-color: rgba(59, 130, 246, 0.4); color: #93c5fd; padding: 6px 12px; font-weight: 500;">
+                                        <span class="material-symbols-outlined" style="font-size: 16px;">search</span>
+                                        <span>Search Registry</span>
+                                    </button>
+                                    <button type="button" class="editor-btn" onclick="refreshMCPServersUI()" title="Refresh MCP Status" style="padding: 6px 10px;">
+                                        <span class="material-symbols-outlined" style="font-size: 16px;">refresh</span>
+                                    </button>
+                                    <button type="button" class="editor-btn" onclick="openAddMCPServerModal()" title="Add MCP Server" style="background: rgba(167, 139, 250, 0.15); border-color: rgba(167, 139, 250, 0.4); color: #c4b5fd; padding: 6px 12px; font-weight: 500;">
+                                        <span class="material-symbols-outlined" style="font-size: 16px;">add</span>
+                                        <span>Add Server</span>
+                                    </button>
+                                </div>
+                            </div>
+
+                            <!-- Server Summary Bar -->
+                            <div class="mcp-summary-bar">
+                                <div class="mcp-stat-chip">
+                                    <span class="mcp-stat-label">Active Servers:</span>
+                                    <span class="mcp-stat-val" id="mcp-active-servers-count">0</span>
+                                </div>
+                                <div class="mcp-stat-chip">
+                                    <span class="mcp-stat-label">Available Tools:</span>
+                                    <span class="mcp-stat-val" id="mcp-total-tools-count">0</span>
+                                </div>
+                            </div>
+
+                            <!-- List of MCP Servers -->
+                            <div class="mcp-server-list" id="mcp-server-list">
+                                <div class="mcp-empty-state">
+                                    <span class="material-symbols-outlined" style="font-size: 32px; color: var(--text-muted); opacity: 0.6;">dns</span>
+                                    <p>No MCP servers configured yet.</p>
+                                    <span style="font-size: 11px; color: var(--text-muted);">Click "Add Server" to connect standard MCP servers (Filesystem, SQLite, Memory, GitHub, etc.)</span>
+                                </div>
+                            </div>
+                        </div>
                     </div>
                 </div>
             </div>
         </aside>
+    </div>
+
+    <!-- Add / Edit MCP Server Modal -->
+    <div class="agentic-modal-overlay" id="mcp-server-modal" style="display:none;">
+        <div class="agentic-modal-card" style="max-width: 640px;">
+            <div class="agentic-modal-header">
+                <div class="agentic-modal-icon-wrap" style="background: rgba(167, 139, 250, 0.15); color: #c4b5fd;">
+                    <span class="material-symbols-outlined" style="font-size: 26px;">extension</span>
+                </div>
+                <div>
+                    <h3 id="mcp-modal-title">Configure MCP Server</h3>
+                    <p class="modal-sub">Add a Model Context Protocol tool server (Local CLI or Remote Streamable-HTTP)</p>
+                </div>
+            </div>
+
+            <!-- Mode Tabs: Search Registry vs Form View vs Raw JSON / Registry Manifest -->
+            <div class="mcp-modal-mode-tabs">
+                <button type="button" class="mcp-modal-tab" id="mcp-tab-btn-search" onclick="switchMCPModalMode('search')">
+                    <span class="material-symbols-outlined" style="font-size: 16px;">search</span>
+                    <span>Search Registry</span>
+                    <span class="mcp-tab-badge" style="background: rgba(56, 189, 248, 0.2); color: #38bdf8; border-color: rgba(56, 189, 248, 0.3);">Online</span>
+                </button>
+                <button type="button" class="mcp-modal-tab active" id="mcp-tab-btn-form" onclick="switchMCPModalMode('form')">
+                    <span class="material-symbols-outlined" style="font-size: 16px;">tune</span>
+                    <span>Form Fields</span>
+                </button>
+                <button type="button" class="mcp-modal-tab" id="mcp-tab-btn-json" onclick="switchMCPModalMode('json')">
+                    <span class="material-symbols-outlined" style="font-size: 16px;">code_blocks</span>
+                    <span>Raw JSON / Manifest</span>
+                    <span class="mcp-tab-badge">Paste JSON</span>
+                </button>
+            </div>
+
+            <div class="agentic-modal-body">
+                <!-- REGISTRY SEARCH PANE -->
+                <div id="mcp-modal-search-pane" style="display: none;">
+                    <div style="background: rgba(56, 189, 248, 0.08); border: 1px solid rgba(56, 189, 248, 0.2); border-radius: 6px; padding: 10px 12px; margin-bottom: 10px; font-size: 12px; color: #bae6fd; line-height: 1.4;">
+                        <span class="material-symbols-outlined" style="font-size: 15px; vertical-align: middle; margin-right: 4px;">travel_explore</span>
+                        Search official MCP servers from <b>registry.modelcontextprotocol.io</b> or paste a registry URL (e.g. <code>https://registry.modelcontextprotocol.io/?q=teams</code>).
+                    </div>
+
+                    <!-- Search Input Box -->
+                    <div style="display: flex; gap: 8px; margin-bottom: 8px;">
+                        <div style="position: relative; flex: 1;">
+                            <span class="material-symbols-outlined" style="position: absolute; left: 10px; top: 50%; transform: translateY(-50%); font-size: 18px; color: var(--text-muted);">search</span>
+                            <input type="text" id="mcp-registry-search-input" placeholder="Search servers (e.g. teams, github, sqlite, slack, fetch)..." class="agentic-text-field" style="padding-left: 34px;" oninput="onMCPRegistrySearchInput()" onkeydown="if(event.key==='Enter'){performMCPRegistrySearch();event.preventDefault();}">
+                        </div>
+                        <button type="button" class="editor-btn" onclick="performMCPRegistrySearch()" style="background: rgba(56, 189, 248, 0.2); border-color: rgba(56, 189, 248, 0.4); color: #bae6fd; font-weight: 600; padding: 6px 14px;">Search</button>
+                    </div>
+
+                    <!-- Quick suggestion chips -->
+                    <div style="display: flex; flex-wrap: wrap; gap: 6px; margin-bottom: 10px; align-items: center;">
+                        <span style="font-size: 11px; color: var(--text-muted); margin-right: 2px;">Popular:</span>
+                        <button type="button" class="mcp-quick-chip" onclick="searchRegistryTag('teams')">Teams</button>
+                        <button type="button" class="mcp-quick-chip" onclick="searchRegistryTag('github')">GitHub</button>
+                        <button type="button" class="mcp-quick-chip" onclick="searchRegistryTag('filesystem')">Filesystem</button>
+                        <button type="button" class="mcp-quick-chip" onclick="searchRegistryTag('sqlite')">SQLite</button>
+                        <button type="button" class="mcp-quick-chip" onclick="searchRegistryTag('postgres')">PostgreSQL</button>
+                        <button type="button" class="mcp-quick-chip" onclick="searchRegistryTag('fetch')">Fetch</button>
+                        <button type="button" class="mcp-quick-chip" onclick="searchRegistryTag('slack')">Slack</button>
+                        <button type="button" class="mcp-quick-chip" onclick="searchRegistryTag('memory')">Memory</button>
+                        <button type="button" class="mcp-quick-chip" onclick="searchRegistryTag('docker')">Docker</button>
+                    </div>
+
+                    <!-- Search Status / Loading -->
+                    <div id="mcp-registry-search-status" class="mcp-json-status info" style="display: none; margin-bottom: 10px;">
+                        <span class="material-symbols-outlined" id="mcp-registry-search-icon" style="font-size: 16px;">search</span>
+                        <span id="mcp-registry-search-text">Searching registry...</span>
+                    </div>
+
+                    <!-- Search Results List -->
+                    <div id="mcp-registry-results-container" class="mcp-registry-results-list">
+                        <!-- Populated dynamically -->
+                    </div>
+                </div>
+
+                <!-- FORM VIEW PANE -->
+                <div id="mcp-modal-form-pane">
+                    <!-- Preset Selector -->
+                    <div class="setting-field-group">
+                        <label class="agentic-section-label" for="mcp-preset-select">Configuration Preset / Template</label>
+                        <select id="mcp-preset-select" class="agentic-select-field" onchange="onMCPPresetSelect()" style="width: 100%; background: #1e293b; color: #f1f5f9; border: 1px solid rgba(255,255,255,0.15); border-radius: 6px; padding: 8px 10px; font-size: 13px;">
+                            <option value="search-registry">🔍 Search Official Registry (registry.modelcontextprotocol.io)</option>
+                            <option value="json-custom">Custom JSON / Registry Manifest (Paste JSON)</option>
+                            <option value="custom" selected>Custom Manual Fields (Local Command or Remote URL)</option>
+                            <option value="filesystem">Filesystem (@modelcontextprotocol/server-filesystem via npx)</option>
+                            <option value="sqlite">SQLite Database (mcp-server-sqlite via uvx)</option>
+                            <option value="fetch">Web Fetcher (mcp-server-fetch via uvx)</option>
+                            <option value="git">Git Repository (mcp-server-git via uvx)</option>
+                            <option value="memory">Knowledge Graph Memory (@modelcontextprotocol/server-memory via npx)</option>
+                        </select>
+                    </div>
+
+                    <div class="setting-field-group" style="margin-top: 10px;">
+                        <label class="agentic-section-label" for="mcp-server-id-input">Server ID / Name *</label>
+                        <input type="text" id="mcp-server-id-input" placeholder="e.g. filesystem, sqlite, workiq-teamsserver" class="agentic-text-field" style="font-family: monospace;">
+                    </div>
+
+                    <div class="setting-field-group" style="margin-top: 10px;">
+                        <label class="agentic-section-label" for="mcp-transport-type-select">Transport Type</label>
+                        <select id="mcp-transport-type-select" class="agentic-select-field" onchange="onMCPTransportTypeChange()" style="width: 100%; background: #1e293b; color: #f1f5f9; border: 1px solid rgba(255,255,255,0.15); border-radius: 6px; padding: 8px 10px; font-size: 13px;">
+                            <option value="stdio" selected>Local CLI Process (stdio)</option>
+                            <option value="streamable-http">Remote Endpoint (streamable-http)</option>
+                            <option value="sse">Remote Server-Sent Events (SSE)</option>
+                        </select>
+                    </div>
+
+                    <div class="setting-field-group" id="mcp-server-cmd-group" style="margin-top: 10px;">
+                        <label class="agentic-section-label" for="mcp-server-cmd-input">Command *</label>
+                        <input type="text" id="mcp-server-cmd-input" placeholder="e.g. npx, uvx, python3, or /usr/bin/..." class="agentic-text-field" style="font-family: monospace;">
+                    </div>
+
+                    <div class="setting-field-group" id="mcp-server-args-group" style="margin-top: 10px;">
+                        <label class="agentic-section-label" for="mcp-server-args-input">Arguments (space-separated or JSON array)</label>
+                        <input type="text" id="mcp-server-args-input" placeholder="e.g. -y @modelcontextprotocol/server-filesystem /path" class="agentic-text-field" style="font-family: monospace;">
+                    </div>
+
+                    <div class="setting-field-group" id="mcp-server-url-group" style="margin-top: 10px; display: none;">
+                        <label class="agentic-section-label" for="mcp-server-url-input">Remote Server URL *</label>
+                        <input type="text" id="mcp-server-url-input" placeholder="https://endpoint.domain.com/servers/mcp..." class="agentic-text-field" style="font-family: monospace;">
+                    </div>
+
+                    <div class="setting-field-group" style="margin-top: 10px;">
+                        <label class="agentic-section-label" for="mcp-server-env-input">Environment Variables / Headers (Optional JSON)</label>
+                        <textarea id="mcp-server-env-input" placeholder='{"API_KEY": "...", "Authorization": "Bearer ..."}' class="agentic-text-field" style="font-family: monospace; height: 50px; resize: vertical;"></textarea>
+                    </div>
+
+                    <div class="setting-field-group" style="margin-top: 10px;">
+                        <label class="agentic-section-label" for="mcp-server-desc-input">Description (Optional)</label>
+                        <input type="text" id="mcp-server-desc-input" placeholder="e.g. Local project workspace file access" class="agentic-text-field">
+                    </div>
+                </div>
+
+                <!-- RAW JSON / REGISTRY MANIFEST PANE -->
+                <div id="mcp-modal-json-pane" style="display: none;">
+                    <div style="background: rgba(167, 139, 250, 0.08); border: 1px solid rgba(167, 139, 250, 0.2); border-radius: 6px; padding: 10px 12px; margin-bottom: 10px; font-size: 12px; color: #e9d5ff; line-height: 1.4;">
+                        <span class="material-symbols-outlined" style="font-size: 15px; vertical-align: middle; margin-right: 4px;">info</span>
+                        Paste any MCP JSON configuration: official <b>server.schema.json</b> registry manifest (with <code>remotes</code>, <code>streamable-http</code>, or <code>variables</code>), Claude Desktop / Cursor <code>mcpServers</code> config, or single server JSON.
+                    </div>
+
+                    <div style="display: flex; justify-content: space-between; align-items: center; margin-bottom: 6px;">
+                        <label class="agentic-section-label" for="mcp-server-json-input" style="margin-bottom: 0;">Configuration JSON *</label>
+                        <div style="display: flex; gap: 6px;">
+                            <button type="button" class="editor-btn" onclick="pasteSampleTeamsMCPJson()" style="font-size: 11px; padding: 2px 8px;" title="Insert Microsoft Teams WorkIQ MCP sample">Sample Manifest</button>
+                            <button type="button" class="editor-btn" onclick="formatMCPJsonInput()" style="font-size: 11px; padding: 2px 8px;" title="Format JSON Indentation">Format</button>
+                            <button type="button" class="editor-btn" onclick="clearMCPJsonInput()" style="font-size: 11px; padding: 2px 8px;" title="Clear JSON text">Clear</button>
+                        </div>
+                    </div>
+
+                    <textarea id="mcp-server-json-input" oninput="onMCPJsonInputChange()" placeholder='{\n  "server": {\n    "name": "com.microsoft/workiq-teamsserver",\n    "title": "Work IQ Teams MCP Server",\n    "description": "Manage Microsoft Teams...",\n    "remotes": [\n      {\n        "type": "streamable-http",\n        "url": "https://...",\n        "variables": { "tenant_id": { "isRequired": true } }\n      }\n    ]\n  }\n}' class="agentic-text-field" style="font-family: monospace; height: 190px; resize: vertical; font-size: 12px; line-height: 1.35; white-space: pre;"></textarea>
+
+                    <!-- Live Parse Status -->
+                    <div id="mcp-json-status" class="mcp-json-status info" style="display: none;">
+                        <span class="material-symbols-outlined" id="mcp-json-status-icon" style="font-size: 16px;">info</span>
+                        <span id="mcp-json-status-text">Ready to parse configuration</span>
+                    </div>
+
+                    <!-- Dynamic URL Variables Container (e.g. {tenant_id}) -->
+                    <div id="mcp-json-variables-container" class="mcp-json-var-card" style="display: none;">
+                        <div style="font-size: 12px; font-weight: 600; color: #e9d5ff; display: flex; align-items: center; gap: 6px;">
+                            <span class="material-symbols-outlined" style="font-size: 16px; color: #a78bfa;">tune</span>
+                            <span>Manifest Template Variables</span>
+                        </div>
+                        <div id="mcp-json-variables-fields" style="margin-top: 6px;"></div>
+                        <div class="mcp-resolved-url-box" id="mcp-json-resolved-preview-box" style="display: none;">
+                            <div style="font-size: 10px; text-transform: uppercase; letter-spacing: 0.05em; color: var(--text-muted); margin-bottom: 2px;">Resolved Remote URL:</div>
+                            <span id="mcp-json-resolved-url-text"></span>
+                        </div>
+                    </div>
+                </div>
+
+                <div class="agentic-switch-row" style="margin-top: 12px; padding: 8px 12px; background: rgba(255,255,255,0.03); border: 1px solid rgba(255,255,255,0.07); border-radius: 6px; display: flex; align-items: center; justify-content: space-between;">
+                    <div class="agentic-switch-info">
+                        <span class="agentic-switch-label">Enable Server Immediately</span>
+                        <span class="agentic-switch-sub">Start process / remote connection and discover tools upon saving</span>
+                    </div>
+                    <input type="checkbox" id="mcp-server-enabled-input" class="agentic-toggle" checked>
+                </div>
+            </div>
+            <div class="agentic-modal-footer" style="display: flex; justify-content: flex-end; gap: 10px; padding: 14px 20px; border-top: 1px solid rgba(255,255,255,0.08);">
+                <button type="button" class="editor-btn" onclick="closeAddMCPServerModal()">Cancel</button>
+                <button type="button" class="editor-btn" id="mcp-save-btn" onclick="saveMCPServerForm()" style="background: rgba(167, 139, 250, 0.25); border-color: rgba(167, 139, 250, 0.5); color: #e9d5ff; font-weight: 600;">
+                    <span class="material-symbols-outlined" style="font-size: 16px;">save</span>
+                    <span>Save & Connect</span>
+                </button>
+            </div>
+        </div>
     </div>
 
     <!-- External Path Authorization Modal Dialog -->
