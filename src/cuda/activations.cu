@@ -1851,6 +1851,162 @@ void gemv_int2_cuda(__nv_bfloat16* out, const __nv_bfloat16* vec,
 }
 
 // ════════════════════════════════════════════════════════════════════════════════
+//  GEMV INT3 Kernel (Block Size = 32, 12 bytes packed per block)
+// ════════════════════════════════════════════════════════════════════════════════
+template <typename TOut = __nv_bfloat16>
+__global__ void gemv_int3_kernel(
+    TOut* __restrict__ out,
+    const __nv_bfloat16* __restrict__ vec,
+    const uint8_t* __restrict__ weight,
+    const __nv_bfloat16* __restrict__ scale,
+    int N, int K)
+{
+    int row = blockIdx.x * 4 + threadIdx.y;
+    int tid = threadIdx.x; // 0..63
+    int num_blocks = (row < N) ? (K / 32) : 0;
+
+    const __nv_bfloat16* row_scales = (row < N) ? (scale + (row * num_blocks)) : nullptr;
+    const uint8_t* row_w = (row < N) ? (&weight[(size_t)row * ((size_t)K * 3 / 8)]) : nullptr;
+    const uint4* a_vec16 = reinterpret_cast<const uint4*>(vec);
+
+    float sum = 0.0f;
+
+    for (int block_idx = tid; block_idx < num_blocks; block_idx += blockDim.x) {
+        float curr_s = __bfloat162float(row_scales[block_idx]);
+        const uint8_t* b_ptr = row_w + (block_idx * 12);
+        const uint4* a_ptr = a_vec16 + (block_idx * 4);
+
+        float block_sum = 0.0f;
+
+        #pragma unroll
+        for (int k = 0; k < 4; k++) {
+            uint32_t b0 = b_ptr[k * 3 + 0];
+            uint32_t b1 = b_ptr[k * 3 + 1];
+            uint32_t b2 = b_ptr[k * 3 + 2];
+
+            float w0 = (float)(b0 & 0x07) - 4.0f;
+            float w1 = (float)((b0 >> 3) & 0x07) - 4.0f;
+            float w2 = (float)(((b0 >> 6) & 0x03) | ((b1 & 0x01) << 2)) - 4.0f;
+            float w3 = (float)((b1 >> 1) & 0x07) - 4.0f;
+            float w4 = (float)((b1 >> 4) & 0x07) - 4.0f;
+            float w5 = (float)(((b1 >> 7) & 0x01) | ((b2 & 0x03) << 1)) - 4.0f;
+            float w6 = (float)((b2 >> 2) & 0x07) - 4.0f;
+            float w7 = (float)((b2 >> 5) & 0x07) - 4.0f;
+
+            uint4 a_val = a_ptr[k];
+            __nv_bfloat162 bf0 = *reinterpret_cast<const __nv_bfloat162*>(&a_val.x);
+            __nv_bfloat162 bf1 = *reinterpret_cast<const __nv_bfloat162*>(&a_val.y);
+            __nv_bfloat162 bf2 = *reinterpret_cast<const __nv_bfloat162*>(&a_val.z);
+            __nv_bfloat162 bf3 = *reinterpret_cast<const __nv_bfloat162*>(&a_val.w);
+
+            float2 f0 = to_float2_bf162(bf0);
+            float2 f1 = to_float2_bf162(bf1);
+            float2 f2 = to_float2_bf162(bf2);
+            float2 f3 = to_float2_bf162(bf3);
+
+            block_sum += w0 * f0.x + w1 * f0.y
+                       + w2 * f1.x + w3 * f1.y
+                       + w4 * f2.x + w5 * f2.y
+                       + w6 * f3.x + w7 * f3.y;
+        }
+        sum += block_sum * curr_s;
+    }
+
+    #pragma unroll
+    for (int offset = 16; offset > 0; offset /= 2)
+        sum += __shfl_down_sync(0xffffffff, sum, offset);
+
+    __shared__ float s_sum[4][2];
+    int lane = tid % 32;
+    int warp = tid / 32;
+    if (lane == 0) s_sum[threadIdx.y][warp] = sum;
+    __syncthreads();
+
+    if (warp == 0) {
+        sum = (lane < 2) ? s_sum[threadIdx.y][lane] : 0.0f;
+        sum += __shfl_down_sync(0xffffffff, sum, 1);
+        if (lane == 0 && row < N) {
+            out[row] = __float2bfloat16(sum);
+        }
+    }
+}
+
+void gemv_int3_cuda(
+    __nv_bfloat16* out,
+    const __nv_bfloat16* vec,
+    const uint8_t* weight,
+    const __nv_bfloat16* scale,
+    int N, int K,
+    cudaStream_t stream)
+{
+    dim3 threads(64, 4);
+    dim3 blocks((N + 3) / 4);
+    gemv_int3_kernel<__nv_bfloat16><<<blocks, threads, 0, stream>>>(out, vec, weight, scale, N, K);
+}
+
+// ════════════════════════════════════════════════════════════════════════════════
+//  INT3 Block-32 Dequantization to BF16
+// ════════════════════════════════════════════════════════════════════════════════
+__global__ void dequant_int3_block_kernel(
+    __nv_bfloat16* __restrict__ out,         // [N, K] BF16
+    const uint8_t* __restrict__ weight,      // packed INT3 (12 bytes per block)
+    const __nv_bfloat16* __restrict__ scale, // [N, K/32] BF16
+    int total_blocks)
+{
+    int block_idx = blockIdx.x * blockDim.x + threadIdx.x;
+    if (block_idx >= total_blocks) return;
+
+    float s = __bfloat162float(scale[block_idx]);
+    const uint8_t* b_ptr = weight + (size_t)block_idx * 12;
+    __nv_bfloat162 res[16];
+
+    #pragma unroll
+    for (int i = 0; i < 4; i++) {
+        uint32_t b0 = b_ptr[i * 3 + 0];
+        uint32_t b1 = b_ptr[i * 3 + 1];
+        uint32_t b2 = b_ptr[i * 3 + 2];
+
+        float w0 = ((float)(b0 & 0x07) - 4.0f) * s;
+        float w1 = ((float)((b0 >> 3) & 0x07) - 4.0f) * s;
+        float w2 = ((float)(((b0 >> 6) & 0x03) | ((b1 & 0x01) << 2)) - 4.0f) * s;
+        float w3 = ((float)((b1 >> 1) & 0x07) - 4.0f) * s;
+        float w4 = ((float)((b1 >> 4) & 0x07) - 4.0f) * s;
+        float w5 = ((float)(((b1 >> 7) & 0x01) | ((b2 & 0x03) << 1)) - 4.0f) * s;
+        float w6 = ((float)((b2 >> 2) & 0x07) - 4.0f) * s;
+        float w7 = ((float)((b2 >> 5) & 0x07) - 4.0f) * s;
+
+        res[i * 4 + 0].x = __float2bfloat16(w0);
+        res[i * 4 + 0].y = __float2bfloat16(w1);
+        res[i * 4 + 1].x = __float2bfloat16(w2);
+        res[i * 4 + 1].y = __float2bfloat16(w3);
+        res[i * 4 + 2].x = __float2bfloat16(w4);
+        res[i * 4 + 2].y = __float2bfloat16(w5);
+        res[i * 4 + 3].x = __float2bfloat16(w6);
+        res[i * 4 + 3].y = __float2bfloat16(w7);
+    }
+
+    uint4* out_u4 = reinterpret_cast<uint4*>(out + (size_t)block_idx * 32);
+    #pragma unroll
+    for (int j = 0; j < 4; j++) {
+        out_u4[j] = *reinterpret_cast<const uint4*>(&res[j * 4]);
+    }
+}
+
+void dequant_int3_block_cuda(
+    __nv_bfloat16* out,
+    const uint8_t* weight,
+    const __nv_bfloat16* scale,
+    int N, int K,
+    int block_size,
+    cudaStream_t stream)
+{
+    int blocks_per_row = K / 32;
+    int total_blocks = N * blocks_per_row;
+    int threads = 256;
+    int blocks = (total_blocks + threads - 1) / threads;
+    dequant_int3_block_kernel<<<blocks, threads, 0, stream>>>(out, weight, scale, total_blocks);
+}
+
 // ════════════════════════════════════════════════════════════════════════════════
 //  GEMV INT4 Kernel with Double-Buffered Memory Prefetching & In-Place Residual
 // ════════════════════════════════════════════════════════════════════════════════

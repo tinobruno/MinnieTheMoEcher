@@ -158,6 +158,23 @@ void gemm_int2_cuda(__nv_bfloat16* out, const __nv_bfloat16* A,
                     int M, int N, int K_packed, int block_size,
                     cudaStream_t stream = 0);
 
+// ── INT3 symmetric block quantization (Block Size = 32) ───────────────────────
+void gemv_int3_cuda(
+    __nv_bfloat16* out,
+    const __nv_bfloat16* vec,
+    const uint8_t* weight,
+    const __nv_bfloat16* scale,
+    int N, int K,
+    cudaStream_t stream = 0);
+
+void dequant_int3_block_cuda(
+    __nv_bfloat16* out,
+    const uint8_t* weight,
+    const __nv_bfloat16* scale,
+    int N, int K,
+    int block_size = 32,
+    cudaStream_t stream = 0);
+
 // ── INT4 symmetric block quantization (Block Size = 32) ───────────────────────
 void gemv_int4_cuda(
     __nv_bfloat16* out,

@@ -1897,6 +1897,8 @@ public:
         auto matmul_proj = [&](GPUTensor& out, GPUTensor& in_vec, GPUTensor& weight, GPUTensor& scale, int N, int K) {
             if (weight.dtype == "int4") {
                 gemv_int4_cuda(out.bf16(), in_vec.bf16(), (const uint8_t*)weight.data, scale.bf16(), N, K, stream);
+            } else if (weight.dtype == "int3") {
+                gemv_int3_cuda(out.bf16(), in_vec.bf16(), (const uint8_t*)weight.data, scale.bf16(), N, K, stream);
             } else {
                 gemv_bf16_out_bf16_cuda(out.bf16(), weight.bf16(), in_vec.bf16(), N, K, stream);
             }
@@ -4784,7 +4786,7 @@ private:
             }
             auto& info = tensor_map[name];
             std::string dtype = info.value("dtype", "");
-            if (dtype != "int4") {
+            if (dtype != "int4" && dtype != "int3") {
                 return false;
             }
             int64_t offset = info["offset"].get<int64_t>();
@@ -5210,7 +5212,8 @@ private:
         buf_down_.alloc(max_down * sizeof(__nv_bfloat16));
         buf_expert_out_.alloc(dim * sizeof(__nv_bfloat16));
         buf_moe_accum_.alloc(dim * sizeof(__nv_bfloat16));
-        buf_dequant_.alloc(128 * 1024 * 1024);  // 128 MB for largest dequant
+        size_t dequant_needed = std::max((size_t)256 * 1024 * 1024, (size_t)max_inter * dim * sizeof(__nv_bfloat16));
+        buf_dequant_.alloc(dequant_needed);
         buf_logits_.alloc((size_t)cfg_.vocab_size * sizeof(float));
         buf_scores_f32_.alloc(std::max(cfg_.n_routed_experts, 64) * sizeof(float));
         buf_scores_bf16_.alloc(std::max(cfg_.n_routed_experts, 64) * sizeof(__nv_bfloat16));
@@ -5381,6 +5384,23 @@ private:
         }
     }
 
+    void gemm_int3_dequant(
+        __nv_bfloat16* C, int M, int N, int K,
+        const __nv_bfloat16* A,              // [M, K] BF16 input
+        const uint8_t* weight,               // packed INT3
+        const __nv_bfloat16* scale,          // [N, K/32] BF16 block scales
+        int block_size = 32,
+        cudaStream_t stream = nullptr)
+    {
+        if (!stream) stream = main_stream_;
+        if (M == 1) {
+            gemv_int3_cuda(C, A, weight, scale, N, K, stream);
+        } else {
+            dequant_int3_block_cuda(buf_dequant_.bf16(), weight, scale, N, K, block_size, stream);
+            gemm_bf16(C, M, N, K, A, buf_dequant_.bf16());
+        }
+    }
+
     // ── Dequant + GEMM for FP4 experts ──────────────────────────────────────
 
     void gemm_fp4_dequant(
@@ -5529,6 +5549,8 @@ private:
         auto matmul_proj = [&](GPUTensor& out, GPUTensor& in_vec, GPUTensor& weight, GPUTensor& scale, int N, int K) {
             if (weight.dtype == "int4") {
                 gemv_int4_cuda(out.bf16(), in_vec.bf16(), (const uint8_t*)weight.data, scale.bf16(), N, K, main_stream_);
+            } else if (weight.dtype == "int3") {
+                gemv_int3_cuda(out.bf16(), in_vec.bf16(), (const uint8_t*)weight.data, scale.bf16(), N, K, main_stream_);
             } else {
                 gemv_bf16_out_bf16_cuda(out.bf16(), weight.bf16(), in_vec.bf16(), N, K, main_stream_);
             }
@@ -5638,6 +5660,8 @@ private:
         auto matmul_proj_batch = [&](GPUTensor& out, GPUTensor& in_vec, GPUTensor& weight, GPUTensor& scale, int N, int K) {
             if (weight.dtype == "int4") {
                 gemm_int4_batch_cuda(out.bf16(), in_vec.bf16(), (const uint8_t*)weight.data, scale.bf16(), N, K, M, main_stream_);
+            } else if (weight.dtype == "int3") {
+                gemm_int3_dequant(out.bf16(), M, N, K, in_vec.bf16(), (const uint8_t*)weight.data, scale.bf16(), 32, main_stream_);
             } else {
                 gemv_bf16_out_bf16_batch_cuda(out.bf16(), weight.bf16(), in_vec.bf16(), N, K, M, main_stream_);
             }
