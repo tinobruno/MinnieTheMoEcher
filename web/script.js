@@ -136,9 +136,12 @@ function setGeneratingState(generating) {
 
 function getApiBase() {
     if (typeof window !== 'undefined' && window.location && window.location.protocol.startsWith('http')) {
-        return window.location.origin;
+        if (window.location.port === '8001' || !window.location.port) {
+            return window.location.origin;
+        }
+        return `${window.location.protocol}//${window.location.hostname}:8001`;
     }
-    return 'http://localhost:8000';
+    return 'http://localhost:8001';
 }
 
 function stopGeneration() {
@@ -1824,13 +1827,35 @@ function saveSearchProviderSettingsUI() {
     });
 }
 
+const webToolNames = ['web_search', 'youtube_search', 'fetch_url', 'google_search'];
+const localToolNames = ['read_file', 'write_file', 'edit_file', 'execute_command'];
+
+function syncMasterCheckboxes() {
+    const masterWebToggle = document.getElementById('tool-master-web');
+    const masterLocalToggle = document.getElementById('tool-master-local');
+    if (masterWebToggle) {
+        masterWebToggle.checked = webToolNames.some(t => agenticSettings.tools[t] !== false);
+    }
+    if (masterLocalToggle) {
+        masterLocalToggle.checked = localToolNames.some(t => agenticSettings.tools[t] !== false);
+    }
+}
+
 function syncFastMediaSearchToggle(enabled) {
     agenticSettings.fastMediaSearch = !!enabled;
+    agenticSettings.tools['youtube_search'] = !!enabled;
+
     const sidebarToggle = document.getElementById('sidebar-fast-media-search');
     const panelToggle = document.getElementById('fast-media-search-toggle');
+    const ytCb = document.getElementById('tool-enable-youtube-search');
+
     if (sidebarToggle) sidebarToggle.checked = !!enabled;
     if (panelToggle) panelToggle.checked = !!enabled;
+    if (ytCb) ytCb.checked = !!enabled;
+
+    syncMasterCheckboxes();
     saveAgenticSettings();
+    syncToolSettingsWithBackend();
 
     // Sync to backend server
     fetch(`${getApiBase()}/api/settings/search_provider`, {
@@ -2070,9 +2095,6 @@ function initAgenticSettingsUI() {
     const masterWebToggle = document.getElementById('tool-master-web');
     const masterLocalToggle = document.getElementById('tool-master-local');
 
-    const webToolNames = ['web_search', 'youtube_search', 'fetch_url', 'google_search'];
-    const localToolNames = ['read_file', 'write_file', 'edit_file', 'execute_command'];
-
     const toolCheckboxes = {
         read_file: document.getElementById('tool-enable-read'),
         write_file: document.getElementById('tool-enable-write'),
@@ -2084,15 +2106,6 @@ function initAgenticSettingsUI() {
         fetch_url: document.getElementById('tool-enable-fetch')
     };
 
-    function syncMasterCheckboxes() {
-        if (masterWebToggle) {
-            masterWebToggle.checked = webToolNames.some(t => agenticSettings.tools[t] !== false);
-        }
-        if (masterLocalToggle) {
-            masterLocalToggle.checked = localToolNames.some(t => agenticSettings.tools[t] !== false);
-        }
-    }
-
     if (masterWebToggle) {
         masterWebToggle.addEventListener('change', (e) => {
             const val = e.target.checked;
@@ -2100,6 +2113,11 @@ function initAgenticSettingsUI() {
                 agenticSettings.tools[t] = val;
                 if (toolCheckboxes[t]) toolCheckboxes[t].checked = val;
             });
+            agenticSettings.fastMediaSearch = val;
+            const sidebarToggle = document.getElementById('sidebar-fast-media-search');
+            const panelToggle = document.getElementById('fast-media-search-toggle');
+            if (sidebarToggle) sidebarToggle.checked = val;
+            if (panelToggle) panelToggle.checked = val;
             saveAgenticSettings();
             syncToolSettingsWithBackend();
         });
@@ -2122,6 +2140,13 @@ function initAgenticSettingsUI() {
             cb.checked = agenticSettings.tools[toolName] !== false;
             cb.addEventListener('change', (e) => {
                 agenticSettings.tools[toolName] = e.target.checked;
+                if (toolName === 'youtube_search') {
+                    agenticSettings.fastMediaSearch = e.target.checked;
+                    const sidebarToggle = document.getElementById('sidebar-fast-media-search');
+                    const panelToggle = document.getElementById('fast-media-search-toggle');
+                    if (sidebarToggle) sidebarToggle.checked = e.target.checked;
+                    if (panelToggle) panelToggle.checked = e.target.checked;
+                }
                 syncMasterCheckboxes();
                 saveAgenticSettings();
                 syncToolSettingsWithBackend();
@@ -2261,6 +2286,9 @@ function getActiveToolsPayload() {
 
     const activeList = knownTools.filter(name => {
         if ((name === 'web_search' || name === 'youtube_search' || name === 'google_search' || name === 'fetch_url') && !isWebRetrieval) {
+            return false;
+        }
+        if (name === 'youtube_search' && agenticSettings.fastMediaSearch === false) {
             return false;
         }
         return agenticSettings.tools[name] !== false;
@@ -2583,8 +2611,24 @@ function resolveCaptchaPrompt(retried) {
 function buildOptimizedMessagesPayload() {
     const messagesToSend = [];
     let sysPrompt = systemPromptInput ? systemPromptInput.value.trim() : '';
+    const activeTools = getActiveToolsPayload();
+
     if (sysPrompt) {
-        messagesToSend.push({ role: 'system', content: sysPrompt });
+        // Strip any stale # Tools or <tools> block if activeTools has changed or youtube_search was disabled
+        if (sysPrompt.includes('# Tools') || sysPrompt.includes('<tools>')) {
+            const hasYt = activeTools.includes('youtube_search');
+            if (activeTools.length === 0 || (!hasYt && sysPrompt.includes('youtube_search'))) {
+                let toolsIdx = sysPrompt.indexOf('\n\n# Tools');
+                if (toolsIdx === -1) toolsIdx = sysPrompt.indexOf('# Tools');
+                if (toolsIdx === -1) toolsIdx = sysPrompt.indexOf('<tools>');
+                if (toolsIdx !== -1) {
+                    sysPrompt = sysPrompt.substring(0, toolsIdx).trim();
+                }
+            }
+        }
+        if (sysPrompt) {
+            messagesToSend.push({ role: 'system', content: sysPrompt });
+        }
     }
 
     // 1. Slice history according to maxTurns limit (1 turn = 1 user + 1 assistant message)
@@ -2604,7 +2648,13 @@ function buildOptimizedMessagesPayload() {
             content: msg.content || ''
         };
 
-        if (msg.tool_calls) {
+        if (msg.tool_calls && Array.isArray(msg.tool_calls)) {
+            // Only preserve tool calls for tools that are currently enabled
+            const allowedCalls = msg.tool_calls.filter(tc => activeTools.includes(tc.name) || tc.name.startsWith('mcp__') || tc.name.startsWith('tinobruno-'));
+            if (allowedCalls.length > 0) {
+                cleanedMsg.tool_calls = allowedCalls;
+            }
+        } else if (msg.tool_calls) {
             cleanedMsg.tool_calls = msg.tool_calls;
         }
 
@@ -3099,6 +3149,12 @@ function executeBrowserFetch(url, mode = 'text', pattern = '', maxChars = 4000) 
 }
 
 async function executeClientToolCall(tc, turnRetrievedDocs = null) {
+    const activeTools = getActiveToolsPayload();
+    if (tc && tc.name && !activeTools.includes(tc.name) && !tc.name.startsWith('mcp__') && !tc.name.startsWith('tinobruno-')) {
+        console.warn(`[Tool Execution Guard] Tool '${tc.name}' is disabled in settings. Refusing execution.`);
+        return `Error: Tool '${tc.name}' is disabled in user settings and cannot be executed.`;
+    }
+
     if (tc.name === 'fetch_url') {
         let args = {};
         try {
@@ -3640,7 +3696,8 @@ async function sendMessage() {
 
                     try {
                         const parsedArgs = typeof tc.arguments === 'string' ? JSON.parse(tc.arguments) : tc.arguments;
-                        let isDirectMedia = (tc.name === 'youtube_search') || ((tc.name === 'web_search' || tc.name === 'google_search') && (agenticSettings.fastMediaSearch !== false) && isMediaSearchQuery(queryStr));
+                        let isDirectMedia = (tc.name === 'youtube_search' && activeTools.includes('youtube_search') && agenticSettings.fastMediaSearch !== false) ||
+                            ((tc.name === 'web_search' || tc.name === 'google_search') && activeTools.includes(tc.name) && (agenticSettings.fastMediaSearch !== false) && isMediaSearchQuery(queryStr));
                         if (tc.name === 'youtube_search' && !isMediaSearchQuery(queryStr)) {
                             const latestUserMsg = (chatHistory.filter(m => m.role === 'user').slice(-1)[0]?.content || '').trim().toLowerCase();
                             const hasMediaKeywords = isMediaSearchQuery(latestUserMsg);
@@ -3772,37 +3829,59 @@ async function sendMessage() {
 
             // --- Turn Media & Preview Detection ---
             let turnMediaDoc = null;
+            const isWebEnabled = webRetrievalEnabled ? webRetrievalEnabled.checked : true;
+            const canPlayMedia = (agenticSettings.fastMediaSearch !== false) && (agenticSettings.tools['youtube_search'] !== false) && isWebEnabled;
 
-            // 1. Check all turnRetrievedDocs from this turn
-            for (let i = turnRetrievedDocs.length - 1; i >= 0; i--) {
-                const d = turnRetrievedDocs[i];
-                if (!d) continue;
-                if (d.html && (d.html.includes('youtube-nocookie.com/embed') || d.html.includes('youtube.com/iframe_api') || d.html.includes('<video') || d.html.includes('<audio'))) {
-                    turnMediaDoc = d;
-                    break;
-                }
-                if (d.url && (d.url.includes('watch?v=') || d.url.includes('youtu.be') || d.url.includes('youtube.com/embed'))) {
-                    const m = d.url.match(/(?:watch\?v=|youtu\.be\/|youtube\.com\/embed\/)([a-zA-Z0-9_-]{11})/i);
-                    if (m) {
-                        turnMediaDoc = {
-                            id: 'yt_' + m[1],
-                            url: `https://www.youtube.com/watch?v=${m[1]}`,
-                            title: d.title || 'YouTube Video',
-                            html: createYouTubePlayerHtml(m[1], d.title || 'YouTube Video'),
-                            snippet: 'Interactive YouTube Player'
-                        };
-                        addRetrievedDocument(turnMediaDoc);
+            if (canPlayMedia) {
+                // 1. Check all turnRetrievedDocs from this turn
+                for (let i = turnRetrievedDocs.length - 1; i >= 0; i--) {
+                    const d = turnRetrievedDocs[i];
+                    if (!d) continue;
+                    if (d.html && (d.html.includes('youtube-nocookie.com/embed') || d.html.includes('youtube.com/iframe_api') || d.html.includes('<video') || d.html.includes('<audio'))) {
+                        turnMediaDoc = d;
                         break;
                     }
+                    if (d.url && (d.url.includes('watch?v=') || d.url.includes('youtu.be') || d.url.includes('youtube.com/embed'))) {
+                        const m = d.url.match(/(?:watch\?v=|youtu\.be\/|youtube\.com\/embed\/)([a-zA-Z0-9_-]{11})/i);
+                        if (m) {
+                            turnMediaDoc = {
+                                id: 'yt_' + m[1],
+                                url: `https://www.youtube.com/watch?v=${m[1]}`,
+                                title: d.title || 'YouTube Video',
+                                html: createYouTubePlayerHtml(m[1], d.title || 'YouTube Video'),
+                                snippet: 'Interactive YouTube Player'
+                            };
+                            addRetrievedDocument(turnMediaDoc);
+                            break;
+                        }
+                    }
                 }
-            }
 
-            // 2. If not found in turnRetrievedDocs, check tool outputs ONLY from THIS turn (in reverse order)
-            if (!turnMediaDoc) {
-                const currentTurnToolOutputs = chatHistory.slice(turnHistoryStartIndex).filter(m => m.role === 'tool');
-                for (let i = currentTurnToolOutputs.length - 1; i >= 0; i--) {
-                    const content = currentTurnToolOutputs[i].content || '';
-                    const ytMatch = content.match(/(?:https?:\/\/)?(?:www\.)?(?:youtube\.com\/watch\?v=|youtu\.be\/|youtube\.com\/embed\/)([a-zA-Z0-9_-]{11})/i);
+                // 2. If not found in turnRetrievedDocs, check tool outputs ONLY from THIS turn (in reverse order)
+                if (!turnMediaDoc) {
+                    const currentTurnToolOutputs = chatHistory.slice(turnHistoryStartIndex).filter(m => m.role === 'tool');
+                    for (let i = currentTurnToolOutputs.length - 1; i >= 0; i--) {
+                        const content = currentTurnToolOutputs[i].content || '';
+                        const ytMatch = content.match(/(?:https?:\/\/)?(?:www\.)?(?:youtube\.com\/watch\?v=|youtu\.be\/|youtube\.com\/embed\/)([a-zA-Z0-9_-]{11})/i);
+                        if (ytMatch) {
+                            const videoId = ytMatch[1];
+                            const ytHtml = createYouTubePlayerHtml(videoId, 'YouTube Video');
+                            turnMediaDoc = {
+                                id: 'yt_' + videoId,
+                                url: `https://www.youtube.com/watch?v=${videoId}`,
+                                title: 'YouTube Video',
+                                html: ytHtml,
+                                snippet: 'Interactive YouTube Player'
+                            };
+                            addRetrievedDocument(turnMediaDoc);
+                            break;
+                        }
+                    }
+                }
+
+                // 3. If not found in tool outputs, check the assistant response (roundContent)
+                if (!turnMediaDoc) {
+                    const ytMatch = roundContent.match(/(?:https?:\/\/)?(?:www\.)?(?:youtube\.com\/watch\?v=|youtu\.be\/|youtube\.com\/embed\/)([a-zA-Z0-9_-]{11})/i);
                     if (ytMatch) {
                         const videoId = ytMatch[1];
                         const ytHtml = createYouTubePlayerHtml(videoId, 'YouTube Video');
@@ -3814,25 +3893,7 @@ async function sendMessage() {
                             snippet: 'Interactive YouTube Player'
                         };
                         addRetrievedDocument(turnMediaDoc);
-                        break;
                     }
-                }
-            }
-
-            // 3. If not found in tool outputs, check the assistant response (roundContent)
-            if (!turnMediaDoc) {
-                const ytMatch = roundContent.match(/(?:https?:\/\/)?(?:www\.)?(?:youtube\.com\/watch\?v=|youtu\.be\/|youtube\.com\/embed\/)([a-zA-Z0-9_-]{11})/i);
-                if (ytMatch) {
-                    const videoId = ytMatch[1];
-                    const ytHtml = createYouTubePlayerHtml(videoId, 'YouTube Video');
-                    turnMediaDoc = {
-                        id: 'yt_' + videoId,
-                        url: `https://www.youtube.com/watch?v=${videoId}`,
-                        title: 'YouTube Video',
-                        html: ytHtml,
-                        snippet: 'Interactive YouTube Player'
-                    };
-                    addRetrievedDocument(turnMediaDoc);
                 }
             }
 

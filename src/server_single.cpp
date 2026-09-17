@@ -7975,6 +7975,11 @@ static std::string build_dynamic_tools_prompt(const json& resolved_tools) {
         if (active_names.count("web_search")) {
             prompt += "  4. If `youtube_search` is not available, invoke `web_search` as a fallback.\n";
         }
+    } else {
+        prompt +=
+            "\n## Media & Online Playback Status:\n"
+            "- YouTube and online media playback tools are currently DISABLED in user settings. Do NOT invoke youtube_search or attempt to search YouTube for videos/songs.\n"
+            "- If the user asks to play a song, video, or music, politely explain that media playback and tools are currently disabled in settings.\n";
     }
 
     return prompt;
@@ -7983,6 +7988,26 @@ static std::string build_dynamic_tools_prompt(const json& resolved_tools) {
 static std::string g_base_system_prompt = "You are a helpful assistant";
 static std::string g_current_system_prompt = "";
 static json g_current_active_tools = json::array();
+
+static std::string update_system_prompt_with_tools(const std::string& original_content, const std::string& tools_system_prompt, bool has_tools) {
+    std::string content = original_content;
+    size_t tools_pos = content.find("\n\n# Tools");
+    if (tools_pos == std::string::npos) tools_pos = content.find("# Tools");
+    if (tools_pos == std::string::npos) tools_pos = content.find("<tools>");
+    if (tools_pos != std::string::npos) {
+        content = content.substr(0, tools_pos);
+    }
+    while (!content.empty() && (content.back() == ' ' || content.back() == '\n' || content.back() == '\r')) {
+        content.pop_back();
+    }
+    if (content.empty()) {
+        content = "You are a helpful assistant";
+    }
+    if (has_tools) {
+        content += tools_system_prompt;
+    }
+    return content;
+}
 
 static std::vector<int> apply_chat_template(const json& messages, const BPETokenizer& tok, bool enable_thinking = true, const std::string& reasoning_effort = "high", const json& tools = json()) {
     json resolved_tools = tools;
@@ -8015,10 +8040,8 @@ static std::vector<int> apply_chat_template(const json& messages, const BPEToken
             std::string role = messages[i].value("role", "user");
             std::string content = messages[i].value("content", "");
 
-            if (role == "system" && i == 0 && has_tools) {
-                if (content.find("<tools>") == std::string::npos && content.find("# Tools") == std::string::npos) {
-                    content += tools_system_prompt;
-                }
+            if (role == "system" && i == 0) {
+                content = update_system_prompt_with_tools(content, tools_system_prompt, has_tools);
             }
 
             if (role == "tool" || role == "function") {
@@ -8119,12 +8142,11 @@ static std::vector<int> apply_chat_template(const json& messages, const BPEToken
         std::string content = messages[i].value("content", "");
 
         if (role == "system") {
-            if (i == 0 && has_tools) {
-                if (content.find("<tools>") == std::string::npos && content.find("# Tools") == std::string::npos) {
-                    content += tools_system_prompt;
-                }
+            std::string sys_body = content;
+            if (i == 0) {
+                sys_body = update_system_prompt_with_tools(content, tools_system_prompt, has_tools);
             }
-            auto enc = tok.encode(content);
+            auto enc = tok.encode(sys_body);
             result.insert(result.end(), enc.begin(), enc.end());
         } else if (role == "user") {
             result.push_back(USER);
@@ -10097,6 +10119,29 @@ static void run_server(MoecherEngine& engine, int port, int default_thinking_bud
         json resp_data = json::object();
         std::string output;
 
+        if (!g_enable_tools) {
+            resp_data["success"] = false;
+            resp_data["output"] = "Error: Tool execution is disabled on this server.";
+            res.set_content(resp_data.dump(), "application/json");
+            return;
+        }
+
+        if (tool_name.rfind("mcp__", 0) != 0 && tool_name.rfind("tinobruno-", 0) != 0) {
+            bool is_active = false;
+            for (const auto& t : g_current_active_tools) {
+                if (t.contains("function") && t["function"].value("name", "") == tool_name) {
+                    is_active = true;
+                    break;
+                }
+            }
+            if (!is_active) {
+                resp_data["success"] = false;
+                resp_data["output"] = "Error: Tool '" + tool_name + "' is disabled in current settings.";
+                res.set_content(resp_data.dump(), "application/json");
+                return;
+            }
+        }
+
         if (tool_name == "read_file") {
             std::string path = args.value("path", "");
             int start_line = args.value("start_line", 1);
@@ -10376,6 +10421,14 @@ static void run_server(MoecherEngine& engine, int port, int default_thinking_bud
             json active_tools = g_current_active_tools;
             if (j.contains("tools")) {
                 active_tools = j["tools"];
+                bool has_yt = false;
+                if (active_tools.is_array()) {
+                    for (const auto& item : active_tools) {
+                        if (item.is_string() && item.get<std::string>() == "youtube_search") has_yt = true;
+                        else if (item.is_object() && item.contains("function") && item["function"].value("name", "") == "youtube_search") has_yt = true;
+                    }
+                }
+                moecher::tooling::g_fast_media_search = has_yt;
             }
 
             rebuild_system_prefix(engine, base_prompt, active_tools, custom_full_prompt);
