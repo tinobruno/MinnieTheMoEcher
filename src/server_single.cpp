@@ -5177,7 +5177,7 @@ private:
             if (tensor_map.contains("mtp.fc.weight")) {
                 std::string draft_ids_path = mtp_model_dir + "/draft_vocab_ids.bin";
                 std::string draft_head_path = mtp_model_dir + "/draft_lm_head_int8_bf16.bin";
-                bool has_draft_head = (access(draft_ids_path.c_str(), R_OK) == 0 && access(draft_head_path.c_str(), R_OK) == 0);
+                bool has_draft_head = (std::filesystem::exists(draft_ids_path) && std::filesystem::exists(draft_head_path));
                 if (head_weight_.dtype == "int4" && !has_draft_head) {
                     LOG_WARN("MTP: Full lm_head is INT4 and no draft_lm_head_int8_bf16.bin found — skipping MTP");
                 } else {
