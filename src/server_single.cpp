@@ -261,6 +261,41 @@ struct ModelConfig {
 };
 
 // ════════════════════════════════════════════════════════════════════════════════
+//  GPU Hardware Capabilities & Gating
+// ════════════════════════════════════════════════════════════════════════════════
+
+struct GpuCapabilities {
+    int major = 0;
+    int minor = 0;
+    size_t total_vram_bytes = 0;
+    std::string device_name = "";
+    bool is_ampere = false;           // SM 8.0/8.6 (RTX 3090, A100)
+    bool is_ada_or_newer = false;     // SM 8.9+ (RTX 4060 Ti, 4090)
+    bool is_blackwell_or_newer = false; // SM 10.0+ (RTX 5060 Ti, 5090)
+    bool supports_fp8 = false;        // FP8 Tensor Cores (Ada/Hopper+)
+    bool supports_fp4 = false;        // Blackwell+
+    bool is_vram_constrained = false; // <= 18GB (e.g. 16GB cards)
+};
+
+static inline GpuCapabilities detect_gpu_capabilities(int device_id = 0) {
+    GpuCapabilities caps;
+    cudaDeviceProp prop;
+    if (cudaGetDeviceProperties(&prop, device_id) == cudaSuccess) {
+        caps.major = prop.major;
+        caps.minor = prop.minor;
+        caps.total_vram_bytes = prop.totalGlobalMem;
+        caps.device_name = prop.name;
+        caps.is_ampere = (prop.major == 8 && (prop.minor == 0 || prop.minor == 6));
+        caps.is_ada_or_newer = (prop.major > 8 || (prop.major == 8 && prop.minor >= 9));
+        caps.is_blackwell_or_newer = (prop.major >= 10);
+        caps.supports_fp8 = caps.is_ada_or_newer;
+        caps.supports_fp4 = caps.is_blackwell_or_newer;
+        caps.is_vram_constrained = (prop.totalGlobalMem <= 18ULL * 1024 * 1024 * 1024);
+    }
+    return caps;
+}
+
+// ════════════════════════════════════════════════════════════════════════════════
 //  JoyAI BPE Tokenizer (reads HuggingFace tokenizer.json)
 // ════════════════════════════════════════════════════════════════════════════════
 
@@ -2654,6 +2689,10 @@ public:
     // Prompt Prefix KV Cache Tracking
     std::vector<int> cached_tokens_;
 
+    // Hardware Detection & Feature Gating
+    GpuCapabilities gpu_caps_;
+    const GpuCapabilities& gpu_capabilities() const { return gpu_caps_; }
+
     void reset_all_kv_caches() {
         for (int l = 0; l < cfg_.num_hidden_layers; l++) {
             if (layers_[l].kv_cache.data) {
@@ -3207,14 +3246,22 @@ public:
         CUBLAS_CHECK(cublasSetStream(cublas_handle_, main_stream_));
         cublasSetMathMode(cublas_handle_, CUBLAS_DEFAULT_MATH);
 
-        // ── Hardware Persistent L2 Cache Configuration ────────────────────────────
+        // ── Hardware Capabilities & Persistent L2 Cache Configuration ─────────────
+        gpu_caps_ = detect_gpu_capabilities(0);
+        LOG_INFO("Hardware: %s (Compute %d.%d, %.1f GB VRAM)",
+                 gpu_caps_.device_name.c_str(), gpu_caps_.major, gpu_caps_.minor,
+                 gpu_caps_.total_vram_bytes / (1024.0 * 1024.0 * 1024.0));
+        LOG_INFO("Hardware Capabilities: Ampere=%d, Ada+=%d, Blackwell+=%d, FP8_TC=%d, FP4=%d, VRAM-Constrained=%d",
+                 (int)gpu_caps_.is_ampere, (int)gpu_caps_.is_ada_or_newer,
+                 (int)gpu_caps_.is_blackwell_or_newer, (int)gpu_caps_.supports_fp8,
+                 (int)gpu_caps_.supports_fp4, (int)gpu_caps_.is_vram_constrained);
+
         cudaDeviceProp prop;
         if (cudaGetDeviceProperties(&prop, 0) == cudaSuccess) {
             size_t max_persisting_l2 = prop.persistingL2CacheMaxSize;
             if (max_persisting_l2 > 0) {
                 size_t l2_limit = (max_persisting_l2 * 3) / 4; // Use 75% for persistent window
                 cudaDeviceSetLimit(cudaLimitPersistingL2CacheSize, l2_limit);
-                LOG_INFO("Hardware: %s (Compute %d.%d)", prop.name, prop.major, prop.minor);
                 LOG_INFO("Persistent L2 Cache configured: %.1f MB / %.1f MB",
                          l2_limit / (1024.0 * 1024.0), max_persisting_l2 / (1024.0 * 1024.0));
             }
@@ -3819,12 +3866,24 @@ public:
 
             // Qwen
             if (lw.k_cache_gqa.data) {
-                if (!l_snap.snap_k_cache_gqa.data) l_snap.snap_k_cache_gqa.alloc(lw.k_cache_gqa.size_bytes);
-                CUDA_CHECK(cudaMemcpyAsync(l_snap.snap_k_cache_gqa.data, lw.k_cache_gqa.data, lw.k_cache_gqa.size_bytes, cudaMemcpyDeviceToDevice, main_stream_));
+                int n_kv = cfg_.num_key_value_heads > 0 ? cfg_.num_key_value_heads : 4;
+                int h_dim = cfg_.head_dim > 0 ? cfg_.head_dim : 256;
+                size_t active_gqa_bytes = (size_t)tokens.size() * n_kv * h_dim * sizeof(uint8_t);
+                if (active_gqa_bytes > lw.k_cache_gqa.size_bytes || active_gqa_bytes == 0) active_gqa_bytes = lw.k_cache_gqa.size_bytes;
+                if (!l_snap.snap_k_cache_gqa.data || l_snap.snap_k_cache_gqa.size_bytes < active_gqa_bytes) {
+                    l_snap.snap_k_cache_gqa.alloc(active_gqa_bytes);
+                }
+                CUDA_CHECK(cudaMemcpyAsync(l_snap.snap_k_cache_gqa.data, lw.k_cache_gqa.data, active_gqa_bytes, cudaMemcpyDeviceToDevice, main_stream_));
             }
             if (lw.v_cache_gqa.data) {
-                if (!l_snap.snap_v_cache_gqa.data) l_snap.snap_v_cache_gqa.alloc(lw.v_cache_gqa.size_bytes);
-                CUDA_CHECK(cudaMemcpyAsync(l_snap.snap_v_cache_gqa.data, lw.v_cache_gqa.data, lw.v_cache_gqa.size_bytes, cudaMemcpyDeviceToDevice, main_stream_));
+                int n_kv = cfg_.num_key_value_heads > 0 ? cfg_.num_key_value_heads : 4;
+                int h_dim = cfg_.head_dim > 0 ? cfg_.head_dim : 256;
+                size_t active_gqa_bytes = (size_t)tokens.size() * n_kv * h_dim * sizeof(uint8_t);
+                if (active_gqa_bytes > lw.v_cache_gqa.size_bytes || active_gqa_bytes == 0) active_gqa_bytes = lw.v_cache_gqa.size_bytes;
+                if (!l_snap.snap_v_cache_gqa.data || l_snap.snap_v_cache_gqa.size_bytes < active_gqa_bytes) {
+                    l_snap.snap_v_cache_gqa.alloc(active_gqa_bytes);
+                }
+                CUDA_CHECK(cudaMemcpyAsync(l_snap.snap_v_cache_gqa.data, lw.v_cache_gqa.data, active_gqa_bytes, cudaMemcpyDeviceToDevice, main_stream_));
             }
             if (lw.ssm_state.data) {
                 if (!l_snap.snap_ssm_state.data) l_snap.snap_ssm_state.alloc(lw.ssm_state.size_bytes);
@@ -3895,10 +3954,22 @@ public:
 
             // Qwen
             if (lw.k_cache_gqa.data && l_snap.snap_k_cache_gqa.data) {
-                CUDA_CHECK(cudaMemcpyAsync(lw.k_cache_gqa.data, l_snap.snap_k_cache_gqa.data, lw.k_cache_gqa.size_bytes, cudaMemcpyDeviceToDevice, main_stream_));
+                int n_kv = cfg_.num_key_value_heads > 0 ? cfg_.num_key_value_heads : 4;
+                int h_dim = cfg_.head_dim > 0 ? cfg_.head_dim : 256;
+                size_t active_gqa_bytes = (size_t)snap.tokens.size() * n_kv * h_dim * sizeof(uint8_t);
+                if (active_gqa_bytes > l_snap.snap_k_cache_gqa.size_bytes || active_gqa_bytes == 0) {
+                    active_gqa_bytes = l_snap.snap_k_cache_gqa.size_bytes;
+                }
+                CUDA_CHECK(cudaMemcpyAsync(lw.k_cache_gqa.data, l_snap.snap_k_cache_gqa.data, active_gqa_bytes, cudaMemcpyDeviceToDevice, main_stream_));
             }
             if (lw.v_cache_gqa.data && l_snap.snap_v_cache_gqa.data) {
-                CUDA_CHECK(cudaMemcpyAsync(lw.v_cache_gqa.data, l_snap.snap_v_cache_gqa.data, lw.v_cache_gqa.size_bytes, cudaMemcpyDeviceToDevice, main_stream_));
+                int n_kv = cfg_.num_key_value_heads > 0 ? cfg_.num_key_value_heads : 4;
+                int h_dim = cfg_.head_dim > 0 ? cfg_.head_dim : 256;
+                size_t active_gqa_bytes = (size_t)snap.tokens.size() * n_kv * h_dim * sizeof(uint8_t);
+                if (active_gqa_bytes > l_snap.snap_v_cache_gqa.size_bytes || active_gqa_bytes == 0) {
+                    active_gqa_bytes = l_snap.snap_v_cache_gqa.size_bytes;
+                }
+                CUDA_CHECK(cudaMemcpyAsync(lw.v_cache_gqa.data, l_snap.snap_v_cache_gqa.data, active_gqa_bytes, cudaMemcpyDeviceToDevice, main_stream_));
             }
             if (lw.ssm_state.data && l_snap.snap_ssm_state.data) {
                 CUDA_CHECK(cudaMemcpyAsync(lw.ssm_state.data, l_snap.snap_ssm_state.data, lw.ssm_state.size_bytes, cudaMemcpyDeviceToDevice, main_stream_));
@@ -3953,28 +4024,12 @@ public:
             while (curr < prefix_tokens.size()) {
                 size_t remaining = prefix_tokens.size() - curr;
                 int chunk_m = (remaining >= 8) ? 8 : (int)remaining;
-                if (chunk_m >= 2 && chunk_m <= 8) {
-                    CUDA_CHECK(cudaMemcpyAsync(buf_input_pos_batch_.i32(), &h_prefill_pos_[curr],
-                                               chunk_m * sizeof(int32_t), cudaMemcpyHostToDevice, main_stream_));
-                    CUDA_CHECK(cudaMemcpyAsync(buf_input_tokens_batch_.i32(), &h_prefill_tok_[curr],
-                                               chunk_m * sizeof(int32_t), cudaMemcpyHostToDevice, main_stream_));
-                    if (batch_graph_captured_[chunk_m]) {
-                        CUDA_CHECK(cudaGraphLaunch(batch_graph_exec_[chunk_m], main_stream_));
-                    } else {
-                        forward_token_batch_qwen_device_body((int)curr, chunk_m);
-                    }
-                    curr += chunk_m;
-                } else {
-                    if (graph_captured_) {
-                        CUDA_CHECK(cudaMemcpyAsync(buf_track_flag_.i32(), h_single_flag_, sizeof(int32_t), cudaMemcpyHostToDevice, main_stream_));
-                        CUDA_CHECK(cudaMemcpyAsync(buf_input_token_.i32(), &h_prefill_tok_[curr], sizeof(int32_t), cudaMemcpyHostToDevice, main_stream_));
-                        CUDA_CHECK(cudaMemcpyAsync(buf_input_pos_.i32(), &h_prefill_pos_[curr], sizeof(int32_t), cudaMemcpyHostToDevice, main_stream_));
-                        CUDA_CHECK(cudaGraphLaunch(graph_exec_, main_stream_));
-                    } else {
-                        forward_token_eager(prefix_tokens[curr], (int)curr);
-                    }
-                    curr += 1;
-                }
+                CUDA_CHECK(cudaMemcpyAsync(buf_input_pos_batch_.i32(), &h_prefill_pos_[curr],
+                                           chunk_m * sizeof(int32_t), cudaMemcpyHostToDevice, main_stream_));
+                CUDA_CHECK(cudaMemcpyAsync(buf_input_tokens_batch_.i32(), &h_prefill_tok_[curr],
+                                           chunk_m * sizeof(int32_t), cudaMemcpyHostToDevice, main_stream_));
+                forward_token_batch_qwen_device_body((int)curr, chunk_m, /*compute_logits=*/false);
+                curr += chunk_m;
             }
         } else {
             // ModelArch::DEEPSEEK_V4
@@ -4137,45 +4192,23 @@ public:
 
             if (cfg_.architecture == ModelArch::QWEN) {
                 size_t curr = prefix_len;
-                // Prefill intermediate prompt tokens using batched CUDA graphs (chunks of up to 8)
+                // Prefill intermediate prompt tokens in chunks of up to 8 (skipping intermediate LM-head computation)
                 while (curr + 1 < prompt.size()) {
                     size_t remaining = (prompt.size() - 1) - curr;
                     int chunk_m = (remaining >= 8) ? 8 : (int)remaining;
-                    if (chunk_m >= 2 && chunk_m <= 8) {
-                        CUDA_CHECK(cudaMemcpyAsync(buf_input_pos_batch_.i32(), &h_prefill_pos_[curr],
-                                                   chunk_m * sizeof(int32_t), cudaMemcpyHostToDevice, main_stream_));
-                        CUDA_CHECK(cudaMemcpyAsync(buf_input_tokens_batch_.i32(), &h_prefill_tok_[curr],
-                                                   chunk_m * sizeof(int32_t), cudaMemcpyHostToDevice, main_stream_));
-                        if (batch_graph_captured_[chunk_m]) {
-                            CUDA_CHECK(cudaGraphLaunch(batch_graph_exec_[chunk_m], main_stream_));
-                        } else {
-                            forward_token_batch_qwen_device_body((int)curr, chunk_m);
+                    CUDA_CHECK(cudaMemcpyAsync(buf_input_pos_batch_.i32(), &h_prefill_pos_[curr],
+                                               chunk_m * sizeof(int32_t), cudaMemcpyHostToDevice, main_stream_));
+                    CUDA_CHECK(cudaMemcpyAsync(buf_input_tokens_batch_.i32(), &h_prefill_tok_[curr],
+                                               chunk_m * sizeof(int32_t), cudaMemcpyHostToDevice, main_stream_));
+                    forward_token_batch_qwen_device_body((int)curr, chunk_m, /*compute_logits=*/false);
+                    if (draft_model_active) {
+                        for (int m = 0; m < chunk_m; m++) {
+                            qwen_draft_.forward_token_async_pinned(&h_prefill_tok_[curr + m],
+                                                                   &h_prefill_pos_[curr + m],
+                                                                   (int)(curr + m), main_stream_);
                         }
-                        if (draft_model_active) {
-                            for (int m = 0; m < chunk_m; m++) {
-                                qwen_draft_.forward_token_async_pinned(&h_prefill_tok_[curr + m],
-                                                                       &h_prefill_pos_[curr + m],
-                                                                       (int)(curr + m), main_stream_);
-                            }
-                        }
-                        curr += chunk_m;
-                    } else {
-                        // chunk_m == 1: forward single token asynchronously
-                        if (graph_captured_) {
-                            CUDA_CHECK(cudaMemcpyAsync(buf_track_flag_.i32(), h_single_flag_, sizeof(int32_t), cudaMemcpyHostToDevice, main_stream_));
-                            CUDA_CHECK(cudaMemcpyAsync(buf_input_token_.i32(), &h_prefill_tok_[curr], sizeof(int32_t), cudaMemcpyHostToDevice, main_stream_));
-                            CUDA_CHECK(cudaMemcpyAsync(buf_input_pos_.i32(), &h_prefill_pos_[curr], sizeof(int32_t), cudaMemcpyHostToDevice, main_stream_));
-                            CUDA_CHECK(cudaGraphLaunch(graph_exec_, main_stream_));
-                        } else {
-                            forward_token_eager(prompt[curr], (int)curr);
-                        }
-                        if (draft_model_active) {
-                            qwen_draft_.forward_token_async_pinned(&h_prefill_tok_[curr],
-                                                                   &h_prefill_pos_[curr],
-                                                                   (int)curr, main_stream_);
-                        }
-                        curr += 1;
                     }
+                    curr += chunk_m;
                 }
 
                 // Forward the very last token individually so buf_logits_ and buf_hidden2_ (for MTP) are populated
@@ -4512,8 +4545,19 @@ public:
 
                 // Priority 1: MTP Self-Drafter (uses target model's POST-NORM hidden state)
                 if (cfg_.architecture == ModelArch::QWEN && mtp_drafter_.loaded_) {
-                    // Adaptive MTP draft depth: K=2 on streak, K=1 otherwise (maximizes sustained tok/s)
-                    int K = (draft_streak >= 1) ? 2 : 1;
+                    bool in_tool_call = false;
+                    size_t last_tc_open = generated_text.rfind("<tool_call>");
+                    if (last_tc_open != std::string::npos) {
+                        size_t last_tc_close = generated_text.rfind("</tool_call>");
+                        if (last_tc_close == std::string::npos || last_tc_close < last_tc_open) {
+                            in_tool_call = true;
+                        }
+                    }
+                    // Adaptive MTP draft depth:
+                    // K=4 when inside tool call or high streak (draft_streak >= 3)
+                    // K=2 on streak (draft_streak >= 1)
+                    // K=1 on cold start
+                    int K = (in_tool_call || draft_streak >= 3) ? 4 : ((draft_streak >= 1) ? 2 : 1);
                     auto t0 = std::chrono::steady_clock::now();
                     mtp_drafter_.draft_k_tokens(buf_hidden2_.bf16(), next_token, position, K, cand_tokens, main_stream_);
                     auto t1 = std::chrono::steady_clock::now();
@@ -4522,10 +4566,10 @@ public:
                 }
 
                 // Priority 2: Prompt-Lookup Drafting (free, zero GPU cost)
-                // Note: Qwen DeltaNet SSM batch kernel maintains 2 rollback slots (slot 0 & 1),
-                // so limit PLD draft tokens to at most 2 for Qwen to prevent unpopulated slot commits.
+                // Qwen DeltaNet SSM batch kernel maintains 4 rollback slots (slots 0..3),
+                // so allow PLD to draft up to 4 tokens for Qwen.
                 if (cfg_.architecture == ModelArch::QWEN && !is_mtp && enable_pld_ && !history.empty()) {
-                    int max_pld = std::min(pld_draft_tokens_, 2);
+                    int max_pld = std::min(pld_draft_tokens_, 4);
                     std::vector<int> pld_cands = PromptLookupDrafter::draft(history, max_pld, 3, 2);
                     if (!pld_cands.empty()) {
                         for (int tok : pld_cands) {
@@ -5733,6 +5777,8 @@ private:
                 lw.conv_state.bf16(),
                 (M > 1) ? lw.conv_state_slots[0].bf16() : nullptr,
                 (M > 2) ? lw.conv_state_slots[1].bf16() : nullptr,
+                (M > 3) ? lw.conv_state_slots[2].bf16() : nullptr,
+                (M > 4) ? lw.conv_state_slots[3].bf16() : nullptr,
                 lw.A_log.bf16(),
                 lw.dt_bias.bf16(),
                 lw.linear_norm_w.bf16(),
@@ -5740,6 +5786,8 @@ private:
                 lw.ssm_state.bf16(),
                 (M > 1) ? lw.ssm_state_slots[0].bf16() : nullptr,
                 (M > 2) ? lw.ssm_state_slots[1].bf16() : nullptr,
+                (M > 3) ? lw.ssm_state_slots[2].bf16() : nullptr,
+                (M > 4) ? lw.ssm_state_slots[3].bf16() : nullptr,
                 16, 48, 128, M, main_stream_);
 
             // Output projection: [M, 6144] -> [M, 5120]
@@ -5805,7 +5853,7 @@ private:
     cudaGraph_t batch_graph_[9];
     cudaGraphExec_t batch_graph_exec_[9];
 
-    void forward_token_batch_qwen_device_body(int position, int M) {
+    void forward_token_batch_qwen_device_body(int position, int M, bool compute_logits = true) {
         int dim = cfg_.hidden_size;
         // 1. Embedding lookup for M tokens
         if (embed_weight_.dtype == "int4") {
@@ -5818,6 +5866,8 @@ private:
         for (int layer = 0; layer < cfg_.num_hidden_layers; layer++) {
             forward_layer_qwen_batch(layer, position, M);
         }
+
+        if (!compute_logits) return;
 
         // 3. Final norm
         rms_norm_one_centered_cuda_batched(buf_hidden_batch_.bf16(), buf_hidden_batch_.bf16(),
@@ -5855,7 +5905,14 @@ private:
 
     void init_batch_cuda_graphs() {
         if (cfg_.architecture != ModelArch::QWEN) return;
-        for (int M : {2, 3, 4, 5, 6, 7, 8}) {
+        std::vector<int> target_batch_sizes;
+        if (gpu_caps_.is_vram_constrained) {
+            // M=2..5 covers speculative draft depth K=1..4 while saving graph workspace VRAM on 16GB cards
+            target_batch_sizes = {2, 3, 4, 5};
+        } else {
+            target_batch_sizes = {2, 3, 4, 5, 6, 7, 8};
+        }
+        for (int M : target_batch_sizes) {
             LOG_INFO("Warming up and capturing Batched Target CUDA Graph (M=%d)...", M);
 
             std::vector<int32_t> dummy_toks(M, 0);
@@ -5910,8 +5967,8 @@ private:
 
     inline void commit_target_state_slot(int slot_idx) {
         if (slot_idx < 0 || slot_idx >= 8) return;
-        // DeltaNet SSM batch kernel currently saves slot 0 and slot 1. Slots >= 2 are not populated.
-        if (slot_idx >= 2) return;
+        // DeltaNet SSM batch kernel maintains intermediate rollback slots 0, 1, 2, and 3. Slots >= 4 are not populated.
+        if (slot_idx >= 4) return;
         if (target_ssm_pool_.data && target_ssm_slots_[slot_idx].data) {
             CUDA_CHECK(cudaMemcpyAsync(target_ssm_pool_.data, target_ssm_slots_[slot_idx].data, target_ssm_pool_.size_bytes, cudaMemcpyDeviceToDevice, main_stream_));
             CUDA_CHECK(cudaMemcpyAsync(target_conv_pool_.data, target_conv_slots_[slot_idx].data, target_conv_pool_.size_bytes, cudaMemcpyDeviceToDevice, main_stream_));

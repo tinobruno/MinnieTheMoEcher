@@ -870,6 +870,8 @@ void deltanet_linear_attention_decode_batch_cuda(
     __nv_bfloat16* out_conv_state,      // [10240, 4]
     __nv_bfloat16* slot_conv_0,
     __nv_bfloat16* slot_conv_1,
+    __nv_bfloat16* slot_conv_2,
+    __nv_bfloat16* slot_conv_3,
     const __nv_bfloat16* A_log,         // [48]
     const __nv_bfloat16* dt_bias,       // [48]
     const __nv_bfloat16* norm_w,        // [128]
@@ -877,6 +879,8 @@ void deltanet_linear_attention_decode_batch_cuda(
     __nv_bfloat16* out_ssm_state,       // [48, 128, 128] BF16
     __nv_bfloat16* slot_ssm_0,
     __nv_bfloat16* slot_ssm_1,
+    __nv_bfloat16* slot_ssm_2,
+    __nv_bfloat16* slot_ssm_3,
     int num_k_heads,
     int num_v_heads,
     int head_dim,

@@ -251,11 +251,40 @@ We designed and implemented two fused optimizations in [`src/cuda/activations.cu
 
 ---
 
+## Endeavour 10: Ampere-Gated Architecture, 4-Slot Speculative Rollback & KV Snapshot Slicing
+
+### Problems Addressed
+1. **Ampere (RTX 3090 / CC 8.6) Architecture Compatibility**:
+   - Newer architectures (Ada CC 8.9+, Hopper CC 9.0+, Blackwell CC 10.0+/12.0+) support hardware FP8 Tensor Cores and FP4 execution. Ampere GPUs (CC 8.0/8.6, such as RTX 3080/3090/A100) fail if native FP8 tensor core instructions or FP4 instructions are invoked without hardware capability detection.
+2. **VRAM Exhaustion on 16GB Cards (RTX 4060 Ti / 5060 Ti)**:
+   - DeepSeek/Qwen full pre-allocated KV caches were allocating maximum sequence context (32,768 tokens = 536.8 MB per layer $\times 2 = 1.07\text{ GB}$) during prefix snapshot cloning, threatening VRAM limits on 16GB cards and triggering PCIe thrashing.
+3. **SSM Rollback Depth Capped at $K=2$**:
+   - `deltanet_ssm_batch_kernel` and `deltanet_conv_batch_kernel` were previously hard-coded to save only 2 intermediate state slots (`slot_0` and `slot_1`), capping speculative draft depth at $K=2$ ($M=3$).
+4. **Intermediate Prefill Micro-Chunk LM Head Overhead**:
+   - During `prefill_prefix()`, evaluating 393 micro-chunks was running the 248k-vocab INT4 LM head on every intermediate chunk, reading 250 GB of unnecessary weight data from VRAM.
+
+### Architectural Solutions & Implementations
+1. **Dynamic Hardware Capability Gating (`GpuCapabilities`)**:
+   - Introduced `detect_gpu_capabilities(device_id)` inspecting CUDA compute capability:
+     - `is_ampere` ($8.0 \le \text{CC} < 8.9$), `is_ada_or_newer` ($\text{CC} \ge 8.9$), `is_blackwell_or_newer` ($\text{CC} \ge 10.0$).
+     - Hardware-gated FP8 Tensor Core and FP4 paths, falling back seamlessly to vectorized BF16 simulation on Ampere.
+     - VRAM constraint detector (`is_vram_constrained <= 16GB`) to cap graph workspace memory.
+2. **Active Prefix KV Cache Slicing (`active_gqa_bytes`)**:
+   - Sliced `snap_k_cache_gqa` and `snap_v_cache_gqa` during `snapshot_kv()` and `restore_kv()` to the exact active prefix token length:
+     $$\text{active\_gqa\_bytes} = \text{tokens.size()} \times N_{\text{kv}} \times d_{\text{head}} \times 1\text{ byte}$$
+   - Reduced snapshot VRAM from 1,073 MB down to 103 MB for a 3,145-token tool prompt, saving **970 MB VRAM** and eliminating 16GB card OOM risk.
+3. **4-Slot Intermediate DeltaNet Rollback ($M=5, K=4$)**:
+   - Upgraded `deltanet_conv_batch_kernel` and `deltanet_ssm_batch_kernel` to maintain 4 rollback slots: `slot_0` ($m=0$), `slot_1` ($m=1$), `slot_2` ($m=2$), and `slot_3` ($m=3$).
+   - Enabled adaptive $K=4$ ($M=5$) speculative drafting in `generate()` when inside tool calls (`<tool_call>`) or on high draft streaks (`draft_streak >= 3`), achieving up to **$M=5$ batched verification cycles**.
+4. **Bypass LM-Head Projection in Prefill Micro-Chunks**:
+   - Parameterized `forward_token_batch_qwen_device_body(position, M, bool compute_logits = true)`.
+   - Disabled final RMSNorm and 248k-vocab LM head GEMM across all intermediate prefill chunks, eliminating 250 GB of memory read bandwidth and writing 0 discarded logits.
+
+---
+
 ## Roadmap of Pending Optimizations
 
 1. **Tensor Core / MMA Attention for GQA Decode**:
    - Explore FP8 tensor core HGEMM / MMA instructions for QK dot products and score-value accumulation on long sequence tiles ($>8\text{k}$ tokens).
-2. **Expanded SSM Rollback Checkpoint Slots ($M \le 8$)**:
-   - Expand `target_ssm_pool_` rollback buffers in shared memory to allow higher speculative drafting depths ($K \ge 4$) on Qwen 3.8.
-3. **Zero-Copy Speculative KV Rollback**:
+2. **Zero-Copy Speculative KV Rollback**:
    - Maintain a hardware-tracked position pointer rather than overwriting rejected positions in VRAM.

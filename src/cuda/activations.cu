@@ -974,7 +974,6 @@ __global__ void precompute_freqs_kernel(
     float theta_extrap = (float)pos * powf(base, -((float)i) / (float)rope_dim);
     float freq_scale = 1.0f / factor;
     float theta = freq_scale * theta_extrap;
-    float mscale = 1.0f;
 
     if (original_seq_len > 0) {
         float denom = 2.0f * logf(base);
@@ -6560,6 +6559,8 @@ __global__ void deltanet_conv_batch_kernel(
     __nv_bfloat16* __restrict__ out_conv_state,
     __nv_bfloat16* __restrict__ slot_conv_0,
     __nv_bfloat16* __restrict__ slot_conv_1,
+    __nv_bfloat16* __restrict__ slot_conv_2,
+    __nv_bfloat16* __restrict__ slot_conv_3,
     int channels, int M)
 {
     int c = blockIdx.x * blockDim.x + threadIdx.x;
@@ -6595,6 +6596,18 @@ __global__ void deltanet_conv_batch_kernel(
             slot_cs[1] = __float2bfloat16(s1);
             slot_cs[2] = __float2bfloat16(s2);
             slot_cs[3] = __float2bfloat16(s3);
+        } else if (m == 2 && slot_conv_2) {
+            __nv_bfloat16* slot_cs = slot_conv_2 + (size_t)c * 4;
+            slot_cs[0] = __float2bfloat16(s0);
+            slot_cs[1] = __float2bfloat16(s1);
+            slot_cs[2] = __float2bfloat16(s2);
+            slot_cs[3] = __float2bfloat16(s3);
+        } else if (m == 3 && slot_conv_3) {
+            __nv_bfloat16* slot_cs = slot_conv_3 + (size_t)c * 4;
+            slot_cs[0] = __float2bfloat16(s0);
+            slot_cs[1] = __float2bfloat16(s1);
+            slot_cs[2] = __float2bfloat16(s2);
+            slot_cs[3] = __float2bfloat16(s3);
         }
 
         if (m == M - 1 && out_conv_state) {
@@ -6624,6 +6637,8 @@ __global__ void deltanet_ssm_batch_kernel(
     __nv_bfloat16* __restrict__ out_ssm_state,
     __nv_bfloat16* __restrict__ slot_ssm_0,
     __nv_bfloat16* __restrict__ slot_ssm_1,
+    __nv_bfloat16* __restrict__ slot_ssm_2,
+    __nv_bfloat16* __restrict__ slot_ssm_3,
     int num_k_heads,
     int num_v_heads,
     int head_dim,
@@ -6753,6 +6768,18 @@ __global__ void deltanet_ssm_batch_kernel(
             for (int r = 0; r < head_dim; r++) {
                 slot_state_h[r * head_dim + tid] = s_state[r][tid];
             }
+        } else if (m == 2 && slot_ssm_2) {
+            __nv_bfloat16* slot_state_h = slot_ssm_2 + (size_t)h * head_dim * head_dim;
+            #pragma unroll 4
+            for (int r = 0; r < head_dim; r++) {
+                slot_state_h[r * head_dim + tid] = s_state[r][tid];
+            }
+        } else if (m == 3 && slot_ssm_3) {
+            __nv_bfloat16* slot_state_h = slot_ssm_3 + (size_t)h * head_dim * head_dim;
+            #pragma unroll 4
+            for (int r = 0; r < head_dim; r++) {
+                slot_state_h[r * head_dim + tid] = s_state[r][tid];
+            }
         }
 
         // 4. Output RMSNorm + Z-gating
@@ -6794,6 +6821,8 @@ void deltanet_linear_attention_decode_batch_cuda(
     __nv_bfloat16* out_conv_state,
     __nv_bfloat16* slot_conv_0,
     __nv_bfloat16* slot_conv_1,
+    __nv_bfloat16* slot_conv_2,
+    __nv_bfloat16* slot_conv_3,
     const __nv_bfloat16* A_log,
     const __nv_bfloat16* dt_bias,
     const __nv_bfloat16* norm_w,
@@ -6801,6 +6830,8 @@ void deltanet_linear_attention_decode_batch_cuda(
     __nv_bfloat16* out_ssm_state,
     __nv_bfloat16* slot_ssm_0,
     __nv_bfloat16* slot_ssm_1,
+    __nv_bfloat16* slot_ssm_2,
+    __nv_bfloat16* slot_ssm_3,
     int num_k_heads,
     int num_v_heads,
     int head_dim,
@@ -6814,11 +6845,11 @@ void deltanet_linear_attention_decode_batch_cuda(
     __nv_bfloat16* conv_out = const_cast<__nv_bfloat16*>(in_qkv);
     deltanet_conv_batch_kernel<<<blocks, threads, 0, stream>>>(
         conv_out, in_qkv, conv1d_w, in_conv_state, out_conv_state,
-        slot_conv_0, slot_conv_1, channels, M);
+        slot_conv_0, slot_conv_1, slot_conv_2, slot_conv_3, channels, M);
 
     deltanet_ssm_batch_kernel<<<num_v_heads, 128, 0, stream>>>(
         out, conv_out, in_z, in_a, in_b, A_log, dt_bias, norm_w,
-        in_ssm_state, out_ssm_state, slot_ssm_0, slot_ssm_1,
+        in_ssm_state, out_ssm_state, slot_ssm_0, slot_ssm_1, slot_ssm_2, slot_ssm_3,
         num_k_heads, num_v_heads, head_dim, M);
 }
 
