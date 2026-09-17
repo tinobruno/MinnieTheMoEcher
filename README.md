@@ -67,29 +67,29 @@ Measured on **NVIDIA RTX PRO 6000 (Blackwell 96GB VRAM, Compute 12.0)**:
 
 ## Understanding Generation Speed & Context-Length Scaling
 
-Depending on the prompt context and active features, you may observe generation throughput between **~42 tok/s** and **~110 tok/s**. Understanding why generation can be slower in the current version:
+Depending on the prompt context and active features, you may observe generation throughput between **~68 tok/s** and **~112 tok/s**. Understanding generation performance across context regimes:
 
 ### 1. Raw Engine Speed vs. Agentic Tool Context
-* **Short Prompts / Chat Mode (No Tools, 20–50 prompt tokens)**: **98 – 110 tok/s**
+* **Short Prompts / Chat Mode (No Tools, 20–50 prompt tokens)**: **98 – 112 tok/s**
   * Speculative verification cycle time: **~18–20 ms / cycle**.
-  * With 70–75% MTP candidate acceptance, sustained throughput reaches **~100+ tok/s**.
-* **Agentic Web UI Mode with Tools Enabled (`tools: "default"`, 3,145+ tokens)**: **42 – 55 tok/s**
-  * Speculative verification cycle time: **~42–45 ms / cycle** (+22 ms per cycle).
-  * **Architectural Reason**: Qwen 3.8 27B is a hybrid architecture containing **48 Linear Attention (DeltaNet) layers** and **16 Full Grouped Query Attention (GQA) layers**.
+  * With 70–75% MTP candidate acceptance, sustained throughput reaches **~100–112 tok/s**.
+* **Agentic Web UI Mode with Tools Enabled (`tools: "default"`, 3,145+ tokens)**: **68 – 74 tok/s** *(previously ~44 tok/s before v2.08)*
+  * Speculative verification cycle time: **~25–27 ms / cycle** (down from 42.1 ms, a **35% reduction** in verify latency).
+  * **Architectural Details & Optimization**: Qwen 3.8 27B is a hybrid architecture containing **48 Linear Attention (DeltaNet) layers** and **16 Full Grouped Query Attention (GQA) layers**.
     * DeltaNet layers evaluate in $O(1)$ constant time regardless of context length using fast on-chip shared-memory recurrence (`deltanet_ssm_batch_kernel`).
-    * However, the 16 full GQA layers must compute attention over the entire sequence history for every speculative candidate token ($M=3$ candidates $\times$ 16 layers = 48 kernel calls per cycle).
+    * The 16 full GQA layers must compute attention over the entire sequence history for all speculative candidate tokens ($M$ candidates $\times$ 16 layers).
     * When the Web UI has **Agentic & Tools** enabled, full JSON schemas for 13 built-in/MCP tools are injected into the system prompt (**3,145 tokens**).
-    * In the current kernel implementation (`qwen_gqa_compute_attn_fp8_kernel`), attention over the FP8 KV cache iterates across all 3,145 tokens using sequential byte loads, adding ~22 ms of memory latency per cycle and bringing sustained throughput to ~44 tok/s.
+    * In **v2.08**, we fused candidate verification into a unified batched kernel (`qwen_gqa_decode_gated_fp8_batch_cuda`) and introduced **Shared-Memory Cooperative V Tiling** with 128-bit `uint4` vector loads (`alignas(16) uint8_t s_v_tile[32768]`). This eliminated global memory latency stalls in the inner accumulation loop and cut GQA attention time from 22.2 ms down to 8.4 ms.
 
 ### 2. Short-Response Startup & Early EOS Penalty
 * When prompting short queries (e.g. `"hello"` which generates ~34 tokens total):
   * Speculative decoding begins with $K=1$ before ramping up.
   * Hitting the `<|im_end|>` (EOS) token rejects the draft candidate on the final cycle.
-  * For a 34-token burst, initial ramp-up and final teardown account for ~20% of the total wall-clock time. Sustained long-form generation (300+ tokens) achieves significantly higher effective throughput.
+  * For a 34-token burst, initial ramp-up and final teardown account for ~15% of the total wall-clock time. Sustained long-form generation (300+ tokens) achieves significantly higher effective throughput.
 
 ### 3. How to Maximize Generation Speed
-* **To run at full 100+ tok/s**: In the Web UI, open the **Agentic & Tools** settings tab and toggle off Web/Local tools (or send `"tools": []` via API). The prompt length drops from 3,156 tokens down to ~20 tokens, immediately unlocking full **98–110 tok/s** speed.
-* **Prefill Speed**: While decoding scales with active KV cache size, prefix evaluation is instantaneous (**0 ms prefill latency**) because the 3,145-token tooling prefix is pre-warmed and stored in a **Pinned System KV Cache snapshot** at startup.
+* **To run at full 100+ tok/s**: In the Web UI, open the **Agentic & Tools** settings tab and toggle off Web/Local tools (or send `"tools": []` via API). The prompt length drops from 3,156 tokens down to ~20 tokens, immediately unlocking full **100–112 tok/s** speed.
+* **Prefill Speed**: While decoding scales with active KV cache size, prefix evaluation is instantaneous (**0 ms prefill latency**) because the 3,145-token tooling prefix is pre-warmed and stored in a **Pinned System KV Cache snapshot** at startup (prefilled at **~181 tok/s**).
 
 > 📖 **Engineering & Research Log**: For deep technical breakdowns, mathematical analyses, and root-cause post-mortems of every bug and optimization, see [DISCOVERIES_AND_ENDEAVOURS_LOG.md](DISCOVERIES_AND_ENDEAVOURS_LOG.md).
 
@@ -296,6 +296,12 @@ curl -s http://localhost:8001/v1/chat/completions \
 ---
 
 ## Changelog
+
+### v2.08 — GQA Attention Vectorization & Batched Verification (~72 tok/s Tooling Context)
+- **Shared-Memory Cooperative V-Cache Tiling (`s_v_tile`)**: Refactored the GQA attention accumulation loop in `qwen_gqa_compute_attn_fp8_batch_kernel` using 128-bit (`uint4`) cooperative vector loads into `__shared__ alignas(16) uint8_t s_v_tile[32768]`, eliminating sequential global memory latency stalls in the inner accumulation loop.
+- **Batched Multi-Candidate GQA Execution**: Fused candidate KV writes and query attention verification across all $M$ speculative candidates into 2D launch grids `dim3(heads, M)`, cutting kernel launches from 96 down to 32 per verify cycle.
+- **+63% Speedup on 3,145-Token Tool Prompts**: Sliced speculative verification cycle latency from **42.14 ms / cycle down to 26.88 ms / cycle** (-36%), boosting sustained decoding speed on tool prompts from **~44 tok/s to 68–74 tok/s** on NVIDIA RTX PRO 6000 Blackwell.
+- **Accelerated Startup Prefill**: Pre-warming the 3,145-token tooling KV prefix snapshot improved from 26.28s (119.7 tok/s) to **17.38s (180.97 tok/s)** (+51.2% faster prefill).
 
 ### v2.07 — Qwen 3.8 27B MTP Speculative Decoding Engine (~98 tok/s Milestone)
 - **Ultra-Fast MTP Self-Drafting Speculative Engine**: Integrated the target model's native Multi-Token Prediction (MTP) layer for self-speculation, achieving **97.94 tok/s** on RTX PRO 6000 Blackwell (+78% over autoregressive baseline, +133% over legacy neural drafter).

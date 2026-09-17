@@ -794,6 +794,26 @@ void qwen_gqa_decode_gated_fp8_cuda(
     float eps = 1e-6f,
     cudaStream_t stream = 0);
 
+void qwen_gqa_decode_gated_fp8_batch_cuda(
+    __nv_bfloat16* out,             // [M, n_q_heads * head_dim]
+    const __nv_bfloat16* q_and_gate,// [M, 2 * n_q_heads * head_dim]
+    __nv_bfloat16* k,               // [M, n_kv_heads * head_dim]
+    const __nv_bfloat16* v,         // [M, n_kv_heads * head_dim]
+    const __nv_bfloat16* q_norm_w,  // [head_dim]
+    const __nv_bfloat16* k_norm_w,  // [head_dim]
+    uint8_t* k_cache,               // [max_seq_len, n_kv_heads, head_dim] FP8
+    uint8_t* v_cache,               // [max_seq_len, n_kv_heads, head_dim] FP8
+    int n_q_heads,
+    int n_kv_heads,
+    int head_dim,
+    const int32_t* d_pos,
+    int pos_scalar,
+    int M,
+    int max_seq_len,
+    float rope_theta = 1000000.0f,
+    float eps = 1e-6f,
+    cudaStream_t stream = 0);
+
 // ── Qwen 3.8 Gated DeltaNet Linear Attention Decode ───────────────────────────
 void deltanet_linear_attention_decode_cuda(
     __nv_bfloat16* out,             // [6144] (48 heads * 128)

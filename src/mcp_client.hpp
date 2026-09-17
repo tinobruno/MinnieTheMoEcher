@@ -13,6 +13,7 @@
 #include <atomic>
 #include <cstring>
 #include <nlohmann/json.hpp>
+#include "version.hpp"
 
 #if !defined(_WIN32) && !defined(_WIN64)
 #include <unistd.h>
@@ -627,7 +628,7 @@ private:
             }},
             {"clientInfo", {
                 {"name", "moecher"},
-                {"version", "1.0.0"}
+                {"version", moecher::VERSION}
             }}
         };
 
@@ -656,7 +657,7 @@ private:
             }},
             {"clientInfo", {
                 {"name", "moecher"},
-                {"version", "1.0.0"}
+                {"version", moecher::VERSION}
             }}
         };
 
