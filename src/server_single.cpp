@@ -7885,45 +7885,113 @@ static json resolve_canonical_tools(const json& tools_input) {
     return json::array();
 }
 
+static std::string build_dynamic_tools_prompt(const json& resolved_tools) {
+    if (!resolved_tools.is_array() || resolved_tools.empty()) {
+        return "";
+    }
+
+    std::unordered_set<std::string> active_names;
+    bool has_mcp = false;
+    for (const auto& item : resolved_tools) {
+        if (item.contains("function") && item["function"].contains("name")) {
+            std::string name = item["function"]["name"].get<std::string>();
+            active_names.insert(name);
+            if (name.rfind("mcp__", 0) == 0 || name.rfind("tinobruno-", 0) == 0) {
+                has_mcp = true;
+            }
+        }
+    }
+
+    std::string prompt =
+        "\n\n# Tools\n\n"
+        "You have access to a set of built-in tools to inspect files, make precise code modifications, run commands, and search the web.\n"
+        "You are provided with function signatures within <tools></tools> XML tags:\n"
+        "<tools>\n" + resolved_tools.dump(2) + "\n</tools>\n\n"
+        "For each function call, return a json object with function name and arguments within <tool_call></tool_call> XML tags:\n"
+        "<tool_call>\n"
+        "{\"name\": \"<function-name>\", \"arguments\": <args-json-object>}\n"
+        "</tool_call>\n\n"
+        "## Tool Usage Instructions:\n";
+
+    if (active_names.count("web_search") || active_names.count("google_search")) {
+        std::string search_tool = active_names.count("web_search") ? "web_search" : "google_search";
+        prompt += "- CRITICAL RULE: When the user asks to search (e.g. 'search <query>', 'who is <person>', 'what is <topic>', search Google, look up facts, recent news, people, documentation, code, or websites), you MUST immediately invoke the `" + search_tool + "` tool.\n";
+    }
+
+    if (active_names.count("youtube_search")) {
+        prompt += "- CRITICAL DISAMBIGUATION: ONLY invoke `youtube_search` when the user EXPLICITLY asks to play, watch, or listen to media, or explicitly asks for a video/song (e.g. 'play ...', 'listen to ...', 'watch ...', 'youtube ...', 'song ...', 'music video ...'). NEVER invoke `youtube_search` for queries starting with 'search' or seeking information about people/topics even if earlier turns were about music.\n";
+    }
+
+    if (active_names.count("fetch_url")) {
+        prompt += "- When the user provides a specific URL or asks to inspect, fetch, or browse a website, invoke the `fetch_url` tool.\n";
+    }
+
+    std::vector<std::string> file_tools;
+    if (active_names.count("read_file")) file_tools.push_back("`read_file`");
+    if (active_names.count("write_file")) file_tools.push_back("`write_file`");
+    if (active_names.count("edit_file")) file_tools.push_back("`edit_file`");
+    if (!file_tools.empty()) {
+        std::string list_str;
+        for (size_t i = 0; i < file_tools.size(); i++) {
+            if (i > 0) list_str += (i == file_tools.size() - 1) ? ", or " : ", ";
+            list_str += file_tools[i];
+        }
+        prompt += "- When the user asks to read, write, or edit local files, invoke " + list_str + ".\n";
+    }
+
+    if (active_names.count("execute_command")) {
+        prompt += "- When the user asks to run terminal commands or inspect system state, invoke `execute_command`.\n";
+    }
+
+    if (has_mcp) {
+        prompt += "- You also have access to external Model Context Protocol (MCP) tools for specialized integrations. Invoke them with standard <tool_call> tags when relevant.\n";
+    }
+
+    prompt += "- For simple greetings (e.g. 'hello', 'hi'), answer conversationally without calling tools.\n";
+
+    std::string example_tool = "read_file";
+    std::string example_args = "{\"path\": \"src/main.cpp\"}";
+    if (active_names.count("web_search")) {
+        example_tool = "web_search";
+        example_args = "{\"query\": \"latest SpaceX rocket launch\"}";
+    } else if (active_names.count("execute_command")) {
+        example_tool = "execute_command";
+        example_args = "{\"command\": \"ls -la\"}";
+    }
+    prompt += "- Example tool call:\n"
+              "<tool_call>\n"
+              "{\"name\": \"" + example_tool + "\", \"arguments\": " + example_args + "}\n"
+              "</tool_call>\n"
+              "When you emit a <tool_call>, the system will execute it and return the results in a <tool_response> block.\n";
+
+    if (active_names.count("youtube_search")) {
+        prompt +=
+            "\n## Media Playback & Web Preview Integration:\n"
+            "You are integrated with an interactive client-side HTML Preview Panel that displays web pages and plays YouTube videos with autoplay.\n"
+            "- When the user asks to play music, a song, or a video (e.g. 'play ...', 'listen to ...', 'watch ...'):\n"
+            "  1. Invoke the `youtube_search` tool directly (e.g. query='<song or artist name>').\n"
+            "  2. Direct YouTube search immediately returns the video and automatically opens the player in the user's preview panel with autoplay! Inform the user that the song/video is now playing in the preview panel.\n"
+            "  3. CRITICAL: Once the video is found, DO NOT invoke `fetch_url` or any other tool on YouTube URLs or watch pages. The video is already rendered and playing in the frontend preview panel.\n";
+        if (active_names.count("web_search")) {
+            prompt += "  4. If `youtube_search` is not available, invoke `web_search` as a fallback.\n";
+        }
+    }
+
+    return prompt;
+}
+
+static std::string g_base_system_prompt = "You are a helpful assistant";
+static std::string g_current_system_prompt = "";
+static json g_current_active_tools = json::array();
+
 static std::vector<int> apply_chat_template(const json& messages, const BPETokenizer& tok, bool enable_thinking = true, const std::string& reasoning_effort = "high", const json& tools = json()) {
     json resolved_tools = tools;
     if (!resolved_tools.empty()) {
         resolved_tools = resolve_canonical_tools(resolved_tools);
     }
     bool has_tools = (!resolved_tools.empty() && resolved_tools.is_array());
-    std::string tools_system_prompt;
-    if (has_tools) {
-        tools_system_prompt =
-            "\n\n# Tools\n\n"
-            "You have access to a set of built-in tools to inspect files, make precise code modifications, run commands, and search the web.\n"
-            "You are provided with function signatures within <tools></tools> XML tags:\n"
-            "<tools>\n" + resolved_tools.dump(2) + "\n</tools>\n\n"
-            "For each function call, return a json object with function name and arguments within <tool_call></tool_call> XML tags:\n"
-            "<tool_call>\n"
-            "{\"name\": \"<function-name>\", \"arguments\": <args-json-object>}\n"
-            "</tool_call>\n\n"
-            "## Tool Usage Instructions:\n"
-            "- CRITICAL RULE: When the user asks to search (e.g. 'search <query>', 'who is <person>', 'what is <topic>', search Google, look up facts, recent news, people, documentation, code, or websites), you MUST immediately invoke the `web_search` tool.\n"
-            "- CRITICAL DISAMBIGUATION: ONLY invoke `youtube_search` when the user EXPLICITLY asks to play, watch, or listen to media, or explicitly asks for a video/song (e.g. 'play ...', 'listen to ...', 'watch ...', 'youtube ...', 'song ...', 'music video ...'). NEVER invoke `youtube_search` for queries starting with 'search' or seeking information about people/topics even if earlier turns were about music.\n"
-            "- When the user provides a specific URL or asks to inspect, fetch, or browse a website, invoke the `fetch_url` tool.\n"
-            "- When the user asks to read, write, or edit local files, invoke `read_file`, `write_file`, or `edit_file`.\n"
-            "- When the user asks to run terminal commands or inspect system state, invoke `execute_command`.\n"
-            "- For simple greetings (e.g. 'hello', 'hi'), answer conversationally without calling tools.\n"
-            "- Example tool call:\n"
-            "<tool_call>\n"
-            "{\"name\": \"web_search\", \"arguments\": {\"query\": \"latest SpaceX rocket launch\"}}\n"
-            "</tool_call>\n"
-            "When you emit a <tool_call>, the system will execute it and return the results in a <tool_response> block.\n"
-            "\n"
-            "## Media Playback & Web Preview Integration:\n"
-            "You are integrated with an interactive client-side HTML Preview Panel that displays web pages and plays YouTube videos with autoplay.\n"
-            "- When the user asks to play music, a song, or a video (e.g. 'play ...', 'listen to ...', 'watch ...'):\n"
-            "  1. Invoke the `youtube_search` tool directly (e.g. query='<song or artist name>').\n"
-            "  2. Direct YouTube search immediately returns the video and automatically opens the player in the user's preview panel with autoplay! Inform the user that the song/video is now playing in the preview panel.\n"
-            "  3. CRITICAL: Once the video is found, DO NOT invoke `fetch_url` or any other tool on YouTube URLs or watch pages. The video is already rendered and playing in the frontend preview panel.\n"
-            "  4. If `youtube_search` is not available, invoke `web_search` as a fallback.\n"
-            "- For any query that says 'search ...' or asks who/what something is, ALWAYS use `web_search`.\n";
-    }
+    std::string tools_system_prompt = has_tools ? build_dynamic_tools_prompt(resolved_tools) : "";
+    has_tools = !tools_system_prompt.empty();
 
     int IM_START = tok.get_token_id("<|im_start|>");
     int IM_END = tok.get_token_id("<|im_end|>");
@@ -7948,7 +8016,9 @@ static std::vector<int> apply_chat_template(const json& messages, const BPEToken
             std::string content = messages[i].value("content", "");
 
             if (role == "system" && i == 0 && has_tools) {
-                content += tools_system_prompt;
+                if (content.find("<tools>") == std::string::npos && content.find("# Tools") == std::string::npos) {
+                    content += tools_system_prompt;
+                }
             }
 
             if (role == "tool" || role == "function") {
@@ -8050,7 +8120,9 @@ static std::vector<int> apply_chat_template(const json& messages, const BPEToken
 
         if (role == "system") {
             if (i == 0 && has_tools) {
-                content += tools_system_prompt;
+                if (content.find("<tools>") == std::string::npos && content.find("# Tools") == std::string::npos) {
+                    content += tools_system_prompt;
+                }
             }
             auto enc = tok.encode(content);
             result.insert(result.end(), enc.begin(), enc.end());
@@ -8835,6 +8907,69 @@ struct EngineBusyGuard {
 
 static int g_request_counter = 0;  // for unique request IDs
 static json s_last_conv_messages = json::array();
+
+static void rebuild_system_prefix(
+    MoecherEngine& engine,
+    const std::string& base_prompt,
+    const json& active_tools,
+    const std::string& custom_full_prompt = "")
+{
+    std::lock_guard<std::mutex> lock(g_engine_mutex);
+
+    // Invalidate conversation-level continuation snapshot so next query doesn't reuse stale prompt
+    engine.turn_kv_snapshot_.valid = false;
+    s_last_conv_messages.clear();
+
+    json resolved_tools = active_tools;
+    if (!resolved_tools.empty()) {
+        resolved_tools = resolve_canonical_tools(resolved_tools);
+    }
+
+    std::string full_prompt_text;
+    if (!custom_full_prompt.empty()) {
+        full_prompt_text = custom_full_prompt;
+    } else {
+        full_prompt_text = base_prompt + build_dynamic_tools_prompt(resolved_tools);
+    }
+
+    g_base_system_prompt = base_prompt;
+    g_current_system_prompt = full_prompt_text;
+    g_current_active_tools = resolved_tools;
+
+    json default_messages = json::array({
+        {{"role", "system"}, {"content", full_prompt_text}},
+        {{"role", "user"}, {"content", ""}}
+    });
+
+    std::vector<int> prompt = apply_chat_template(default_messages, engine.tokenizer_, true, "high", resolved_tools);
+
+    int user_start = (engine.cfg_.architecture == ModelArch::QWEN)
+                         ? engine.tokenizer_.get_token_id("<|im_start|>")
+                         : engine.tokenizer_.get_token_id("<｜User｜>");
+    if (user_start < 0) {
+        user_start = (engine.cfg_.architecture == ModelArch::QWEN) ? 151644 : 128803;
+    }
+    size_t sys_len = prompt.size();
+    for (size_t i = 1; i < prompt.size(); i++) {
+        if (prompt[i] == user_start) {
+            sys_len = i;
+            break;
+        }
+    }
+    if (sys_len > 0) {
+        std::vector<int> sys_tokens(prompt.begin(), prompt.begin() + sys_len);
+        LOG_INFO("Rebuilding System KV Cache snapshot (%zu tokens, %zu active tools)...",
+                 sys_tokens.size(), resolved_tools.size());
+        engine.reset_all_kv_caches();
+        engine.prefill_prefix(sys_tokens);
+        engine.snapshot_system_kv(sys_tokens);
+        LOG_INFO("System KV Cache snapshot pinned successfully (%zu tokens).", sys_tokens.size());
+    } else {
+        engine.reset_all_kv_caches();
+        engine.system_kv_snapshot_.valid = false;
+        LOG_INFO("System KV Cache snapshot cleared.");
+    }
+}
 
 static std::vector<int> build_continuation_prompt(
     const MoecherEngine& engine,
@@ -10211,6 +10346,62 @@ static void run_server(MoecherEngine& engine, int port, int default_thinking_bud
         res.status = 204;
     });
 
+    // ── System Prompt & Tool Configuration Endpoints ────────────────────────
+    svr.Get("/api/system/prompt", [&engine](const httplib::Request&, httplib::Response& res) {
+        res.set_header("Access-Control-Allow-Origin", "*");
+        json body = {
+            {"status", "ok"},
+            {"base_prompt", g_base_system_prompt},
+            {"system_prompt", g_current_system_prompt},
+            {"active_tools", g_current_active_tools},
+            {"tokens_count", engine.system_kv_snapshot_.valid ? engine.system_kv_snapshot_.tokens.size() : 0}
+        };
+        res.set_content(body.dump(), "application/json");
+    });
+
+    svr.Options("/api/system/prompt", [](const httplib::Request&, httplib::Response& res) {
+        res.set_header("Access-Control-Allow-Origin", "*");
+        res.set_header("Access-Control-Allow-Methods", "GET, POST, OPTIONS");
+        res.set_header("Access-Control-Allow-Headers", "*");
+        res.status = 204;
+    });
+
+    svr.Post("/api/system/configure", [&engine](const httplib::Request& req, httplib::Response& res) {
+        res.set_header("Access-Control-Allow-Origin", "*");
+        try {
+            json j = json::parse(req.body);
+            std::string base_prompt = j.value("base_prompt", g_base_system_prompt);
+            std::string custom_full_prompt = j.value("system_prompt", j.value("custom_system_prompt", ""));
+
+            json active_tools = g_current_active_tools;
+            if (j.contains("tools")) {
+                active_tools = j["tools"];
+            }
+
+            rebuild_system_prefix(engine, base_prompt, active_tools, custom_full_prompt);
+
+            json body = {
+                {"status", "ok"},
+                {"base_prompt", g_base_system_prompt},
+                {"system_prompt", g_current_system_prompt},
+                {"active_tools", g_current_active_tools},
+                {"tokens_count", engine.system_kv_snapshot_.valid ? engine.system_kv_snapshot_.tokens.size() : 0}
+            };
+            res.set_content(body.dump(), "application/json");
+        } catch (const std::exception& e) {
+            json err = {{"status", "error"}, {"message", e.what()}};
+            res.status = 400;
+            res.set_content(err.dump(), "application/json");
+        }
+    });
+
+    svr.Options("/api/system/configure", [](const httplib::Request&, httplib::Response& res) {
+        res.set_header("Access-Control-Allow-Origin", "*");
+        res.set_header("Access-Control-Allow-Methods", "GET, POST, OPTIONS");
+        res.set_header("Access-Control-Allow-Headers", "*");
+        res.status = 204;
+    });
+
     svr.Get("/v1/workspace", [](const httplib::Request&, httplib::Response& res) {
         json info = {
             {"workspace_directory", moecher::tooling::get_workspace_directory()},
@@ -10580,15 +10771,30 @@ static void run_server(MoecherEngine& engine, int port, int default_thinking_bud
 
             json tools = json::array();
             if (g_enable_tools) {
-                if (request.contains("tools") && !request["tools"].empty()) {
-                    tools = resolve_canonical_tools(request["tools"]);
-                } else if (request.contains("enable_tools") && request["enable_tools"].is_boolean() && request["enable_tools"].get<bool>()) {
-                    tools = resolve_canonical_tools("default");
-                }
-                // Append active MCP tools
-                json mcp_tools = moecher::mcp::MCPManager::instance().get_openai_tools_schema();
-                for (const auto& mt : mcp_tools) {
-                    tools.push_back(mt);
+                if (request.contains("tools")) {
+                    if (request["tools"].is_array()) {
+                        tools = resolve_canonical_tools(request["tools"]);
+                    } else if (request["tools"].is_string()) {
+                        tools = resolve_canonical_tools(request["tools"]);
+                    }
+                    // If the request explicitly passed an empty array "tools": [], honor it (user disabled all tools)
+                    if (!request["tools"].is_array() || !request["tools"].empty()) {
+                        json mcp_tools = moecher::mcp::MCPManager::instance().get_openai_tools_schema();
+                        for (const auto& mt : mcp_tools) {
+                            tools.push_back(mt);
+                        }
+                    }
+                } else if (request.contains("enable_tools") && request["enable_tools"].is_boolean()) {
+                    if (request["enable_tools"].get<bool>()) {
+                        tools = resolve_canonical_tools("default");
+                        json mcp_tools = moecher::mcp::MCPManager::instance().get_openai_tools_schema();
+                        for (const auto& mt : mcp_tools) {
+                            tools.push_back(mt);
+                        }
+                    }
+                } else {
+                    // Fallback to active tools configured via /api/system/configure
+                    tools = g_current_active_tools;
                 }
             }
 
@@ -12012,36 +12218,12 @@ int main(int argc, char** argv) {
 
     // Pre-warm default system prompt and tooling into KV Cache for 0ms initial prefill latency
     if (g_enable_tools) {
-        json default_messages = json::array({
-            {{"role", "system"}, {"content", "You are a helpful assistant"}},
-            {{"role", "user"}, {"content", ""}}
-        });
         json default_tools = resolve_canonical_tools("default");
         json mcp_tools = mcp_mgr.get_openai_tools_schema();
         for (const auto& mt : mcp_tools) {
             default_tools.push_back(mt);
         }
-        std::vector<int> prompt = apply_chat_template(default_messages, engine.tokenizer_, true, "high", default_tools);
-        int user_start = (engine.cfg_.architecture == ModelArch::QWEN)
-                             ? engine.tokenizer_.get_token_id("<|im_start|>")
-                             : engine.tokenizer_.get_token_id("<｜User｜>");
-        if (user_start < 0) {
-            user_start = (engine.cfg_.architecture == ModelArch::QWEN) ? 151644 : 128803;
-        }
-        size_t sys_len = prompt.size();
-        for (size_t i = 1; i < prompt.size(); i++) {
-            if (prompt[i] == user_start) {
-                sys_len = i;
-                break;
-            }
-        }
-        if (sys_len > 0) {
-            std::vector<int> sys_tokens(prompt.begin(), prompt.begin() + sys_len);
-            LOG_INFO("Pre-warming startup KV Cache with default tooling system prompt (%zu tokens, %zu tools)...",
-                     sys_tokens.size(), default_tools.size());
-            engine.prefill_prefix(sys_tokens);
-            LOG_INFO("Startup KV Cache pre-warmed successfully (0ms latency ready for incoming queries).");
-        }
+        rebuild_system_prefix(engine, g_base_system_prompt, default_tools);
     }
 
     run_server(engine, port, default_thinking_budget, proxy_port, enable_forward_proxy, enable_system_proxy);

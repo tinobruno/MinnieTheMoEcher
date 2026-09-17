@@ -2101,6 +2101,7 @@ function initAgenticSettingsUI() {
                 if (toolCheckboxes[t]) toolCheckboxes[t].checked = val;
             });
             saveAgenticSettings();
+            syncToolSettingsWithBackend();
         });
     }
 
@@ -2112,6 +2113,7 @@ function initAgenticSettingsUI() {
                 if (toolCheckboxes[t]) toolCheckboxes[t].checked = val;
             });
             saveAgenticSettings();
+            syncToolSettingsWithBackend();
         });
     }
 
@@ -2122,9 +2124,16 @@ function initAgenticSettingsUI() {
                 agenticSettings.tools[toolName] = e.target.checked;
                 syncMasterCheckboxes();
                 saveAgenticSettings();
+                syncToolSettingsWithBackend();
             });
         }
     });
+
+    if (webRetrievalEnabled) {
+        webRetrievalEnabled.addEventListener('change', () => {
+            syncToolSettingsWithBackend();
+        });
+    }
 
     syncMasterCheckboxes();
 
@@ -2258,6 +2267,128 @@ function getActiveToolsPayload() {
     });
 
     return activeList;
+}
+
+// ============================================================================
+// System Prompt & Dynamic Tooling Prefix Synchronization
+// ============================================================================
+
+function setSystemPromptSyncStatus(status, text) {
+    const el = document.getElementById('system-prompt-sync-status');
+    if (!el) return;
+    if (status === 'syncing') {
+        el.innerHTML = `<span style="display: inline-block; width: 6px; height: 6px; border-radius: 50%; background: #eab308;"></span> ${text || 'Updating engine prefix...'}`;
+    } else if (status === 'synced') {
+        el.innerHTML = `<span style="display: inline-block; width: 6px; height: 6px; border-radius: 50%; background: #22c55e;"></span> ${text || 'Synced with engine'}`;
+    } else if (status === 'error') {
+        el.innerHTML = `<span style="display: inline-block; width: 6px; height: 6px; border-radius: 50%; background: #ef4444;"></span> ${text || 'Sync error'}`;
+    } else {
+        el.innerHTML = `<span style="display: inline-block; width: 6px; height: 6px; border-radius: 50%; background: #3b82f6;"></span> ${text || status}`;
+    }
+}
+
+let isSyncingSystemPrompt = false;
+let systemPromptDebounceTimer = null;
+let toolSyncDebounceTimer = null;
+
+async function fetchBackendSystemPrompt() {
+    try {
+        setSystemPromptSyncStatus('syncing', 'Fetching engine prompt...');
+        const res = await fetch(`${getApiBase()}/api/system/prompt`);
+        if (!res.ok) throw new Error(`HTTP ${res.status}`);
+        const data = await res.json();
+        if (data && data.system_prompt !== undefined) {
+            if (systemPromptInput) {
+                systemPromptInput.value = data.system_prompt;
+            }
+            const count = (data.tokens_count !== undefined) ? data.tokens_count : data.num_tokens;
+            const tokStr = count ? ` (${count} tokens)` : '';
+            setSystemPromptSyncStatus('synced', `Synced with engine${tokStr}`);
+        }
+    } catch (e) {
+        console.warn('Failed to fetch backend system prompt:', e);
+        setSystemPromptSyncStatus('error', 'Sync offline');
+    }
+}
+
+function syncToolSettingsWithBackend() {
+    setSystemPromptSyncStatus('syncing', 'Updating prefix & tools...');
+    if (toolSyncDebounceTimer) {
+        clearTimeout(toolSyncDebounceTimer);
+    }
+    toolSyncDebounceTimer = setTimeout(async () => {
+        try {
+            isSyncingSystemPrompt = true;
+            const activeTools = getActiveToolsPayload();
+            const res = await fetch(`${getApiBase()}/api/system/configure`, {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify({
+                    tools: activeTools
+                })
+            });
+            if (!res.ok) throw new Error(`HTTP ${res.status}`);
+            const data = await res.json();
+            if (data && data.system_prompt !== undefined) {
+                if (systemPromptInput) {
+                    systemPromptInput.value = data.system_prompt;
+                }
+            }
+            const count = (data.tokens_count !== undefined) ? data.tokens_count : data.num_tokens;
+            const tokStr = count ? ` (${count} tokens)` : '';
+            setSystemPromptSyncStatus('synced', `Synced with engine${tokStr}`);
+        } catch (err) {
+            console.warn('Failed to sync tools with backend:', err);
+            setSystemPromptSyncStatus('error', 'Sync failed');
+        } finally {
+            isSyncingSystemPrompt = false;
+        }
+    }, 150);
+}
+
+function handleSystemPromptInput() {
+    if (isSyncingSystemPrompt) return;
+    setSystemPromptSyncStatus('syncing', 'Syncing custom prompt...');
+    if (systemPromptDebounceTimer) {
+        clearTimeout(systemPromptDebounceTimer);
+    }
+    systemPromptDebounceTimer = setTimeout(async () => {
+        try {
+            const promptVal = systemPromptInput ? systemPromptInput.value : '';
+            const activeTools = getActiveToolsPayload();
+            const res = await fetch(`${getApiBase()}/api/system/configure`, {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify({
+                    system_prompt: promptVal,
+                    tools: activeTools
+                })
+            });
+            if (!res.ok) throw new Error(`HTTP ${res.status}`);
+            const data = await res.json();
+            const count = (data.tokens_count !== undefined) ? data.tokens_count : data.num_tokens;
+            const tokStr = count ? ` (${count} tokens)` : '';
+            setSystemPromptSyncStatus('synced', `Synced with engine${tokStr}`);
+        } catch (err) {
+            console.warn('Failed to sync custom system prompt:', err);
+            setSystemPromptSyncStatus('error', 'Sync failed');
+        }
+    }, 500);
+}
+
+async function initSystemPromptSync() {
+    if (systemPromptInput) {
+        systemPromptInput.addEventListener('input', handleSystemPromptInput);
+    }
+    const activeTools = getActiveToolsPayload();
+    const allTools = ['web_search', 'youtube_search', 'google_search', 'fetch_url', 'read_file', 'write_file', 'edit_file', 'execute_command'];
+    const hasCustomToolConfig = (activeTools.length !== allTools.length);
+
+    if (hasCustomToolConfig) {
+        syncToolSettingsWithBackend();
+    } else {
+        await fetchBackendSystemPrompt();
+    }
 }
 
 // Authorization Modal Prompt
@@ -3246,14 +3377,7 @@ async function sendMessage() {
                 }
             };
 
-            if (activeTools.length > 0) {
-                const allTools = ['web_search', 'youtube_search', 'google_search', 'fetch_url', 'read_file', 'write_file', 'edit_file', 'execute_command'];
-                if (activeTools.length === allTools.length && activeTools.every((t, i) => t === allTools[i])) {
-                    payload.tools = "default";
-                } else {
-                    payload.tools = activeTools;
-                }
-            }
+            payload.tools = activeTools;
 
             let roundReasoning = "";
             let roundContent = "";
@@ -5263,6 +5387,7 @@ document.addEventListener('DOMContentLoaded', () => {
     initPreviewPanel();
     initExpertProfileUI();
     initAgenticSettingsUI();
+    initSystemPromptSync();
     initModelSelector();
     initMCPUI();
 });
