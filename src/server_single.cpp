@@ -5748,20 +5748,21 @@ private:
             matmul_proj_batch(buf_gate_batch_, buf_hidden2_batch_, lw.w_k, lw.w_k_scale, n_kv_heads * head_dim, dim);
             matmul_proj_batch(buf_up_batch_, buf_hidden2_batch_, lw.w_v, lw.w_v_scale, n_kv_heads * head_dim, dim);
 
-            for (int m = 0; m < M; m++) {
-                qwen_gqa_decode_gated_fp8_cuda(
-                    buf_attn_out_batch_.bf16() + m * (n_q_heads * head_dim),
-                    buf_q_batch_.bf16() + m * (2 * n_q_heads * head_dim),
-                    buf_gate_batch_.bf16() + m * (n_kv_heads * head_dim),
-                    buf_up_batch_.bf16() + m * (n_kv_heads * head_dim),
-                    lw.gqa_q_norm_w.bf16(),
-                    lw.gqa_k_norm_w.bf16(),
-                    lw.k_cache_gqa.u8(),
-                    lw.v_cache_gqa.u8(),
-                    n_q_heads, n_kv_heads, head_dim,
-                    buf_input_pos_batch_.data ? (buf_input_pos_batch_.i32() + m) : nullptr, position + m, cfg_.max_seq_len,
-                    cfg_.rope_theta, cfg_.rms_norm_eps, main_stream_);
-            }
+            qwen_gqa_decode_gated_fp8_batch_cuda(
+                buf_attn_out_batch_.bf16(),
+                buf_q_batch_.bf16(),
+                buf_gate_batch_.bf16(),
+                buf_up_batch_.bf16(),
+                lw.gqa_q_norm_w.bf16(),
+                lw.gqa_k_norm_w.bf16(),
+                lw.k_cache_gqa.u8(),
+                lw.v_cache_gqa.u8(),
+                n_q_heads, n_kv_heads, head_dim,
+                buf_input_pos_batch_.data ? buf_input_pos_batch_.i32() : nullptr,
+                position,
+                M,
+                cfg_.max_seq_len,
+                cfg_.rope_theta, cfg_.rms_norm_eps, main_stream_);
 
             matmul_proj_batch(buf_hidden2_batch_, buf_attn_out_batch_, lw.w_o, lw.w_o_scale, dim, n_q_heads * head_dim);
         }

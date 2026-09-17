@@ -5955,7 +5955,7 @@ void qwen_gqa_decode_gated_cuda(
 //  Qwen 3.8 FP8 Quantized KV Cache GQA Attention Kernels (50% Bandwidth Reduction)
 // ════════════════════════════════════════════════════════════════════════════════
 
-__global__ void qwen_gqa_write_kv_fp8_kernel(
+__global__ void qwen_gqa_write_kv_fp8_batch_kernel(
     __nv_bfloat16* __restrict__ k,
     const __nv_bfloat16* __restrict__ v,
     const __nv_bfloat16* __restrict__ k_norm_w,
@@ -5965,19 +5965,22 @@ __global__ void qwen_gqa_write_kv_fp8_kernel(
     int head_dim,
     const int32_t* __restrict__ d_pos,
     int pos_scalar,
+    int M,
     int max_seq_len,
     float rope_theta,
     float eps)
 {
     int kv_head = blockIdx.x;
-    if (kv_head >= n_kv_heads) return;
+    int m = blockIdx.y;
+    if (kv_head >= n_kv_heads || m >= M) return;
 
-    int pos = d_pos ? *d_pos : pos_scalar;
+    int pos = d_pos ? d_pos[m] : (pos_scalar + m);
     if (pos >= max_seq_len) return;
 
     int tid = threadIdx.x;
-    __nv_bfloat16* k_vec = k + kv_head * head_dim;
-    const __nv_bfloat16* v_vec = v + kv_head * head_dim;
+    size_t in_offset = (size_t)m * (n_kv_heads * head_dim) + (size_t)kv_head * head_dim;
+    __nv_bfloat16* k_vec = k + in_offset;
+    const __nv_bfloat16* v_vec = v + in_offset;
 
     // 1. RMSNorm on K
     __shared__ float s_k_sum;
@@ -6028,7 +6031,7 @@ __global__ void qwen_gqa_write_kv_fp8_kernel(
     }
 }
 
-__global__ void qwen_gqa_compute_attn_fp8_kernel(
+__global__ void qwen_gqa_compute_attn_fp8_batch_kernel(
     __nv_bfloat16* __restrict__ out,
     const __nv_bfloat16* __restrict__ q_and_gate,
     const __nv_bfloat16* __restrict__ q_norm_w,
@@ -6039,14 +6042,16 @@ __global__ void qwen_gqa_compute_attn_fp8_kernel(
     int head_dim,
     const int32_t* __restrict__ d_pos,
     int pos_scalar,
+    int M,
     int max_seq_len,
     float rope_theta,
     float eps)
 {
     int q_head = blockIdx.x;
-    if (q_head >= n_q_heads) return;
+    int m = blockIdx.y;
+    if (q_head >= n_q_heads || m >= M) return;
 
-    int pos = d_pos ? *d_pos : pos_scalar;
+    int pos = d_pos ? d_pos[m] : (pos_scalar + m);
     if (pos >= max_seq_len) pos = max_seq_len - 1;
 
     int tid = threadIdx.x;
@@ -6059,15 +6064,19 @@ __global__ void qwen_gqa_compute_attn_fp8_kernel(
     __shared__ float s_warp_reduce[4];
     __shared__ float s_new_max;
     __shared__ float s_alpha;
+    __shared__ alignas(16) uint8_t s_v_tile[32768];
 
-    // Initialize all 256 entries of s_fp8_lut across the 128 threads (positive and negative values)
+    // Initialize all 256 entries of s_fp8_lut across the 128 threads
     s_fp8_lut[tid] = fp8_e4m3_to_float((uint8_t)tid);
     s_fp8_lut[tid + 128] = fp8_e4m3_to_float((uint8_t)(tid + 128));
     __syncthreads();
 
-    const __nv_bfloat16* q_in = q_and_gate + (size_t)q_head * (2 * head_dim);
+    size_t q_offset = (size_t)m * (2 * n_q_heads * head_dim) + (size_t)q_head * (2 * head_dim);
+    const __nv_bfloat16* q_in = q_and_gate + q_offset;
     const __nv_bfloat16* gate_in = q_in + head_dim;
-    __nv_bfloat16* out_vec = out + (size_t)q_head * head_dim;
+
+    size_t out_offset = (size_t)m * (n_q_heads * head_dim) + (size_t)q_head * head_dim;
+    __nv_bfloat16* out_vec = out + out_offset;
 
     // 1. RMSNorm on Q per head
     if (tid == 0) s_q_sum = 0.0f;
@@ -6120,6 +6129,9 @@ __global__ void qwen_gqa_compute_attn_fp8_kernel(
 
     int warp_id = tid >> 5;
     int lane_id = tid & 31;
+    int u4_shift = (head_dim == 256) ? 4 : 3;
+    int u4_mask = (1 << u4_shift) - 1;
+    int j_shift = (head_dim == 256) ? 8 : 7;
 
     for (int t_block = 0; t_block <= pos; t_block += 128) {
         int chunk_len = min(128, pos + 1 - t_block);
@@ -6178,8 +6190,8 @@ __global__ void qwen_gqa_compute_attn_fp8_kernel(
         __syncthreads();
 
         if (tid == 0) {
-            float m = fmaxf(fmaxf(s_warp_reduce[0], s_warp_reduce[1]), fmaxf(s_warp_reduce[2], s_warp_reduce[3]));
-            float new_m = fmaxf(running_max, m);
+            float m_val = fmaxf(fmaxf(s_warp_reduce[0], s_warp_reduce[1]), fmaxf(s_warp_reduce[2], s_warp_reduce[3]));
+            float new_m = fmaxf(running_max, m_val);
             float a = (running_max <= -1e37f) ? 0.0f : __expf(running_max - new_m);
             s_new_max = new_m;
             s_alpha = a;
@@ -6212,18 +6224,29 @@ __global__ void qwen_gqa_compute_attn_fp8_kernel(
         __syncthreads();
         running_sum += s_warp_reduce[0];
 
-        // E. Accumulate V values for dim0 and dim1 with FP8 LUT
-        #pragma unroll 4
+        // E. Fast Shared-Memory Cooperative Tiling for V values
+        int total_u4 = (chunk_len * head_dim) >> 4;
+        uint4* s_v_u4 = reinterpret_cast<uint4*>(s_v_tile);
+
+        #pragma unroll 2
+        for (int idx = tid; idx < total_u4; idx += blockDim.x) {
+            int t_offset = idx >> u4_shift;
+            int v_idx = idx & u4_mask;
+            int t = t_block + t_offset;
+            size_t v_off = ((size_t)t * n_kv_heads + kv_head) * head_dim + (v_idx << 4);
+            s_v_u4[idx] = *reinterpret_cast<const uint4*>(v_cache + v_off);
+        }
+        __syncthreads();
+
+        #pragma unroll 8
         for (int j = 0; j < chunk_len; j++) {
             float weight = s_tile_scores[j];
-            int t = t_block + j;
-            size_t v_offset = ((size_t)t * n_kv_heads + kv_head) * head_dim;
-            const uint8_t* v_ptr = v_cache + v_offset;
+            int j_base = j << j_shift;
             if (dim0 < head_dim) {
-                acc0 += weight * s_fp8_lut[v_ptr[dim0]];
+                acc0 += weight * s_fp8_lut[s_v_tile[j_base + dim0]];
             }
             if (dim1 < head_dim) {
-                acc1 += weight * s_fp8_lut[v_ptr[dim1]];
+                acc1 += weight * s_fp8_lut[s_v_tile[j_base + dim1]];
             }
         }
         __syncthreads();
@@ -6241,6 +6264,40 @@ __global__ void qwen_gqa_compute_attn_fp8_kernel(
         float sig1 = 1.0f / (1.0f + __expf(-g1));
         out_vec[dim1] = __float2bfloat16(acc1 * inv_sum * sig1);
     }
+}
+
+void qwen_gqa_decode_gated_fp8_batch_cuda(
+    __nv_bfloat16* out,
+    const __nv_bfloat16* q_and_gate,
+    __nv_bfloat16* k,
+    const __nv_bfloat16* v,
+    const __nv_bfloat16* q_norm_w,
+    const __nv_bfloat16* k_norm_w,
+    uint8_t* k_cache,
+    uint8_t* v_cache,
+    int n_q_heads,
+    int n_kv_heads,
+    int head_dim,
+    const int32_t* d_pos,
+    int pos_scalar,
+    int M,
+    int max_seq_len,
+    float rope_theta,
+    float eps,
+    cudaStream_t stream)
+{
+    if (M <= 0) return;
+    int threads = 128;
+
+    // Step 1: Write KV to FP8 cache in parallel across (n_kv_heads, M)
+    dim3 grid_kv(n_kv_heads, M);
+    qwen_gqa_write_kv_fp8_batch_kernel<<<grid_kv, threads, 0, stream>>>(
+        k, v, k_norm_w, k_cache, v_cache, n_kv_heads, head_dim, d_pos, pos_scalar, M, max_seq_len, rope_theta, eps);
+
+    // Step 2: Compute Query Attention against FP8 cache in parallel across (n_q_heads, M)
+    dim3 grid_q(n_q_heads, M);
+    qwen_gqa_compute_attn_fp8_batch_kernel<<<grid_q, threads, 0, stream>>>(
+        out, q_and_gate, q_norm_w, k_cache, v_cache, n_q_heads, n_kv_heads, head_dim, d_pos, pos_scalar, M, max_seq_len, rope_theta, eps);
 }
 
 void qwen_gqa_decode_gated_fp8_cuda(
@@ -6262,14 +6319,10 @@ void qwen_gqa_decode_gated_fp8_cuda(
     float eps,
     cudaStream_t stream)
 {
-    int threads = 128;
-    // Step 1: Write KV to FP8 cache
-    qwen_gqa_write_kv_fp8_kernel<<<n_kv_heads, threads, 0, stream>>>(
-        k, v, k_norm_w, k_cache, v_cache, n_kv_heads, head_dim, d_pos, pos_scalar, max_seq_len, rope_theta, eps);
-
-    // Step 2: Compute Query Attention against FP8 cache and Gate via Online Softmax
-    qwen_gqa_compute_attn_fp8_kernel<<<n_q_heads, threads, 0, stream>>>(
-        out, q_and_gate, q_norm_w, k_cache, v_cache, n_q_heads, n_kv_heads, head_dim, d_pos, pos_scalar, max_seq_len, rope_theta, eps);
+    qwen_gqa_decode_gated_fp8_batch_cuda(
+        out, q_and_gate, k, v, q_norm_w, k_norm_w,
+        k_cache, v_cache, n_q_heads, n_kv_heads, head_dim,
+        d_pos, pos_scalar, 1, max_seq_len, rope_theta, eps, stream);
 }
 
 void accumulate_expert_imatrix_cuda(
