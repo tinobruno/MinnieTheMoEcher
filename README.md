@@ -89,7 +89,7 @@ Depending on the prompt context and active features, you may observe generation 
 
 ### 3. How to Maximize Generation Speed
 * **To run at full 100+ tok/s**: In the Web UI, open the **Agentic & Tools** settings tab and toggle off Web/Local tools (or send `"tools": []` via API). The prompt length drops from 3,156 tokens down to ~20 tokens, immediately unlocking full **100–112 tok/s** speed.
-* **Prefill Speed**: While decoding scales with active KV cache size, prefix evaluation is instantaneous (**0 ms prefill latency**) because the 3,145-token tooling prefix is pre-warmed and stored in a **Pinned System KV Cache snapshot** at startup (prefilled at **~169 tok/s**).
+* **Prefill Speed**: While decoding scales with active KV cache size, prefix evaluation is instantaneous (**0 ms prefill latency**) because the 3,145-token tooling prefix is pre-warmed and stored in a **Pinned System KV Cache snapshot** at startup (prefilled at **~181 tok/s**).
 
 > 📖 **Engineering & Research Log**: For deep technical breakdowns, mathematical analyses, and root-cause post-mortems of every bug and optimization, see [DISCOVERIES_AND_ENDEAVOURS_LOG.md](DISCOVERIES_AND_ENDEAVOURS_LOG.md).
 
@@ -301,7 +301,7 @@ curl -s http://localhost:8001/v1/chat/completions \
 - **Shared-Memory Cooperative V-Cache Tiling (`s_v_tile`)**: Refactored the GQA attention accumulation loop in `qwen_gqa_compute_attn_fp8_batch_kernel` using 128-bit (`uint4`) cooperative vector loads into `__shared__ alignas(16) uint8_t s_v_tile[32768]`, eliminating sequential global memory latency stalls in the inner accumulation loop.
 - **Batched Multi-Candidate GQA Execution**: Fused candidate KV writes and query attention verification across all $M$ speculative candidates into 2D launch grids `dim3(heads, M)`, cutting kernel launches from 96 down to 32 per verify cycle.
 - **+63% Speedup on 3,145-Token Tool Prompts**: Sliced speculative verification cycle latency from **42.14 ms / cycle down to 26.88 ms / cycle** (-36%), boosting sustained decoding speed on tool prompts from **~44 tok/s to 68–74 tok/s** on NVIDIA RTX PRO 6000 Blackwell.
-- **Accelerated Startup Prefill**: Pre-warming the 3,145-token tooling KV prefix snapshot improved from 26.28s (119.7 tok/s) to **18.62s (168.9 tok/s)** (+41.1% faster prefill).
+- **Accelerated Startup Prefill**: Pre-warming the 3,145-token tooling KV prefix snapshot improved from 26.28s (119.7 tok/s) to **17.38s (180.97 tok/s)** (+51.2% faster prefill).
 
 ### v2.07 — Qwen 3.8 27B MTP Speculative Decoding Engine (~98 tok/s Milestone)
 - **Ultra-Fast MTP Self-Drafting Speculative Engine**: Integrated the target model's native Multi-Token Prediction (MTP) layer for self-speculation, achieving **97.94 tok/s** on RTX PRO 6000 Blackwell (+78% over autoregressive baseline, +133% over legacy neural drafter).

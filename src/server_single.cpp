@@ -11745,7 +11745,7 @@ static void run_server(MoecherEngine& engine, int port, int default_thinking_bud
     });
 
     LOG_INFO("Server listening on port %d", port);
-    LOG_INFO("version 2.03");
+    LOG_INFO("version 2.08");
     g_server_ready = true;
     svr.listen("0.0.0.0", port);
     moecher::mcp::MCPManager::instance().stop_all();
@@ -11896,7 +11896,7 @@ int main(int argc, char** argv) {
     // Open log file
     g_log_file.open(log_path, std::ios::app);
     LOG_INFO("=== moecher starting ===");
-    LOG_INFO("=== v2.05 ===");
+    LOG_INFO("=== v2.08 ===");
     LOG_INFO("Default thinking token budget: %d", default_thinking_budget);
     LOG_INFO("Tool calling support: %s", g_enable_tools ? "enabled" : "disabled");
     LOG_INFO("Max tool execution rounds: %d", g_max_tool_rounds);

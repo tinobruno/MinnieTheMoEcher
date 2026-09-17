@@ -231,7 +231,7 @@ We designed and implemented two fused optimizations in [`src/cuda/activations.cu
 | **Web UI "hello" (3,156 tokens)** | 43.98 tok/s | **71.52 tok/s** | **+62.6% faster** |
 | **Reasoning Prompt (3,178 tokens)** | 39.05 tok/s | **67.14 tok/s** | **+71.9% faster** |
 | **CLI Test Prompt (43 tokens)** | 109.41 tok/s | **111.21 tok/s** | **Peak efficiency** |
-| **Startup Prefill (3,145 tokens)** | 119.70 tok/s (26.28s) | **168.92 tok/s (18.62s)** | **+41.1% faster prefill** |
+| **Startup Prefill (3,145 tokens)** | 119.70 tok/s (26.28s) | **180.97 tok/s (17.38s)** | **+51.2% faster prefill** |
 
 ---
 

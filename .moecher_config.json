@@ -1,5 +1,6 @@
 {
   "brave_api_key": "",
+  "fast_media_search": false,
   "google_search_api_key": "",
   "google_search_cx": "",
   "search_provider": "tavily",
