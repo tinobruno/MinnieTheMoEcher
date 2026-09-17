@@ -2148,6 +2148,190 @@ void gemm_int4_f32_batch_cuda(
 }
 
 // ════════════════════════════════════════════════════════════════════════════════
+//  INT4 Block-32 Dequantization to BF16 (Vectorized 128-bit)
+// ════════════════════════════════════════════════════════════════════════════════
+__global__ void dequant_int4_block_kernel(
+    __nv_bfloat16* __restrict__ out,         // [N, K] BF16
+    const uint8_t* __restrict__ weight,      // [N, K/2] packed INT4
+    const __nv_bfloat16* __restrict__ scale, // [N, K/32] BF16
+    int total_blocks)
+{
+    int block_idx = blockIdx.x * blockDim.x + threadIdx.x;
+    if (block_idx >= total_blocks) return;
+
+    // Each block represents 32 INT4 weights (16 bytes packed) with 1 BF16 scale
+    float s = __bfloat162float(scale[block_idx]);
+    uint4 w_val = reinterpret_cast<const uint4*>(weight)[block_idx];
+
+    uint32_t w_arr[4] = {w_val.x, w_val.y, w_val.z, w_val.w};
+    __nv_bfloat162 res[16];
+
+    #pragma unroll
+    for (int i = 0; i < 4; i++) {
+        uint32_t chunk = w_arr[i];
+        uint32_t b0 = chunk & 0xFF;
+        uint32_t b1 = (chunk >> 8) & 0xFF;
+        uint32_t b2 = (chunk >> 16) & 0xFF;
+        uint32_t b3 = (chunk >> 24) & 0xFF;
+
+        float w0 = ((float)(b0 & 0x0F) - 8.0f) * s;
+        float w1 = ((float)(b0 >> 4) - 8.0f) * s;
+        float w2 = ((float)(b1 & 0x0F) - 8.0f) * s;
+        float w3 = ((float)(b1 >> 4) - 8.0f) * s;
+        float w4 = ((float)(b2 & 0x0F) - 8.0f) * s;
+        float w5 = ((float)(b2 >> 4) - 8.0f) * s;
+        float w6 = ((float)(b3 & 0x0F) - 8.0f) * s;
+        float w7 = ((float)(b3 >> 4) - 8.0f) * s;
+
+        res[i * 4 + 0].x = __float2bfloat16(w0);
+        res[i * 4 + 0].y = __float2bfloat16(w1);
+        res[i * 4 + 1].x = __float2bfloat16(w2);
+        res[i * 4 + 1].y = __float2bfloat16(w3);
+        res[i * 4 + 2].x = __float2bfloat16(w4);
+        res[i * 4 + 2].y = __float2bfloat16(w5);
+        res[i * 4 + 3].x = __float2bfloat16(w6);
+        res[i * 4 + 3].y = __float2bfloat16(w7);
+    }
+
+    uint4* out_u4 = reinterpret_cast<uint4*>(out + (size_t)block_idx * 32);
+    #pragma unroll
+    for (int j = 0; j < 4; j++) {
+        out_u4[j] = *reinterpret_cast<const uint4*>(&res[j * 4]);
+    }
+}
+
+void dequant_int4_block_cuda(
+    __nv_bfloat16* out,
+    const uint8_t* weight,
+    const __nv_bfloat16* scale,
+    int N, int K,
+    int block_size,
+    cudaStream_t stream)
+{
+    int blocks_per_row = K / 32;
+    int total_blocks = N * blocks_per_row;
+    int threads = 256;
+    int blocks = (total_blocks + threads - 1) / threads;
+    dequant_int4_block_kernel<<<blocks, threads, 0, stream>>>(out, weight, scale, total_blocks);
+}
+
+// ════════════════════════════════════════════════════════════════════════════════
+//  GEMV INT4 Grouped Batch Kernel (for wo_a: M tokens, groups blocks)
+// ════════════════════════════════════════════════════════════════════════════════
+template <typename TOut = __nv_bfloat16>
+__global__ void gemv_int4_grouped_batch_kernel(
+    TOut* __restrict__ out,
+    const __nv_bfloat16* __restrict__ vec,
+    const uint8_t* __restrict__ weight,
+    const __nv_bfloat16* __restrict__ scale,
+    int M, int N, int K, int groups)
+{
+    int row = blockIdx.x * 4 + threadIdx.y;
+    int group = blockIdx.y;
+    int m = blockIdx.z;
+    int tid = threadIdx.x; // 0..63
+
+    if (group >= groups || m >= M) return;
+
+    int num_blocks = (row < N) ? (K / 32) : 0;
+
+    const uint8_t* g_weight = weight + (size_t)group * N * (K / 2);
+    const __nv_bfloat16* g_scale = scale + (size_t)group * N * (K / 32);
+    const __nv_bfloat16* g_vec = vec + (size_t)m * ((size_t)groups * K) + (size_t)group * K;
+    TOut* g_out = out + (size_t)m * ((size_t)groups * N) + (size_t)group * N;
+
+    const __nv_bfloat16* row_scales = (row < N) ? (g_scale + (row * num_blocks)) : nullptr;
+    const uint4* w_vec16 = (row < N) ? reinterpret_cast<const uint4*>(&g_weight[row * (K / 2)]) : nullptr;
+    const uint4* a_vec16 = reinterpret_cast<const uint4*>(g_vec);
+
+    float sum = 0.0f;
+
+    uint4 next_w_val;
+    float next_s = 0.0f;
+    if (tid < num_blocks) {
+        next_w_val = w_vec16[tid];
+        next_s = __bfloat162float(row_scales[tid]);
+    }
+
+    for (int block_idx = tid; block_idx < num_blocks; block_idx += blockDim.x) {
+        uint4 curr_w_val = next_w_val;
+        float curr_s = next_s;
+
+        int next_block_idx = block_idx + blockDim.x;
+        if (next_block_idx < num_blocks) {
+            next_w_val = w_vec16[next_block_idx];
+            next_s = __bfloat162float(row_scales[next_block_idx]);
+        }
+
+        const uint4* a_ptr = a_vec16 + (block_idx * 4);
+        uint32_t w_arr[4] = {curr_w_val.x, curr_w_val.y, curr_w_val.z, curr_w_val.w};
+        float block_sum = 0.0f;
+
+        #pragma unroll
+        for (int k = 0; k < 4; k++) {
+            uint32_t chunk = w_arr[k];
+            uint4 a_val = a_ptr[k];
+
+            __nv_bfloat162 bf0 = *reinterpret_cast<const __nv_bfloat162*>(&a_val.x);
+            __nv_bfloat162 bf1 = *reinterpret_cast<const __nv_bfloat162*>(&a_val.y);
+            __nv_bfloat162 bf2 = *reinterpret_cast<const __nv_bfloat162*>(&a_val.z);
+            __nv_bfloat162 bf3 = *reinterpret_cast<const __nv_bfloat162*>(&a_val.w);
+
+            float2 f0 = to_float2_bf162(bf0);
+            float2 f1 = to_float2_bf162(bf1);
+            float2 f2 = to_float2_bf162(bf2);
+            float2 f3 = to_float2_bf162(bf3);
+
+            uint32_t b0 = chunk & 0xFF;
+            block_sum += ((float)(b0 & 0x0F) - 8.0f) * f0.x + ((float)(b0 >> 4) - 8.0f) * f0.y;
+
+            uint32_t b1 = (chunk >> 8) & 0xFF;
+            block_sum += ((float)(b1 & 0x0F) - 8.0f) * f1.x + ((float)(b1 >> 4) - 8.0f) * f1.y;
+
+            uint32_t b2 = (chunk >> 16) & 0xFF;
+            block_sum += ((float)(b2 & 0x0F) - 8.0f) * f2.x + ((float)(b2 >> 4) - 8.0f) * f2.y;
+
+            uint32_t b3 = (chunk >> 24) & 0xFF;
+            block_sum += ((float)(b3 & 0x0F) - 8.0f) * f3.x + ((float)(b3 >> 4) - 8.0f) * f3.y;
+        }
+        sum += block_sum * curr_s;
+    }
+
+    #pragma unroll
+    for (int offset = 16; offset > 0; offset /= 2)
+        sum += __shfl_down_sync(0xffffffff, sum, offset);
+
+    __shared__ float s_sum[4][2];
+    int lane = tid % 32;
+    int warp = tid / 32;
+    if (lane == 0) s_sum[threadIdx.y][warp] = sum;
+    __syncthreads();
+
+    if (warp == 0) {
+        sum = (lane < 2) ? s_sum[threadIdx.y][lane] : 0.0f;
+        sum += __shfl_down_sync(0xffffffff, sum, 1);
+
+        if (lane == 0 && row < N) {
+            g_out[row] = __float2bfloat16(sum);
+        }
+    }
+}
+
+void gemv_int4_grouped_batch_cuda(
+    __nv_bfloat16* out,
+    const __nv_bfloat16* vec,
+    const uint8_t* weight,
+    const __nv_bfloat16* scale,
+    int M, int N, int K, int groups,
+    cudaStream_t stream)
+{
+    dim3 threads(64, 4);
+    dim3 blocks((N + 3) / 4, groups, M);
+    gemv_int4_grouped_batch_kernel<<<blocks, threads, 0, stream>>>(
+        out, vec, weight, scale, M, N, K, groups);
+}
+
+// ════════════════════════════════════════════════════════════════════════════════
 //  GEMV INT4 Fused SwiGLU Kernel (Block Size = 32, Symmetric Zero-point 8, 128-bit)
 // ════════════════════════════════════════════════════════════════════════════════
 // ════════════════════════════════════════════════════════════════════════════════

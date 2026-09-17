@@ -3514,10 +3514,9 @@ public:
             return;
         }
 
-        // Tier 0: INT4 Dense model check (batched prefill is currently specialized for FP8 dense weights)
-        bool has_int4_dense = (layers_.size() > 0 && layers_[0].wq_a_w.dtype == "int4") || (embed_weight_.dtype == "int4");
-        if (has_int4_dense) {
-            LOG_INFO("[Prefill] INT4 dense model detected. Using CUDA Graph accelerated sequential prefill.");
+        // Tier 0: Embedding format check (batched embedding lookup currently expects BF16 embeddings)
+        if (embed_weight_.dtype == "int4") {
+            LOG_INFO("[Prefill] INT4 embedding weights detected. Using sequential prefill.");
             enable_batched_prefill_ = false;
             return;
         }
@@ -5361,6 +5360,27 @@ private:
         }
     }
 
+    // ── Dequant + GEMM: dequantize INT4 weight to BF16 temp, then GEMM ──────
+
+    void gemm_int4_dequant(
+        __nv_bfloat16* C, int M, int N, int K,
+        const __nv_bfloat16* A,              // [M, K] BF16 input
+        const uint8_t* weight,               // [N, K/2] packed INT4
+        const __nv_bfloat16* scale,          // [N, K/32] BF16 block scales
+        int block_size = 32,
+        cudaStream_t stream = nullptr)
+    {
+        if (!stream) stream = main_stream_;
+        if (M == 1) {
+            gemv_int4_cuda(C, A, weight, scale, N, K, stream);
+        } else if (M <= 8) {
+            gemm_int4_batch_cuda(C, A, weight, scale, N, K, M, stream);
+        } else {
+            dequant_int4_block_cuda(buf_dequant_.bf16(), weight, scale, N, K, block_size, stream);
+            gemm_bf16(C, M, N, K, A, buf_dequant_.bf16());
+        }
+    }
+
     // ── Dequant + GEMM for FP4 experts ──────────────────────────────────────
 
     void gemm_fp4_dequant(
@@ -6646,21 +6666,39 @@ private:
                                                     lw.attn_norm_w.bf16(),
                                                     M, dim, hc, cfg_.rms_norm_eps, main_stream_);
 
-                // ── Attention Q & KV Projections (batched via cuBLAS FP8 Tensor Cores) ──
-                gemm_fp8_dequant(prefill_bufs_.buf_lora.bf16(), M, q_lora, dim,
-                                 prefill_bufs_.buf_hidden.bf16(),
-                                 lw.wq_a_w.u8(), lw.wq_a_s.u8(), 128, main_stream_);
+                // ── Attention Q & KV Projections (batched via cuBLAS Tensor Cores) ──
+                if (lw.wq_a_w.dtype == "int4") {
+                    gemm_int4_dequant(prefill_bufs_.buf_lora.bf16(), M, q_lora, dim,
+                                     prefill_bufs_.buf_hidden.bf16(),
+                                     (const uint8_t*)lw.wq_a_w.data, lw.wq_a_s.bf16(), 32, main_stream_);
+                } else {
+                    gemm_fp8_dequant(prefill_bufs_.buf_lora.bf16(), M, q_lora, dim,
+                                     prefill_bufs_.buf_hidden.bf16(),
+                                     lw.wq_a_w.u8(), lw.wq_a_s.u8(), 128, main_stream_);
+                }
 
                 rms_norm_cuda_batched(prefill_bufs_.buf_lora.bf16(), prefill_bufs_.buf_lora.bf16(),
                                       lw.q_norm_w.bf16(), M, q_lora, cfg_.rms_norm_eps, main_stream_);
 
-                gemm_fp8_dequant(prefill_bufs_.buf_q.bf16(), M, n_heads * head_dim_val, q_lora,
-                                 prefill_bufs_.buf_lora.bf16(),
-                                 lw.wq_b_w.u8(), lw.wq_b_s.u8(), 128, main_stream_);
+                if (lw.wq_b_w.dtype == "int4") {
+                    gemm_int4_dequant(prefill_bufs_.buf_q.bf16(), M, n_heads * head_dim_val, q_lora,
+                                     prefill_bufs_.buf_lora.bf16(),
+                                     (const uint8_t*)lw.wq_b_w.data, lw.wq_b_s.bf16(), 32, main_stream_);
+                } else {
+                    gemm_fp8_dequant(prefill_bufs_.buf_q.bf16(), M, n_heads * head_dim_val, q_lora,
+                                     prefill_bufs_.buf_lora.bf16(),
+                                     lw.wq_b_w.u8(), lw.wq_b_s.u8(), 128, main_stream_);
+                }
 
-                gemm_fp8_dequant(prefill_bufs_.buf_kv.bf16(), M, head_dim_val, dim,
-                                 prefill_bufs_.buf_hidden.bf16(),
-                                 lw.wkv_w.u8(), lw.wkv_s.u8(), 128, main_stream_);
+                if (lw.wkv_w.dtype == "int4") {
+                    gemm_int4_dequant(prefill_bufs_.buf_kv.bf16(), M, head_dim_val, dim,
+                                     prefill_bufs_.buf_hidden.bf16(),
+                                     (const uint8_t*)lw.wkv_w.data, lw.wkv_s.bf16(), 32, main_stream_);
+                } else {
+                    gemm_fp8_dequant(prefill_bufs_.buf_kv.bf16(), M, head_dim_val, dim,
+                                     prefill_bufs_.buf_hidden.bf16(),
+                                     lw.wkv_w.u8(), lw.wkv_s.u8(), 128, main_stream_);
+                }
 
                 rms_norm_cuda_batched(prefill_bufs_.buf_kv.bf16(), prefill_bufs_.buf_kv.bf16(),
                                       lw.kv_norm_w.bf16(), M, head_dim_val, cfg_.rms_norm_eps, main_stream_);
@@ -6738,14 +6776,27 @@ private:
                 }
 
                 // ── Output projection (wo_a and wo_b) ──
-                gemv_fp8_grouped_batch_cuda(prefill_bufs_.buf_lora.bf16(),
-                                            prefill_bufs_.buf_attn_out.bf16(),
-                                            lw.wo_a_w.u8(), lw.wo_a_s.u8(),
-                                            M, o_lora, hpg_dim, o_groups, 128, main_stream_);
+                if (lw.wo_a_w.dtype == "int4") {
+                    gemv_int4_grouped_batch_cuda(prefill_bufs_.buf_lora.bf16(),
+                                                 prefill_bufs_.buf_attn_out.bf16(),
+                                                 (const uint8_t*)lw.wo_a_w.data, lw.wo_a_s.bf16(),
+                                                 M, o_lora, hpg_dim, o_groups, main_stream_);
+                } else {
+                    gemv_fp8_grouped_batch_cuda(prefill_bufs_.buf_lora.bf16(),
+                                                prefill_bufs_.buf_attn_out.bf16(),
+                                                lw.wo_a_w.u8(), lw.wo_a_s.u8(),
+                                                M, o_lora, hpg_dim, o_groups, 128, main_stream_);
+                }
 
-                gemm_fp8_dequant(prefill_bufs_.buf_hidden.bf16(), M, dim, o_groups * o_lora,
-                                 prefill_bufs_.buf_lora.bf16(),
-                                 lw.wo_b_w.u8(), lw.wo_b_s.u8(), 128, main_stream_);
+                if (lw.wo_b_w.dtype == "int4") {
+                    gemm_int4_dequant(prefill_bufs_.buf_hidden.bf16(), M, dim, o_groups * o_lora,
+                                     prefill_bufs_.buf_lora.bf16(),
+                                     (const uint8_t*)lw.wo_b_w.data, lw.wo_b_s.bf16(), 32, main_stream_);
+                } else {
+                    gemm_fp8_dequant(prefill_bufs_.buf_hidden.bf16(), M, dim, o_groups * o_lora,
+                                     prefill_bufs_.buf_lora.bf16(),
+                                     lw.wo_b_w.u8(), lw.wo_b_s.u8(), 128, main_stream_);
+                }
 
                 // ── HC post for attention: reads buf_hc_state, writes to buf_hc_after_attn ──
                 hc_post_update_batch_cuda(prefill_bufs_.buf_hc_after_attn.bf16(),
@@ -6797,23 +6848,42 @@ private:
                         main_stream_);
                 }
 
-                // ── Shared Expert (batched FP8 Tensor Cores) ──
-                gemm_fp8_dequant(prefill_bufs_.buf_shared_gate.bf16(), M, moe_inter, dim,
-                                 prefill_bufs_.buf_hidden.bf16(),
-                                 lw.shared_w1_w.u8(), lw.shared_w1_s.u8(), 128, main_stream_);
+                // ── Shared Expert (batched Tensor Cores) ──
+                if (lw.shared_w1_w.dtype == "int4") {
+                    gemm_int4_dequant(prefill_bufs_.buf_shared_gate.bf16(), M, moe_inter, dim,
+                                     prefill_bufs_.buf_hidden.bf16(),
+                                     (const uint8_t*)lw.shared_w1_w.data, lw.shared_w1_s.bf16(), 32, main_stream_);
 
-                gemm_fp8_dequant(prefill_bufs_.buf_shared_up.bf16(), M, moe_inter, dim,
-                                 prefill_bufs_.buf_hidden.bf16(),
-                                 lw.shared_w3_w.u8(), lw.shared_w3_s.u8(), 128, main_stream_);
+                    gemm_int4_dequant(prefill_bufs_.buf_shared_up.bf16(), M, moe_inter, dim,
+                                     prefill_bufs_.buf_hidden.bf16(),
+                                     (const uint8_t*)lw.shared_w3_w.data, lw.shared_w3_s.bf16(), 32, main_stream_);
 
-                silu_mul_cuda(prefill_bufs_.buf_shared_gate.bf16(),
-                              prefill_bufs_.buf_shared_gate.bf16(),
-                              prefill_bufs_.buf_shared_up.bf16(),
-                              M * moe_inter, cfg_.swiglu_limit, main_stream_);
+                    silu_mul_cuda(prefill_bufs_.buf_shared_gate.bf16(),
+                                  prefill_bufs_.buf_shared_gate.bf16(),
+                                  prefill_bufs_.buf_shared_up.bf16(),
+                                  M * moe_inter, cfg_.swiglu_limit, main_stream_);
 
-                gemm_fp8_dequant(prefill_bufs_.buf_shared_down.bf16(), M, dim, moe_inter,
-                                 prefill_bufs_.buf_shared_gate.bf16(),
-                                 lw.shared_w2_w.u8(), lw.shared_w2_s.u8(), 128, main_stream_);
+                    gemm_int4_dequant(prefill_bufs_.buf_shared_down.bf16(), M, dim, moe_inter,
+                                     prefill_bufs_.buf_shared_gate.bf16(),
+                                     (const uint8_t*)lw.shared_w2_w.data, lw.shared_w2_s.bf16(), 32, main_stream_);
+                } else {
+                    gemm_fp8_dequant(prefill_bufs_.buf_shared_gate.bf16(), M, moe_inter, dim,
+                                     prefill_bufs_.buf_hidden.bf16(),
+                                     lw.shared_w1_w.u8(), lw.shared_w1_s.u8(), 128, main_stream_);
+
+                    gemm_fp8_dequant(prefill_bufs_.buf_shared_up.bf16(), M, moe_inter, dim,
+                                     prefill_bufs_.buf_hidden.bf16(),
+                                     lw.shared_w3_w.u8(), lw.shared_w3_s.u8(), 128, main_stream_);
+
+                    silu_mul_cuda(prefill_bufs_.buf_shared_gate.bf16(),
+                                  prefill_bufs_.buf_shared_gate.bf16(),
+                                  prefill_bufs_.buf_shared_up.bf16(),
+                                  M * moe_inter, cfg_.swiglu_limit, main_stream_);
+
+                    gemm_fp8_dequant(prefill_bufs_.buf_shared_down.bf16(), M, dim, moe_inter,
+                                     prefill_bufs_.buf_shared_gate.bf16(),
+                                     lw.shared_w2_w.u8(), lw.shared_w2_s.u8(), 128, main_stream_);
+                }
 
                 // ── Routed Experts (Resident MoE) ──
                 const void* const* flat_ptrs = expert_loader_.flat_vram_ptrs_gpu();

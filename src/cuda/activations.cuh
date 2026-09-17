@@ -199,6 +199,22 @@ void gemm_int4_f32_batch_cuda(
     int N, int K, int M,
     cudaStream_t stream = 0);
 
+void dequant_int4_block_cuda(
+    __nv_bfloat16* out,
+    const uint8_t* weight,
+    const __nv_bfloat16* scale,
+    int N, int K,
+    int block_size = 32,
+    cudaStream_t stream = 0);
+
+void gemv_int4_grouped_batch_cuda(
+    __nv_bfloat16* out,
+    const __nv_bfloat16* vec,
+    const uint8_t* weight,
+    const __nv_bfloat16* scale,
+    int M, int N, int K, int groups,
+    cudaStream_t stream = 0);
+
 void gemv_int4_swiglu_fused_cuda(
     __nv_bfloat16* out,
     const __nv_bfloat16* vec,
