@@ -111,9 +111,6 @@ static std::atomic<bool> g_stop_requested{false};
 
 
 static void log_msg(const char* level, const char* fmt, ...) {
-    if (g_quiet && g_server_ready && (strcmp(level, "INFO") == 0 || strcmp(level, "WARN") == 0)) {
-        return;
-    }
     std::lock_guard<std::mutex> lock(g_log_mutex);
     auto now = std::chrono::system_clock::now();
     auto time = std::chrono::system_clock::to_time_t(now);
@@ -126,7 +123,9 @@ static void log_msg(const char* level, const char* fmt, ...) {
     vsnprintf(buf, sizeof(buf), fmt, args);
     va_end(args);
 
-    fprintf(stderr, "[%s] [%s] %s\n", timebuf, level, buf);
+    if (!(g_quiet && g_server_ready && (strcmp(level, "INFO") == 0 || strcmp(level, "WARN") == 0))) {
+        fprintf(stderr, "[%s] [%s] %s\n", timebuf, level, buf);
+    }
     if (g_log_file.is_open()) {
         g_log_file << "[" << timebuf << "] [" << level << "] " << buf << "\n";
         g_log_file.flush();
@@ -9244,6 +9243,7 @@ private:
 
 static void run_server(MoecherEngine& engine, int port, int default_thinking_budget = 4096, int proxy_port = 8002, bool enable_forward_proxy = true, bool enable_system_proxy = false) {
     httplib::Server svr;
+    svr.set_tcp_nodelay(true);
     svr.set_payload_max_length(64 * 1024 * 1024); // 64 MB
 
     if (enable_forward_proxy) {
@@ -10599,17 +10599,39 @@ static void run_server(MoecherEngine& engine, int port, int default_thinking_bud
             std::string model_id = engine.get_model_id();
 
             if (stream) {
+                // Fast SSE delta writer avoiding heap-allocated JSON ASTs
+                auto send_sse_delta = [](httplib::DataSink& sink, const std::string& req_id, const std::string& model_id,
+                                         const std::string& created_str, const char* field_name, const std::string& text) -> bool {
+                    std::string sse;
+                    sse.reserve(128 + text.size() * 2);
+                    sse.append("data: {\"id\":\"");
+                    sse.append(req_id);
+                    sse.append("\",\"object\":\"chat.completion.chunk\",\"created\":");
+                    sse.append(created_str);
+                    sse.append(",\"model\":\"");
+                    sse.append(model_id);
+                    sse.append("\",\"choices\":[{\"index\":0,\"delta\":{\"");
+                    sse.append(field_name);
+                    sse.append("\":");
+                    sse.append(json(text).dump());
+                    sse.append("},\"finish_reason\":null}]}\n\n");
+                    return sink.write(sse.data(), sse.size()) && !g_stop_requested.load();
+                };
+
                 // SSE streaming
                 res.set_chunked_content_provider(
                     "text/event-stream",
-                    [&engine, messages, tools, max_tokens, temperature, req_id, repetition_penalty, enable_thinking, max_thinking_tokens, top_p, min_p, top_k, reasoning_effort, model_id, execution_timeout_ms, require_external_authorization, workspace_boundary_enforced, authorized_paths, do_server_exec, req_max_tool_rounds, busy_guard](size_t offset, httplib::DataSink &sink) {
+                    [&engine, messages, tools, max_tokens, temperature, req_id, repetition_penalty, enable_thinking, max_thinking_tokens, top_p, min_p, top_k, reasoning_effort, model_id, execution_timeout_ms, require_external_authorization, workspace_boundary_enforced, authorized_paths, do_server_exec, req_max_tool_rounds, busy_guard, send_sse_delta](size_t offset, httplib::DataSink &sink) {
                         if (offset > 0) return false;
                         std::lock_guard<std::mutex> lock(g_engine_mutex);
+
+                        time_t created_time = std::chrono::system_clock::to_time_t(std::chrono::system_clock::now());
+                        std::string created_time_str = std::to_string(created_time);
 
                         json initial_chunk = {
                             {"id", req_id},
                             {"object", "chat.completion.chunk"},
-                            {"created", std::chrono::system_clock::to_time_t(std::chrono::system_clock::now())},
+                            {"created", created_time},
                             {"model", model_id},
                             {"choices", {{
                                 {"index", 0},
@@ -10668,67 +10690,19 @@ static void run_server(MoecherEngine& engine, int port, int default_thinking_bud
                                     round_reasoning += text;
                                     if (g_enable_tools && !tools.empty()) {
                                         return reasoning_filter.feed(text, [&](const std::string& safe_text) -> bool {
-                                            json delta_chunk = {
-                                                {"id", req_id},
-                                                {"object", "chat.completion.chunk"},
-                                                {"created", std::chrono::system_clock::to_time_t(std::chrono::system_clock::now())},
-                                                {"model", model_id},
-                                                {"choices", {{
-                                                    {"index", 0},
-                                                    {"delta", {{"reasoning_content", safe_text}}},
-                                                    {"finish_reason", nullptr}
-                                                }}}
-                                            };
-                                            std::string sse_chunk = "data: " + delta_chunk.dump(-1, ' ', false, json::error_handler_t::replace) + "\n\n";
-                                            return sink.write(sse_chunk.data(), sse_chunk.size()) && !g_stop_requested.load();
+                                            return send_sse_delta(sink, req_id, model_id, created_time_str, "reasoning_content", safe_text);
                                         });
                                     } else {
-                                        json delta_chunk = {
-                                            {"id", req_id},
-                                            {"object", "chat.completion.chunk"},
-                                            {"created", std::chrono::system_clock::to_time_t(std::chrono::system_clock::now())},
-                                            {"model", model_id},
-                                            {"choices", {{
-                                                {"index", 0},
-                                                {"delta", {{"reasoning_content", text}}},
-                                                {"finish_reason", nullptr}
-                                            }}}
-                                        };
-                                        std::string sse_chunk = "data: " + delta_chunk.dump(-1, ' ', false, json::error_handler_t::replace) + "\n\n";
-                                        return sink.write(sse_chunk.data(), sse_chunk.size()) && !g_stop_requested.load();
+                                        return send_sse_delta(sink, req_id, model_id, created_time_str, "reasoning_content", text);
                                     }
                                 } else {
                                     round_content += text;
                                     if (g_enable_tools && !tools.empty()) {
                                         return content_filter.feed(text, [&](const std::string& safe_text) -> bool {
-                                            json delta_chunk = {
-                                                {"id", req_id},
-                                                {"object", "chat.completion.chunk"},
-                                                {"created", std::chrono::system_clock::to_time_t(std::chrono::system_clock::now())},
-                                                {"model", model_id},
-                                                {"choices", {{
-                                                    {"index", 0},
-                                                    {"delta", {{"content", safe_text}}},
-                                                    {"finish_reason", nullptr}
-                                                }}}
-                                            };
-                                            std::string sse_chunk = "data: " + delta_chunk.dump(-1, ' ', false, json::error_handler_t::replace) + "\n\n";
-                                            return sink.write(sse_chunk.data(), sse_chunk.size()) && !g_stop_requested.load();
+                                            return send_sse_delta(sink, req_id, model_id, created_time_str, "content", safe_text);
                                         });
                                     } else {
-                                        json delta_chunk = {
-                                            {"id", req_id},
-                                            {"object", "chat.completion.chunk"},
-                                            {"created", std::chrono::system_clock::to_time_t(std::chrono::system_clock::now())},
-                                            {"model", model_id},
-                                            {"choices", {{
-                                                {"index", 0},
-                                                {"delta", {{"content", text}}},
-                                                {"finish_reason", nullptr}
-                                            }}}
-                                        };
-                                        std::string sse_chunk = "data: " + delta_chunk.dump(-1, ' ', false, json::error_handler_t::replace) + "\n\n";
-                                        return sink.write(sse_chunk.data(), sse_chunk.size()) && !g_stop_requested.load();
+                                        return send_sse_delta(sink, req_id, model_id, created_time_str, "content", text);
                                     }
                                 }
                             }, repetition_penalty, enable_thinking, max_thinking_tokens, top_p, min_p, top_k);
@@ -10737,34 +10711,10 @@ static void run_server(MoecherEngine& engine, int port, int default_thinking_bud
 
                             if (g_enable_tools && !tools.empty()) {
                                 reasoning_filter.flush_remaining([&](const std::string& safe_text) -> bool {
-                                    json delta_chunk = {
-                                        {"id", req_id},
-                                        {"object", "chat.completion.chunk"},
-                                        {"created", std::chrono::system_clock::to_time_t(std::chrono::system_clock::now())},
-                                        {"model", model_id},
-                                        {"choices", {{
-                                            {"index", 0},
-                                            {"delta", {{"reasoning_content", safe_text}}},
-                                            {"finish_reason", nullptr}
-                                        }}}
-                                    };
-                                    std::string sse_chunk = "data: " + delta_chunk.dump(-1, ' ', false, json::error_handler_t::replace) + "\n\n";
-                                    return sink.write(sse_chunk.data(), sse_chunk.size()) && !g_stop_requested.load();
+                                    return send_sse_delta(sink, req_id, model_id, created_time_str, "reasoning_content", safe_text);
                                 });
                                 content_filter.flush_remaining([&](const std::string& safe_text) -> bool {
-                                    json delta_chunk = {
-                                        {"id", req_id},
-                                        {"object", "chat.completion.chunk"},
-                                        {"created", std::chrono::system_clock::to_time_t(std::chrono::system_clock::now())},
-                                        {"model", model_id},
-                                        {"choices", {{
-                                            {"index", 0},
-                                            {"delta", {{"content", safe_text}}},
-                                            {"finish_reason", nullptr}
-                                        }}}
-                                    };
-                                    std::string sse_chunk = "data: " + delta_chunk.dump(-1, ' ', false, json::error_handler_t::replace) + "\n\n";
-                                    return sink.write(sse_chunk.data(), sse_chunk.size()) && !g_stop_requested.load();
+                                    return send_sse_delta(sink, req_id, model_id, created_time_str, "content", safe_text);
                                 });
                             }
 
