@@ -236,10 +236,11 @@ def quantize_qwen_vision(
 
                 is_2d = (len(shape) == 2 and shape[0] >= 512 and shape[1] >= 512 and shape[1] % block_size == 0)
                 is_visual = ("visual" in t_name)
-                is_embed = ("embed" in t_name)
+                is_embed = ("embed" in t_name and "mtp" not in t_name)
                 is_head = ("lm_head" in t_name or "head.weight" in t_name)
-                is_mlp = ("mlp" in t_name)
-                is_attn = ("attn" in t_name and not is_visual)
+                is_mtp = ("mtp" in t_name)
+                is_mlp = ("mlp" in t_name and not is_mtp)
+                is_attn = ("attn" in t_name and not is_visual and not is_mtp)
 
                 # Determine target quantization format for this tensor
                 target_format = "BF16"
@@ -252,6 +253,8 @@ def quantize_qwen_vision(
                 elif is_embed and quantize_embed and is_2d:
                     target_format = "int4"
                 elif is_head and quantize_head and is_2d:
+                    target_format = "int4"
+                elif is_mtp and is_2d:
                     target_format = "int4"
                 elif is_mlp and is_2d:
                     if mlp_scheme == "hybrid" and "down_proj" in t_name:
@@ -368,10 +371,21 @@ def quantize_qwen_vision(
                     cur_size = dense_tensors_meta[t_name]["nbytes"] + dense_tensors_meta[t_name].get("scale_nbytes", 0)
                     print(f"[{idx+1}/{total_tensors}] {target_format.upper():5s}: {t_name} {shape} -> {cur_size / (1024**2):.2f} MB")
 
-        # Copy tokenizer if available
-        src_tok = manifest_in.parent / "tokenizer.json"
-        if src_tok.exists():
-            shutil.copy2(src_tok, output_dir / "tokenizer.json")
+        # Copy tokenizer and draft model files if available
+        src_dir = manifest_in.parent
+        for extra_file in [
+            "tokenizer.json",
+            "draft_lm_head_int8_bf16.bin",
+            "draft_lm_head_int8.bin",
+            "draft_vocab_ids.bin",
+            "draft_vocab_ids.json",
+            "draft_vocab_ids_mapping.json",
+            "draft_vocab_ids_reverse.bin"
+        ]:
+            src_path = src_dir / extra_file
+            if src_path.exists():
+                shutil.copy2(src_path, output_dir / extra_file)
+                print(f"  [Copied] {extra_file} -> {output_dir / extra_file}")
 
     # Mode 2: Convert from raw safetensors directory
     elif raw_hf_dir and raw_hf_dir.exists():
@@ -413,10 +427,11 @@ def quantize_qwen_vision(
 
                 is_2d = (len(shape) == 2 and shape[0] >= 512 and shape[1] >= 512 and shape[1] % block_size == 0)
                 is_visual = ("visual" in t_name)
-                is_embed = ("embed" in t_name)
+                is_embed = ("embed" in t_name and "mtp" not in t_name)
                 is_head = ("lm_head" in t_name or "head.weight" in t_name)
-                is_mlp = ("mlp" in t_name)
-                is_attn = ("attn" in t_name and not is_visual)
+                is_mtp = ("mtp" in t_name)
+                is_mlp = ("mlp" in t_name and not is_mtp)
+                is_attn = ("attn" in t_name and not is_visual and not is_mtp)
 
                 target_format = "BF16"
                 if is_visual:
@@ -424,6 +439,8 @@ def quantize_qwen_vision(
                 elif is_embed and quantize_embed and is_2d:
                     target_format = "int4"
                 elif is_head and quantize_head and is_2d:
+                    target_format = "int4"
+                elif is_mtp and is_2d:
                     target_format = "int4"
                 elif is_mlp and is_2d:
                     target_format = "int4" if (mlp_scheme == "hybrid" and "down_proj" in t_name) else f"int{mlp_bits}"

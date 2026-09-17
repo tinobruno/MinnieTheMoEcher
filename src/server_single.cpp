@@ -2185,7 +2185,7 @@ public:
     float rms_eps_ = 1e-6f;
 
     // MTP module weights (loaded from main model checkpoint)
-    GPUTensor mtp_fc_w_;                   // [5120, 10240] BF16
+    GPUTensor mtp_fc_w_, mtp_fc_s_;        // [5120, 10240] BF16 or INT4
     GPUTensor mtp_pre_fc_norm_hidden_w_;   // [5120] BF16
     GPUTensor mtp_pre_fc_norm_embed_w_;    // [5120] BF16
     GPUTensor mtp_norm_w_;                 // [5120] BF16
@@ -2292,8 +2292,16 @@ public:
         };
 
         // Load MTP module weights
-        if (!load_t(mtp_fc_w_, "mtp.fc.weight")) {
-            LOG_WARN("MTP: mtp.fc.weight not found, MTP self-drafter disabled");
+        bool fc_loaded = false;
+        if (tensor_map.contains("mtp.fc.weight")) {
+            if (tensor_map["mtp.fc.weight"].value("dtype", "") == "int4") {
+                fc_loaded = load_quant_t(mtp_fc_w_, mtp_fc_s_, "mtp.fc.weight");
+            } else {
+                fc_loaded = load_t(mtp_fc_w_, "mtp.fc.weight");
+            }
+        }
+        if (!fc_loaded) {
+            LOG_WARN("MTP: mtp.fc.weight not found or failed to load, MTP self-drafter disabled");
             return false;
         }
         load_t(mtp_pre_fc_norm_hidden_w_, "mtp.pre_fc_norm_hidden.weight");
@@ -2313,18 +2321,20 @@ public:
         load_quant_t(mtp_layer_up_w_, mtp_layer_up_s_, "mtp.layers.0.mlp.up_proj.weight");
         load_quant_t(mtp_layer_down_w_, mtp_layer_down_s_, "mtp.layers.0.mlp.down_proj.weight");
 
+        if (!mtp_layer_attn_norm_w_.data || !mtp_layer_post_attn_norm_w_.data ||
+            !mtp_layer_q_proj_w_.data || !mtp_layer_k_proj_w_.data ||
+            !mtp_layer_v_proj_w_.data || !mtp_layer_o_proj_w_.data ||
+            !mtp_layer_gate_w_.data || !mtp_layer_up_w_.data || !mtp_layer_down_w_.data) {
+            LOG_WARN("MTP: One or more MTP transformer layer weights could not be loaded (ensure INT4 format), MTP self-drafter disabled");
+            return false;
+        }
+
         // Allocate MTP KV cache
         int max_seq = 32768;
         mtp_k_cache_.alloc(max_seq * num_kv_heads_ * head_dim_ * sizeof(__nv_bfloat16));
         mtp_v_cache_.alloc(max_seq * num_kv_heads_ * head_dim_ * sizeof(__nv_bfloat16));
         CUDA_CHECK(cudaMemsetAsync(mtp_k_cache_.data, 0, mtp_k_cache_.size_bytes, stream));
         CUDA_CHECK(cudaMemsetAsync(mtp_v_cache_.data, 0, mtp_v_cache_.size_bytes, stream));
-
-        // Validate full lm_head pointer
-        if (!full_lm_head_w_) {
-            LOG_WARN("MTP: full lm_head pointer is null, MTP drafter disabled");
-            return false;
-        }
 
         // Try loading compact draft vocabulary and draft lm_head (BF16)
         std::string draft_ids_path = model_dir + "/draft_vocab_ids.bin";
@@ -2358,7 +2368,12 @@ public:
         if (f_ids) fclose(f_ids);
         if (f_head) fclose(f_head);
 
+        // Validate lm_head pointer if draft vocabulary is not available
         if (!use_draft_vocab_) {
+            if (!full_lm_head_w_) {
+                LOG_WARN("MTP: full lm_head pointer is null and no draft lm_head found, MTP drafter disabled");
+                return false;
+            }
             LOG_INFO("MTP: Using full model lm_head [%d, %d] BF16 (shared, no extra VRAM)",
                      full_vocab_size_, hidden_size_);
         }
@@ -2388,7 +2403,7 @@ public:
         loaded_ = true;
         LOG_INFO("MTP Self-Drafter loaded: 1 transformer layer + full %dk vocab (shared lm_head) = %.1f MB own VRAM",
                  full_vocab_size_ / 1000,
-                 (mtp_fc_w_.size_bytes + mtp_layer_q_proj_w_.size_bytes + mtp_layer_k_proj_w_.size_bytes +
+                 (mtp_fc_w_.size_bytes + mtp_fc_s_.size_bytes + mtp_layer_q_proj_w_.size_bytes + mtp_layer_k_proj_w_.size_bytes +
                   mtp_layer_v_proj_w_.size_bytes + mtp_layer_o_proj_w_.size_bytes +
                   mtp_layer_gate_w_.size_bytes + mtp_layer_up_w_.size_bytes + mtp_layer_down_w_.size_bytes +
                   mtp_k_cache_.size_bytes + mtp_v_cache_.size_bytes) / (1024.0 * 1024.0));
@@ -2440,8 +2455,14 @@ public:
                                    hidden_size_ * sizeof(__nv_bfloat16), cudaMemcpyDeviceToDevice, stream));
 
         // 4. FC projection: [10240] → [5120]
-        gemv_bf16_out_bf16_cuda(buf_mtp_hidden_.bf16(), mtp_fc_w_.bf16(), buf_mtp_concat_.bf16(),
-                                hidden_size_, 2 * hidden_size_, stream);
+        if (mtp_fc_w_.dtype == "int4") {
+            gemv_int4_cuda(buf_mtp_hidden_.bf16(), buf_mtp_concat_.bf16(),
+                           (const uint8_t*)mtp_fc_w_.data, mtp_fc_s_.bf16(),
+                           hidden_size_, 2 * hidden_size_, stream);
+        } else {
+            gemv_bf16_out_bf16_cuda(buf_mtp_hidden_.bf16(), mtp_fc_w_.bf16(), buf_mtp_concat_.bf16(),
+                                    hidden_size_, 2 * hidden_size_, stream);
+        }
 
         // 5. MTP Transformer layer
         // 5a. Attention pre-norm
@@ -4500,8 +4521,11 @@ public:
                 }
 
                 // Priority 2: Prompt-Lookup Drafting (free, zero GPU cost)
+                // Note: Qwen DeltaNet SSM batch kernel maintains 2 rollback slots (slot 0 & 1),
+                // so limit PLD draft tokens to at most 2 for Qwen to prevent unpopulated slot commits.
                 if (cfg_.architecture == ModelArch::QWEN && !is_mtp && enable_pld_ && !history.empty()) {
-                    std::vector<int> pld_cands = PromptLookupDrafter::draft(history, 5, 3, 2);
+                    int max_pld = std::min(pld_draft_tokens_, 2);
+                    std::vector<int> pld_cands = PromptLookupDrafter::draft(history, max_pld, 3, 2);
                     if (!pld_cands.empty()) {
                         for (int tok : pld_cands) {
                             cand_tokens.push_back(tok);
@@ -5152,15 +5176,18 @@ private:
                 mtp_model_dir = "f:/Moecher/models/qwen3_8_27b_q4";
             }
             if (tensor_map.contains("mtp.fc.weight")) {
-                if (head_weight_.dtype == "int4") {
-                    LOG_WARN("MTP: Full lm_head is INT4, not supported for MTP yet — skipping MTP");
+                std::string draft_ids_path = mtp_model_dir + "/draft_vocab_ids.bin";
+                std::string draft_head_path = mtp_model_dir + "/draft_lm_head_int8_bf16.bin";
+                bool has_draft_head = (access(draft_ids_path.c_str(), R_OK) == 0 && access(draft_head_path.c_str(), R_OK) == 0);
+                if (head_weight_.dtype == "int4" && !has_draft_head) {
+                    LOG_WARN("MTP: Full lm_head is INT4 and no draft_lm_head_int8_bf16.bin found — skipping MTP");
                 } else {
                     mtp_drafter_.load_mtp_weights(mapped, tensor_map, 
                                                   embed_weight_.dtype == "int4" ? nullptr : embed_weight_.bf16(),
                                                   embed_weight_.dtype == "int4" ? (uint8_t*)embed_weight_.data : nullptr,
                                                   embed_weight_scale_.bf16(),
                                                   embed_weight_.dtype == "int4",
-                                                  head_weight_.bf16(),
+                                                  head_weight_.dtype == "int4" ? nullptr : head_weight_.bf16(),
                                                   cfg_.vocab_size, mtp_model_dir, main_stream_);
                 }
             }
@@ -5861,6 +5888,8 @@ private:
 
     inline void commit_target_state_slot(int slot_idx) {
         if (slot_idx < 0 || slot_idx >= 8) return;
+        // DeltaNet SSM batch kernel currently saves slot 0 and slot 1. Slots >= 2 are not populated.
+        if (slot_idx >= 2) return;
         if (target_ssm_pool_.data && target_ssm_slots_[slot_idx].data) {
             CUDA_CHECK(cudaMemcpyAsync(target_ssm_pool_.data, target_ssm_slots_[slot_idx].data, target_ssm_pool_.size_bytes, cudaMemcpyDeviceToDevice, main_stream_));
             CUDA_CHECK(cudaMemcpyAsync(target_conv_pool_.data, target_conv_slots_[slot_idx].data, target_conv_pool_.size_bytes, cudaMemcpyDeviceToDevice, main_stream_));
