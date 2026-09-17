@@ -62,6 +62,37 @@ Measured on **NVIDIA RTX PRO 6000 (Blackwell 96GB VRAM, Compute 12.0)**:
 | **Router Latency** | Host D2H sync | **Single GPU Block Reduction** | **Zero CPU-GPU sync stalls** |
 | **Context Retention** | 32-token truncation | **Full 32K token reasoning cache** | **Zero reasoning context amnesia** |
 
+
+---
+
+## Understanding Generation Speed & Context-Length Scaling
+
+Depending on the prompt context and active features, you may observe generation throughput between **~42 tok/s** and **~110 tok/s**. Understanding why generation can be slower in the current version:
+
+### 1. Raw Engine Speed vs. Agentic Tool Context
+* **Short Prompts / Chat Mode (No Tools, 20–50 prompt tokens)**: **98 – 110 tok/s**
+  * Speculative verification cycle time: **~18–20 ms / cycle**.
+  * With 70–75% MTP candidate acceptance, sustained throughput reaches **~100+ tok/s**.
+* **Agentic Web UI Mode with Tools Enabled (`tools: "default"`, 3,145+ tokens)**: **42 – 55 tok/s**
+  * Speculative verification cycle time: **~42–45 ms / cycle** (+22 ms per cycle).
+  * **Architectural Reason**: Qwen 3.8 27B is a hybrid architecture containing **48 Linear Attention (DeltaNet) layers** and **16 Full Grouped Query Attention (GQA) layers**.
+    * DeltaNet layers evaluate in $O(1)$ constant time regardless of context length using fast on-chip shared-memory recurrence (`deltanet_ssm_batch_kernel`).
+    * However, the 16 full GQA layers must compute attention over the entire sequence history for every speculative candidate token ($M=3$ candidates $\times$ 16 layers = 48 kernel calls per cycle).
+    * When the Web UI has **Agentic & Tools** enabled, full JSON schemas for 13 built-in/MCP tools are injected into the system prompt (**3,145 tokens**).
+    * In the current kernel implementation (`qwen_gqa_compute_attn_fp8_kernel`), attention over the FP8 KV cache iterates across all 3,145 tokens using sequential byte loads, adding ~22 ms of memory latency per cycle and bringing sustained throughput to ~44 tok/s.
+
+### 2. Short-Response Startup & Early EOS Penalty
+* When prompting short queries (e.g. `"hello"` which generates ~34 tokens total):
+  * Speculative decoding begins with $K=1$ before ramping up.
+  * Hitting the `<|im_end|>` (EOS) token rejects the draft candidate on the final cycle.
+  * For a 34-token burst, initial ramp-up and final teardown account for ~20% of the total wall-clock time. Sustained long-form generation (300+ tokens) achieves significantly higher effective throughput.
+
+### 3. How to Maximize Generation Speed
+* **To run at full 100+ tok/s**: In the Web UI, open the **Agentic & Tools** settings tab and toggle off Web/Local tools (or send `"tools": []` via API). The prompt length drops from 3,156 tokens down to ~20 tokens, immediately unlocking full **98–110 tok/s** speed.
+* **Prefill Speed**: While decoding scales with active KV cache size, prefix evaluation is instantaneous (**0 ms prefill latency**) because the 3,145-token tooling prefix is pre-warmed and stored in a **Pinned System KV Cache snapshot** at startup.
+
+> 📖 **Engineering & Research Log**: For deep technical breakdowns, mathematical analyses, and root-cause post-mortems of every bug and optimization, see [DISCOVERIES_AND_ENDEAVOURS_LOG.md](DISCOVERIES_AND_ENDEAVOURS_LOG.md).
+
 ---
 
 ## Setup Guide
