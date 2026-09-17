@@ -5659,6 +5659,11 @@ private:
                                         (const uint8_t*)lw.w_gate.data, lw.w_gate_scale.bf16(),
                                         (const uint8_t*)lw.w_up.data, lw.w_up_scale.bf16(),
                                         inter_size, dim, cfg_.swiglu_limit, main_stream_);
+        } else if (lw.w_gate.dtype == "int3") {
+            gemv_int3_swiglu_fused_cuda(buf_gate_.bf16(), buf_hidden2_.bf16(),
+                                        (const uint8_t*)lw.w_gate.data, lw.w_gate_scale.bf16(),
+                                        (const uint8_t*)lw.w_up.data, lw.w_up_scale.bf16(),
+                                        inter_size, dim, cfg_.swiglu_limit, main_stream_);
         } else {
             matmul_proj(buf_gate_, buf_hidden2_, lw.w_gate, lw.w_gate_scale, inter_size, dim);
             matmul_proj(buf_up_, buf_hidden2_, lw.w_up, lw.w_up_scale, inter_size, dim);
@@ -5668,6 +5673,10 @@ private:
         // 10. Down projection: in-place residual accumulation into buf_hidden_
         if (lw.w_down.dtype == "int4") {
             gemv_int4_residual_cuda(buf_hidden_.bf16(), buf_gate_.bf16(),
+                                    (const uint8_t*)lw.w_down.data, lw.w_down_scale.bf16(),
+                                    dim, inter_size, main_stream_);
+        } else if (lw.w_down.dtype == "int3") {
+            gemv_int3_residual_cuda(buf_hidden_.bf16(), buf_gate_.bf16(),
                                     (const uint8_t*)lw.w_down.data, lw.w_down_scale.bf16(),
                                     dim, inter_size, main_stream_);
         } else {
@@ -5688,7 +5697,13 @@ private:
             if (weight.dtype == "int4") {
                 gemm_int4_batch_cuda(out.bf16(), in_vec.bf16(), (const uint8_t*)weight.data, scale.bf16(), N, K, M, main_stream_);
             } else if (weight.dtype == "int3") {
-                gemm_int3_dequant(out.bf16(), M, N, K, in_vec.bf16(), (const uint8_t*)weight.data, scale.bf16(), 32, main_stream_);
+                if (M == 1) {
+                    gemv_int3_cuda(out.bf16(), in_vec.bf16(), (const uint8_t*)weight.data, scale.bf16(), N, K, main_stream_);
+                } else if (M <= 8) {
+                    gemm_int3_batch_cuda(out.bf16(), in_vec.bf16(), (const uint8_t*)weight.data, scale.bf16(), N, K, M, main_stream_);
+                } else {
+                    gemm_int3_dequant(out.bf16(), M, N, K, in_vec.bf16(), (const uint8_t*)weight.data, scale.bf16(), 32, main_stream_);
+                }
             } else {
                 gemv_bf16_out_bf16_batch_cuda(out.bf16(), weight.bf16(), in_vec.bf16(), N, K, M, main_stream_);
             }
@@ -5760,6 +5775,11 @@ private:
         // FFN SwiGLU for M tokens simultaneously:
         if (lw.w_gate.dtype == "int4") {
             gemm_int4_swiglu_fused_batch_cuda(buf_gate_batch_.bf16(), buf_hidden2_batch_.bf16(),
+                                              (const uint8_t*)lw.w_gate.data, lw.w_gate_scale.bf16(),
+                                              (const uint8_t*)lw.w_up.data, lw.w_up_scale.bf16(),
+                                              inter_size, dim, M, cfg_.swiglu_limit, main_stream_);
+        } else if (lw.w_gate.dtype == "int3" && M <= 8) {
+            gemm_int3_swiglu_fused_batch_cuda(buf_gate_batch_.bf16(), buf_hidden2_batch_.bf16(),
                                               (const uint8_t*)lw.w_gate.data, lw.w_gate_scale.bf16(),
                                               (const uint8_t*)lw.w_up.data, lw.w_up_scale.bf16(),
                                               inter_size, dim, M, cfg_.swiglu_limit, main_stream_);

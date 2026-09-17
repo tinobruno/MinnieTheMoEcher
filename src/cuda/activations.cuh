@@ -167,6 +167,42 @@ void gemv_int3_cuda(
     int N, int K,
     cudaStream_t stream = 0);
 
+void gemv_int3_residual_cuda(
+    __nv_bfloat16* inout,
+    const __nv_bfloat16* vec,
+    const uint8_t* weight,
+    const __nv_bfloat16* scale,
+    int N, int K,
+    cudaStream_t stream = 0);
+
+void gemm_int3_batch_cuda(
+    __nv_bfloat16* out,
+    const __nv_bfloat16* A,
+    const uint8_t* weight,
+    const __nv_bfloat16* scale,
+    int N, int K, int M,
+    cudaStream_t stream = 0);
+
+void gemv_int3_swiglu_fused_cuda(
+    __nv_bfloat16* out,
+    const __nv_bfloat16* vec,
+    const uint8_t* gate_weight,
+    const __nv_bfloat16* gate_scale,
+    const uint8_t* up_weight,
+    const __nv_bfloat16* up_scale,
+    int N, int K, float swiglu_limit = 0.0f,
+    cudaStream_t stream = 0);
+
+void gemm_int3_swiglu_fused_batch_cuda(
+    __nv_bfloat16* out,
+    const __nv_bfloat16* A,
+    const uint8_t* gate_weight,
+    const __nv_bfloat16* gate_scale,
+    const uint8_t* up_weight,
+    const __nv_bfloat16* up_scale,
+    int N, int K, int M, float swiglu_limit = 0.0f,
+    cudaStream_t stream = 0);
+
 void dequant_int3_block_cuda(
     __nv_bfloat16* out,
     const uint8_t* weight,
