@@ -12,6 +12,7 @@
 #include "embedded_web.hpp"
 #include "tool_exec.hpp"
 #include "mcp_client.hpp"
+#include "version.hpp"
 
 #include <cstdio>
 #include <cstdlib>
@@ -90,6 +91,7 @@ using std::string;
 
 static constexpr int PAGE_SIZE = 4096;
 static constexpr int MAX_SEQ_LEN = 65536;
+static constexpr const char* MOECHER_VERSION = moecher::VERSION;
 
 // ════════════════════════════════════════════════════════════════════════════════
 //  Logging
@@ -9431,7 +9433,7 @@ static void run_server(MoecherEngine& engine, int port, int default_thinking_bud
 
     // Health & status check
     svr.Get("/health", [](const httplib::Request&, httplib::Response& res) {
-        res.set_content("{\"status\":\"ok\",\"engine\":\"moecher\",\"version\":\"2.05\"}", "application/json");
+        res.set_content(std::string("{\"status\":\"ok\",\"engine\":\"moecher\",\"version\":\"") + MOECHER_VERSION + "\"}", "application/json");
     });
 
     // Local Rewriting Reverse Proxy Endpoint for Browser Preview & Cross-Origin Unblocking
@@ -11745,7 +11747,7 @@ static void run_server(MoecherEngine& engine, int port, int default_thinking_bud
     });
 
     LOG_INFO("Server listening on port %d", port);
-    LOG_INFO("version 2.08");
+    LOG_INFO("version %s", MOECHER_VERSION);
     g_server_ready = true;
     svr.listen("0.0.0.0", port);
     moecher::mcp::MCPManager::instance().stop_all();
@@ -11896,7 +11898,7 @@ int main(int argc, char** argv) {
     // Open log file
     g_log_file.open(log_path, std::ios::app);
     LOG_INFO("=== moecher starting ===");
-    LOG_INFO("=== v2.08 ===");
+    LOG_INFO("=== v%s ===", MOECHER_VERSION);
     LOG_INFO("Default thinking token budget: %d", default_thinking_budget);
     LOG_INFO("Tool calling support: %s", g_enable_tools ? "enabled" : "disabled");
     LOG_INFO("Max tool execution rounds: %d", g_max_tool_rounds);
