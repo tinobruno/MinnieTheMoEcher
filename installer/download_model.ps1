@@ -4,7 +4,7 @@
 
 param (
     [Parameter(Mandatory=$true)]
-    [ValidateSet("qwen", "deepseek", "deepseek_q4", "both")]
+    [ValidateSet("qwen", "qwen_13g", "deepseek", "deepseek_q4", "both")]
     [string]$Model,
 
     [string]$DestDir = "",
@@ -39,6 +39,21 @@ $ModelConfigs = @{
             "attention_dense_layers_q4.bin",
             "draft_vocab_ids.bin",
             "draft_lm_head_int8_bf16.bin"
+        )
+    }
+    "qwen_13g" = @{
+        "Repo"  = "$Username/moecher-qwen-3.8-27b-vision-13g"
+        "Dir"   = (Join-Path $DestDir "qwen3_8_27b_vision_13g")
+        "Files" = @(
+            "moecher_manifest.json",
+            "tokenizer.json",
+            "attention_dense_layers.bin",
+            "draft_lm_head_int8_bf16.bin",
+            "draft_lm_head_int8.bin",
+            "draft_vocab_ids.bin",
+            "draft_vocab_ids.json",
+            "draft_vocab_ids_mapping.json",
+            "draft_vocab_ids_reverse.bin"
         )
     }
     "deepseek" = @{
