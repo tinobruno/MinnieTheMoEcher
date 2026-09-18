@@ -240,12 +240,43 @@ struct MCPToolInfo {
     json input_schema;
 
     json to_openai_schema() const {
+        std::string desc = description;
+        // Trim to first sentence if verbose
+        size_t cut = desc.find(". ");
+        if (cut == std::string::npos) cut = desc.find(".\n");
+        if (cut == std::string::npos) cut = desc.find("\n");
+        if (cut != std::string::npos && cut >= 10) {
+            desc = desc.substr(0, cut + 1);
+        }
+        if (desc.size() > 120) {
+            size_t space_pos = desc.rfind(' ', 120);
+            if (space_pos != std::string::npos && space_pos > 60) {
+                desc = desc.substr(0, space_pos) + ".";
+            } else {
+                desc = desc.substr(0, 120);
+            }
+        }
+
+        json params = input_schema.is_object() ? input_schema : json::object({{"type", "object"}, {"properties", json::object()}});
+        if (params.contains("properties") && params["properties"].is_object()) {
+            for (auto& [prop_name, prop_val] : params["properties"].items()) {
+                if (prop_val.is_object()) {
+                    if (prop_val.contains("description")) prop_val.erase("description");
+                    if (prop_val.contains("title")) prop_val.erase("title");
+                }
+            }
+        }
+        if (params.contains("title")) params.erase("title");
+        if (params.contains("description")) params.erase("description");
+        if (params.contains("$schema")) params.erase("$schema");
+        if (params.contains("additionalProperties")) params.erase("additionalProperties");
+
         return {
             {"type", "function"},
             {"function", {
                 {"name", qualified_name},
-                {"description", description.empty() ? ("MCP Tool from server '" + server_id + "'") : ("[" + server_id + " MCP] " + description)},
-                {"parameters", input_schema.is_object() ? input_schema : json::object({{"type", "object"}, {"properties", json::object()}})}
+                {"description", desc.empty() ? (raw_name + " tool") : desc},
+                {"parameters", params}
             }}
         };
     }

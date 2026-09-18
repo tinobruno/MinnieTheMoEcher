@@ -2318,6 +2318,28 @@ function setSystemPromptSyncStatus(status, text) {
 let isSyncingSystemPrompt = false;
 let systemPromptDebounceTimer = null;
 let toolSyncDebounceTimer = null;
+let lastServerInstanceId = null;
+
+function renderServerRestartNotice() {
+    if (document.getElementById('server-reboot-notice')) return;
+    const noticeDiv = document.createElement('div');
+    noticeDiv.id = 'server-reboot-notice';
+    noticeDiv.style.cssText = 'margin: 12px 16px; padding: 10px 14px; background: rgba(56, 189, 248, 0.1); border: 1px solid rgba(56, 189, 248, 0.3); border-radius: 8px; font-size: 12px; color: var(--text-primary); display: flex; align-items: center; justify-content: space-between; gap: 10px; z-index: 10;';
+    noticeDiv.innerHTML = `
+        <div style="display: flex; align-items: center; gap: 8px;">
+            <span class="material-symbols-outlined" style="color: #38bdf8; font-size: 18px;">restart_alt</span>
+            <span><strong>Engine Restarted:</strong> Conversation KV cache was cleared on server. Click <em>New Chat</em> for 0ms instant prefill, or continue to re-evaluate history.</span>
+        </div>
+        <div style="display: flex; gap: 6px; align-items: center;">
+            <button onclick="clearChat(); const n = document.getElementById('server-reboot-notice'); if (n) n.remove();" class="btn btn-secondary" style="padding: 4px 10px; font-size: 11px; cursor: pointer; border-radius: 4px; border: 1px solid #38bdf8; color: #38bdf8;">New Chat (0ms)</button>
+            <button onclick="this.closest('#server-reboot-notice').remove();" style="background: transparent; border: none; color: var(--text-secondary); cursor: pointer; font-size: 16px;">&times;</button>
+        </div>
+    `;
+    if (messagesContainer) {
+        messagesContainer.appendChild(noticeDiv);
+        messagesContainer.scrollTo({ top: messagesContainer.scrollHeight, behavior: 'smooth' });
+    }
+}
 
 async function fetchBackendSystemPrompt() {
     try {
@@ -2332,6 +2354,14 @@ async function fetchBackendSystemPrompt() {
             const count = (data.tokens_count !== undefined) ? data.tokens_count : data.num_tokens;
             const tokStr = count ? ` (${count} tokens)` : '';
             setSystemPromptSyncStatus('synced', `Synced with engine${tokStr}`);
+
+            if (data.server_instance_id) {
+                if (lastServerInstanceId && lastServerInstanceId !== data.server_instance_id && chatHistory && chatHistory.length > 0) {
+                    console.info('[Engine] Server reboot detected. Conversation turn cache was reset.');
+                    renderServerRestartNotice();
+                }
+                lastServerInstanceId = data.server_instance_id;
+            }
         }
     } catch (e) {
         console.warn('Failed to fetch backend system prompt:', e);
@@ -2417,6 +2447,8 @@ async function initSystemPromptSync() {
     } else {
         await fetchBackendSystemPrompt();
     }
+    window.addEventListener('focus', () => fetchBackendSystemPrompt());
+    setInterval(() => fetchBackendSystemPrompt(), 30000);
 }
 
 // Authorization Modal Prompt
@@ -2650,7 +2682,11 @@ function buildOptimizedMessagesPayload() {
 
         if (msg.tool_calls && Array.isArray(msg.tool_calls)) {
             // Only preserve tool calls for tools that are currently enabled
-            const allowedCalls = msg.tool_calls.filter(tc => activeTools.includes(tc.name) || tc.name.startsWith('mcp__') || tc.name.startsWith('tinobruno-'));
+            const allowedCalls = msg.tool_calls.filter(tc => {
+                const name = (tc && tc.function && tc.function.name) ? tc.function.name : (tc && tc.name ? tc.name : '');
+                if (!name) return true;
+                return activeTools.includes(name) || name.startsWith('mcp__') || name.startsWith('tinobruno-');
+            });
             if (allowedCalls.length > 0) {
                 cleanedMsg.tool_calls = allowedCalls;
             }
@@ -3683,6 +3719,7 @@ async function sendMessage() {
                     reasoning_content: roundReasoning || undefined,
                     tool_calls: validToolCalls.map(tc => ({
                         id: tc.id,
+                        name: tc.name,
                         type: tc.type || 'function',
                         function: { name: tc.name, arguments: tc.arguments }
                     }))

@@ -7727,13 +7727,13 @@ static json resolve_canonical_tools(const json& tools_input) {
             {"type", "function"},
             {"function", {
                 {"name", "web_search"},
-                {"description", "Search the live web for facts, documentation, news, websites, articles, and general information."},
+                {"description", "Search the web for current information and news."},
                 {"parameters", {
                     {"type", "object"},
                     {"properties", {
-                        {"query", {{"type", "string"}, {"description", "The search query string."}}},
-                        {"num_results", {{"type", "integer"}, {"description", "Optional number of results (1-10, default: 4)."}}},
-                        {"site", {{"type", "string"}, {"description", "Optional domain filter (e.g. 'github.com')."}}}
+                        {"query", {{"type", "string"}}},
+                        {"num_results", {{"type", "integer"}}},
+                        {"site", {{"type", "string"}}}
                     }},
                     {"required", json::array({"query"})}
                 }}
@@ -7743,12 +7743,12 @@ static json resolve_canonical_tools(const json& tools_input) {
             {"type", "function"},
             {"function", {
                 {"name", "youtube_search"},
-                {"description", "Search YouTube directly for songs, music, videos, trailers, podcasts, and clips. Returns instant video links and playable preview."},
+                {"description", "Search YouTube for videos and music."},
                 {"parameters", {
                     {"type", "object"},
                     {"properties", {
-                        {"query", {{"type", "string"}, {"description", "The video, song, or music search query string."}}},
-                        {"num_results", {{"type", "integer"}, {"description", "Optional number of results (1-5, default: 3)."}}}
+                        {"query", {{"type", "string"}}},
+                        {"num_results", {{"type", "integer"}}}
                     }},
                     {"required", json::array({"query"})}
                 }}
@@ -7758,13 +7758,13 @@ static json resolve_canonical_tools(const json& tools_input) {
             {"type", "function"},
             {"function", {
                 {"name", "google_search"},
-                {"description", "Search the web using Google Search engine."},
+                {"description", "Search the web using Google."},
                 {"parameters", {
                     {"type", "object"},
                     {"properties", {
-                        {"query", {{"type", "string"}, {"description", "The search query string."}}},
-                        {"num_results", {{"type", "integer"}, {"description", "Optional number of results (1-10, default: 4)."}}},
-                        {"site", {{"type", "string"}, {"description", "Optional domain filter."}}}
+                        {"query", {{"type", "string"}}},
+                        {"num_results", {{"type", "integer"}}},
+                        {"site", {{"type", "string"}}}
                     }},
                     {"required", json::array({"query"})}
                 }}
@@ -7774,14 +7774,14 @@ static json resolve_canonical_tools(const json& tools_input) {
             {"type", "function"},
             {"function", {
                 {"name", "fetch_url"},
-                {"description", "Fetch clean readable text, metadata, or documentation from a public web URL."},
+                {"description", "Fetch text content from a web URL."},
                 {"parameters", {
                     {"type", "object"},
                     {"properties", {
-                        {"url", {{"type", "string"}, {"description", "The complete HTTP or HTTPS URL to fetch."}}},
-                        {"mode", {{"type", "string"}, {"enum", {"text", "raw", "scripts", "links"}}, {"description", "Extraction mode (default: 'text')."}}},
-                        {"pattern", {{"type", "string"}, {"description", "Optional substring filter."}}},
-                        {"max_chars", {{"type", "integer"}, {"description", "Max characters (default: 1500)."}}}
+                        {"url", {{"type", "string"}}},
+                        {"mode", {{"type", "string"}, {"enum", {"text", "raw", "scripts", "links"}}}},
+                        {"pattern", {{"type", "string"}}},
+                        {"max_chars", {{"type", "integer"}}}
                     }},
                     {"required", json::array({"url"})}
                 }}
@@ -7791,13 +7791,13 @@ static json resolve_canonical_tools(const json& tools_input) {
             {"type", "function"},
             {"function", {
                 {"name", "read_file"},
-                {"description", "Read the text contents of a file on the local filesystem with optional line numbers."},
+                {"description", "Read file contents from local filesystem."},
                 {"parameters", {
                     {"type", "object"},
                     {"properties", {
-                        {"path", {{"type", "string"}, {"description", "The relative or absolute file path to read."}}},
-                        {"start_line", {{"type", "integer"}, {"description", "Optional 1-indexed starting line number."}}},
-                        {"end_line", {{"type", "integer"}, {"description", "Optional 1-indexed ending line number."}}}
+                        {"path", {{"type", "string"}}},
+                        {"start_line", {{"type", "integer"}}},
+                        {"end_line", {{"type", "integer"}}}
                     }},
                     {"required", json::array({"path"})}
                 }}
@@ -7807,13 +7807,13 @@ static json resolve_canonical_tools(const json& tools_input) {
             {"type", "function"},
             {"function", {
                 {"name", "write_file"},
-                {"description", "Create a new file or completely overwrite an existing file with the provided text."},
+                {"description", "Write or overwrite a file on local filesystem."},
                 {"parameters", {
                     {"type", "object"},
                     {"properties", {
-                        {"path", {{"type", "string"}, {"description", "The relative or absolute file path to write."}}},
-                        {"content", {{"type", "string"}, {"description", "The complete text content to write."}}},
-                        {"overwrite", {{"type", "boolean"}, {"description", "Whether to overwrite (default: true)."}}}
+                        {"path", {{"type", "string"}}},
+                        {"content", {{"type", "string"}}},
+                        {"overwrite", {{"type", "boolean"}}}
                     }},
                     {"required", json::array({"path", "content"})}
                 }}
@@ -7823,13 +7823,13 @@ static json resolve_canonical_tools(const json& tools_input) {
             {"type", "function"},
             {"function", {
                 {"name", "edit_file"},
-                {"description", "Perform a precise search-and-replace on a unique block of text within an existing file."},
+                {"description", "Replace unique text in an existing file."},
                 {"parameters", {
                     {"type", "object"},
                     {"properties", {
-                        {"path", {{"type", "string"}, {"description", "The relative or absolute file path to edit."}}},
-                        {"target_content", {{"type", "string"}, {"description", "Exact block of lines to replace."}}},
-                        {"replacement_content", {{"type", "string"}, {"description", "New replacement content."}}}
+                        {"path", {{"type", "string"}}},
+                        {"target_content", {{"type", "string"}}},
+                        {"replacement_content", {{"type", "string"}}}
                     }},
                     {"required", json::array({"path", "target_content", "replacement_content"})}
                 }}
@@ -7839,11 +7839,11 @@ static json resolve_canonical_tools(const json& tools_input) {
             {"type", "function"},
             {"function", {
                 {"name", "execute_command"},
-                {"description", "Execute a terminal/shell command on the local system and return its output."},
+                {"description", "Execute a local shell command."},
                 {"parameters", {
                     {"type", "object"},
                     {"properties", {
-                        {"command", {{"type", "string"}, {"description", "The exact shell command line to execute."}}}
+                        {"command", {{"type", "string"}}}
                     }},
                     {"required", json::array({"command"})}
                 }}
@@ -7885,101 +7885,41 @@ static json resolve_canonical_tools(const json& tools_input) {
     return json::array();
 }
 
-static std::string build_dynamic_tools_prompt(const json& resolved_tools) {
+static std::string build_dynamic_tools_prompt(const json& resolved_tools, bool is_qwen = false) {
     if (!resolved_tools.is_array() || resolved_tools.empty()) {
         return "";
     }
 
-    std::unordered_set<std::string> active_names;
-    bool has_mcp = false;
+    bool has_yt = false;
     for (const auto& item : resolved_tools) {
-        if (item.contains("function") && item["function"].contains("name")) {
-            std::string name = item["function"]["name"].get<std::string>();
-            active_names.insert(name);
-            if (name.rfind("mcp__", 0) == 0 || name.rfind("tinobruno-", 0) == 0) {
-                has_mcp = true;
-            }
+        if (item.contains("function") && item["function"].value("name", "") == "youtube_search") {
+            has_yt = true;
+            break;
         }
     }
 
     std::string prompt =
         "\n\n# Tools\n\n"
-        "You have access to a set of built-in tools to inspect files, make precise code modifications, run commands, and search the web.\n"
+        "You may call one or more functions to assist with the user query.\n"
         "You are provided with function signatures within <tools></tools> XML tags:\n"
-        "<tools>\n" + resolved_tools.dump(2) + "\n</tools>\n\n"
-        "For each function call, return a json object with function name and arguments within <tool_call></tool_call> XML tags:\n"
-        "<tool_call>\n"
-        "{\"name\": \"<function-name>\", \"arguments\": <args-json-object>}\n"
-        "</tool_call>\n\n"
-        "## Tool Usage Instructions:\n";
-
-    if (active_names.count("web_search") || active_names.count("google_search")) {
-        std::string search_tool = active_names.count("web_search") ? "web_search" : "google_search";
-        prompt += "- CRITICAL RULE: When the user asks to search (e.g. 'search <query>', 'who is <person>', 'what is <topic>', search Google, look up facts, recent news, people, documentation, code, or websites), you MUST immediately invoke the `" + search_tool + "` tool.\n";
+        "<tools>\n";
+    for (const auto& item : resolved_tools) {
+        prompt += item.dump() + "\n";
     }
+    prompt += "</tools>\n\n";
 
-    if (active_names.count("youtube_search")) {
-        prompt += "- CRITICAL DISAMBIGUATION: ONLY invoke `youtube_search` when the user EXPLICITLY asks to play, watch, or listen to media, or explicitly asks for a video/song (e.g. 'play ...', 'listen to ...', 'watch ...', 'youtube ...', 'song ...', 'music video ...'). NEVER invoke `youtube_search` for queries starting with 'search' or seeking information about people/topics even if earlier turns were about music.\n";
-    }
-
-    if (active_names.count("fetch_url")) {
-        prompt += "- When the user provides a specific URL or asks to inspect, fetch, or browse a website, invoke the `fetch_url` tool.\n";
-    }
-
-    std::vector<std::string> file_tools;
-    if (active_names.count("read_file")) file_tools.push_back("`read_file`");
-    if (active_names.count("write_file")) file_tools.push_back("`write_file`");
-    if (active_names.count("edit_file")) file_tools.push_back("`edit_file`");
-    if (!file_tools.empty()) {
-        std::string list_str;
-        for (size_t i = 0; i < file_tools.size(); i++) {
-            if (i > 0) list_str += (i == file_tools.size() - 1) ? ", or " : ", ";
-            list_str += file_tools[i];
-        }
-        prompt += "- When the user asks to read, write, or edit local files, invoke " + list_str + ".\n";
-    }
-
-    if (active_names.count("execute_command")) {
-        prompt += "- When the user asks to run terminal commands or inspect system state, invoke `execute_command`.\n";
-    }
-
-    if (has_mcp) {
-        prompt += "- You also have access to external Model Context Protocol (MCP) tools for specialized integrations. Invoke them with standard <tool_call> tags when relevant.\n";
-    }
-
-    prompt += "- For simple greetings (e.g. 'hello', 'hi'), answer conversationally without calling tools.\n";
-
-    std::string example_tool = "read_file";
-    std::string example_args = "{\"path\": \"src/main.cpp\"}";
-    if (active_names.count("web_search")) {
-        example_tool = "web_search";
-        example_args = "{\"query\": \"latest SpaceX rocket launch\"}";
-    } else if (active_names.count("execute_command")) {
-        example_tool = "execute_command";
-        example_args = "{\"command\": \"ls -la\"}";
-    }
-    prompt += "- Example tool call:\n"
-              "<tool_call>\n"
-              "{\"name\": \"" + example_tool + "\", \"arguments\": " + example_args + "}\n"
-              "</tool_call>\n"
-              "When you emit a <tool_call>, the system will execute it and return the results in a <tool_response> block.\n";
-
-    if (active_names.count("youtube_search")) {
+    if (is_qwen) {
         prompt +=
-            "\n## Media Playback & Web Preview Integration:\n"
-            "You are integrated with an interactive client-side HTML Preview Panel that displays web pages and plays YouTube videos with autoplay.\n"
-            "- When the user asks to play music, a song, or a video (e.g. 'play ...', 'listen to ...', 'watch ...'):\n"
-            "  1. Invoke the `youtube_search` tool directly (e.g. query='<song or artist name>').\n"
-            "  2. Direct YouTube search immediately returns the video and automatically opens the player in the user's preview panel with autoplay! Inform the user that the song/video is now playing in the preview panel.\n"
-            "  3. CRITICAL: Once the video is found, DO NOT invoke `fetch_url` or any other tool on YouTube URLs or watch pages. The video is already rendered and playing in the frontend preview panel.\n";
-        if (active_names.count("web_search")) {
-            prompt += "  4. If `youtube_search` is not available, invoke `web_search` as a fallback.\n";
-        }
-    } else {
+            "For each function call, return a json object with function name and arguments within <tool_call></tool_call> XML tags:\n"
+            "<tool_call>\n"
+            "{\"name\": \"<function-name>\", \"arguments\": <args-json-object>}\n"
+            "</tool_call>\n\n";
+    }
+
+    if (has_yt) {
         prompt +=
-            "\n## Media & Online Playback Status:\n"
-            "- YouTube and online media playback tools are currently DISABLED in user settings. Do NOT invoke youtube_search or attempt to search YouTube for videos/songs.\n"
-            "- If the user asks to play a song, video, or music, politely explain that media playback and tools are currently disabled in settings.\n";
+            "## Tool Usage Instructions:\n"
+            "- When the user asks to play music, a song, or a video, invoke `youtube_search` directly. The video will automatically load and play in the user's preview panel with autoplay.\n";
     }
 
     return prompt;
@@ -7988,6 +7928,7 @@ static std::string build_dynamic_tools_prompt(const json& resolved_tools) {
 static std::string g_base_system_prompt = "You are a helpful assistant";
 static std::string g_current_system_prompt = "";
 static json g_current_active_tools = json::array();
+static const std::string g_server_instance_id = std::to_string(std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::system_clock::now().time_since_epoch()).count());
 
 static std::string update_system_prompt_with_tools(const std::string& original_content, const std::string& tools_system_prompt, bool has_tools) {
     std::string content = original_content;
@@ -8015,11 +7956,12 @@ static std::vector<int> apply_chat_template(const json& messages, const BPEToken
         resolved_tools = resolve_canonical_tools(resolved_tools);
     }
     bool has_tools = (!resolved_tools.empty() && resolved_tools.is_array());
-    std::string tools_system_prompt = has_tools ? build_dynamic_tools_prompt(resolved_tools) : "";
-    has_tools = !tools_system_prompt.empty();
-
     int IM_START = tok.get_token_id("<|im_start|>");
     int IM_END = tok.get_token_id("<|im_end|>");
+    bool is_qwen = (IM_START >= 0 && IM_END >= 0);
+    std::string tools_system_prompt = has_tools ? build_dynamic_tools_prompt(resolved_tools, is_qwen) : "";
+    has_tools = !tools_system_prompt.empty();
+
     if (IM_START >= 0 && IM_END >= 0) {
         // ChatML template (Qwen / Llama / SmolLM)
         std::vector<int> result;
@@ -8951,7 +8893,8 @@ static void rebuild_system_prefix(
     if (!custom_full_prompt.empty()) {
         full_prompt_text = custom_full_prompt;
     } else {
-        full_prompt_text = base_prompt + build_dynamic_tools_prompt(resolved_tools);
+        bool is_qwen = (engine.cfg_.architecture == ModelArch::QWEN);
+        full_prompt_text = base_prompt + build_dynamic_tools_prompt(resolved_tools, is_qwen);
     }
 
     g_base_system_prompt = base_prompt;
@@ -8984,7 +8927,7 @@ static void rebuild_system_prefix(
                  sys_tokens.size(), resolved_tools.size());
         engine.reset_all_kv_caches();
         engine.prefill_prefix(sys_tokens);
-        engine.snapshot_system_kv(sys_tokens);
+        // Note: prefill_prefix() already calls snapshot_system_kv() internally on line 4060
         LOG_INFO("System KV Cache snapshot pinned successfully (%zu tokens).", sys_tokens.size());
     } else {
         engine.reset_all_kv_caches();
@@ -10396,6 +10339,7 @@ static void run_server(MoecherEngine& engine, int port, int default_thinking_bud
         res.set_header("Access-Control-Allow-Origin", "*");
         json body = {
             {"status", "ok"},
+            {"server_instance_id", g_server_instance_id},
             {"base_prompt", g_base_system_prompt},
             {"system_prompt", g_current_system_prompt},
             {"active_tools", g_current_active_tools},
@@ -10421,6 +10365,16 @@ static void run_server(MoecherEngine& engine, int port, int default_thinking_bud
             json active_tools = g_current_active_tools;
             if (j.contains("tools")) {
                 active_tools = j["tools"];
+                if (active_tools.is_array() || active_tools.is_string()) {
+                    active_tools = resolve_canonical_tools(active_tools);
+                    // Retain discovered MCP tools unless caller explicitly passed an empty array []
+                    if (!j["tools"].is_array() || !j["tools"].empty()) {
+                        json mcp_tools = moecher::mcp::MCPManager::instance().get_openai_tools_schema();
+                        for (const auto& mt : mcp_tools) {
+                            active_tools.push_back(mt);
+                        }
+                    }
+                }
                 bool has_yt = false;
                 if (active_tools.is_array()) {
                     for (const auto& item : active_tools) {
@@ -10435,6 +10389,7 @@ static void run_server(MoecherEngine& engine, int port, int default_thinking_bud
 
             json body = {
                 {"status", "ok"},
+                {"server_instance_id", g_server_instance_id},
                 {"base_prompt", g_base_system_prompt},
                 {"system_prompt", g_current_system_prompt},
                 {"active_tools", g_current_active_tools},
