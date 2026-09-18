@@ -14,7 +14,9 @@ A comprehensive chronological record of engineering breakthroughs, mathematical 
 7. [Endeavour 7: Server Streaming Latency, Nagle's Algorithm (`TCP_NODELAY`), and Zero-Alloc SSE](#endeavour-7-server-streaming-latency-nagles-algorithm-tcp_nodelay-and-zero-alloc-sse)
 8. [Endeavour 8: Context-Length Scaling Bottleneck — 3,145-Token Tool Attention (44 tok/s vs 109 tok/s)](#endeavour-8-context-length-scaling-bottleneck--3145-token-tool-attention-44-toks-vs-109-toks)
 9. [Endeavour 9: Pinned System KV Snapshots & Autonomous Agentic Suite](#endeavour-9-pinned-system-kv-snapshots--autonomous-agentic-suite)
-10. [Roadmap of Pending Optimizations](#roadmap-of-pending-optimizations)
+10. [Endeavour 10: Ampere-Gated Architecture, 4-Slot Speculative Rollback & KV Snapshot Slicing](#endeavour-10-ampere-gated-architecture-4-slot-speculative-rollback--kv-snapshot-slicing)
+11. [Endeavour 11: Prompt Attention Minimization, Qwen-Conditional Tool Formatting & Dynamic MCP Schema Compression (2,638 $\to$ ~500 Tokens)](#endeavour-11-prompt-attention-minimization-qwen-conditional-tool-formatting--dynamic-mcp-schema-compression-2638--500-tokens)
+12. [Roadmap of Pending Optimizations](#roadmap-of-pending-optimizations)
 
 ---
 
@@ -279,6 +281,58 @@ We designed and implemented two fused optimizations in [`src/cuda/activations.cu
 4. **Bypass LM-Head Projection in Prefill Micro-Chunks**:
    - Parameterized `forward_token_batch_qwen_device_body(position, M, bool compute_logits = true)`.
    - Disabled final RMSNorm and 248k-vocab LM head GEMM across all intermediate prefill chunks, eliminating 250 GB of memory read bandwidth and writing 0 discarded logits.
+
+---
+
+## Endeavour 11: Prompt Attention Minimization, Qwen-Conditional Tool Formatting & Dynamic MCP Schema Compression (2,638 $\to$ ~500 Tokens)
+
+### Problem Statement & Investigation
+When full agentic capabilities were enabled (8 canonical built-in tools plus discovered Model Context Protocol servers such as `tinobruno-teams-mcp`), the system prompt ballooned to **2,638 tokens** (10,044 raw characters). In a local serving environment, context length directly drives self-attention quadratic compute during sequence prefill and increases KV cache memory allocation.
+
+Profiling revealed five distinct sources of prompt inflation:
+1. **JSON Indentation & Pretty-Printing Overhead**:
+   - `resolved_tools.dump(2)` serialized the tool array with 2-space indentation and newlines across every property, enum, and bracket.
+   - For 13 tools, over **1,400 tokens** consisted entirely of structural whitespace and repeated newline characters.
+2. **OpenAPI Parameter Redundancy**:
+   - Every parameter property in `CANONICAL_TOOLS` contained verbose natural language descriptions (e.g. `"The search query string."`, `"The relative or absolute file path to read."`).
+   - For state-of-the-art LLMs, primitive type declarations (`"type": "string"`) and descriptive parameter names (`query`, `path`, `command`) provide sufficient semantic grounding.
+3. **System Prompt Prose Duplication**:
+   - Natural language paragraphs in the system prompt duplicated tool instructions already defined in `<tools>` schemas, alongside defensive negative constraints and greeting rules.
+4. **Tool-Calling Syntax Cross-Contamination**:
+   - The `<tool_call>` XML format reminder was being injected unconditionally, conflicting with models that utilize native special vocabulary tokens (e.g., DeepSeek-V3/R1 `<｜tool call begin｜>`).
+5. **External Enterprise MCP Schema Bloat**:
+   - Discovered MCP servers (such as Microsoft Teams MCP) injected large enterprise docstrings and Azure AD parameter descriptions directly into the model context, consuming over **800 tokens** across 5 tools.
+
+### Architectural Solutions & Implementations
+
+1. **Compact Single-Line Tool Serialization**:
+   - Replaced multi-line indented `resolved_tools.dump(2)` with compact, unindented single-line serialization matching the official Qwen chat template training distribution:
+     ```cpp
+     for (const auto& item : resolved_tools) {
+         prompt += item.dump() + "\n";
+     }
+     ```
+   - **Immediate Impact**: Instantly eliminated 1,404 whitespace tokens, reducing prompt size from **2,638 to 1,234 tokens**.
+
+2. **Canonical Parameter Schema Stripping**:
+   - Removed redundant `description` fields from all parameter properties across all 8 canonical tools in `CANONICAL_TOOLS`.
+   - Preserved parameter types (`string`, `integer`, `boolean`), `enum` constraints, and concise function-level summaries (`"Read file contents from local filesystem."`, `"Search the web for current information and news."`).
+
+3. **Architecture-Conditional `<tool_call>` Syntax Ingestion**:
+   - Parameterized `build_dynamic_tools_prompt(resolved_tools, is_qwen)`.
+   - Bound `<tool_call>` format instructions strictly to Qwen family models via `engine.cfg_.architecture == ModelArch::QWEN` and `<|im_start|>` vocabulary detection.
+   - Non-Qwen architectures (such as DeepSeek) omit this block entirely, preventing prompt contamination and allowing native tool-calling tokens to operate cleanly.
+
+4. **Dynamic On-The-Fly MCP Schema Minifier**:
+   - Enhanced `MCPToolInfo::to_openai_schema()` in `src/mcp_client.hpp` to automatically prune any connected MCP server:
+     - **First-Sentence Truncation**: Truncates multi-paragraph tool docstrings at the first sentence boundary (capped at 120 characters).
+     - **Parameter Description Eradication**: Automatically iterates `input_schema["properties"]` and strips all `description` and `title` fields.
+     - **Schema Ceremony Elimination**: Strips `$schema` URLs, `additionalProperties`, and redundant `[server_id MCP]` prefix tags.
+     - **Dashboard Fidelity Preserved**: Full descriptions and schemas remain intact in `get_servers_status_json()` for web UI inspector cards.
+
+### Results & Performance Milestone
+- **Total Token Reduction**: Slashed the 13-tool system prompt from **2,638 tokens down to ~500 tokens** (an **~80% reduction**).
+- **System KV Snapshot Efficiency**: The pinned system prefix snapshot memory scaled down from over 1,000 MB to ~150 MB, freeing VRAM on memory-constrained GPUs (16GB cards) and minimizing prefill time.
 
 ---
 
