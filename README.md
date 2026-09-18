@@ -91,7 +91,7 @@ Depending on the prompt context and active features, you may observe generation 
 * **To run at full 100+ tok/s**: In the Web UI, open the **Agentic & Tools** settings tab and toggle off Web/Local tools (or send `"tools": []` via API). The prompt length drops from 3,156 tokens down to ~20 tokens, immediately unlocking full **100–112 tok/s** speed.
 * **Prefill Speed**: While decoding scales with active KV cache size, prefix evaluation is instantaneous (**0 ms prefill latency**) because the 3,145-token tooling prefix is pre-warmed and stored in a **Pinned System KV Cache snapshot** at startup (prefilled at **~181 tok/s**).
 
-> 📖 **Engineering & Research Log**: For deep technical breakdowns, mathematical analyses, and root-cause post-mortems of every bug and optimization, see [DISCOVERIES_AND_ENDEAVOURS_LOG.md](DISCOVERIES_AND_ENDEAVOURS_LOG.md).
+> 📖 **Engineering & Research Journal**: For deep technical breakdowns, mathematical analyses, and root-cause post-mortems of every bug and optimization, see [tinobruno-journal.md](tinobruno-journal.md).
 
 ---
 
@@ -296,6 +296,12 @@ curl -s http://localhost:8001/v1/chat/completions \
 ---
 
 ## Changelog
+
+### v2.09 — Ampere-Gated Architecture, 4-Slot Speculative Rollback & Sliced KV Snapshotting
+- **Dynamic Hardware Capability Gating (`GpuCapabilities`)**: Added runtime GPU capability detection and gating ensuring 100% stability on Ampere architectures (RTX 3080/3090, CC 8.0/8.6). Bypasses unsupported hardware FP8 Tensor Core / FP4 paths and provides clean fallback paths.
+- **Active Prefix Snapshot Slicing (Saves ~970 MB VRAM)**: Sliced `snap_k_cache_gqa` and `snap_v_cache_gqa` allocations to the exact active prefix token count ($N_{\text{kv}} \times d_{\text{head}} \times \text{tokens}$), dropping snapshot footprint from 1,073 MB down to 103 MB and preventing PCIe paging/OOM on 16GB cards (RTX 4060 Ti / 5060 Ti).
+- **4-Slot Intermediate DeltaNet Rollback ($M=5, K=4$)**: Expanded `deltanet_ssm_batch_kernel` and `deltanet_conv_batch_kernel` to record 4 intermediate recurrence rollback checkpoints (slots 0..3). Unlocks adaptive $K=4$ ($M=5$) speculative drafting during structured tool calls and high-streak sequences.
+- **Bypass LM Head in Prefill Micro-Chunks**: Parameterized `forward_token_batch_qwen_device_body` with `compute_logits = false`, skipping redundant 248k vocabulary INT4 GEMMs on intermediate prefill chunks and eliminating hundreds of megabytes of discarded memory traffic.
 
 ### v2.08 — GQA Attention Vectorization & Batched Verification (~72 tok/s Tooling Context)
 - **Shared-Memory Cooperative V-Cache Tiling (`s_v_tile`)**: Refactored the GQA attention accumulation loop in `qwen_gqa_compute_attn_fp8_batch_kernel` using 128-bit (`uint4`) cooperative vector loads into `__shared__ alignas(16) uint8_t s_v_tile[32768]`, eliminating sequential global memory latency stalls in the inner accumulation loop.

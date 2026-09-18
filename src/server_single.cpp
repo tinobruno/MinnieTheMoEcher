@@ -261,6 +261,41 @@ struct ModelConfig {
 };
 
 // ════════════════════════════════════════════════════════════════════════════════
+//  GPU Hardware Capabilities & Gating
+// ════════════════════════════════════════════════════════════════════════════════
+
+struct GpuCapabilities {
+    int major = 0;
+    int minor = 0;
+    size_t total_vram_bytes = 0;
+    std::string device_name = "";
+    bool is_ampere = false;           // SM 8.0/8.6 (RTX 3090, A100)
+    bool is_ada_or_newer = false;     // SM 8.9+ (RTX 4060 Ti, 4090)
+    bool is_blackwell_or_newer = false; // SM 10.0+ (RTX 5060 Ti, 5090)
+    bool supports_fp8 = false;        // FP8 Tensor Cores (Ada/Hopper+)
+    bool supports_fp4 = false;        // Blackwell+
+    bool is_vram_constrained = false; // <= 18GB (e.g. 16GB cards)
+};
+
+static inline GpuCapabilities detect_gpu_capabilities(int device_id = 0) {
+    GpuCapabilities caps;
+    cudaDeviceProp prop;
+    if (cudaGetDeviceProperties(&prop, device_id) == cudaSuccess) {
+        caps.major = prop.major;
+        caps.minor = prop.minor;
+        caps.total_vram_bytes = prop.totalGlobalMem;
+        caps.device_name = prop.name;
+        caps.is_ampere = (prop.major == 8 && (prop.minor == 0 || prop.minor == 6));
+        caps.is_ada_or_newer = (prop.major > 8 || (prop.major == 8 && prop.minor >= 9));
+        caps.is_blackwell_or_newer = (prop.major >= 10);
+        caps.supports_fp8 = caps.is_ada_or_newer;
+        caps.supports_fp4 = caps.is_blackwell_or_newer;
+        caps.is_vram_constrained = (prop.totalGlobalMem <= 18ULL * 1024 * 1024 * 1024);
+    }
+    return caps;
+}
+
+// ════════════════════════════════════════════════════════════════════════════════
 //  JoyAI BPE Tokenizer (reads HuggingFace tokenizer.json)
 // ════════════════════════════════════════════════════════════════════════════════
 
@@ -2654,6 +2689,10 @@ public:
     // Prompt Prefix KV Cache Tracking
     std::vector<int> cached_tokens_;
 
+    // Hardware Detection & Feature Gating
+    GpuCapabilities gpu_caps_;
+    const GpuCapabilities& gpu_capabilities() const { return gpu_caps_; }
+
     void reset_all_kv_caches() {
         for (int l = 0; l < cfg_.num_hidden_layers; l++) {
             if (layers_[l].kv_cache.data) {
@@ -3207,14 +3246,22 @@ public:
         CUBLAS_CHECK(cublasSetStream(cublas_handle_, main_stream_));
         cublasSetMathMode(cublas_handle_, CUBLAS_DEFAULT_MATH);
 
-        // ── Hardware Persistent L2 Cache Configuration ────────────────────────────
+        // ── Hardware Capabilities & Persistent L2 Cache Configuration ─────────────
+        gpu_caps_ = detect_gpu_capabilities(0);
+        LOG_INFO("Hardware: %s (Compute %d.%d, %.1f GB VRAM)",
+                 gpu_caps_.device_name.c_str(), gpu_caps_.major, gpu_caps_.minor,
+                 gpu_caps_.total_vram_bytes / (1024.0 * 1024.0 * 1024.0));
+        LOG_INFO("Hardware Capabilities: Ampere=%d, Ada+=%d, Blackwell+=%d, FP8_TC=%d, FP4=%d, VRAM-Constrained=%d",
+                 (int)gpu_caps_.is_ampere, (int)gpu_caps_.is_ada_or_newer,
+                 (int)gpu_caps_.is_blackwell_or_newer, (int)gpu_caps_.supports_fp8,
+                 (int)gpu_caps_.supports_fp4, (int)gpu_caps_.is_vram_constrained);
+
         cudaDeviceProp prop;
         if (cudaGetDeviceProperties(&prop, 0) == cudaSuccess) {
             size_t max_persisting_l2 = prop.persistingL2CacheMaxSize;
             if (max_persisting_l2 > 0) {
                 size_t l2_limit = (max_persisting_l2 * 3) / 4; // Use 75% for persistent window
                 cudaDeviceSetLimit(cudaLimitPersistingL2CacheSize, l2_limit);
-                LOG_INFO("Hardware: %s (Compute %d.%d)", prop.name, prop.major, prop.minor);
                 LOG_INFO("Persistent L2 Cache configured: %.1f MB / %.1f MB",
                          l2_limit / (1024.0 * 1024.0), max_persisting_l2 / (1024.0 * 1024.0));
             }
@@ -3819,12 +3866,24 @@ public:
 
             // Qwen
             if (lw.k_cache_gqa.data) {
-                if (!l_snap.snap_k_cache_gqa.data) l_snap.snap_k_cache_gqa.alloc(lw.k_cache_gqa.size_bytes);
-                CUDA_CHECK(cudaMemcpyAsync(l_snap.snap_k_cache_gqa.data, lw.k_cache_gqa.data, lw.k_cache_gqa.size_bytes, cudaMemcpyDeviceToDevice, main_stream_));
+                int n_kv = cfg_.num_key_value_heads > 0 ? cfg_.num_key_value_heads : 4;
+                int h_dim = cfg_.head_dim > 0 ? cfg_.head_dim : 256;
+                size_t active_gqa_bytes = (size_t)tokens.size() * n_kv * h_dim * sizeof(uint8_t);
+                if (active_gqa_bytes > lw.k_cache_gqa.size_bytes || active_gqa_bytes == 0) active_gqa_bytes = lw.k_cache_gqa.size_bytes;
+                if (!l_snap.snap_k_cache_gqa.data || l_snap.snap_k_cache_gqa.size_bytes < active_gqa_bytes) {
+                    l_snap.snap_k_cache_gqa.alloc(active_gqa_bytes);
+                }
+                CUDA_CHECK(cudaMemcpyAsync(l_snap.snap_k_cache_gqa.data, lw.k_cache_gqa.data, active_gqa_bytes, cudaMemcpyDeviceToDevice, main_stream_));
             }
             if (lw.v_cache_gqa.data) {
-                if (!l_snap.snap_v_cache_gqa.data) l_snap.snap_v_cache_gqa.alloc(lw.v_cache_gqa.size_bytes);
-                CUDA_CHECK(cudaMemcpyAsync(l_snap.snap_v_cache_gqa.data, lw.v_cache_gqa.data, lw.v_cache_gqa.size_bytes, cudaMemcpyDeviceToDevice, main_stream_));
+                int n_kv = cfg_.num_key_value_heads > 0 ? cfg_.num_key_value_heads : 4;
+                int h_dim = cfg_.head_dim > 0 ? cfg_.head_dim : 256;
+                size_t active_gqa_bytes = (size_t)tokens.size() * n_kv * h_dim * sizeof(uint8_t);
+                if (active_gqa_bytes > lw.v_cache_gqa.size_bytes || active_gqa_bytes == 0) active_gqa_bytes = lw.v_cache_gqa.size_bytes;
+                if (!l_snap.snap_v_cache_gqa.data || l_snap.snap_v_cache_gqa.size_bytes < active_gqa_bytes) {
+                    l_snap.snap_v_cache_gqa.alloc(active_gqa_bytes);
+                }
+                CUDA_CHECK(cudaMemcpyAsync(l_snap.snap_v_cache_gqa.data, lw.v_cache_gqa.data, active_gqa_bytes, cudaMemcpyDeviceToDevice, main_stream_));
             }
             if (lw.ssm_state.data) {
                 if (!l_snap.snap_ssm_state.data) l_snap.snap_ssm_state.alloc(lw.ssm_state.size_bytes);
@@ -3895,10 +3954,22 @@ public:
 
             // Qwen
             if (lw.k_cache_gqa.data && l_snap.snap_k_cache_gqa.data) {
-                CUDA_CHECK(cudaMemcpyAsync(lw.k_cache_gqa.data, l_snap.snap_k_cache_gqa.data, lw.k_cache_gqa.size_bytes, cudaMemcpyDeviceToDevice, main_stream_));
+                int n_kv = cfg_.num_key_value_heads > 0 ? cfg_.num_key_value_heads : 4;
+                int h_dim = cfg_.head_dim > 0 ? cfg_.head_dim : 256;
+                size_t active_gqa_bytes = (size_t)snap.tokens.size() * n_kv * h_dim * sizeof(uint8_t);
+                if (active_gqa_bytes > l_snap.snap_k_cache_gqa.size_bytes || active_gqa_bytes == 0) {
+                    active_gqa_bytes = l_snap.snap_k_cache_gqa.size_bytes;
+                }
+                CUDA_CHECK(cudaMemcpyAsync(lw.k_cache_gqa.data, l_snap.snap_k_cache_gqa.data, active_gqa_bytes, cudaMemcpyDeviceToDevice, main_stream_));
             }
             if (lw.v_cache_gqa.data && l_snap.snap_v_cache_gqa.data) {
-                CUDA_CHECK(cudaMemcpyAsync(lw.v_cache_gqa.data, l_snap.snap_v_cache_gqa.data, lw.v_cache_gqa.size_bytes, cudaMemcpyDeviceToDevice, main_stream_));
+                int n_kv = cfg_.num_key_value_heads > 0 ? cfg_.num_key_value_heads : 4;
+                int h_dim = cfg_.head_dim > 0 ? cfg_.head_dim : 256;
+                size_t active_gqa_bytes = (size_t)snap.tokens.size() * n_kv * h_dim * sizeof(uint8_t);
+                if (active_gqa_bytes > l_snap.snap_v_cache_gqa.size_bytes || active_gqa_bytes == 0) {
+                    active_gqa_bytes = l_snap.snap_v_cache_gqa.size_bytes;
+                }
+                CUDA_CHECK(cudaMemcpyAsync(lw.v_cache_gqa.data, l_snap.snap_v_cache_gqa.data, active_gqa_bytes, cudaMemcpyDeviceToDevice, main_stream_));
             }
             if (lw.ssm_state.data && l_snap.snap_ssm_state.data) {
                 CUDA_CHECK(cudaMemcpyAsync(lw.ssm_state.data, l_snap.snap_ssm_state.data, lw.ssm_state.size_bytes, cudaMemcpyDeviceToDevice, main_stream_));
@@ -3953,28 +4024,12 @@ public:
             while (curr < prefix_tokens.size()) {
                 size_t remaining = prefix_tokens.size() - curr;
                 int chunk_m = (remaining >= 8) ? 8 : (int)remaining;
-                if (chunk_m >= 2 && chunk_m <= 8) {
-                    CUDA_CHECK(cudaMemcpyAsync(buf_input_pos_batch_.i32(), &h_prefill_pos_[curr],
-                                               chunk_m * sizeof(int32_t), cudaMemcpyHostToDevice, main_stream_));
-                    CUDA_CHECK(cudaMemcpyAsync(buf_input_tokens_batch_.i32(), &h_prefill_tok_[curr],
-                                               chunk_m * sizeof(int32_t), cudaMemcpyHostToDevice, main_stream_));
-                    if (batch_graph_captured_[chunk_m]) {
-                        CUDA_CHECK(cudaGraphLaunch(batch_graph_exec_[chunk_m], main_stream_));
-                    } else {
-                        forward_token_batch_qwen_device_body((int)curr, chunk_m);
-                    }
-                    curr += chunk_m;
-                } else {
-                    if (graph_captured_) {
-                        CUDA_CHECK(cudaMemcpyAsync(buf_track_flag_.i32(), h_single_flag_, sizeof(int32_t), cudaMemcpyHostToDevice, main_stream_));
-                        CUDA_CHECK(cudaMemcpyAsync(buf_input_token_.i32(), &h_prefill_tok_[curr], sizeof(int32_t), cudaMemcpyHostToDevice, main_stream_));
-                        CUDA_CHECK(cudaMemcpyAsync(buf_input_pos_.i32(), &h_prefill_pos_[curr], sizeof(int32_t), cudaMemcpyHostToDevice, main_stream_));
-                        CUDA_CHECK(cudaGraphLaunch(graph_exec_, main_stream_));
-                    } else {
-                        forward_token_eager(prefix_tokens[curr], (int)curr);
-                    }
-                    curr += 1;
-                }
+                CUDA_CHECK(cudaMemcpyAsync(buf_input_pos_batch_.i32(), &h_prefill_pos_[curr],
+                                           chunk_m * sizeof(int32_t), cudaMemcpyHostToDevice, main_stream_));
+                CUDA_CHECK(cudaMemcpyAsync(buf_input_tokens_batch_.i32(), &h_prefill_tok_[curr],
+                                           chunk_m * sizeof(int32_t), cudaMemcpyHostToDevice, main_stream_));
+                forward_token_batch_qwen_device_body((int)curr, chunk_m, /*compute_logits=*/false);
+                curr += chunk_m;
             }
         } else {
             // ModelArch::DEEPSEEK_V4
@@ -4137,45 +4192,23 @@ public:
 
             if (cfg_.architecture == ModelArch::QWEN) {
                 size_t curr = prefix_len;
-                // Prefill intermediate prompt tokens using batched CUDA graphs (chunks of up to 8)
+                // Prefill intermediate prompt tokens in chunks of up to 8 (skipping intermediate LM-head computation)
                 while (curr + 1 < prompt.size()) {
                     size_t remaining = (prompt.size() - 1) - curr;
                     int chunk_m = (remaining >= 8) ? 8 : (int)remaining;
-                    if (chunk_m >= 2 && chunk_m <= 8) {
-                        CUDA_CHECK(cudaMemcpyAsync(buf_input_pos_batch_.i32(), &h_prefill_pos_[curr],
-                                                   chunk_m * sizeof(int32_t), cudaMemcpyHostToDevice, main_stream_));
-                        CUDA_CHECK(cudaMemcpyAsync(buf_input_tokens_batch_.i32(), &h_prefill_tok_[curr],
-                                                   chunk_m * sizeof(int32_t), cudaMemcpyHostToDevice, main_stream_));
-                        if (batch_graph_captured_[chunk_m]) {
-                            CUDA_CHECK(cudaGraphLaunch(batch_graph_exec_[chunk_m], main_stream_));
-                        } else {
-                            forward_token_batch_qwen_device_body((int)curr, chunk_m);
+                    CUDA_CHECK(cudaMemcpyAsync(buf_input_pos_batch_.i32(), &h_prefill_pos_[curr],
+                                               chunk_m * sizeof(int32_t), cudaMemcpyHostToDevice, main_stream_));
+                    CUDA_CHECK(cudaMemcpyAsync(buf_input_tokens_batch_.i32(), &h_prefill_tok_[curr],
+                                               chunk_m * sizeof(int32_t), cudaMemcpyHostToDevice, main_stream_));
+                    forward_token_batch_qwen_device_body((int)curr, chunk_m, /*compute_logits=*/false);
+                    if (draft_model_active) {
+                        for (int m = 0; m < chunk_m; m++) {
+                            qwen_draft_.forward_token_async_pinned(&h_prefill_tok_[curr + m],
+                                                                   &h_prefill_pos_[curr + m],
+                                                                   (int)(curr + m), main_stream_);
                         }
-                        if (draft_model_active) {
-                            for (int m = 0; m < chunk_m; m++) {
-                                qwen_draft_.forward_token_async_pinned(&h_prefill_tok_[curr + m],
-                                                                       &h_prefill_pos_[curr + m],
-                                                                       (int)(curr + m), main_stream_);
-                            }
-                        }
-                        curr += chunk_m;
-                    } else {
-                        // chunk_m == 1: forward single token asynchronously
-                        if (graph_captured_) {
-                            CUDA_CHECK(cudaMemcpyAsync(buf_track_flag_.i32(), h_single_flag_, sizeof(int32_t), cudaMemcpyHostToDevice, main_stream_));
-                            CUDA_CHECK(cudaMemcpyAsync(buf_input_token_.i32(), &h_prefill_tok_[curr], sizeof(int32_t), cudaMemcpyHostToDevice, main_stream_));
-                            CUDA_CHECK(cudaMemcpyAsync(buf_input_pos_.i32(), &h_prefill_pos_[curr], sizeof(int32_t), cudaMemcpyHostToDevice, main_stream_));
-                            CUDA_CHECK(cudaGraphLaunch(graph_exec_, main_stream_));
-                        } else {
-                            forward_token_eager(prompt[curr], (int)curr);
-                        }
-                        if (draft_model_active) {
-                            qwen_draft_.forward_token_async_pinned(&h_prefill_tok_[curr],
-                                                                   &h_prefill_pos_[curr],
-                                                                   (int)curr, main_stream_);
-                        }
-                        curr += 1;
                     }
+                    curr += chunk_m;
                 }
 
                 // Forward the very last token individually so buf_logits_ and buf_hidden2_ (for MTP) are populated
@@ -4512,8 +4545,19 @@ public:
 
                 // Priority 1: MTP Self-Drafter (uses target model's POST-NORM hidden state)
                 if (cfg_.architecture == ModelArch::QWEN && mtp_drafter_.loaded_) {
-                    // Adaptive MTP draft depth: K=2 on streak, K=1 otherwise (maximizes sustained tok/s)
-                    int K = (draft_streak >= 1) ? 2 : 1;
+                    bool in_tool_call = false;
+                    size_t last_tc_open = generated_text.rfind("<tool_call>");
+                    if (last_tc_open != std::string::npos) {
+                        size_t last_tc_close = generated_text.rfind("</tool_call>");
+                        if (last_tc_close == std::string::npos || last_tc_close < last_tc_open) {
+                            in_tool_call = true;
+                        }
+                    }
+                    // Adaptive MTP draft depth:
+                    // K=4 when inside tool call or high streak (draft_streak >= 3)
+                    // K=2 on streak (draft_streak >= 1)
+                    // K=1 on cold start
+                    int K = (in_tool_call || draft_streak >= 3) ? 4 : ((draft_streak >= 1) ? 2 : 1);
                     auto t0 = std::chrono::steady_clock::now();
                     mtp_drafter_.draft_k_tokens(buf_hidden2_.bf16(), next_token, position, K, cand_tokens, main_stream_);
                     auto t1 = std::chrono::steady_clock::now();
@@ -4522,10 +4566,10 @@ public:
                 }
 
                 // Priority 2: Prompt-Lookup Drafting (free, zero GPU cost)
-                // Note: Qwen DeltaNet SSM batch kernel maintains 2 rollback slots (slot 0 & 1),
-                // so limit PLD draft tokens to at most 2 for Qwen to prevent unpopulated slot commits.
+                // Qwen DeltaNet SSM batch kernel maintains 4 rollback slots (slots 0..3),
+                // so allow PLD to draft up to 4 tokens for Qwen.
                 if (cfg_.architecture == ModelArch::QWEN && !is_mtp && enable_pld_ && !history.empty()) {
-                    int max_pld = std::min(pld_draft_tokens_, 2);
+                    int max_pld = std::min(pld_draft_tokens_, 4);
                     std::vector<int> pld_cands = PromptLookupDrafter::draft(history, max_pld, 3, 2);
                     if (!pld_cands.empty()) {
                         for (int tok : pld_cands) {
@@ -5733,6 +5777,8 @@ private:
                 lw.conv_state.bf16(),
                 (M > 1) ? lw.conv_state_slots[0].bf16() : nullptr,
                 (M > 2) ? lw.conv_state_slots[1].bf16() : nullptr,
+                (M > 3) ? lw.conv_state_slots[2].bf16() : nullptr,
+                (M > 4) ? lw.conv_state_slots[3].bf16() : nullptr,
                 lw.A_log.bf16(),
                 lw.dt_bias.bf16(),
                 lw.linear_norm_w.bf16(),
@@ -5740,6 +5786,8 @@ private:
                 lw.ssm_state.bf16(),
                 (M > 1) ? lw.ssm_state_slots[0].bf16() : nullptr,
                 (M > 2) ? lw.ssm_state_slots[1].bf16() : nullptr,
+                (M > 3) ? lw.ssm_state_slots[2].bf16() : nullptr,
+                (M > 4) ? lw.ssm_state_slots[3].bf16() : nullptr,
                 16, 48, 128, M, main_stream_);
 
             // Output projection: [M, 6144] -> [M, 5120]
@@ -5805,7 +5853,7 @@ private:
     cudaGraph_t batch_graph_[9];
     cudaGraphExec_t batch_graph_exec_[9];
 
-    void forward_token_batch_qwen_device_body(int position, int M) {
+    void forward_token_batch_qwen_device_body(int position, int M, bool compute_logits = true) {
         int dim = cfg_.hidden_size;
         // 1. Embedding lookup for M tokens
         if (embed_weight_.dtype == "int4") {
@@ -5818,6 +5866,8 @@ private:
         for (int layer = 0; layer < cfg_.num_hidden_layers; layer++) {
             forward_layer_qwen_batch(layer, position, M);
         }
+
+        if (!compute_logits) return;
 
         // 3. Final norm
         rms_norm_one_centered_cuda_batched(buf_hidden_batch_.bf16(), buf_hidden_batch_.bf16(),
@@ -5855,7 +5905,14 @@ private:
 
     void init_batch_cuda_graphs() {
         if (cfg_.architecture != ModelArch::QWEN) return;
-        for (int M : {2, 3, 4, 5, 6, 7, 8}) {
+        std::vector<int> target_batch_sizes;
+        if (gpu_caps_.is_vram_constrained) {
+            // M=2..5 covers speculative draft depth K=1..4 while saving graph workspace VRAM on 16GB cards
+            target_batch_sizes = {2, 3, 4, 5};
+        } else {
+            target_batch_sizes = {2, 3, 4, 5, 6, 7, 8};
+        }
+        for (int M : target_batch_sizes) {
             LOG_INFO("Warming up and capturing Batched Target CUDA Graph (M=%d)...", M);
 
             std::vector<int32_t> dummy_toks(M, 0);
@@ -5910,8 +5967,8 @@ private:
 
     inline void commit_target_state_slot(int slot_idx) {
         if (slot_idx < 0 || slot_idx >= 8) return;
-        // DeltaNet SSM batch kernel currently saves slot 0 and slot 1. Slots >= 2 are not populated.
-        if (slot_idx >= 2) return;
+        // DeltaNet SSM batch kernel maintains intermediate rollback slots 0, 1, 2, and 3. Slots >= 4 are not populated.
+        if (slot_idx >= 4) return;
         if (target_ssm_pool_.data && target_ssm_slots_[slot_idx].data) {
             CUDA_CHECK(cudaMemcpyAsync(target_ssm_pool_.data, target_ssm_slots_[slot_idx].data, target_ssm_pool_.size_bytes, cudaMemcpyDeviceToDevice, main_stream_));
             CUDA_CHECK(cudaMemcpyAsync(target_conv_pool_.data, target_conv_slots_[slot_idx].data, target_conv_pool_.size_bytes, cudaMemcpyDeviceToDevice, main_stream_));
@@ -7670,13 +7727,13 @@ static json resolve_canonical_tools(const json& tools_input) {
             {"type", "function"},
             {"function", {
                 {"name", "web_search"},
-                {"description", "Search the live web for facts, documentation, news, websites, articles, and general information."},
+                {"description", "Search the web for current information and news."},
                 {"parameters", {
                     {"type", "object"},
                     {"properties", {
-                        {"query", {{"type", "string"}, {"description", "The search query string."}}},
-                        {"num_results", {{"type", "integer"}, {"description", "Optional number of results (1-10, default: 4)."}}},
-                        {"site", {{"type", "string"}, {"description", "Optional domain filter (e.g. 'github.com')."}}}
+                        {"query", {{"type", "string"}}},
+                        {"num_results", {{"type", "integer"}}},
+                        {"site", {{"type", "string"}}}
                     }},
                     {"required", json::array({"query"})}
                 }}
@@ -7686,12 +7743,12 @@ static json resolve_canonical_tools(const json& tools_input) {
             {"type", "function"},
             {"function", {
                 {"name", "youtube_search"},
-                {"description", "Search YouTube directly for songs, music, videos, trailers, podcasts, and clips. Returns instant video links and playable preview."},
+                {"description", "Search YouTube for videos and music."},
                 {"parameters", {
                     {"type", "object"},
                     {"properties", {
-                        {"query", {{"type", "string"}, {"description", "The video, song, or music search query string."}}},
-                        {"num_results", {{"type", "integer"}, {"description", "Optional number of results (1-5, default: 3)."}}}
+                        {"query", {{"type", "string"}}},
+                        {"num_results", {{"type", "integer"}}}
                     }},
                     {"required", json::array({"query"})}
                 }}
@@ -7701,13 +7758,13 @@ static json resolve_canonical_tools(const json& tools_input) {
             {"type", "function"},
             {"function", {
                 {"name", "google_search"},
-                {"description", "Search the web using Google Search engine."},
+                {"description", "Search the web using Google."},
                 {"parameters", {
                     {"type", "object"},
                     {"properties", {
-                        {"query", {{"type", "string"}, {"description", "The search query string."}}},
-                        {"num_results", {{"type", "integer"}, {"description", "Optional number of results (1-10, default: 4)."}}},
-                        {"site", {{"type", "string"}, {"description", "Optional domain filter."}}}
+                        {"query", {{"type", "string"}}},
+                        {"num_results", {{"type", "integer"}}},
+                        {"site", {{"type", "string"}}}
                     }},
                     {"required", json::array({"query"})}
                 }}
@@ -7717,14 +7774,14 @@ static json resolve_canonical_tools(const json& tools_input) {
             {"type", "function"},
             {"function", {
                 {"name", "fetch_url"},
-                {"description", "Fetch clean readable text, metadata, or documentation from a public web URL."},
+                {"description", "Fetch text content from a web URL."},
                 {"parameters", {
                     {"type", "object"},
                     {"properties", {
-                        {"url", {{"type", "string"}, {"description", "The complete HTTP or HTTPS URL to fetch."}}},
-                        {"mode", {{"type", "string"}, {"enum", {"text", "raw", "scripts", "links"}}, {"description", "Extraction mode (default: 'text')."}}},
-                        {"pattern", {{"type", "string"}, {"description", "Optional substring filter."}}},
-                        {"max_chars", {{"type", "integer"}, {"description", "Max characters (default: 1500)."}}}
+                        {"url", {{"type", "string"}}},
+                        {"mode", {{"type", "string"}, {"enum", {"text", "raw", "scripts", "links"}}}},
+                        {"pattern", {{"type", "string"}}},
+                        {"max_chars", {{"type", "integer"}}}
                     }},
                     {"required", json::array({"url"})}
                 }}
@@ -7734,13 +7791,13 @@ static json resolve_canonical_tools(const json& tools_input) {
             {"type", "function"},
             {"function", {
                 {"name", "read_file"},
-                {"description", "Read the text contents of a file on the local filesystem with optional line numbers."},
+                {"description", "Read file contents from local filesystem."},
                 {"parameters", {
                     {"type", "object"},
                     {"properties", {
-                        {"path", {{"type", "string"}, {"description", "The relative or absolute file path to read."}}},
-                        {"start_line", {{"type", "integer"}, {"description", "Optional 1-indexed starting line number."}}},
-                        {"end_line", {{"type", "integer"}, {"description", "Optional 1-indexed ending line number."}}}
+                        {"path", {{"type", "string"}}},
+                        {"start_line", {{"type", "integer"}}},
+                        {"end_line", {{"type", "integer"}}}
                     }},
                     {"required", json::array({"path"})}
                 }}
@@ -7750,13 +7807,13 @@ static json resolve_canonical_tools(const json& tools_input) {
             {"type", "function"},
             {"function", {
                 {"name", "write_file"},
-                {"description", "Create a new file or completely overwrite an existing file with the provided text."},
+                {"description", "Write or overwrite a file on local filesystem."},
                 {"parameters", {
                     {"type", "object"},
                     {"properties", {
-                        {"path", {{"type", "string"}, {"description", "The relative or absolute file path to write."}}},
-                        {"content", {{"type", "string"}, {"description", "The complete text content to write."}}},
-                        {"overwrite", {{"type", "boolean"}, {"description", "Whether to overwrite (default: true)."}}}
+                        {"path", {{"type", "string"}}},
+                        {"content", {{"type", "string"}}},
+                        {"overwrite", {{"type", "boolean"}}}
                     }},
                     {"required", json::array({"path", "content"})}
                 }}
@@ -7766,13 +7823,13 @@ static json resolve_canonical_tools(const json& tools_input) {
             {"type", "function"},
             {"function", {
                 {"name", "edit_file"},
-                {"description", "Perform a precise search-and-replace on a unique block of text within an existing file."},
+                {"description", "Replace unique text in an existing file."},
                 {"parameters", {
                     {"type", "object"},
                     {"properties", {
-                        {"path", {{"type", "string"}, {"description", "The relative or absolute file path to edit."}}},
-                        {"target_content", {{"type", "string"}, {"description", "Exact block of lines to replace."}}},
-                        {"replacement_content", {{"type", "string"}, {"description", "New replacement content."}}}
+                        {"path", {{"type", "string"}}},
+                        {"target_content", {{"type", "string"}}},
+                        {"replacement_content", {{"type", "string"}}}
                     }},
                     {"required", json::array({"path", "target_content", "replacement_content"})}
                 }}
@@ -7782,11 +7839,11 @@ static json resolve_canonical_tools(const json& tools_input) {
             {"type", "function"},
             {"function", {
                 {"name", "execute_command"},
-                {"description", "Execute a terminal/shell command on the local system and return its output."},
+                {"description", "Execute a local shell command."},
                 {"parameters", {
                     {"type", "object"},
                     {"properties", {
-                        {"command", {{"type", "string"}, {"description", "The exact shell command line to execute."}}}
+                        {"command", {{"type", "string"}}}
                     }},
                     {"required", json::array({"command"})}
                 }}
@@ -7828,48 +7885,83 @@ static json resolve_canonical_tools(const json& tools_input) {
     return json::array();
 }
 
+static std::string build_dynamic_tools_prompt(const json& resolved_tools, bool is_qwen = false) {
+    if (!resolved_tools.is_array() || resolved_tools.empty()) {
+        return "";
+    }
+
+    bool has_yt = false;
+    for (const auto& item : resolved_tools) {
+        if (item.contains("function") && item["function"].value("name", "") == "youtube_search") {
+            has_yt = true;
+            break;
+        }
+    }
+
+    std::string prompt =
+        "\n\n# Tools\n\n"
+        "You may call one or more functions to assist with the user query.\n"
+        "You are provided with function signatures within <tools></tools> XML tags:\n"
+        "<tools>\n";
+    for (const auto& item : resolved_tools) {
+        prompt += item.dump() + "\n";
+    }
+    prompt += "</tools>\n\n";
+
+    if (is_qwen) {
+        prompt +=
+            "For each function call, return a json object with function name and arguments within <tool_call></tool_call> XML tags:\n"
+            "<tool_call>\n"
+            "{\"name\": \"<function-name>\", \"arguments\": <args-json-object>}\n"
+            "</tool_call>\n\n";
+    }
+
+    if (has_yt) {
+        prompt +=
+            "## Tool Usage Instructions:\n"
+            "- When the user asks to play music, a song, or a video, invoke `youtube_search` directly. The video will automatically load and play in the user's preview panel with autoplay.\n";
+    }
+
+    return prompt;
+}
+
+static std::string g_base_system_prompt = "You are a helpful assistant";
+static std::string g_current_system_prompt = "";
+static json g_current_active_tools = json::array();
+static const std::string g_server_instance_id = std::to_string(std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::system_clock::now().time_since_epoch()).count());
+
+static std::string update_system_prompt_with_tools(const std::string& original_content, const std::string& tools_system_prompt, bool has_tools) {
+    std::string content = original_content;
+    size_t tools_pos = content.find("\n\n# Tools");
+    if (tools_pos == std::string::npos) tools_pos = content.find("# Tools");
+    if (tools_pos == std::string::npos) tools_pos = content.find("<tools>");
+    if (tools_pos != std::string::npos) {
+        content = content.substr(0, tools_pos);
+    }
+    while (!content.empty() && (content.back() == ' ' || content.back() == '\n' || content.back() == '\r')) {
+        content.pop_back();
+    }
+    if (content.empty()) {
+        content = "You are a helpful assistant";
+    }
+    if (has_tools) {
+        content += tools_system_prompt;
+    }
+    return content;
+}
+
 static std::vector<int> apply_chat_template(const json& messages, const BPETokenizer& tok, bool enable_thinking = true, const std::string& reasoning_effort = "high", const json& tools = json()) {
     json resolved_tools = tools;
     if (!resolved_tools.empty()) {
         resolved_tools = resolve_canonical_tools(resolved_tools);
     }
     bool has_tools = (!resolved_tools.empty() && resolved_tools.is_array());
-    std::string tools_system_prompt;
-    if (has_tools) {
-        tools_system_prompt =
-            "\n\n# Tools\n\n"
-            "You have access to a set of built-in tools to inspect files, make precise code modifications, run commands, and search the web.\n"
-            "You are provided with function signatures within <tools></tools> XML tags:\n"
-            "<tools>\n" + resolved_tools.dump(2) + "\n</tools>\n\n"
-            "For each function call, return a json object with function name and arguments within <tool_call></tool_call> XML tags:\n"
-            "<tool_call>\n"
-            "{\"name\": \"<function-name>\", \"arguments\": <args-json-object>}\n"
-            "</tool_call>\n\n"
-            "## Tool Usage Instructions:\n"
-            "- CRITICAL RULE: When the user asks to search (e.g. 'search <query>', 'who is <person>', 'what is <topic>', search Google, look up facts, recent news, people, documentation, code, or websites), you MUST immediately invoke the `web_search` tool.\n"
-            "- CRITICAL DISAMBIGUATION: ONLY invoke `youtube_search` when the user EXPLICITLY asks to play, watch, or listen to media, or explicitly asks for a video/song (e.g. 'play ...', 'listen to ...', 'watch ...', 'youtube ...', 'song ...', 'music video ...'). NEVER invoke `youtube_search` for queries starting with 'search' or seeking information about people/topics even if earlier turns were about music.\n"
-            "- When the user provides a specific URL or asks to inspect, fetch, or browse a website, invoke the `fetch_url` tool.\n"
-            "- When the user asks to read, write, or edit local files, invoke `read_file`, `write_file`, or `edit_file`.\n"
-            "- When the user asks to run terminal commands or inspect system state, invoke `execute_command`.\n"
-            "- For simple greetings (e.g. 'hello', 'hi'), answer conversationally without calling tools.\n"
-            "- Example tool call:\n"
-            "<tool_call>\n"
-            "{\"name\": \"web_search\", \"arguments\": {\"query\": \"latest SpaceX rocket launch\"}}\n"
-            "</tool_call>\n"
-            "When you emit a <tool_call>, the system will execute it and return the results in a <tool_response> block.\n"
-            "\n"
-            "## Media Playback & Web Preview Integration:\n"
-            "You are integrated with an interactive client-side HTML Preview Panel that displays web pages and plays YouTube videos with autoplay.\n"
-            "- When the user asks to play music, a song, or a video (e.g. 'play ...', 'listen to ...', 'watch ...'):\n"
-            "  1. Invoke the `youtube_search` tool directly (e.g. query='<song or artist name>').\n"
-            "  2. Direct YouTube search immediately returns the video and automatically opens the player in the user's preview panel with autoplay! Inform the user that the song/video is now playing in the preview panel.\n"
-            "  3. CRITICAL: Once the video is found, DO NOT invoke `fetch_url` or any other tool on YouTube URLs or watch pages. The video is already rendered and playing in the frontend preview panel.\n"
-            "  4. If `youtube_search` is not available, invoke `web_search` as a fallback.\n"
-            "- For any query that says 'search ...' or asks who/what something is, ALWAYS use `web_search`.\n";
-    }
-
     int IM_START = tok.get_token_id("<|im_start|>");
     int IM_END = tok.get_token_id("<|im_end|>");
+    bool is_qwen = (IM_START >= 0 && IM_END >= 0);
+    std::string tools_system_prompt = has_tools ? build_dynamic_tools_prompt(resolved_tools, is_qwen) : "";
+    has_tools = !tools_system_prompt.empty();
+
     if (IM_START >= 0 && IM_END >= 0) {
         // ChatML template (Qwen / Llama / SmolLM)
         std::vector<int> result;
@@ -7890,8 +7982,8 @@ static std::vector<int> apply_chat_template(const json& messages, const BPEToken
             std::string role = messages[i].value("role", "user");
             std::string content = messages[i].value("content", "");
 
-            if (role == "system" && i == 0 && has_tools) {
-                content += tools_system_prompt;
+            if (role == "system" && i == 0) {
+                content = update_system_prompt_with_tools(content, tools_system_prompt, has_tools);
             }
 
             if (role == "tool" || role == "function") {
@@ -7992,10 +8084,11 @@ static std::vector<int> apply_chat_template(const json& messages, const BPEToken
         std::string content = messages[i].value("content", "");
 
         if (role == "system") {
-            if (i == 0 && has_tools) {
-                content += tools_system_prompt;
+            std::string sys_body = content;
+            if (i == 0) {
+                sys_body = update_system_prompt_with_tools(content, tools_system_prompt, has_tools);
             }
-            auto enc = tok.encode(content);
+            auto enc = tok.encode(sys_body);
             result.insert(result.end(), enc.begin(), enc.end());
         } else if (role == "user") {
             result.push_back(USER);
@@ -8778,6 +8871,70 @@ struct EngineBusyGuard {
 
 static int g_request_counter = 0;  // for unique request IDs
 static json s_last_conv_messages = json::array();
+
+static void rebuild_system_prefix(
+    MoecherEngine& engine,
+    const std::string& base_prompt,
+    const json& active_tools,
+    const std::string& custom_full_prompt = "")
+{
+    std::lock_guard<std::mutex> lock(g_engine_mutex);
+
+    // Invalidate conversation-level continuation snapshot so next query doesn't reuse stale prompt
+    engine.turn_kv_snapshot_.valid = false;
+    s_last_conv_messages.clear();
+
+    json resolved_tools = active_tools;
+    if (!resolved_tools.empty()) {
+        resolved_tools = resolve_canonical_tools(resolved_tools);
+    }
+
+    std::string full_prompt_text;
+    if (!custom_full_prompt.empty()) {
+        full_prompt_text = custom_full_prompt;
+    } else {
+        bool is_qwen = (engine.cfg_.architecture == ModelArch::QWEN);
+        full_prompt_text = base_prompt + build_dynamic_tools_prompt(resolved_tools, is_qwen);
+    }
+
+    g_base_system_prompt = base_prompt;
+    g_current_system_prompt = full_prompt_text;
+    g_current_active_tools = resolved_tools;
+
+    json default_messages = json::array({
+        {{"role", "system"}, {"content", full_prompt_text}},
+        {{"role", "user"}, {"content", ""}}
+    });
+
+    std::vector<int> prompt = apply_chat_template(default_messages, engine.tokenizer_, true, "high", resolved_tools);
+
+    int user_start = (engine.cfg_.architecture == ModelArch::QWEN)
+                         ? engine.tokenizer_.get_token_id("<|im_start|>")
+                         : engine.tokenizer_.get_token_id("<｜User｜>");
+    if (user_start < 0) {
+        user_start = (engine.cfg_.architecture == ModelArch::QWEN) ? 151644 : 128803;
+    }
+    size_t sys_len = prompt.size();
+    for (size_t i = 1; i < prompt.size(); i++) {
+        if (prompt[i] == user_start) {
+            sys_len = i;
+            break;
+        }
+    }
+    if (sys_len > 0) {
+        std::vector<int> sys_tokens(prompt.begin(), prompt.begin() + sys_len);
+        LOG_INFO("Rebuilding System KV Cache snapshot (%zu tokens, %zu active tools)...",
+                 sys_tokens.size(), resolved_tools.size());
+        engine.reset_all_kv_caches();
+        engine.prefill_prefix(sys_tokens);
+        // Note: prefill_prefix() already calls snapshot_system_kv() internally on line 4060
+        LOG_INFO("System KV Cache snapshot pinned successfully (%zu tokens).", sys_tokens.size());
+    } else {
+        engine.reset_all_kv_caches();
+        engine.system_kv_snapshot_.valid = false;
+        LOG_INFO("System KV Cache snapshot cleared.");
+    }
+}
 
 static std::vector<int> build_continuation_prompt(
     const MoecherEngine& engine,
@@ -9905,6 +10062,29 @@ static void run_server(MoecherEngine& engine, int port, int default_thinking_bud
         json resp_data = json::object();
         std::string output;
 
+        if (!g_enable_tools) {
+            resp_data["success"] = false;
+            resp_data["output"] = "Error: Tool execution is disabled on this server.";
+            res.set_content(resp_data.dump(), "application/json");
+            return;
+        }
+
+        if (tool_name.rfind("mcp__", 0) != 0 && tool_name.rfind("tinobruno-", 0) != 0) {
+            bool is_active = false;
+            for (const auto& t : g_current_active_tools) {
+                if (t.contains("function") && t["function"].value("name", "") == tool_name) {
+                    is_active = true;
+                    break;
+                }
+            }
+            if (!is_active) {
+                resp_data["success"] = false;
+                resp_data["output"] = "Error: Tool '" + tool_name + "' is disabled in current settings.";
+                res.set_content(resp_data.dump(), "application/json");
+                return;
+            }
+        }
+
         if (tool_name == "read_file") {
             std::string path = args.value("path", "");
             int start_line = args.value("start_line", 1);
@@ -10148,6 +10328,82 @@ static void run_server(MoecherEngine& engine, int port, int default_thinking_bud
     });
 
     svr.Options("/api/kv/reset", [](const httplib::Request&, httplib::Response& res) {
+        res.set_header("Access-Control-Allow-Origin", "*");
+        res.set_header("Access-Control-Allow-Methods", "GET, POST, OPTIONS");
+        res.set_header("Access-Control-Allow-Headers", "*");
+        res.status = 204;
+    });
+
+    // ── System Prompt & Tool Configuration Endpoints ────────────────────────
+    svr.Get("/api/system/prompt", [&engine](const httplib::Request&, httplib::Response& res) {
+        res.set_header("Access-Control-Allow-Origin", "*");
+        json body = {
+            {"status", "ok"},
+            {"server_instance_id", g_server_instance_id},
+            {"base_prompt", g_base_system_prompt},
+            {"system_prompt", g_current_system_prompt},
+            {"active_tools", g_current_active_tools},
+            {"tokens_count", engine.system_kv_snapshot_.valid ? engine.system_kv_snapshot_.tokens.size() : 0}
+        };
+        res.set_content(body.dump(), "application/json");
+    });
+
+    svr.Options("/api/system/prompt", [](const httplib::Request&, httplib::Response& res) {
+        res.set_header("Access-Control-Allow-Origin", "*");
+        res.set_header("Access-Control-Allow-Methods", "GET, POST, OPTIONS");
+        res.set_header("Access-Control-Allow-Headers", "*");
+        res.status = 204;
+    });
+
+    svr.Post("/api/system/configure", [&engine](const httplib::Request& req, httplib::Response& res) {
+        res.set_header("Access-Control-Allow-Origin", "*");
+        try {
+            json j = json::parse(req.body);
+            std::string base_prompt = j.value("base_prompt", g_base_system_prompt);
+            std::string custom_full_prompt = j.value("system_prompt", j.value("custom_system_prompt", ""));
+
+            json active_tools = g_current_active_tools;
+            if (j.contains("tools")) {
+                active_tools = j["tools"];
+                if (active_tools.is_array() || active_tools.is_string()) {
+                    active_tools = resolve_canonical_tools(active_tools);
+                    // Retain discovered MCP tools unless caller explicitly passed an empty array []
+                    if (!j["tools"].is_array() || !j["tools"].empty()) {
+                        json mcp_tools = moecher::mcp::MCPManager::instance().get_openai_tools_schema();
+                        for (const auto& mt : mcp_tools) {
+                            active_tools.push_back(mt);
+                        }
+                    }
+                }
+                bool has_yt = false;
+                if (active_tools.is_array()) {
+                    for (const auto& item : active_tools) {
+                        if (item.is_string() && item.get<std::string>() == "youtube_search") has_yt = true;
+                        else if (item.is_object() && item.contains("function") && item["function"].value("name", "") == "youtube_search") has_yt = true;
+                    }
+                }
+                moecher::tooling::g_fast_media_search = has_yt;
+            }
+
+            rebuild_system_prefix(engine, base_prompt, active_tools, custom_full_prompt);
+
+            json body = {
+                {"status", "ok"},
+                {"server_instance_id", g_server_instance_id},
+                {"base_prompt", g_base_system_prompt},
+                {"system_prompt", g_current_system_prompt},
+                {"active_tools", g_current_active_tools},
+                {"tokens_count", engine.system_kv_snapshot_.valid ? engine.system_kv_snapshot_.tokens.size() : 0}
+            };
+            res.set_content(body.dump(), "application/json");
+        } catch (const std::exception& e) {
+            json err = {{"status", "error"}, {"message", e.what()}};
+            res.status = 400;
+            res.set_content(err.dump(), "application/json");
+        }
+    });
+
+    svr.Options("/api/system/configure", [](const httplib::Request&, httplib::Response& res) {
         res.set_header("Access-Control-Allow-Origin", "*");
         res.set_header("Access-Control-Allow-Methods", "GET, POST, OPTIONS");
         res.set_header("Access-Control-Allow-Headers", "*");
@@ -10523,15 +10779,30 @@ static void run_server(MoecherEngine& engine, int port, int default_thinking_bud
 
             json tools = json::array();
             if (g_enable_tools) {
-                if (request.contains("tools") && !request["tools"].empty()) {
-                    tools = resolve_canonical_tools(request["tools"]);
-                } else if (request.contains("enable_tools") && request["enable_tools"].is_boolean() && request["enable_tools"].get<bool>()) {
-                    tools = resolve_canonical_tools("default");
-                }
-                // Append active MCP tools
-                json mcp_tools = moecher::mcp::MCPManager::instance().get_openai_tools_schema();
-                for (const auto& mt : mcp_tools) {
-                    tools.push_back(mt);
+                if (request.contains("tools")) {
+                    if (request["tools"].is_array()) {
+                        tools = resolve_canonical_tools(request["tools"]);
+                    } else if (request["tools"].is_string()) {
+                        tools = resolve_canonical_tools(request["tools"]);
+                    }
+                    // If the request explicitly passed an empty array "tools": [], honor it (user disabled all tools)
+                    if (!request["tools"].is_array() || !request["tools"].empty()) {
+                        json mcp_tools = moecher::mcp::MCPManager::instance().get_openai_tools_schema();
+                        for (const auto& mt : mcp_tools) {
+                            tools.push_back(mt);
+                        }
+                    }
+                } else if (request.contains("enable_tools") && request["enable_tools"].is_boolean()) {
+                    if (request["enable_tools"].get<bool>()) {
+                        tools = resolve_canonical_tools("default");
+                        json mcp_tools = moecher::mcp::MCPManager::instance().get_openai_tools_schema();
+                        for (const auto& mt : mcp_tools) {
+                            tools.push_back(mt);
+                        }
+                    }
+                } else {
+                    // Fallback to active tools configured via /api/system/configure
+                    tools = g_current_active_tools;
                 }
             }
 
@@ -11955,36 +12226,12 @@ int main(int argc, char** argv) {
 
     // Pre-warm default system prompt and tooling into KV Cache for 0ms initial prefill latency
     if (g_enable_tools) {
-        json default_messages = json::array({
-            {{"role", "system"}, {"content", "You are a helpful assistant"}},
-            {{"role", "user"}, {"content", ""}}
-        });
         json default_tools = resolve_canonical_tools("default");
         json mcp_tools = mcp_mgr.get_openai_tools_schema();
         for (const auto& mt : mcp_tools) {
             default_tools.push_back(mt);
         }
-        std::vector<int> prompt = apply_chat_template(default_messages, engine.tokenizer_, true, "high", default_tools);
-        int user_start = (engine.cfg_.architecture == ModelArch::QWEN)
-                             ? engine.tokenizer_.get_token_id("<|im_start|>")
-                             : engine.tokenizer_.get_token_id("<｜User｜>");
-        if (user_start < 0) {
-            user_start = (engine.cfg_.architecture == ModelArch::QWEN) ? 151644 : 128803;
-        }
-        size_t sys_len = prompt.size();
-        for (size_t i = 1; i < prompt.size(); i++) {
-            if (prompt[i] == user_start) {
-                sys_len = i;
-                break;
-            }
-        }
-        if (sys_len > 0) {
-            std::vector<int> sys_tokens(prompt.begin(), prompt.begin() + sys_len);
-            LOG_INFO("Pre-warming startup KV Cache with default tooling system prompt (%zu tokens, %zu tools)...",
-                     sys_tokens.size(), default_tools.size());
-            engine.prefill_prefix(sys_tokens);
-            LOG_INFO("Startup KV Cache pre-warmed successfully (0ms latency ready for incoming queries).");
-        }
+        rebuild_system_prefix(engine, g_base_system_prompt, default_tools);
     }
 
     run_server(engine, port, default_thinking_budget, proxy_port, enable_forward_proxy, enable_system_proxy);

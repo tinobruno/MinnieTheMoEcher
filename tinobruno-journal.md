@@ -1,24 +1,27 @@
-# MinnieTheMoECher: Engineering, Research & Discoveries Log
+# MinnieTheMoECher: Engineering, Research & Discoveries Journal (Tino Bruno)
 
 A comprehensive chronological record of engineering breakthroughs, mathematical analyses, performance bottlenecks, root-cause investigations, and architectural milestones in **MinnieTheMoECher**.
 
 ---
 
 ## Table of Contents
-1. [Endeavour 1: DeepSeek V4-Flash 100% Resident MoE Quantization (IQ2_XXS + Q2_K)](#endeavour-1-deepseek-v4-flash-100-resident-moe-quantization-iq2_xxs--q2_k)
-2. [Endeavour 2: Context Retention & Compressed Sequence Attention (CSA & HCA)](#endeavour-2-context-retention--compressed-sequence-attention-csa--hca)
-3. [Endeavour 3: Qwen 3.8 27B Native MTP Speculative Decoding (~98 tok/s Milestone)](#endeavour-3-qwen-38-27b-native-mtp-speculative-decoding-98-toks-milestone)
-4. [Endeavour 4: Mixed INT3/INT4 Quantization for 16GB GPUs (`qwen3.8-27B-Vision-13G`)](#endeavour-4-mixed-int3int4-quantization-for-16gb-gpus-qwen38-27b-vision-13g)
-5. [Endeavour 5: Recurrent State Preservation — The DeltaNet SSM Rollback Overflow](#endeavour-5-recurrent-state-preservation--the-deltanet-ssm-rollback-overflow)
-6. [Endeavour 6: Speculative Verification Dequantization Thrashing (14 tok/s $\to$ 110 tok/s)](#endeavour-6-speculative-verification-dequantization-thrashing-14-toks--110-toks)
-7. [Endeavour 7: Server Streaming Latency, Nagle's Algorithm (`TCP_NODELAY`), and Zero-Alloc SSE](#endeavour-7-server-streaming-latency-nagles-algorithm-tcp_nodelay-and-zero-alloc-sse)
-8. [Endeavour 8: Context-Length Scaling Bottleneck — 3,145-Token Tool Attention (44 tok/s vs 109 tok/s)](#endeavour-8-context-length-scaling-bottleneck--3145-token-tool-attention-44-toks-vs-109-toks)
-9. [Endeavour 9: Pinned System KV Snapshots & Autonomous Agentic Suite](#endeavour-9-pinned-system-kv-snapshots--autonomous-agentic-suite)
-10. [Roadmap of Pending Optimizations](#roadmap-of-pending-optimizations)
+1. [2026-08-28 — Endeavour 1: DeepSeek V4-Flash 100% Resident MoE Quantization (IQ2_XXS + Q2_K)](#endeavour-1-deepseek-v4-flash-100-resident-moe-quantization-iq2_xxs--q2_k)
+2. [2026-08-30 — Endeavour 2: Context Retention & Compressed Sequence Attention (CSA & HCA)](#endeavour-2-context-retention--compressed-sequence-attention-csa--hca)
+3. [2026-09-04 — Endeavour 3: Qwen 3.8 27B Native MTP Speculative Decoding (~98 tok/s Milestone)](#endeavour-3-qwen-38-27b-native-mtp-speculative-decoding-98-toks-milestone)
+4. [2026-09-17 — Endeavour 4: Mixed INT3/INT4 Quantization for 16GB GPUs (`qwen3.8-27B-Vision-13G`)](#endeavour-4-mixed-int3int4-quantization-for-16gb-gpus-qwen38-27b-vision-13g)
+5. [2026-09-17 — Endeavour 5: Recurrent State Preservation — The DeltaNet SSM Rollback Overflow](#endeavour-5-recurrent-state-preservation--the-deltanet-ssm-rollback-overflow)
+6. [2026-09-17 — Endeavour 6: Speculative Verification Dequantization Thrashing (14 tok/s $\to$ 110 tok/s)](#endeavour-6-speculative-verification-dequantization-thrashing-14-toks--110-toks)
+7. [2026-09-17 — Endeavour 7: Server Streaming Latency, Nagle's Algorithm (`TCP_NODELAY`), and Zero-Alloc SSE](#endeavour-7-server-streaming-latency-nagles-algorithm-tcp_nodelay-and-zero-alloc-sse)
+8. [2026-09-17 — Endeavour 8: Context-Length Scaling Bottleneck — 3,145-Token Tool Attention (44 tok/s vs 109 tok/s)](#endeavour-8-context-length-scaling-bottleneck--3145-token-tool-attention-44-toks-vs-109-toks)
+9. [2026-09-17 — Endeavour 9: Pinned System KV Snapshots & Autonomous Agentic Suite](#endeavour-9-pinned-system-kv-snapshots--autonomous-agentic-suite)
+10. [2026-09-17 — Endeavour 10: Ampere-Gated Architecture, 4-Slot Speculative Rollback & KV Snapshot Slicing](#endeavour-10-ampere-gated-architecture-4-slot-speculative-rollback--kv-snapshot-slicing)
+11. [2026-09-18 — Endeavour 11: Prompt Attention Minimization, Qwen-Conditional Tool Formatting & Dynamic MCP Schema Compression (2,638 $\to$ ~500 Tokens)](#endeavour-11-prompt-attention-minimization-qwen-conditional-tool-formatting--dynamic-mcp-schema-compression-2638--500-tokens)
+12. [Roadmap of Pending Optimizations](#roadmap-of-pending-optimizations)
 
 ---
 
 ## Endeavour 1: DeepSeek V4-Flash 100% Resident MoE Quantization (IQ2_XXS + Q2_K)
+**Date:** August 28, 2026 (`2026-08-28`)
 
 ### Problem Statement
 DeepSeek V4-Flash contains **11,008 MoE experts** across 43 layers. The uncompressed FP4 weights required **157.4 GB**, exceeding 96GB VRAM on RTX PRO 6000 (Blackwell). NVMe SSD streaming and DRAM offloading resulted in disk I/O stalls, capping decode throughput at **~35 tok/s**.
@@ -42,6 +45,7 @@ DeepSeek V4-Flash contains **11,008 MoE experts** across 43 layers. The uncompre
 ---
 
 ## Endeavour 2: Context Retention & Compressed Sequence Attention (CSA & HCA)
+**Date:** August 30, 2026 (`2026-08-30`)
 
 ### Problem Statement
 During multi-step reasoning deliberation (`<think>...</think>`), the model frequently suffered reasoning context amnesia after ~32 tokens, looping or forgetting premises.
@@ -62,6 +66,7 @@ During multi-step reasoning deliberation (`<think>...</think>`), the model frequ
 ---
 
 ## Endeavour 3: Qwen 3.8 27B Native MTP Speculative Decoding (~98 tok/s Milestone)
+**Date:** September 4, 2026 (`2026-09-04`)
 
 ### Problem Statement
 Autoregressive decoding of Qwen 3.8 27B (hybrid DeltaNet linear attention + full GQA) ran at **55.0 tok/s**. Attempting to use an external 2B neural drafter actually **degraded** speed to **42.0 tok/s** (-24%) due to high draft latency (8 ms) and poor token acceptance (22.1%).
@@ -86,6 +91,7 @@ Autoregressive decoding of Qwen 3.8 27B (hybrid DeltaNet linear attention + full
 ---
 
 ## Endeavour 4: Mixed INT3/INT4 Quantization for 16GB GPUs (`qwen3.8-27B-Vision-13G`)
+**Date:** September 17, 2026 (`2026-09-17`)
 
 ### Problem Statement
 Standard INT4 checkpoints of Qwen 3.8 27B occupied **>20 GB**, exceeding the VRAM of mainstream 16GB cards (RTX 4060 Ti, RTX 5060 Ti) and forcing PCIe host memory paging that collapsed generation to single digits.
@@ -105,6 +111,7 @@ We designed a selective precision hierarchy implemented in [`scripts/quantize_qw
 ---
 
 ## Endeavour 5: Recurrent State Preservation — The DeltaNet SSM Rollback Overflow
+**Date:** September 17, 2026 (`2026-09-17`)
 
 ### Problem Statement
 During complex reasoning prompts (e.g. *"Which number is bigger: 9.11 or 9.9?"*), the model's thinking stream began hallucinating numbers and devolved into an infinite repetitive loop (`24.1.2.1.2.1.1.1.1.1.1...`).
@@ -126,6 +133,7 @@ During complex reasoning prompts (e.g. *"Which number is bigger: 9.11 or 9.9?"*)
 ---
 
 ## Endeavour 6: Speculative Verification Dequantization Thrashing (14 tok/s $\to$ 110 tok/s)
+**Date:** September 17, 2026 (`2026-09-17`)
 
 ### Problem Statement
 After deploying the INT3/INT4 model, throughput on short prompts ("hello") collapsed down to **~14 tok/s**.
@@ -152,6 +160,7 @@ Implemented direct packed INT3 kernels in [`src/cuda/activations.cu`](file:///ho
 ---
 
 ## Endeavour 7: Server Streaming Latency, Nagle's Algorithm (`TCP_NODELAY`), and Zero-Alloc SSE
+**Date:** September 17, 2026 (`2026-09-17`)
 
 ### Problem Statement
 While CLI benchmarks achieved 109 tok/s, the Web UI and HTTP client registered jitter and lower perceived token delivery rates.
@@ -169,6 +178,7 @@ While CLI benchmarks achieved 109 tok/s, the Web UI and HTTP client registered j
 ---
 
 ## Endeavour 8: Context-Length Scaling Bottleneck — 3,145-Token Tool Attention (44 tok/s vs 109 tok/s)
+**Date:** September 17, 2026 (`2026-09-17`)
 
 ### Problem Statement
 Testing `"hello"` via CLI produced **109.41 tok/s**, but testing `"hello"` in the Web UI produced **43.98 tok/s**.
@@ -236,6 +246,7 @@ We designed and implemented two fused optimizations in [`src/cuda/activations.cu
 ---
 
 ## Endeavour 9: Pinned System KV Snapshots & Autonomous Agentic Suite
+**Date:** September 17, 2026 (`2026-09-17`)
 
 ### Features & Capabilities
 1. **Startup KV Cache Snapshotting**:
@@ -251,11 +262,94 @@ We designed and implemented two fused optimizations in [`src/cuda/activations.cu
 
 ---
 
+## Endeavour 10: Ampere-Gated Architecture, 4-Slot Speculative Rollback & KV Snapshot Slicing
+**Date:** September 17, 2026 (`2026-09-17`)
+
+### Problems Addressed
+1. **Ampere (RTX 3090 / CC 8.6) Architecture Compatibility**:
+   - Newer architectures (Ada CC 8.9+, Hopper CC 9.0+, Blackwell CC 10.0+/12.0+) support hardware FP8 Tensor Cores and FP4 execution. Ampere GPUs (CC 8.0/8.6, such as RTX 3080/3090/A100) fail if native FP8 tensor core instructions or FP4 instructions are invoked without hardware capability detection.
+2. **VRAM Exhaustion on 16GB Cards (RTX 4060 Ti / 5060 Ti)**:
+   - DeepSeek/Qwen full pre-allocated KV caches were allocating maximum sequence context (32,768 tokens = 536.8 MB per layer $\times 2 = 1.07\text{ GB}$) during prefix snapshot cloning, threatening VRAM limits on 16GB cards and triggering PCIe thrashing.
+3. **SSM Rollback Depth Capped at $K=2$**:
+   - `deltanet_ssm_batch_kernel` and `deltanet_conv_batch_kernel` were previously hard-coded to save only 2 intermediate state slots (`slot_0` and `slot_1`), capping speculative draft depth at $K=2$ ($M=3$).
+4. **Intermediate Prefill Micro-Chunk LM Head Overhead**:
+   - During `prefill_prefix()`, evaluating 393 micro-chunks was running the 248k-vocab INT4 LM head on every intermediate chunk, reading 250 GB of unnecessary weight data from VRAM.
+
+### Architectural Solutions & Implementations
+1. **Dynamic Hardware Capability Gating (`GpuCapabilities`)**:
+   - Introduced `detect_gpu_capabilities(device_id)` inspecting CUDA compute capability:
+     - `is_ampere` ($8.0 \le \text{CC} < 8.9$), `is_ada_or_newer` ($\text{CC} \ge 8.9$), `is_blackwell_or_newer` ($\text{CC} \ge 10.0$).
+     - Hardware-gated FP8 Tensor Core and FP4 paths, falling back seamlessly to vectorized BF16 simulation on Ampere.
+     - VRAM constraint detector (`is_vram_constrained <= 16GB`) to cap graph workspace memory.
+2. **Active Prefix KV Cache Slicing (`active_gqa_bytes`)**:
+   - Sliced `snap_k_cache_gqa` and `snap_v_cache_gqa` during `snapshot_kv()` and `restore_kv()` to the exact active prefix token length:
+     $$\text{active\_gqa\_bytes} = \text{tokens.size()} \times N_{\text{kv}} \times d_{\text{head}} \times 1\text{ byte}$$
+   - Reduced snapshot VRAM from 1,073 MB down to 103 MB for a 3,145-token tool prompt, saving **970 MB VRAM** and eliminating 16GB card OOM risk.
+3. **4-Slot Intermediate DeltaNet Rollback ($M=5, K=4$)**:
+   - Upgraded `deltanet_conv_batch_kernel` and `deltanet_ssm_batch_kernel` to maintain 4 rollback slots: `slot_0` ($m=0$), `slot_1` ($m=1$), `slot_2` ($m=2$), and `slot_3` ($m=3$).
+   - Enabled adaptive $K=4$ ($M=5$) speculative drafting in `generate()` when inside tool calls (`<tool_call>`) or on high draft streaks (`draft_streak >= 3`), achieving up to **$M=5$ batched verification cycles**.
+4. **Bypass LM-Head Projection in Prefill Micro-Chunks**:
+   - Parameterized `forward_token_batch_qwen_device_body(position, M, bool compute_logits = true)`.
+   - Disabled final RMSNorm and 248k-vocab LM head GEMM across all intermediate prefill chunks, eliminating 250 GB of memory read bandwidth and writing 0 discarded logits.
+
+---
+
+## Endeavour 11: Prompt Attention Minimization, Qwen-Conditional Tool Formatting & Dynamic MCP Schema Compression (2,638 $\to$ ~500 Tokens)
+**Date:** September 18, 2026 (`2026-09-18`)
+
+### Problem Statement & Investigation
+When full agentic capabilities were enabled (8 canonical built-in tools plus discovered Model Context Protocol servers such as `tinobruno-teams-mcp`), the system prompt ballooned to **2,638 tokens** (10,044 raw characters). In a local serving environment, context length directly drives self-attention quadratic compute during sequence prefill and increases KV cache memory allocation.
+
+Profiling revealed five distinct sources of prompt inflation:
+1. **JSON Indentation & Pretty-Printing Overhead**:
+   - `resolved_tools.dump(2)` serialized the tool array with 2-space indentation and newlines across every property, enum, and bracket.
+   - For 13 tools, over **1,400 tokens** consisted entirely of structural whitespace and repeated newline characters.
+2. **OpenAPI Parameter Redundancy**:
+   - Every parameter property in `CANONICAL_TOOLS` contained verbose natural language descriptions (e.g. `"The search query string."`, `"The relative or absolute file path to read."`).
+   - For state-of-the-art LLMs, primitive type declarations (`"type": "string"`) and descriptive parameter names (`query`, `path`, `command`) provide sufficient semantic grounding.
+3. **System Prompt Prose Duplication**:
+   - Natural language paragraphs in the system prompt duplicated tool instructions already defined in `<tools>` schemas, alongside defensive negative constraints and greeting rules.
+4. **Tool-Calling Syntax Cross-Contamination**:
+   - The `<tool_call>` XML format reminder was being injected unconditionally, conflicting with models that utilize native special vocabulary tokens (e.g., DeepSeek-V3/R1 `<｜tool call begin｜>`).
+5. **External Enterprise MCP Schema Bloat**:
+   - Discovered MCP servers (such as Microsoft Teams MCP) injected large enterprise docstrings and Azure AD parameter descriptions directly into the model context, consuming over **800 tokens** across 5 tools.
+
+### Architectural Solutions & Implementations
+
+1. **Compact Single-Line Tool Serialization**:
+   - Replaced multi-line indented `resolved_tools.dump(2)` with compact, unindented single-line serialization matching the official Qwen chat template training distribution:
+     ```cpp
+     for (const auto& item : resolved_tools) {
+         prompt += item.dump() + "\n";
+     }
+     ```
+   - **Immediate Impact**: Instantly eliminated 1,404 whitespace tokens, reducing prompt size from **2,638 to 1,234 tokens**.
+
+2. **Canonical Parameter Schema Stripping**:
+   - Removed redundant `description` fields from all parameter properties across all 8 canonical tools in `CANONICAL_TOOLS`.
+   - Preserved parameter types (`string`, `integer`, `boolean`), `enum` constraints, and concise function-level summaries (`"Read file contents from local filesystem."`, `"Search the web for current information and news."`).
+
+3. **Architecture-Conditional `<tool_call>` Syntax Ingestion**:
+   - Parameterized `build_dynamic_tools_prompt(resolved_tools, is_qwen)`.
+   - Bound `<tool_call>` format instructions strictly to Qwen family models via `engine.cfg_.architecture == ModelArch::QWEN` and `<|im_start|>` vocabulary detection.
+   - Non-Qwen architectures (such as DeepSeek) omit this block entirely, preventing prompt contamination and allowing native tool-calling tokens to operate cleanly.
+
+4. **Dynamic On-The-Fly MCP Schema Minifier**:
+   - Enhanced `MCPToolInfo::to_openai_schema()` in `src/mcp_client.hpp` to automatically prune any connected MCP server:
+     - **First-Sentence Truncation**: Truncates multi-paragraph tool docstrings at the first sentence boundary (capped at 120 characters).
+     - **Parameter Description Eradication**: Automatically iterates `input_schema["properties"]` and strips all `description` and `title` fields.
+     - **Schema Ceremony Elimination**: Strips `$schema` URLs, `additionalProperties`, and redundant `[server_id MCP]` prefix tags.
+     - **Dashboard Fidelity Preserved**: Full descriptions and schemas remain intact in `get_servers_status_json()` for web UI inspector cards.
+
+### Results & Performance Milestone
+- **Total Token Reduction**: Slashed the 13-tool system prompt from **2,638 tokens down to ~500 tokens** (an **~80% reduction**).
+- **System KV Snapshot Efficiency**: The pinned system prefix snapshot memory scaled down from over 1,000 MB to ~150 MB, freeing VRAM on memory-constrained GPUs (16GB cards) and minimizing prefill time.
+
+---
+
 ## Roadmap of Pending Optimizations
 
 1. **Tensor Core / MMA Attention for GQA Decode**:
    - Explore FP8 tensor core HGEMM / MMA instructions for QK dot products and score-value accumulation on long sequence tiles ($>8\text{k}$ tokens).
-2. **Expanded SSM Rollback Checkpoint Slots ($M \le 8$)**:
-   - Expand `target_ssm_pool_` rollback buffers in shared memory to allow higher speculative drafting depths ($K \ge 4$) on Qwen 3.8.
-3. **Zero-Copy Speculative KV Rollback**:
+2. **Zero-Copy Speculative KV Rollback**:
    - Maintain a hardware-tracked position pointer rather than overwriting rejected positions in VRAM.
