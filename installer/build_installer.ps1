@@ -39,6 +39,7 @@ if (-not (Test-Path "moecher.exe") -and (Test-Path "build\moecher.exe")) {
 $RequiredFiles = @(
     "moecher.exe",
     "installer\Moecher_Setup.iss",
+    "installer\start_qwen_13g_server.bat",
     "installer\start_qwen_server.bat",
     "installer\start_deepseek_server.bat",
     "installer\test_qwen.bat",
@@ -78,8 +79,13 @@ $setupExe = "$DistDir\Moecher-Setup.exe"
 if (Test-Path $setupExe) {
     $setupItem = Get-Item $setupExe
     $setupMB = [math]::Round($setupItem.Length / 1MB, 2)
+    Copy-Item $setupExe "F:\moecher\Moecher-Setup.exe" -Force -ErrorAction SilentlyContinue
+    if (Test-Path "Y:\Moecher") {
+        Copy-Item $setupExe "Y:\Moecher\Moecher-Setup.exe" -Force -ErrorAction SilentlyContinue
+    }
     Write-Host "================================================================" -ForegroundColor Green
     Write-Host "  Moecher Installer Created Successfully!" -ForegroundColor Green
     Write-Host "  Installer Path: $setupExe ($setupMB MB)" -ForegroundColor Green
+    Write-Host "  Mirrored to: F:\moecher\Moecher-Setup.exe and Y:\Moecher\Moecher-Setup.exe" -ForegroundColor Green
     Write-Host "================================================================" -ForegroundColor Green
 }
