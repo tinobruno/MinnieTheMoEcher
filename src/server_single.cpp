@@ -2218,6 +2218,7 @@ public:
     int num_kv_heads_ = 4;     // kv heads
     int head_dim_ = 256;
     int full_vocab_size_ = 0;   // Size of full vocabulary (248320)
+    int max_seq_len_ = 32768;
     float rms_eps_ = 1e-6f;
 
     // MTP module weights (loaded from main model checkpoint)
@@ -2281,7 +2282,9 @@ public:
     bool load_mtp_weights(const void* mapped_data, const json& tensor_map,
                           __nv_bfloat16* embed_w, uint8_t* embed_w_int4, __nv_bfloat16* embed_s, bool is_embed_int4,
                           __nv_bfloat16* full_lm_head, int full_vocab,
-                          const std::string& model_dir, cudaStream_t stream) {
+                          const std::string& model_dir, cudaStream_t stream,
+                          int max_seq_len = 32768) {
+        max_seq_len_ = max_seq_len > 0 ? max_seq_len : 32768;
         full_vocab_size_ = full_vocab;
         target_embed_w_ = embed_w;
         target_embed_w_int4_ = embed_w_int4;
@@ -2366,9 +2369,9 @@ public:
         }
 
         // Allocate MTP KV cache
-        int max_seq = 32768;
-        mtp_k_cache_.alloc(max_seq * num_kv_heads_ * head_dim_ * sizeof(__nv_bfloat16));
-        mtp_v_cache_.alloc(max_seq * num_kv_heads_ * head_dim_ * sizeof(__nv_bfloat16));
+        int max_seq = max_seq_len_ > 0 ? max_seq_len_ : 32768;
+        mtp_k_cache_.alloc((size_t)max_seq * num_kv_heads_ * head_dim_ * sizeof(__nv_bfloat16));
+        mtp_v_cache_.alloc((size_t)max_seq * num_kv_heads_ * head_dim_ * sizeof(__nv_bfloat16));
         CUDA_CHECK(cudaMemsetAsync(mtp_k_cache_.data, 0, mtp_k_cache_.size_bytes, stream));
         CUDA_CHECK(cudaMemsetAsync(mtp_v_cache_.data, 0, mtp_v_cache_.size_bytes, stream));
 
@@ -2584,7 +2587,7 @@ public:
             mtp_layer_q_norm_w_.bf16(), mtp_layer_k_norm_w_.bf16(),
             mtp_k_cache_.bf16(), mtp_v_cache_.bf16(),
             num_heads_, num_kv_heads_, head_dim_,
-            buf_mtp_input_pos_.i32(), position, 32768,
+            buf_mtp_input_pos_.i32(), position, max_seq_len_ > 0 ? max_seq_len_ : 32768,
             10000000.0f, rms_eps_, stream);
 
         // 5d. Output projection + residual
@@ -2743,6 +2746,7 @@ public:
 
     // MTP Self-Drafter (new, faster)
     MTPSelfDrafter mtp_drafter_;
+    bool enable_mtp_ = true;
 
     // Prompt-Lookup Drafting (PLD) Speculative Decoding
     bool enable_pld_ = true;
@@ -3246,7 +3250,8 @@ public:
 
     bool load(const std::string& manifest_path, float max_vram_gb = 0.0f, float dram_cache_gb = 0.0f,
               const std::string& expert_dtype_override = "", bool buffered_io = false,
-              int max_seq_len_override = 0) {
+              int max_seq_len_override = 0, bool enable_mtp = true) {
+        enable_mtp_ = enable_mtp;
         manifest_path_ = manifest_path;
         LOG_INFO("Loading manifest: %s", manifest_path.c_str());
 
@@ -3317,6 +3322,13 @@ public:
                  (int)gpu_caps_.is_ampere, (int)gpu_caps_.is_ada_or_newer,
                  (int)gpu_caps_.is_blackwell_or_newer, (int)gpu_caps_.supports_fp8,
                  (int)gpu_caps_.supports_fp4, (int)gpu_caps_.is_vram_constrained);
+
+        if (max_seq_len_override == 0 && gpu_caps_.total_vram_bytes > 0 &&
+            gpu_caps_.total_vram_bytes <= 17ULL * 1024 * 1024 * 1024 && cfg_.max_seq_len > 8192) {
+            LOG_INFO("Hardware: 16GB GPU detected (%.1f GB VRAM). Auto-tuning max_seq_len from %d to 8192 to prevent Windows shared DRAM paging (use --ctx <n> to override).",
+                     gpu_caps_.total_vram_bytes / (1024.0 * 1024.0 * 1024.0), cfg_.max_seq_len);
+            cfg_.max_seq_len = 8192;
+        }
 
         cudaDeviceProp prop;
         if (cudaGetDeviceProperties(&prop, 0) == cudaSuccess) {
@@ -5277,7 +5289,7 @@ private:
         }
 
         // Load MTP Self-Drafter weights from the same checkpoint
-        if (cfg_.architecture == ModelArch::QWEN && embed_weight_.data) {
+        if (enable_mtp_ && cfg_.architecture == ModelArch::QWEN && embed_weight_.data) {
             std::string mtp_model_dir = model_dir_;
             if (mtp_model_dir.empty()) {
                 mtp_model_dir = ".";
@@ -5289,8 +5301,11 @@ private:
                                               embed_weight_scale_.bf16(),
                                               embed_weight_.dtype == "int4",
                                               head_weight_.dtype == "int4" ? nullptr : head_weight_.bf16(),
-                                              cfg_.vocab_size, mtp_model_dir, main_stream_);
+                                              cfg_.vocab_size, mtp_model_dir, main_stream_,
+                                              cfg_.max_seq_len);
             }
+        } else if (!enable_mtp_) {
+            LOG_INFO("MTP: Self-drafter explicitly disabled via --no-mtp flag");
         }
 
         dense_mmap.close();
@@ -12118,6 +12133,7 @@ int main(int argc, char** argv) {
     std::string batched_prefill_mode = "auto";
     int prefill_chunk_size = 512;
     int max_seq_len_override = 0;
+    bool enable_mtp = true;
 
     for (int i = 1; i < argc; i++) {
         if (std::string(argv[i]) == "--help" || std::string(argv[i]) == "-h") {
@@ -12129,6 +12145,7 @@ int main(int argc, char** argv) {
             printf("  --dram-cache-gb <gb>        DRAM cache budget in GB\n");
             printf("  --ctx, -c <tokens>          Max context length in tokens (default: 65536)\n");
             printf("  --max-seq-len <tokens>      Alias for --ctx\n");
+            printf("  --no-mtp, --disable-mtp     Disable MTP self-speculative decoding\n");
             printf("  --budget <tokens>           Default thinking budget tokens\n");
             printf("  --max-tool-rounds <n>       Max sequential tool execution rounds per turn (default: %d)\n", g_max_tool_rounds);
             printf("  --help, -h                  Show this help message\n");
@@ -12139,6 +12156,8 @@ int main(int argc, char** argv) {
             port = std::stoi(argv[++i]);
         } else if ((std::string(argv[i]) == "--proxy-port" || std::string(argv[i]) == "-pp") && i + 1 < argc) {
             proxy_port = std::stoi(argv[++i]);
+        } else if (std::string(argv[i]) == "--no-mtp" || std::string(argv[i]) == "--disable-mtp") {
+            enable_mtp = false;
         } else if (std::string(argv[i]) == "--no-proxy" || std::string(argv[i]) == "--disable-proxy") {
             enable_forward_proxy = false;
         } else if (std::string(argv[i]) == "--system-proxy" || std::string(argv[i]) == "--auto-proxy") {
@@ -12231,13 +12250,14 @@ int main(int argc, char** argv) {
     LOG_INFO("Server-side tool execution: %s (headless-browsing: %s)", g_server_exec ? "enabled" : "disabled", g_headless_browsing ? "enabled" : "disabled");
 
     MoecherEngine engine;
+    engine.enable_mtp_ = enable_mtp;
     engine.batched_prefill_mode_ = batched_prefill_mode;
     engine.prefill_chunk_size_ = prefill_chunk_size;
     engine.enable_pld_ = enable_pld;
     engine.pld_draft_tokens_ = pld_draft_tokens;
     LOG_INFO("Prompt-Lookup Drafting (PLD): %s (draft_tokens=%d)", enable_pld ? "enabled" : "disabled", pld_draft_tokens);
 
-    if (!engine.load(manifest_path, max_vram_gb, dram_cache_gb, expert_dtype_override, buffered_io, max_seq_len_override)) {
+    if (!engine.load(manifest_path, max_vram_gb, dram_cache_gb, expert_dtype_override, buffered_io, max_seq_len_override, enable_mtp)) {
         LOG_ERROR("Failed to load model");
         return 1;
     }

@@ -127,7 +127,7 @@ begin
       'echo   Starting Moecher Server with Qwen 3.8 27B Vision (13GB GPU Mode)' + #13#10 +
       'echo   Web UI: http://localhost:8001' + #13#10 +
       'echo ===============================================================================' + #13#10 +
-      'start "Moecher Qwen 13G Server" /high moecher.exe --manifest models\qwen3_8_27b_vision_13g\moecher_manifest.json --max-vram ' + MaxVram + ' --dram-cache-gb ' + DramCache + ' --quiet' + #13#10;
+      'start "Moecher Qwen 13G Server" /high moecher.exe --manifest models\qwen3_8_27b_vision_13g\moecher_manifest.json --max-vram ' + MaxVram + ' --dram-cache-gb ' + DramCache + ' --ctx 8192 --quiet' + #13#10;
     SaveStringToFile(AppDir + '\start_qwen_13g_server.bat', Qwen13gBatContent, False);
 
     // Customize start_qwen_server.bat
