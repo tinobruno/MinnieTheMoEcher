@@ -2747,6 +2747,7 @@ public:
     // MTP Self-Drafter (new, faster)
     MTPSelfDrafter mtp_drafter_;
     bool enable_mtp_ = true;
+    int mtp_k_ = 0; // 0 = auto (1 for 16GB GPUs, 4 for >= 24GB GPUs)
 
     // Prompt-Lookup Drafting (PLD) Speculative Decoding
     bool enable_pld_ = true;
@@ -4628,10 +4629,11 @@ public:
                         }
                     }
                     // Adaptive MTP draft depth:
-                    // K=4 when inside tool call or high streak (draft_streak >= 3)
-                    // K=2 on streak (draft_streak >= 1)
-                    // K=1 on cold start
+                    // On VRAM/compute-constrained 16GB cards (36 SMs), cap to K=1 so verification is always M=2,
+                    // avoiding the severe compute latency spike of M=5 verification on missed draft tokens.
+                    int max_k = (mtp_k_ > 0) ? mtp_k_ : (gpu_caps_.is_vram_constrained ? 1 : 4);
                     int K = (in_tool_call || draft_streak >= 3) ? 4 : ((draft_streak >= 1) ? 2 : 1);
+                    if (K > max_k) K = max_k;
                     auto t0 = std::chrono::steady_clock::now();
                     mtp_drafter_.draft_k_tokens(buf_hidden2_.bf16(), next_token, position, K, cand_tokens, main_stream_);
                     auto t1 = std::chrono::steady_clock::now();
@@ -12134,6 +12136,7 @@ int main(int argc, char** argv) {
     int prefill_chunk_size = 512;
     int max_seq_len_override = 0;
     bool enable_mtp = true;
+    int mtp_k = 0;
 
     for (int i = 1; i < argc; i++) {
         if (std::string(argv[i]) == "--help" || std::string(argv[i]) == "-h") {
@@ -12146,6 +12149,7 @@ int main(int argc, char** argv) {
             printf("  --ctx, -c <tokens>          Max context length in tokens (default: 65536)\n");
             printf("  --max-seq-len <tokens>      Alias for --ctx\n");
             printf("  --no-mtp, --disable-mtp     Disable MTP self-speculative decoding\n");
+            printf("  --mtp-k <n>                 Max MTP draft depth (default: 1 on 16GB GPUs, 4 on >=24GB GPUs)\n");
             printf("  --budget <tokens>           Default thinking budget tokens\n");
             printf("  --max-tool-rounds <n>       Max sequential tool execution rounds per turn (default: %d)\n", g_max_tool_rounds);
             printf("  --help, -h                  Show this help message\n");
@@ -12158,6 +12162,8 @@ int main(int argc, char** argv) {
             proxy_port = std::stoi(argv[++i]);
         } else if (std::string(argv[i]) == "--no-mtp" || std::string(argv[i]) == "--disable-mtp") {
             enable_mtp = false;
+        } else if ((std::string(argv[i]) == "--mtp-k" || std::string(argv[i]) == "--mtp-depth") && i + 1 < argc) {
+            mtp_k = std::stoi(argv[++i]);
         } else if (std::string(argv[i]) == "--no-proxy" || std::string(argv[i]) == "--disable-proxy") {
             enable_forward_proxy = false;
         } else if (std::string(argv[i]) == "--system-proxy" || std::string(argv[i]) == "--auto-proxy") {
@@ -12251,6 +12257,7 @@ int main(int argc, char** argv) {
 
     MoecherEngine engine;
     engine.enable_mtp_ = enable_mtp;
+    engine.mtp_k_ = mtp_k;
     engine.batched_prefill_mode_ = batched_prefill_mode;
     engine.prefill_chunk_size_ = prefill_chunk_size;
     engine.enable_pld_ = enable_pld;
