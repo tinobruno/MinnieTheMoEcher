@@ -2373,46 +2373,107 @@ public:
         CUDA_CHECK(cudaMemsetAsync(mtp_v_cache_.data, 0, mtp_v_cache_.size_bytes, stream));
 
         // Try loading compact draft vocabulary and draft lm_head (BF16)
-        std::string draft_ids_path = model_dir + "/draft_vocab_ids.bin";
-        std::string draft_head_path = model_dir + "/draft_lm_head_int8_bf16.bin";
+        std::string resolved_ids_path;
+        std::vector<std::string> ids_candidates;
+        if (!model_dir.empty()) {
+            std::filesystem::path p_model(model_dir);
+            ids_candidates.push_back((p_model / "draft_vocab_ids.bin").string());
+            ids_candidates.push_back((p_model / "draft_vocab_ids.bin").lexically_normal().string());
+        }
+        ids_candidates.push_back("draft_vocab_ids.bin");
+        ids_candidates.push_back("./draft_vocab_ids.bin");
+        ids_candidates.push_back("models/qwen3_8_27b_vision_13g/draft_vocab_ids.bin");
+        ids_candidates.push_back("models/qwen3.8-27B-Vision-13G/draft_vocab_ids.bin");
+        ids_candidates.push_back("models/qwen3_8_27b_q4/draft_vocab_ids.bin");
 
-        FILE* f_ids = fopen(draft_ids_path.c_str(), "rb");
-        FILE* f_head = fopen(draft_head_path.c_str(), "rb");
-        if (f_ids && f_head) {
-            uint32_t n_ids = 0;
-            if (fread(&n_ids, sizeof(uint32_t), 1, f_ids) == 1 && n_ids > 0) {
-                draft_vocab_ids_.resize(n_ids);
-                if (fread(draft_vocab_ids_.data(), sizeof(int32_t), n_ids, f_ids) == n_ids) {
-                    uint32_t rows = 0, cols = 0;
-                    if (fread(&rows, sizeof(uint32_t), 1, f_head) == 1 &&
-                        fread(&cols, sizeof(uint32_t), 1, f_head) == 1 &&
-                        rows == n_ids && (int)cols == hidden_size_) {
-                        size_t head_bytes = (size_t)rows * cols * sizeof(__nv_bfloat16);
-                        std::vector<char> head_buf(head_bytes);
-                        if (fread(head_buf.data(), 1, head_bytes, f_head) == head_bytes) {
-                            draft_lm_head_w_.alloc(head_bytes);
-                            CUDA_CHECK(cudaMemcpyAsync(draft_lm_head_w_.data, head_buf.data(), head_bytes, cudaMemcpyHostToDevice, stream));
-                            use_draft_vocab_ = true;
-                            draft_vocab_size_ = (int)n_ids;
-                            LOG_INFO("MTP: Loaded draft vocabulary (%d tokens) and draft lm_head (%.1f MB BF16, 6.2x faster drafting!)",
-                                     draft_vocab_size_, head_bytes / (1024.0 * 1024.0));
-                        }
-                    }
-                }
+        for (const auto& c : ids_candidates) {
+            std::error_code ec;
+            if (std::filesystem::exists(c, ec) && std::filesystem::file_size(c, ec) > 0) {
+                resolved_ids_path = c;
+                break;
             }
         }
-        if (f_ids) fclose(f_ids);
-        if (f_head) fclose(f_head);
 
-        // Validate lm_head pointer if draft vocabulary is not available
-        if (!use_draft_vocab_) {
-            if (!full_lm_head_w_) {
-                LOG_WARN("MTP: full lm_head pointer is null and no draft lm_head found, MTP drafter disabled");
-                return false;
-            }
-            LOG_INFO("MTP: Using full model lm_head [%d, %d] BF16 (shared, no extra VRAM)",
-                     full_vocab_size_, hidden_size_);
+        std::string resolved_head_path;
+        std::vector<std::string> head_candidates;
+        if (!model_dir.empty()) {
+            std::filesystem::path p_model(model_dir);
+            head_candidates.push_back((p_model / "draft_lm_head_int8_bf16.bin").string());
+            head_candidates.push_back((p_model / "draft_lm_head_int8_bf16.bin").lexically_normal().string());
         }
+        head_candidates.push_back("draft_lm_head_int8_bf16.bin");
+        head_candidates.push_back("./draft_lm_head_int8_bf16.bin");
+        head_candidates.push_back("models/qwen3_8_27b_vision_13g/draft_lm_head_int8_bf16.bin");
+        head_candidates.push_back("models/qwen3.8-27B-Vision-13G/draft_lm_head_int8_bf16.bin");
+        head_candidates.push_back("models/qwen3_8_27b_q4/draft_lm_head_int8_bf16.bin");
+
+        for (const auto& c : head_candidates) {
+            std::error_code ec;
+            if (std::filesystem::exists(c, ec) && std::filesystem::file_size(c, ec) > 0) {
+                resolved_head_path = c;
+                break;
+            }
+        }
+
+        if (resolved_ids_path.empty() || resolved_head_path.empty()) {
+            LOG_WARN("MTP: Compact draft files not found in model_dir '%s' (ids=%s, head=%s). Disabling MTP to prevent slow 2.54 GB shared lm_head memory bottleneck.",
+                     model_dir.c_str(),
+                     resolved_ids_path.empty() ? "NOT_FOUND" : resolved_ids_path.c_str(),
+                     resolved_head_path.empty() ? "NOT_FOUND" : resolved_head_path.c_str());
+            return false;
+        }
+
+        FILE* f_ids = fopen(resolved_ids_path.c_str(), "rb");
+        FILE* f_head = fopen(resolved_head_path.c_str(), "rb");
+        if (!f_ids || !f_head) {
+            LOG_WARN("MTP: Failed to open draft files (ids='%s', head='%s', errno=%d). Disabling MTP.",
+                     resolved_ids_path.c_str(), resolved_head_path.c_str(), errno);
+            if (f_ids) fclose(f_ids);
+            if (f_head) fclose(f_head);
+            return false;
+        }
+
+        uint32_t n_ids = 0;
+        if (fread(&n_ids, sizeof(uint32_t), 1, f_ids) != 1 || n_ids == 0) {
+            LOG_WARN("MTP: Failed to read vocab count from '%s'", resolved_ids_path.c_str());
+            fclose(f_ids);
+            fclose(f_head);
+            return false;
+        }
+        draft_vocab_ids_.resize(n_ids);
+        if (fread(draft_vocab_ids_.data(), sizeof(int32_t), n_ids, f_ids) != n_ids) {
+            LOG_WARN("MTP: Failed to read %u token IDs from '%s'", n_ids, resolved_ids_path.c_str());
+            fclose(f_ids);
+            fclose(f_head);
+            return false;
+        }
+        uint32_t rows = 0, cols = 0;
+        if (fread(&rows, sizeof(uint32_t), 1, f_head) != 1 ||
+            fread(&cols, sizeof(uint32_t), 1, f_head) != 1 ||
+            rows != n_ids || (int)cols != hidden_size_) {
+            LOG_WARN("MTP: Draft head shape mismatch in '%s': rows=%u (expected %u), cols=%u (expected %d)",
+                     resolved_head_path.c_str(), rows, n_ids, cols, hidden_size_);
+            fclose(f_ids);
+            fclose(f_head);
+            return false;
+        }
+        size_t head_bytes = (size_t)rows * cols * sizeof(__nv_bfloat16);
+        std::vector<char> head_buf(head_bytes);
+        if (fread(head_buf.data(), 1, head_bytes, f_head) != head_bytes) {
+            LOG_WARN("MTP: Incomplete read of %zu bytes from '%s'", head_bytes, resolved_head_path.c_str());
+            fclose(f_ids);
+            fclose(f_head);
+            return false;
+        }
+        fclose(f_ids);
+        fclose(f_head);
+
+        draft_lm_head_w_.alloc(head_bytes);
+        CUDA_CHECK(cudaMemcpyAsync(draft_lm_head_w_.data, head_buf.data(), head_bytes, cudaMemcpyHostToDevice, stream));
+        use_draft_vocab_ = true;
+        draft_vocab_size_ = (int)n_ids;
+        LOG_INFO("MTP: Loaded compact draft vocabulary (%d tokens from '%s') and draft lm_head (%.1f MB BF16 from '%s') — 6.2x faster drafting enabled!",
+                 draft_vocab_size_, resolved_ids_path.c_str(), head_bytes / (1024.0 * 1024.0), resolved_head_path.c_str());
 
         // Allocate working buffers
         buf_mtp_hidden_.alloc(hidden_size_ * sizeof(__nv_bfloat16));
@@ -2425,7 +2486,7 @@ public:
         buf_mtp_attn_out_.alloc(num_heads_ * head_dim_ * sizeof(__nv_bfloat16));
         buf_mtp_gate_.alloc(intermediate_size_ * sizeof(__nv_bfloat16));
         buf_mtp_up_.alloc(intermediate_size_ * sizeof(__nv_bfloat16));
-        buf_mtp_logits_.alloc(full_vocab_size_ * sizeof(float));
+        buf_mtp_logits_.alloc(draft_vocab_size_ * sizeof(float));
         buf_mtp_argmax_.alloc(sizeof(int32_t));
         buf_mtp_input_pos_.alloc(sizeof(int32_t));
         buf_draft_k_tokens_.alloc(16 * sizeof(int32_t));
@@ -2437,12 +2498,13 @@ public:
         CUDA_CHECK(cudaStreamSynchronize(stream));
 
         loaded_ = true;
-        LOG_INFO("MTP Self-Drafter loaded: 1 transformer layer + full %dk vocab (shared lm_head) = %.1f MB own VRAM",
-                 full_vocab_size_ / 1000,
+        LOG_INFO("MTP Self-Drafter loaded: 1 transformer layer + compact %d vocab draft head (%.1f MB) = %.1f MB own VRAM",
+                 draft_vocab_size_,
+                 draft_lm_head_w_.size_bytes / (1024.0 * 1024.0),
                  (mtp_fc_w_.size_bytes + mtp_fc_s_.size_bytes + mtp_layer_q_proj_w_.size_bytes + mtp_layer_k_proj_w_.size_bytes +
                   mtp_layer_v_proj_w_.size_bytes + mtp_layer_o_proj_w_.size_bytes +
                   mtp_layer_gate_w_.size_bytes + mtp_layer_up_w_.size_bytes + mtp_layer_down_w_.size_bytes +
-                  mtp_k_cache_.size_bytes + mtp_v_cache_.size_bytes) / (1024.0 * 1024.0));
+                  mtp_k_cache_.size_bytes + mtp_v_cache_.size_bytes + draft_lm_head_w_.size_bytes) / (1024.0 * 1024.0));
         return true;
     }
 
@@ -5218,23 +5280,16 @@ private:
         if (cfg_.architecture == ModelArch::QWEN && embed_weight_.data) {
             std::string mtp_model_dir = model_dir_;
             if (mtp_model_dir.empty()) {
-                mtp_model_dir = "f:/Moecher/models/qwen3_8_27b_q4";
+                mtp_model_dir = ".";
             }
             if (tensor_map.contains("mtp.fc.weight")) {
-                std::string draft_ids_path = mtp_model_dir + "/draft_vocab_ids.bin";
-                std::string draft_head_path = mtp_model_dir + "/draft_lm_head_int8_bf16.bin";
-                bool has_draft_head = (std::filesystem::exists(draft_ids_path) && std::filesystem::exists(draft_head_path));
-                if (head_weight_.dtype == "int4" && !has_draft_head) {
-                    LOG_WARN("MTP: Full lm_head is INT4 and no draft_lm_head_int8_bf16.bin found — skipping MTP");
-                } else {
-                    mtp_drafter_.load_mtp_weights(mapped, tensor_map, 
-                                                  embed_weight_.dtype == "int4" ? nullptr : embed_weight_.bf16(),
-                                                  embed_weight_.dtype == "int4" ? (uint8_t*)embed_weight_.data : nullptr,
-                                                  embed_weight_scale_.bf16(),
-                                                  embed_weight_.dtype == "int4",
-                                                  head_weight_.dtype == "int4" ? nullptr : head_weight_.bf16(),
-                                                  cfg_.vocab_size, mtp_model_dir, main_stream_);
-                }
+                mtp_drafter_.load_mtp_weights(mapped, tensor_map, 
+                                              embed_weight_.dtype == "int4" ? nullptr : embed_weight_.bf16(),
+                                              embed_weight_.dtype == "int4" ? (uint8_t*)embed_weight_.data : nullptr,
+                                              embed_weight_scale_.bf16(),
+                                              embed_weight_.dtype == "int4",
+                                              head_weight_.dtype == "int4" ? nullptr : head_weight_.bf16(),
+                                              cfg_.vocab_size, mtp_model_dir, main_stream_);
             }
         }
 
