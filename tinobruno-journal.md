@@ -1,26 +1,27 @@
-# MinnieTheMoECher: Engineering, Research & Discoveries Log
+# MinnieTheMoECher: Engineering, Research & Discoveries Journal (Tino Bruno)
 
 A comprehensive chronological record of engineering breakthroughs, mathematical analyses, performance bottlenecks, root-cause investigations, and architectural milestones in **MinnieTheMoECher**.
 
 ---
 
 ## Table of Contents
-1. [Endeavour 1: DeepSeek V4-Flash 100% Resident MoE Quantization (IQ2_XXS + Q2_K)](#endeavour-1-deepseek-v4-flash-100-resident-moe-quantization-iq2_xxs--q2_k)
-2. [Endeavour 2: Context Retention & Compressed Sequence Attention (CSA & HCA)](#endeavour-2-context-retention--compressed-sequence-attention-csa--hca)
-3. [Endeavour 3: Qwen 3.8 27B Native MTP Speculative Decoding (~98 tok/s Milestone)](#endeavour-3-qwen-38-27b-native-mtp-speculative-decoding-98-toks-milestone)
-4. [Endeavour 4: Mixed INT3/INT4 Quantization for 16GB GPUs (`qwen3.8-27B-Vision-13G`)](#endeavour-4-mixed-int3int4-quantization-for-16gb-gpus-qwen38-27b-vision-13g)
-5. [Endeavour 5: Recurrent State Preservation — The DeltaNet SSM Rollback Overflow](#endeavour-5-recurrent-state-preservation--the-deltanet-ssm-rollback-overflow)
-6. [Endeavour 6: Speculative Verification Dequantization Thrashing (14 tok/s $\to$ 110 tok/s)](#endeavour-6-speculative-verification-dequantization-thrashing-14-toks--110-toks)
-7. [Endeavour 7: Server Streaming Latency, Nagle's Algorithm (`TCP_NODELAY`), and Zero-Alloc SSE](#endeavour-7-server-streaming-latency-nagles-algorithm-tcp_nodelay-and-zero-alloc-sse)
-8. [Endeavour 8: Context-Length Scaling Bottleneck — 3,145-Token Tool Attention (44 tok/s vs 109 tok/s)](#endeavour-8-context-length-scaling-bottleneck--3145-token-tool-attention-44-toks-vs-109-toks)
-9. [Endeavour 9: Pinned System KV Snapshots & Autonomous Agentic Suite](#endeavour-9-pinned-system-kv-snapshots--autonomous-agentic-suite)
-10. [Endeavour 10: Ampere-Gated Architecture, 4-Slot Speculative Rollback & KV Snapshot Slicing](#endeavour-10-ampere-gated-architecture-4-slot-speculative-rollback--kv-snapshot-slicing)
-11. [Endeavour 11: Prompt Attention Minimization, Qwen-Conditional Tool Formatting & Dynamic MCP Schema Compression (2,638 $\to$ ~500 Tokens)](#endeavour-11-prompt-attention-minimization-qwen-conditional-tool-formatting--dynamic-mcp-schema-compression-2638--500-tokens)
+1. [2026-08-28 — Endeavour 1: DeepSeek V4-Flash 100% Resident MoE Quantization (IQ2_XXS + Q2_K)](#endeavour-1-deepseek-v4-flash-100-resident-moe-quantization-iq2_xxs--q2_k)
+2. [2026-08-30 — Endeavour 2: Context Retention & Compressed Sequence Attention (CSA & HCA)](#endeavour-2-context-retention--compressed-sequence-attention-csa--hca)
+3. [2026-09-04 — Endeavour 3: Qwen 3.8 27B Native MTP Speculative Decoding (~98 tok/s Milestone)](#endeavour-3-qwen-38-27b-native-mtp-speculative-decoding-98-toks-milestone)
+4. [2026-09-17 — Endeavour 4: Mixed INT3/INT4 Quantization for 16GB GPUs (`qwen3.8-27B-Vision-13G`)](#endeavour-4-mixed-int3int4-quantization-for-16gb-gpus-qwen38-27b-vision-13g)
+5. [2026-09-17 — Endeavour 5: Recurrent State Preservation — The DeltaNet SSM Rollback Overflow](#endeavour-5-recurrent-state-preservation--the-deltanet-ssm-rollback-overflow)
+6. [2026-09-17 — Endeavour 6: Speculative Verification Dequantization Thrashing (14 tok/s $\to$ 110 tok/s)](#endeavour-6-speculative-verification-dequantization-thrashing-14-toks--110-toks)
+7. [2026-09-17 — Endeavour 7: Server Streaming Latency, Nagle's Algorithm (`TCP_NODELAY`), and Zero-Alloc SSE](#endeavour-7-server-streaming-latency-nagles-algorithm-tcp_nodelay-and-zero-alloc-sse)
+8. [2026-09-17 — Endeavour 8: Context-Length Scaling Bottleneck — 3,145-Token Tool Attention (44 tok/s vs 109 tok/s)](#endeavour-8-context-length-scaling-bottleneck--3145-token-tool-attention-44-toks-vs-109-toks)
+9. [2026-09-17 — Endeavour 9: Pinned System KV Snapshots & Autonomous Agentic Suite](#endeavour-9-pinned-system-kv-snapshots--autonomous-agentic-suite)
+10. [2026-09-17 — Endeavour 10: Ampere-Gated Architecture, 4-Slot Speculative Rollback & KV Snapshot Slicing](#endeavour-10-ampere-gated-architecture-4-slot-speculative-rollback--kv-snapshot-slicing)
+11. [2026-09-18 — Endeavour 11: Prompt Attention Minimization, Qwen-Conditional Tool Formatting & Dynamic MCP Schema Compression (2,638 $\to$ ~500 Tokens)](#endeavour-11-prompt-attention-minimization-qwen-conditional-tool-formatting--dynamic-mcp-schema-compression-2638--500-tokens)
 12. [Roadmap of Pending Optimizations](#roadmap-of-pending-optimizations)
 
 ---
 
 ## Endeavour 1: DeepSeek V4-Flash 100% Resident MoE Quantization (IQ2_XXS + Q2_K)
+**Date:** August 28, 2026 (`2026-08-28`)
 
 ### Problem Statement
 DeepSeek V4-Flash contains **11,008 MoE experts** across 43 layers. The uncompressed FP4 weights required **157.4 GB**, exceeding 96GB VRAM on RTX PRO 6000 (Blackwell). NVMe SSD streaming and DRAM offloading resulted in disk I/O stalls, capping decode throughput at **~35 tok/s**.
@@ -44,6 +45,7 @@ DeepSeek V4-Flash contains **11,008 MoE experts** across 43 layers. The uncompre
 ---
 
 ## Endeavour 2: Context Retention & Compressed Sequence Attention (CSA & HCA)
+**Date:** August 30, 2026 (`2026-08-30`)
 
 ### Problem Statement
 During multi-step reasoning deliberation (`<think>...</think>`), the model frequently suffered reasoning context amnesia after ~32 tokens, looping or forgetting premises.
@@ -64,6 +66,7 @@ During multi-step reasoning deliberation (`<think>...</think>`), the model frequ
 ---
 
 ## Endeavour 3: Qwen 3.8 27B Native MTP Speculative Decoding (~98 tok/s Milestone)
+**Date:** September 4, 2026 (`2026-09-04`)
 
 ### Problem Statement
 Autoregressive decoding of Qwen 3.8 27B (hybrid DeltaNet linear attention + full GQA) ran at **55.0 tok/s**. Attempting to use an external 2B neural drafter actually **degraded** speed to **42.0 tok/s** (-24%) due to high draft latency (8 ms) and poor token acceptance (22.1%).
@@ -88,6 +91,7 @@ Autoregressive decoding of Qwen 3.8 27B (hybrid DeltaNet linear attention + full
 ---
 
 ## Endeavour 4: Mixed INT3/INT4 Quantization for 16GB GPUs (`qwen3.8-27B-Vision-13G`)
+**Date:** September 17, 2026 (`2026-09-17`)
 
 ### Problem Statement
 Standard INT4 checkpoints of Qwen 3.8 27B occupied **>20 GB**, exceeding the VRAM of mainstream 16GB cards (RTX 4060 Ti, RTX 5060 Ti) and forcing PCIe host memory paging that collapsed generation to single digits.
@@ -107,6 +111,7 @@ We designed a selective precision hierarchy implemented in [`scripts/quantize_qw
 ---
 
 ## Endeavour 5: Recurrent State Preservation — The DeltaNet SSM Rollback Overflow
+**Date:** September 17, 2026 (`2026-09-17`)
 
 ### Problem Statement
 During complex reasoning prompts (e.g. *"Which number is bigger: 9.11 or 9.9?"*), the model's thinking stream began hallucinating numbers and devolved into an infinite repetitive loop (`24.1.2.1.2.1.1.1.1.1.1...`).
@@ -128,6 +133,7 @@ During complex reasoning prompts (e.g. *"Which number is bigger: 9.11 or 9.9?"*)
 ---
 
 ## Endeavour 6: Speculative Verification Dequantization Thrashing (14 tok/s $\to$ 110 tok/s)
+**Date:** September 17, 2026 (`2026-09-17`)
 
 ### Problem Statement
 After deploying the INT3/INT4 model, throughput on short prompts ("hello") collapsed down to **~14 tok/s**.
@@ -154,6 +160,7 @@ Implemented direct packed INT3 kernels in [`src/cuda/activations.cu`](file:///ho
 ---
 
 ## Endeavour 7: Server Streaming Latency, Nagle's Algorithm (`TCP_NODELAY`), and Zero-Alloc SSE
+**Date:** September 17, 2026 (`2026-09-17`)
 
 ### Problem Statement
 While CLI benchmarks achieved 109 tok/s, the Web UI and HTTP client registered jitter and lower perceived token delivery rates.
@@ -171,6 +178,7 @@ While CLI benchmarks achieved 109 tok/s, the Web UI and HTTP client registered j
 ---
 
 ## Endeavour 8: Context-Length Scaling Bottleneck — 3,145-Token Tool Attention (44 tok/s vs 109 tok/s)
+**Date:** September 17, 2026 (`2026-09-17`)
 
 ### Problem Statement
 Testing `"hello"` via CLI produced **109.41 tok/s**, but testing `"hello"` in the Web UI produced **43.98 tok/s**.
@@ -238,6 +246,7 @@ We designed and implemented two fused optimizations in [`src/cuda/activations.cu
 ---
 
 ## Endeavour 9: Pinned System KV Snapshots & Autonomous Agentic Suite
+**Date:** September 17, 2026 (`2026-09-17`)
 
 ### Features & Capabilities
 1. **Startup KV Cache Snapshotting**:
@@ -254,6 +263,7 @@ We designed and implemented two fused optimizations in [`src/cuda/activations.cu
 ---
 
 ## Endeavour 10: Ampere-Gated Architecture, 4-Slot Speculative Rollback & KV Snapshot Slicing
+**Date:** September 17, 2026 (`2026-09-17`)
 
 ### Problems Addressed
 1. **Ampere (RTX 3090 / CC 8.6) Architecture Compatibility**:
@@ -285,6 +295,7 @@ We designed and implemented two fused optimizations in [`src/cuda/activations.cu
 ---
 
 ## Endeavour 11: Prompt Attention Minimization, Qwen-Conditional Tool Formatting & Dynamic MCP Schema Compression (2,638 $\to$ ~500 Tokens)
+**Date:** September 18, 2026 (`2026-09-18`)
 
 ### Problem Statement & Investigation
 When full agentic capabilities were enabled (8 canonical built-in tools plus discovered Model Context Protocol servers such as `tinobruno-teams-mcp`), the system prompt ballooned to **2,638 tokens** (10,044 raw characters). In a local serving environment, context length directly drives self-attention quadratic compute during sequence prefill and increases KV cache memory allocation.

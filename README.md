@@ -91,7 +91,7 @@ Depending on the prompt context and active features, you may observe generation 
 * **To run at full 100+ tok/s**: In the Web UI, open the **Agentic & Tools** settings tab and toggle off Web/Local tools (or send `"tools": []` via API). The prompt length drops from 3,156 tokens down to ~20 tokens, immediately unlocking full **100–112 tok/s** speed.
 * **Prefill Speed**: While decoding scales with active KV cache size, prefix evaluation is instantaneous (**0 ms prefill latency**) because the 3,145-token tooling prefix is pre-warmed and stored in a **Pinned System KV Cache snapshot** at startup (prefilled at **~181 tok/s**).
 
-> 📖 **Engineering & Research Log**: For deep technical breakdowns, mathematical analyses, and root-cause post-mortems of every bug and optimization, see [DISCOVERIES_AND_ENDEAVOURS_LOG.md](DISCOVERIES_AND_ENDEAVOURS_LOG.md).
+> 📖 **Engineering & Research Journal**: For deep technical breakdowns, mathematical analyses, and root-cause post-mortems of every bug and optimization, see [tinobruno-journal.md](tinobruno-journal.md).
 
 ---
 
