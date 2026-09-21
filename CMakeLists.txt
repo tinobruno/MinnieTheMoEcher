@@ -67,6 +67,7 @@ find_package(CUDAToolkit REQUIRED)
 set(MOECHER_SOURCES
     src/server_single.cpp
     src/cuda/activations.cu
+    src/cuda/vision_kernels.cu
 )
 if(WIN32)
     list(APPEND MOECHER_SOURCES src/moecher.rc)

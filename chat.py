@@ -183,8 +183,8 @@ def main():
     parser = argparse.ArgumentParser(description="Chat with the Moecher engine")
     parser.add_argument("--url", default="http://localhost:8001",
                         help="Base URL of the Moecher API (default: http://localhost:8001)")
-    parser.add_argument("--max-tokens", type=int, default=512,
-                        help="Max tokens per response (default: 512)")
+    parser.add_argument("--max-tokens", type=int, default=20000,
+                        help="Max tokens per response (default: 20000)")
     parser.add_argument("--temperature", type=float, default=1.0,
                         help="Sampling temperature (default: 1.0)")
     parser.add_argument("--model", default="deepseek-v4-flash",

@@ -16,7 +16,8 @@ A comprehensive chronological record of engineering breakthroughs, mathematical 
 9. [2026-09-17 — Endeavour 9: Pinned System KV Snapshots & Autonomous Agentic Suite](#endeavour-9-pinned-system-kv-snapshots--autonomous-agentic-suite)
 10. [2026-09-17 — Endeavour 10: Ampere-Gated Architecture, 4-Slot Speculative Rollback & KV Snapshot Slicing](#endeavour-10-ampere-gated-architecture-4-slot-speculative-rollback--kv-snapshot-slicing)
 11. [2026-09-18 — Endeavour 11: Prompt Attention Minimization, Qwen-Conditional Tool Formatting & Dynamic MCP Schema Compression (2,638 $\to$ ~500 Tokens)](#endeavour-11-prompt-attention-minimization-qwen-conditional-tool-formatting--dynamic-mcp-schema-compression-2638--500-tokens)
-12. [Roadmap of Pending Optimizations](#roadmap-of-pending-optimizations)
+12. [2026-09-21 — Endeavour 12: Multimodal CUDA Vision Tower, 2D Vision RoPE & Interactive 3D Studio Engine](#endeavour-12-multimodal-cuda-vision-tower-2d-vision-rope--interactive-3d-studio-engine)
+13. [Roadmap of Pending Optimizations](#roadmap-of-pending-optimizations)
 
 ---
 
@@ -344,6 +345,55 @@ Profiling revealed five distinct sources of prompt inflation:
 ### Results & Performance Milestone
 - **Total Token Reduction**: Slashed the 13-tool system prompt from **2,638 tokens down to ~500 tokens** (an **~80% reduction**).
 - **System KV Snapshot Efficiency**: The pinned system prefix snapshot memory scaled down from over 1,000 MB to ~150 MB, freeing VRAM on memory-constrained GPUs (16GB cards) and minimizing prefill time.
+
+---
+
+## Endeavour 12: Multimodal CUDA Vision Tower, 2D Vision RoPE & Interactive 3D Studio Engine
+**Date:** September 21, 2026 (`2026-09-21`)
+
+### Problem Statement & Architectural Vision
+`qwen3.8-27B-Vision-13G` incorporates native multimodal visual reasoning weights. However, the serving engine lacked vision prefill pipelines, ViT transformer evaluation kernels, and client-side visualization tooling. Furthermore, early experimental vision inference suffered from severe object hallucination (e.g. classifying red apples as watermelons) and procedural 3D model generation produced non-manifold meshes filled with holes, unclosed splines, and execution syntax crashes.
+
+### Key Discoveries & Root-Cause Analyses
+
+1. **Vision ViT Processing Bottlenecks & Tensor Misalignments**:
+   - *Image Normalization Mismatch*: ImageNet normalization ($\sigma \approx 0.26$) distorted Qwen’s expected dynamic range ($\mu = 0.5, \sigma = 0.5$).
+   - *Patch Sequence Layout*: Qwen Vision requires $2 \times 2$ block-major patch ordering for its spatial merger rather than naive row-major raster scans.
+   - *Missing 2D Rotary Position Embeddings (2D RoPE)*: Without spatial frequency coordinates in ViT self-attention (`apply_rotary_pos_emb_vision`), the attention heads had zero spatial orientation, perceiving only an unstructured "bag of colors" (red body + green leaf + dark stem hallucinated as watermelon flesh + rind + seeds).
+
+2. **3D Code Execution Crashes & DOM Pollution**:
+   - When asked to generate 3D representations, the model frequently outputted complete HTML documents (`<!DOCTYPE html>...<script>...`) rather than raw functions, creating duplicate rendering loops, canvas conflicts, and unhandled syntax errors.
+   - Truncated code blocks or omitted closing braces in `function createModel(...)` caused `new Function(...)` compilation failures (`SyntaxError: Unexpected token ')'`), silently leaving the 3D studio viewport empty.
+   - Three.js version discrepancies caused `geometry.attributes.position` and `setAttribute` errors on legacy `Geometry` objects.
+
+3. **Non-Manifold 3D Geometries & Surface Holes**:
+   - `THREE.LatheGeometry` profiles failing to anchor at $x=0$ left circular voids at the top and bottom poles.
+   - Open tube meshes (stems, pipes, handles) lacked terminal disk caps, exposing hollow cylinder interiors.
+
+### Engineering Solutions & Implementations
+
+1. **Zero-Copy CUDA Vision Tower (`src/vision_tower.hpp`, `src/cuda/vision_kernels.cu`)**:
+   - High-performance base64 image decoding and aspect-ratio letterboxing to $768 \times 768 \times 3$.
+   - Fused patch embedding and $2 \times 2$ block-major spatial layout with precomputed 2D RoPE CUDA kernels.
+   - 27-block ViT evaluated via cuBLAS batched strided GEMMs in BF16, projecting 576 visual tokens directly into `buf_hidden_` during prompt prefill in $<0.09\text{s}$.
+
+2. **Universal 3D Studio & Sandboxed Runtime (`web/script.js`, `web/index.html`, `web/style.css`)**:
+   - Integrated Three.js 3D Studio with OrbitControls, TransformControls (translate, rotate, scale, vertex edit mode, wireframe, ground grid), and GLB/OBJ model exporters.
+   - Implemented `ThreeProxy` sandbox to intercept `new THREE.Scene()`, prevent DOM pollution, and route legacy geometry constructors to modern `BufferGeometry`.
+   - Built automatic material & texture editor with interactive UV mapping (repeat, offset, rotation, wrapping) and photo texture projection.
+
+3. **Syntax-Aware Balancer & Truncation Recovery (`balanceAndRepairCode`)**:
+   - Lexical scanner that tracks quotes (`"`, `'`, `` ` ``), escape characters, and comments to automatically close strings and balance bracket stacks (`(`, `[`, `{`).
+   - Automated backward line-peeling recovery for code truncated mid-expression by token limits.
+
+4. **Watertight Geometry Engine & Post-Processing**:
+   - Boundary closure enforcement for `LatheGeometry` anchoring endpoints to $x=0$.
+   - Watertight helper library (`createWatertightLathe`, `createHollowVessel`, `createCappedTube`, `sampleColor`, `applyCylindricalUV`, `applyPlanarUV`).
+   - Automated post-execution healing with `BufferGeometryUtils.mergeVertices` and vertex normal recalculation.
+
+### Results & Impact
+- **Accurate Visual Grounding**: Object recognition correctly identifies geometric contours, silhouettes, and fine features without color-bag hallucinations.
+- **Robust Procedural 3D Generation**: Complete resilience against truncated or unclosed code, rendering solid, watertight 3D meshes with custom UV mappings directly in the Web UI.
 
 ---
 

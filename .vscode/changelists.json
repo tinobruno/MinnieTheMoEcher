@@ -5,9 +5,17 @@
       "files": [
         "src/server_single.cpp",
         "src/embedded_web.hpp",
-        "src/tool_exec.hpp",
         "web/index.html",
         "web/script.js",
+        "CMakeLists.txt",
+        "chat.py",
+        "web/style.css",
+        "src/cuda/vision_kernels.cu",
+        "src/cuda/vision_kernels.cuh",
+        "src/image_loader.hpp",
+        "src/stb_image.h",
+        "src/stb_image_resize2.h",
+        "src/vision_tower.hpp",
         ".vscode/changelists.json"
       ]
     }

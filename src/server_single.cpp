@@ -13,6 +13,8 @@
 #include "tool_exec.hpp"
 #include "mcp_client.hpp"
 #include "version.hpp"
+#include "image_loader.hpp"
+#include "vision_tower.hpp"
 
 #include <cstdio>
 #include <cstdlib>
@@ -2682,6 +2684,15 @@ public:
     // MTP Self-Drafter (new, faster)
     MTPSelfDrafter mtp_drafter_;
 
+    // Qwen Vision Tower (Multimodal)
+    bool has_vision_ = false;
+    std::unique_ptr<moecher::vision::QwenVisionTower> vision_tower_;
+    const __nv_bfloat16* active_visual_embeddings_ = nullptr;
+    int visual_embed_start_pos_ = -1;
+    int visual_embed_num_tokens_ = 0;
+
+    bool has_vision() const { return has_vision_ && (vision_tower_ != nullptr); }
+
     // Prompt-Lookup Drafting (PLD) Speculative Decoding
     bool enable_pld_ = true;
     int pld_draft_tokens_ = 4;
@@ -3415,6 +3426,29 @@ public:
             }
         }
 
+        // Auto-load Qwen Vision Tower if available in manifest
+        has_vision_ = false;
+        bool vision_flag = (manifest.contains("model_config") && manifest["model_config"].value("has_vision", false)) ||
+                           manifest.contains("visual_config");
+        if (cfg_.architecture == ModelArch::QWEN && vision_flag) {
+            if (manifest.contains("dense_tensors") && manifest["dense_tensors"].contains("model.visual.patch_embed.proj.weight")) {
+                std::string dense_path = manifest["dense_bin"].get<std::string>();
+                std::string dense_full = (base_dir / dense_path).string();
+                if (!std::ifstream(dense_full).good()) {
+                    dense_full = dense_path;
+                }
+                LOG_INFO("[Vision] Qwen Vision configuration detected in manifest. Loading Vision Tower from %s...", dense_full.c_str());
+                vision_tower_ = std::make_unique<moecher::vision::QwenVisionTower>();
+                if (vision_tower_->load_from_manifest(dense_full, manifest["dense_tensors"], cublas_handle_, main_stream_)) {
+                    has_vision_ = true;
+                    LOG_INFO("[Vision] Vision Tower successfully loaded and operational! (27 ViT blocks, 576 tokens output)");
+                } else {
+                    LOG_WARN("[Vision] Failed to load Vision Tower weights. Disabling vision capabilities.");
+                    vision_tower_.reset();
+                }
+            }
+        }
+
         apply_l2_cache_persistence();
         init_cuda_graph();
         init_batched_prefill();
@@ -3733,6 +3767,15 @@ public:
                 embedding_int4_cuda(buf_hidden_.bf16(), (uint8_t*)embed_weight_.data, embed_weight_scale_.bf16(), buf_input_token_.i32(), 1, dim, main_stream_);
             } else {
                 embedding_cuda(buf_hidden_.bf16(), embed_weight_.bf16(), buf_input_token_.i32(), 1, dim, main_stream_);
+            }
+
+            // Override with vision tower embedding for image tokens
+            if (active_visual_embeddings_ && position >= visual_embed_start_pos_ && position < visual_embed_start_pos_ + visual_embed_num_tokens_) {
+                int v_idx = position - visual_embed_start_pos_;
+                CUDA_CHECK(cudaMemcpyAsync(buf_hidden_.bf16(),
+                                           active_visual_embeddings_ + (size_t)v_idx * dim,
+                                           dim * sizeof(__nv_bfloat16),
+                                           cudaMemcpyDeviceToDevice, main_stream_));
             }
 
             // 2. Process each layer
@@ -4062,7 +4105,7 @@ public:
 
     // ── Generate tokens ─────────────────────────────────────────────────────
 
-    std::string generate(const std::vector<int>& prompt_in, int max_tokens = 512,
+    std::string generate(const std::vector<int>& prompt_in, int max_tokens = 20000,
                          float temperature = 1.0f,
                          std::function<bool(const std::string&,bool)> on_token = nullptr,
                          float repetition_penalty = 1.0f,
@@ -4070,7 +4113,10 @@ public:
                          int max_thinking_tokens = 2048,
                          float top_p = 0.95f,
                          float min_p = 0.0f,
-                         int top_k = 1024) {
+                         int top_k = 1024,
+                         const __nv_bfloat16* visual_embeddings = nullptr,
+                         int visual_start_pos = -1,
+                         int visual_num_tokens = 0) {
         // Ensure prompt fits within max_seq_len (defense-in-depth safety clamp)
         std::vector<int> prompt = prompt_in;
         if (prompt.size() > (size_t)cfg_.max_seq_len) {
@@ -4078,6 +4124,21 @@ public:
                      prompt.size(), cfg_.max_seq_len);
             size_t excess = prompt.size() - (size_t)cfg_.max_seq_len;
             prompt.erase(prompt.begin(), prompt.begin() + excess);
+        }
+
+        // Configure visual embeddings for prompt prefill if present
+        if (visual_embeddings && visual_start_pos >= 0 && visual_num_tokens > 0) {
+            active_visual_embeddings_ = visual_embeddings;
+            visual_embed_start_pos_ = visual_start_pos;
+            visual_embed_num_tokens_ = visual_num_tokens;
+            reset_all_kv_caches();
+            cached_tokens_.clear();
+            LOG_INFO("[Engine] Multimodal input active: visual tokens injected at pos %d..%d (%d tokens)",
+                     visual_start_pos, visual_start_pos + visual_num_tokens - 1, visual_num_tokens);
+        } else {
+            active_visual_embeddings_ = nullptr;
+            visual_embed_start_pos_ = -1;
+            visual_embed_num_tokens_ = 0;
         }
 
         // Reset debug flags for this request
@@ -4250,6 +4311,11 @@ public:
             CUDA_CHECK(cudaStreamSynchronize(main_stream_));
         }
 
+        // Visual tokens are fully prefilled into KV cache; disable active override for generation
+        active_visual_embeddings_ = nullptr;
+        visual_embed_start_pos_ = -1;
+        visual_embed_num_tokens_ = 0;
+
         auto prefill_end_time = std::chrono::steady_clock::now();
         double prefill_sec = std::chrono::duration<double>(prefill_end_time - prefill_start_time).count();
         size_t evaluated_tokens = (prompt.size() > prefix_len) ? (prompt.size() - prefix_len) : 0;
@@ -4352,6 +4418,9 @@ public:
             }
 
             if (next_token == think_start_id || next_token == think_end_id) {
+                if (next_token == think_end_id && on_token) {
+                    on_token("", false); // Signal end of reasoning to stream consumer
+                }
                 return true;
             }
 
@@ -5860,6 +5929,20 @@ private:
             embedding_int4_cuda(buf_hidden_batch_.bf16(), (uint8_t*)embed_weight_.data, embed_weight_scale_.bf16(), buf_input_tokens_batch_.i32(), M, dim, main_stream_);
         } else {
             embedding_cuda(buf_hidden_batch_.bf16(), embed_weight_.bf16(), buf_input_tokens_batch_.i32(), M, dim, main_stream_);
+        }
+
+        // Override with vision tower embedding for image tokens
+        if (active_visual_embeddings_) {
+            for (int m = 0; m < M; m++) {
+                int pos = position + m;
+                if (pos >= visual_embed_start_pos_ && pos < visual_embed_start_pos_ + visual_embed_num_tokens_) {
+                    int v_idx = pos - visual_embed_start_pos_;
+                    CUDA_CHECK(cudaMemcpyAsync(buf_hidden_batch_.bf16() + (size_t)m * dim,
+                                               active_visual_embeddings_ + (size_t)v_idx * dim,
+                                               dim * sizeof(__nv_bfloat16),
+                                               cudaMemcpyDeviceToDevice, main_stream_));
+                }
+            }
         }
 
         // 2. Process each layer
@@ -7848,6 +7931,21 @@ static json resolve_canonical_tools(const json& tools_input) {
                     {"required", json::array({"command"})}
                 }}
             }}
+        }},
+        {"create_3d_model", {
+            {"type", "function"},
+            {"function", {
+                {"name", "create_3d_model"},
+                {"description", "Create and display an interactive 3D model in the 3D Studio using Three.js representation code."},
+                {"parameters", {
+                    {"type", "object"},
+                    {"properties", {
+                        {"name", {{"type", "string"}, {"description", "Name of the 3D object or model"}}},
+                        {"code", {{"type", "string"}, {"description", "Three.js JavaScript representation code defining function createModel(scene, THREE) { ... }"}}}
+                    }},
+                    {"required", json::array({"name", "code"})}
+                }}
+            }}
         }}
     };
 
@@ -7855,7 +7953,7 @@ static json resolve_canonical_tools(const json& tools_input) {
         std::string s = tools_input.get<std::string>();
         if (s == "default" || s == "all") {
             json arr = json::array();
-            static const std::vector<std::string> default_order = {"web_search", "youtube_search", "google_search", "fetch_url", "read_file", "write_file", "edit_file", "execute_command"};
+            static const std::vector<std::string> default_order = {"web_search", "youtube_search", "google_search", "fetch_url", "create_3d_model", "read_file", "write_file", "edit_file", "execute_command"};
             for (const auto& name : default_order) {
                 if (CANONICAL_TOOLS.count(name)) arr.push_back(CANONICAL_TOOLS.at(name));
             }
@@ -7922,10 +8020,46 @@ static std::string build_dynamic_tools_prompt(const json& resolved_tools, bool i
             "- When the user asks to play music, a song, or a video, invoke `youtube_search` directly. The video will automatically load and play in the user's preview panel with autoplay.\n";
     }
 
+    prompt +=
+        "## High-Fidelity Analytic 3D Modeling Instructions:\n"
+        "- When asked to create, model, or reconstruct in 3D (or reconstruct an object from an image), always output Three.js representation code defining `function createModel(scene, THREE, inputImage, helpers) { ... }` inside a ```javascript code block (never output a full HTML file), adding all meshes to `scene`.\n"
+        "- 1. SEMANTIC PART DECOMPOSITION: Never model an object as a single monolithic mesh. Deconstruct the object into its distinct structural and anatomical parts (e.g. for an apple: body, stem, leaf; for a teapot: vessel body, lid, knob, handle, spout; for vehicles/furniture: body, wheels, windows, panels). Model EVERY part as a separate named `THREE.Mesh` with its own geometry and material (or use `helpers.createPart(name, geometry, material, scene)`).\n"
+        "- 2. PART-SPECIFIC TEXTURES & COLORS (DO NOT NAIVELY APPLY THE ENTIRE PHOTO!):\n"
+        "  * NEVER blindly apply the entire input photo onto the whole model or primary mesh (which stretches background, shadows, and unrelated features across surfaces).\n"
+        "  * For parts requiring surface textures (skin, patterns, labels, dials, leaves): use `helpers.cropTexture(inputImage, uMin, vMin, uMax, vMax, options)` to crop clean sub-regions of the photo matching that part (normalized coordinates 0..1).\n"
+        "  * For uniform, solid, or metallic parts (stems, chrome handles, rims, bases): use `helpers.sampleColor(inputImage, u, v)` to sample realistic colors and set physically accurate PBR properties (`roughness`, `metalness`, `clearcoat`).\n"
+        "- 3. ACCURATE UV MAPPING:\n"
+        "  * For flat, curved, or extruded parts (leaves, labels, panels, wings): apply planar UVs using `helpers.applyPlanarUV(geometry, 'z')` so cropped sub-textures map cleanly without distortion.\n"
+        "  * For cylindrical or revolved parts: use cylindrical UVs (`helpers.applyCylindricalUV(geometry)` or standard Lathe UVs) with `wrapS: THREE.RepeatWrapping`.\n"
+        "  * For complex multi-sided parts: use `helpers.applyBoxUV(geometry)`.\n"
+        "- 4. WATERTIGHT GEOMETRY & SEAMLESS INTEGRATION:\n"
+        "  * Revolved profiles must start and end at x=0 (use `helpers.createWatertightLathe` or `helpers.createHollowVessel` for vessels with solid wall thickness).\n"
+        "  * Tubes, pipes, stems, and handles must have sealed end caps (use `helpers.createCappedTube`).\n"
+        "  * Attachments (stems, leaves, handles, spouts) must penetrate 5-10% deep into parent meshes to prevent floating seams or gaps.\n";
+
     return prompt;
 }
 
-static std::string g_base_system_prompt = "You are a helpful assistant";
+static std::string g_base_system_prompt = 
+    "You are a helpful assistant.\n\n"
+    "# High-Fidelity Analytic 3D Modeling Instructions\n"
+    "When asked to create, model, or reconstruct in 3D (or reconstruct an object from an image), "
+    "always output Three.js representation code defining `function createModel(scene, THREE, inputImage, helpers) { ... }` inside a ```javascript code block "
+    "(never output a full HTML file), adding all meshes to `scene`.\n\n"
+    "CRITICAL RULES FOR ANALYTIC MODELING, PART-SPECIFIC TEXTURING & UV MAPPING:\n"
+    "1. SEMANTIC PART DECOMPOSITION: Never model an object as a single monolithic mesh. Deconstruct the subject into its distinct structural and anatomical parts (e.g. for an apple: body, stem, leaf; for a teapot: body, lid, knob, handle, spout; for vehicles/furniture: body, wheels, windows, panels). Model EVERY part as a separate named `THREE.Mesh` with its own geometry and material, or use `helpers.createPart(name, geometry, material, scene)`.\n"
+    "2. PART-SPECIFIC TEXTURES & COLORS (DO NOT NAIVELY APPLY THE ENTIRE PHOTO!):\n"
+    "   - NEVER blindly apply the entire input photo onto the whole model or primary mesh (which stretches background, shadows, and unrelated features across surfaces).\n"
+    "   - For parts requiring surface textures: use `helpers.cropTexture(inputImage, uMin, vMin, uMax, vMax, options)` to crop clean sub-regions of the photo matching that part (normalized coordinates 0..1).\n"
+    "   - For uniform, solid, or metallic parts: use `helpers.sampleColor(inputImage, u, v)` to sample realistic colors and set physically accurate PBR properties (roughness, metalness, clearcoat).\n"
+    "3. ACCURATE UV MAPPING:\n"
+    "   - Revolved / lathe / cylindrical parts: use cylindrical/lathe UVs (`helpers.applyCylindricalUV(geometry)` or standard Lathe UVs) with `wrapS: THREE.RepeatWrapping`.\n"
+    "   - Flat / curved / extruded parts (leaves, labels, panels, wings): use `helpers.applyPlanarUV(geometry, 'z')` so cropped sub-textures map cleanly without distortion.\n"
+    "   - Multi-sided / cubic parts: use `helpers.applyBoxUV(geometry)`.\n"
+    "4. WATERTIGHT GEOMETRY & SEAMLESS INTEGRATION:\n"
+    "   - Revolved profiles must start and end at x=0 (use `helpers.createWatertightLathe` or `helpers.createHollowVessel` for vessels with solid wall thickness).\n"
+    "   - Tubes, pipes, stems, and handles must have sealed end caps (use `helpers.createCappedTube`).\n"
+    "   - Attachments (stems, leaves, handles, spouts) must penetrate 5-10% deep into parent meshes to prevent floating seams or gaps.";
 static std::string g_current_system_prompt = "";
 static json g_current_active_tools = json::array();
 static const std::string g_server_instance_id = std::to_string(std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::system_clock::now().time_since_epoch()).count());
@@ -7942,7 +8076,7 @@ static std::string update_system_prompt_with_tools(const std::string& original_c
         content.pop_back();
     }
     if (content.empty()) {
-        content = "You are a helpful assistant";
+        content = g_base_system_prompt;
     }
     if (has_tools) {
         content += tools_system_prompt;
@@ -7950,7 +8084,22 @@ static std::string update_system_prompt_with_tools(const std::string& original_c
     return content;
 }
 
-static std::vector<int> apply_chat_template(const json& messages, const BPETokenizer& tok, bool enable_thinking = true, const std::string& reasoning_effort = "high", const json& tools = json()) {
+struct MultimodalPrompt {
+    std::vector<int> prompt;
+    std::string image_b64;
+    int visual_start_pos = -1;
+    int visual_num_tokens = 0;
+};
+
+static MultimodalPrompt apply_chat_template_multimodal(
+    const json& messages,
+    const BPETokenizer& tok,
+    bool enable_thinking = true,
+    const std::string& reasoning_effort = "high",
+    const json& tools = json(),
+    bool model_has_vision = false)
+{
+    MultimodalPrompt out;
     json resolved_tools = tools;
     if (!resolved_tools.empty()) {
         resolved_tools = resolve_canonical_tools(resolved_tools);
@@ -7980,15 +8129,52 @@ static std::vector<int> apply_chat_template(const json& messages, const BPEToken
         }
         for (size_t i = 0; i < messages.size(); i++) {
             std::string role = messages[i].value("role", "user");
-            std::string content = messages[i].value("content", "");
+            std::string content_str = "";
+            std::string extracted_image_b64 = "";
+
+            if (messages[i].contains("content")) {
+                const auto& c = messages[i]["content"];
+                if (c.is_string()) {
+                    content_str = c.get<std::string>();
+                } else if (c.is_array()) {
+                    for (const auto& part : c) {
+                        if (part.is_object()) {
+                            std::string ptype = part.value("type", "text");
+                            if (ptype == "text") {
+                                content_str += part.value("text", "");
+                            } else if (ptype == "image_url" && part.contains("image_url")) {
+                                std::string url;
+                                if (part["image_url"].is_string()) {
+                                    url = part["image_url"].get<std::string>();
+                                } else if (part["image_url"].is_object()) {
+                                    url = part["image_url"].value("url", "");
+                                }
+                                if (!url.empty()) {
+                                    size_t b64_pos = url.find("base64,");
+                                    if (b64_pos != std::string::npos) {
+                                        extracted_image_b64 = url.substr(b64_pos + 7);
+                                    } else {
+                                        extracted_image_b64 = url;
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+            if (extracted_image_b64.empty() && messages[i].contains("image") && messages[i]["image"].is_string()) {
+                std::string url = messages[i]["image"].get<std::string>();
+                size_t b64_pos = url.find("base64,");
+                extracted_image_b64 = (b64_pos != std::string::npos) ? url.substr(b64_pos + 7) : url;
+            }
 
             if (role == "system" && i == 0) {
-                content = update_system_prompt_with_tools(content, tools_system_prompt, has_tools);
+                content_str = update_system_prompt_with_tools(content_str, tools_system_prompt, has_tools);
             }
 
             if (role == "tool" || role == "function") {
                 result.push_back(IM_START);
-                auto user_role = tok.encode("user\n<tool_response>\n" + content + "\n</tool_response>");
+                auto user_role = tok.encode("user\n<tool_response>\n" + content_str + "\n</tool_response>");
                 result.insert(result.end(), user_role.begin(), user_role.end());
                 result.push_back(IM_END);
                 auto nl_enc = tok.encode("\n");
@@ -8000,7 +8186,24 @@ static std::vector<int> apply_chat_template(const json& messages, const BPEToken
             auto role_enc = tok.encode(role + "\n");
             result.insert(result.end(), role_enc.begin(), role_enc.end());
 
-            std::string body = content;
+            // Multimodal image injection for Qwen Vision
+            if (model_has_vision && !extracted_image_b64.empty() && role == "user") {
+                int VISION_START = tok.get_token_id("<|vision_start|>");
+                if (VISION_START < 0) VISION_START = 248053;
+                int VISION_END = tok.get_token_id("<|vision_end|>");
+                if (VISION_END < 0) VISION_END = 248054;
+                int IMAGE_PAD = tok.get_token_id("<|image_pad|>");
+                if (IMAGE_PAD < 0) IMAGE_PAD = 248056;
+
+                out.image_b64 = extracted_image_b64;
+                result.push_back(VISION_START);
+                out.visual_start_pos = (int)result.size();
+                out.visual_num_tokens = 576;
+                result.insert(result.end(), 576, IMAGE_PAD);
+                result.push_back(VISION_END);
+            }
+
+            std::string body = content_str;
             if (role == "assistant") {
                 if (messages[i].contains("reasoning_content") && messages[i]["reasoning_content"].is_string()) {
                     std::string r_content = messages[i]["reasoning_content"].get<std::string>();
@@ -8040,7 +8243,8 @@ static std::vector<int> apply_chat_template(const json& messages, const BPEToken
                 }
             }
         }
-        return result;
+        out.prompt = result;
+        return out;
     }
 
     int BOS = tok.get_token_id("<｜begin of sentence｜>");
@@ -8143,7 +8347,12 @@ static std::vector<int> apply_chat_template(const json& messages, const BPEToken
         }
     }
 
-    return result;
+    out.prompt = result;
+    return out;
+}
+
+static std::vector<int> apply_chat_template(const json& messages, const BPETokenizer& tok, bool enable_thinking = true, const std::string& reasoning_effort = "high", const json& tools = json()) {
+    return apply_chat_template_multimodal(messages, tok, enable_thinking, reasoning_effort, tools, false).prompt;
 }
 
 // ════════════════════════════════════════════════════════════════════════════════
@@ -9147,6 +9356,9 @@ struct ToolTagStreamFilter {
     std::string tool_buffer;
     std::string streamed_clean_text;
     bool in_tool_calls_container = false;
+    std::function<bool(const std::string&)> on_status = nullptr;
+    std::string current_tool_name;
+    size_t last_reported_size = 0;
 
     bool feed(const std::string& text, const std::function<bool(const std::string&)>& emit_cb) {
         std::string safe_chunk;
@@ -9171,6 +9383,11 @@ struct ToolTagStreamFilter {
                         }
                         tool_buffer = tag_candidate;
                         tag_candidate.clear();
+                        current_tool_name.clear();
+                        last_reported_size = 0;
+                        if (on_status) {
+                            on_status("Preparing tool call & arguments...");
+                        }
                     } else if (is_closing_or_standalone_tool_tag(tag_candidate)) {
                         // Stray / standalone tool tag (e.g. </tool_call>, <｜tool sep｜>, </｜DSML...>)
                         state = State::STREAMING;
@@ -9180,6 +9397,11 @@ struct ToolTagStreamFilter {
                         state = State::BUFFERING_TOOL;
                         tool_buffer = tag_candidate;
                         tag_candidate.clear();
+                        current_tool_name.clear();
+                        last_reported_size = 0;
+                        if (on_status) {
+                            on_status("Preparing tool call & arguments...");
+                        }
                     } else {
                         // Normal HTML tag that happened to complete
                         safe_chunk += tag_candidate;
@@ -9202,16 +9424,60 @@ struct ToolTagStreamFilter {
                 }
             } else if (state == State::BUFFERING_TOOL) {
                 tool_buffer.push_back(c);
+
+                // Early detection of tool name inside JSON arguments
+                if (current_tool_name.empty() && tool_buffer.size() > 15) {
+                    size_t npos = tool_buffer.find("\"name\"");
+                    if (npos != std::string::npos) {
+                        size_t colon = tool_buffer.find(':', npos);
+                        if (colon != std::string::npos) {
+                            size_t q1 = tool_buffer.find('"', colon);
+                            if (q1 != std::string::npos) {
+                                size_t q2 = tool_buffer.find('"', q1 + 1);
+                                if (q2 != std::string::npos) {
+                                    current_tool_name = tool_buffer.substr(q1 + 1, q2 - q1 - 1);
+                                    if (on_status) {
+                                        if (current_tool_name == "create_3d_model" || current_tool_name == "model_3d") {
+                                            on_status("Generating 3D model geometry & Three.js code...");
+                                        } else {
+                                            on_status("Generating tool call: " + current_tool_name + "...");
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+
+                // Periodic live progress reporting while tool arguments stream in
+                if (tool_buffer.size() - last_reported_size >= 120) {
+                    last_reported_size = tool_buffer.size();
+                    if (on_status) {
+                        int approx_tokens = (int)(tool_buffer.size() / 4);
+                        if (current_tool_name == "create_3d_model" || current_tool_name == "model_3d") {
+                            on_status("Generating 3D model geometry & Three.js code (" + std::to_string(approx_tokens) + " tokens)...");
+                        } else if (!current_tool_name.empty()) {
+                            on_status("Generating arguments for " + current_tool_name + " (" + std::to_string(approx_tokens) + " tokens)...");
+                        } else {
+                            on_status("Generating tool call parameters (" + std::to_string(approx_tokens) + " tokens)...");
+                        }
+                    }
+                }
+
                 if (in_tool_calls_container) {
                     if (ends_with_container_closing(tool_buffer)) {
                         state = State::STREAMING;
                         tool_buffer.clear();
+                        current_tool_name.clear();
+                        last_reported_size = 0;
                         in_tool_calls_container = false;
                     }
                 } else {
                     if (ends_with_tool_closing(tool_buffer)) {
                         state = State::STREAMING;
                         tool_buffer.clear();
+                        current_tool_name.clear();
+                        last_reported_size = 0;
                     }
                 }
             }
@@ -9405,6 +9671,14 @@ static void run_server(MoecherEngine& engine, int port, int default_thinking_bud
     httplib::Server svr;
     svr.set_tcp_nodelay(true);
     svr.set_payload_max_length(64 * 1024 * 1024); // 64 MB
+    svr.set_socket_options([](socket_t sock) {
+        int opt = 1;
+#ifdef _WIN32
+        setsockopt(sock, SOL_SOCKET, SO_REUSEADDR, reinterpret_cast<const char*>(&opt), sizeof(opt));
+#else
+        setsockopt(sock, SOL_SOCKET, SO_REUSEADDR, reinterpret_cast<const void*>(&opt), sizeof(opt));
+#endif
+    });
 
     if (enable_forward_proxy) {
         moecher::proxy::start_forward_proxy(proxy_port);
@@ -10437,6 +10711,7 @@ static void run_server(MoecherEngine& engine, int port, int default_thinking_bud
                     {"owned_by", "moecher"},
                     {"architecture", arch_desc},
                     {"max_context_length", engine.cfg_.max_seq_len},
+                    {"has_vision", engine.has_vision()},
                     {"active", true}
                 }
             }}
@@ -10460,6 +10735,7 @@ static void run_server(MoecherEngine& engine, int port, int default_thinking_bud
             {"max_context_length", engine.cfg_.max_seq_len},
             {"vocab_size", engine.cfg_.vocab_size},
             {"max_tool_rounds", g_max_tool_rounds},
+            {"has_vision", engine.has_vision()},
             {"active", true}
         };
         res.set_content(body.dump(), "application/json");
@@ -10770,7 +11046,7 @@ static void run_server(MoecherEngine& engine, int port, int default_thinking_bud
             float top_p = request.value("top_p", 0.95f);
             float min_p = request.value("min_p", 0.0f);
             int top_k = request.value("top_k", 1024);
-            int max_tokens = request.value("max_tokens", 512);
+            int max_tokens = request.value("max_tokens", 20000);
             bool stream = request.value("stream", false);
             float repetition_penalty = request.value("repetition_penalty", 1.0f);
             std::string reasoning_effort = request.value("reasoning_effort", "high");
@@ -10945,16 +11221,36 @@ static void run_server(MoecherEngine& engine, int port, int default_thinking_bud
                                 }
                                 round_new_tool_msgs.clear();
                             }
+                            MultimodalPrompt mm_prompt;
+                            const __nv_bfloat16* d_vis_out = nullptr;
                             if (!is_continuation) {
                                 current_messages = prune_messages_to_fit(current_messages, engine.tokenizer_, max_allowed_prompt, enable_thinking, reasoning_effort, tools);
-                                prompt = apply_chat_template(current_messages, engine.tokenizer_, enable_thinking, reasoning_effort, tools);
+                                mm_prompt = apply_chat_template_multimodal(current_messages, engine.tokenizer_, enable_thinking, reasoning_effort, tools, engine.has_vision());
+                                prompt = mm_prompt.prompt;
+                                if (engine.has_vision() && !mm_prompt.image_b64.empty() && mm_prompt.visual_start_pos >= 0) {
+                                    moecher::vision::ProcessedImage proc_img;
+                                    LOG_INFO("[Vision] Preprocessing image attachment for multimodal inference (%zu bytes b64)...", mm_prompt.image_b64.size());
+                                    if (moecher::vision::preprocess_image_from_base64(mm_prompt.image_b64, proc_img, 768)) {
+                                        d_vis_out = engine.vision_tower_->forward(proc_img, engine.main_stream_);
+                                        LOG_INFO("[Vision] Vision Tower forward pass complete: 576 visual tokens projected to hidden size %d.", engine.cfg_.hidden_size);
+                                    } else {
+                                        LOG_WARN("[Vision] Failed to decode/preprocess image attachment!");
+                                    }
+                                }
                             }
-                            LOG_INFO("STREAM PROMPT [round %d] (len=%zu, continuation=%s)", round + 1, prompt.size(), is_continuation ? "true" : "false");
+                            LOG_INFO("STREAM PROMPT [round %d] (len=%zu, continuation=%s, visual=%s)",
+                                     round + 1, prompt.size(), is_continuation ? "true" : "false", (d_vis_out != nullptr) ? "active" : "none");
 
                             std::string round_content;
                             std::string round_reasoning;
                             ToolTagStreamFilter content_filter;
                             ToolTagStreamFilter reasoning_filter;
+
+                            auto status_cb = [&](const std::string& status_msg) -> bool {
+                                return send_sse_delta(sink, req_id, model_id, created_time_str, "status", status_msg);
+                            };
+                            content_filter.on_status = status_cb;
+                            reasoning_filter.on_status = status_cb;
 
                             engine.generate(prompt, max_tokens, temperature, [&](const std::string& text, bool is_reasoning) -> bool {
                                 if (g_stop_requested.load()) return false;
@@ -10979,7 +11275,8 @@ static void run_server(MoecherEngine& engine, int port, int default_thinking_bud
                                         return send_sse_delta(sink, req_id, model_id, created_time_str, "content", text);
                                     }
                                 }
-                            }, repetition_penalty, enable_thinking, max_thinking_tokens, top_p, min_p, top_k);
+                            }, repetition_penalty, enable_thinking, max_thinking_tokens, top_p, min_p, top_k,
+                               d_vis_out, mm_prompt.visual_start_pos, mm_prompt.visual_num_tokens);
 
                             final_finish_reason = engine.last_finish_reason_.empty() ? "stop" : engine.last_finish_reason_;
 
@@ -11762,16 +12059,31 @@ static void run_server(MoecherEngine& engine, int port, int default_thinking_bud
                         }
                         round_new_tool_msgs.clear();
                     }
+                    MultimodalPrompt mm_prompt;
+                    const __nv_bfloat16* d_vis_out = nullptr;
                     if (!is_continuation) {
                         current_messages = prune_messages_to_fit(current_messages, engine.tokenizer_, max_allowed_prompt, enable_thinking, reasoning_effort, tools);
-                        prompt = apply_chat_template(current_messages, engine.tokenizer_, enable_thinking, reasoning_effort, tools);
+                        mm_prompt = apply_chat_template_multimodal(current_messages, engine.tokenizer_, enable_thinking, reasoning_effort, tools, engine.has_vision());
+                        prompt = mm_prompt.prompt;
+                        if (engine.has_vision() && !mm_prompt.image_b64.empty() && mm_prompt.visual_start_pos >= 0) {
+                            moecher::vision::ProcessedImage proc_img;
+                            LOG_INFO("[Vision] Preprocessing image attachment for multimodal inference (%zu bytes b64)...", mm_prompt.image_b64.size());
+                            if (moecher::vision::preprocess_image_from_base64(mm_prompt.image_b64, proc_img, 768)) {
+                                d_vis_out = engine.vision_tower_->forward(proc_img, engine.main_stream_);
+                                LOG_INFO("[Vision] Vision Tower forward pass complete: 576 visual tokens projected to hidden size %d.", engine.cfg_.hidden_size);
+                            } else {
+                                LOG_WARN("[Vision] Failed to decode/preprocess image attachment!");
+                            }
+                        }
                     }
-                    LOG_INFO("PROMPT [round %d] (len=%zu, continuation=%s)", round + 1, prompt.size(), is_continuation ? "true" : "false");
+                    LOG_INFO("PROMPT [round %d] (len=%zu, continuation=%s, visual=%s)",
+                             round + 1, prompt.size(), is_continuation ? "true" : "false", (d_vis_out != nullptr) ? "active" : "none");
 
                     std::string response_text;
                     {
                         std::lock_guard<std::mutex> lock(g_engine_mutex);
-                        response_text = engine.generate(prompt, max_tokens, temperature, nullptr, repetition_penalty, enable_thinking, max_thinking_tokens, top_p, min_p, top_k);
+                        response_text = engine.generate(prompt, max_tokens, temperature, nullptr, repetition_penalty, enable_thinking, max_thinking_tokens, top_p, min_p, top_k,
+                                                        d_vis_out, mm_prompt.visual_start_pos, mm_prompt.visual_num_tokens);
                         finish_reason = engine.last_finish_reason_;
                     }
 
@@ -12017,10 +12329,17 @@ static void run_server(MoecherEngine& engine, int port, int default_thinking_bud
         res.set_content(body.dump(), "application/json");
     });
 
+    LOG_INFO("Binding to 0.0.0.0:%d...", port);
+    if (!svr.bind_to_port("0.0.0.0", port)) {
+        LOG_ERROR("Failed to bind to 0.0.0.0:%d: %s (errno=%d)", port, strerror(errno), errno);
+        moecher::mcp::MCPManager::instance().stop_all();
+        return;
+    }
     LOG_INFO("Server listening on port %d", port);
     LOG_INFO("version %s", MOECHER_VERSION);
     g_server_ready = true;
-    svr.listen("0.0.0.0", port);
+    svr.listen_after_bind();
+    LOG_INFO("Server stopped on port %d", port);
     moecher::mcp::MCPManager::instance().stop_all();
 }
 

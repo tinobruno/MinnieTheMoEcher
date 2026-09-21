@@ -20,15 +20,15 @@
             </div>
             
             <div class="sidebar-actions">
-                <button class="action-btn new-chat-btn" onclick="clearChat()" title="Start a fresh chat">
+                <button type="button" class="action-btn new-chat-btn" onclick="clearChat()" title="Start a fresh chat">
                     <span class="material-symbols-outlined">add</span>
                     <span>New Chat</span>
                 </button>
-                <button class="action-btn clear-history-btn" onclick="clearChat()" title="Clear conversation history">
+                <button type="button" class="action-btn clear-history-btn" onclick="clearChat()" title="Clear conversation history">
                     <span class="material-symbols-outlined">delete_sweep</span>
                     <span>Clear History</span>
                 </button>
-                <button class="action-btn settings-nav-btn" onclick="openSettingsPanel()" title="Open Settings & Configuration">
+                <button type="button" class="action-btn settings-nav-btn" onclick="openSettingsPanel()" title="Open Settings & Configuration">
                     <span class="material-symbols-outlined">tune</span>
                     <span>Settings</span>
                 </button>
@@ -202,13 +202,13 @@
                     </div>
                 </div>
                 <div class="topbar-actions">
-                    <button class="topbar-icon-btn settings-toggle-btn" id="settings-toggle-btn" onclick="toggleSettingsPanel()" title="Toggle Settings Panel">
+                    <button type="button" class="topbar-icon-btn settings-toggle-btn" id="settings-toggle-btn" onclick="toggleSettingsPanel()" title="Toggle Settings Panel">
                         <span class="material-symbols-outlined">tune</span>
                     </button>
-                    <button class="topbar-icon-btn preview-toggle-btn" id="preview-toggle-btn" onclick="togglePreviewPanel()" title="Toggle HTML Preview Panel">
+                    <button type="button" class="topbar-icon-btn preview-toggle-btn" id="preview-toggle-btn" onclick="togglePreviewPanel()" title="Toggle HTML Preview Panel">
                         <span class="material-symbols-outlined">preview</span>
                     </button>
-                    <button class="topbar-icon-btn" onclick="clearChat()" title="Clear Chat History">
+                    <button type="button" class="topbar-icon-btn" onclick="clearChat()" title="Clear Chat History">
                         <span class="material-symbols-outlined">delete_sweep</span>
                     </button>
                 </div>
@@ -227,13 +227,37 @@
 
             <!-- Input Area -->
             <div class="input-area-wrapper">
+                <!-- Image Attachment Preview Chip -->
+                <div id="image-attachment-preview" class="image-attachment-preview hidden">
+                    <div class="attachment-thumb-card">
+                        <img id="attachment-thumb-img" src="" alt="Attached image preview" />
+                        <div class="attachment-meta">
+                            <span id="attachment-filename">image.png</span>
+                            <span id="attachment-filesize">768x768</span>
+                        </div>
+                        <div class="attachment-actions">
+                            <button type="button" class="attachment-3d-btn" id="btn-quick-model-3d" onclick="quickPromptModel3D()" title="Model this object in 3D">
+                                <span class="material-symbols-outlined">view_in_ar</span>
+                                <span>Model in 3D</span>
+                            </button>
+                            <button type="button" class="attachment-remove-btn" id="btn-remove-attachment" onclick="removeImageAttachment()" title="Remove image">
+                                <span class="material-symbols-outlined">close</span>
+                            </button>
+                        </div>
+                    </div>
+                </div>
+
                 <div class="input-box">
                     <textarea id="chat-input" placeholder="Enter a prompt here..." rows="1"></textarea>
                     <div class="input-controls">
+                        <button type="button" id="vision-upload-btn" class="vision-upload-btn hidden" onclick="triggerVisionUpload()" title="Attach image (PNG, JPG, WebP, BMP)">
+                            <span class="material-symbols-outlined">add_photo_alternate</span>
+                        </button>
+                        <input type="file" id="vision-file-input" accept="image/png,image/jpeg,image/webp,image/bmp" class="hidden" onchange="handleVisionFileSelect(event)">
                         <button type="button" id="preview-btn-chatbar" class="code-action-btn preview-btn chatbar-preview-btn hidden" onclick="previewLatestHtmlSnippet()" title="Test and render HTML code in preview panel">
                             <span class="material-symbols-outlined btn-icon">play_circle</span> Preview
                         </button>
-                        <button id="send-btn" class="send-btn" disabled title="Send / Stop">
+                        <button type="button" id="send-btn" class="send-btn" disabled title="Send / Stop">
                             <span class="material-symbols-outlined">send</span>
                         </button>
                     </div>
@@ -259,20 +283,24 @@
                 </div>
 
                 <div class="preview-tabs">
-                    <button class="preview-tab active" data-tab="tab-preview" title="Rendered View">
+                    <button type="button" class="preview-tab active" data-tab="tab-preview" title="Rendered View">
                         <span class="material-symbols-outlined">visibility</span>
                         <span>Preview</span>
                     </button>
-                    <button class="preview-tab" data-tab="tab-code" title="View/Edit Source Code">
+                    <button type="button" class="preview-tab" data-tab="tab-code" title="View/Edit Source Code">
                         <span class="material-symbols-outlined">code</span>
                         <span>Code</span>
                     </button>
-                    <button class="preview-tab" data-tab="tab-retrieved" title="Retrieved Web Documents & Sources">
+                    <button type="button" class="preview-tab" data-tab="tab-3d" id="preview-tab-3d" title="Interactive 3D Studio (View, Edit & Export 3D Models)">
+                        <span class="material-symbols-outlined">view_in_ar</span>
+                        <span>3D Studio</span>
+                    </button>
+                    <button type="button" class="preview-tab" data-tab="tab-retrieved" title="Retrieved Web Documents & Sources">
                         <span class="material-symbols-outlined">travel_explore</span>
                         <span>Retrieved Documents</span>
                         <span class="console-count-badge" id="retrieved-docs-badge" style="display:none;">0</span>
                     </button>
-                    <button class="preview-tab" data-tab="tab-console" title="Console Logs & Errors">
+                    <button type="button" class="preview-tab" data-tab="tab-console" title="Console Logs & Errors">
                         <span class="material-symbols-outlined">terminal</span>
                         <span>Console</span>
                         <span class="console-count-badge" id="console-error-badge" style="display:none;">0</span>
@@ -281,35 +309,35 @@
 
                 <div class="preview-actions">
                     <div class="viewport-controls" id="viewport-controls">
-                        <button class="preview-tool-btn active" data-viewport="100%" title="Desktop View (100%)">
+                        <button type="button" class="preview-tool-btn active" data-viewport="100%" title="Desktop View (100%)">
                             <span class="material-symbols-outlined">desktop_windows</span>
                         </button>
-                        <button class="preview-tool-btn" data-viewport="768px" title="Tablet View (768px)">
+                        <button type="button" class="preview-tool-btn" data-viewport="768px" title="Tablet View (768px)">
                             <span class="material-symbols-outlined">tablet_mac</span>
                         </button>
-                        <button class="preview-tool-btn" data-viewport="375px" title="Mobile View (375px)">
+                        <button type="button" class="preview-tool-btn" data-viewport="375px" title="Mobile View (375px)">
                             <span class="material-symbols-outlined">smartphone</span>
                         </button>
                     </div>
 
                     <div class="action-divider"></div>
 
-                    <button class="preview-tool-btn" id="preview-theme-btn" onclick="togglePreviewBg()" title="Toggle Canvas Background (Dark/Light/Checker)">
+                    <button type="button" class="preview-tool-btn" id="preview-theme-btn" onclick="togglePreviewBg()" title="Toggle Canvas Background (Dark/Light/Checker)">
                         <span class="material-symbols-outlined">contrast</span>
                     </button>
-                    <button class="preview-tool-btn" onclick="reloadPreview()" title="Reload HTML Preview">
+                    <button type="button" class="preview-tool-btn" onclick="reloadPreview()" title="Reload HTML Preview">
                         <span class="material-symbols-outlined">refresh</span>
                     </button>
-                    <button class="preview-tool-btn" onclick="openPreviewInNewTab()" title="Open Preview in New Window/Tab">
+                    <button type="button" class="preview-tool-btn" onclick="openPreviewInNewTab()" title="Open Preview in New Window/Tab">
                         <span class="material-symbols-outlined">open_in_new</span>
                     </button>
-                    <button class="preview-tool-btn" onclick="downloadPreviewHtml()" title="Download as .html File">
+                    <button type="button" class="preview-tool-btn" onclick="downloadPreviewHtml()" title="Download as .html File">
                         <span class="material-symbols-outlined">download</span>
                     </button>
-                    <button class="preview-tool-btn" id="preview-maximize-btn" onclick="toggleMaximizePreview()" title="Maximize / Restore Panel">
+                    <button type="button" class="preview-tool-btn" id="preview-maximize-btn" onclick="toggleMaximizePreview()" title="Maximize / Restore Panel">
                         <span class="material-symbols-outlined">fullscreen</span>
                     </button>
-                    <button class="preview-tool-btn close-btn" onclick="closePreviewPanel()" title="Close Preview Panel">
+                    <button type="button" class="preview-tool-btn close-btn" onclick="closePreviewPanel()" title="Close Preview Panel">
                         <span class="material-symbols-outlined">close</span>
                     </button>
                 </div>
@@ -329,12 +357,275 @@
                                 <span class="material-symbols-outlined empty-icon">web_asset</span>
                                 <h3>No HTML Document Loaded</h3>
                                 <p>Ask Moecher to generate an HTML document or web app, or paste your HTML into the <b>Code</b> tab.</p>
-                                <button class="action-btn" onclick="loadSampleHtml()" style="margin-top: 14px;">
+                                <button type="button" class="action-btn" onclick="loadSampleHtml()" style="margin-top: 14px;">
                                     <span class="material-symbols-outlined">play_circle</span>
                                     <span>Load Interactive Demo</span>
                                 </button>
                             </div>
                         </div>
+                    </div>
+                </div>
+
+                <!-- 3D Studio Tab Pane -->
+                <div class="tab-pane" id="tab-3d">
+                    <div class="three-studio-container" id="three-studio-container">
+                        <!-- 3D Floating Action Toolbar -->
+                        <div class="three-toolbar glass-toolbar">
+                            <div class="toolbar-group">
+                                <button type="button" class="three-tool-btn active" id="btn-tool-select" onclick="ThreeStudio.setTransformMode('select')" title="Select Tool (Click to select mesh)">
+                                    <span class="material-symbols-outlined">near_me</span>
+                                </button>
+                                <button type="button" class="three-tool-btn" id="btn-tool-translate" onclick="ThreeStudio.setTransformMode('translate')" title="Translate / Move Object (W or G)">
+                                    <span class="material-symbols-outlined">open_with</span>
+                                </button>
+                                <button type="button" class="three-tool-btn" id="btn-tool-rotate" onclick="ThreeStudio.setTransformMode('rotate')" title="Rotate Object (E or R)">
+                                    <span class="material-symbols-outlined">rotate_right</span>
+                                </button>
+                                <button type="button" class="three-tool-btn" id="btn-tool-scale" onclick="ThreeStudio.setTransformMode('scale')" title="Scale Object (R or S)">
+                                    <span class="material-symbols-outlined">aspect_ratio</span>
+                                </button>
+                            </div>
+                            <div class="toolbar-separator"></div>
+                            <div class="toolbar-group">
+                                <button type="button" class="three-tool-btn" id="btn-tool-vertex" onclick="ThreeStudio.toggleVertexMode()" title="Toggle Vertex Edit Mode">
+                                    <span class="material-symbols-outlined">grain</span>
+                                    <span class="btn-label">Vertices</span>
+                                </button>
+                                <button type="button" class="three-tool-btn" id="btn-tool-wireframe" onclick="ThreeStudio.toggleWireframe()" title="Toggle Wireframe View">
+                                    <span class="material-symbols-outlined">grid_4x4</span>
+                                </button>
+                                <button type="button" class="three-tool-btn" id="btn-tool-autorotate" onclick="ThreeStudio.toggleAutoRotate()" title="Toggle Auto-Rotation">
+                                    <span class="material-symbols-outlined">sync</span>
+                                </button>
+                                <button type="button" class="three-tool-btn" id="btn-tool-grid" onclick="ThreeStudio.toggleGrid()" title="Toggle Ground Grid">
+                                    <span class="material-symbols-outlined">grid_on</span>
+                                </button>
+                                <button type="button" class="three-tool-btn" id="btn-tool-reset" onclick="ThreeStudio.resetCamera()" title="Reset Camera View">
+                                    <span class="material-symbols-outlined">center_focus_strong</span>
+                                </button>
+                            </div>
+                            <div class="toolbar-separator"></div>
+                            <div class="toolbar-group">
+                                <button type="button" class="three-tool-btn" id="btn-tool-edit-code" onclick="ThreeStudio.openCodeEditor()" title="View & Edit 3D Source Code">
+                                    <span class="material-symbols-outlined">code</span>
+                                    <span class="btn-label">Code</span>
+                                </button>
+                                <button type="button" class="three-tool-btn export-btn" id="btn-export-glb" onclick="ThreeStudio.exportGLTF()" title="Export Scene to GLB">
+                                    <span class="material-symbols-outlined">download</span>
+                                    <span class="btn-label">GLB</span>
+                                </button>
+                                <button type="button" class="three-tool-btn export-btn" id="btn-export-obj" onclick="ThreeStudio.exportOBJ()" title="Export Scene to OBJ">
+                                    <span class="material-symbols-outlined">download</span>
+                                    <span class="btn-label">OBJ</span>
+                                </button>
+                            </div>
+                        </div>
+
+                        <!-- WebGL Canvas Viewport -->
+                        <div class="three-canvas-wrapper" id="three-canvas-wrapper">
+                            <canvas id="three-viewport-canvas"></canvas>
+
+                            <div class="three-error-banner" id="three-error-banner" style="display:none;">
+                                <span class="material-symbols-outlined">error</span>
+                                <span id="three-error-message"></span>
+                                <button type="button" class="three-error-close-btn" onclick="ThreeStudio.clearErrorNotification()" title="Dismiss">✕</button>
+                            </div>
+                            
+                            <div class="three-empty-state" id="three-empty-state">
+                                <span class="material-symbols-outlined empty-icon">view_in_ar</span>
+                                <h3>3D Studio Viewport</h3>
+                                <p>Ask Moecher to model an object in 3D, or drop an image and ask for a 3D model.</p>
+                                <button type="button" class="action-btn" onclick="ThreeStudio.loadDemoModel()" style="margin-top: 14px;">
+                                    <span class="material-symbols-outlined">play_circle</span>
+                                    <span>Load Interactive 3D Demo</span>
+                                </button>
+                            </div>
+                        </div>
+
+                        <!-- Floating Inspector & Outliner Drawer -->
+                        <aside class="three-inspector-drawer" id="three-inspector-drawer">
+                            <div class="inspector-header">
+                                <div class="inspector-title">
+                                    <span class="material-symbols-outlined">tune</span>
+                                    <span>3D Inspector</span>
+                                </div>
+                                <button type="button" class="inspector-toggle-btn" id="inspector-toggle-btn" onclick="ThreeStudio.toggleInspector()" title="Toggle Inspector">
+                                    <span class="material-symbols-outlined">chevron_right</span>
+                                </button>
+                            </div>
+                            <div class="inspector-body">
+                                <!-- Scene Outliner Tree -->
+                                <div class="inspector-section">
+                                    <div class="section-title">Scene Hierarchy</div>
+                                    <div class="outliner-tree" id="outliner-tree">
+                                        <div class="outliner-empty">No objects in scene</div>
+                                    </div>
+                                </div>
+
+                                <!-- Selected Object Info -->
+                                <div class="inspector-section" id="inspector-selection-section">
+                                    <div class="section-title">Selected Mesh: <span id="selected-mesh-name">None</span></div>
+                                    
+                                    <!-- Transform Controls -->
+                                    <div class="prop-group">
+                                        <label class="prop-label">Position</label>
+                                        <div class="coord-inputs">
+                                            <span>X <input type="number" step="0.1" id="mesh-pos-x" onchange="ThreeStudio.updateSelectedPosition()" disabled></span>
+                                            <span>Y <input type="number" step="0.1" id="mesh-pos-y" onchange="ThreeStudio.updateSelectedPosition()" disabled></span>
+                                            <span>Z <input type="number" step="0.1" id="mesh-pos-z" onchange="ThreeStudio.updateSelectedPosition()" disabled></span>
+                                        </div>
+                                    </div>
+
+                                    <!-- Material Controls -->
+                                    <div class="prop-group">
+                                        <label class="prop-label">Material Shading</label>
+                                        <select id="mesh-material-type" class="inspector-select" onchange="ThreeStudio.changeSelectedMaterialType(this.value)" disabled>
+                                            <option value="MeshStandardMaterial">Standard PBR</option>
+                                            <option value="MeshPhysicalMaterial">Physical (Clearcoat)</option>
+                                            <option value="MeshPhongMaterial">Phong (Glossy)</option>
+                                            <option value="MeshBasicMaterial">Basic (Unlit)</option>
+                                        </select>
+                                    </div>
+
+                                    <div class="prop-group">
+                                        <label class="prop-label">Diffuse Color</label>
+                                        <div class="color-picker-row">
+                                            <input type="color" id="mesh-color-picker" value="#3b82f6" onchange="ThreeStudio.updateSelectedMaterial()" disabled>
+                                            <span id="mesh-color-hex">#3b82f6</span>
+                                        </div>
+                                    </div>
+
+                                    <div class="prop-group">
+                                        <label class="prop-label">Emissive Glow</label>
+                                        <div class="color-picker-row">
+                                            <input type="color" id="mesh-emissive-picker" value="#000000" onchange="ThreeStudio.updateSelectedMaterial()" disabled>
+                                            <span id="mesh-emissive-hex">#000000</span>
+                                        </div>
+                                    </div>
+
+                                    <div class="prop-group">
+                                        <div class="slider-header">
+                                            <label class="prop-label">Roughness</label>
+                                            <span id="mesh-roughness-val">0.5</span>
+                                        </div>
+                                        <input type="range" min="0" max="1" step="0.05" id="mesh-roughness-slider" value="0.5" oninput="ThreeStudio.updateSelectedMaterial()" disabled>
+                                    </div>
+
+                                    <div class="prop-group">
+                                        <div class="slider-header">
+                                            <label class="prop-label">Metalness</label>
+                                            <span id="mesh-metalness-val">0.2</span>
+                                        </div>
+                                        <input type="range" min="0" max="1" step="0.05" id="mesh-metalness-slider" value="0.2" oninput="ThreeStudio.updateSelectedMaterial()" disabled>
+                                    </div>
+
+                                    <div class="prop-group">
+                                        <div class="slider-header">
+                                            <label class="prop-label">Opacity</label>
+                                            <span id="mesh-opacity-val">1.0</span>
+                                        </div>
+                                        <input type="range" min="0" max="1" step="0.05" id="mesh-opacity-slider" value="1.0" oninput="ThreeStudio.updateSelectedMaterial()" disabled>
+                                    </div>
+
+                                    <div class="prop-group">
+                                        <label class="checkbox-label" style="display:flex; align-items:center; gap:8px; font-size:12px; color:var(--text-secondary); cursor:pointer;">
+                                            <input type="checkbox" id="mesh-wireframe-toggle" onchange="ThreeStudio.updateSelectedMaterial()" disabled>
+                                            <span>Wireframe Mode</span>
+                                        </label>
+                                    </div>
+
+                                    <!-- Texture & Surface Mapping -->
+                                    <div class="section-divider"></div>
+                                    <div class="section-title">Texture Map</div>
+
+                                    <div class="texture-slot-box">
+                                        <div class="texture-preview-box" id="texture-preview-box">
+                                            <div class="no-texture-msg" id="no-texture-placeholder">
+                                                <span class="material-symbols-outlined">texture</span>
+                                                <span>No Texture Applied</span>
+                                            </div>
+                                            <img id="texture-preview-img" style="display:none;" alt="Applied Texture">
+                                        </div>
+                                        <div class="texture-meta-row">
+                                            <span id="texture-meta-dim" class="texture-badge">Solid Material</span>
+                                        </div>
+                                    </div>
+
+                                    <div class="texture-btn-grid">
+                                        <button type="button" class="btn-texture-action primary" id="btn-crop-chat-photo" onclick="ThreeStudio.openPhotoCropper()" title="Crop texture patch from uploaded photo" disabled>
+                                            <span class="material-symbols-outlined">crop</span>
+                                            <span>Crop from Photo</span>
+                                        </button>
+                                        <button type="button" class="btn-texture-action" id="btn-apply-full-photo" onclick="ThreeStudio.applyChatPhotoToSelected()" title="Apply whole uploaded photo" disabled>
+                                            <span class="material-symbols-outlined">image</span>
+                                            <span>Apply Full Photo</span>
+                                        </button>
+                                        <button type="button" class="btn-texture-action" id="btn-upload-custom-tex" onclick="document.getElementById('custom-texture-file-input').click()" title="Load custom texture file" disabled>
+                                            <span class="material-symbols-outlined">upload_file</span>
+                                            <span>Custom Texture</span>
+                                        </button>
+                                        <button type="button" class="btn-texture-action danger" id="btn-remove-tex" onclick="ThreeStudio.removeTextureFromSelected()" title="Remove texture map" disabled>
+                                            <span class="material-symbols-outlined">delete</span>
+                                            <span>Remove</span>
+                                        </button>
+                                    </div>
+                                    <input type="file" id="custom-texture-file-input" accept="image/*" style="display:none;" onchange="ThreeStudio.handleCustomTextureUpload(this)">
+
+                                    <!-- UV Mapping Controls -->
+                                    <div class="section-divider"></div>
+                                    <div class="section-title">UV Mapping & Tiling</div>
+
+                                    <div class="uv-controls-container" id="uv-controls-container">
+                                        <div class="prop-group">
+                                            <div class="slider-header">
+                                                <label class="prop-label">UV Tiling (Repeat)</label>
+                                                <div class="uv-presets">
+                                                    <button type="button" class="uv-chip" onclick="ThreeStudio.setUVRepeatPreset(1, 1)">1x</button>
+                                                    <button type="button" class="uv-chip" onclick="ThreeStudio.setUVRepeatPreset(2, 2)">2x</button>
+                                                    <button type="button" class="uv-chip" onclick="ThreeStudio.setUVRepeatPreset(4, 4)">4x</button>
+                                                </div>
+                                            </div>
+                                            <div class="coord-inputs">
+                                                <span>U <input type="number" step="0.1" min="0.1" max="50" id="uv-repeat-u" value="1.0" oninput="ThreeStudio.updateUVMapping()" disabled></span>
+                                                <span>V <input type="number" step="0.1" min="0.1" max="50" id="uv-repeat-v" value="1.0" oninput="ThreeStudio.updateUVMapping()" disabled></span>
+                                            </div>
+                                        </div>
+
+                                        <div class="prop-group">
+                                            <label class="prop-label">UV Offset (Shift)</label>
+                                            <div class="coord-inputs">
+                                                <span>U <input type="number" step="0.05" min="-10" max="10" id="uv-offset-u" value="0.0" oninput="ThreeStudio.updateUVMapping()" disabled></span>
+                                                <span>V <input type="number" step="0.05" min="-10" max="10" id="uv-offset-v" value="0.0" oninput="ThreeStudio.updateUVMapping()" disabled></span>
+                                            </div>
+                                        </div>
+
+                                        <div class="prop-group">
+                                            <div class="slider-header">
+                                                <label class="prop-label">UV Rotation</label>
+                                                <span id="uv-rotation-val">0°</span>
+                                            </div>
+                                            <input type="range" min="0" max="360" step="1" id="uv-rotation-slider" value="0" oninput="ThreeStudio.updateUVMapping()" disabled>
+                                        </div>
+
+                                        <div class="prop-group">
+                                            <label class="prop-label">Wrap Mode</label>
+                                            <select id="uv-wrap-mode" class="inspector-select" onchange="ThreeStudio.updateUVMapping()" disabled>
+                                                <option value="RepeatWrapping">Repeat Wrapping</option>
+                                                <option value="ClampToEdgeWrapping">Clamp to Edge</option>
+                                                <option value="MirroredRepeatWrapping">Mirrored Repeat</option>
+                                            </select>
+                                        </div>
+
+                                        <div style="display:flex; justify-content:flex-end; margin-top:4px;">
+                                            <button type="button" class="btn-uv-reset" id="btn-reset-uv" onclick="ThreeStudio.resetUVMapping()" disabled>
+                                                <span class="material-symbols-outlined">restart_alt</span>
+                                                <span>Reset UVs</span>
+                                            </button>
+                                        </div>
+                                    </div>
+                                </div>
+                            </div>
+                        </aside>
                     </div>
                 </div>
 
@@ -346,7 +637,7 @@
                             <span id="retrieved-doc-count-label">0 Documents Retrieved</span>
                         </div>
                         <div class="retrieved-actions">
-                            <button class="editor-btn" onclick="clearRetrievedDocs()" title="Clear Retrieved Documents">
+                            <button type="button" class="editor-btn" onclick="clearRetrievedDocs()" title="Clear Retrieved Documents">
                                 <span class="material-symbols-outlined">clear_all</span>
                                 <span>Clear</span>
                             </button>
@@ -369,19 +660,23 @@
                             <span id="editor-doc-size">0 lines</span>
                         </div>
                         <div class="editor-actions">
-                            <button class="editor-btn run-btn" onclick="runCodeFromEditor()" title="Re-render HTML in Preview">
+                            <button type="button" class="editor-btn run-btn" onclick="runCodeFromEditor()" title="Re-render HTML in Preview">
                                 <span class="material-symbols-outlined">play_arrow</span>
                                 <span>Run Code</span>
                             </button>
-                            <button class="editor-btn" onclick="copyEditorCode()" title="Copy Code">
+                            <button type="button" class="editor-btn run-3d-btn" id="btn-editor-3d" onclick="run3DFromEditor()" title="Update and View in 3D Studio">
+                                <span class="material-symbols-outlined">view_in_ar</span>
+                                <span>3D Studio</span>
+                            </button>
+                            <button type="button" class="editor-btn" onclick="copyEditorCode()" title="Copy Code">
                                 <span class="material-symbols-outlined">content_copy</span>
                                 <span>Copy</span>
                             </button>
-                            <button class="editor-btn" onclick="formatEditorCode()" title="Clean / Format Indentation">
+                            <button type="button" class="editor-btn" onclick="formatEditorCode()" title="Clean / Format Indentation">
                                 <span class="material-symbols-outlined">auto_fix_high</span>
                                 <span>Format</span>
                             </button>
-                            <button class="editor-btn" onclick="clearEditorCode()" title="Clear Editor">
+                            <button type="button" class="editor-btn" onclick="clearEditorCode()" title="Clear Editor">
                                 <span class="material-symbols-outlined">clear_all</span>
                                 <span>Clear</span>
                             </button>
@@ -397,12 +692,12 @@
                 <div class="tab-pane" id="tab-console">
                     <div class="console-toolbar">
                         <div class="console-filters">
-                            <button class="console-filter-btn active" data-filter="all">All</button>
-                            <button class="console-filter-btn" data-filter="error">Errors <span class="badge" id="badge-err-count">0</span></button>
-                            <button class="console-filter-btn" data-filter="warn">Warnings <span class="badge" id="badge-warn-count">0</span></button>
-                            <button class="console-filter-btn" data-filter="log">Logs <span class="badge" id="badge-log-count">0</span></button>
+                            <button type="button" class="console-filter-btn active" data-filter="all">All</button>
+                            <button type="button" class="console-filter-btn" data-filter="error">Errors <span class="badge" id="badge-err-count">0</span></button>
+                            <button type="button" class="console-filter-btn" data-filter="warn">Warnings <span class="badge" id="badge-warn-count">0</span></button>
+                            <button type="button" class="console-filter-btn" data-filter="log">Logs <span class="badge" id="badge-log-count">0</span></button>
                         </div>
-                        <button class="console-tool-btn" onclick="clearConsoleLogs()" title="Clear Console">
+                        <button type="button" class="console-tool-btn" onclick="clearConsoleLogs()" title="Clear Console">
                             <span class="material-symbols-outlined">block</span>
                             <span>Clear</span>
                         </button>
@@ -423,20 +718,20 @@
                     <span class="settings-title">Settings</span>
                 </div>
                 <div class="settings-tabs">
-                    <button class="settings-tab active" data-tab="settings-tab-general" title="General & Inference Settings">
+                    <button type="button" class="settings-tab active" data-tab="settings-tab-general" title="General & Inference Settings">
                         <span class="material-symbols-outlined tab-icon">tune</span>
                         <span>General & Inference</span>
                     </button>
-                    <button class="settings-tab" data-tab="settings-tab-agentic" title="Agentic Guardrails & Tools">
+                    <button type="button" class="settings-tab" data-tab="settings-tab-agentic" title="Agentic Guardrails & Tools">
                         <span class="material-symbols-outlined tab-icon">shield_person</span>
                         <span>Agentic & Tools</span>
                     </button>
                 </div>
                 <div class="settings-actions">
-                    <button class="settings-tool-btn" id="settings-maximize-btn" onclick="toggleMaximizeSettings()" title="Maximize / Restore Panel">
+                    <button type="button" class="settings-tool-btn" id="settings-maximize-btn" onclick="toggleMaximizeSettings()" title="Maximize / Restore Panel">
                         <span class="material-symbols-outlined">fullscreen</span>
                     </button>
-                    <button class="settings-tool-btn close-btn" onclick="closeSettingsPanel()" title="Close Settings Panel">
+                    <button type="button" class="settings-tool-btn close-btn" onclick="closeSettingsPanel()" title="Close Settings Panel">
                         <span class="material-symbols-outlined">close</span>
                     </button>
                 </div>
@@ -478,7 +773,7 @@
                             
                             <div class="setting-item">
                                 <label>Max Tokens</label>
-                                <input type="number" id="tokens-input" value="2048" class="num-input">
+                                <input type="number" id="tokens-input" value="20000" class="num-input">
                             </div>
 
                             <div class="setting-item">
@@ -709,6 +1004,14 @@
                                         <small>Direct Google web search</small>
                                     </div>
                                 </label>
+                                <label class="agentic-tool-chip">
+                                    <input type="checkbox" id="tool-enable-3d-model" checked>
+                                    <span class="material-symbols-outlined tool-chip-icon" style="color: #a855f7;">view_in_ar</span>
+                                    <div class="tool-chip-text">
+                                        <strong>create_3d_model</strong>
+                                        <small>Interactive Three.js 3D Studio</small>
+                                    </div>
+                                </label>
                             </div>
                         </div>
 
@@ -790,7 +1093,7 @@
                                     <div class="setting-field-group">
                                         <label class="agentic-section-label" for="tavily-api-key-input">Tavily API Key</label>
                                         <div style="display: flex; gap: 8px; align-items: center;">
-                                             <input type="password" id="tavily-api-key-input" placeholder="tvly-..." class="agentic-text-field" style="flex: 1; font-family: monospace;">
+                                             <input type="text" id="tavily-api-key-input" placeholder="tvly-..." class="agentic-text-field masked-api-key" autocomplete="off" autocorrect="off" autocapitalize="off" spellcheck="false" data-lpignore="true" data-1p-ignore="true" style="flex: 1; font-family: monospace;">
                                             <button type="button" class="editor-btn" onclick="toggleKeyVisibility('tavily-api-key-input', 'tavily-key-visibility-icon')" title="Show/Hide Key" style="padding: 6px 10px;">
                                                 <span class="material-symbols-outlined" id="tavily-key-visibility-icon" style="font-size: 18px;">visibility</span>
                                             </button>
@@ -813,7 +1116,7 @@
                                     <div class="setting-field-group">
                                         <label class="agentic-section-label" for="brave-api-key-input">Brave Search API Key</label>
                                         <div style="display: flex; gap: 8px; align-items: center;">
-                                            <input type="password" id="brave-api-key-input" placeholder="BSA..." class="agentic-text-field" style="flex: 1; font-family: monospace;">
+                                            <input type="text" id="brave-api-key-input" placeholder="BSA..." class="agentic-text-field masked-api-key" autocomplete="off" autocorrect="off" autocapitalize="off" spellcheck="false" data-lpignore="true" data-1p-ignore="true" style="flex: 1; font-family: monospace;">
                                             <button type="button" class="editor-btn" onclick="toggleKeyVisibility('brave-api-key-input', 'brave-key-visibility-icon')" title="Show/Hide Key" style="padding: 6px 10px;">
                                                 <span class="material-symbols-outlined" id="brave-key-visibility-icon" style="font-size: 18px;">visibility</span>
                                             </button>
@@ -827,7 +1130,7 @@
                                     <div class="setting-field-group">
                                         <label class="agentic-section-label" for="serper-api-key-input">Serper.dev API Key</label>
                                         <div style="display: flex; gap: 8px; align-items: center;">
-                                            <input type="password" id="serper-api-key-input" placeholder="Enter Serper API Key" class="agentic-text-field" style="flex: 1; font-family: monospace;">
+                                            <input type="text" id="serper-api-key-input" placeholder="Enter Serper API Key" class="agentic-text-field masked-api-key" autocomplete="off" autocorrect="off" autocapitalize="off" spellcheck="false" data-lpignore="true" data-1p-ignore="true" style="flex: 1; font-family: monospace;">
                                             <button type="button" class="editor-btn" onclick="toggleKeyVisibility('serper-api-key-input', 'serper-key-visibility-icon')" title="Show/Hide Key" style="padding: 6px 10px;">
                                                 <span class="material-symbols-outlined" id="serper-key-visibility-icon" style="font-size: 18px;">visibility</span>
                                             </button>
@@ -841,7 +1144,7 @@
                                     <div class="setting-field-group">
                                         <label class="agentic-section-label" for="google-api-key-input">Google API Key</label>
                                         <div style="display: flex; gap: 8px; align-items: center;">
-                                            <input type="password" id="google-api-key-input" placeholder="AIzaSy..." class="agentic-text-field" style="flex: 1; font-family: monospace;">
+                                            <input type="text" id="google-api-key-input" placeholder="AIzaSy..." class="agentic-text-field masked-api-key" autocomplete="off" autocorrect="off" autocapitalize="off" spellcheck="false" data-lpignore="true" data-1p-ignore="true" style="flex: 1; font-family: monospace;">
                                             <button type="button" class="editor-btn" onclick="toggleKeyVisibility('google-api-key-input', 'google-key-visibility-icon')" title="Show/Hide Key" style="padding: 6px 10px;">
                                                 <span class="material-symbols-outlined" id="google-key-visibility-icon" style="font-size: 18px;">visibility</span>
                                             </button>
@@ -1253,8 +1556,60 @@
         </div>
     </div>
 
-    <!-- Client Sandbox Iframe for Frontend Browser DOM & Script Execution -->
-    <iframe id="client-sandbox-iframe" style="position: absolute; width: 1024px; height: 768px; left: -9999px; top: -9999px; visibility: hidden; border: none;" sandbox="allow-scripts allow-same-origin allow-forms allow-popups allow-modals" title="Client Background Sandbox"></iframe>
+    <!-- Photo Texture Cropper Modal -->
+    <div class="photo-crop-modal-backdrop" id="photo-texture-crop-modal" style="display:none;">
+        <div class="photo-crop-modal">
+            <div class="photo-crop-header">
+                <div class="photo-crop-title">
+                    <span class="material-symbols-outlined">crop</span>
+                    <span>Extract Texture Patch from Photo</span>
+                </div>
+                <button type="button" class="photo-crop-close-btn" onclick="ThreeStudio.closePhotoCropper()">
+                    <span class="material-symbols-outlined">close</span>
+                </button>
+            </div>
+            <div class="photo-crop-body">
+                <div class="photo-crop-hint">
+                    Drag the bounding box over the surface or material you want to extract as a texture:
+                </div>
+                <div class="photo-crop-canvas-wrapper" id="photo-crop-canvas-wrapper">
+                    <canvas id="photo-crop-canvas"></canvas>
+                </div>
+                <div class="photo-crop-toolbar">
+                    <span style="font-size:12px; color:var(--text-muted); font-weight:600;">Aspect Ratio:</span>
+                    <button type="button" class="crop-ratio-btn active" data-ratio="free" onclick="ThreeStudio.setCropRatio('free', this)">Freeform</button>
+                    <button type="button" class="crop-ratio-btn" data-ratio="1:1" onclick="ThreeStudio.setCropRatio('1:1', this)">1:1 Square</button>
+                    <button type="button" class="crop-ratio-btn" data-ratio="2:1" onclick="ThreeStudio.setCropRatio('2:1', this)">2:1 Wide</button>
+                    <button type="button" class="crop-ratio-btn" data-ratio="1:2" onclick="ThreeStudio.setCropRatio('1:2', this)">1:2 Tall</button>
+                    <button type="button" class="crop-ratio-btn" onclick="ThreeStudio.resetCropToFull()">Full Image</button>
+                </div>
+            </div>
+            <div class="photo-crop-footer">
+                <button type="button" class="modal-btn deny-btn" onclick="ThreeStudio.closePhotoCropper()">Cancel</button>
+                <button type="button" class="modal-btn allow-always-btn" onclick="ThreeStudio.applyCroppedTexture()">
+                    <span class="material-symbols-outlined">check_circle</span>
+                    <span>Apply Texture to Selected Mesh</span>
+                </button>
+            </div>
+        </div>
+    </div>
+
+    <!-- Three.js and 3D Studio Dependencies -->
+    <script type="importmap">
+    {
+        "imports": {
+            "three": "https://cdnjs.cloudflare.com/ajax/libs/three.js/r128/three.module.js",
+            "three/addons/": "https://cdn.jsdelivr.net/npm/three@0.128.0/examples/jsm/",
+            "three/examples/jsm/": "https://cdn.jsdelivr.net/npm/three@0.128.0/examples/jsm/"
+        }
+    }
+    </script>
+    <script src="https://cdnjs.cloudflare.com/ajax/libs/three.js/r128/three.min.js"></script>
+    <script src="https://cdn.jsdelivr.net/npm/three@0.128.0/examples/js/controls/OrbitControls.js"></script>
+    <script src="https://cdn.jsdelivr.net/npm/three@0.128.0/examples/js/controls/TransformControls.js"></script>
+    <script src="https://cdn.jsdelivr.net/npm/three@0.128.0/examples/js/exporters/GLTFExporter.js"></script>
+    <script src="https://cdn.jsdelivr.net/npm/three@0.128.0/examples/js/exporters/OBJExporter.js"></script>
+    <script src="https://cdn.jsdelivr.net/npm/three@0.128.0/examples/js/utils/BufferGeometryUtils.js"></script>
 
     <script src="script.js"></script>
 </body>

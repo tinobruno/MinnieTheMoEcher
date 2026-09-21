@@ -438,6 +438,16 @@ function switchPreviewTab(tabId) {
 
     if (tabId === 'tab-code') {
         updateEditorLineNumbers();
+    } else if (tabId === 'tab-3d') {
+        if (typeof ThreeStudio !== 'undefined') {
+            ThreeStudio.onTabActivated();
+            if (ThreeStudio.isModelGroupEmpty()) {
+                const code = currentHtmlCode || getLastTurnPreviewCode();
+                if (code && is3DContent(code)) {
+                    ThreeStudio.loadModelCode(code);
+                }
+            }
+        }
     }
 }
 
@@ -511,6 +521,11 @@ function loadHtmlIntoPreview(htmlCode, autoSwitchTab = true) {
 
     clearConsoleLogs();
 
+    const is3d = is3DContent(currentHtmlCode);
+    if (is3d && typeof ThreeStudio !== 'undefined') {
+        ThreeStudio.loadModelCode(currentHtmlCode);
+    }
+
     // Direct YouTube video player detection for 100% reliable hardware-accelerated playback
     const ytMatch = currentHtmlCode.match(/(?:youtube-nocookie\.com\/embed\/|youtube\.com\/watch\?v=|youtu\.be\/)([a-zA-Z0-9_-]{11})/i);
     if (ytMatch && (currentHtmlCode.includes('youtube-nocookie.com') || currentHtmlCode.includes('YouTube Video') || currentHtmlCode.includes('yt-container') || currentHtmlCode.includes('player'))) {
@@ -542,7 +557,11 @@ function loadHtmlIntoPreview(htmlCode, autoSwitchTab = true) {
     }
 
     if (autoSwitchTab) {
-        switchPreviewTab('tab-preview');
+        if (is3d) {
+            switchPreviewTab('tab-3d');
+        } else {
+            switchPreviewTab('tab-preview');
+        }
     }
 }
 
@@ -557,7 +576,7 @@ function getLastTurnPreviewCode() {
     for (let i = codeBlocks.length - 1; i >= 0; i--) {
         const code = codeBlocks[i].textContent || '';
         const lang = (codeBlocks[i].className || '').toLowerCase();
-        if (isHtmlContent(code, lang)) {
+        if (isHtmlContent(code, lang) || is3DContent(code, lang)) {
             return code;
         }
     }
@@ -596,19 +615,19 @@ function getLatestHtmlCode() {
     return getLastTurnPreviewCode();
 }
 
-// Extract HTML snippet specifically generated in the current assistant message
+// Extract HTML or 3D snippet specifically generated in the current assistant message
 function getTurnHtmlCode(assistantMsgEl, rawText) {
     if (assistantMsgEl) {
         const codeBlocks = assistantMsgEl.querySelectorAll('pre code');
         for (let i = codeBlocks.length - 1; i >= 0; i--) {
             const code = codeBlocks[i].textContent || '';
             const lang = (codeBlocks[i].className || '').toLowerCase();
-            if (isHtmlContent(code, lang)) {
+            if (isHtmlContent(code, lang) || is3DContent(code, lang)) {
                 return code;
             }
         }
     }
-    if (isFullHtmlDocument(rawText)) {
+    if (isFullHtmlDocument(rawText) || is3DContent(rawText)) {
         return rawText;
     }
     return '';
@@ -684,13 +703,26 @@ function renderPreviewIframe(htmlCode) {
 </script>
 `;
 
+    const importMap = `
+<script type="importmap">
+{
+  "imports": {
+    "three": "https://cdnjs.cloudflare.com/ajax/libs/three.js/r128/three.module.js",
+    "three/addons/": "https://cdn.jsdelivr.net/npm/three@0.128.0/examples/jsm/",
+    "three/examples/jsm/": "https://cdn.jsdelivr.net/npm/three@0.128.0/examples/jsm/"
+  }
+}
+</script>
+`;
+
     let finalHtml = htmlCode;
+    const injectContent = consoleBridge + (!finalHtml.includes('type="importmap"') && !finalHtml.includes("type='importmap'") ? importMap : '');
     if (finalHtml.includes('<head>')) {
-        finalHtml = finalHtml.replace('<head>', '<head>' + consoleBridge);
+        finalHtml = finalHtml.replace('<head>', '<head>' + injectContent);
     } else if (finalHtml.includes('<html>')) {
-        finalHtml = finalHtml.replace('<html>', '<html><head>' + consoleBridge + '</head>');
+        finalHtml = finalHtml.replace('<html>', '<html><head>' + injectContent + '</head>');
     } else {
-        finalHtml = consoleBridge + finalHtml;
+        finalHtml = injectContent + finalHtml;
     }
 
     previewIframe.removeAttribute('src');
@@ -776,13 +808,29 @@ function updateEditorLineNumbers() {
 function runCodeFromEditor() {
     if (!previewCodeEditor) return;
     currentHtmlCode = previewCodeEditor.value;
+    const is3d = is3DContent(currentHtmlCode);
+    if (is3d && typeof ThreeStudio !== 'undefined') {
+        ThreeStudio.loadModelCode(currentHtmlCode);
+    }
     renderPreviewIframe(currentHtmlCode);
     if (previewEmptyState) previewEmptyState.classList.add('hidden');
     if (docStatusBadge) {
         docStatusBadge.textContent = 'Active';
         docStatusBadge.classList.remove('modified');
     }
-    switchPreviewTab('tab-preview');
+    if (is3d) {
+        switchPreviewTab('tab-3d');
+    } else {
+        switchPreviewTab('tab-preview');
+    }
+}
+
+function run3DFromEditor() {
+    if (!previewCodeEditor) return;
+    currentHtmlCode = previewCodeEditor.value;
+    if (typeof ThreeStudio !== 'undefined') {
+        ThreeStudio.openWithCode(currentHtmlCode);
+    }
 }
 
 function copyEditorCode() {
@@ -1202,8 +1250,21 @@ function renderMarkdownContent(rawText, containerElement) {
         langDiv.className = 'code-block-lang';
         langDiv.textContent = (lang || 'code').toUpperCase();
 
+        const is3dCandidate = is3DContent(codeContent, lang);
+
         const actionsDiv = document.createElement('div');
         actionsDiv.className = 'code-block-actions';
+
+        if (is3dCandidate) {
+            const studio3dBtn = document.createElement('button');
+            studio3dBtn.className = 'code-action-btn preview-btn-highlight btn-view-3d-model';
+            studio3dBtn.innerHTML = `<span class="material-symbols-outlined btn-icon">view_in_ar</span> 3D Studio`;
+            studio3dBtn.title = 'Open and interact with this 3D model in the 3D Studio';
+            studio3dBtn.addEventListener('click', () => {
+                ThreeStudio.openWithCode(codeContent);
+            });
+            actionsDiv.appendChild(studio3dBtn);
+        }
 
         const previewBtn = document.createElement('button');
         previewBtn.className = 'code-action-btn' + (isHtmlCandidate ? ' preview-btn-highlight' : '');
@@ -1241,23 +1302,42 @@ function renderMarkdownContent(rawText, containerElement) {
         if (!existingBanner) {
             const banner = document.createElement('div');
             banner.className = 'msg-html-banner';
+            const is3d = is3DContent(rawText);
             banner.innerHTML = `
                 <div class="msg-html-banner-left">
-                    <span class="material-symbols-outlined msg-html-banner-icon">html</span>
+                    <span class="material-symbols-outlined msg-html-banner-icon">${is3d ? 'view_in_ar' : 'html'}</span>
                     <div>
-                        <div class="msg-html-banner-text">HTML Document Detected</div>
-                        <div class="msg-html-banner-sub">Test and interact with this document in the preview panel</div>
+                        <div class="msg-html-banner-text">${is3d ? '3D Model Scene Detected' : 'HTML Document Detected'}</div>
+                        <div class="msg-html-banner-sub">${is3d ? 'Interact, rotate, and edit this 3D model in the 3D Studio' : 'Test and interact with this document in the preview panel'}</div>
                     </div>
                 </div>
-                <button class="msg-html-banner-btn">
-                    <span class="material-symbols-outlined">play_circle</span>
-                    <span>Open in Preview</span>
-                </button>
+                <div style="display: flex; gap: 8px; align-items: center;">
+                    ${is3d ? `
+                    <button class="msg-html-banner-btn btn-open-3d">
+                        <span class="material-symbols-outlined">view_in_ar</span>
+                        <span>Open in 3D Studio</span>
+                    </button>
+                    ` : ''}
+                    <button class="msg-html-banner-btn btn-open-preview">
+                        <span class="material-symbols-outlined">play_circle</span>
+                        <span>Open in Preview</span>
+                    </button>
+                </div>
             `;
-            const bannerBtn = banner.querySelector('.msg-html-banner-btn');
-            bannerBtn.addEventListener('click', () => {
-                loadHtmlIntoPreview(rawText, true);
-            });
+            const previewBtn = banner.querySelector('.btn-open-preview');
+            if (previewBtn) {
+                previewBtn.addEventListener('click', () => {
+                    loadHtmlIntoPreview(rawText, true);
+                });
+            }
+            if (is3d) {
+                const btn3d = banner.querySelector('.btn-open-3d');
+                if (btn3d) {
+                    btn3d.addEventListener('click', () => {
+                        ThreeStudio.openWithCode(rawText);
+                    });
+                }
+            }
             containerElement.appendChild(banner);
         }
     }
@@ -1686,12 +1766,14 @@ function toggleKeyVisibility(inputId, iconId) {
     const input = document.getElementById(inputId);
     const icon = document.getElementById(iconId);
     if (!input || !icon) return;
-    if (input.type === 'password') {
-        input.type = 'text';
-        icon.textContent = 'visibility_off';
-    } else {
-        input.type = 'password';
+    if (input.classList.contains('revealed')) {
+        input.classList.remove('revealed');
+        input.style.webkitTextSecurity = 'disc';
         icon.textContent = 'visibility';
+    } else {
+        input.classList.add('revealed');
+        input.style.webkitTextSecurity = 'none';
+        icon.textContent = 'visibility_off';
     }
 }
 
@@ -1827,7 +1909,7 @@ function saveSearchProviderSettingsUI() {
     });
 }
 
-const webToolNames = ['web_search', 'youtube_search', 'fetch_url', 'google_search'];
+const webToolNames = ['web_search', 'youtube_search', 'fetch_url', 'google_search', 'create_3d_model'];
 const localToolNames = ['read_file', 'write_file', 'edit_file', 'execute_command'];
 
 function syncMasterCheckboxes() {
@@ -2103,7 +2185,8 @@ function initAgenticSettingsUI() {
         web_search: document.getElementById('tool-enable-web-search'),
         youtube_search: document.getElementById('tool-enable-youtube-search'),
         google_search: document.getElementById('tool-enable-google-search'),
-        fetch_url: document.getElementById('tool-enable-fetch')
+        fetch_url: document.getElementById('tool-enable-fetch'),
+        create_3d_model: document.getElementById('tool-enable-3d-model')
     };
 
     if (masterWebToggle) {
@@ -2282,7 +2365,7 @@ function removeAuthorizedPath(idx) {
 // Built-in tool definitions builder (sends lightweight tool name list to backend)
 function getActiveToolsPayload() {
     const isWebRetrieval = webRetrievalEnabled ? webRetrievalEnabled.checked : true;
-    const knownTools = ['web_search', 'youtube_search', 'google_search', 'fetch_url', 'read_file', 'write_file', 'edit_file', 'execute_command'];
+    const knownTools = ['web_search', 'youtube_search', 'google_search', 'fetch_url', 'create_3d_model', 'read_file', 'write_file', 'edit_file', 'execute_command'];
 
     const activeList = knownTools.filter(name => {
         if ((name === 'web_search' || name === 'youtube_search' || name === 'google_search' || name === 'fetch_url') && !isWebRetrieval) {
@@ -2439,7 +2522,7 @@ async function initSystemPromptSync() {
         systemPromptInput.addEventListener('input', handleSystemPromptInput);
     }
     const activeTools = getActiveToolsPayload();
-    const allTools = ['web_search', 'youtube_search', 'google_search', 'fetch_url', 'read_file', 'write_file', 'edit_file', 'execute_command'];
+    const allTools = ['web_search', 'youtube_search', 'google_search', 'fetch_url', 'create_3d_model', 'read_file', 'write_file', 'edit_file', 'execute_command'];
     const hasCustomToolConfig = (activeTools.length !== allTools.length);
 
     if (hasCustomToolConfig) {
@@ -2657,6 +2740,34 @@ function buildOptimizedMessagesPayload() {
                     sysPrompt = sysPrompt.substring(0, toolsIdx).trim();
                 }
             }
+        }
+        if (window.lastUserPromptWas3D && sysPrompt) {
+            // Strip any short/stale 3D instructions from base system prompt
+            let basicIdx = sysPrompt.indexOf('\n\n# 3D Modeling Instructions');
+            if (basicIdx === -1) basicIdx = sysPrompt.indexOf('# 3D Modeling Instructions');
+            if (basicIdx === -1) basicIdx = sysPrompt.indexOf('\n\n## 3D Modeling Instructions');
+            if (basicIdx === -1) basicIdx = sysPrompt.indexOf('## 3D Modeling Instructions');
+            if (basicIdx !== -1) {
+                sysPrompt = sysPrompt.substring(0, basicIdx).trim();
+            }
+            sysPrompt += "\n\n# High-Fidelity Analytic 3D Modeling Instructions\n" +
+                "When asked to create, model, or reconstruct in 3D (or reconstruct an object from an image), always output Three.js representation code defining `function createModel(scene, THREE, inputImage, helpers) { ... }` inside a ```javascript code block (never output a full HTML file), adding all meshes to `scene`.\n\n" +
+                "CRITICAL RULES FOR ANALYTIC MODELING, PART-SPECIFIC TEXTURING & UV MAPPING:\n" +
+                "1. SEMANTIC & GEOMETRIC PART DECOMPOSITION:\n" +
+                "   - Never model an object as a single monolithic blob. Analytically decompose the subject into its distinct structural and anatomical parts (e.g. for an apple: body, stem, leaf; for a teapot: vessel body, lid, knob, handle, spout, foot ring; for furniture/vehicles/shoes: separate functional components).\n" +
+                "   - Model EVERY part as a separate named `THREE.Mesh` with its own geometry and material. Name every mesh descriptively (`mesh.name = 'apple_body'`, `mesh.name = 'apple_stem'`) or use `helpers.createPart(name, geometry, material)` and add all parts to `scene`.\n\n" +
+                "2. PART-SPECIFIC TEXTURES & COLORS (DO NOT NAIVELY APPLY THE ENTIRE PHOTO!):\n" +
+                "   - NEVER blindly apply the entire input photo onto the whole model or primary mesh (which stretches background, shadows, and unrelated features across surfaces).\n" +
+                "   - For parts requiring surface textures: use `helpers.cropTexture(inputImage, uMin, vMin, uMax, vMax, options)` to crop clean sub-regions of the photo matching that part (e.g. cropped skin texture for body, cropped leaf texture for leaf, cropped label for bottle). Coordinates are normalized 0..1.\n" +
+                "   - For uniform, solid, or metallic parts: use `helpers.sampleColor(inputImage, u, v)` to sample the exact realistic color from the image and set appropriate PBR properties (roughness, metalness, clearcoat).\n\n" +
+                "3. ACCURATE UV MAPPING:\n" +
+                "   - Revolved / lathe / cylindrical parts: use cylindrical/lathe UVs (`helpers.applyCylindricalUV(geometry)` or standard Lathe UVs) with `wrapS: THREE.RepeatWrapping`.\n" +
+                "   - Flat / curved / extruded parts (leaves, labels, panels, wings): use `helpers.applyPlanarUV(geometry, 'z')` so cropped sub-textures map cleanly without distortion.\n" +
+                "   - Multi-sided / cubic parts: use `helpers.applyBoxUV(geometry)`.\n\n" +
+                "4. WATERTIGHT GEOMETRY & SEAMLESS INTEGRATION:\n" +
+                "   - Revolved profiles must start and end at x=0 (use `helpers.createWatertightLathe` or `helpers.createHollowVessel` for vessels with solid wall thickness).\n" +
+                "   - Tubes, pipes, stems, and handles must have sealed end caps (use `helpers.createCappedTube`).\n" +
+                "   - Attachments (stems, leaves, handles, spouts) must penetrate 5-10% deep into parent meshes to prevent floating seams or gaps.";
         }
         if (sysPrompt) {
             messagesToSend.push({ role: 'system', content: sysPrompt });
@@ -3314,6 +3425,21 @@ async function executeClientToolCall(tc, turnRetrievedDocs = null) {
         } catch (err) {
             return `[Failed to execute ${tc.name}: ${err.message}]`;
         }
+    } else if (tc.name === 'create_3d_model' || tc.name === 'model_3d') {
+        let args = {};
+        try {
+            args = typeof tc.arguments === 'string' ? JSON.parse(tc.arguments) : (tc.arguments || {});
+        } catch (e) {
+            args = { code: tc.arguments };
+        }
+        const modelCode = args.code || '';
+        const modelName = args.name || '3D Model';
+        if (modelCode) {
+            window.lastUserPromptWas3D = true;
+            loadHtmlIntoPreview(modelCode, true);
+            return `Successfully generated and loaded 3D model "${modelName}" into 3D Studio.`;
+        }
+        return `Error: No 3D model code provided.`;
     } else {
         try {
             const res = await fetch(`${getApiBase()}/api/tool/execute`, {
@@ -3359,14 +3485,41 @@ async function sendMessage() {
     chatInput.value = '';
     chatInput.style.height = 'auto';
     setGeneratingState(true);
-    welcomeScreen.style.display = 'none';
+    // Detect if user prompt is asking for 3D model creation
+    const is3dPrompt = /(?:\b3d\b|three\.?js|\bmodel\b|\bmesh\b|\bobj\b|\bgltf\b)/i.test(text) ||
+                       (activeImageAttachment && /(?:model|3d|mesh|render|create)/i.test(text));
+    window.lastUserPromptWas3D = is3dPrompt;
+    if (is3dPrompt) {
+        if (!isPreviewOpen) openPreviewPanel();
+        switchPreviewTab('tab-3d');
+    }
 
     // Index where this turn starts in chatHistory
     const turnHistoryStartIndex = chatHistory.length;
 
-    // Add user message
-    appendMessage('user', text);
-    chatHistory.push({ role: 'user', content: text });
+    // Add user message (with optional image attachment)
+    let userMsgContent = text;
+    let attachedImg = null;
+    if (activeImageAttachment && currentModelHasVision) {
+        attachedImg = Object.assign({}, activeImageAttachment);
+        window.__lastUploadedImage = attachedImg.dataUrl;
+        if (!window.__lastUploadedImageElement || window.__lastUploadedImageElement.src !== attachedImg.dataUrl) {
+            const cachedImg = new Image();
+            cachedImg.crossOrigin = 'anonymous';
+            cachedImg.src = attachedImg.dataUrl;
+            window.__lastUploadedImageElement = cachedImg;
+        }
+        userMsgContent = [
+            { type: "text", text: text },
+            { type: "image_url", image_url: { url: attachedImg.dataUrl } }
+        ];
+        removeImageAttachment();
+        if (typeof ThreeStudio !== 'undefined' && ThreeStudio.updatePhotoTextureButtons) {
+            ThreeStudio.updatePhotoTextureButtons();
+        }
+    }
+    appendMessage('user', text, attachedImg);
+    chatHistory.push({ role: 'user', content: userMsgContent });
 
     // Create assistant message container
     const assistantMsgDiv = createMessageContainer('assistant');
@@ -3444,7 +3597,7 @@ async function sendMessage() {
             const payload = {
                 model: currentModelId || "deepseek-v4-flash",
                 messages: messagesToSend,
-                max_tokens: parseInt(tokensInput.value, 10),
+                max_tokens: parseInt(tokensInput ? tokensInput.value : 20000, 10) || 20000,
                 temperature: parseFloat(tempSlider.value),
                 stream: true,
                 thinking: {
@@ -3573,6 +3726,27 @@ async function sendMessage() {
                                             if (tc.function.arguments) roundToolCalls[idx].arguments += tc.function.arguments;
                                         }
                                     }
+                                }
+
+                                if (delta.status !== undefined) {
+                                    const statusText = liveIndicator ? liveIndicator.querySelector('.status-msg-text') : null;
+                                    if (statusText) statusText.textContent = delta.status;
+                                    let procBadge = assistantMsgDiv.querySelector('#tool-proc-indicator');
+                                    if (!procBadge) {
+                                        procBadge = document.createElement('div');
+                                        procBadge.className = 'tool-activity-block active tool-processing-badge';
+                                        procBadge.id = 'tool-proc-indicator';
+                                        const targetContainer = (reasoningBlock && !isReasoningDone) ? reasoningContent : mainContent;
+                                        targetContainer.appendChild(procBadge);
+                                    }
+                                    procBadge.innerHTML = `
+                                        <span class="thinking-spinner">progress_activity</span>
+                                        <span class="tool-action-label">${escapeHtml(delta.status)}</span>
+                                    `;
+                                    messagesContainer.scrollTo({
+                                        top: messagesContainer.scrollHeight,
+                                        behavior: 'smooth'
+                                    });
                                 }
 
                                 if (delta.reasoning_content !== undefined) {
@@ -3940,7 +4114,8 @@ async function sendMessage() {
             if (turnMediaDoc && turnMediaDoc.html) {
                 loadHtmlIntoPreview(turnMediaDoc.html, true);
             } else if (turnHtml && turnHtml.trim().length > 0) {
-                loadHtmlIntoPreview(turnHtml, false);
+                const is3dTurn = is3DContent(turnHtml);
+                loadHtmlIntoPreview(turnHtml, is3dTurn && window.lastUserPromptWas3D);
             }
 
             break;
@@ -4030,10 +4205,27 @@ function createMessageContainer(role) {
     return div;
 }
 
-function appendMessage(role, text) {
+function appendMessage(role, text, attachedImg = null) {
     const div = createMessageContainer(role);
     if (role === 'user') {
-        div.querySelector('.msg-content').textContent = text;
+        const contentEl = div.querySelector('.msg-content');
+        contentEl.textContent = '';
+        if (attachedImg && attachedImg.dataUrl) {
+            const thumbCard = document.createElement('div');
+            thumbCard.className = 'attachment-thumb-card user-msg-attachment';
+            thumbCard.style.marginBottom = '8px';
+            thumbCard.innerHTML = `
+                <img src="${attachedImg.dataUrl}" alt="Attached thumbnail" style="width: 56px; height: 56px; object-fit: cover; border-radius: 8px;">
+                <div class="attachment-meta">
+                    <span style="font-size: 12px; font-weight: 500; color: #fff;">${escapeHtml(attachedImg.filename || 'image.png')}</span>
+                    <span style="font-size: 11px; color: var(--text-muted);">${escapeHtml(attachedImg.filesize || '')}</span>
+                </div>
+            `;
+            contentEl.appendChild(thumbCard);
+        }
+        const textSpan = document.createElement('div');
+        textSpan.textContent = text;
+        contentEl.appendChild(textSpan);
     }
     messagesContainer.appendChild(div);
     messagesContainer.scrollTo({
@@ -4277,6 +4469,8 @@ async function initModelSelector() {
                     if (dropdownModelCtx && active.max_context_length) {
                         dropdownModelCtx.textContent = `${Number(active.max_context_length).toLocaleString()} ctx`;
                     }
+                    currentModelHasVision = (active.has_vision === true || active.has_vision === 'true');
+                    updateVisionUploadVisibility();
                 }
             }
         } catch (e) {
@@ -5479,6 +5673,2212 @@ function initMCPUI() {
     fetchMCPServers();
 }
 
+// ════════════════════════════════════════════════════════════════════════════════
+//  3D Detection & Content Classifier
+// ════════════════════════════════════════════════════════════════════════════════
+
+function is3DContent(code, lang) {
+    if (!code) return false;
+    const l = (lang || '').toLowerCase();
+    if (l === 'three' || l === 'threejs' || l === '3d') return true;
+
+    // Check Three.js script tags, CDNs or ES module imports
+    if (/three(?:\.min)?\.js/i.test(code) || /from\s+['"]three['"]/i.test(code) || /three@[\d.]+/i.test(code)) {
+        return true;
+    }
+
+    // Check Three.js APIs, objects, geometries, materials
+    if (code.includes('createModel') || 
+        /THREE\.(?:Mesh|Scene|BoxGeometry|SphereGeometry|CylinderGeometry|BufferGeometry|PlaneGeometry|TorusGeometry|ConeGeometry|Group|WebGLRenderer|PerspectiveCamera|MeshStandardMaterial|MeshBasicMaterial|MeshPhongMaterial)/.test(code) ||
+        (code.includes('THREE.') && /scene\.add\s*\(/.test(code))) {
+        return true;
+    }
+    return false;
+}
+
+// ════════════════════════════════════════════════════════════════════════════════
+//  Vision Capabilities & Image Attachment Handling
+// ════════════════════════════════════════════════════════════════════════════════
+
+let activeImageAttachment = null;
+let currentModelHasVision = false;
+
+function updateVisionUploadVisibility() {
+    const uploadBtn = document.getElementById('vision-upload-btn');
+    if (!uploadBtn) return;
+    if (currentModelHasVision) {
+        uploadBtn.classList.remove('hidden');
+    } else {
+        uploadBtn.classList.add('hidden');
+        removeImageAttachment();
+    }
+}
+
+function triggerVisionUpload() {
+    const fileInput = document.getElementById('vision-file-input');
+    if (fileInput) fileInput.click();
+}
+
+function handleVisionFileSelect(event) {
+    const file = event.target.files && event.target.files[0];
+    if (!file) return;
+    processImageFile(file);
+    event.target.value = '';
+}
+
+function processImageFile(file) {
+    if (!file.type.startsWith('image/')) {
+        alert('Please select an image file (PNG, JPG, WebP, BMP).');
+        return;
+    }
+    const reader = new FileReader();
+    reader.onload = function(e) {
+        const dataUrl = e.target.result;
+        const img = new Image();
+        img.onload = function() {
+            activeImageAttachment = {
+                filename: file.name,
+                filesize: `${img.width}x${img.height}`,
+                dataUrl: dataUrl
+            };
+            window.__lastUploadedImage = dataUrl;
+            window.__lastUploadedImageElement = img;
+            renderImageAttachmentChip();
+            if (typeof ThreeStudio !== 'undefined' && ThreeStudio.updatePhotoTextureButtons) {
+                ThreeStudio.updatePhotoTextureButtons();
+            }
+        };
+        img.src = dataUrl;
+    };
+    reader.readAsDataURL(file);
+}
+
+function renderImageAttachmentChip() {
+    const chip = document.getElementById('image-attachment-preview');
+    const thumb = document.getElementById('attachment-thumb-img');
+    const nameEl = document.getElementById('attachment-filename');
+    const sizeEl = document.getElementById('attachment-filesize');
+    if (!chip || !thumb) return;
+
+    if (activeImageAttachment) {
+        thumb.src = activeImageAttachment.dataUrl;
+        if (nameEl) nameEl.textContent = activeImageAttachment.filename;
+        if (sizeEl) sizeEl.textContent = activeImageAttachment.filesize;
+        chip.classList.remove('hidden');
+    } else {
+        chip.classList.add('hidden');
+    }
+}
+
+function removeImageAttachment() {
+    activeImageAttachment = null;
+    const chip = document.getElementById('image-attachment-preview');
+    if (chip) chip.classList.add('hidden');
+}
+
+function getLastUploadedPhoto() {
+    if (window.__lastUploadedImage) return window.__lastUploadedImage;
+    if (typeof chatHistory !== 'undefined' && Array.isArray(chatHistory)) {
+        for (let i = chatHistory.length - 1; i >= 0; i--) {
+            const m = chatHistory[i];
+            if (m.role === 'user' && Array.isArray(m.content)) {
+                for (const part of m.content) {
+                    if (part.type === 'image_url' && part.image_url && part.image_url.url) {
+                        window.__lastUploadedImage = part.image_url.url;
+                        return part.image_url.url;
+                    }
+                }
+            }
+        }
+    }
+    const imgs = document.querySelectorAll('.msg-user img');
+    if (imgs.length > 0) {
+        const lastImg = imgs[imgs.length - 1];
+        if (lastImg.src && lastImg.src.startsWith('data:image/')) {
+            window.__lastUploadedImage = lastImg.src;
+            return lastImg.src;
+        }
+    }
+    return '';
+}
+
+function quickPromptModel3D() {
+    window.lastUserPromptWas3D = true;
+    if (!isPreviewOpen) openPreviewPanel();
+    switchPreviewTab('tab-3d');
+    if (chatInput) {
+        chatInput.value = 'Reconstruct an accurate, watertight 3D model matching the exact shape, silhouette, and contours of the object in this image. Apply the photo texture using `new THREE.TextureLoader().load(inputImage)` with RepeatWrapping and DoubleSide on the primary mesh.\n\nGEOMETRIC QUALITY RULES (AVOID HOLES):\n1. Watertight Solid: Zero holes. Lathe profiles must start and end at x=0 (or use helpers.createWatertightLathe). Open vessels (cups, bowls, vases) must have solid wall thickness (use helpers.createHollowVessel).\n2. Capped Ends: Tubes, pipes, handles, and spouts must have closed ends (use helpers.createCappedTube).\n3. Deep Embedding: Attachments (handles, spouts, limbs) must penetrate 5-10% deep into parent meshes so there are no floating gaps or seam cracks.\n4. Smooth Shading: Use 32-64 radial segments for curves and call geometry.computeVertexNormals().\n\nReturn Three.js function createModel(scene, THREE, inputImage, helpers) in a ```javascript block.';
+        chatInput.focus();
+        sendBtn.disabled = false;
+    }
+}
+
+function setupVisionDragAndDrop() {
+    window.addEventListener('dragover', (e) => {
+        if (!currentModelHasVision) return;
+        e.preventDefault();
+    });
+    window.addEventListener('drop', (e) => {
+        if (!currentModelHasVision) return;
+        e.preventDefault();
+        if (e.dataTransfer && e.dataTransfer.files && e.dataTransfer.files.length > 0) {
+            const file = e.dataTransfer.files[0];
+            if (file.type.startsWith('image/')) {
+                processImageFile(file);
+            }
+        }
+    });
+    if (chatInput) {
+        chatInput.addEventListener('paste', (e) => {
+            if (!currentModelHasVision) return;
+            const items = (e.clipboardData || e.originalEvent?.clipboardData)?.items;
+            if (!items) return;
+            for (let i = 0; i < items.length; i++) {
+                if (items[i].type.indexOf('image') !== -1) {
+                    const file = items[i].getAsFile();
+                    if (file) {
+                        processImageFile(file);
+                        e.preventDefault();
+                        break;
+                    }
+                }
+            }
+        });
+    }
+}
+
+// ════════════════════════════════════════════════════════════════════════════════
+//  Interactive 3D Studio (Three.js Visualizer & Editor)
+// ════════════════════════════════════════════════════════════════════════════════
+
+const ThreeStudio = {
+    isInitialized: false,
+    scene: null,
+    camera: null,
+    renderer: null,
+    controls: null,
+    transformControls: null,
+    modelGroup: null,
+    selectedObject: null,
+    vertexMode: false,
+    vertexHandlesGroup: null,
+    wireframeMode: false,
+    gridHelper: null,
+    raycaster: null,
+    mouse: null,
+    canvasEl: null,
+    currentCode: '',
+
+    helpers: {
+        /**
+         * Ensures a LatheGeometry profile starts strictly at x=0 and ends at x=0,
+         * completely sealing top and bottom holes.
+         */
+        createWatertightLathe(points, segments = 32, phiStart = 0, phiLength = Math.PI * 2) {
+            if (!Array.isArray(points) || points.length < 2) {
+                return new THREE.BufferGeometry();
+            }
+            const pts = points.map(p => (p instanceof THREE.Vector2 ? p.clone() : new THREE.Vector2(p.x, p.y)));
+
+            // Ensure bottom point starts at x=0
+            if (pts[0].x > 0.001) {
+                pts.unshift(new THREE.Vector2(0, pts[0].y));
+            }
+            // Ensure top point ends at x=0
+            if (pts[pts.length - 1].x > 0.001) {
+                pts.push(new THREE.Vector2(0, pts[pts.length - 1].y));
+            }
+
+            const LatheCtor = THREE.LatheBufferGeometry || THREE.LatheGeometry;
+            let geom = new LatheCtor(pts, Math.max(segments, 16), phiStart, phiLength);
+            if (geom.vertices && !geom.attributes && THREE.BufferGeometry) {
+                geom = new THREE.BufferGeometry().fromGeometry(geom);
+            }
+            geom.computeVertexNormals();
+            return geom;
+        },
+
+        /**
+         * Creates a vessel (cup, mug, bowl, vase, bottle) with TRUE solid wall thickness
+         * (outer shell + rounded rim + inner shell + solid bottom), eliminating paper-thin hollow geometry!
+         */
+        createHollowVessel(points, wallThickness = 0.08, segments = 32) {
+            if (!Array.isArray(points) || points.length < 2) {
+                return new THREE.BufferGeometry();
+            }
+            const outer = points.map(p => (p instanceof THREE.Vector2 ? p.clone() : new THREE.Vector2(p.x, p.y)));
+
+            // Ensure outer starts at x=0
+            if (outer[0].x > 0.001) {
+                outer.unshift(new THREE.Vector2(0, outer[0].y));
+            }
+
+            const t = Math.max(0.01, wallThickness);
+            const closedProfile = [];
+
+            // 1. Add outer profile points from bottom to top rim
+            for (let i = 0; i < outer.length; i++) {
+                closedProfile.push(outer[i]);
+            }
+
+            // 2. Add rim connector (rounded or flat inward offset)
+            const rimTop = outer[outer.length - 1];
+            const innerRimX = Math.max(0.02, rimTop.x - t);
+            closedProfile.push(new THREE.Vector2(innerRimX, rimTop.y));
+
+            // 3. Generate inner profile points going downward
+            for (let i = outer.length - 2; i >= 1; i--) {
+                const p = outer[i];
+                const innerX = Math.max(0.01, p.x - t);
+                const innerY = p.y;
+                closedProfile.push(new THREE.Vector2(innerX, innerY));
+            }
+
+            // 4. Inner bottom closure at x=0
+            const innerBottomY = outer[0].y + t;
+            closedProfile.push(new THREE.Vector2(0, innerBottomY));
+
+            const geom = new THREE.LatheGeometry(closedProfile, Math.max(segments, 24));
+            geom.computeVertexNormals();
+            return geom;
+        },
+
+        /**
+         * Creates a tube along a 3D curve with sealed hemispherical/disc end caps.
+         * Solves the open-ended tube problem for handles, spouts, wires, and pipes.
+         */
+        createCappedTube(curve, tubularSegments = 64, radius = 0.1, radialSegments = 16, closed = false) {
+            const tubeGeom = new THREE.TubeGeometry(curve, tubularSegments, radius, radialSegments, closed);
+            if (closed) {
+                tubeGeom.computeVertexNormals();
+                return tubeGeom;
+            }
+
+            // Generate start and end spherical caps
+            try {
+                const p0 = curve.getPointAt(0);
+                const p1 = curve.getPointAt(1);
+
+                const cap0 = new THREE.SphereGeometry(radius, radialSegments, Math.max(4, Math.floor(radialSegments / 2)));
+                cap0.translate(p0.x, p0.y, p0.z);
+
+                const cap1 = new THREE.SphereGeometry(radius, radialSegments, Math.max(4, Math.floor(radialSegments / 2)));
+                cap1.translate(p1.x, p1.y, p1.z);
+
+                if (THREE.BufferGeometryUtils && typeof THREE.BufferGeometryUtils.mergeBufferGeometries === 'function') {
+                    const merged = THREE.BufferGeometryUtils.mergeBufferGeometries([tubeGeom, cap0, cap1]);
+                    if (merged) {
+                        merged.computeVertexNormals();
+                        return merged;
+                    }
+                }
+            } catch(e) {
+                console.warn('[3D Studio helpers.createCappedTube] merge fallback:', e);
+            }
+            tubeGeom.computeVertexNormals();
+            return tubeGeom;
+        },
+
+        /**
+         * Creates a smooth beveled / rounded box without razor-sharp polygon edges.
+         */
+        createRoundedBox(width = 1, height = 1, depth = 1, radius = 0.08, smoothness = 4) {
+            const r = Math.min(radius, width / 2 - 0.001, height / 2 - 0.001, depth / 2 - 0.001);
+            if (r <= 0) {
+                return new THREE.BoxGeometry(width, height, depth);
+            }
+            const shape = new THREE.Shape();
+            const w = width - 2 * r;
+            const h = height - 2 * r;
+            shape.moveTo(-w / 2, -h / 2 - r);
+            shape.lineTo(w / 2, -h / 2 - r);
+            shape.absarc(w / 2, -h / 2, r, -Math.PI / 2, 0, false);
+            shape.lineTo(w / 2 + r, h / 2);
+            shape.absarc(w / 2, h / 2, r, 0, Math.PI / 2, false);
+            shape.lineTo(-w / 2, h / 2 + r);
+            shape.absarc(-w / 2, h / 2, r, Math.PI / 2, Math.PI, false);
+            shape.lineTo(-w / 2 - r, -h / 2);
+            shape.absarc(-w / 2, -h / 2, r, Math.PI, Math.PI * 1.5, false);
+            shape.closePath();
+
+            const extrudeSettings = {
+                depth: Math.max(0.01, depth - 2 * r),
+                bevelEnabled: true,
+                bevelSegments: Math.max(2, smoothness),
+                steps: 1,
+                bevelSize: r,
+                bevelThickness: r
+            };
+            const geom = new THREE.ExtrudeGeometry(shape, extrudeSettings);
+            geom.center();
+            geom.computeVertexNormals();
+            return geom;
+        },
+
+        /**
+         * Creates a watertight capsule (cylinder with hemispherical caps).
+         */
+        createCapsule(radius = 0.2, length = 0.8, capSegments = 8, radialSegments = 24) {
+            const cylH = Math.max(0.01, length);
+            const cyl = new THREE.CylinderGeometry(radius, radius, cylH, radialSegments, 1, true);
+            const topCap = new THREE.SphereGeometry(radius, radialSegments, capSegments, 0, Math.PI * 2, 0, Math.PI / 2);
+            topCap.translate(0, cylH / 2, 0);
+            const botCap = new THREE.SphereGeometry(radius, radialSegments, capSegments, 0, Math.PI * 2, Math.PI / 2, Math.PI / 2);
+            botCap.translate(0, -cylH / 2, 0);
+
+            if (THREE.BufferGeometryUtils && typeof THREE.BufferGeometryUtils.mergeBufferGeometries === 'function') {
+                const merged = THREE.BufferGeometryUtils.mergeBufferGeometries([cyl, topCap, botCap]);
+                if (merged) {
+                    const welded = THREE.BufferGeometryUtils.mergeVertices(merged, 1e-4);
+                    welded.computeVertexNormals();
+                    return welded;
+                }
+            }
+            const fallback = new THREE.CylinderGeometry(radius, radius, cylH, radialSegments, 1, false);
+            fallback.computeVertexNormals();
+            return fallback;
+        },
+
+        /**
+         * Welds duplicate vertices to eliminate seam cracks and recalculates smooth normals.
+         */
+        weldAndSmooth(geometry, tolerance = 1e-4) {
+            if (!geometry) return geometry;
+            let res = geometry;
+            if (THREE.BufferGeometryUtils && typeof THREE.BufferGeometryUtils.mergeVertices === 'function') {
+                try {
+                    res = THREE.BufferGeometryUtils.mergeVertices(geometry, tolerance);
+                } catch(e) {}
+            }
+            try {
+                res.computeVertexNormals();
+            } catch(e) {}
+            return res;
+        },
+
+        /**
+         * Helper to create a production-quality PBR material with DoubleSide enabled.
+         */
+        createPBRMaterial(options = {}) {
+            return new THREE.MeshStandardMaterial({
+                color: options.color !== undefined ? options.color : 0x3b82f6,
+                roughness: options.roughness !== undefined ? options.roughness : 0.35,
+                metalness: options.metalness !== undefined ? options.metalness : 0.1,
+                side: THREE.DoubleSide,
+                shadowSide: THREE.DoubleSide,
+                ...options
+            });
+        },
+
+        /**
+         * Generates cylindrical UV coordinates around the Y-axis.
+         */
+        applyCylindricalUV(geometry) {
+            if (!geometry) return geometry;
+            try {
+                if (geometry.vertices && !geometry.attributes && typeof THREE.BufferGeometry === 'function') {
+                    geometry = new THREE.BufferGeometry().fromGeometry(geometry);
+                }
+                geometry.computeBoundingBox();
+                const bbox = geometry.boundingBox || new THREE.Box3();
+                const pos = geometry.attributes ? geometry.attributes.position : null;
+                if (!pos) return geometry;
+                const uvs = [];
+                const minY = bbox.min.y;
+                const rangeY = (bbox.max.y - bbox.min.y) || 1.0;
+                for (let i = 0; i < pos.count; i++) {
+                    const x = pos.getX(i);
+                    const y = pos.getY(i);
+                    const z = pos.getZ(i);
+                    let u = (Math.atan2(x, z) / (2 * Math.PI)) + 0.5;
+                    let v = (y - minY) / rangeY;
+                    uvs.push(u, v);
+                }
+                const attr = new THREE.Float32BufferAttribute(uvs, 2);
+                if (typeof geometry.setAttribute === 'function') {
+                    geometry.setAttribute('uv', attr);
+                } else if (typeof geometry.addAttribute === 'function') {
+                    geometry.addAttribute('uv', attr);
+                } else if (geometry.attributes) {
+                    geometry.attributes.uv = attr;
+                }
+                geometry.uvsNeedUpdate = true;
+            } catch(e) {
+                console.warn('[3D Studio applyCylindricalUV]', e);
+            }
+            return geometry;
+        },
+
+        /**
+         * Generates 2D planar projection UV coordinates along the specified axis ('x', 'y', or 'z').
+         */
+        applyPlanarUV(geometry, axis = 'z') {
+            if (!geometry) return geometry;
+            try {
+                if (geometry.vertices && !geometry.attributes && typeof THREE.BufferGeometry === 'function') {
+                    geometry = new THREE.BufferGeometry().fromGeometry(geometry);
+                }
+                geometry.computeBoundingBox();
+                const bbox = geometry.boundingBox || new THREE.Box3();
+                const pos = geometry.attributes ? geometry.attributes.position : null;
+                if (!pos) return geometry;
+                const uvs = [];
+                const minX = bbox.min.x, rangeX = (bbox.max.x - bbox.min.x) || 1.0;
+                const minY = bbox.min.y, rangeY = (bbox.max.y - bbox.min.y) || 1.0;
+                const minZ = bbox.min.z, rangeZ = (bbox.max.z - bbox.min.z) || 1.0;
+                const ax = (axis || 'z').toLowerCase();
+                for (let i = 0; i < pos.count; i++) {
+                    const x = pos.getX(i), y = pos.getY(i), z = pos.getZ(i);
+                    let u, v;
+                    if (ax === 'x') {
+                        u = (z - minZ) / rangeZ;
+                        v = (y - minY) / rangeY;
+                    } else if (ax === 'y') {
+                        u = (x - minX) / rangeX;
+                        v = (z - minZ) / rangeZ;
+                    } else {
+                        u = (x - minX) / rangeX;
+                        v = (y - minY) / rangeY;
+                    }
+                    uvs.push(Math.max(0, Math.min(1, u)), Math.max(0, Math.min(1, v)));
+                }
+                const attr = new THREE.Float32BufferAttribute(uvs, 2);
+                if (typeof geometry.setAttribute === 'function') {
+                    geometry.setAttribute('uv', attr);
+                } else if (typeof geometry.addAttribute === 'function') {
+                    geometry.addAttribute('uv', attr);
+                } else if (geometry.attributes) {
+                    geometry.attributes.uv = attr;
+                }
+                geometry.uvsNeedUpdate = true;
+            } catch(e) {
+                console.warn('[3D Studio applyPlanarUV]', e);
+            }
+            return geometry;
+        },
+
+        /**
+         * Generates triplanar box projection UV coordinates.
+         */
+        applyBoxUV(geometry) {
+            if (!geometry) return geometry;
+            try {
+                geometry.computeBoundingBox();
+                geometry.computeVertexNormals();
+                const bbox = geometry.boundingBox || new THREE.Box3();
+                const pos = geometry.attributes.position;
+                const norm = geometry.attributes.normal;
+                if (!pos) return geometry;
+                const uvs = [];
+                const minX = bbox.min.x, rangeX = (bbox.max.x - bbox.min.x) || 1.0;
+                const minY = bbox.min.y, rangeY = (bbox.max.y - bbox.min.y) || 1.0;
+                const minZ = bbox.min.z, rangeZ = (bbox.max.z - bbox.min.z) || 1.0;
+                for (let i = 0; i < pos.count; i++) {
+                    const x = pos.getX(i), y = pos.getY(i), z = pos.getZ(i);
+                    let nx = 0, ny = 0, nz = 1;
+                    if (norm) {
+                        nx = Math.abs(norm.getX(i));
+                        ny = Math.abs(norm.getY(i));
+                        nz = Math.abs(norm.getZ(i));
+                    }
+                    let u, v;
+                    if (nx >= ny && nx >= nz) {
+                        u = (z - minZ) / rangeZ;
+                        v = (y - minY) / rangeY;
+                    } else if (ny >= nx && ny >= nz) {
+                        u = (x - minX) / rangeX;
+                        v = (z - minZ) / rangeZ;
+                    } else {
+                        u = (x - minX) / rangeX;
+                        v = (y - minY) / rangeY;
+                    }
+                    uvs.push(u, v);
+                }
+                geometry.setAttribute('uv', new THREE.Float32BufferAttribute(uvs, 2));
+                geometry.uvsNeedUpdate = true;
+            } catch(e) {
+                console.warn('[3D Studio applyBoxUV]', e);
+            }
+            return geometry;
+        },
+
+        /**
+         * Samples pixel RGB color from the input photo or image.
+         */
+        sampleColor(inputImage, u = 0.5, v = 0.5) {
+            try {
+                const src = inputImage || (typeof getLastUploadedPhoto === 'function' ? getLastUploadedPhoto() : window.__lastUploadedImage);
+                if (!src || typeof document === 'undefined') return new THREE.Color(0xC41E3E);
+
+                if (!ThreeStudio._sampleCanvas) {
+                    ThreeStudio._sampleCanvas = document.createElement('canvas');
+                    ThreeStudio._sampleCtx = ThreeStudio._sampleCanvas.getContext('2d', { willReadFrequently: true });
+                }
+                if (ThreeStudio._cachedSampleImg && ThreeStudio._cachedSampleImg.src === src && ThreeStudio._cachedSampleImg.complete) {
+                    const w = ThreeStudio._sampleCanvas.width;
+                    const h = ThreeStudio._sampleCanvas.height;
+                    const px = Math.min(w - 1, Math.max(0, Math.floor(u * w)));
+                    const py = Math.min(h - 1, Math.max(0, Math.floor(v * h)));
+                    const pixel = ThreeStudio._sampleCtx.getImageData(px, py, 1, 1).data;
+                    return new THREE.Color(pixel[0] / 255, pixel[1] / 255, pixel[2] / 255);
+                } else if (typeof src === 'string' && src.startsWith('data:image/')) {
+                    const img = new Image();
+                    img.crossOrigin = 'anonymous';
+                    img.onload = () => {
+                        ThreeStudio._sampleCanvas.width = img.naturalWidth || 256;
+                        ThreeStudio._sampleCanvas.height = img.naturalHeight || 256;
+                        ThreeStudio._sampleCtx.drawImage(img, 0, 0);
+                        ThreeStudio._cachedSampleImg = img;
+                    };
+                    img.src = src;
+                }
+            } catch(e) {
+                console.warn('[3D Studio sampleColor]', e);
+            }
+            return new THREE.Color(0xC41E3E);
+        },
+
+        /**
+         * Crops and returns a THREE.CanvasTexture from the input photo or image.
+         */
+        cropTexture(inputImage, uMin = 0, vMin = 0, uMax = 1, vMax = 1, options = {}) {
+            const canvas = document.createElement('canvas');
+            canvas.width = 512;
+            canvas.height = 512;
+            const ctx = canvas.getContext('2d');
+            ctx.fillStyle = '#C41E3E';
+            ctx.fillRect(0, 0, 512, 512);
+
+            const texture = new THREE.CanvasTexture(canvas);
+            texture.wrapS = options.wrapS !== undefined ? options.wrapS : THREE.ClampToEdgeWrapping;
+            texture.wrapT = options.wrapT !== undefined ? options.wrapT : THREE.ClampToEdgeWrapping;
+
+            const src = inputImage || (typeof getLastUploadedPhoto === 'function' ? getLastUploadedPhoto() : window.__lastUploadedImage);
+            if (src && typeof src === 'string' && src.startsWith('data:image/')) {
+                const img = new Image();
+                img.crossOrigin = 'anonymous';
+                img.onload = () => {
+                    const iw = img.naturalWidth || 512;
+                    const ih = img.naturalHeight || 512;
+                    const sx = Math.max(0, uMin * iw);
+                    const sy = Math.max(0, vMin * ih);
+                    const sw = Math.max(1, (uMax - uMin) * iw);
+                    const sh = Math.max(1, (vMax - vMin) * ih);
+                    canvas.width = Math.min(1024, Math.max(64, sw));
+                    canvas.height = Math.min(1024, Math.max(64, sh));
+                    ctx.drawImage(img, sx, sy, sw, sh, 0, 0, canvas.width, canvas.height);
+                    texture.needsUpdate = true;
+                };
+                img.src = src;
+            }
+            return texture;
+        },
+
+        /**
+         * Creates and returns a named THREE.Mesh.
+         */
+        createPart(name, geometry, material) {
+            const mesh = new THREE.Mesh(geometry, material || this.createPBRMaterial());
+            if (name) mesh.name = name;
+            return mesh;
+        }
+    },
+
+    getSafeHelpers() {
+        const target = this.helpers;
+        return new Proxy(target, {
+            get(t, prop, receiver) {
+                if (prop in t) {
+                    return t[prop];
+                }
+                return function(...args) {
+                    console.warn(`[3D Studio Helpers] Undefined helper called: helpers.${String(prop)}`, args);
+                    if (args[0] && (args[0].isBufferGeometry || args[0].isGeometry || args[0].isObject3D)) {
+                        return args[0];
+                    }
+                    return null;
+                };
+            }
+        });
+    },
+
+    showErrorNotification(msg) {
+        const banner = document.getElementById('three-error-banner');
+        const text = document.getElementById('three-error-message');
+        if (banner && text) {
+            text.textContent = msg || '3D Execution Error';
+            banner.style.display = 'flex';
+        }
+    },
+
+    clearErrorNotification() {
+        const banner = document.getElementById('three-error-banner');
+        if (banner) banner.style.display = 'none';
+    },
+
+    postProcessModelGeometries(rootGroup) {
+        if (!rootGroup) return;
+        rootGroup.traverse(child => {
+            if (child.isMesh && child.geometry) {
+                let geom = child.geometry;
+
+                // 1. Auto-weld duplicate/split vertices to seal cracks and holes
+                if (typeof THREE.BufferGeometryUtils !== 'undefined' && typeof THREE.BufferGeometryUtils.mergeVertices === 'function') {
+                    try {
+                        const welded = THREE.BufferGeometryUtils.mergeVertices(geom, 1e-4);
+                        if (welded) {
+                            child.geometry = welded;
+                            geom = welded;
+                        }
+                    } catch(e) {
+                        console.warn('[3D Studio Healer] Vertex weld note:', e);
+                    }
+                }
+
+                // 2. Compute smooth vertex normals
+                try {
+                    geom.computeVertexNormals();
+                } catch(e) {}
+
+                // 3. Ensure double-sided material rendering
+                if (child.material) {
+                    const mats = Array.isArray(child.material) ? child.material : [child.material];
+                    mats.forEach(m => {
+                        m.side = THREE.DoubleSide;
+                        m.shadowSide = THREE.DoubleSide;
+                    });
+                }
+
+                child.castShadow = true;
+                child.receiveShadow = true;
+            }
+        });
+    },
+
+    init() {
+        if (this.isInitialized) return;
+        this.canvasEl = document.getElementById('three-viewport-canvas');
+        if (!this.canvasEl) return;
+        if (typeof THREE === 'undefined') {
+            console.warn('[3D Studio] THREE is not loaded.');
+            return;
+        }
+
+        // Global Three.js compatibility aliases for LLM generated code
+        if (!THREE.CatmullRomCurve && THREE.CatmullRomCurve3) THREE.CatmullRomCurve = THREE.CatmullRomCurve3;
+        if (!THREE.SplineCurve3 && THREE.CatmullRomCurve3) THREE.SplineCurve3 = THREE.CatmullRomCurve3;
+        if (!THREE.CubicBezierCurve && THREE.CubicBezierCurve3) THREE.CubicBezierCurve = THREE.CubicBezierCurve3;
+        if (!THREE.QuadraticBezierCurve && THREE.QuadraticBezierCurve3) THREE.QuadraticBezierCurve = THREE.QuadraticBezierCurve3;
+        if (!THREE.LineCurve && THREE.LineCurve3) THREE.LineCurve = THREE.LineCurve3;
+        if (!THREE.Geometry && THREE.BufferGeometry) THREE.Geometry = THREE.BufferGeometry;
+        if (THREE.BufferGeometry && !THREE.BufferGeometry.prototype.setAttribute && THREE.BufferGeometry.prototype.addAttribute) {
+            THREE.BufferGeometry.prototype.setAttribute = THREE.BufferGeometry.prototype.addAttribute;
+        }
+
+        const wrapper = document.getElementById('three-canvas-wrapper');
+        const width = wrapper ? wrapper.clientWidth : 600;
+        const height = wrapper ? wrapper.clientHeight : 400;
+
+        // Scene
+        this.scene = new THREE.Scene();
+        this.scene.background = new THREE.Color(0x0f1115);
+
+        // Camera
+        this.camera = new THREE.PerspectiveCamera(45, width / (height || 1), 0.1, 1000);
+        this.camera.position.set(4, 4, 6);
+
+        // Renderer
+        this.renderer = new THREE.WebGLRenderer({ canvas: this.canvasEl, antialias: true, alpha: true });
+        this.renderer.setSize(width, height);
+        this.renderer.setPixelRatio(Math.min(window.devicePixelRatio, 2));
+        this.renderer.shadowMap.enabled = true;
+        this.renderer.shadowMap.type = THREE.PCFSoftShadowMap;
+
+        // Lighting
+        const hemiLight = new THREE.HemisphereLight(0xffffff, 0x334155, 0.7);
+        this.scene.add(hemiLight);
+
+        const dirLight = new THREE.DirectionalLight(0xffffff, 0.85);
+        dirLight.position.set(6, 12, 8);
+        dirLight.castShadow = true;
+        dirLight.shadow.mapSize.width = 1024;
+        dirLight.shadow.mapSize.height = 1024;
+        this.scene.add(dirLight);
+
+        const fillLight = new THREE.DirectionalLight(0x60a5fa, 0.35);
+        fillLight.position.set(-6, -4, -6);
+        this.scene.add(fillLight);
+
+        // Ground Grid
+        this.gridHelper = new THREE.GridHelper(20, 20, 0x3b82f6, 0x334155);
+        this.gridHelper.position.y = -0.01;
+        this.scene.add(this.gridHelper);
+
+        // Model Group Container
+        this.modelGroup = new THREE.Group();
+        this.modelGroup.name = 'UserScene';
+        this.scene.add(this.modelGroup);
+
+        // Vertex Handles Group
+        this.vertexHandlesGroup = new THREE.Group();
+        this.vertexHandlesGroup.name = 'VertexHandles';
+        this.scene.add(this.vertexHandlesGroup);
+
+        // OrbitControls
+        if (typeof THREE.OrbitControls !== 'undefined') {
+            this.controls = new THREE.OrbitControls(this.camera, this.renderer.domElement);
+            this.controls.enableDamping = true;
+            this.controls.dampingFactor = 0.05;
+            this.controls.target.set(0, 0, 0);
+        }
+
+        // TransformControls
+        if (typeof THREE.TransformControls !== 'undefined') {
+            this.transformControls = new THREE.TransformControls(this.camera, this.renderer.domElement);
+            this.transformControls.size = 0.75;
+            this.transformControls.addEventListener('dragging-changed', (event) => {
+                if (this.controls) this.controls.enabled = !event.value;
+            });
+            this.transformControls.addEventListener('change', () => {
+                this.syncInspectorFromTransform();
+            });
+            this.scene.add(this.transformControls);
+        }
+
+        // Raycasting for object selection
+        this.raycaster = new THREE.Raycaster();
+        this.mouse = new THREE.Vector2();
+
+        this.canvasEl.addEventListener('pointerdown', (e) => {
+            this.onPointerDown(e);
+        });
+
+        // Window resize
+        window.addEventListener('resize', () => {
+            this.onResize();
+        });
+
+        this.isInitialized = true;
+        this.animate();
+    },
+
+    animate() {
+        requestAnimationFrame(() => this.animate());
+        if (this.controls) this.controls.update();
+        if (this.renderer && this.scene && this.camera) {
+            this.renderer.render(this.scene, this.camera);
+        }
+    },
+
+    onTabActivated() {
+        if (!this.isInitialized) {
+            this.init();
+        }
+        setTimeout(() => this.onResize(), 60);
+    },
+
+    onResize() {
+        const wrapper = document.getElementById('three-canvas-wrapper');
+        if (!wrapper || !this.renderer || !this.camera) return;
+        const width = wrapper.clientWidth;
+        const height = wrapper.clientHeight;
+        if (width <= 0 || height <= 0) return;
+        this.camera.aspect = width / height;
+        this.camera.updateProjectionMatrix();
+        this.renderer.setSize(width, height);
+    },
+
+    onPointerDown(event) {
+        if (this.transformControls && this.transformControls.dragging) return;
+        const rect = this.canvasEl.getBoundingClientRect();
+        this.mouse.x = ((event.clientX - rect.left) / rect.width) * 2 - 1;
+        this.mouse.y = -((event.clientY - rect.top) / rect.height) * 2 + 1;
+
+        this.raycaster.setFromCamera(this.mouse, this.camera);
+
+        // Check vertex handles first if vertex mode is active
+        if (this.vertexMode && this.vertexHandlesGroup.children.length > 0) {
+            const vertexHits = this.raycaster.intersectObjects(this.vertexHandlesGroup.children);
+            if (vertexHits.length > 0) {
+                const handle = vertexHits[0].object;
+                if (this.transformControls) {
+                    this.transformControls.attach(handle);
+                    this.transformControls.setMode('translate');
+                }
+                return;
+            }
+        }
+
+        // Check meshes in modelGroup
+        const intersects = this.raycaster.intersectObjects(this.modelGroup.children, true);
+        if (intersects.length > 0) {
+            let hit = intersects[0].object;
+            while (hit.parent && hit.parent !== this.modelGroup && hit.parent.type === 'Group') {
+                hit = hit.parent;
+            }
+            this.selectObject(hit);
+        } else {
+            // Clicked empty space
+            if (this.transformControls && !this.vertexMode) {
+                this.transformControls.detach();
+            }
+            this.selectedObject = null;
+            this.updateInspectorUI(null);
+            this.highlightOutliner(null);
+        }
+    },
+
+    selectObject(obj) {
+        this.selectedObject = obj;
+        if (this.transformControls) {
+            this.transformControls.attach(obj);
+            const activeTool = document.querySelector('.three-tool-btn.active');
+            const toolId = activeTool ? activeTool.id : '';
+            if (toolId === 'btn-tool-rotate') this.transformControls.setMode('rotate');
+            else if (toolId === 'btn-tool-scale') this.transformControls.setMode('scale');
+            else this.transformControls.setMode('translate');
+        }
+        this.updateInspectorUI(obj);
+        this.highlightOutliner(obj);
+        if (this.vertexMode) {
+            this.rebuildVertexHandles(obj);
+        }
+    },
+
+    setTransformMode(mode) {
+        document.querySelectorAll('.three-toolbar #btn-tool-select, #btn-tool-translate, #btn-tool-rotate, #btn-tool-scale').forEach(b => b.classList.remove('active'));
+        const btn = document.getElementById(`btn-tool-${mode}`);
+        if (btn) btn.classList.add('active');
+
+        if (!this.transformControls) return;
+        if (mode === 'select') {
+            this.transformControls.detach();
+        } else if (this.selectedObject) {
+            this.transformControls.attach(this.selectedObject);
+            this.transformControls.setMode(mode);
+        }
+    },
+
+    toggleVertexMode() {
+        this.vertexMode = !this.vertexMode;
+        const btn = document.getElementById('btn-tool-vertex');
+        if (btn) btn.classList.toggle('active', this.vertexMode);
+
+        if (this.vertexMode) {
+            if (this.selectedObject) {
+                this.rebuildVertexHandles(this.selectedObject);
+            }
+        } else {
+            this.clearVertexHandles();
+            if (this.selectedObject && this.transformControls) {
+                this.transformControls.attach(this.selectedObject);
+            }
+        }
+    },
+
+    rebuildVertexHandles(mesh) {
+        this.clearVertexHandles();
+        if (!mesh || !mesh.geometry) return;
+
+        const geom = mesh.geometry;
+        const posAttr = geom.attributes.position;
+        if (!posAttr) return;
+
+        const handleGeom = new THREE.SphereGeometry(0.06, 8, 8);
+        const handleMat = new THREE.MeshBasicMaterial({ color: 0x38bdf8 });
+
+        const count = Math.min(posAttr.count, 256); // clamp for performance
+        for (let i = 0; i < count; i++) {
+            const v = new THREE.Vector3().fromBufferAttribute(posAttr, i);
+            mesh.localToWorld(v);
+            const handle = new THREE.Mesh(handleGeom, handleMat);
+            handle.position.copy(v);
+            handle.userData = { vertexIndex: i, targetMesh: mesh };
+            this.vertexHandlesGroup.add(handle);
+        }
+    },
+
+    clearVertexHandles() {
+        if (!this.vertexHandlesGroup) return;
+        while (this.vertexHandlesGroup.children.length > 0) {
+            const h = this.vertexHandlesGroup.children.pop();
+            if (h.geometry) h.geometry.dispose();
+        }
+    },
+
+    syncInspectorFromTransform() {
+        if (!this.selectedObject) return;
+
+        // If dragging vertex handle
+        if (this.vertexMode && this.transformControls && this.transformControls.object && this.transformControls.object.userData.targetMesh) {
+            const handle = this.transformControls.object;
+            const mesh = handle.userData.targetMesh;
+            const idx = handle.userData.vertexIndex;
+            const localPos = handle.position.clone();
+            mesh.worldToLocal(localPos);
+            mesh.geometry.attributes.position.setXYZ(idx, localPos.x, localPos.y, localPos.z);
+            mesh.geometry.attributes.position.needsUpdate = true;
+            mesh.geometry.computeVertexNormals();
+            return;
+        }
+
+        const posX = document.getElementById('mesh-pos-x');
+        const posY = document.getElementById('mesh-pos-y');
+        const posZ = document.getElementById('mesh-pos-z');
+        if (posX && posY && posZ) {
+            posX.value = this.selectedObject.position.x.toFixed(2);
+            posY.value = this.selectedObject.position.y.toFixed(2);
+            posZ.value = this.selectedObject.position.z.toFixed(2);
+        }
+    },
+
+    toggleWireframe() {
+        this.wireframeMode = !this.wireframeMode;
+        const btn = document.getElementById('btn-tool-wireframe');
+        if (btn) btn.classList.toggle('active', this.wireframeMode);
+
+        if (this.modelGroup) {
+            this.modelGroup.traverse((child) => {
+                if (child.isMesh && child.material) {
+                    if (Array.isArray(child.material)) {
+                        child.material.forEach(m => m.wireframe = this.wireframeMode);
+                    } else {
+                        child.material.wireframe = this.wireframeMode;
+                    }
+                }
+            });
+        }
+    },
+
+    toggleAutoRotate() {
+        if (!this.controls) return;
+        this.controls.autoRotate = !this.controls.autoRotate;
+        const btn = document.getElementById('btn-tool-autorotate');
+        if (btn) btn.classList.toggle('active', this.controls.autoRotate);
+    },
+
+    toggleGrid() {
+        if (!this.gridHelper) return;
+        this.gridHelper.visible = !this.gridHelper.visible;
+        const btn = document.getElementById('btn-tool-grid');
+        if (btn) btn.classList.toggle('active', this.gridHelper.visible);
+    },
+
+    resetCamera() {
+        if (!this.camera || !this.controls) return;
+        this.camera.position.set(4, 4, 6);
+        this.camera.lookAt(0, 0, 0);
+        this.controls.target.set(0, 0, 0);
+        this.controls.update();
+    },
+
+    updateSelectedPosition() {
+        if (!this.selectedObject) return;
+        const x = parseFloat(document.getElementById('mesh-pos-x')?.value || 0);
+        const y = parseFloat(document.getElementById('mesh-pos-y')?.value || 0);
+        const z = parseFloat(document.getElementById('mesh-pos-z')?.value || 0);
+        this.selectedObject.position.set(x, y, z);
+    },
+
+    updateSelectedMaterial() {
+        if (!this.selectedObject || !this.selectedObject.material) return;
+        const mat = Array.isArray(this.selectedObject.material) ? this.selectedObject.material[0] : this.selectedObject.material;
+        
+        const colorInput = document.getElementById('mesh-color-picker');
+        const colorHex = document.getElementById('mesh-color-hex');
+        if (colorInput && mat.color) {
+            mat.color.set(colorInput.value);
+            if (colorHex) colorHex.textContent = colorInput.value;
+        }
+
+        const emissiveInput = document.getElementById('mesh-emissive-picker');
+        const emissiveHex = document.getElementById('mesh-emissive-hex');
+        if (emissiveInput && mat.emissive) {
+            mat.emissive.set(emissiveInput.value);
+            if (emissiveHex) emissiveHex.textContent = emissiveInput.value;
+        }
+
+        const roughSlider = document.getElementById('mesh-roughness-slider');
+        const roughVal = document.getElementById('mesh-roughness-val');
+        if (roughSlider && 'roughness' in mat) {
+            mat.roughness = parseFloat(roughSlider.value);
+            if (roughVal) roughVal.textContent = parseFloat(roughSlider.value).toFixed(2);
+        }
+
+        const metalSlider = document.getElementById('mesh-metalness-slider');
+        const metalVal = document.getElementById('mesh-metalness-val');
+        if (metalSlider && 'metalness' in mat) {
+            mat.metalness = parseFloat(metalSlider.value);
+            if (metalVal) metalVal.textContent = parseFloat(metalSlider.value).toFixed(2);
+        }
+
+        const opacSlider = document.getElementById('mesh-opacity-slider');
+        const opacVal = document.getElementById('mesh-opacity-val');
+        if (opacSlider) {
+            const opVal = parseFloat(opacSlider.value);
+            mat.opacity = opVal;
+            mat.transparent = opVal < 1.0;
+            if (opacVal) opacVal.textContent = opVal.toFixed(2);
+        }
+
+        const wireToggle = document.getElementById('mesh-wireframe-toggle');
+        if (wireToggle) {
+            mat.wireframe = wireToggle.checked;
+        }
+        mat.needsUpdate = true;
+    },
+
+    changeSelectedMaterialType(newType) {
+        if (!this.selectedObject || !this.selectedObject.material || !THREE[newType]) return;
+        const oldMat = Array.isArray(this.selectedObject.material) ? this.selectedObject.material[0] : this.selectedObject.material;
+        const params = {
+            color: oldMat.color ? oldMat.color.clone() : new THREE.Color(0x3b82f6),
+            map: oldMat.map || null,
+            wireframe: !!oldMat.wireframe,
+            opacity: oldMat.opacity !== undefined ? oldMat.opacity : 1.0,
+            transparent: oldMat.transparent !== undefined ? oldMat.transparent : false
+        };
+        if (newType === 'MeshStandardMaterial' || newType === 'MeshPhysicalMaterial') {
+            params.roughness = oldMat.roughness !== undefined ? oldMat.roughness : 0.5;
+            params.metalness = oldMat.metalness !== undefined ? oldMat.metalness : 0.2;
+        }
+        if (oldMat.emissive) {
+            params.emissive = oldMat.emissive.clone();
+        }
+
+        const newMat = new THREE[newType](params);
+        this.selectedObject.material = newMat;
+        this.updateInspectorUI(this.selectedObject);
+    },
+
+    updateInspectorUI(mesh) {
+        const nameEl = document.getElementById('selected-mesh-name');
+        const posX = document.getElementById('mesh-pos-x');
+        const posY = document.getElementById('mesh-pos-y');
+        const posZ = document.getElementById('mesh-pos-z');
+        const matTypeSelect = document.getElementById('mesh-material-type');
+        const colorInput = document.getElementById('mesh-color-picker');
+        const colorHex = document.getElementById('mesh-color-hex');
+        const emissiveInput = document.getElementById('mesh-emissive-picker');
+        const emissiveHex = document.getElementById('mesh-emissive-hex');
+        const roughSlider = document.getElementById('mesh-roughness-slider');
+        const roughVal = document.getElementById('mesh-roughness-val');
+        const metalSlider = document.getElementById('mesh-metalness-slider');
+        const metalVal = document.getElementById('mesh-metalness-val');
+        const opacSlider = document.getElementById('mesh-opacity-slider');
+        const opacVal = document.getElementById('mesh-opacity-val');
+        const wireToggle = document.getElementById('mesh-wireframe-toggle');
+
+        const btnCrop = document.getElementById('btn-crop-chat-photo');
+        const btnApplyPhoto = document.getElementById('btn-apply-full-photo');
+        const btnCustomTex = document.getElementById('btn-upload-custom-tex');
+        const btnRemoveTex = document.getElementById('btn-remove-tex');
+
+        const previewImg = document.getElementById('texture-preview-img');
+        const placeholder = document.getElementById('no-texture-placeholder');
+        const metaDim = document.getElementById('texture-meta-dim');
+
+        const uvInputs = [
+            document.getElementById('uv-repeat-u'),
+            document.getElementById('uv-repeat-v'),
+            document.getElementById('uv-offset-u'),
+            document.getElementById('uv-offset-v'),
+            document.getElementById('uv-rotation-slider'),
+            document.getElementById('uv-wrap-mode'),
+            document.getElementById('btn-reset-uv')
+        ];
+
+        if (!mesh) {
+            if (nameEl) nameEl.textContent = 'None';
+            [posX, posY, posZ, matTypeSelect, colorInput, emissiveInput, roughSlider, metalSlider, opacSlider, wireToggle, btnCrop, btnApplyPhoto, btnCustomTex, btnRemoveTex, ...uvInputs].forEach(el => {
+                if (el) el.disabled = true;
+            });
+            if (previewImg) previewImg.style.display = 'none';
+            if (placeholder) placeholder.style.display = 'flex';
+            if (metaDim) metaDim.textContent = 'Solid Material';
+            return;
+        }
+
+        [posX, posY, posZ, matTypeSelect, colorInput, emissiveInput, roughSlider, metalSlider, opacSlider, wireToggle, btnCustomTex].forEach(el => {
+            if (el) el.disabled = false;
+        });
+
+        const hasPhoto = !!window.__lastUploadedImage;
+        if (btnCrop) btnCrop.disabled = !hasPhoto;
+        if (btnApplyPhoto) btnApplyPhoto.disabled = !hasPhoto;
+
+        if (nameEl) nameEl.textContent = mesh.name || mesh.type || 'Object';
+        if (posX) posX.value = mesh.position.x.toFixed(2);
+        if (posY) posY.value = mesh.position.y.toFixed(2);
+        if (posZ) posZ.value = mesh.position.z.toFixed(2);
+
+        const mat = Array.isArray(mesh.material) ? mesh.material[0] : mesh.material;
+        if (mat) {
+            if (matTypeSelect) matTypeSelect.value = mat.type || 'MeshStandardMaterial';
+            if (mat.color && colorInput) {
+                const hex = '#' + mat.color.getHexString();
+                colorInput.value = hex;
+                if (colorHex) colorHex.textContent = hex;
+            }
+            if (mat.emissive && emissiveInput) {
+                const hex = '#' + mat.emissive.getHexString();
+                emissiveInput.value = hex;
+                if (emissiveHex) emissiveHex.textContent = hex;
+            }
+            if ('roughness' in mat && roughSlider) {
+                roughSlider.value = mat.roughness;
+                if (roughVal) roughVal.textContent = mat.roughness.toFixed(2);
+                roughSlider.disabled = false;
+            } else if (roughSlider) {
+                roughSlider.disabled = true;
+            }
+            if ('metalness' in mat && metalSlider) {
+                metalSlider.value = mat.metalness;
+                if (metalVal) metalVal.textContent = mat.metalness.toFixed(2);
+                metalSlider.disabled = false;
+            } else if (metalSlider) {
+                metalSlider.disabled = true;
+            }
+            if (opacSlider) {
+                opacSlider.value = mat.opacity !== undefined ? mat.opacity : 1.0;
+                if (opacVal) opacVal.textContent = (mat.opacity !== undefined ? mat.opacity : 1.0).toFixed(2);
+            }
+            if (wireToggle) {
+                wireToggle.checked = !!mat.wireframe;
+            }
+
+            // Texture Map Inspection
+            if (mat.map) {
+                const tex = mat.map;
+                if (btnRemoveTex) btnRemoveTex.disabled = false;
+                uvInputs.forEach(el => { if (el) el.disabled = false; });
+
+                let imgSrc = '';
+                if (tex.image) {
+                    if (tex.image.src) imgSrc = tex.image.src;
+                    else if (tex.image.toDataURL) imgSrc = tex.image.toDataURL();
+                }
+                if (previewImg && imgSrc) {
+                    previewImg.src = imgSrc;
+                    previewImg.style.display = 'block';
+                    if (placeholder) placeholder.style.display = 'none';
+                }
+                if (metaDim) {
+                    const w = tex.image ? (tex.image.naturalWidth || tex.image.width || 512) : 512;
+                    const h = tex.image ? (tex.image.naturalHeight || tex.image.height || 512) : 512;
+                    metaDim.textContent = `${w}x${h} Map`;
+                }
+
+                const repU = document.getElementById('uv-repeat-u');
+                const repV = document.getElementById('uv-repeat-v');
+                if (repU && tex.repeat) repU.value = tex.repeat.x.toFixed(1);
+                if (repV && tex.repeat) repV.value = tex.repeat.y.toFixed(1);
+
+                const offU = document.getElementById('uv-offset-u');
+                const offV = document.getElementById('uv-offset-v');
+                if (offU && tex.offset) offU.value = tex.offset.x.toFixed(2);
+                if (offV && tex.offset) offV.value = tex.offset.y.toFixed(2);
+
+                const rotSlider = document.getElementById('uv-rotation-slider');
+                const rotVal = document.getElementById('uv-rotation-val');
+                const deg = Math.round(((tex.rotation || 0) * (180 / Math.PI)) % 360);
+                const posDeg = deg >= 0 ? deg : deg + 360;
+                if (rotSlider) rotSlider.value = posDeg;
+                if (rotVal) rotVal.textContent = `${posDeg}°`;
+
+                const wrapSelect = document.getElementById('uv-wrap-mode');
+                if (wrapSelect) {
+                    if (tex.wrapS === THREE.ClampToEdgeWrapping) wrapSelect.value = 'ClampToEdgeWrapping';
+                    else if (tex.wrapS === THREE.MirroredRepeatWrapping) wrapSelect.value = 'MirroredRepeatWrapping';
+                    else wrapSelect.value = 'RepeatWrapping';
+                }
+            } else {
+                if (btnRemoveTex) btnRemoveTex.disabled = true;
+                uvInputs.forEach(el => { if (el) el.disabled = true; });
+                if (previewImg) previewImg.style.display = 'none';
+                if (placeholder) placeholder.style.display = 'flex';
+                if (metaDim) metaDim.textContent = 'Solid Material';
+            }
+        }
+    },
+
+    updateUVMapping() {
+        if (!this.selectedObject || !this.selectedObject.material) return;
+        const mat = Array.isArray(this.selectedObject.material) ? this.selectedObject.material[0] : this.selectedObject.material;
+        if (!mat.map) return;
+        const tex = mat.map;
+
+        const repU = parseFloat(document.getElementById('uv-repeat-u')?.value || 1.0);
+        const repV = parseFloat(document.getElementById('uv-repeat-v')?.value || 1.0);
+        tex.repeat.set(repU, repV);
+
+        const offU = parseFloat(document.getElementById('uv-offset-u')?.value || 0.0);
+        const offV = parseFloat(document.getElementById('uv-offset-v')?.value || 0.0);
+        tex.offset.set(offU, offV);
+
+        const rotDeg = parseFloat(document.getElementById('uv-rotation-slider')?.value || 0);
+        const rotVal = document.getElementById('uv-rotation-val');
+        if (rotVal) rotVal.textContent = `${rotDeg}°`;
+        tex.center.set(0.5, 0.5);
+        tex.rotation = rotDeg * (Math.PI / 180);
+
+        const wrapMode = document.getElementById('uv-wrap-mode')?.value || 'RepeatWrapping';
+        tex.wrapS = THREE[wrapMode] || THREE.RepeatWrapping;
+        tex.wrapT = THREE[wrapMode] || THREE.RepeatWrapping;
+        tex.needsUpdate = true;
+    },
+
+    setUVRepeatPreset(u, v) {
+        const inputU = document.getElementById('uv-repeat-u');
+        const inputV = document.getElementById('uv-repeat-v');
+        if (inputU) inputU.value = u;
+        if (inputV) inputV.value = v;
+        this.updateUVMapping();
+    },
+
+    resetUVMapping() {
+        const inputU = document.getElementById('uv-repeat-u');
+        const inputV = document.getElementById('uv-repeat-v');
+        const offU = document.getElementById('uv-offset-u');
+        const offV = document.getElementById('uv-offset-v');
+        const rotSlider = document.getElementById('uv-rotation-slider');
+        const wrapSelect = document.getElementById('uv-wrap-mode');
+        if (inputU) inputU.value = 1.0;
+        if (inputV) inputV.value = 1.0;
+        if (offU) offU.value = 0.0;
+        if (offV) offV.value = 0.0;
+        if (rotSlider) rotSlider.value = 0;
+        if (wrapSelect) wrapSelect.value = 'RepeatWrapping';
+        this.updateUVMapping();
+    },
+
+    applyTextureToSelected(url) {
+        if (!this.selectedObject || !this.selectedObject.material) return;
+        const mat = Array.isArray(this.selectedObject.material) ? this.selectedObject.material[0] : this.selectedObject.material;
+        const loader = new THREE.TextureLoader();
+        loader.load(url, (texture) => {
+            texture.wrapS = THREE.RepeatWrapping;
+            texture.wrapT = THREE.RepeatWrapping;
+            texture.repeat.set(1, 1);
+            texture.center.set(0.5, 0.5);
+            if (mat.map) mat.map.dispose();
+            mat.map = texture;
+            mat.needsUpdate = true;
+            this.updateInspectorUI(this.selectedObject);
+        });
+    },
+
+    applyChatPhotoToSelected() {
+        const photo = getLastUploadedPhoto();
+        if (!this.selectedObject || !photo) return;
+        this.applyTextureToSelected(photo);
+    },
+
+    handleCustomTextureUpload(input) {
+        if (!input.files || !input.files[0] || !this.selectedObject) return;
+        const file = input.files[0];
+        const reader = new FileReader();
+        reader.onload = (e) => {
+            this.applyTextureToSelected(e.target.result);
+        };
+        reader.readAsDataURL(file);
+        input.value = '';
+    },
+
+    removeTextureFromSelected() {
+        if (!this.selectedObject || !this.selectedObject.material) return;
+        const mat = Array.isArray(this.selectedObject.material) ? this.selectedObject.material[0] : this.selectedObject.material;
+        if (mat.map) {
+            mat.map.dispose();
+            mat.map = null;
+            mat.needsUpdate = true;
+        }
+        this.updateInspectorUI(this.selectedObject);
+    },
+
+    updatePhotoTextureButtons() {
+        const hasPhoto = !!getLastUploadedPhoto();
+        const hasMesh = !!this.selectedObject;
+        const btnCrop = document.getElementById('btn-crop-chat-photo');
+        const btnApply = document.getElementById('btn-apply-full-photo');
+        if (btnCrop) btnCrop.disabled = !(hasPhoto && hasMesh);
+        if (btnApply) btnApply.disabled = !(hasPhoto && hasMesh);
+    },
+
+    /* Photo Texture Cropper State & Methods */
+    cropper: {
+        img: null,
+        cropX: 0,
+        cropY: 0,
+        cropW: 100,
+        cropH: 100,
+        ratio: 'free',
+        scale: 1,
+        isDragging: false,
+        dragMode: null,
+        startX: 0,
+        startY: 0,
+        origX: 0,
+        origY: 0,
+        origW: 0,
+        origH: 0
+    },
+
+    openPhotoCropper() {
+        const photo = getLastUploadedPhoto();
+        if (!photo) {
+            alert('No photo was attached or uploaded in chat yet.');
+            return;
+        }
+        if (!this.selectedObject) {
+            alert('Please select a 3D mesh first to apply the cropped texture.');
+            return;
+        }
+        const modal = document.getElementById('photo-texture-crop-modal');
+        if (modal) modal.style.display = 'flex';
+
+        const canvas = document.getElementById('photo-crop-canvas');
+        const img = new Image();
+        img.onload = () => {
+            this.cropper.img = img;
+            const maxW = Math.min(620, window.innerWidth * 0.85);
+            const maxH = Math.min(380, window.innerHeight * 0.5);
+            const scaleW = maxW / img.naturalWidth;
+            const scaleH = maxH / img.naturalHeight;
+            const scale = Math.min(scaleW, scaleH, 1.0);
+            this.cropper.scale = scale;
+
+            canvas.width = Math.round(img.naturalWidth * scale);
+            canvas.height = Math.round(img.naturalHeight * scale);
+
+            const initW = Math.round(canvas.width * 0.6);
+            const initH = this.cropper.ratio === '1:1' ? initW : Math.round(canvas.height * 0.6);
+            this.cropper.cropW = Math.min(initW, canvas.width);
+            this.cropper.cropH = Math.min(initH, canvas.height);
+            this.cropper.cropX = Math.round((canvas.width - this.cropper.cropW) / 2);
+            this.cropper.cropY = Math.round((canvas.height - this.cropper.cropH) / 2);
+
+            this.setupCropCanvasListeners(canvas);
+            this.renderCropCanvas();
+        };
+        img.src = window.__lastUploadedImage;
+    },
+
+    setupCropCanvasListeners(canvas) {
+        if (canvas._hasCropListeners) return;
+        canvas._hasCropListeners = true;
+
+        const getPos = (e) => {
+            const rect = canvas.getBoundingClientRect();
+            return {
+                x: (e.clientX - rect.left) * (canvas.width / rect.width),
+                y: (e.clientY - rect.top) * (canvas.height / rect.height)
+            };
+        };
+
+        const getHandle = (x, y) => {
+            const { cropX, cropY, cropW, cropH } = this.cropper;
+            const pad = 16;
+            if (Math.hypot(x - cropX, y - cropY) < pad) return 'nw';
+            if (Math.hypot(x - (cropX + cropW), y - cropY) < pad) return 'ne';
+            if (Math.hypot(x - (cropX + cropW), y - (cropY + cropH)) < pad) return 'se';
+            if (Math.hypot(x - cropX, y - (cropY + cropH)) < pad) return 'sw';
+            if (x >= cropX && x <= cropX + cropW && y >= cropY && y <= cropY + cropH) return 'move';
+            return null;
+        };
+
+        canvas.addEventListener('pointerdown', (e) => {
+            const pos = getPos(e);
+            const handle = getHandle(pos.x, pos.y);
+            if (!handle) return;
+            canvas.setPointerCapture(e.pointerId);
+            this.cropper.isDragging = true;
+            this.cropper.dragMode = handle;
+            this.cropper.startX = pos.x;
+            this.cropper.startY = pos.y;
+            this.cropper.origX = this.cropper.cropX;
+            this.cropper.origY = this.cropper.cropY;
+            this.cropper.origW = this.cropper.cropW;
+            this.cropper.origH = this.cropper.cropH;
+        });
+
+        canvas.addEventListener('pointermove', (e) => {
+            const pos = getPos(e);
+            if (!this.cropper.isDragging) {
+                const handle = getHandle(pos.x, pos.y);
+                if (handle === 'nw' || handle === 'se') canvas.style.cursor = 'nwse-resize';
+                else if (handle === 'ne' || handle === 'sw') canvas.style.cursor = 'nesw-resize';
+                else if (handle === 'move') canvas.style.cursor = 'move';
+                else canvas.style.cursor = 'crosshair';
+                return;
+            }
+
+            const dx = pos.x - this.cropper.startX;
+            const dy = pos.y - this.cropper.startY;
+            let { origX, origY, origW, origH, dragMode, ratio } = this.cropper;
+
+            if (dragMode === 'move') {
+                this.cropper.cropX = Math.max(0, Math.min(canvas.width - origW, origX + dx));
+                this.cropper.cropY = Math.max(0, Math.min(canvas.height - origH, origY + dy));
+            } else if (dragMode === 'se') {
+                let newW = Math.max(24, Math.min(canvas.width - origX, origW + dx));
+                let newH = Math.max(24, Math.min(canvas.height - origY, origH + dy));
+                if (ratio === '1:1') newH = newW = Math.min(newW, newH);
+                else if (ratio === '2:1') newH = Math.round(newW / 2);
+                else if (ratio === '1:2') newW = Math.round(newH / 2);
+                this.cropper.cropW = newW;
+                this.cropper.cropH = newH;
+            } else if (dragMode === 'nw') {
+                let newX = Math.max(0, Math.min(origX + origW - 24, origX + dx));
+                let newY = Math.max(0, Math.min(origY + origH - 24, origY + dy));
+                this.cropper.cropW = origX + origW - newX;
+                this.cropper.cropH = origY + origH - newY;
+                if (ratio === '1:1') this.cropper.cropH = this.cropper.cropW;
+                this.cropper.cropX = newX;
+                this.cropper.cropY = newY;
+            }
+            this.renderCropCanvas();
+        });
+
+        const stopDrag = (e) => {
+            if (this.cropper.isDragging) {
+                this.cropper.isDragging = false;
+                this.cropper.dragMode = null;
+                try { canvas.releasePointerCapture(e.pointerId); } catch(ex) {}
+                this.renderCropCanvas();
+            }
+        };
+        canvas.addEventListener('pointerup', stopDrag);
+        canvas.addEventListener('pointercancel', stopDrag);
+    },
+
+    renderCropCanvas() {
+        const canvas = document.getElementById('photo-crop-canvas');
+        if (!canvas || !this.cropper.img) return;
+        const ctx = canvas.getContext('2d');
+        const { cropX, cropY, cropW, cropH } = this.cropper;
+
+        ctx.clearRect(0, 0, canvas.width, canvas.height);
+        ctx.drawImage(this.cropper.img, 0, 0, canvas.width, canvas.height);
+
+        // Dark dim overlay outside crop area
+        ctx.fillStyle = 'rgba(0, 0, 0, 0.6)';
+        ctx.fillRect(0, 0, canvas.width, cropY);
+        ctx.fillRect(0, cropY, cropX, cropH);
+        ctx.fillRect(cropX + cropW, cropY, canvas.width - (cropX + cropW), cropH);
+        ctx.fillRect(0, cropY + cropH, canvas.width, canvas.height - (cropY + cropH));
+
+        // Crop rect outline
+        ctx.strokeStyle = '#38bdf8';
+        ctx.lineWidth = 2;
+        ctx.setLineDash([4, 4]);
+        ctx.strokeRect(cropX, cropY, cropW, cropH);
+        ctx.setLineDash([]);
+
+        // Corner handles
+        const handleSize = 8;
+        ctx.fillStyle = '#ffffff';
+        ctx.strokeStyle = '#0284c7';
+        ctx.lineWidth = 2;
+        const corners = [
+            [cropX, cropY],
+            [cropX + cropW, cropY],
+            [cropX + cropW, cropY + cropH],
+            [cropX, cropY + cropH]
+        ];
+        corners.forEach(([cx, cy]) => {
+            ctx.fillRect(cx - handleSize / 2, cy - handleSize / 2, handleSize, handleSize);
+            ctx.strokeRect(cx - handleSize / 2, cy - handleSize / 2, handleSize, handleSize);
+        });
+    },
+
+    setCropRatio(ratio, btn) {
+        this.cropper.ratio = ratio;
+        document.querySelectorAll('.crop-ratio-btn').forEach(b => b.classList.remove('active'));
+        if (btn) btn.classList.add('active');
+
+        const canvas = document.getElementById('photo-crop-canvas');
+        if (!canvas) return;
+        let { cropX, cropY, cropW } = this.cropper;
+        if (ratio === '1:1') {
+            this.cropper.cropH = Math.min(cropW, canvas.height - cropY);
+            this.cropper.cropW = this.cropper.cropH;
+        } else if (ratio === '2:1') {
+            this.cropper.cropH = Math.min(Math.round(cropW / 2), canvas.height - cropY);
+        } else if (ratio === '1:2') {
+            this.cropper.cropW = Math.min(Math.round(this.cropper.cropH / 2), canvas.width - cropX);
+        }
+        this.renderCropCanvas();
+    },
+
+    resetCropToFull() {
+        const canvas = document.getElementById('photo-crop-canvas');
+        if (!canvas) return;
+        this.cropper.cropX = 0;
+        this.cropper.cropY = 0;
+        this.cropper.cropW = canvas.width;
+        this.cropper.cropH = canvas.height;
+        this.renderCropCanvas();
+    },
+
+    closePhotoCropper() {
+        const modal = document.getElementById('photo-texture-crop-modal');
+        if (modal) modal.style.display = 'none';
+    },
+
+    applyCroppedTexture() {
+        if (!this.selectedObject || !this.cropper.img) return;
+        const scale = this.cropper.scale || 1.0;
+        const sx = Math.max(0, Math.round(this.cropper.cropX / scale));
+        const sy = Math.max(0, Math.round(this.cropper.cropY / scale));
+        const sw = Math.min(this.cropper.img.naturalWidth - sx, Math.round(this.cropper.cropW / scale));
+        const sh = Math.min(this.cropper.img.naturalHeight - sy, Math.round(this.cropper.cropH / scale));
+
+        if (sw <= 0 || sh <= 0) return;
+
+        const offCanvas = document.createElement('canvas');
+        offCanvas.width = sw;
+        offCanvas.height = sh;
+        const offCtx = offCanvas.getContext('2d');
+        offCtx.drawImage(this.cropper.img, sx, sy, sw, sh, 0, 0, sw, sh);
+
+        const tex = new THREE.CanvasTexture(offCanvas);
+        tex.wrapS = THREE.RepeatWrapping;
+        tex.wrapT = THREE.RepeatWrapping;
+        tex.repeat.set(1, 1);
+        tex.center.set(0.5, 0.5);
+
+        const mat = Array.isArray(this.selectedObject.material) ? this.selectedObject.material[0] : this.selectedObject.material;
+        if (mat.map) mat.map.dispose();
+        mat.map = tex;
+        mat.needsUpdate = true;
+
+        this.closePhotoCropper();
+        this.updateInspectorUI(this.selectedObject);
+    },
+
+    updateOutliner() {
+        const outliner = document.getElementById('outliner-tree');
+        if (!outliner || !this.modelGroup) return;
+
+        outliner.innerHTML = '';
+        const meshes = [];
+        this.modelGroup.traverse((child) => {
+            if (child.isMesh) meshes.push(child);
+        });
+
+        if (meshes.length === 0) {
+            outliner.innerHTML = '<div class="outliner-empty">No objects in scene</div>';
+            return;
+        }
+
+        meshes.forEach((m, idx) => {
+            if (!m.name) m.name = `Mesh_${idx + 1}`;
+            const item = document.createElement('div');
+            item.className = 'outliner-item' + (this.selectedObject === m ? ' selected' : '');
+            item.dataset.uuid = m.uuid;
+            item.innerHTML = `
+                <span class="material-symbols-outlined">deployed_code</span>
+                <span>${escapeHtml(m.name)}</span>
+            `;
+            item.addEventListener('click', () => {
+                this.selectObject(m);
+            });
+            outliner.appendChild(item);
+        });
+    },
+
+    highlightOutliner(mesh) {
+        document.querySelectorAll('.outliner-item').forEach(el => {
+            el.classList.toggle('selected', mesh && el.dataset.uuid === mesh.uuid);
+        });
+    },
+
+    toggleInspector() {
+        const drawer = document.getElementById('three-inspector-drawer');
+        if (drawer) drawer.classList.toggle('collapsed');
+    },
+
+    isModelGroupEmpty() {
+        return !this.modelGroup || this.modelGroup.children.length === 0;
+    },
+
+    openCodeEditor() {
+        if (this.currentCode && previewCodeEditor) {
+            previewCodeEditor.value = this.currentCode;
+            updateEditorLineNumbers();
+        }
+        switchPreviewTab('tab-code');
+    },
+
+    sanitizeModuleCode(code) {
+        if (!code) return '';
+        let result = code;
+
+        // 1. Remove side-effect imports: import "something"; or import 'something';
+        result = result.replace(/^[\t ]*import\s+['"][^'"]+['"];?/gm, '// [studio side-effect import removed]');
+
+        // 2. Transform mixed default and named imports: import THREE, { OrbitControls } from "..."
+        result = result.replace(/^[\t ]*import\s+([a-zA-Z0-9_$]+)\s*,\s*\{([\s\S]*?)\}\s*from\s*['"][^'"]+['"];?/gm, (match, defaultName, namedList) => {
+            let defCode = '';
+            if (defaultName === 'THREE') {
+                defCode = '// [studio THREE mixed import]\n';
+            } else {
+                defCode = `const ${defaultName} = (typeof ${defaultName} !== "undefined" ? ${defaultName} : ((typeof THREE !== "undefined" && THREE.${defaultName}) || (typeof window !== "undefined" && window.${defaultName}) || __studioThree || {}));\n`;
+            }
+            const parts = namedList.split(',').map(s => s.trim()).filter(Boolean);
+            const mapped = [];
+            for (const part of parts) {
+                const m = part.match(/^([a-zA-Z0-9_$]+)(?:\s+as\s+([a-zA-Z0-9_$]+))?$/);
+                if (m) {
+                    const orig = m[1];
+                    const alias = m[2] || orig;
+                    mapped.push(`${orig}: ${alias}`);
+                }
+            }
+            const namedCode = mapped.length > 0
+                ? `const { ${mapped.join(', ')} } = (typeof THREE !== "undefined" ? THREE : __studioThree);\n`
+                : '';
+            return defCode + namedCode;
+        });
+
+        // 3. Transform namespace imports: import * as Foo from "..."
+        result = result.replace(/^[\t ]*import\s+\*\s+as\s+([a-zA-Z0-9_$]+)\s+from\s+['"][^'"]+['"];?/gm, (match, p1) => {
+            if (p1 === 'THREE') return '// [studio THREE namespace import]';
+            return `const ${p1} = (typeof ${p1} !== "undefined" ? ${p1} : ((typeof THREE !== "undefined" && THREE.${p1}) || (typeof window !== "undefined" && window.${p1}) || __studioThree || {}));`;
+        });
+
+        // 4. Transform default imports: import Foo from "..."
+        result = result.replace(/^[\t ]*import\s+([a-zA-Z0-9_$]+)\s+from\s+['"][^'"]+['"];?/gm, (match, p1) => {
+            if (p1 === 'THREE') return '// [studio THREE default import]';
+            return `const ${p1} = (typeof ${p1} !== "undefined" ? ${p1} : ((typeof THREE !== "undefined" && THREE.${p1}) || (typeof window !== "undefined" && window.${p1}) || __studioThree || {}));`;
+        });
+
+        // 5. Transform named imports: import { A, B as C } from "..." (single or multi-line)
+        result = result.replace(/^[\t ]*import\s*\{([\s\S]*?)\}\s*from\s*['"][^'"]+['"];?/gm, (match, names) => {
+            const parts = names.split(',').map(s => s.trim()).filter(Boolean);
+            const mapped = [];
+            for (const part of parts) {
+                const m = part.match(/^([a-zA-Z0-9_$]+)(?:\s+as\s+([a-zA-Z0-9_$]+))?$/);
+                if (m) {
+                    const orig = m[1];
+                    const alias = m[2] || orig;
+                    mapped.push(`${orig}: ${alias}`);
+                }
+            }
+            if (mapped.length === 0) return '// [studio empty import]';
+            return `const { ${mapped.join(', ')} } = (typeof THREE !== "undefined" ? THREE : __studioThree);`;
+        });
+
+        // 6. Transform export default
+        result = result.replace(/^[\t ]*export\s+default\s+function\s*\(/gm, 'function createModel(');
+        result = result.replace(/^[\t ]*export\s+default\s+function\s+([a-zA-Z0-9_$]+)/gm, (match, fnName) => {
+            return `function ${fnName}`;
+        });
+        result = result.replace(/^[\t ]*export\s+default\s+class\s+([a-zA-Z0-9_$]+)?/gm, (match, clsName) => {
+            return clsName ? `class ${clsName}` : 'const __studioExportedClass = class';
+        });
+        result = result.replace(/^[\t ]*export\s+default\s+([a-zA-Z0-9_$]+);?/gm, (match, name) => {
+            return `if (typeof createModel === "undefined" && typeof ${name} === "function") { var createModel = ${name}; }`;
+        });
+        result = result.replace(/^[\t ]*export\s+default\s+/gm, '// [studio export default removed] ');
+
+        // 7. Transform named exports
+        result = result.replace(/^[\t ]*export\s+(?:async\s+)?function\s+/gm, 'function ');
+        result = result.replace(/^[\t ]*export\s+class\s+/gm, 'class ');
+        result = result.replace(/^[\t ]*export\s+(?:const|let|var)\s+/gm, (match) => match.replace('export', '').trim() + ' ');
+        result = result.replace(/^[\t ]*export\s*\{[\s\S]*?\};?/gm, '// [studio removed export]');
+
+        return result;
+    },
+
+    extractModelCode(code) {
+        if (!code) return '';
+        let cleaned = code.trim();
+
+        // If markdown code block exists, strip fences
+        cleaned = cleaned.replace(/^```[a-zA-Z0-9_-]*\n?/, '').replace(/\n?```$/, '').trim();
+
+        // If it's a full HTML document or contains <script> tags, extract the Three.js script body
+        if (cleaned.includes('<script') || cleaned.includes('<!DOCTYPE') || cleaned.includes('<html')) {
+            const scriptMatches = cleaned.match(/<script\b[^>]*>([\s\S]*?)<\/script>/gi);
+            if (scriptMatches && scriptMatches.length > 0) {
+                let candidate = '';
+                for (const sm of scriptMatches) {
+                    const inner = sm.replace(/<script\b[^>]*>/i, '').replace(/<\/script>/i, '').trim();
+                    if (inner.includes('THREE') || inner.includes('createModel') || inner.includes('scene.add') || inner.includes('from \'three\'') || inner.includes('from "three"')) {
+                        candidate += '\n' + inner;
+                    }
+                }
+                if (candidate.trim().length > 0) {
+                    cleaned = candidate.trim();
+                }
+            }
+        }
+
+        // Sanitize ES module import/export statements
+        cleaned = this.sanitizeModuleCode(cleaned);
+
+        // Auto-balance unclosed functions, braces, and repair truncated statements
+        cleaned = this.balanceAndRepairCode(cleaned);
+
+        return cleaned;
+    },
+
+    /**
+     * Balances unclosed braces, brackets, and parentheses in generated JavaScript code.
+     * Also detects and repairs unclosed strings/template literals and truncated trailing lines.
+     */
+    balanceAndRepairCode(code) {
+        if (!code || typeof code !== 'string') return '';
+        const cleaned = code.trim();
+
+        function tryBalance(source) {
+            let inSingle = false;
+            let inDouble = false;
+            let inTemplate = false;
+            let inLineComment = false;
+            let inBlockComment = false;
+            const stack = [];
+
+            for (let i = 0; i < source.length; i++) {
+                const c = source[i];
+                const next = source[i + 1] || '';
+
+                if (inLineComment) {
+                    if (c === '\n') inLineComment = false;
+                    continue;
+                }
+                if (inBlockComment) {
+                    if (c === '*' && next === '/') {
+                        inBlockComment = false;
+                        i++;
+                    }
+                    continue;
+                }
+
+                // Count preceding backslashes to check if quote is escaped
+                let backslashCount = 0;
+                for (let j = i - 1; j >= 0 && source[j] === '\\'; j--) {
+                    backslashCount++;
+                }
+                const isEscaped = (backslashCount % 2 === 1);
+
+                if (inSingle) {
+                    if (c === '\'' && !isEscaped) inSingle = false;
+                    continue;
+                }
+                if (inDouble) {
+                    if (c === '"' && !isEscaped) inDouble = false;
+                    continue;
+                }
+                if (inTemplate) {
+                    if (c === '`' && !isEscaped) inTemplate = false;
+                    continue;
+                }
+
+                // Comment starts
+                if (c === '/' && next === '/') {
+                    inLineComment = true;
+                    i++;
+                    continue;
+                }
+                if (c === '/' && next === '*') {
+                    inBlockComment = true;
+                    i++;
+                    continue;
+                }
+
+                // String starts
+                if (c === '\'') { inSingle = true; continue; }
+                if (c === '"') { inDouble = true; continue; }
+                if (c === '`') { inTemplate = true; continue; }
+
+                if (c === '{' || c === '(' || c === '[') {
+                    stack.push(c);
+                } else if (c === '}') {
+                    if (stack.length > 0 && stack[stack.length - 1] === '{') stack.pop();
+                } else if (c === ')') {
+                    if (stack.length > 0 && stack[stack.length - 1] === '(') stack.pop();
+                } else if (c === ']') {
+                    if (stack.length > 0 && stack[stack.length - 1] === '[') stack.pop();
+                }
+            }
+
+            let completion = '';
+            if (inSingle) completion += '\'';
+            if (inDouble) completion += '"';
+            if (inTemplate) completion += '`';
+
+            while (stack.length > 0) {
+                const open = stack.pop();
+                if (open === '{') completion += '\n}';
+                else if (open === '[') completion += ']';
+                else if (open === '(') completion += ')';
+            }
+
+            return source + completion;
+        }
+
+        function testParses(src) {
+            try {
+                new Function('scene', 'THREE', 'inputImage', 'helpers', src);
+                return true;
+            } catch (e) {
+                return false;
+            }
+        }
+
+        // 1. Direct bracket balancing
+        const candidate = tryBalance(cleaned);
+        if (testParses(candidate)) {
+            return candidate;
+        }
+
+        // 2. Truncation recovery: if the snippet was cut off mid-statement, peel back incomplete trailing lines
+        const lines = cleaned.split('\n');
+        for (let removeCount = 1; removeCount <= Math.min(10, lines.length - 1); removeCount++) {
+            const truncatedLines = lines.slice(0, lines.length - removeCount);
+            const truncatedCandidate = tryBalance(truncatedLines.join('\n'));
+            if (testParses(truncatedCandidate)) {
+                console.log(`[3D Studio] Recovered truncated code by trimming ${removeCount} trailing unparsed line(s).`);
+                return truncatedCandidate;
+            }
+        }
+
+        return candidate;
+    },
+
+    loadModelCode(code) {
+        this.init();
+        if (!this.modelGroup) return;
+
+        this.currentCode = code || '';
+
+        // Clean model group
+        while (this.modelGroup.children.length > 0) {
+            const obj = this.modelGroup.children.pop();
+            if (obj.geometry) obj.geometry.dispose();
+        }
+        this.clearVertexHandles();
+        this.clearErrorNotification();
+
+        const cleaned = this.extractModelCode(code);
+        if (!cleaned) return;
+
+        const targetGroup = this.modelGroup;
+
+        // Create proxy around THREE to intercept scene creation and renderer
+        const ThreeProxy = new Proxy(THREE, {
+            get(target, prop, receiver) {
+                if (prop === 'Scene') {
+                    return function() {
+                        const grp = new THREE.Group();
+                        targetGroup.add(grp);
+                        return grp;
+                    };
+                }
+                if (prop === 'WebGLRenderer') {
+                    return function() {
+                        return {
+                            setSize: () => {},
+                            render: () => {},
+                            setPixelRatio: () => {},
+                            shadowMap: {},
+                            domElement: document.createElement('div')
+                        };
+                    };
+                }
+                // Common LLM curve/geometry naming fallbacks
+                if (prop === 'CatmullRomCurve' && target.CatmullRomCurve3) return target.CatmullRomCurve3;
+                if (prop === 'SplineCurve3' && target.CatmullRomCurve3) return target.CatmullRomCurve3;
+                if (prop === 'CubicBezierCurve' && target.CubicBezierCurve3) return target.CubicBezierCurve3;
+                if (prop === 'QuadraticBezierCurve' && target.QuadraticBezierCurve3) return target.QuadraticBezierCurve3;
+                if (prop === 'LineCurve' && target.LineCurve3) return target.LineCurve3;
+                if (prop === 'Geometry' && target.BufferGeometry) return target.BufferGeometry;
+
+                // Auto-close open Lathe profiles to prevent holes
+                if (prop === 'LatheGeometry' || prop === 'LatheBufferGeometry') {
+                    return function(points, segments, phiStart, phiLength) {
+                        if (Array.isArray(points) && points.length > 1) {
+                            return ThreeStudio.helpers.createWatertightLathe(points, segments, phiStart, phiLength);
+                        }
+                        const ctor = target.LatheBufferGeometry || target.LatheGeometry;
+                        return new ctor(points, segments, phiStart, phiLength);
+                    };
+                }
+
+                // In Three.js r128, automatically route legacy Geometry constructors to modern BufferGeometry constructors
+                if (typeof prop === 'string' && prop.endsWith('Geometry') && !prop.includes('Buffer')) {
+                    const bufProp = prop.replace('Geometry', 'BufferGeometry');
+                    if (typeof target[bufProp] === 'function') {
+                        return target[bufProp];
+                    }
+                }
+
+                if (prop === 'helpers') return ThreeStudio.helpers;
+                if (prop === 'BufferGeometryUtils') {
+                    return target.BufferGeometryUtils || (typeof window !== 'undefined' && window.THREE?.BufferGeometryUtils) || null;
+                }
+
+                return Reflect.get(target, prop, receiver);
+            }
+        });
+
+        // Dummy environment preventing HTML scripts from polluting the DOM or hanging
+        const dummyElement = document.createElement('div');
+        const fakeDoc = {
+            body: {
+                appendChild: () => {},
+                style: {}
+            },
+            createElement: (tag) => document.createElement(tag),
+            getElementById: (id) => dummyElement,
+            querySelector: (sel) => dummyElement,
+            querySelectorAll: (sel) => [],
+            addEventListener: () => {},
+            removeEventListener: () => {}
+        };
+        const fakeWin = {
+            innerWidth: 600,
+            innerHeight: 400,
+            addEventListener: () => {},
+            removeEventListener: () => {}
+        };
+        const fakeRaf = (cb) => {
+            try { cb(0); } catch(e) {}
+            return 1;
+        };
+
+        const hasThreeDecl = /(?:const|let|var)\s+THREE\b/.test(cleaned);
+        const threeInjection = hasThreeDecl ? '' : 'let THREE = __studioThree;\n';
+
+        const hasSceneDecl = /(?:const|let|var)\s+scene\b/.test(cleaned);
+        const sceneInjection = hasSceneDecl ? '' : 'let scene = __studioScene;\n';
+
+        const hasInputImageDecl = /(?:const|let|var)\s+inputImage\b/.test(cleaned);
+        const inputImageInjection = hasInputImageDecl ? '' : 'let inputImage = __studioInputImage;\n';
+
+        const hasHelpersDecl = /(?:const|let|var)\s+helpers\b/.test(cleaned);
+        const helpersInjection = hasHelpersDecl ? '' : 'let helpers = __studioHelpers;\n';
+
+        const inputPhoto = typeof getLastUploadedPhoto === 'function' ? getLastUploadedPhoto() : (window.__lastUploadedImage || '');
+
+        try {
+            const runner = new Function(
+                '__studioScene', '__studioThree', '__studioInputImage', '__studioHelpers', 'document', 'window', 'requestAnimationFrame',
+                `
+                try {
+                    ${threeInjection}
+                    ${sceneInjection}
+                    ${inputImageInjection}
+                    ${helpersInjection}
+                    ${cleaned}
+                    let res = null;
+                    if (typeof createModel === 'function') {
+                        res = createModel(__studioScene, THREE, __studioInputImage, __studioHelpers);
+                    } else if (typeof createScene === 'function') {
+                        res = createScene(__studioScene, THREE, __studioInputImage, __studioHelpers);
+                    } else if (typeof initModel === 'function') {
+                        res = initModel(__studioScene, THREE, __studioInputImage, __studioHelpers);
+                    }
+                    if (Array.isArray(res)) {
+                        for (const item of res) {
+                            if (item && item.isObject3D && !__studioScene.children.includes(item)) {
+                                __studioScene.add(item);
+                            }
+                        }
+                    } else if (res && res.isObject3D && !__studioScene.children.includes(res)) {
+                        __studioScene.add(res);
+                    }
+                } catch(e) {
+                    console.error('[3D Studio Runtime Error]', e);
+                    if (typeof ThreeStudio !== 'undefined' && ThreeStudio.showErrorNotification) {
+                        ThreeStudio.showErrorNotification('3D Runtime Error: ' + (e.message || e));
+                    }
+                }
+                `
+            );
+            runner(targetGroup, ThreeProxy, inputPhoto, this.helpers, fakeDoc, fakeWin, fakeRaf);
+        } catch (err) {
+            console.error('[3D Studio Compilation Error]', err);
+            this.showErrorNotification(`3D Code Syntax Error: ${err.message}`);
+            return;
+        }
+
+        if (this.modelGroup.children.length === 0) {
+            this.showErrorNotification('Notice: 3D model script executed, but no objects were added to the scene.');
+        } else {
+            this.clearErrorNotification();
+        }
+
+        // Apply automatic geometry healing: weld duplicate vertices, cap open tubes, compute smooth normals, double-side
+        this.postProcessModelGeometries(this.modelGroup);
+
+        // Center and fit model
+        const box = new THREE.Box3().setFromObject(this.modelGroup);
+        const size = box.getSize(new THREE.Vector3());
+        const center = box.getCenter(new THREE.Vector3());
+        this.modelGroup.position.sub(center);
+
+        const maxDim = Math.max(size.x, size.y, size.z);
+        if (maxDim > 0 && this.camera && this.controls) {
+            const dist = maxDim * 2.2;
+            this.camera.position.set(dist * 0.7, dist * 0.7, dist);
+            this.controls.target.set(0, 0, 0);
+            this.controls.update();
+        }
+
+        // Hide empty state
+        const emptyState = document.getElementById('three-empty-state');
+        if (emptyState) emptyState.style.display = 'none';
+
+        this.updateOutliner();
+
+        // Double-side all meshes and find primary mesh / textures
+        let firstMesh = null;
+        let hasAnyTexture = false;
+        this.modelGroup.traverse(c => {
+            if (c.isMesh) {
+                if (!firstMesh) firstMesh = c;
+                if (c.material) {
+                    const mats = Array.isArray(c.material) ? c.material : [c.material];
+                    mats.forEach(m => {
+                        if (m && m.map) hasAnyTexture = true;
+                        if (m && m.side === THREE.FrontSide) {
+                            m.side = THREE.DoubleSide;
+                        }
+                    });
+                }
+            }
+        });
+
+        // Auto-apply chat photo texture if uploaded and model lacks textures
+        if (!hasAnyTexture && inputPhoto && firstMesh && firstMesh.material) {
+            console.log('[3D Studio] Auto-applying chat photo texture to primary mesh:', firstMesh.name || 'Body');
+            const mat = Array.isArray(firstMesh.material) ? firstMesh.material[0] : firstMesh.material;
+            const loader = new THREE.TextureLoader();
+            loader.load(inputPhoto, (texture) => {
+                texture.wrapS = THREE.RepeatWrapping;
+                texture.wrapT = THREE.RepeatWrapping;
+                texture.repeat.set(1, 1);
+                texture.center.set(0.5, 0.5);
+                mat.map = texture;
+                mat.needsUpdate = true;
+                if (this.selectedObject === firstMesh) {
+                    this.updateInspectorUI(firstMesh);
+                }
+                if (typeof showNotification === 'function') {
+                    showNotification('📷 Applied chat photo texture to model', 'success');
+                }
+            });
+        }
+
+        if (firstMesh) {
+            this.selectObject(firstMesh);
+        } else {
+            this.updateInspectorUI(null);
+        }
+    },
+
+    openWithCode(code) {
+        openPreviewPanel();
+        switchPreviewTab('tab-3d');
+        this.loadModelCode(code);
+    },
+
+    loadDemoModel() {
+        const demoCode = `
+            function createModel(scene, THREE) {
+                // Sci-Fi Energy Crate with Glowing Core
+                const root = new THREE.Group();
+                root.name = 'SciFiCrate';
+
+                // Outer Armor Frame
+                const frameGeom = new THREE.BoxGeometry(2, 2, 2);
+                const frameMat = new THREE.MeshStandardMaterial({
+                    color: 0x1e293b,
+                    metalness: 0.85,
+                    roughness: 0.25
+                });
+                const frame = new THREE.Mesh(frameGeom, frameMat);
+                frame.name = 'OuterFrame';
+                frame.castShadow = true;
+                frame.receiveShadow = true;
+                root.add(frame);
+
+                // Glowing Reactor Core
+                const coreGeom = new THREE.SphereGeometry(0.7, 32, 32);
+                const coreMat = new THREE.MeshStandardMaterial({
+                    color: 0x38bdf8,
+                    emissive: 0x0284c7,
+                    emissiveIntensity: 0.9,
+                    metalness: 0.1,
+                    roughness: 0.1,
+                    transparent: true,
+                    opacity: 0.92
+                });
+                const core = new THREE.Mesh(coreGeom, coreMat);
+                core.name = 'PlasmaCore';
+                root.add(core);
+
+                // Corner Bevel Accents
+                const cornerGeom = new THREE.BoxGeometry(0.4, 0.4, 0.4);
+                const cornerMat = new THREE.MeshStandardMaterial({
+                    color: 0xf59e0b,
+                    metalness: 0.9,
+                    roughness: 0.2
+                });
+                const offsets = [-1, 1];
+                offsets.forEach(x => {
+                    offsets.forEach(y => {
+                        offsets.forEach(z => {
+                            const corner = new THREE.Mesh(cornerGeom, cornerMat);
+                            corner.position.set(x, y, z);
+                            corner.name = \`Corner_\${x}_\${y}_\${z}\`;
+                            root.add(corner);
+                        });
+                    });
+                });
+
+                scene.add(root);
+            }
+        `;
+        this.loadModelCode(demoCode);
+    },
+
+    exportGLTF() {
+        if (!this.modelGroup || typeof THREE.GLTFExporter === 'undefined') {
+            alert('GLTFExporter is not available or scene is empty.');
+            return;
+        }
+        const exporter = new THREE.GLTFExporter();
+        exporter.parse(this.modelGroup, (gltf) => {
+            const blob = new Blob([gltf], { type: 'application/octet-stream' });
+            const link = document.createElement('a');
+            link.href = URL.createObjectURL(blob);
+            link.download = 'model_3d.glb';
+            link.click();
+            URL.revokeObjectURL(link.href);
+        }, { binary: true });
+    },
+
+    exportOBJ() {
+        if (!this.modelGroup || typeof THREE.OBJExporter === 'undefined') {
+            alert('OBJExporter is not available or scene is empty.');
+            return;
+        }
+        const exporter = new THREE.OBJExporter();
+        const result = exporter.parse(this.modelGroup);
+        const blob = new Blob([result], { type: 'text/plain' });
+        const link = document.createElement('a');
+        link.href = URL.createObjectURL(blob);
+        link.download = 'model_3d.obj';
+        link.click();
+        URL.revokeObjectURL(link.href);
+    }
+};
+
 // Run initialization on DOM load
 document.addEventListener('DOMContentLoaded', () => {
     initProxyServiceWorker();
@@ -5488,5 +7888,7 @@ document.addEventListener('DOMContentLoaded', () => {
     initSystemPromptSync();
     initModelSelector();
     initMCPUI();
+    setupVisionDragAndDrop();
+    ThreeStudio.init();
 });
 
