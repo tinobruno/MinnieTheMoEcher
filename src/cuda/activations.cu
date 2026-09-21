@@ -38,11 +38,8 @@ __device__ __forceinline__ __nv_bfloat162 to_bf162_float2(const float2& v) {
 __device__ __forceinline__ float fp8_e4m3_to_float_v2(uint8_t val) {
     if (val == 0) return 0.0f;
     uint32_t sign = (uint32_t)(val & 0x80) << 24;
-    uint32_t exp  = (uint32_t)(val & 0x78) >> 3;
-    uint32_t mant = (uint32_t)(val & 0x07);
-    uint32_t f_exp = exp + 120;
-    uint32_t res = sign | (f_exp << 23) | (mant << 20);
-    return __uint_as_float(res);
+    uint32_t body = ((uint32_t)(val & 0x7F) << 20) + 0x3C000000U;
+    return __uint_as_float(sign | body);
 }
 
 __device__ __forceinline__ float e8m0_to_float_v2(uint8_t val) {
@@ -1870,29 +1867,46 @@ __global__ void gemv_int3_kernel(
 
     float sum = 0.0f;
 
+    // Asynchronous double-buffered prefetching
+    uint32_t next_w[3];
+    float next_s = 0.0f;
+
+    if (tid < num_blocks) {
+        const uint32_t* w32 = reinterpret_cast<const uint32_t*>(row_w + (tid * 12));
+        next_w[0] = w32[0];
+        next_w[1] = w32[1];
+        next_w[2] = w32[2];
+        next_s = __bfloat162float(row_scales[tid]);
+    }
+
     for (int block_idx = tid; block_idx < num_blocks; block_idx += blockDim.x) {
-        float curr_s = __bfloat162float(row_scales[block_idx]);
-        const uint8_t* b_ptr = row_w + (block_idx * 12);
+        uint32_t curr_w[3] = {next_w[0], next_w[1], next_w[2]};
+        float curr_s = next_s;
+
+        int next_idx = block_idx + blockDim.x;
+        if (next_idx < num_blocks) {
+            const uint32_t* w32 = reinterpret_cast<const uint32_t*>(row_w + (next_idx * 12));
+            next_w[0] = w32[0];
+            next_w[1] = w32[1];
+            next_w[2] = w32[2];
+            next_s = __bfloat162float(row_scales[next_idx]);
+        }
+
         const uint4* a_ptr = a_vec16 + (block_idx * 4);
+
+        uint32_t g_words[4];
+        g_words[0] = curr_w[0] & 0x00FFFFFF;
+        g_words[1] = (curr_w[0] >> 24) | ((curr_w[1] & 0xFFFF) << 8);
+        g_words[2] = (curr_w[1] >> 16) | ((curr_w[2] & 0xFF) << 16);
+        g_words[3] = curr_w[2] >> 8;
 
         float block_sum = 0.0f;
 
         #pragma unroll
         for (int k = 0; k < 4; k++) {
-            uint32_t b0 = b_ptr[k * 3 + 0];
-            uint32_t b1 = b_ptr[k * 3 + 1];
-            uint32_t b2 = b_ptr[k * 3 + 2];
-
-            float w0 = (float)(b0 & 0x07) - 4.0f;
-            float w1 = (float)((b0 >> 3) & 0x07) - 4.0f;
-            float w2 = (float)(((b0 >> 6) & 0x03) | ((b1 & 0x01) << 2)) - 4.0f;
-            float w3 = (float)((b1 >> 1) & 0x07) - 4.0f;
-            float w4 = (float)((b1 >> 4) & 0x07) - 4.0f;
-            float w5 = (float)(((b1 >> 7) & 0x01) | ((b2 & 0x03) << 1)) - 4.0f;
-            float w6 = (float)((b2 >> 2) & 0x07) - 4.0f;
-            float w7 = (float)((b2 >> 5) & 0x07) - 4.0f;
-
+            uint32_t g_val = g_words[k];
             uint4 a_val = a_ptr[k];
+
             __nv_bfloat162 bf0 = *reinterpret_cast<const __nv_bfloat162*>(&a_val.x);
             __nv_bfloat162 bf1 = *reinterpret_cast<const __nv_bfloat162*>(&a_val.y);
             __nv_bfloat162 bf2 = *reinterpret_cast<const __nv_bfloat162*>(&a_val.z);
@@ -1902,6 +1916,15 @@ __global__ void gemv_int3_kernel(
             float2 f1 = to_float2_bf162(bf1);
             float2 f2 = to_float2_bf162(bf2);
             float2 f3 = to_float2_bf162(bf3);
+
+            float w0 = (float)(g_val & 0x07) - 4.0f;
+            float w1 = (float)((g_val >> 3) & 0x07) - 4.0f;
+            float w2 = (float)((g_val >> 6) & 0x07) - 4.0f;
+            float w3 = (float)((g_val >> 9) & 0x07) - 4.0f;
+            float w4 = (float)((g_val >> 12) & 0x07) - 4.0f;
+            float w5 = (float)((g_val >> 15) & 0x07) - 4.0f;
+            float w6 = (float)((g_val >> 18) & 0x07) - 4.0f;
+            float w7 = (float)((g_val >> 21) & 0x07) - 4.0f;
 
             block_sum += w0 * f0.x + w1 * f0.y
                        + w2 * f1.x + w3 * f1.y
@@ -2050,45 +2073,68 @@ __global__ void gemv_int3_swiglu_fused_kernel(
     float sum_g = 0.0f;
     float sum_u = 0.0f;
 
+    // Asynchronous double-buffered prefetching
+    uint32_t next_gw[3];
+    uint32_t next_uw[3];
+    float next_sg = 0.0f;
+    float next_su = 0.0f;
+
+    if (tid < num_blocks) {
+        const uint32_t* gw32 = reinterpret_cast<const uint32_t*>(g_row_w + (tid * 12));
+        const uint32_t* uw32 = reinterpret_cast<const uint32_t*>(u_row_w + (tid * 12));
+        next_gw[0] = gw32[0];
+        next_gw[1] = gw32[1];
+        next_gw[2] = gw32[2];
+        next_uw[0] = uw32[0];
+        next_uw[1] = uw32[1];
+        next_uw[2] = uw32[2];
+        next_sg = __bfloat162float(gate_row_scales[tid]);
+        next_su = __bfloat162float(up_row_scales[tid]);
+    }
+
     for (int block_idx = tid; block_idx < num_blocks; block_idx += blockDim.x) {
-        float sg = __bfloat162float(gate_row_scales[block_idx]);
-        float su = __bfloat162float(up_row_scales[block_idx]);
-        const uint8_t* gb_ptr = g_row_w + (block_idx * 12);
-        const uint8_t* ub_ptr = u_row_w + (block_idx * 12);
+        uint32_t curr_gw[3] = {next_gw[0], next_gw[1], next_gw[2]};
+        uint32_t curr_uw[3] = {next_uw[0], next_uw[1], next_uw[2]};
+        float curr_sg = next_sg;
+        float curr_su = next_su;
+
+        int next_idx = block_idx + blockDim.x;
+        if (next_idx < num_blocks) {
+            const uint32_t* gw32 = reinterpret_cast<const uint32_t*>(g_row_w + (next_idx * 12));
+            const uint32_t* uw32 = reinterpret_cast<const uint32_t*>(u_row_w + (next_idx * 12));
+            next_gw[0] = gw32[0];
+            next_gw[1] = gw32[1];
+            next_gw[2] = gw32[2];
+            next_uw[0] = uw32[0];
+            next_uw[1] = uw32[1];
+            next_uw[2] = uw32[2];
+            next_sg = __bfloat162float(gate_row_scales[next_idx]);
+            next_su = __bfloat162float(up_row_scales[next_idx]);
+        }
+
         const uint4* a_ptr = a_vec16 + (block_idx * 4);
+
+        uint32_t g_words[4];
+        g_words[0] = curr_gw[0] & 0x00FFFFFF;
+        g_words[1] = (curr_gw[0] >> 24) | ((curr_gw[1] & 0xFFFF) << 8);
+        g_words[2] = (curr_gw[1] >> 16) | ((curr_gw[2] & 0xFF) << 16);
+        g_words[3] = curr_gw[2] >> 8;
+
+        uint32_t u_words[4];
+        u_words[0] = curr_uw[0] & 0x00FFFFFF;
+        u_words[1] = (curr_uw[0] >> 24) | ((curr_uw[1] & 0xFFFF) << 8);
+        u_words[2] = (curr_uw[1] >> 16) | ((curr_uw[2] & 0xFF) << 16);
+        u_words[3] = curr_uw[2] >> 8;
 
         float block_sum_g = 0.0f;
         float block_sum_u = 0.0f;
 
         #pragma unroll
         for (int k = 0; k < 4; k++) {
-            uint32_t gb0 = gb_ptr[k * 3 + 0];
-            uint32_t gb1 = gb_ptr[k * 3 + 1];
-            uint32_t gb2 = gb_ptr[k * 3 + 2];
-
-            float gw0 = (float)(gb0 & 0x07) - 4.0f;
-            float gw1 = (float)((gb0 >> 3) & 0x07) - 4.0f;
-            float gw2 = (float)(((gb0 >> 6) & 0x03) | ((gb1 & 0x01) << 2)) - 4.0f;
-            float gw3 = (float)((gb1 >> 1) & 0x07) - 4.0f;
-            float gw4 = (float)((gb1 >> 4) & 0x07) - 4.0f;
-            float gw5 = (float)(((gb1 >> 7) & 0x01) | ((gb2 & 0x03) << 1)) - 4.0f;
-            float gw6 = (float)((gb2 >> 2) & 0x07) - 4.0f;
-            float gw7 = (float)((gb2 >> 5) & 0x07) - 4.0f;
-
-            uint32_t ub0 = ub_ptr[k * 3 + 0];
-            uint32_t ub1 = ub_ptr[k * 3 + 1];
-            uint32_t ub2 = ub_ptr[k * 3 + 2];
-
-            float uw0 = (float)(ub0 & 0x07) - 4.0f;
-            float uw1 = (float)((ub0 >> 3) & 0x07) - 4.0f;
-            float uw2 = (float)(((ub0 >> 6) & 0x03) | ((ub1 & 0x01) << 2)) - 4.0f;
-            float uw3 = (float)((ub1 >> 1) & 0x07) - 4.0f;
-            float uw4 = (float)((ub1 >> 4) & 0x07) - 4.0f;
-            float uw5 = (float)(((ub1 >> 7) & 0x01) | ((ub2 & 0x03) << 1)) - 4.0f;
-            float uw6 = (float)((ub2 >> 2) & 0x07) - 4.0f;
-            float uw7 = (float)((ub2 >> 5) & 0x07) - 4.0f;
-
+            uint32_t g_val = g_words[k];
+            uint32_t u_val = u_words[k];
             uint4 a_val = a_ptr[k];
+
             __nv_bfloat162 bf0 = *reinterpret_cast<const __nv_bfloat162*>(&a_val.x);
             __nv_bfloat162 bf1 = *reinterpret_cast<const __nv_bfloat162*>(&a_val.y);
             __nv_bfloat162 bf2 = *reinterpret_cast<const __nv_bfloat162*>(&a_val.z);
@@ -2098,6 +2144,24 @@ __global__ void gemv_int3_swiglu_fused_kernel(
             float2 f1 = to_float2_bf162(bf1);
             float2 f2 = to_float2_bf162(bf2);
             float2 f3 = to_float2_bf162(bf3);
+
+            float gw0 = (float)(g_val & 0x07) - 4.0f;
+            float gw1 = (float)((g_val >> 3) & 0x07) - 4.0f;
+            float gw2 = (float)((g_val >> 6) & 0x07) - 4.0f;
+            float gw3 = (float)((g_val >> 9) & 0x07) - 4.0f;
+            float gw4 = (float)((g_val >> 12) & 0x07) - 4.0f;
+            float gw5 = (float)((g_val >> 15) & 0x07) - 4.0f;
+            float gw6 = (float)((g_val >> 18) & 0x07) - 4.0f;
+            float gw7 = (float)((g_val >> 21) & 0x07) - 4.0f;
+
+            float uw0 = (float)(u_val & 0x07) - 4.0f;
+            float uw1 = (float)((u_val >> 3) & 0x07) - 4.0f;
+            float uw2 = (float)((u_val >> 6) & 0x07) - 4.0f;
+            float uw3 = (float)((u_val >> 9) & 0x07) - 4.0f;
+            float uw4 = (float)((u_val >> 12) & 0x07) - 4.0f;
+            float uw5 = (float)((u_val >> 15) & 0x07) - 4.0f;
+            float uw6 = (float)((u_val >> 18) & 0x07) - 4.0f;
+            float uw7 = (float)((u_val >> 21) & 0x07) - 4.0f;
 
             block_sum_g += gw0 * f0.x + gw1 * f0.y
                          + gw2 * f1.x + gw3 * f1.y
@@ -2109,8 +2173,8 @@ __global__ void gemv_int3_swiglu_fused_kernel(
                          + uw4 * f2.x + uw5 * f2.y
                          + uw6 * f3.x + uw7 * f3.y;
         }
-        sum_g += block_sum_g * sg;
-        sum_u += block_sum_u * su;
+        sum_g += block_sum_g * curr_sg;
+        sum_u += block_sum_u * curr_su;
     }
 
     #pragma unroll
@@ -2181,26 +2245,51 @@ __global__ void gemm_int3_batch_kernel(
 
     float sum[MAX_M] = {0.0f};
 
+    // Asynchronous double-buffered prefetching
+    uint32_t next_w[3];
+    float next_s = 0.0f;
+
+    if (tid < num_blocks) {
+        const uint32_t* w32 = reinterpret_cast<const uint32_t*>(row_w + (tid * 12));
+        next_w[0] = w32[0];
+        next_w[1] = w32[1];
+        next_w[2] = w32[2];
+        next_s = __bfloat162float(row_scales[tid]);
+    }
+
     for (int block_idx = tid; block_idx < num_blocks; block_idx += blockDim.x) {
-        float s = __bfloat162float(row_scales[block_idx]);
-        const uint8_t* b_ptr = row_w + (block_idx * 12);
+        uint32_t curr_w[3] = {next_w[0], next_w[1], next_w[2]};
+        float curr_s = next_s;
+
+        int next_idx = block_idx + blockDim.x;
+        if (next_idx < num_blocks) {
+            const uint32_t* w32 = reinterpret_cast<const uint32_t*>(row_w + (next_idx * 12));
+            next_w[0] = w32[0];
+            next_w[1] = w32[1];
+            next_w[2] = w32[2];
+            next_s = __bfloat162float(row_scales[next_idx]);
+        }
+
+        uint32_t g_words[4];
+        g_words[0] = curr_w[0] & 0x00FFFFFF;
+        g_words[1] = (curr_w[0] >> 24) | ((curr_w[1] & 0xFFFF) << 8);
+        g_words[2] = (curr_w[1] >> 16) | ((curr_w[2] & 0xFF) << 16);
+        g_words[3] = curr_w[2] >> 8;
 
         float block_sum[MAX_M] = {0.0f};
 
         #pragma unroll
         for (int k = 0; k < 4; k++) {
-            uint32_t b0 = b_ptr[k * 3 + 0];
-            uint32_t b1 = b_ptr[k * 3 + 1];
-            uint32_t b2 = b_ptr[k * 3 + 2];
+            uint32_t g_val = g_words[k];
 
-            float w0 = (float)(b0 & 0x07) - 4.0f;
-            float w1 = (float)((b0 >> 3) & 0x07) - 4.0f;
-            float w2 = (float)(((b0 >> 6) & 0x03) | ((b1 & 0x01) << 2)) - 4.0f;
-            float w3 = (float)((b1 >> 1) & 0x07) - 4.0f;
-            float w4 = (float)((b1 >> 4) & 0x07) - 4.0f;
-            float w5 = (float)(((b1 >> 7) & 0x01) | ((b2 & 0x03) << 1)) - 4.0f;
-            float w6 = (float)((b2 >> 2) & 0x07) - 4.0f;
-            float w7 = (float)((b2 >> 5) & 0x07) - 4.0f;
+            float w0 = (float)(g_val & 0x07) - 4.0f;
+            float w1 = (float)((g_val >> 3) & 0x07) - 4.0f;
+            float w2 = (float)((g_val >> 6) & 0x07) - 4.0f;
+            float w3 = (float)((g_val >> 9) & 0x07) - 4.0f;
+            float w4 = (float)((g_val >> 12) & 0x07) - 4.0f;
+            float w5 = (float)((g_val >> 15) & 0x07) - 4.0f;
+            float w6 = (float)((g_val >> 18) & 0x07) - 4.0f;
+            float w7 = (float)((g_val >> 21) & 0x07) - 4.0f;
 
             #pragma unroll
             for (int m = 0; m < MAX_M; m++) {
@@ -2230,7 +2319,7 @@ __global__ void gemm_int3_batch_kernel(
         #pragma unroll
         for (int m = 0; m < MAX_M; m++) {
             if (m < M) {
-                sum[m] += block_sum[m] * s;
+                sum[m] += block_sum[m] * curr_s;
             }
         }
     }
@@ -2320,42 +2409,82 @@ __global__ void gemm_int3_swiglu_fused_batch_kernel(
     float sum_g[MAX_M] = {0.0f};
     float sum_u[MAX_M] = {0.0f};
 
+    // Asynchronous double-buffered prefetching
+    uint32_t next_gw[3];
+    uint32_t next_uw[3];
+    float next_sg = 0.0f;
+    float next_su = 0.0f;
+
+    if (tid < num_blocks) {
+        const uint32_t* gw32 = reinterpret_cast<const uint32_t*>(g_row_w + (tid * 12));
+        const uint32_t* uw32 = reinterpret_cast<const uint32_t*>(u_row_w + (tid * 12));
+        next_gw[0] = gw32[0];
+        next_gw[1] = gw32[1];
+        next_gw[2] = gw32[2];
+        next_uw[0] = uw32[0];
+        next_uw[1] = uw32[1];
+        next_uw[2] = uw32[2];
+        next_sg = __bfloat162float(gate_row_scales[tid]);
+        next_su = __bfloat162float(up_row_scales[tid]);
+    }
+
     for (int block_idx = tid; block_idx < num_blocks; block_idx += blockDim.x) {
-        float sg = __bfloat162float(gate_row_scales[block_idx]);
-        float su = __bfloat162float(up_row_scales[block_idx]);
-        const uint8_t* gb_ptr = g_row_w + (block_idx * 12);
-        const uint8_t* ub_ptr = u_row_w + (block_idx * 12);
+        uint32_t curr_gw[3] = {next_gw[0], next_gw[1], next_gw[2]};
+        uint32_t curr_uw[3] = {next_uw[0], next_uw[1], next_uw[2]};
+        float curr_sg = next_sg;
+        float curr_su = next_su;
+
+        int next_idx = block_idx + blockDim.x;
+        if (next_idx < num_blocks) {
+            const uint32_t* gw32 = reinterpret_cast<const uint32_t*>(g_row_w + (next_idx * 12));
+            const uint32_t* uw32 = reinterpret_cast<const uint32_t*>(u_row_w + (next_idx * 12));
+            next_gw[0] = gw32[0];
+            next_gw[1] = gw32[1];
+            next_gw[2] = gw32[2];
+            next_uw[0] = uw32[0];
+            next_uw[1] = uw32[1];
+            next_uw[2] = uw32[2];
+            next_sg = __bfloat162float(gate_row_scales[next_idx]);
+            next_su = __bfloat162float(up_row_scales[next_idx]);
+        }
+
+        uint32_t g_words[4];
+        g_words[0] = curr_gw[0] & 0x00FFFFFF;
+        g_words[1] = (curr_gw[0] >> 24) | ((curr_gw[1] & 0xFFFF) << 8);
+        g_words[2] = (curr_gw[1] >> 16) | ((curr_gw[2] & 0xFF) << 16);
+        g_words[3] = curr_gw[2] >> 8;
+
+        uint32_t u_words[4];
+        u_words[0] = curr_uw[0] & 0x00FFFFFF;
+        u_words[1] = (curr_uw[0] >> 24) | ((curr_uw[1] & 0xFFFF) << 8);
+        u_words[2] = (curr_uw[1] >> 16) | ((curr_uw[2] & 0xFF) << 16);
+        u_words[3] = curr_uw[2] >> 8;
 
         float block_sum_g[MAX_M] = {0.0f};
         float block_sum_u[MAX_M] = {0.0f};
 
         #pragma unroll
         for (int k = 0; k < 4; k++) {
-            uint32_t gb0 = gb_ptr[k * 3 + 0];
-            uint32_t gb1 = gb_ptr[k * 3 + 1];
-            uint32_t gb2 = gb_ptr[k * 3 + 2];
+            uint32_t g_val = g_words[k];
+            uint32_t u_val = u_words[k];
 
-            float gw0 = (float)(gb0 & 0x07) - 4.0f;
-            float gw1 = (float)((gb0 >> 3) & 0x07) - 4.0f;
-            float gw2 = (float)(((gb0 >> 6) & 0x03) | ((gb1 & 0x01) << 2)) - 4.0f;
-            float gw3 = (float)((gb1 >> 1) & 0x07) - 4.0f;
-            float gw4 = (float)((gb1 >> 4) & 0x07) - 4.0f;
-            float gw5 = (float)(((gb1 >> 7) & 0x01) | ((gb2 & 0x03) << 1)) - 4.0f;
-            float gw6 = (float)((gb2 >> 2) & 0x07) - 4.0f;
-            float gw7 = (float)((gb2 >> 5) & 0x07) - 4.0f;
+            float gw0 = (float)(g_val & 0x07) - 4.0f;
+            float gw1 = (float)((g_val >> 3) & 0x07) - 4.0f;
+            float gw2 = (float)((g_val >> 6) & 0x07) - 4.0f;
+            float gw3 = (float)((g_val >> 9) & 0x07) - 4.0f;
+            float gw4 = (float)((g_val >> 12) & 0x07) - 4.0f;
+            float gw5 = (float)((g_val >> 15) & 0x07) - 4.0f;
+            float gw6 = (float)((g_val >> 18) & 0x07) - 4.0f;
+            float gw7 = (float)((g_val >> 21) & 0x07) - 4.0f;
 
-            uint32_t ub0 = ub_ptr[k * 3 + 0];
-            uint32_t ub1 = ub_ptr[k * 3 + 1];
-            uint32_t ub2 = ub_ptr[k * 3 + 2];
-
-            float uw0 = (float)(ub0 & 0x07) - 4.0f;
-            float uw1 = (float)((ub0 >> 3) & 0x07) - 4.0f;
-            float uw2 = (float)(((ub0 >> 6) & 0x03) | ((ub1 & 0x01) << 2)) - 4.0f;
-            float uw3 = (float)((ub1 >> 1) & 0x07) - 4.0f;
-            float uw4 = (float)((ub1 >> 4) & 0x07) - 4.0f;
-            float uw5 = (float)(((ub1 >> 7) & 0x01) | ((ub2 & 0x03) << 1)) - 4.0f;
-            float uw6 = (float)((ub2 >> 2) & 0x07) - 4.0f;
-            float uw7 = (float)((ub2 >> 5) & 0x07) - 4.0f;
+            float uw0 = (float)(u_val & 0x07) - 4.0f;
+            float uw1 = (float)((u_val >> 3) & 0x07) - 4.0f;
+            float uw2 = (float)((u_val >> 6) & 0x07) - 4.0f;
+            float uw3 = (float)((u_val >> 9) & 0x07) - 4.0f;
+            float uw4 = (float)((u_val >> 12) & 0x07) - 4.0f;
+            float uw5 = (float)((u_val >> 15) & 0x07) - 4.0f;
+            float uw6 = (float)((u_val >> 18) & 0x07) - 4.0f;
+            float uw7 = (float)((u_val >> 21) & 0x07) - 4.0f;
 
             #pragma unroll
             for (int m = 0; m < MAX_M; m++) {
@@ -2390,8 +2519,8 @@ __global__ void gemm_int3_swiglu_fused_batch_kernel(
         #pragma unroll
         for (int m = 0; m < MAX_M; m++) {
             if (m < M) {
-                sum_g[m] += block_sum_g[m] * sg;
-                sum_u[m] += block_sum_u[m] * su;
+                sum_g[m] += block_sum_g[m] * curr_sg;
+                sum_u[m] += block_sum_u[m] * curr_su;
             }
         }
     }
@@ -6056,19 +6185,14 @@ __global__ void qwen_gqa_compute_attn_fp8_batch_kernel(
     int tid = threadIdx.x;
     int kv_head = q_head / (n_q_heads / n_kv_heads);
 
-    __shared__ float s_fp8_lut[256];
     __shared__ float s_q[256];
     __shared__ float s_q_sum;
     __shared__ float s_tile_scores[128];
     __shared__ float s_warp_reduce[4];
     __shared__ float s_new_max;
     __shared__ float s_alpha;
+    __shared__ float s_reduce_acc[64][4];
     __shared__ alignas(16) uint8_t s_v_tile[32768];
-
-    // Initialize all 256 entries of s_fp8_lut across the 128 threads
-    s_fp8_lut[tid] = fp8_e4m3_to_float((uint8_t)tid);
-    s_fp8_lut[tid + 128] = fp8_e4m3_to_float((uint8_t)(tid + 128));
-    __syncthreads();
 
     size_t q_offset = (size_t)m * (2 * n_q_heads * head_dim) + (size_t)q_head * (2 * head_dim);
     const __nv_bfloat16* q_in = q_and_gate + q_offset;
@@ -6123,14 +6247,17 @@ __global__ void qwen_gqa_compute_attn_fp8_batch_kernel(
     float running_sum = 0.0f;
     float acc0 = 0.0f;
     float acc1 = 0.0f;
-    int dim0 = tid;
-    int dim1 = tid + 128;
+    float acc2 = 0.0f;
+    float acc3 = 0.0f;
+
+    int w = tid % 64;
+    int half = tid / 64;
+    int words_per_tok = head_dim >> 2;
 
     int warp_id = tid >> 5;
     int lane_id = tid & 31;
     int u4_shift = (head_dim == 256) ? 4 : 3;
     int u4_mask = (1 << u4_shift) - 1;
-    int j_shift = (head_dim == 256) ? 8 : 7;
 
     for (int t_block = 0; t_block <= pos; t_block += 128) {
         int chunk_len = min(128, pos + 1 - t_block);
@@ -6150,28 +6277,28 @@ __global__ void qwen_gqa_compute_attn_fp8_batch_kernel(
                 int base = v_idx * 16;
 
                 uint32_t w0 = kv4.x;
-                d += s_q[base + 0] * s_fp8_lut[w0 & 0xFF];
-                d += s_q[base + 1] * s_fp8_lut[(w0 >> 8) & 0xFF];
-                d += s_q[base + 2] * s_fp8_lut[(w0 >> 16) & 0xFF];
-                d += s_q[base + 3] * s_fp8_lut[(w0 >> 24) & 0xFF];
+                d += s_q[base + 0] * fp8_e4m3_to_float_v2(w0 & 0xFF);
+                d += s_q[base + 1] * fp8_e4m3_to_float_v2((w0 >> 8) & 0xFF);
+                d += s_q[base + 2] * fp8_e4m3_to_float_v2((w0 >> 16) & 0xFF);
+                d += s_q[base + 3] * fp8_e4m3_to_float_v2((w0 >> 24) & 0xFF);
 
                 uint32_t w1 = kv4.y;
-                d += s_q[base + 4] * s_fp8_lut[w1 & 0xFF];
-                d += s_q[base + 5] * s_fp8_lut[(w1 >> 8) & 0xFF];
-                d += s_q[base + 6] * s_fp8_lut[(w1 >> 16) & 0xFF];
-                d += s_q[base + 7] * s_fp8_lut[(w1 >> 24) & 0xFF];
+                d += s_q[base + 4] * fp8_e4m3_to_float_v2(w1 & 0xFF);
+                d += s_q[base + 5] * fp8_e4m3_to_float_v2((w1 >> 8) & 0xFF);
+                d += s_q[base + 6] * fp8_e4m3_to_float_v2((w1 >> 16) & 0xFF);
+                d += s_q[base + 7] * fp8_e4m3_to_float_v2((w1 >> 24) & 0xFF);
 
                 uint32_t w2 = kv4.z;
-                d += s_q[base + 8] * s_fp8_lut[w2 & 0xFF];
-                d += s_q[base + 9] * s_fp8_lut[(w2 >> 8) & 0xFF];
-                d += s_q[base + 10] * s_fp8_lut[(w2 >> 16) & 0xFF];
-                d += s_q[base + 11] * s_fp8_lut[(w2 >> 24) & 0xFF];
+                d += s_q[base + 8] * fp8_e4m3_to_float_v2(w2 & 0xFF);
+                d += s_q[base + 9] * fp8_e4m3_to_float_v2((w2 >> 8) & 0xFF);
+                d += s_q[base + 10] * fp8_e4m3_to_float_v2((w2 >> 16) & 0xFF);
+                d += s_q[base + 11] * fp8_e4m3_to_float_v2((w2 >> 24) & 0xFF);
 
                 uint32_t w3 = kv4.w;
-                d += s_q[base + 12] * s_fp8_lut[w3 & 0xFF];
-                d += s_q[base + 13] * s_fp8_lut[(w3 >> 8) & 0xFF];
-                d += s_q[base + 14] * s_fp8_lut[(w3 >> 16) & 0xFF];
-                d += s_q[base + 15] * s_fp8_lut[(w3 >> 24) & 0xFF];
+                d += s_q[base + 12] * fp8_e4m3_to_float_v2(w3 & 0xFF);
+                d += s_q[base + 13] * fp8_e4m3_to_float_v2((w3 >> 8) & 0xFF);
+                d += s_q[base + 14] * fp8_e4m3_to_float_v2((w3 >> 16) & 0xFF);
+                d += s_q[base + 15] * fp8_e4m3_to_float_v2((w3 >> 24) & 0xFF);
             }
             dot = d * scale;
         }
@@ -6201,8 +6328,12 @@ __global__ void qwen_gqa_compute_attn_fp8_batch_kernel(
         float alpha = s_alpha;
         running_max = new_max;
         running_sum = running_sum * alpha;
-        acc0 = acc0 * alpha;
-        acc1 = acc1 * alpha;
+        if (half == 0) {
+            acc0 = acc0 * alpha;
+            acc1 = acc1 * alpha;
+            acc2 = acc2 * alpha;
+            acc3 = acc3 * alpha;
+        }
 
         // C. Convert tile scores to exp(score - new_max)
         float exp_s = (tid < chunk_len) ? __expf(s_tile_scores[tid] - new_max) : 0.0f;
@@ -6237,31 +6368,71 @@ __global__ void qwen_gqa_compute_attn_fp8_batch_kernel(
         }
         __syncthreads();
 
-        #pragma unroll 8
-        for (int j = 0; j < chunk_len; j++) {
-            float weight = s_tile_scores[j];
-            int j_base = j << j_shift;
-            if (dim0 < head_dim) {
-                acc0 += weight * s_fp8_lut[s_v_tile[j_base + dim0]];
+        // Bank-conflict-free 32-bit cooperative accumulation split between lower/upper token halves
+        const uint32_t* s_v_u32 = reinterpret_cast<const uint32_t*>(s_v_tile);
+        int j_start = (half == 0) ? 0 : 64;
+        int j_end   = (half == 0) ? min(64, chunk_len) : chunk_len;
+
+        float c0 = 0.0f, c1 = 0.0f, c2 = 0.0f, c3 = 0.0f;
+        if (w < words_per_tok && j_start < j_end) {
+            #pragma unroll 4
+            for (int j = j_start; j < j_end; j++) {
+                float weight = s_tile_scores[j];
+                uint32_t v4 = s_v_u32[j * words_per_tok + w];
+                c0 += weight * fp8_e4m3_to_float_v2(v4 & 0xFF);
+                c1 += weight * fp8_e4m3_to_float_v2((v4 >> 8) & 0xFF);
+                c2 += weight * fp8_e4m3_to_float_v2((v4 >> 16) & 0xFF);
+                c3 += weight * fp8_e4m3_to_float_v2((v4 >> 24) & 0xFF);
             }
-            if (dim1 < head_dim) {
-                acc1 += weight * s_fp8_lut[s_v_tile[j_base + dim1]];
+        }
+
+        if (half == 1 && w < words_per_tok) {
+            s_reduce_acc[w][0] = c0;
+            s_reduce_acc[w][1] = c1;
+            s_reduce_acc[w][2] = c2;
+            s_reduce_acc[w][3] = c3;
+        }
+        __syncthreads();
+
+        if (half == 0 && w < words_per_tok) {
+            if (chunk_len > 64) {
+                c0 += s_reduce_acc[w][0];
+                c1 += s_reduce_acc[w][1];
+                c2 += s_reduce_acc[w][2];
+                c3 += s_reduce_acc[w][3];
             }
+            acc0 += c0;
+            acc1 += c1;
+            acc2 += c2;
+            acc3 += c3;
         }
         __syncthreads();
     }
 
     // Final normalization and sigmoid gating
     float inv_sum = 1.0f / (running_sum + 1e-8f);
-    if (dim0 < head_dim) {
-        float g0 = __bfloat162float(gate_in[dim0]);
-        float sig0 = 1.0f / (1.0f + __expf(-g0));
-        out_vec[dim0] = __float2bfloat16(acc0 * inv_sum * sig0);
-    }
-    if (dim1 < head_dim) {
-        float g1 = __bfloat162float(gate_in[dim1]);
-        float sig1 = 1.0f / (1.0f + __expf(-g1));
-        out_vec[dim1] = __float2bfloat16(acc1 * inv_sum * sig1);
+    if (half == 0 && w < words_per_tok) {
+        int base_d = w * 4;
+        if (base_d < head_dim) {
+            float g0 = __bfloat162float(gate_in[base_d]);
+            float sig0 = 1.0f / (1.0f + __expf(-g0));
+            out_vec[base_d] = __float2bfloat16(acc0 * inv_sum * sig0);
+        }
+        if (base_d + 1 < head_dim) {
+            float g1 = __bfloat162float(gate_in[base_d + 1]);
+            float sig1 = 1.0f / (1.0f + __expf(-g1));
+            out_vec[base_d + 1] = __float2bfloat16(acc1 * inv_sum * sig1);
+        }
+        if (base_d + 2 < head_dim) {
+            float g2 = __bfloat162float(gate_in[base_d + 2]);
+            float sig2 = 1.0f / (1.0f + __expf(-g2));
+            out_vec[base_d + 2] = __float2bfloat16(acc2 * inv_sum * sig2);
+        }
+        if (base_d + 3 < head_dim) {
+            float g3 = __bfloat162float(gate_in[base_d + 3]);
+            float sig3 = 1.0f / (1.0f + __expf(-g3));
+            out_vec[base_d + 3] = __float2bfloat16(acc3 * inv_sum * sig3);
+        }
     }
 }
 
@@ -6474,12 +6645,14 @@ __global__ void deltanet_ssm_step_kernel(
     }
     __syncthreads();
 
-    // 2. Compute kv_mem[col] = sum_row (decay * S[row, col]) * k[row] (read in_state_h in BF16)
+    // 2. Compute kv_mem[col] = sum_row (decay * S[row, col]) * k[row] (read in_state_h once and cache in registers)
+    float col_s[128];
     if (tid < head_dim) {
         float mem = 0.0f;
         #pragma unroll 4
         for (int r = 0; r < head_dim; r++) {
             float s_val = __bfloat162float(in_state_h[r * head_dim + tid]);
+            col_s[r] = s_val;
             mem += (decay * s_val) * s_k[r];
         }
         s_kv_mem[tid] = mem;
@@ -6488,12 +6661,13 @@ __global__ void deltanet_ssm_step_kernel(
 
     // 3. State delta update and single-pass VRAM write: S[r, c] = decay * S[r, c] + k[r] * delta[c] (BF16)
     // and compute out[c] = sum_r S[r, c] * q[r]
+    // Reads directly from col_s registers, NEVER touching global memory for in_state_h again!
     if (tid < head_dim) {
         float delta_c = (s_v[tid] - s_kv_mem[tid]) * beta;
         float out_c = 0.0f;
         #pragma unroll 4
         for (int r = 0; r < head_dim; r++) {
-            float new_s = decay * __bfloat162float(in_state_h[r * head_dim + tid]) + s_k[r] * delta_c;
+            float new_s = decay * col_s[r] + s_k[r] * delta_c;
             out_state_h[r * head_dim + tid] = __float2bfloat16(new_s);
             out_c += new_s * s_q[r];
         }
@@ -6729,12 +6903,14 @@ __global__ void deltanet_ssm_batch_kernel(
         }
         __syncthreads();
 
-        // 2. Compute kv_mem[col] from shared memory state
+        // 2. Compute kv_mem[col] from shared memory state (cached in registers)
+        float col_s[128];
         if (tid < head_dim) {
             float mem = 0.0f;
             #pragma unroll 4
             for (int r = 0; r < head_dim; r++) {
                 float s_val = __bfloat162float(s_state[r][tid]);
+                col_s[r] = s_val;
                 mem += (decay * s_val) * s_k[r];
             }
             s_kv_mem[tid] = mem;
@@ -6747,7 +6923,7 @@ __global__ void deltanet_ssm_batch_kernel(
             float out_c = 0.0f;
             #pragma unroll 4
             for (int r = 0; r < head_dim; r++) {
-                float new_s = decay * __bfloat162float(s_state[r][tid]) + s_k[r] * delta_c;
+                float new_s = decay * col_s[r] + s_k[r] * delta_c;
                 s_state[r][tid] = __float2bfloat16(new_s);
                 out_c += new_s * s_q[r];
             }

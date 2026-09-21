@@ -127,7 +127,7 @@ static void log_msg(const char* level, const char* fmt, ...) {
     vsnprintf(buf, sizeof(buf), fmt, args);
     va_end(args);
 
-    if (!(g_quiet && g_server_ready && (strcmp(level, "INFO") == 0 || strcmp(level, "WARN") == 0))) {
+    if (!g_quiet || !g_server_ready || strstr(buf, "[GENERATION STATS]") || strstr(buf, "[SPECULATIVE STATS]") || strstr(buf, "VERIFY TIMING") || strstr(buf, "MTP DEBUG") || strstr(buf, "SINGLE FWD TIMING") || strcmp(level, "ERROR") == 0) {
         fprintf(stderr, "[%s] [%s] %s\n", timebuf, level, buf);
     }
     if (g_log_file.is_open()) {
@@ -2696,6 +2696,8 @@ public:
     // Prompt-Lookup Drafting (PLD) Speculative Decoding
     bool enable_pld_ = true;
     int pld_draft_tokens_ = 4;
+    bool enable_mtp_ = true;
+    bool enable_spec_ = true;
     
     // Prompt Prefix KV Cache Tracking
     std::vector<int> cached_tokens_;
@@ -4596,8 +4598,8 @@ public:
             }
 
             // 2. Speculative Decoding Verification Loop (MTP Self-Drafter + PLD + 2B Neural Drafter fallback)
-            bool allow_draft = (draft_streak >= 0) &&
-                               (content_tokens_generated + 4 < max_tokens || in_think_block) && !g_stop_requested.load();
+            bool allow_draft = enable_spec_ && (draft_streak >= 0) && !in_think_block &&
+                               (content_tokens_generated + 4 < max_tokens) && !g_stop_requested.load();
 
             if (allow_draft) {
                 if (!emit_token_cpu(next_token, t)) {
@@ -4612,34 +4614,10 @@ public:
                 bool is_pld = false;
                 bool is_mtp = false;
 
-                // Priority 1: MTP Self-Drafter (uses target model's POST-NORM hidden state)
-                if (cfg_.architecture == ModelArch::QWEN && mtp_drafter_.loaded_) {
-                    bool in_tool_call = false;
-                    size_t last_tc_open = generated_text.rfind("<tool_call>");
-                    if (last_tc_open != std::string::npos) {
-                        size_t last_tc_close = generated_text.rfind("</tool_call>");
-                        if (last_tc_close == std::string::npos || last_tc_close < last_tc_open) {
-                            in_tool_call = true;
-                        }
-                    }
-                    // Adaptive MTP draft depth:
-                    // K=4 when inside tool call or high streak (draft_streak >= 3)
-                    // K=2 on streak (draft_streak >= 1)
-                    // K=1 on cold start
-                    int K = (in_tool_call || draft_streak >= 3) ? 4 : ((draft_streak >= 1) ? 2 : 1);
-                    auto t0 = std::chrono::steady_clock::now();
-                    mtp_drafter_.draft_k_tokens(buf_hidden2_.bf16(), next_token, position, K, cand_tokens, main_stream_);
-                    auto t1 = std::chrono::steady_clock::now();
-                    total_draft_ms += std::chrono::duration<double, std::milli>(t1 - t0).count();
-                    is_mtp = (cand_tokens.size() > 1);
-                }
-
-                // Priority 2: Prompt-Lookup Drafting (free, zero GPU cost)
-                // Qwen DeltaNet SSM batch kernel maintains 4 rollback slots (slots 0..3),
-                // so allow PLD to draft up to 4 tokens for Qwen.
-                if (cfg_.architecture == ModelArch::QWEN && !is_mtp && enable_pld_ && !history.empty()) {
+                // Priority 1: Prompt-Lookup Drafting (free, zero GPU cost, high precision with 4-to-6-gram match)
+                if (cfg_.architecture == ModelArch::QWEN && enable_pld_ && !history.empty()) {
                     int max_pld = std::min(pld_draft_tokens_, 4);
-                    std::vector<int> pld_cands = PromptLookupDrafter::draft(history, max_pld, 3, 2);
+                    std::vector<int> pld_cands = PromptLookupDrafter::draft(history, max_pld, 6, 4);
                     if (!pld_cands.empty()) {
                         for (int tok : pld_cands) {
                             cand_tokens.push_back(tok);
@@ -4648,9 +4626,29 @@ public:
                     }
                 }
 
-                // Priority 3: Legacy 2B Neural Drafter (fallback)
-                if (cfg_.architecture == ModelArch::QWEN && !is_mtp && !is_pld && qwen_draft_.loaded_) {
-                    int K = (draft_streak >= 2) ? 4 : 3;
+                // Priority 2: MTP Self-Drafter (only when confirmed streak >= 2 or inside tool call)
+                if (cfg_.architecture == ModelArch::QWEN && !is_pld && enable_mtp_ && mtp_drafter_.loaded_) {
+                    bool in_tool_call = false;
+                    size_t last_tc_open = generated_text.rfind("<tool_call>");
+                    if (last_tc_open != std::string::npos) {
+                        size_t last_tc_close = generated_text.rfind("</tool_call>");
+                        if (last_tc_close == std::string::npos || last_tc_close < last_tc_open) {
+                            in_tool_call = true;
+                        }
+                    }
+                    if (in_tool_call || draft_streak >= 2) {
+                        int K = (in_tool_call || draft_streak >= 3) ? 4 : 2;
+                        auto t0 = std::chrono::steady_clock::now();
+                        mtp_drafter_.draft_k_tokens(buf_hidden2_.bf16(), next_token, position, K, cand_tokens, main_stream_);
+                        auto t1 = std::chrono::steady_clock::now();
+                        total_draft_ms += std::chrono::duration<double, std::milli>(t1 - t0).count();
+                        is_mtp = (cand_tokens.size() > 1);
+                    }
+                }
+
+                // Priority 3: Legacy 2B Neural Drafter (fallback on confirmed streak)
+                if (cfg_.architecture == ModelArch::QWEN && !is_mtp && !is_pld && qwen_draft_.loaded_ && draft_streak >= 2) {
+                    int K = (draft_streak >= 3) ? 4 : 2;
                     qwen_draft_.draft_k_tokens(next_token, position, K, cand_tokens, main_stream_);
                 }
 
@@ -4773,7 +4771,7 @@ public:
                         decode_step_idx_ += (accepted + 1);
 
                         if (accepted == 0) {
-                            draft_streak = 0;
+                            draft_streak = -8;
                         } else {
                             draft_streak = std::min(draft_streak + accepted, 6);
                         }
@@ -4788,6 +4786,7 @@ public:
                     position++;
                     decode_step_idx_++;
                     next_token = -1;
+                    draft_streak = -2;
                     continue;
                 }
             }
@@ -7173,22 +7172,26 @@ private:
     int sample_from_logits_ptr(float* logits_ptr, float temperature, const std::vector<int>& history, int step = 0, bool is_reasoning = true,
                                int top_k = 1024, float top_p = 0.95f, float min_p = 0.0f) {
         int vocab = cfg_.vocab_size;
+        static int32_t* h_sample_pin = nullptr;
+        if (!h_sample_pin) {
+            CUDA_CHECK(cudaMallocHost(&h_sample_pin, sizeof(int32_t)));
+        }
 
         if (temperature <= 0.0f) {
-            argmax_f32_cuda(buf_argmax_out_.i32(), logits_ptr, vocab, main_stream_);
-            int best = 0;
-            CUDA_CHECK(cudaMemcpyAsync(&best, buf_argmax_out_.i32(), sizeof(int32_t), cudaMemcpyDeviceToHost, main_stream_));
+            if (logits_ptr != buf_logits_.f32() || !graph_captured_) {
+                argmax_f32_cuda(buf_argmax_out_.i32(), logits_ptr, vocab, main_stream_);
+            }
+            CUDA_CHECK(cudaMemcpyAsync(h_sample_pin, buf_argmax_out_.i32(), sizeof(int32_t), cudaMemcpyDeviceToHost, main_stream_));
             CUDA_CHECK(cudaStreamSynchronize(main_stream_));
-            return best;
+            return *h_sample_pin;
         }
 
         std::uniform_real_distribution<float> dist(0.0f, 1.0f);
         float r = dist(rng_);
         sample_multinomial_f32_cuda(buf_argmax_out_.i32(), logits_ptr, vocab, temperature, r, min_p, main_stream_);
-        int sampled = 0;
-        CUDA_CHECK(cudaMemcpyAsync(&sampled, buf_argmax_out_.i32(), sizeof(int32_t), cudaMemcpyDeviceToHost, main_stream_));
+        CUDA_CHECK(cudaMemcpyAsync(h_sample_pin, buf_argmax_out_.i32(), sizeof(int32_t), cudaMemcpyDeviceToHost, main_stream_));
         CUDA_CHECK(cudaStreamSynchronize(main_stream_));
-        return sampled;
+        return *h_sample_pin;
     }
 
 public:
@@ -12371,6 +12374,8 @@ int main(int argc, char** argv) {
     int imatrix_max_tokens = -1;
     bool enable_pld = true;
     int pld_draft_tokens = 4;
+    bool enable_mtp = true;
+    bool enable_spec = true;
     std::string test_prompt = "";
     bool benchmark_mode = false;
     float test_temp = 0.7f;
@@ -12435,6 +12440,10 @@ int main(int argc, char** argv) {
             benchmark_mode = true;
         } else if (std::string(argv[i]) == "--no-pld" || std::string(argv[i]) == "--disable-pld") {
             enable_pld = false;
+        } else if (std::string(argv[i]) == "--no-mtp" || std::string(argv[i]) == "--disable-mtp") {
+            enable_mtp = false;
+        } else if (std::string(argv[i]) == "--no-spec" || std::string(argv[i]) == "--disable-spec") {
+            enable_spec = false;
         } else if ((std::string(argv[i]) == "--pld-tokens" || std::string(argv[i]) == "--pld-draft-tokens") && i + 1 < argc) {
             pld_draft_tokens = std::stoi(argv[++i]);
         } else if (std::string(argv[i]) == "--log-experts") {
@@ -12499,7 +12508,12 @@ int main(int argc, char** argv) {
     engine.prefill_chunk_size_ = prefill_chunk_size;
     engine.enable_pld_ = enable_pld;
     engine.pld_draft_tokens_ = pld_draft_tokens;
-    LOG_INFO("Prompt-Lookup Drafting (PLD): %s (draft_tokens=%d)", enable_pld ? "enabled" : "disabled", pld_draft_tokens);
+    engine.enable_mtp_ = enable_mtp;
+    engine.enable_spec_ = enable_spec;
+    LOG_INFO("Speculative decoding: %s (PLD: %s, MTP: %s)",
+             enable_spec ? "enabled" : "disabled",
+             enable_pld ? "enabled" : "disabled",
+             enable_mtp ? "enabled" : "disabled");
 
     if (!engine.load(manifest_path, max_vram_gb, dram_cache_gb, expert_dtype_override, buffered_io, max_seq_len_override)) {
         LOG_ERROR("Failed to load model");
