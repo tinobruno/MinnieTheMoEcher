@@ -2277,18 +2277,24 @@ public:
     // Reference to target model's embedding table (shared, not owned)
     __nv_bfloat16* target_embed_w_ = nullptr;
     uint8_t* target_embed_w_int4_ = nullptr;
+    const uint8_t* target_embed_w_fp4_ = nullptr;
     __nv_bfloat16* target_embed_s_ = nullptr;
+    const uint8_t* target_embed_s_fp4_ = nullptr;
     bool is_embed_int4_ = false;
+    bool is_embed_fp4_ = false;
 
     bool load_mtp_weights(const void* mapped_data, const json& tensor_map,
-                          __nv_bfloat16* embed_w, uint8_t* embed_w_int4, __nv_bfloat16* embed_s, bool is_embed_int4,
+                          __nv_bfloat16* embed_w, uint8_t* embed_w_int4, void* embed_s, bool is_embed_int4, bool is_embed_fp4,
                           __nv_bfloat16* full_lm_head, int full_vocab,
                           const std::string& model_dir, cudaStream_t stream) {
         full_vocab_size_ = full_vocab;
         target_embed_w_ = embed_w;
         target_embed_w_int4_ = embed_w_int4;
-        target_embed_s_ = embed_s;
+        target_embed_w_fp4_ = is_embed_fp4 ? (const uint8_t*)embed_w_int4 : nullptr;
+        target_embed_s_ = is_embed_int4 ? (__nv_bfloat16*)embed_s : nullptr;
+        target_embed_s_fp4_ = is_embed_fp4 ? (const uint8_t*)embed_s : nullptr;
         is_embed_int4_ = is_embed_int4;
+        is_embed_fp4_ = is_embed_fp4;
         full_lm_head_w_ = full_lm_head;
 
         auto load_t = [&](GPUTensor& gpu, const std::string& name) -> bool {
@@ -2305,11 +2311,10 @@ public:
             return true;
         };
 
-        auto load_quant_t = [&](GPUTensor& gpu_w, GPUTensor& gpu_s, const std::string& name) -> bool {
+        auto load_layer_weight = [&](GPUTensor& gpu_w, GPUTensor& gpu_s, const std::string& name) -> bool {
             if (!tensor_map.contains(name)) return false;
             auto& info = tensor_map[name];
             std::string dtype = info.value("dtype", "");
-            if (dtype != "int4") return false;
             int64_t offset = info["offset"].get<int64_t>();
             int64_t nbytes = info["nbytes"].get<int64_t>();
             gpu_w.dtype = dtype;
@@ -2318,26 +2323,21 @@ public:
             gpu_w.alloc(nbytes);
             CUDA_CHECK(cudaMemcpyAsync(gpu_w.data, (const char*)mapped_data + offset, nbytes,
                                        cudaMemcpyHostToDevice, stream));
-            if (info.contains("scale_offset")) {
-                int64_t scale_offset = info["scale_offset"].get<int64_t>();
-                int64_t scale_nbytes = info["scale_nbytes"].get<int64_t>();
-                gpu_s.dtype = info.value("scale_dtype", "bfloat16");
-                gpu_s.alloc(scale_nbytes);
-                CUDA_CHECK(cudaMemcpyAsync(gpu_s.data, (const char*)mapped_data + scale_offset, scale_nbytes,
-                                           cudaMemcpyHostToDevice, stream));
+            if (dtype == "int4" || dtype == "fp4") {
+                if (info.contains("scale_offset")) {
+                    int64_t scale_offset = info["scale_offset"].get<int64_t>();
+                    int64_t scale_nbytes = info["scale_nbytes"].get<int64_t>();
+                    gpu_s.dtype = info.value("scale_dtype", dtype == "fp4" ? "F8_E8M0" : "bfloat16");
+                    gpu_s.alloc(scale_nbytes);
+                    CUDA_CHECK(cudaMemcpyAsync(gpu_s.data, (const char*)mapped_data + scale_offset, scale_nbytes,
+                                               cudaMemcpyHostToDevice, stream));
+                }
             }
             return true;
         };
 
         // Load MTP module weights
-        bool fc_loaded = false;
-        if (tensor_map.contains("mtp.fc.weight")) {
-            if (tensor_map["mtp.fc.weight"].value("dtype", "") == "int4") {
-                fc_loaded = load_quant_t(mtp_fc_w_, mtp_fc_s_, "mtp.fc.weight");
-            } else {
-                fc_loaded = load_t(mtp_fc_w_, "mtp.fc.weight");
-            }
-        }
+        bool fc_loaded = load_layer_weight(mtp_fc_w_, mtp_fc_s_, "mtp.fc.weight");
         if (!fc_loaded) {
             LOG_WARN("MTP: mtp.fc.weight not found or failed to load, MTP self-drafter disabled");
             return false;
@@ -2349,21 +2349,21 @@ public:
         // Load MTP transformer layer
         load_t(mtp_layer_attn_norm_w_, "mtp.layers.0.input_layernorm.weight");
         load_t(mtp_layer_post_attn_norm_w_, "mtp.layers.0.post_attention_layernorm.weight");
-        load_quant_t(mtp_layer_q_proj_w_, mtp_layer_q_proj_s_, "mtp.layers.0.self_attn.q_proj.weight");
-        load_quant_t(mtp_layer_k_proj_w_, mtp_layer_k_proj_s_, "mtp.layers.0.self_attn.k_proj.weight");
-        load_quant_t(mtp_layer_v_proj_w_, mtp_layer_v_proj_s_, "mtp.layers.0.self_attn.v_proj.weight");
-        load_quant_t(mtp_layer_o_proj_w_, mtp_layer_o_proj_s_, "mtp.layers.0.self_attn.o_proj.weight");
+        load_layer_weight(mtp_layer_q_proj_w_, mtp_layer_q_proj_s_, "mtp.layers.0.self_attn.q_proj.weight");
+        load_layer_weight(mtp_layer_k_proj_w_, mtp_layer_k_proj_s_, "mtp.layers.0.self_attn.k_proj.weight");
+        load_layer_weight(mtp_layer_v_proj_w_, mtp_layer_v_proj_s_, "mtp.layers.0.self_attn.v_proj.weight");
+        load_layer_weight(mtp_layer_o_proj_w_, mtp_layer_o_proj_s_, "mtp.layers.0.self_attn.o_proj.weight");
         load_t(mtp_layer_q_norm_w_, "mtp.layers.0.self_attn.q_norm.weight");
         load_t(mtp_layer_k_norm_w_, "mtp.layers.0.self_attn.k_norm.weight");
-        load_quant_t(mtp_layer_gate_w_, mtp_layer_gate_s_, "mtp.layers.0.mlp.gate_proj.weight");
-        load_quant_t(mtp_layer_up_w_, mtp_layer_up_s_, "mtp.layers.0.mlp.up_proj.weight");
-        load_quant_t(mtp_layer_down_w_, mtp_layer_down_s_, "mtp.layers.0.mlp.down_proj.weight");
+        load_layer_weight(mtp_layer_gate_w_, mtp_layer_gate_s_, "mtp.layers.0.mlp.gate_proj.weight");
+        load_layer_weight(mtp_layer_up_w_, mtp_layer_up_s_, "mtp.layers.0.mlp.up_proj.weight");
+        load_layer_weight(mtp_layer_down_w_, mtp_layer_down_s_, "mtp.layers.0.mlp.down_proj.weight");
 
         if (!mtp_layer_attn_norm_w_.data || !mtp_layer_post_attn_norm_w_.data ||
             !mtp_layer_q_proj_w_.data || !mtp_layer_k_proj_w_.data ||
             !mtp_layer_v_proj_w_.data || !mtp_layer_o_proj_w_.data ||
             !mtp_layer_gate_w_.data || !mtp_layer_up_w_.data || !mtp_layer_down_w_.data) {
-            LOG_WARN("MTP: One or more MTP transformer layer weights could not be loaded (ensure INT4 format), MTP self-drafter disabled");
+            LOG_WARN("MTP: One or more MTP transformer layer weights could not be loaded, MTP self-drafter disabled");
             return false;
         }
 
@@ -2465,6 +2465,8 @@ public:
         auto matmul_proj = [&](GPUTensor& out, __nv_bfloat16* in_vec, GPUTensor& weight, GPUTensor& scale, int N, int K) {
             if (weight.dtype == "int4") {
                 gemv_int4_cuda(out.bf16(), in_vec, (const uint8_t*)weight.data, scale.bf16(), N, K, stream);
+            } else if (weight.dtype == "fp4") {
+                gemv_fp4_cuda(out.bf16(), in_vec, (const uint8_t*)weight.data, (const uint8_t*)scale.data, N, K, stream);
             } else {
                 gemv_bf16_out_bf16_cuda(out.bf16(), weight.bf16(), in_vec, N, K, stream);
             }
@@ -2477,7 +2479,9 @@ public:
         // 2. Embed the last token and norm it
         int32_t tok = last_token_id;
         CUDA_CHECK(cudaMemcpyAsync(buf_mtp_argmax_.i32(), &tok, sizeof(int32_t), cudaMemcpyHostToDevice, stream));
-        if (is_embed_int4_) {
+        if (is_embed_fp4_) {
+            embedding_fp4_cuda(buf_mtp_embed_.bf16(), target_embed_w_fp4_, target_embed_s_fp4_, buf_mtp_argmax_.i32(), 1, hidden_size_, stream);
+        } else if (is_embed_int4_) {
             embedding_int4_cuda(buf_mtp_embed_.bf16(), target_embed_w_int4_, target_embed_s_, buf_mtp_argmax_.i32(), 1, hidden_size_, stream);
         } else {
             embedding_cuda(buf_mtp_embed_.bf16(), target_embed_w_, buf_mtp_argmax_.i32(), 1, hidden_size_, stream);
@@ -2497,6 +2501,10 @@ public:
             gemv_int4_cuda(buf_mtp_hidden_.bf16(), buf_mtp_concat_.bf16(),
                            (const uint8_t*)mtp_fc_w_.data, mtp_fc_s_.bf16(),
                            hidden_size_, 2 * hidden_size_, stream);
+        } else if (mtp_fc_w_.dtype == "fp4") {
+            gemv_fp4_cuda(buf_mtp_hidden_.bf16(), buf_mtp_concat_.bf16(),
+                          (const uint8_t*)mtp_fc_w_.data, (const uint8_t*)mtp_fc_s_.data,
+                          hidden_size_, 2 * hidden_size_, stream);
         } else {
             gemv_bf16_out_bf16_cuda(buf_mtp_hidden_.bf16(), mtp_fc_w_.bf16(), buf_mtp_concat_.bf16(),
                                     hidden_size_, 2 * hidden_size_, stream);
@@ -2532,6 +2540,10 @@ public:
             gemv_int4_residual_cuda(buf_mtp_hidden_.bf16(), buf_mtp_attn_out_.bf16(),
                                     (const uint8_t*)mtp_layer_o_proj_w_.data, mtp_layer_o_proj_s_.bf16(),
                                     hidden_size_, num_heads_ * head_dim_, stream);
+        } else if (mtp_layer_o_proj_w_.dtype == "fp4") {
+            gemv_fp4_residual_cuda(buf_mtp_hidden_.bf16(), buf_mtp_attn_out_.bf16(),
+                                   (const uint8_t*)mtp_layer_o_proj_w_.data, (const uint8_t*)mtp_layer_o_proj_s_.data,
+                                   hidden_size_, num_heads_ * head_dim_, stream);
         } else {
             gemv_bf16_out_bf16_cuda(buf_mtp_hidden2_.bf16(), mtp_layer_o_proj_w_.bf16(),
                                     buf_mtp_attn_out_.bf16(), hidden_size_, num_heads_ * head_dim_, stream);
@@ -2548,6 +2560,11 @@ public:
                                         (const uint8_t*)mtp_layer_gate_w_.data, mtp_layer_gate_s_.bf16(),
                                         (const uint8_t*)mtp_layer_up_w_.data, mtp_layer_up_s_.bf16(),
                                         intermediate_size_, hidden_size_, 0.0f, stream);
+        } else if (mtp_layer_gate_w_.dtype == "fp4") {
+            gemv_fp4_swiglu_fused_cuda(buf_mtp_gate_.bf16(), buf_mtp_hidden2_.bf16(),
+                                       (const uint8_t*)mtp_layer_gate_w_.data, (const uint8_t*)mtp_layer_gate_s_.data,
+                                       (const uint8_t*)mtp_layer_up_w_.data, (const uint8_t*)mtp_layer_up_s_.data,
+                                       intermediate_size_, hidden_size_, 0.0f, stream);
         } else {
             gemv_bf16_out_bf16_cuda(buf_mtp_gate_.bf16(), mtp_layer_gate_w_.bf16(),
                                     buf_mtp_hidden2_.bf16(), intermediate_size_, hidden_size_, stream);
@@ -2560,6 +2577,10 @@ public:
             gemv_int4_residual_cuda(buf_mtp_hidden_.bf16(), buf_mtp_gate_.bf16(),
                                     (const uint8_t*)mtp_layer_down_w_.data, mtp_layer_down_s_.bf16(),
                                     hidden_size_, intermediate_size_, stream);
+        } else if (mtp_layer_down_w_.dtype == "fp4") {
+            gemv_fp4_residual_cuda(buf_mtp_hidden_.bf16(), buf_mtp_gate_.bf16(),
+                                   (const uint8_t*)mtp_layer_down_w_.data, (const uint8_t*)mtp_layer_down_s_.data,
+                                   hidden_size_, intermediate_size_, stream);
         } else {
             gemv_bf16_out_bf16_cuda(buf_mtp_hidden2_.bf16(), mtp_layer_down_w_.bf16(),
                                     buf_mtp_gate_.bf16(), hidden_size_, intermediate_size_, stream);
@@ -2704,6 +2725,7 @@ public:
 
     // Hardware Detection & Feature Gating
     GpuCapabilities gpu_caps_;
+    bool is_blackwell_tc_active_ = false;
     const GpuCapabilities& gpu_capabilities() const { return gpu_caps_; }
 
     void reset_all_kv_caches() {
@@ -2787,6 +2809,7 @@ public:
             mtp_drafter_.reset_kv_cache(main_stream_);
         }
         cached_tokens_.clear();
+        argmax_cache_valid_ = false;
     }
 
     // Thread pool for loading experts (max 16 concurrent reads)
@@ -2963,6 +2986,8 @@ public:
     GPUTensor buf_input_pos_batch_;    // [8] I32
     GPUTensor buf_hidden_batch_;       // [8, hidden_size] BF16
     GPUTensor buf_hidden2_batch_;      // [8, hidden_size] BF16
+    GPUTensor buf_activation_fp4_;     // [16, max_dim / 2] FP4 bytes for Blackwell Tensor Core GEMM
+    GPUTensor buf_activation_scale_;   // [16, max_dim / 32] E8M0 scale bytes for Blackwell Tensor Core GEMM
     GPUTensor buf_q_batch_;            // [8, 10240] BF16
     GPUTensor buf_gate_batch_;         // [8, intermediate_size] BF16
     GPUTensor buf_up_batch_;           // [8, intermediate_size] BF16
@@ -3024,6 +3049,7 @@ public:
     cudaGraph_t graph_ = nullptr;
     cudaGraphExec_t graph_exec_ = nullptr;
     bool graph_captured_ = false;
+    bool argmax_cache_valid_ = false;
 
     // Imatrix calibration accumulators
     bool collect_imatrix_ = false;
@@ -3268,6 +3294,36 @@ public:
                  (int)gpu_caps_.is_ampere, (int)gpu_caps_.is_ada_or_newer,
                  (int)gpu_caps_.is_blackwell_or_newer, (int)gpu_caps_.supports_fp8,
                  (int)gpu_caps_.supports_fp4, (int)gpu_caps_.is_vram_constrained);
+        // Check if model requires NVIDIA Blackwell FP4 (NVFP4)
+        bool model_requires_fp4 = false;
+        if (manifest.contains("target_vram_profile")) {
+            model_requires_fp4 = true;
+        }
+        if (manifest.contains("dense_tensors") && manifest["dense_tensors"].is_object()) {
+            for (auto& [tname, tinfo] : manifest["dense_tensors"].items()) {
+                if (tinfo.value("dtype", "") == "fp4") {
+                    model_requires_fp4 = true;
+                    break;
+                }
+            }
+        }
+        if (manifest.contains("model_config") && manifest["model_config"].value("expert_dtype", "") == "fp4") {
+            model_requires_fp4 = true;
+        }
+
+        is_blackwell_tc_active_ = gpu_caps_.supports_fp4 && (gpu_caps_.major >= 12) && model_requires_fp4;
+        LOG_INFO("Blackwell Tensor Core Acceleration: %s",
+                 is_blackwell_tc_active_ ? "ENABLED (Native sm_120a hardware FP4 mma.sync)" : "DISABLED (SIMT Fallback / Non-FP4 Model)");
+
+        if (model_requires_fp4 && !gpu_caps_.supports_fp4) {
+            LOG_ERROR("================================================================================");
+            LOG_ERROR("FATAL: Hardware Unsupported! Model requires NVIDIA Blackwell NVFP4 (SM 10.0+ / 12.0+)");
+            LOG_ERROR("Current GPU is '%s' (Compute %d.%d), which does not support hardware FP4.",
+                      gpu_caps_.device_name.c_str(), gpu_caps_.major, gpu_caps_.minor);
+            LOG_ERROR("Please use an INT4 or BF16 model on this GPU, or run on Blackwell hardware.");
+            LOG_ERROR("================================================================================");
+            return false;
+        }
 
         cudaDeviceProp prop;
         if (cudaGetDeviceProperties(&prop, 0) == cudaSuccess) {
@@ -3297,26 +3353,35 @@ public:
             return false;
         }
 
-        // Load expert layout info
-        auto& el = manifest["expert_layout"];
-        int expert_block_size = el["block_size"].get<int>();
-        int expert_n_layers = el["n_layers"].get<int>();
-        if (expert_n_layers > cfg_.num_hidden_layers && cfg_.num_hidden_layers > 0) {
-            expert_n_layers = cfg_.num_hidden_layers;
-        }
-        int expert_n_experts = el["n_experts"].get<int>();
+        // Load expert layout info safely (optional for dense models like Qwen)
+        int expert_block_size = 0;
+        int expert_n_layers = 0;
+        int expert_n_experts = 0;
+        if (manifest.contains("expert_layout") && !manifest["expert_layout"].is_null()) {
+            auto& el = manifest["expert_layout"];
+            expert_block_size = el.value("block_size", 0);
+            expert_n_layers = el.value("n_layers", 0);
+            if (expert_n_layers > cfg_.num_hidden_layers && cfg_.num_hidden_layers > 0) {
+                expert_n_layers = cfg_.num_hidden_layers;
+            }
+            expert_n_experts = el.value("n_experts", 0);
 
-        for (auto& [part_name, part_info] : el["parts"].items()) {
-            ExpertPartInfo epi;
-            epi.offset_in_block = part_info["offset_in_block"].get<int>();
-            epi.nbytes = part_info["nbytes"].get<int>();
-            epi.dtype = part_info["dtype"].get<std::string>();
-            for (auto& s : part_info["shape"]) epi.shape.push_back(s.get<int>());
-            expert_parts_[part_name] = epi;
+            if (el.contains("parts") && el["parts"].is_object()) {
+                for (auto& [part_name, part_info] : el["parts"].items()) {
+                    ExpertPartInfo epi;
+                    epi.offset_in_block = part_info.value("offset_in_block", 0);
+                    epi.nbytes = part_info.value("nbytes", 0);
+                    epi.dtype = part_info.value("dtype", "fp4");
+                    if (part_info.contains("shape")) {
+                        for (auto& s : part_info["shape"]) epi.shape.push_back(s.get<int>());
+                    }
+                    expert_parts_[part_name] = epi;
+                }
+            }
         }
 
         // Init expert loader with O_DIRECT
-        std::string expert_path = manifest["expert_bin"].get<std::string>();
+        std::string expert_path = manifest.value("expert_bin", "");
         std::string expert_full = expert_path.empty() ? "" : (base_dir / expert_path).string();
 
         // Allocate working buffers first
@@ -3431,7 +3496,8 @@ public:
         // Auto-load Qwen Vision Tower if available in manifest
         has_vision_ = false;
         bool vision_flag = (manifest.contains("model_config") && manifest["model_config"].value("has_vision", false)) ||
-                           manifest.contains("visual_config");
+                           manifest.contains("visual_config") ||
+                           (manifest.contains("dense_tensors") && manifest["dense_tensors"].contains("model.visual.patch_embed.proj.weight"));
         if (cfg_.architecture == ModelArch::QWEN && vision_flag) {
             if (manifest.contains("dense_tensors") && manifest["dense_tensors"].contains("model.visual.patch_embed.proj.weight")) {
                 std::string dense_path = manifest["dense_bin"].get<std::string>();
@@ -3765,7 +3831,9 @@ public:
 
         if (cfg_.architecture == ModelArch::QWEN) {
             // 1. Standard Embedding lookup
-            if (embed_weight_.dtype == "int4") {
+            if (embed_weight_.dtype == "fp4") {
+                embedding_fp4_cuda(buf_hidden_.bf16(), (const uint8_t*)embed_weight_.data, (const uint8_t*)embed_weight_scale_.data, buf_input_token_.i32(), 1, dim, main_stream_);
+            } else if (embed_weight_.dtype == "int4") {
                 embedding_int4_cuda(buf_hidden_.bf16(), (uint8_t*)embed_weight_.data, embed_weight_scale_.bf16(), buf_input_token_.i32(), 1, dim, main_stream_);
             } else {
                 embedding_cuda(buf_hidden_.bf16(), embed_weight_.bf16(), buf_input_token_.i32(), 1, dim, main_stream_);
@@ -4614,20 +4682,8 @@ public:
                 bool is_pld = false;
                 bool is_mtp = false;
 
-                // Priority 1: Prompt-Lookup Drafting (free, zero GPU cost, high precision with 4-to-6-gram match)
-                if (cfg_.architecture == ModelArch::QWEN && enable_pld_ && !history.empty()) {
-                    int max_pld = std::min(pld_draft_tokens_, 4);
-                    std::vector<int> pld_cands = PromptLookupDrafter::draft(history, max_pld, 6, 4);
-                    if (!pld_cands.empty()) {
-                        for (int tok : pld_cands) {
-                            cand_tokens.push_back(tok);
-                        }
-                        is_pld = true;
-                    }
-                }
-
-                // Priority 2: MTP Self-Drafter (only when confirmed streak >= 2 or inside tool call)
-                if (cfg_.architecture == ModelArch::QWEN && !is_pld && enable_mtp_ && mtp_drafter_.loaded_) {
+                // Priority 1: MTP Self-Drafter (trained neural speculative drafter for Qwen)
+                if (cfg_.architecture == ModelArch::QWEN && enable_mtp_ && mtp_drafter_.loaded_) {
                     bool in_tool_call = false;
                     size_t last_tc_open = generated_text.rfind("<tool_call>");
                     if (last_tc_open != std::string::npos) {
@@ -4636,13 +4692,25 @@ public:
                             in_tool_call = true;
                         }
                     }
-                    if (in_tool_call || draft_streak >= 2) {
-                        int K = (in_tool_call || draft_streak >= 3) ? 4 : 2;
+                    if (in_tool_call || draft_streak >= 0) {
+                        int K = in_tool_call ? 4 : ((draft_streak >= 1) ? 3 : 2);
                         auto t0 = std::chrono::steady_clock::now();
                         mtp_drafter_.draft_k_tokens(buf_hidden2_.bf16(), next_token, position, K, cand_tokens, main_stream_);
                         auto t1 = std::chrono::steady_clock::now();
                         total_draft_ms += std::chrono::duration<double, std::milli>(t1 - t0).count();
                         is_mtp = (cand_tokens.size() > 1);
+                    }
+                }
+
+                // Priority 2: Prompt-Lookup Drafting (only as fallback when MTP is not loaded / disabled)
+                if (cfg_.architecture == ModelArch::QWEN && !is_mtp && (!enable_mtp_ || !mtp_drafter_.loaded_) && enable_pld_ && !history.empty()) {
+                    int max_pld = std::min(pld_draft_tokens_, 2);
+                    std::vector<int> pld_cands = PromptLookupDrafter::draft(history, max_pld, 6, 6);
+                    if (!pld_cands.empty()) {
+                        for (int tok : pld_cands) {
+                            cand_tokens.push_back(tok);
+                        }
+                        is_pld = true;
                     }
                 }
 
@@ -4658,14 +4726,14 @@ public:
                     forward_token_batch_qwen(cand_tokens.data(), position, M);
 
                     int num_verify = M - 1;
-                    // Verify candidate positions simultaneously in ONE GPU pass
-                    argmax_f32_batch_cuda(buf_argmax_out_batch_.i32(), buf_logits_batch_.f32(), cfg_.vocab_size, num_verify, main_stream_);
+                    // Verify candidate positions simultaneously in ONE GPU pass (computing all M predictions)
+                    argmax_f32_batch_cuda(buf_argmax_out_batch_.i32(), buf_logits_batch_.f32(), cfg_.vocab_size, M, main_stream_);
 
                     static int32_t* host_batch_preds = nullptr;
                     if (!host_batch_preds) {
                         CUDA_CHECK(cudaMallocHost(&host_batch_preds, 16 * sizeof(int32_t)));
                     }
-                    CUDA_CHECK(cudaMemcpyAsync(host_batch_preds, buf_argmax_out_batch_.i32(), num_verify * sizeof(int32_t), cudaMemcpyDeviceToHost, main_stream_));
+                    CUDA_CHECK(cudaMemcpyAsync(host_batch_preds, buf_argmax_out_batch_.i32(), M * sizeof(int32_t), cudaMemcpyDeviceToHost, main_stream_));
                     CUDA_CHECK(cudaStreamSynchronize(main_stream_));
                     auto tv1 = std::chrono::steady_clock::now();
                     double ver_ms = std::chrono::duration<double, std::milli>(tv1 - tv0).count();
@@ -4720,11 +4788,6 @@ public:
                             }
                         }
 
-                        // Copy latest logits from position M - 1 for next token sampling
-                        CUDA_CHECK(cudaMemcpyAsync(buf_logits_.f32(),
-                                                   buf_logits_batch_.f32() + (size_t)(M - 1) * cfg_.vocab_size,
-                                                   cfg_.vocab_size * sizeof(float),
-                                                   cudaMemcpyDeviceToDevice, main_stream_));
                         // Save post-norm hidden state from last batch slot for MTP drafter
                         if (mtp_drafter_.loaded_) {
                             CUDA_CHECK(cudaMemcpyAsync(buf_hidden2_.bf16(),
@@ -4732,10 +4795,21 @@ public:
                                                        cfg_.hidden_size * sizeof(__nv_bfloat16),
                                                        cudaMemcpyDeviceToDevice, main_stream_));
                         }
-                        CUDA_CHECK(cudaStreamSynchronize(main_stream_));
 
-                        next_token = sample_token(temperature, history, content_tokens_generated, in_think_block,
-                                                  top_k, top_p, min_p);
+                        if (temperature <= 0.0f) {
+                            // Fast path: host_batch_preds[M - 1] already holds the exact greedy argmax of position M - 1!
+                            next_token = host_batch_preds[M - 1];
+                        } else {
+                            // Copy latest logits from position M - 1 for multinomial sampling
+                            CUDA_CHECK(cudaMemcpyAsync(buf_logits_.f32(),
+                                                       buf_logits_batch_.f32() + (size_t)(M - 1) * cfg_.vocab_size,
+                                                       cfg_.vocab_size * sizeof(float),
+                                                       cudaMemcpyDeviceToDevice, main_stream_));
+                            CUDA_CHECK(cudaStreamSynchronize(main_stream_));
+                            argmax_cache_valid_ = false;
+                            next_token = sample_token(temperature, history, content_tokens_generated, in_think_block,
+                                                      top_k, top_p, min_p);
+                        }
 
                         position += M;
                         decode_step_idx_ += M;
@@ -4771,7 +4845,7 @@ public:
                         decode_step_idx_ += (accepted + 1);
 
                         if (accepted == 0) {
-                            draft_streak = -8;
+                            draft_streak = is_mtp ? 0 : -8;
                         } else {
                             draft_streak = std::min(draft_streak + accepted, 6);
                         }
@@ -4923,7 +4997,7 @@ private:
             }
             auto& info = tensor_map[name];
             std::string dtype = info.value("dtype", "");
-            if (dtype != "int4" && dtype != "int3") {
+            if (dtype != "int4" && dtype != "int3" && dtype != "fp4") {
                 return false;
             }
             int64_t offset = info["offset"].get<int64_t>();
@@ -4937,11 +5011,16 @@ private:
             if (info.contains("scale_offset")) {
                 int64_t scale_offset = info["scale_offset"].get<int64_t>();
                 int64_t scale_nbytes = info["scale_nbytes"].get<int64_t>();
-                gpu_s.dtype = info.value("scale_dtype", "bfloat16");
+                gpu_s.dtype = info.value("scale_dtype", dtype == "fp4" ? "F8_E8M0" : "bfloat16");
                 gpu_s.alloc(scale_nbytes);
                 CUDA_CHECK(cudaMemcpy(gpu_s.data, (char*)mapped + scale_offset, scale_nbytes, cudaMemcpyHostToDevice));
             }
             return true;
+        };
+
+        auto load_layer_weight = [&](GPUTensor& gpu_w, GPUTensor& gpu_s, const std::string& name) -> bool {
+            if (load_quant_tensor(gpu_w, gpu_s, name)) return true;
+            return load_tensor(gpu_w, name);
         };
 
         // Load global tensors
@@ -4968,6 +5047,12 @@ private:
                                     head_weight_.shape = embed_weight_.shape;
                                     head_weight_.alloc(embed_weight_.size_bytes);
                                     CUDA_CHECK(cudaMemcpy(head_weight_.data, embed_weight_.data, embed_weight_.size_bytes, cudaMemcpyDeviceToDevice));
+                                    if (embed_weight_scale_.data) {
+                                        head_weight_scale_.dtype = embed_weight_scale_.dtype;
+                                        head_weight_scale_.shape = embed_weight_scale_.shape;
+                                        head_weight_scale_.alloc(embed_weight_scale_.size_bytes);
+                                        CUDA_CHECK(cudaMemcpy(head_weight_scale_.data, embed_weight_scale_.data, embed_weight_scale_.size_bytes, cudaMemcpyDeviceToDevice));
+                                    }
                                 }
                             }
                         }
@@ -5015,11 +5100,11 @@ private:
                 }
 
                 // Check for Linear Attention (Gated DeltaNet) vs Full GQA Attention
-                if (load_quant_tensor(lw.w_in_qkv, lw.w_in_qkv_scale, lm_prefix + ".linear_attn.in_proj_qkv.weight") ||
-                    load_quant_tensor(lw.w_in_qkv, lw.w_in_qkv_scale, hf_prefix + ".linear_attn.in_proj_qkv.weight")) {
+                if (load_layer_weight(lw.w_in_qkv, lw.w_in_qkv_scale, lm_prefix + ".linear_attn.in_proj_qkv.weight") ||
+                    load_layer_weight(lw.w_in_qkv, lw.w_in_qkv_scale, hf_prefix + ".linear_attn.in_proj_qkv.weight")) {
                     lw.is_linear_attn = true;
-                    if (!load_quant_tensor(lw.w_in_z, lw.w_in_z_scale, lm_prefix + ".linear_attn.in_proj_z.weight")) {
-                        load_quant_tensor(lw.w_in_z, lw.w_in_z_scale, hf_prefix + ".linear_attn.in_proj_z.weight");
+                    if (!load_layer_weight(lw.w_in_z, lw.w_in_z_scale, lm_prefix + ".linear_attn.in_proj_z.weight")) {
+                        load_layer_weight(lw.w_in_z, lw.w_in_z_scale, hf_prefix + ".linear_attn.in_proj_z.weight");
                     }
                     if (!load_tensor(lw.w_in_a, lm_prefix + ".linear_attn.in_proj_a.weight")) {
                         load_tensor(lw.w_in_a, hf_prefix + ".linear_attn.in_proj_a.weight");
@@ -5039,32 +5124,32 @@ private:
                     if (!load_tensor(lw.linear_norm_w, lm_prefix + ".linear_attn.norm.weight")) {
                         load_tensor(lw.linear_norm_w, hf_prefix + ".linear_attn.norm.weight");
                     }
-                    if (!load_quant_tensor(lw.linear_out_proj, lw.linear_out_proj_scale, lm_prefix + ".linear_attn.out_proj.weight")) {
-                        load_quant_tensor(lw.linear_out_proj, lw.linear_out_proj_scale, hf_prefix + ".linear_attn.out_proj.weight");
+                    if (!load_layer_weight(lw.linear_out_proj, lw.linear_out_proj_scale, lm_prefix + ".linear_attn.out_proj.weight")) {
+                        load_layer_weight(lw.linear_out_proj, lw.linear_out_proj_scale, hf_prefix + ".linear_attn.out_proj.weight");
                     }
 
                     // Linear attention recurrent states managed in contiguous target_ssm_pool_
                 } else {
                     // Full GQA Projections
                     lw.is_linear_attn = false;
-                    if (!load_quant_tensor(lw.w_q, lw.w_q_scale, lm_prefix + ".self_attn.q_proj.weight")) {
-                        if (!load_quant_tensor(lw.w_q, lw.w_q_scale, hf_prefix + ".self_attn.q_proj.weight")) {
-                            load_quant_tensor(lw.w_q, lw.w_q_scale, alt_prefix + ".attn.q.weight");
+                    if (!load_layer_weight(lw.w_q, lw.w_q_scale, lm_prefix + ".self_attn.q_proj.weight")) {
+                        if (!load_layer_weight(lw.w_q, lw.w_q_scale, hf_prefix + ".self_attn.q_proj.weight")) {
+                            load_layer_weight(lw.w_q, lw.w_q_scale, alt_prefix + ".attn.q.weight");
                         }
                     }
-                    if (!load_quant_tensor(lw.w_k, lw.w_k_scale, lm_prefix + ".self_attn.k_proj.weight")) {
-                        if (!load_quant_tensor(lw.w_k, lw.w_k_scale, hf_prefix + ".self_attn.k_proj.weight")) {
-                            load_quant_tensor(lw.w_k, lw.w_k_scale, alt_prefix + ".attn.k.weight");
+                    if (!load_layer_weight(lw.w_k, lw.w_k_scale, lm_prefix + ".self_attn.k_proj.weight")) {
+                        if (!load_layer_weight(lw.w_k, lw.w_k_scale, hf_prefix + ".self_attn.k_proj.weight")) {
+                            load_layer_weight(lw.w_k, lw.w_k_scale, alt_prefix + ".attn.k.weight");
                         }
                     }
-                    if (!load_quant_tensor(lw.w_v, lw.w_v_scale, lm_prefix + ".self_attn.v_proj.weight")) {
-                        if (!load_quant_tensor(lw.w_v, lw.w_v_scale, hf_prefix + ".self_attn.v_proj.weight")) {
-                            load_quant_tensor(lw.w_v, lw.w_v_scale, alt_prefix + ".attn.v.weight");
+                    if (!load_layer_weight(lw.w_v, lw.w_v_scale, lm_prefix + ".self_attn.v_proj.weight")) {
+                        if (!load_layer_weight(lw.w_v, lw.w_v_scale, hf_prefix + ".self_attn.v_proj.weight")) {
+                            load_layer_weight(lw.w_v, lw.w_v_scale, alt_prefix + ".attn.v.weight");
                         }
                     }
-                    if (!load_quant_tensor(lw.w_o, lw.w_o_scale, lm_prefix + ".self_attn.o_proj.weight")) {
-                        if (!load_quant_tensor(lw.w_o, lw.w_o_scale, hf_prefix + ".self_attn.o_proj.weight")) {
-                            load_quant_tensor(lw.w_o, lw.w_o_scale, alt_prefix + ".attn.o.weight");
+                    if (!load_layer_weight(lw.w_o, lw.w_o_scale, lm_prefix + ".self_attn.o_proj.weight")) {
+                        if (!load_layer_weight(lw.w_o, lw.w_o_scale, hf_prefix + ".self_attn.o_proj.weight")) {
+                            load_layer_weight(lw.w_o, lw.w_o_scale, alt_prefix + ".attn.o.weight");
                         }
                     }
                     if (!load_tensor(lw.gqa_q_norm_w, lm_prefix + ".self_attn.q_norm.weight")) {
@@ -5085,19 +5170,19 @@ private:
                 }
 
                 // SwiGLU FFN Projections
-                if (!load_quant_tensor(lw.w_gate, lw.w_gate_scale, lm_prefix + ".mlp.gate_proj.weight")) {
-                    if (!load_quant_tensor(lw.w_gate, lw.w_gate_scale, hf_prefix + ".mlp.gate_proj.weight")) {
-                        load_quant_tensor(lw.w_gate, lw.w_gate_scale, alt_prefix + ".ffn.gate.weight");
+                if (!load_layer_weight(lw.w_gate, lw.w_gate_scale, lm_prefix + ".mlp.gate_proj.weight")) {
+                    if (!load_layer_weight(lw.w_gate, lw.w_gate_scale, hf_prefix + ".mlp.gate_proj.weight")) {
+                        load_layer_weight(lw.w_gate, lw.w_gate_scale, alt_prefix + ".ffn.gate.weight");
                     }
                 }
-                if (!load_quant_tensor(lw.w_up, lw.w_up_scale, lm_prefix + ".mlp.up_proj.weight")) {
-                    if (!load_quant_tensor(lw.w_up, lw.w_up_scale, hf_prefix + ".mlp.up_proj.weight")) {
-                        load_quant_tensor(lw.w_up, lw.w_up_scale, alt_prefix + ".ffn.up.weight");
+                if (!load_layer_weight(lw.w_up, lw.w_up_scale, lm_prefix + ".mlp.up_proj.weight")) {
+                    if (!load_layer_weight(lw.w_up, lw.w_up_scale, hf_prefix + ".mlp.up_proj.weight")) {
+                        load_layer_weight(lw.w_up, lw.w_up_scale, alt_prefix + ".ffn.up.weight");
                     }
                 }
-                if (!load_quant_tensor(lw.w_down, lw.w_down_scale, lm_prefix + ".mlp.down_proj.weight")) {
-                    if (!load_quant_tensor(lw.w_down, lw.w_down_scale, hf_prefix + ".mlp.down_proj.weight")) {
-                        load_quant_tensor(lw.w_down, lw.w_down_scale, alt_prefix + ".ffn.down.weight");
+                if (!load_layer_weight(lw.w_down, lw.w_down_scale, lm_prefix + ".mlp.down_proj.weight")) {
+                    if (!load_layer_weight(lw.w_down, lw.w_down_scale, hf_prefix + ".mlp.down_proj.weight")) {
+                        load_layer_weight(lw.w_down, lw.w_down_scale, alt_prefix + ".ffn.down.weight");
                     }
                 }
 
@@ -5105,7 +5190,7 @@ private:
                     LOG_INFO("  Loaded Qwen layer %d/%d (%s%s)",
                              l + 1, cfg_.num_hidden_layers,
                              lw.is_linear_attn ? "Linear Attention DeltaNet" : "Full GQA Attention",
-                             lw.w_gate.dtype == "int4" ? " [INT4]" : "");
+                             lw.w_gate.dtype == "fp4" ? " [FP4]" : (lw.w_gate.dtype == "int4" ? " [INT4]" : (lw.w_gate.dtype == "int3" ? " [INT3]" : (lw.w_gate.dtype == "BF16" || lw.w_gate.dtype == "bfloat16" ? " [BF16]" : ""))));
                 }
                 continue;
             }
@@ -5292,15 +5377,16 @@ private:
                 std::string draft_ids_path = mtp_model_dir + "/draft_vocab_ids.bin";
                 std::string draft_head_path = mtp_model_dir + "/draft_lm_head_int8_bf16.bin";
                 bool has_draft_head = (access(draft_ids_path.c_str(), R_OK) == 0 && access(draft_head_path.c_str(), R_OK) == 0);
-                if (head_weight_.dtype == "int4" && !has_draft_head) {
-                    LOG_WARN("MTP: Full lm_head is INT4 and no draft_lm_head_int8_bf16.bin found — skipping MTP");
+                if ((head_weight_.dtype == "int4" || head_weight_.dtype == "fp4") && !has_draft_head) {
+                    LOG_WARN("MTP: Full lm_head is %s and no draft_lm_head_int8_bf16.bin found — skipping MTP", head_weight_.dtype.c_str());
                 } else {
                     mtp_drafter_.load_mtp_weights(mapped, tensor_map, 
-                                                  embed_weight_.dtype == "int4" ? nullptr : embed_weight_.bf16(),
-                                                  embed_weight_.dtype == "int4" ? (uint8_t*)embed_weight_.data : nullptr,
-                                                  embed_weight_scale_.bf16(),
+                                                  (embed_weight_.dtype == "int4" || embed_weight_.dtype == "fp4") ? nullptr : embed_weight_.bf16(),
+                                                  (embed_weight_.dtype == "int4" || embed_weight_.dtype == "fp4") ? (uint8_t*)embed_weight_.data : nullptr,
+                                                  embed_weight_scale_.data,
                                                   embed_weight_.dtype == "int4",
-                                                  head_weight_.dtype == "int4" ? nullptr : head_weight_.bf16(),
+                                                  embed_weight_.dtype == "fp4",
+                                                  (head_weight_.dtype == "int4" || head_weight_.dtype == "fp4") ? nullptr : head_weight_.bf16(),
                                                   cfg_.vocab_size, mtp_model_dir, main_stream_);
                 }
             }
@@ -5379,6 +5465,10 @@ private:
         buf_input_pos_batch_.alloc(max_batch_m * sizeof(int32_t));
         buf_hidden_batch_.alloc(max_batch_m * dim * sizeof(__nv_bfloat16));
         buf_hidden2_batch_.alloc(max_batch_m * dim * sizeof(__nv_bfloat16));
+        int max_act_k = (int)std::max({(size_t)dim, (size_t)max_inter, (size_t)10240, (size_t)6144});
+        int max_act_m = 16;
+        buf_activation_fp4_.alloc((size_t)max_act_m * (max_act_k / 2));
+        buf_activation_scale_.alloc((size_t)max_act_m * (max_act_k / 32));
         buf_q_batch_.alloc(max_batch_m * std::max(10240, 2 * n_heads * head_dim_val) * sizeof(__nv_bfloat16));
         buf_gate_batch_.alloc(max_batch_m * max_inter * sizeof(__nv_bfloat16));
         buf_up_batch_.alloc(max_batch_m * max_inter * sizeof(__nv_bfloat16));
@@ -5687,7 +5777,9 @@ private:
         int inter_size = cfg_.intermediate_size > 0 ? cfg_.intermediate_size : cfg_.moe_intermediate_size;
 
         auto matmul_proj = [&](GPUTensor& out, GPUTensor& in_vec, GPUTensor& weight, GPUTensor& scale, int N, int K) {
-            if (weight.dtype == "int4") {
+            if (weight.dtype == "fp4") {
+                gemv_fp4_cuda(out.bf16(), in_vec.bf16(), (const uint8_t*)weight.data, (const uint8_t*)scale.data, N, K, main_stream_);
+            } else if (weight.dtype == "int4") {
                 gemv_int4_cuda(out.bf16(), in_vec.bf16(), (const uint8_t*)weight.data, scale.bf16(), N, K, main_stream_);
             } else if (weight.dtype == "int3") {
                 gemv_int3_cuda(out.bf16(), in_vec.bf16(), (const uint8_t*)weight.data, scale.bf16(), N, K, main_stream_);
@@ -5700,10 +5792,27 @@ private:
         rms_norm_one_centered_cuda(buf_hidden2_.bf16(), buf_hidden_.bf16(),
                                    lw.attn_norm_w.bf16(), dim, cfg_.rms_norm_eps, main_stream_);
 
+        if (is_blackwell_tc_active_) {
+            quantize_bf16_to_fp4_e2m1_cuda(buf_activation_fp4_.u8(), buf_activation_scale_.u8(),
+                                           buf_hidden2_.bf16(), 1, dim, main_stream_);
+        }
+
         if (lw.is_linear_attn) {
             // Qwen 3.8 Gated DeltaNet Linear Attention Projections
-            matmul_proj(buf_q_, buf_hidden2_, lw.w_in_qkv, lw.w_in_qkv_scale, 10240, dim);
-            matmul_proj(buf_up_, buf_hidden2_, lw.w_in_z, lw.w_in_z_scale, 6144, dim);
+            if (is_blackwell_tc_active_ && lw.w_in_qkv.dtype == "fp4") {
+                gemm_fp4_blackwell_tensorcore_cuda(buf_q_.bf16(), buf_activation_fp4_.u8(), buf_activation_scale_.u8(),
+                                                    (const uint8_t*)lw.w_in_qkv.data, (const uint8_t*)lw.w_in_qkv_scale.data,
+                                                    10240, dim, 1, main_stream_);
+            } else {
+                matmul_proj(buf_q_, buf_hidden2_, lw.w_in_qkv, lw.w_in_qkv_scale, 10240, dim);
+            }
+            if (is_blackwell_tc_active_ && lw.w_in_z.dtype == "fp4") {
+                gemm_fp4_blackwell_tensorcore_cuda(buf_up_.bf16(), buf_activation_fp4_.u8(), buf_activation_scale_.u8(),
+                                                    (const uint8_t*)lw.w_in_z.data, (const uint8_t*)lw.w_in_z_scale.data,
+                                                    6144, dim, 1, main_stream_);
+            } else {
+                matmul_proj(buf_up_, buf_hidden2_, lw.w_in_z, lw.w_in_z_scale, 6144, dim);
+            }
             gemv_bf16_out_bf16_cuda(buf_linear_a_.bf16(), lw.w_in_a.bf16(), buf_hidden2_.bf16(), 48, dim, main_stream_);
             gemv_bf16_out_bf16_cuda(buf_linear_b_.bf16(), lw.w_in_b.bf16(), buf_hidden2_.bf16(), 48, dim, main_stream_);
 
@@ -5723,7 +5832,19 @@ private:
                 16, 48, 128, main_stream_);
 
             // 4. Output Projection: in-place residual accumulation into buf_hidden_
-            if (lw.linear_out_proj.dtype == "int4") {
+            if (lw.linear_out_proj.dtype == "fp4") {
+                if (is_blackwell_tc_active_) {
+                    quantize_bf16_to_fp4_e2m1_cuda(buf_activation_fp4_.u8(), buf_activation_scale_.u8(),
+                                                   buf_attn_out_.bf16(), 1, 6144, main_stream_);
+                    gemm_fp4_residual_blackwell_tensorcore_cuda(buf_hidden_.bf16(), buf_activation_fp4_.u8(), buf_activation_scale_.u8(),
+                                                                (const uint8_t*)lw.linear_out_proj.data, (const uint8_t*)lw.linear_out_proj_scale.data,
+                                                                dim, 6144, 1, main_stream_);
+                } else {
+                    gemv_fp4_residual_cuda(buf_hidden_.bf16(), buf_attn_out_.bf16(),
+                                            (const uint8_t*)lw.linear_out_proj.data, (const uint8_t*)lw.linear_out_proj_scale.data,
+                                            dim, 6144, main_stream_);
+                }
+            } else if (lw.linear_out_proj.dtype == "int4") {
                 gemv_int4_residual_cuda(buf_hidden_.bf16(), buf_attn_out_.bf16(),
                                         (const uint8_t*)lw.linear_out_proj.data, lw.linear_out_proj_scale.bf16(),
                                         dim, 6144, main_stream_);
@@ -5733,9 +5854,27 @@ private:
             }
         } else {
             // Standard Full GQA Attention (Gated) Projections
-            matmul_proj(buf_q_, buf_hidden2_, lw.w_q, lw.w_q_scale, 2 * n_q_heads * head_dim, dim);
-            matmul_proj(buf_gate_, buf_hidden2_, lw.w_k, lw.w_k_scale, n_kv_heads * head_dim, dim);
-            matmul_proj(buf_up_, buf_hidden2_, lw.w_v, lw.w_v_scale, n_kv_heads * head_dim, dim);
+            if (is_blackwell_tc_active_ && lw.w_q.dtype == "fp4") {
+                gemm_fp4_blackwell_tensorcore_cuda(buf_q_.bf16(), buf_activation_fp4_.u8(), buf_activation_scale_.u8(),
+                                                    (const uint8_t*)lw.w_q.data, (const uint8_t*)lw.w_q_scale.data,
+                                                    2 * n_q_heads * head_dim, dim, 1, main_stream_);
+            } else {
+                matmul_proj(buf_q_, buf_hidden2_, lw.w_q, lw.w_q_scale, 2 * n_q_heads * head_dim, dim);
+            }
+            if (is_blackwell_tc_active_ && lw.w_k.dtype == "fp4") {
+                gemm_fp4_blackwell_tensorcore_cuda(buf_gate_.bf16(), buf_activation_fp4_.u8(), buf_activation_scale_.u8(),
+                                                    (const uint8_t*)lw.w_k.data, (const uint8_t*)lw.w_k_scale.data,
+                                                    n_kv_heads * head_dim, dim, 1, main_stream_);
+            } else {
+                matmul_proj(buf_gate_, buf_hidden2_, lw.w_k, lw.w_k_scale, n_kv_heads * head_dim, dim);
+            }
+            if (is_blackwell_tc_active_ && lw.w_v.dtype == "fp4") {
+                gemm_fp4_blackwell_tensorcore_cuda(buf_up_.bf16(), buf_activation_fp4_.u8(), buf_activation_scale_.u8(),
+                                                    (const uint8_t*)lw.w_v.data, (const uint8_t*)lw.w_v_scale.data,
+                                                    n_kv_heads * head_dim, dim, 1, main_stream_);
+            } else {
+                matmul_proj(buf_up_, buf_hidden2_, lw.w_v, lw.w_v_scale, n_kv_heads * head_dim, dim);
+            }
 
             // 3 & 4. QK Norm + RoPE + GQA FP8 Decode + Sigmoid Gate
             qwen_gqa_decode_gated_fp8_cuda(
@@ -5752,7 +5891,19 @@ private:
                 cfg_.rope_theta, cfg_.rms_norm_eps, main_stream_);
 
             // 5. Output Projection: in-place residual accumulation into buf_hidden_
-            if (lw.w_o.dtype == "int4") {
+            if (lw.w_o.dtype == "fp4") {
+                if (is_blackwell_tc_active_) {
+                    quantize_bf16_to_fp4_e2m1_cuda(buf_activation_fp4_.u8(), buf_activation_scale_.u8(),
+                                                   buf_attn_out_.bf16(), 1, n_q_heads * head_dim, main_stream_);
+                    gemm_fp4_residual_blackwell_tensorcore_cuda(buf_hidden_.bf16(), buf_activation_fp4_.u8(), buf_activation_scale_.u8(),
+                                                                (const uint8_t*)lw.w_o.data, (const uint8_t*)lw.w_o_scale.data,
+                                                                dim, n_q_heads * head_dim, 1, main_stream_);
+                } else {
+                    gemv_fp4_residual_cuda(buf_hidden_.bf16(), buf_attn_out_.bf16(),
+                                            (const uint8_t*)lw.w_o.data, (const uint8_t*)lw.w_o_scale.data,
+                                            dim, n_q_heads * head_dim, main_stream_);
+                }
+            } else if (lw.w_o.dtype == "int4") {
                 gemv_int4_residual_cuda(buf_hidden_.bf16(), buf_attn_out_.bf16(),
                                         (const uint8_t*)lw.w_o.data, lw.w_o_scale.bf16(),
                                         dim, n_q_heads * head_dim, main_stream_);
@@ -5767,7 +5918,21 @@ private:
                                    lw.ffn_norm_w.bf16(), dim, cfg_.rms_norm_eps, main_stream_);
 
         // 8 & 9. Gate & Up projections + Fused SiLU(Gate) * Up
-        if (lw.w_gate.dtype == "int4") {
+        if (lw.w_gate.dtype == "fp4") {
+            if (is_blackwell_tc_active_) {
+                quantize_bf16_to_fp4_e2m1_cuda(buf_activation_fp4_.u8(), buf_activation_scale_.u8(),
+                                               buf_hidden2_.bf16(), 1, dim, main_stream_);
+                gemm_fp4_swiglu_blackwell_tensorcore_cuda(buf_gate_.bf16(), buf_activation_fp4_.u8(), buf_activation_scale_.u8(),
+                                                          (const uint8_t*)lw.w_gate.data, (const uint8_t*)lw.w_gate_scale.data,
+                                                          (const uint8_t*)lw.w_up.data, (const uint8_t*)lw.w_up_scale.data,
+                                                          inter_size, dim, 1, cfg_.swiglu_limit, main_stream_);
+            } else {
+                gemv_fp4_swiglu_fused_cuda(buf_gate_.bf16(), buf_hidden2_.bf16(),
+                                            (const uint8_t*)lw.w_gate.data, (const uint8_t*)lw.w_gate_scale.data,
+                                            (const uint8_t*)lw.w_up.data, (const uint8_t*)lw.w_up_scale.data,
+                                            inter_size, dim, cfg_.swiglu_limit, main_stream_);
+            }
+        } else if (lw.w_gate.dtype == "int4") {
             gemv_int4_swiglu_fused_cuda(buf_gate_.bf16(), buf_hidden2_.bf16(),
                                         (const uint8_t*)lw.w_gate.data, lw.w_gate_scale.bf16(),
                                         (const uint8_t*)lw.w_up.data, lw.w_up_scale.bf16(),
@@ -5784,7 +5949,19 @@ private:
         }
 
         // 10. Down projection: in-place residual accumulation into buf_hidden_
-        if (lw.w_down.dtype == "int4") {
+        if (lw.w_down.dtype == "fp4") {
+            if (is_blackwell_tc_active_) {
+                quantize_bf16_to_fp4_e2m1_cuda(buf_activation_fp4_.u8(), buf_activation_scale_.u8(),
+                                               buf_gate_.bf16(), 1, inter_size, main_stream_);
+                gemm_fp4_residual_blackwell_tensorcore_cuda(buf_hidden_.bf16(), buf_activation_fp4_.u8(), buf_activation_scale_.u8(),
+                                                            (const uint8_t*)lw.w_down.data, (const uint8_t*)lw.w_down_scale.data,
+                                                            dim, inter_size, 1, main_stream_);
+            } else {
+                gemv_fp4_residual_cuda(buf_hidden_.bf16(), buf_gate_.bf16(),
+                                        (const uint8_t*)lw.w_down.data, (const uint8_t*)lw.w_down_scale.data,
+                                        dim, inter_size, main_stream_);
+            }
+        } else if (lw.w_down.dtype == "int4") {
             gemv_int4_residual_cuda(buf_hidden_.bf16(), buf_gate_.bf16(),
                                     (const uint8_t*)lw.w_down.data, lw.w_down_scale.bf16(),
                                     dim, inter_size, main_stream_);
@@ -5807,7 +5984,13 @@ private:
         int inter_size = cfg_.intermediate_size > 0 ? cfg_.intermediate_size : cfg_.moe_intermediate_size;
 
         auto matmul_proj_batch = [&](GPUTensor& out, GPUTensor& in_vec, GPUTensor& weight, GPUTensor& scale, int N, int K) {
-            if (weight.dtype == "int4") {
+            if (weight.dtype == "fp4") {
+                if (M == 1) {
+                    gemv_fp4_cuda(out.bf16(), in_vec.bf16(), (const uint8_t*)weight.data, (const uint8_t*)scale.data, N, K, main_stream_);
+                } else {
+                    gemm_fp4_batch_cuda(out.bf16(), in_vec.bf16(), (const uint8_t*)weight.data, (const uint8_t*)scale.data, N, K, M, main_stream_);
+                }
+            } else if (weight.dtype == "int4") {
                 gemm_int4_batch_cuda(out.bf16(), in_vec.bf16(), (const uint8_t*)weight.data, scale.bf16(), N, K, M, main_stream_);
             } else if (weight.dtype == "int3") {
                 if (M == 1) {
@@ -5826,10 +6009,27 @@ private:
         rms_norm_one_centered_cuda_batched(buf_hidden2_batch_.bf16(), buf_hidden_batch_.bf16(),
                                            lw.attn_norm_w.bf16(), M, dim, cfg_.rms_norm_eps, main_stream_);
 
+        if (is_blackwell_tc_active_) {
+            quantize_bf16_to_fp4_e2m1_cuda(buf_activation_fp4_.u8(), buf_activation_scale_.u8(),
+                                           buf_hidden2_batch_.bf16(), M, dim, main_stream_);
+        }
+
         if (lw.is_linear_attn) {
             // Qwen 3.8 Gated DeltaNet Linear Attention Projections for M tokens
-            matmul_proj_batch(buf_q_batch_, buf_hidden2_batch_, lw.w_in_qkv, lw.w_in_qkv_scale, 10240, dim);
-            matmul_proj_batch(buf_up_batch_, buf_hidden2_batch_, lw.w_in_z, lw.w_in_z_scale, 6144, dim);
+            if (is_blackwell_tc_active_ && lw.w_in_qkv.dtype == "fp4") {
+                gemm_fp4_blackwell_tensorcore_cuda(buf_q_batch_.bf16(), buf_activation_fp4_.u8(), buf_activation_scale_.u8(),
+                                                    (const uint8_t*)lw.w_in_qkv.data, (const uint8_t*)lw.w_in_qkv_scale.data,
+                                                    10240, dim, M, main_stream_);
+            } else {
+                matmul_proj_batch(buf_q_batch_, buf_hidden2_batch_, lw.w_in_qkv, lw.w_in_qkv_scale, 10240, dim);
+            }
+            if (is_blackwell_tc_active_ && lw.w_in_z.dtype == "fp4") {
+                gemm_fp4_blackwell_tensorcore_cuda(buf_up_batch_.bf16(), buf_activation_fp4_.u8(), buf_activation_scale_.u8(),
+                                                    (const uint8_t*)lw.w_in_z.data, (const uint8_t*)lw.w_in_z_scale.data,
+                                                    6144, dim, M, main_stream_);
+            } else {
+                matmul_proj_batch(buf_up_batch_, buf_hidden2_batch_, lw.w_in_z, lw.w_in_z_scale, 6144, dim);
+            }
             gemv_bf16_out_bf16_batch_cuda(buf_linear_a_batch_.bf16(), lw.w_in_a.bf16(), buf_hidden2_batch_.bf16(), 48, dim, M, main_stream_);
             gemv_bf16_out_bf16_batch_cuda(buf_linear_b_batch_.bf16(), lw.w_in_b.bf16(), buf_hidden2_batch_.bf16(), 48, dim, M, main_stream_);
 
@@ -5859,12 +6059,49 @@ private:
                 16, 48, 128, M, main_stream_);
 
             // Output projection: [M, 6144] -> [M, 5120]
-            matmul_proj_batch(buf_hidden2_batch_, buf_attn_out_batch_, lw.linear_out_proj, lw.linear_out_proj_scale, dim, 6144);
+            if (lw.linear_out_proj.dtype == "fp4") {
+                if (is_blackwell_tc_active_) {
+                    quantize_bf16_to_fp4_e2m1_cuda(buf_activation_fp4_.u8(), buf_activation_scale_.u8(),
+                                                   buf_attn_out_batch_.bf16(), M, 6144, main_stream_);
+                    gemm_fp4_residual_blackwell_tensorcore_cuda(buf_hidden_batch_.bf16(), buf_activation_fp4_.u8(), buf_activation_scale_.u8(),
+                                                                (const uint8_t*)lw.linear_out_proj.data, (const uint8_t*)lw.linear_out_proj_scale.data,
+                                                                dim, 6144, M, main_stream_);
+                } else if (M == 1) {
+                    gemv_fp4_residual_cuda(buf_hidden_batch_.bf16(), buf_attn_out_batch_.bf16(),
+                                           (const uint8_t*)lw.linear_out_proj.data, (const uint8_t*)lw.linear_out_proj_scale.data,
+                                           dim, 6144, main_stream_);
+                } else {
+                    gemm_fp4_residual_batch_cuda(buf_hidden_batch_.bf16(), buf_attn_out_batch_.bf16(),
+                                                 (const uint8_t*)lw.linear_out_proj.data, (const uint8_t*)lw.linear_out_proj_scale.data,
+                                                 dim, 6144, M, main_stream_);
+                }
+            } else {
+                matmul_proj_batch(buf_hidden2_batch_, buf_attn_out_batch_, lw.linear_out_proj, lw.linear_out_proj_scale, dim, 6144);
+                vector_add_bf16_cuda(buf_hidden_batch_.bf16(), buf_hidden2_batch_.bf16(), M * dim, main_stream_);
+            }
         } else {
             // Full GQA Attention Projections for M tokens
-            matmul_proj_batch(buf_q_batch_, buf_hidden2_batch_, lw.w_q, lw.w_q_scale, 2 * n_q_heads * head_dim, dim);
-            matmul_proj_batch(buf_gate_batch_, buf_hidden2_batch_, lw.w_k, lw.w_k_scale, n_kv_heads * head_dim, dim);
-            matmul_proj_batch(buf_up_batch_, buf_hidden2_batch_, lw.w_v, lw.w_v_scale, n_kv_heads * head_dim, dim);
+            if (is_blackwell_tc_active_ && lw.w_q.dtype == "fp4") {
+                gemm_fp4_blackwell_tensorcore_cuda(buf_q_batch_.bf16(), buf_activation_fp4_.u8(), buf_activation_scale_.u8(),
+                                                    (const uint8_t*)lw.w_q.data, (const uint8_t*)lw.w_q_scale.data,
+                                                    2 * n_q_heads * head_dim, dim, M, main_stream_);
+            } else {
+                matmul_proj_batch(buf_q_batch_, buf_hidden2_batch_, lw.w_q, lw.w_q_scale, 2 * n_q_heads * head_dim, dim);
+            }
+            if (is_blackwell_tc_active_ && lw.w_k.dtype == "fp4") {
+                gemm_fp4_blackwell_tensorcore_cuda(buf_gate_batch_.bf16(), buf_activation_fp4_.u8(), buf_activation_scale_.u8(),
+                                                    (const uint8_t*)lw.w_k.data, (const uint8_t*)lw.w_k_scale.data,
+                                                    n_kv_heads * head_dim, dim, M, main_stream_);
+            } else {
+                matmul_proj_batch(buf_gate_batch_, buf_hidden2_batch_, lw.w_k, lw.w_k_scale, n_kv_heads * head_dim, dim);
+            }
+            if (is_blackwell_tc_active_ && lw.w_v.dtype == "fp4") {
+                gemm_fp4_blackwell_tensorcore_cuda(buf_up_batch_.bf16(), buf_activation_fp4_.u8(), buf_activation_scale_.u8(),
+                                                    (const uint8_t*)lw.w_v.data, (const uint8_t*)lw.w_v_scale.data,
+                                                    n_kv_heads * head_dim, dim, M, main_stream_);
+            } else {
+                matmul_proj_batch(buf_up_batch_, buf_hidden2_batch_, lw.w_v, lw.w_v_scale, n_kv_heads * head_dim, dim);
+            }
 
             qwen_gqa_decode_gated_fp8_batch_cuda(
                 buf_attn_out_batch_.bf16(),
@@ -5882,16 +6119,52 @@ private:
                 cfg_.max_seq_len,
                 cfg_.rope_theta, cfg_.rms_norm_eps, main_stream_);
 
-            matmul_proj_batch(buf_hidden2_batch_, buf_attn_out_batch_, lw.w_o, lw.w_o_scale, dim, n_q_heads * head_dim);
+            if (lw.w_o.dtype == "fp4") {
+                if (is_blackwell_tc_active_) {
+                    quantize_bf16_to_fp4_e2m1_cuda(buf_activation_fp4_.u8(), buf_activation_scale_.u8(),
+                                                   buf_attn_out_batch_.bf16(), M, n_q_heads * head_dim, main_stream_);
+                    gemm_fp4_residual_blackwell_tensorcore_cuda(buf_hidden_batch_.bf16(), buf_activation_fp4_.u8(), buf_activation_scale_.u8(),
+                                                                (const uint8_t*)lw.w_o.data, (const uint8_t*)lw.w_o_scale.data,
+                                                                dim, n_q_heads * head_dim, M, main_stream_);
+                } else if (M == 1) {
+                    gemv_fp4_residual_cuda(buf_hidden_batch_.bf16(), buf_attn_out_batch_.bf16(),
+                                           (const uint8_t*)lw.w_o.data, (const uint8_t*)lw.w_o_scale.data,
+                                           dim, n_q_heads * head_dim, main_stream_);
+                } else {
+                    gemm_fp4_residual_batch_cuda(buf_hidden_batch_.bf16(), buf_attn_out_batch_.bf16(),
+                                                 (const uint8_t*)lw.w_o.data, (const uint8_t*)lw.w_o_scale.data,
+                                                 dim, n_q_heads * head_dim, M, main_stream_);
+                }
+            } else {
+                matmul_proj_batch(buf_hidden2_batch_, buf_attn_out_batch_, lw.w_o, lw.w_o_scale, dim, n_q_heads * head_dim);
+                vector_add_bf16_cuda(buf_hidden_batch_.bf16(), buf_hidden2_batch_.bf16(), M * dim, main_stream_);
+            }
         }
 
-        // Residual connection: buf_hidden_ += buf_hidden2_
-        vector_add_bf16_cuda(buf_hidden_batch_.bf16(), buf_hidden2_batch_.bf16(), M * dim, main_stream_);
         rms_norm_one_centered_cuda_batched(buf_hidden2_batch_.bf16(), buf_hidden_batch_.bf16(),
                                            lw.ffn_norm_w.bf16(), M, dim, cfg_.rms_norm_eps, main_stream_);
 
         // FFN SwiGLU for M tokens simultaneously:
-        if (lw.w_gate.dtype == "int4") {
+        if (lw.w_gate.dtype == "fp4") {
+            if (is_blackwell_tc_active_) {
+                quantize_bf16_to_fp4_e2m1_cuda(buf_activation_fp4_.u8(), buf_activation_scale_.u8(),
+                                               buf_hidden2_batch_.bf16(), M, dim, main_stream_);
+                gemm_fp4_swiglu_blackwell_tensorcore_cuda(buf_gate_batch_.bf16(), buf_activation_fp4_.u8(), buf_activation_scale_.u8(),
+                                                          (const uint8_t*)lw.w_gate.data, (const uint8_t*)lw.w_gate_scale.data,
+                                                          (const uint8_t*)lw.w_up.data, (const uint8_t*)lw.w_up_scale.data,
+                                                          inter_size, dim, M, cfg_.swiglu_limit, main_stream_);
+            } else if (M == 1) {
+                gemv_fp4_swiglu_fused_cuda(buf_gate_batch_.bf16(), buf_hidden2_batch_.bf16(),
+                                           (const uint8_t*)lw.w_gate.data, (const uint8_t*)lw.w_gate_scale.data,
+                                           (const uint8_t*)lw.w_up.data, (const uint8_t*)lw.w_up_scale.data,
+                                           inter_size, dim, cfg_.swiglu_limit, main_stream_);
+            } else {
+                gemm_fp4_swiglu_fused_batch_cuda(buf_gate_batch_.bf16(), buf_hidden2_batch_.bf16(),
+                                                  (const uint8_t*)lw.w_gate.data, (const uint8_t*)lw.w_gate_scale.data,
+                                                  (const uint8_t*)lw.w_up.data, (const uint8_t*)lw.w_up_scale.data,
+                                                  inter_size, dim, M, cfg_.swiglu_limit, main_stream_);
+            }
+        } else if (lw.w_gate.dtype == "int4") {
             gemm_int4_swiglu_fused_batch_cuda(buf_gate_batch_.bf16(), buf_hidden2_batch_.bf16(),
                                               (const uint8_t*)lw.w_gate.data, lw.w_gate_scale.bf16(),
                                               (const uint8_t*)lw.w_up.data, lw.w_up_scale.bf16(),
@@ -5911,10 +6184,28 @@ private:
         }
 
         // Down projection: [M, inter_size] -> [M, dim]
-        matmul_proj_batch(buf_hidden2_batch_, buf_gate_batch_, lw.w_down, lw.w_down_scale, dim, inter_size);
+        if (lw.w_down.dtype == "fp4") {
+            if (is_blackwell_tc_active_) {
+                quantize_bf16_to_fp4_e2m1_cuda(buf_activation_fp4_.u8(), buf_activation_scale_.u8(),
+                                               buf_gate_batch_.bf16(), M, inter_size, main_stream_);
+                gemm_fp4_residual_blackwell_tensorcore_cuda(buf_hidden_batch_.bf16(), buf_activation_fp4_.u8(), buf_activation_scale_.u8(),
+                                                            (const uint8_t*)lw.w_down.data, (const uint8_t*)lw.w_down_scale.data,
+                                                            dim, inter_size, M, main_stream_);
+            } else if (M == 1) {
+                gemv_fp4_residual_cuda(buf_hidden_batch_.bf16(), buf_gate_batch_.bf16(),
+                                       (const uint8_t*)lw.w_down.data, (const uint8_t*)lw.w_down_scale.data,
+                                       dim, inter_size, main_stream_);
+            } else {
+                gemm_fp4_residual_batch_cuda(buf_hidden_batch_.bf16(), buf_gate_batch_.bf16(),
+                                             (const uint8_t*)lw.w_down.data, (const uint8_t*)lw.w_down_scale.data,
+                                             dim, inter_size, M, main_stream_);
+            }
+        } else {
+            matmul_proj_batch(buf_hidden2_batch_, buf_gate_batch_, lw.w_down, lw.w_down_scale, dim, inter_size);
 
-        // Residual connection: buf_hidden_ += buf_hidden2_
-        vector_add_bf16_cuda(buf_hidden_batch_.bf16(), buf_hidden2_batch_.bf16(), M * dim, main_stream_);
+            // Residual connection: buf_hidden_ += buf_hidden2_
+            vector_add_bf16_cuda(buf_hidden_batch_.bf16(), buf_hidden2_batch_.bf16(), M * dim, main_stream_);
+        }
     }
 
     bool batch_graph_captured_[9] = {false};
@@ -5924,7 +6215,9 @@ private:
     void forward_token_batch_qwen_device_body(int position, int M, bool compute_logits = true) {
         int dim = cfg_.hidden_size;
         // 1. Embedding lookup for M tokens
-        if (embed_weight_.dtype == "int4") {
+        if (embed_weight_.dtype == "fp4") {
+            embedding_fp4_cuda(buf_hidden_batch_.bf16(), (const uint8_t*)embed_weight_.data, (const uint8_t*)embed_weight_scale_.data, buf_input_tokens_batch_.i32(), M, dim, main_stream_);
+        } else if (embed_weight_.dtype == "int4") {
             embedding_int4_cuda(buf_hidden_batch_.bf16(), (uint8_t*)embed_weight_.data, embed_weight_scale_.bf16(), buf_input_tokens_batch_.i32(), M, dim, main_stream_);
         } else {
             embedding_cuda(buf_hidden_batch_.bf16(), embed_weight_.bf16(), buf_input_tokens_batch_.i32(), M, dim, main_stream_);
@@ -5956,7 +6249,19 @@ private:
                                            norm_weight_.bf16(), M, dim, cfg_.rms_norm_eps, main_stream_);
 
         // 4. Logits: hidden @ head_weight.T -> [M, vocab_size] in F32
-        if (head_weight_scale_.data) {
+        if (head_weight_.dtype == "fp4") {
+            if (is_blackwell_tc_active_) {
+                quantize_bf16_to_fp4_e2m1_cuda(buf_activation_fp4_.u8(), buf_activation_scale_.u8(),
+                                               buf_hidden_batch_.bf16(), M, dim, main_stream_);
+                gemm_fp4_f32_blackwell_tensorcore_cuda(buf_logits_batch_.f32(), buf_activation_fp4_.u8(), buf_activation_scale_.u8(),
+                                                       (const uint8_t*)head_weight_.data, (const uint8_t*)head_weight_scale_.data,
+                                                       cfg_.vocab_size, dim, M, main_stream_);
+            } else {
+                gemm_fp4_f32_batch_cuda(buf_logits_batch_.f32(), buf_hidden_batch_.bf16(),
+                                         (const uint8_t*)head_weight_.data, (const uint8_t*)head_weight_scale_.data,
+                                         cfg_.vocab_size, dim, M, main_stream_);
+            }
+        } else if (head_weight_scale_.data) {
             gemm_int4_f32_batch_cuda(buf_logits_batch_.f32(), buf_hidden_batch_.bf16(),
                                      (const uint8_t*)head_weight_.data, head_weight_scale_.bf16(),
                                      cfg_.vocab_size, dim, M, main_stream_);
@@ -6786,7 +7091,19 @@ private:
         int dim = cfg_.hidden_size;
         int vocab = cfg_.vocab_size;
 
-        if (head_weight_.dtype == "int4") {
+        if (head_weight_.dtype == "fp4") {
+            if (is_blackwell_tc_active_) {
+                quantize_bf16_to_fp4_e2m1_cuda(buf_activation_fp4_.u8(), buf_activation_scale_.u8(),
+                                               buf_hidden_.bf16(), 1, dim, main_stream_);
+                gemm_fp4_f32_blackwell_tensorcore_cuda(buf_logits_.f32(), buf_activation_fp4_.u8(), buf_activation_scale_.u8(),
+                                                       (const uint8_t*)head_weight_.data, (const uint8_t*)head_weight_scale_.data,
+                                                       vocab, dim, 1, main_stream_);
+            } else {
+                gemv_fp4_f32_cuda(buf_logits_.f32(), buf_hidden_.bf16(),
+                                   (const uint8_t*)head_weight_.data, (const uint8_t*)head_weight_scale_.data,
+                                   vocab, dim, main_stream_);
+            }
+        } else if (head_weight_.dtype == "int4") {
             gemv_int4_f32_cuda(buf_logits_.f32(), buf_hidden_.bf16(),
                                (const uint8_t*)head_weight_.data, head_weight_scale_.bf16(),
                                vocab, dim, main_stream_);
@@ -6795,6 +7112,7 @@ private:
             gemv_bf16_cuda(buf_logits_.f32(), head_weight_.bf16(), buf_hidden_.bf16(), vocab, dim, main_stream_);
         }
         argmax_f32_cuda(buf_argmax_out_.i32(), buf_logits_.f32(), vocab, main_stream_);
+        argmax_cache_valid_ = true;
     }
 
     // ── Batched Prefill for DeepSeek V4 Flash MoE (All-Resident Mode) ────────
@@ -7178,9 +7496,10 @@ private:
         }
 
         if (temperature <= 0.0f) {
-            if (logits_ptr != buf_logits_.f32() || !graph_captured_) {
+            if (logits_ptr != buf_logits_.f32() || !graph_captured_ || !argmax_cache_valid_) {
                 argmax_f32_cuda(buf_argmax_out_.i32(), logits_ptr, vocab, main_stream_);
             }
+            argmax_cache_valid_ = false;
             CUDA_CHECK(cudaMemcpyAsync(h_sample_pin, buf_argmax_out_.i32(), sizeof(int32_t), cudaMemcpyDeviceToHost, main_stream_));
             CUDA_CHECK(cudaStreamSynchronize(main_stream_));
             return *h_sample_pin;
@@ -8087,6 +8406,46 @@ static std::string update_system_prompt_with_tools(const std::string& original_c
     return content;
 }
 
+static std::string get_message_content_string(const json& msg) {
+    if (!msg.is_object() || !msg.contains("content")) return "";
+    const auto& c = msg["content"];
+    if (c.is_string()) {
+        return c.get<std::string>();
+    }
+    if (c.is_array()) {
+        std::string res;
+        for (const auto& part : c) {
+            if (part.is_string()) {
+                res += part.get<std::string>();
+            } else if (part.is_object()) {
+                std::string ptype = part.value("type", "text");
+                if (ptype == "text") {
+                    res += part.value("text", "");
+                }
+            }
+        }
+        return res;
+    }
+    return "";
+}
+
+static bool message_has_image(const json& msg) {
+    if (!msg.is_object()) return false;
+    if (msg.contains("image") && !msg["image"].is_null()) return true;
+    if (msg.contains("image_url") && !msg["image_url"].is_null()) return true;
+    if (msg.contains("content") && msg["content"].is_array()) {
+        for (const auto& part : msg["content"]) {
+            if (part.is_object()) {
+                std::string ptype = part.value("type", "");
+                if (ptype == "image" || ptype == "image_url" || part.contains("image") || part.contains("image_url")) {
+                    return true;
+                }
+            }
+        }
+    }
+    return false;
+}
+
 struct MultimodalPrompt {
     std::vector<int> prompt;
     std::string image_b64;
@@ -8145,12 +8504,20 @@ static MultimodalPrompt apply_chat_template_multimodal(
                             std::string ptype = part.value("type", "text");
                             if (ptype == "text") {
                                 content_str += part.value("text", "");
-                            } else if (ptype == "image_url" && part.contains("image_url")) {
+                            } else if ((ptype == "image_url" || ptype == "image") || part.contains("image_url") || part.contains("image")) {
                                 std::string url;
-                                if (part["image_url"].is_string()) {
-                                    url = part["image_url"].get<std::string>();
-                                } else if (part["image_url"].is_object()) {
-                                    url = part["image_url"].value("url", "");
+                                if (part.contains("image_url")) {
+                                    if (part["image_url"].is_string()) {
+                                        url = part["image_url"].get<std::string>();
+                                    } else if (part["image_url"].is_object()) {
+                                        url = part["image_url"].value("url", "");
+                                    }
+                                } else if (part.contains("image")) {
+                                    if (part["image"].is_string()) {
+                                        url = part["image"].get<std::string>();
+                                    } else if (part["image"].is_object()) {
+                                        url = part["image"].value("url", "");
+                                    }
                                 }
                                 if (!url.empty()) {
                                     size_t b64_pos = url.find("base64,");
@@ -8288,7 +8655,7 @@ static MultimodalPrompt apply_chat_template_multimodal(
 
     for (size_t i = 0; i < messages.size(); i++) {
         std::string role = messages[i].value("role", "user");
-        std::string content = messages[i].value("content", "");
+        std::string content = get_message_content_string(messages[i]);
 
         if (role == "system") {
             std::string sys_body = content;
@@ -9165,7 +9532,7 @@ static std::vector<int> build_continuation_prompt(
         result.insert(result.end(), nl.begin(), nl.end());
         for (const auto& msg : new_messages) {
             std::string role = msg.value("role", "user");
-            std::string content = msg.value("content", "");
+            std::string content = get_message_content_string(msg);
             result.push_back(IM_START);
             if (role == "tool" || role == "function") {
                 auto u_enc = tok.encode("user\n<tool_response>\n" + content + "\n</tool_response>");
@@ -9208,7 +9575,7 @@ static std::vector<int> build_continuation_prompt(
         result.push_back(EOS);
         for (const auto& msg : new_messages) {
             std::string role = msg.value("role", "user");
-            std::string content = msg.value("content", "");
+            std::string content = get_message_content_string(msg);
             result.push_back(USER);
             if (role == "tool" || role == "function") {
                 auto enc = tok.encode("<tool_response>\n" + content + "\n</tool_response>");
@@ -9256,8 +9623,8 @@ static bool check_and_build_continuation(
 
     // Check if previous assistant message matches
     if (prev_len > 0) {
-        std::string cur_asst = current_messages[prev_len - 1].value("content", "");
-        std::string last_asst = last_conv_messages[prev_len - 1].value("content", "");
+        std::string cur_asst = get_message_content_string(current_messages[prev_len - 1]);
+        std::string last_asst = get_message_content_string(last_conv_messages[prev_len - 1]);
         if (!cur_asst.empty() && !last_asst.empty() && cur_asst != last_asst) {
             return false;
         }
@@ -9268,6 +9635,11 @@ static bool check_and_build_continuation(
     for (size_t i = prev_len; i < current_messages.size(); i++) {
         std::string role = current_messages[i].value("role", "");
         if (role != "user" && role != "tool" && role != "function") {
+            return false;
+        }
+        // If any incoming message has multimodal image content, bypass text-only continuation
+        // so that the Vision Tower can process the image and embed visual tokens
+        if (message_has_image(current_messages[i])) {
             return false;
         }
         new_msgs.push_back(current_messages[i]);
@@ -9320,7 +9692,7 @@ static json prune_messages_to_fit(
         size_t largest_idx = 0;
         size_t largest_len = 0;
         for (size_t i = min_idx; i < pruned.size(); i++) {
-            std::string content = pruned[i].value("content", "");
+            std::string content = get_message_content_string(pruned[i]);
             if (content.size() > largest_len) {
                 largest_len = content.size();
                 largest_idx = i;
@@ -9328,7 +9700,7 @@ static json prune_messages_to_fit(
         }
         if (largest_len < 300) break; // Cannot truncate safely further
 
-        std::string content = pruned[largest_idx].value("content", "");
+        std::string content = get_message_content_string(pruned[largest_idx]);
         size_t keep_len = (content.size() * 3) / 4;
         std::string notice = "\n[... Content truncated to fit context window ...]\n";
         if (keep_len > notice.size()) {
@@ -11181,6 +11553,8 @@ static void run_server(MoecherEngine& engine, int port, int default_thinking_bud
                         time_t created_time = std::chrono::system_clock::to_time_t(std::chrono::system_clock::now());
                         std::string created_time_str = std::to_string(created_time);
 
+                        try {
+
                         json initial_chunk = {
                             {"id", req_id},
                             {"object", "chat.completion.chunk"},
@@ -12026,10 +12400,17 @@ static void run_server(MoecherEngine& engine, int port, int default_thinking_bud
                             engine.save_expert_profile(engine.model_dir_);
                         }
                         return true;
+                        } catch (const std::exception& e) {
+                            LOG_ERROR("[Streaming] Exception during request execution: %s", e.what());
+                            send_sse_delta(sink, req_id, model_id, created_time_str, "content", std::string("\n\n[Server Error: ") + e.what() + "]\n");
+                            sink.done();
+                            return false;
+                        }
                     }
                 );
             } else {
-                std::string final_response_text;
+                try {
+                    std::string final_response_text;
                 std::vector<moecher::tooling::ToolCall> emitted_tool_calls;
                 json current_messages = messages;
                 std::string finish_reason = "stop";
@@ -12305,6 +12686,12 @@ static void run_server(MoecherEngine& engine, int port, int default_thinking_bud
                         conv_to_save.push_back({{"role", "assistant"}, {"content", final_response_text}});
                     }
                     s_last_conv_messages = conv_to_save;
+                }
+                } catch (const std::exception& e) {
+                    LOG_ERROR("[Completion] Exception during request execution: %s", e.what());
+                    json err_resp = {{"error", {{"message", e.what()}, {"type", "server_error"}}}};
+                    res.status = 500;
+                    res.set_content(err_resp.dump(), "application/json");
                 }
             }
             auto end = std::chrono::steady_clock::now();

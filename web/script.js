@@ -5678,21 +5678,25 @@ function initMCPUI() {
 // ════════════════════════════════════════════════════════════════════════════════
 
 function is3DContent(code, lang) {
-    if (!code) return false;
-    const l = (lang || '').toLowerCase();
-    if (l === 'three' || l === 'threejs' || l === '3d') return true;
+    if (!code || typeof code !== 'string') return false;
 
-    // Check Three.js script tags, CDNs or ES module imports
-    if (/three(?:\.min)?\.js/i.test(code) || /from\s+['"]three['"]/i.test(code) || /three@[\d.]+/i.test(code)) {
+    const trimmed = code.trim();
+    if (trimmed.length < 20) return false;
+
+    // Check for an explicit 3D scene/model creation function (createScene, createModel, initModel)
+    const funcPattern = /(?:(?:export\s+(?:default\s+)?)?(?:async\s+)?function\s+(?:createModel|createScene|initModel)\s*\(|(?:const|let|var)\s+(?:createModel|createScene|initModel)\s*=\s*(?:async\s*)?(?:function\b|\([^)]*\)\s*=>|[a-zA-Z0-9_$]+\s*=>))/i;
+    if (funcPattern.test(trimmed)) {
+        // Ensure the function body actually references 3D constructs (THREE, scene, helpers, geometry, mesh)
+        if (/\b(?:THREE|scene|helpers|geometry|material|mesh)\b/i.test(trimmed)) {
+            return true;
+        }
+    }
+
+    // Direct scene construction fallback: explicit scene.add(...) with new THREE.* objects
+    if (/\bscene\.add\s*\(/.test(trimmed) && (/\bnew\s+THREE\./.test(trimmed) || /\bTHREE\.(?:Mesh|Group|Points|Line|LineSegments)\b/.test(trimmed))) {
         return true;
     }
 
-    // Check Three.js APIs, objects, geometries, materials
-    if (code.includes('createModel') || 
-        /THREE\.(?:Mesh|Scene|BoxGeometry|SphereGeometry|CylinderGeometry|BufferGeometry|PlaneGeometry|TorusGeometry|ConeGeometry|Group|WebGLRenderer|PerspectiveCamera|MeshStandardMaterial|MeshBasicMaterial|MeshPhongMaterial)/.test(code) ||
-        (code.includes('THREE.') && /scene\.add\s*\(/.test(code))) {
-        return true;
-    }
     return false;
 }
 
@@ -5947,7 +5951,27 @@ const ThreeStudio = {
          * Creates a tube along a 3D curve with sealed hemispherical/disc end caps.
          * Solves the open-ended tube problem for handles, spouts, wires, and pipes.
          */
-        createCappedTube(curve, tubularSegments = 64, radius = 0.1, radialSegments = 16, closed = false) {
+        createCappedTube(curveOrRadius, tubularSegmentsOrHeight = 64, radiusOrMat = 0.1, radialSegments = 16, closed = false, targetScene = null) {
+            // Handle numeric cylinder / capped tube invocation: helpers.createCappedTube(radius, height, material, scene)
+            if (typeof curveOrRadius === 'number') {
+                const radius = Math.max(0.01, curveOrRadius);
+                const height = typeof tubularSegmentsOrHeight === 'number' ? Math.max(0.01, tubularSegmentsOrHeight) : 1.0;
+                const mat = (radiusOrMat && (radiusOrMat.isMaterial || (typeof radiusOrMat === 'object' && !radiusOrMat.isBufferGeometry && !radiusOrMat.isGeometry))) ? radiusOrMat : null;
+                const radSegs = typeof radialSegments === 'number' ? radialSegments : 24;
+                const cylGeom = new THREE.CylinderGeometry(radius, radius, height, radSegs, 1, false);
+                cylGeom.computeVertexNormals();
+                if (mat) {
+                    const mesh = new THREE.Mesh(cylGeom, mat);
+                    const sceneToAdd = (targetScene && typeof targetScene.add === 'function') ? targetScene : ((closed && typeof closed.add === 'function') ? closed : null);
+                    if (sceneToAdd) sceneToAdd.add(mesh);
+                    return mesh;
+                }
+                return cylGeom;
+            }
+
+            const curve = curveOrRadius;
+            const tubularSegments = typeof tubularSegmentsOrHeight === 'number' ? tubularSegmentsOrHeight : 64;
+            const radius = typeof radiusOrMat === 'number' ? radiusOrMat : 0.1;
             const tubeGeom = new THREE.TubeGeometry(curve, tubularSegments, radius, radialSegments, closed);
             if (closed) {
                 tubeGeom.computeVertexNormals();
@@ -6277,9 +6301,12 @@ const ThreeStudio = {
         /**
          * Creates and returns a named THREE.Mesh.
          */
-        createPart(name, geometry, material) {
+        createPart(name, geometry, material, targetScene) {
             const mesh = new THREE.Mesh(geometry, material || this.createPBRMaterial());
             if (name) mesh.name = name;
+            if (targetScene && typeof targetScene.add === 'function') {
+                targetScene.add(mesh);
+            }
             return mesh;
         }
     },
@@ -7616,6 +7643,7 @@ const ThreeStudio = {
                     }
                 }
 
+                if (prop === 'SRGBColorSpace') return target.sRGBEncoding || 'srgb';
                 if (prop === 'helpers') return ThreeStudio.helpers;
                 if (prop === 'BufferGeometryUtils') {
                     return target.BufferGeometryUtils || (typeof window !== 'undefined' && window.THREE?.BufferGeometryUtils) || null;
@@ -7684,11 +7712,11 @@ const ThreeStudio = {
                     }
                     if (Array.isArray(res)) {
                         for (const item of res) {
-                            if (item && item.isObject3D && !__studioScene.children.includes(item)) {
+                            if (item && item.isObject3D && item !== __studioScene && !__studioScene.children.includes(item)) {
                                 __studioScene.add(item);
                             }
                         }
-                    } else if (res && res.isObject3D && !__studioScene.children.includes(res)) {
+                    } else if (res && res.isObject3D && res !== __studioScene && !__studioScene.children.includes(res)) {
                         __studioScene.add(res);
                     }
                 } catch(e) {
@@ -7699,7 +7727,7 @@ const ThreeStudio = {
                 }
                 `
             );
-            runner(targetGroup, ThreeProxy, inputPhoto, this.helpers, fakeDoc, fakeWin, fakeRaf);
+            runner(targetGroup, ThreeProxy, inputPhoto, (this.getSafeHelpers ? this.getSafeHelpers() : this.helpers), fakeDoc, fakeWin, fakeRaf);
         } catch (err) {
             console.error('[3D Studio Compilation Error]', err);
             this.showErrorNotification(`3D Code Syntax Error: ${err.message}`);

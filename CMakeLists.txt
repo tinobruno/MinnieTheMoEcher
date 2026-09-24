@@ -1,9 +1,14 @@
 cmake_minimum_required(VERSION 3.18)
 
+# Prefer CUDA 12.9 toolchain if present to support sm_120a (Blackwell native Tensor Cores)
+if(NOT DEFINED CMAKE_CUDA_COMPILER AND EXISTS "/usr/local/cuda-12.9/bin/nvcc")
+    set(CMAKE_CUDA_COMPILER "/usr/local/cuda-12.9/bin/nvcc")
+endif()
+
 # Set CUDA architectures before project() initializes the CUDA toolchain
-# sm_86 (Ampere/3090/Ada/Hopper/Blackwell forward-compatible)
+# sm_86, sm_89, sm_90, sm_120a (Ampere, Ada, Hopper, Blackwell)
 if(NOT DEFINED CMAKE_CUDA_ARCHITECTURES)
-    set(CMAKE_CUDA_ARCHITECTURES "86;89;90;100;120")
+    set(CMAKE_CUDA_ARCHITECTURES "86;89;90;120a")
 endif()
 
 # Allow newer MSVC compiler versions with CUDA

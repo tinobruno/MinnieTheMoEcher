@@ -288,6 +288,122 @@ void gemm_int4_swiglu_fused_batch_cuda(
     int N, int K, int M, float swiglu_limit,
     cudaStream_t stream = 0);
 
+// ── FP4 E2M1 Vectorized GEMV / GEMM (Block-32 F8_E8M0 scales) ─────────────────
+void gemv_fp4_cuda(
+    __nv_bfloat16* out,
+    const __nv_bfloat16* vec,
+    const uint8_t* weight,
+    const uint8_t* scale,
+    int N, int K,
+    cudaStream_t stream = 0);
+
+void gemv_fp4_residual_cuda(
+    __nv_bfloat16* inout,
+    const __nv_bfloat16* vec,
+    const uint8_t* weight,
+    const uint8_t* scale,
+    int N, int K,
+    cudaStream_t stream = 0);
+
+void gemv_fp4_f32_cuda(
+    float* out,
+    const __nv_bfloat16* vec,
+    const uint8_t* weight,
+    const uint8_t* scale,
+    int N, int K,
+    cudaStream_t stream = 0);
+
+void gemm_fp4_batch_cuda(
+    __nv_bfloat16* out,
+    const __nv_bfloat16* A,
+    const uint8_t* weight,
+    const uint8_t* scale,
+    int N, int K, int M,
+    cudaStream_t stream = 0);
+
+void gemm_fp4_residual_batch_cuda(
+    __nv_bfloat16* inout,
+    const __nv_bfloat16* A,
+    const uint8_t* weight,
+    const uint8_t* scale,
+    int N, int K, int M,
+    cudaStream_t stream = 0);
+
+void gemm_fp4_f32_batch_cuda(
+    float* out,
+    const __nv_bfloat16* A,
+    const uint8_t* weight,
+    const uint8_t* scale,
+    int N, int K, int M,
+    cudaStream_t stream = 0);
+
+void gemv_fp4_swiglu_fused_cuda(
+    __nv_bfloat16* out,
+    const __nv_bfloat16* vec,
+    const uint8_t* gate_weight,
+    const uint8_t* gate_scale,
+    const uint8_t* up_weight,
+    const uint8_t* up_scale,
+    int N, int K, float swiglu_limit,
+    cudaStream_t stream = 0);
+
+void gemm_fp4_swiglu_fused_batch_cuda(
+    __nv_bfloat16* out,
+    const __nv_bfloat16* A,
+    const uint8_t* gate_weight,
+    const uint8_t* gate_scale,
+    const uint8_t* up_weight,
+    const uint8_t* up_scale,
+    int N, int K, int M, float swiglu_limit,
+    cudaStream_t stream = 0);
+
+// ── Blackwell Hardware Tensor Core FP4 Operations ────────────────────────────
+void quantize_bf16_to_fp4_e2m1_cuda(
+    uint8_t* A_fp4,
+    uint8_t* A_scale,
+    const __nv_bfloat16* A,
+    int M, int K,
+    cudaStream_t stream = 0);
+
+void gemm_fp4_blackwell_tensorcore_cuda(
+    __nv_bfloat16* out,
+    const uint8_t* A_fp4,
+    const uint8_t* A_scale,
+    const uint8_t* weight,
+    const uint8_t* scale,
+    int N, int K, int M,
+    cudaStream_t stream = 0);
+
+void gemm_fp4_residual_blackwell_tensorcore_cuda(
+    __nv_bfloat16* inout,
+    const uint8_t* A_fp4,
+    const uint8_t* A_scale,
+    const uint8_t* weight,
+    const uint8_t* scale,
+    int N, int K, int M,
+    cudaStream_t stream = 0);
+
+void gemm_fp4_f32_blackwell_tensorcore_cuda(
+    float* out,
+    const uint8_t* A_fp4,
+    const uint8_t* A_scale,
+    const uint8_t* weight,
+    const uint8_t* scale,
+    int N, int K, int M,
+    cudaStream_t stream = 0);
+
+void gemm_fp4_swiglu_blackwell_tensorcore_cuda(
+    __nv_bfloat16* out,
+    const uint8_t* A_fp4,
+    const uint8_t* A_scale,
+    const uint8_t* gate_weight,
+    const uint8_t* gate_scale,
+    const uint8_t* up_weight,
+    const uint8_t* up_scale,
+    int N, int K, int M,
+    float swiglu_limit = 0.0f,
+    cudaStream_t stream = 0);
+
 void vector_add_bf16_cuda(
     __nv_bfloat16* a,
     const __nv_bfloat16* b,
@@ -352,6 +468,14 @@ void embedding_int4_cuda(
     __nv_bfloat16* out,            // [seq_len, dim]
     const uint8_t* table_w,        // [vocab_size, dim / 2] (INT4 packed)
     const __nv_bfloat16* table_s,  // [vocab_size, dim / 32] (BF16 scales)
+    const int32_t* ids,            // [seq_len]
+    int seq_len, int dim,
+    cudaStream_t stream = 0);
+
+void embedding_fp4_cuda(
+    __nv_bfloat16* out,            // [seq_len, dim]
+    const uint8_t* table_w,        // [vocab_size, dim / 2] (FP4 packed)
+    const uint8_t* table_s,        // [vocab_size, dim / 32] (F8_E8M0 scales)
     const int32_t* ids,            // [seq_len]
     int seq_len, int dim,
     cudaStream_t stream = 0);
