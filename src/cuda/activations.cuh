@@ -357,6 +357,28 @@ void gemm_fp4_swiglu_fused_batch_cuda(
     int N, int K, int M, float swiglu_limit,
     cudaStream_t stream = 0);
 
+// ── 2:4 Structured Sparse NVFP4 Operations ────────────────────────────────────
+void gemv_sparse_nvfp4_cuda(
+    __nv_bfloat16* out,
+    const __nv_bfloat16* vec,
+    const uint8_t* weight,
+    const uint8_t* meta,
+    const uint8_t* scale,
+    int N, int K,
+    cudaStream_t stream = 0);
+
+void gemv_sparse_nvfp4_swiglu_fused_cuda(
+    __nv_bfloat16* out,
+    const __nv_bfloat16* vec,
+    const uint8_t* gate_weight,
+    const uint8_t* gate_meta,
+    const uint8_t* gate_scale,
+    const uint8_t* up_weight,
+    const uint8_t* up_meta,
+    const uint8_t* up_scale,
+    int N, int K, float swiglu_limit,
+    cudaStream_t stream = 0);
+
 // ── Blackwell Hardware Tensor Core FP4 Operations ────────────────────────────
 void quantize_bf16_to_fp4_e2m1_cuda(
     uint8_t* A_fp4,
@@ -533,6 +555,13 @@ void argmax_f32_cuda(
     int32_t* out,
     const float* logits,
     int n,
+    cudaStream_t stream = 0);
+
+void apply_repetition_penalty_cuda(
+    float* logits,
+    const int32_t* history_tokens,
+    int num_tokens,
+    float penalty,
     cudaStream_t stream = 0);
 
 void argmax_f32_batch_cuda(
@@ -938,6 +967,48 @@ void qwen_gqa_decode_gated_fp8_batch_cuda(
     float eps = 1e-6f,
     cudaStream_t stream = 0);
 
+// ── Qwen 2 / 2.5 Standard GQA Attention Decode (Ungated) ─────────────────────
+void qwen2_gqa_decode_fp8_cuda(
+    __nv_bfloat16* out,             // [n_q_heads * head_dim]
+    const __nv_bfloat16* q,         // [n_q_heads * head_dim]
+    __nv_bfloat16* k,               // [n_kv_heads * head_dim]
+    const __nv_bfloat16* v,         // [n_kv_heads * head_dim]
+    const __nv_bfloat16* q_norm_w,  // [head_dim] (optional)
+    const __nv_bfloat16* k_norm_w,  // [head_dim] (optional)
+    uint8_t* k_cache,               // [max_seq_len, n_kv_heads, head_dim] FP8
+    uint8_t* v_cache,               // [max_seq_len, n_kv_heads, head_dim] FP8
+    int n_q_heads,
+    int n_kv_heads,
+    int head_dim,
+    const int32_t* d_pos,
+    int pos_scalar,
+    int max_seq_len,
+    float rope_theta = 1000000.0f,
+    float eps = 1e-6f,
+    const int32_t* d_mrope_pos = nullptr,
+    cudaStream_t stream = 0);
+
+void qwen2_gqa_decode_fp8_batch_cuda(
+    __nv_bfloat16* out,             // [M, n_q_heads * head_dim]
+    const __nv_bfloat16* q,         // [M, n_q_heads * head_dim]
+    __nv_bfloat16* k,               // [M, n_kv_heads * head_dim]
+    const __nv_bfloat16* v,         // [M, n_kv_heads * head_dim]
+    const __nv_bfloat16* q_norm_w,  // [head_dim] (optional)
+    const __nv_bfloat16* k_norm_w,  // [head_dim] (optional)
+    uint8_t* k_cache,               // [max_seq_len, n_kv_heads, head_dim] FP8
+    uint8_t* v_cache,               // [max_seq_len, n_kv_heads, head_dim] FP8
+    int n_q_heads,
+    int n_kv_heads,
+    int head_dim,
+    const int32_t* d_pos,
+    int pos_scalar,
+    int M,
+    int max_seq_len,
+    float rope_theta = 1000000.0f,
+    float eps = 1e-6f,
+    const int32_t* d_mrope_pos = nullptr,
+    cudaStream_t stream = 0);
+
 // ── Qwen 3.8 Gated DeltaNet Linear Attention Decode ───────────────────────────
 void deltanet_linear_attention_decode_cuda(
     __nv_bfloat16* out,             // [6144] (48 heads * 128)
@@ -1112,6 +1183,24 @@ void fused_moe_accum_dynamic_batch_cuda(
     int dim, int M,
     cudaStream_t stream = 0);
 
+// ── Mixed Quantization MoE Operations (Hot: 2:4 Sparse NVFP4, Cold: IQ2_XXS + Q2_K) ──
+void gemv_mixed_moe_swiglu_fused_batch_cuda(
+    __nv_bfloat16* gate_buf,
+    const __nv_bfloat16* vec,
+    int w1_cold_offset, int w3_cold_offset,
+    int N, int K, float swiglu_limit,
+    const int32_t* topk_ids,
+    const void* const* flat_expert_ptrs,
+    const uint8_t* expert_type_map,
+    int layer_id, int n_experts, int M,
+    cudaStream_t stream = 0);
 
-
-
+void gemv_mixed_moe_down_batch_cuda(
+    __nv_bfloat16* down_buf,
+    const __nv_bfloat16* gate_buf,
+    const int32_t* topk_ids,
+    const void* const* flat_expert_ptrs,
+    const uint8_t* expert_type_map,
+    int layer_id, int n_experts,
+    int w2_cold_offset, int N, int K, int M,
+    cudaStream_t stream = 0);

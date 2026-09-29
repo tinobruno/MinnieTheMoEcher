@@ -118,3 +118,86 @@ void add_bias_and_posemb_bf16_cuda(
     int dim,
     cudaStream_t stream = 0
 );
+
+// Scaled RMSNorm across token rows: out[row, d] = (x[row, d] / sqrt(mean(x[row]^2) + eps)) * target_scale
+void rms_norm_scaled_batched_bf16_cuda(
+    __nv_bfloat16* out,
+    const __nv_bfloat16* x,
+    float target_scale,
+    int n, int dim, float eps,
+    cudaStream_t stream = 0
+);
+
+// Cross-patch carrier wave removal and DeepSeek language manifold centering:
+// 1. col_mean[d] = mean_i(x[i, d])
+// 2. r[i, d] = x[i, d] - col_mean[d]
+// 3. out[i, d] = target_scale * (r[i, d] / norm(r[i])) + d_embed_mean[d]
+void visual_carrier_removal_and_align_bf16_cuda(
+    __nv_bfloat16* out,
+    const __nv_bfloat16* x,
+    float* d_col_mean_scratch,
+    const __nv_bfloat16* d_embed_mean,
+    float target_scale,
+    int n, int dim, float eps,
+    cudaStream_t stream = 0
+);
+
+// Soft norm cap for visual tokens (caps at max_norm, preserving grounded tokens < max_norm)
+void norm_cap_bf16_cuda(
+    __nv_bfloat16* out,
+    const __nv_bfloat16* x,
+    float max_norm,
+    int n, int dim, float eps,
+    cudaStream_t stream = 0
+);
+
+// Permutes patches [num_blocks, block_size, dim] by window_index: out[b, :] = in[window_index[b], :]
+void permute_patches_by_window_bf16_cuda(
+    __nv_bfloat16* out,
+    const __nv_bfloat16* in,
+    const int* window_index,
+    int num_blocks,
+    int block_size,
+    int dim,
+    cudaStream_t stream = 0
+);
+
+// Split QKV buffer for Window Attention into layout [36 windows, 16 heads, 64 tokens, 80 head_dim]
+void vit_split_qkv_bias_window_bf16_cuda(
+    __nv_bfloat16* Q_out,
+    __nv_bfloat16* K_out,
+    __nv_bfloat16* V_out,
+    const __nv_bfloat16* qkv_in,
+    const __nv_bfloat16* bias,
+    const float* cos_table,
+    const float* sin_table,
+    int N,
+    int n_heads,
+    int head_dim,
+    int window_len,
+    cudaStream_t stream = 0
+);
+
+// Merge Window Attention heads [36 windows, 16 heads, 64 tokens, 80 head_dim] -> [2304, 1280]
+void vit_merge_heads_window_bf16_cuda(
+    __nv_bfloat16* out,
+    const __nv_bfloat16* heads,
+    int N,
+    int n_heads,
+    int head_dim,
+    int window_len,
+    cudaStream_t stream = 0
+);
+
+// Unpermute merged tokens back to raster order: out[t, :] = in[reverse_indices[t], :]
+void unpermute_merged_tokens_bf16_cuda(
+    __nv_bfloat16* out,
+    const __nv_bfloat16* in,
+    const int* reverse_indices,
+    int num_tokens,
+    int dim,
+    cudaStream_t stream = 0
+);
+
+
+

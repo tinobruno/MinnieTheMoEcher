@@ -71,34 +71,17 @@ static inline bool preprocess_image(
         return false;
     }
 
-    // Letterbox resize to target_size x target_size preserving aspect ratio
-    float scale = std::min((float)target_size / orig_w, (float)target_size / orig_h);
-    int new_w = std::clamp((int)std::round(orig_w * scale), 1, target_size);
-    int new_h = std::clamp((int)std::round(orig_h * scale), 1, target_size);
-
-    std::vector<uint8_t> resized_rgb(new_w * new_h * 3);
+    std::vector<uint8_t> canvas(target_size * target_size * 3);
     stbir_resize_uint8_srgb(rgb, orig_w, orig_h, orig_w * 3,
-                            resized_rgb.data(), new_w, new_h, new_w * 3,
+                            canvas.data(), target_size, target_size, target_size * 3,
                             STBIR_RGB);
     stbi_image_free(rgb);
 
-    // Create target_size x target_size canvas with neutral padding (128)
-    std::vector<uint8_t> canvas(target_size * target_size * 3, 128);
-    int pad_x = (target_size - new_w) / 2;
-    int pad_y = (target_size - new_h) / 2;
-
-    for (int y = 0; y < new_h; y++) {
-        int dst_y = pad_y + y;
-        const uint8_t* src_row = resized_rgb.data() + y * (new_w * 3);
-        uint8_t* dst_row = canvas.data() + (dst_y * target_size + pad_x) * 3;
-        std::memcpy(dst_row, src_row, new_w * 3);
-    }
-
-    // Qwen3.5 / Qwen2.5-VL standard normalization (preprocessor_config.json):
-    // mean = [0.5, 0.5, 0.5]
-    // std  = [0.5, 0.5, 0.5]
-    const float mean[3] = {0.5f, 0.5f, 0.5f};
-    const float std_dev[3] = {0.5f, 0.5f, 0.5f};
+    // Qwen2.5-VL normalization (preprocessor_config.json):
+    // mean = [0.48145466, 0.4578275, 0.40821073]
+    // std  = [0.26862954, 0.26130258, 0.27577711]
+    const float mean[3] = {0.48145466f, 0.4578275f, 0.40821073f};
+    const float std_dev[3] = {0.26862954f, 0.26130258f, 0.27577711f};
 
     size_t plane_size = (size_t)target_size * target_size;
     size_t frame_size = 3 * plane_size;
@@ -117,7 +100,8 @@ static inline bool preprocess_image(
             size_t dst_offset = y * target_size + x;
 
             for (int c = 0; c < 3; c++) {
-                float val = ((float)canvas[src_idx + c] / 255.0f - mean[c]) / std_dev[c];
+                int src_c = c; // Standard RGB channel order
+                float val = ((float)canvas[src_idx + src_c] / 255.0f - mean[c]) / std_dev[c];
                 t0_ptr[c * plane_size + dst_offset] = val;
                 t1_ptr[c * plane_size + dst_offset] = val; // temporal duplication for image
             }

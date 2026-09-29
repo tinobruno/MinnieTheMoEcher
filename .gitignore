@@ -15,6 +15,7 @@ _deps/
 moecher
 *.exe
 *.dll
+tools/extract_vit_features
 
 # Large model binaries & manifests
 *.bin

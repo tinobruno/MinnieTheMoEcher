@@ -312,8 +312,8 @@ input[type="range"] { flex: 1; }
     position: absolute;
     top: calc(100% + 8px);
     left: 0;
-    min-width: 320px;
-    max-width: 400px;
+    min-width: 360px;
+    max-width: 460px;
     background: #1E1F20;
     border: 1px solid rgba(255, 255, 255, 0.12);
     border-radius: 12px;
@@ -384,6 +384,7 @@ input[type="range"] { flex: 1; }
     display: flex;
     align-items: center;
     gap: 8px;
+    flex-wrap: wrap;
 }
 
 .model-item-title {
@@ -404,6 +405,32 @@ input[type="range"] { flex: 1; }
     font-size: 0.72rem;
     font-weight: 600;
     letter-spacing: 0.02em;
+}
+
+.model-badge-vision {
+    display: inline-flex;
+    align-items: center;
+    gap: 4px;
+    padding: 2px 8px;
+    border-radius: 12px;
+    font-size: 0.72rem;
+    font-weight: 600;
+    letter-spacing: 0.02em;
+    transition: all 0.2s ease;
+}
+.model-badge-vision.enabled {
+    background: rgba(168, 85, 247, 0.16);
+    color: #C084FC;
+    border: 1px solid rgba(168, 85, 247, 0.35);
+    box-shadow: 0 0 8px rgba(168, 85, 247, 0.15);
+}
+.model-badge-vision.disabled {
+    background: rgba(255, 255, 255, 0.05);
+    color: var(--text-muted);
+    border: 1px solid rgba(255, 255, 255, 0.08);
+}
+.model-badge-vision .vision-icon {
+    font-size: 13px;
 }
 
 .badge-dot {
@@ -434,6 +461,73 @@ input[type="range"] { flex: 1; }
     padding: 2px 6px;
     border-radius: 4px;
     font-family: monospace;
+}
+
+/* System Resources Telemetry Grid */
+.model-resources-grid {
+    display: grid;
+    grid-template-columns: repeat(3, 1fr);
+    gap: 6px;
+    margin-top: 8px;
+    padding-top: 8px;
+    border-top: 1px solid rgba(255, 255, 255, 0.08);
+}
+
+.resource-chip {
+    display: flex;
+    align-items: center;
+    gap: 6px;
+    padding: 5px 7px;
+    background: rgba(0, 0, 0, 0.28);
+    border: 1px solid rgba(255, 255, 255, 0.08);
+    border-radius: 6px;
+    transition: background 0.15s ease, border-color 0.15s ease;
+    cursor: default;
+}
+.resource-chip:hover {
+    background: rgba(255, 255, 255, 0.05);
+    border-color: rgba(255, 255, 255, 0.18);
+}
+
+.resource-chip .res-icon {
+    font-size: 16px;
+    flex-shrink: 0;
+}
+.resource-chip#dropdown-res-vram .res-icon {
+    color: #A78BFA; /* Violet for VRAM */
+}
+.resource-chip#dropdown-res-ram .res-icon {
+    color: #38BDF8; /* Sky blue for System RAM */
+}
+.resource-chip#dropdown-res-ssd .res-icon {
+    color: #34D399; /* Emerald for SSD storage */
+}
+
+.resource-chip .res-body {
+    display: flex;
+    flex-direction: column;
+    overflow: hidden;
+}
+
+.resource-chip .res-label {
+    font-size: 0.65rem;
+    text-transform: uppercase;
+    letter-spacing: 0.04em;
+    color: var(--text-muted);
+    font-weight: 600;
+    line-height: 1;
+}
+
+.resource-chip .res-val {
+    font-size: 0.72rem;
+    font-weight: 600;
+    color: var(--text-primary);
+    font-family: var(--font-mono, monospace);
+    white-space: nowrap;
+    overflow: hidden;
+    text-overflow: ellipsis;
+    line-height: 1.2;
+    margin-top: 2px;
 }
 
 .model-item .check-icon {

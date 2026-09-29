@@ -3500,7 +3500,7 @@ async function sendMessage() {
     // Add user message (with optional image attachment)
     let userMsgContent = text;
     let attachedImg = null;
-    if (activeImageAttachment && currentModelHasVision) {
+    if (activeImageAttachment) {
         attachedImg = Object.assign({}, activeImageAttachment);
         window.__lastUploadedImage = attachedImg.dataUrl;
         if (!window.__lastUploadedImageElement || window.__lastUploadedImageElement.src !== attachedImg.dataUrl) {
@@ -3509,8 +3509,13 @@ async function sendMessage() {
             cachedImg.src = attachedImg.dataUrl;
             window.__lastUploadedImageElement = cachedImg;
         }
+        let sendText = text ? text.trim() : "";
+        let lower = sendText.toLowerCase();
+        if (!sendText || lower === "describe this image" || lower === "describe the image" || lower === "describe image" || lower === "what is this" || lower === "what is this?" || lower === "what's this") {
+            sendText = "What is shown in this image?";
+        }
         userMsgContent = [
-            { type: "text", text: text },
+            { type: "text", text: sendText },
             { type: "image_url", image_url: { url: attachedImg.dataUrl } }
         ];
         removeImageAttachment();
@@ -3518,7 +3523,7 @@ async function sendMessage() {
             ThreeStudio.updatePhotoTextureButtons();
         }
     }
-    appendMessage('user', text, attachedImg);
+    appendMessage('user', text || "Describe this image", attachedImg);
     chatHistory.push({ role: 'user', content: userMsgContent });
 
     // Create assistant message container
@@ -3531,18 +3536,18 @@ async function sendMessage() {
     let mainContent = document.createElement('div');
     assistantMsgDiv.querySelector('.msg-content').appendChild(mainContent);
 
+    const isThinking = attachedImg ? false : (thinkingEnabled ? thinkingEnabled.checked : true);
+
     // Initial visual feedback while engine starts thinking/elaborating
     const liveIndicator = document.createElement('div');
     liveIndicator.className = 'elaboration-status-badge';
     liveIndicator.id = 'live-status-indicator';
     liveIndicator.innerHTML = `
         <span class="tool-pulse-spinner"></span>
-        <span class="status-msg-text">Thinking and preparing response</span>
+        <span class="status-msg-text">${isThinking ? 'Thinking and preparing response' : 'Analyzing image and preparing response'}</span>
         <div class="elaboration-dots"><span></span><span></span><span></span></div>
     `;
     mainContent.appendChild(liveIndicator);
-
-    const isThinking = thinkingEnabled ? thinkingEnabled.checked : true;
     const budgetVal = isThinking ? (thinkingBudget ? parseInt(thinkingBudget.value, 10) : 4096) : 0;
     const activeTools = getActiveToolsPayload();
 
@@ -4447,8 +4452,24 @@ async function initModelSelector() {
     const dropdownModelArch = document.getElementById('dropdown-model-arch');
     const dropdownModelId = document.getElementById('dropdown-model-id');
     const dropdownModelCtx = document.getElementById('dropdown-model-ctx');
+    const dropdownVisionBadge = document.getElementById('dropdown-model-vision');
+    const dropdownVisionText = document.getElementById('dropdown-vision-text');
+    const dropdownVramText = document.getElementById('dropdown-vram-text');
+    const dropdownRamText = document.getElementById('dropdown-ram-text');
+    const dropdownSsdText = document.getElementById('dropdown-ssd-text');
+    const dropdownResVram = document.getElementById('dropdown-res-vram');
+    const dropdownResRam = document.getElementById('dropdown-res-ram');
+    const dropdownResSsd = document.getElementById('dropdown-res-ssd');
 
     if (!selectorEl || !modelNameEl) return;
+
+    function formatGb(val) {
+        if (val === undefined || val === null || isNaN(val)) return '--';
+        if (val >= 1000) {
+            return (val / 1024).toFixed(1) + ' TB';
+        }
+        return val.toFixed(1) + ' GB';
+    }
 
     async function fetchModelInfo() {
         try {
@@ -4471,6 +4492,49 @@ async function initModelSelector() {
                     }
                     currentModelHasVision = (active.has_vision === true || active.has_vision === 'true');
                     updateVisionUploadVisibility();
+
+                    // Update Vision capabilities badge
+                    if (dropdownVisionBadge && dropdownVisionText) {
+                        if (currentModelHasVision) {
+                            dropdownVisionBadge.className = 'model-badge-vision enabled';
+                            dropdownVisionText.textContent = 'Vision Enabled';
+                            dropdownVisionBadge.title = 'Multimodal visual perception and OCR enabled';
+                        } else {
+                            dropdownVisionBadge.className = 'model-badge-vision disabled';
+                            dropdownVisionText.textContent = 'Vision Disabled';
+                            dropdownVisionBadge.title = 'Text-only model profile';
+                        }
+                    }
+
+                    // Update System Resources (VRAM, RAM, SSD)
+                    let resources = active.resources || data.resources;
+                    if (!resources) {
+                        try {
+                            const sysRes = await fetch(`${getApiBase()}/api/system/resources`);
+                            if (sysRes.ok) resources = await sysRes.json();
+                        } catch (_) {}
+                    }
+
+                    if (resources) {
+                        if (resources.vram && dropdownVramText) {
+                            dropdownVramText.textContent = `${formatGb(resources.vram.free_gb)} free`;
+                            if (dropdownResVram) {
+                                dropdownResVram.title = `GPU VRAM: ${resources.vram.free_gb.toFixed(1)} GB free / ${resources.vram.total_gb.toFixed(1)} GB total (${resources.vram.used_gb.toFixed(1)} GB used)`;
+                            }
+                        }
+                        if (resources.ram && dropdownRamText) {
+                            dropdownRamText.textContent = `${formatGb(resources.ram.available_gb)} free`;
+                            if (dropdownResRam) {
+                                dropdownResRam.title = `System RAM: ${resources.ram.available_gb.toFixed(1)} GB available / ${resources.ram.total_gb.toFixed(1)} GB total`;
+                            }
+                        }
+                        if (resources.storage && dropdownSsdText) {
+                            dropdownSsdText.textContent = `${formatGb(resources.storage.available_gb)} free`;
+                            if (dropdownResSsd) {
+                                dropdownResSsd.title = `SSD Storage: ${formatGb(resources.storage.available_gb)} available / ${formatGb(resources.storage.total_gb)} total`;
+                            }
+                        }
+                    }
                 }
             }
         } catch (e) {
@@ -5819,36 +5883,51 @@ function quickPromptModel3D() {
 
 function setupVisionDragAndDrop() {
     window.addEventListener('dragover', (e) => {
-        if (!currentModelHasVision) return;
-        e.preventDefault();
+        const types = e.dataTransfer?.types;
+        if (types && (types.includes('Files') || types.includes('public.file-url'))) {
+            e.preventDefault();
+        }
     });
     window.addEventListener('drop', (e) => {
-        if (!currentModelHasVision) return;
-        e.preventDefault();
         if (e.dataTransfer && e.dataTransfer.files && e.dataTransfer.files.length > 0) {
             const file = e.dataTransfer.files[0];
             if (file.type.startsWith('image/')) {
+                e.preventDefault();
+                currentModelHasVision = true;
+                updateVisionUploadVisibility();
                 processImageFile(file);
             }
         }
     });
-    if (chatInput) {
-        chatInput.addEventListener('paste', (e) => {
-            if (!currentModelHasVision) return;
-            const items = (e.clipboardData || e.originalEvent?.clipboardData)?.items;
-            if (!items) return;
-            for (let i = 0; i < items.length; i++) {
-                if (items[i].type.indexOf('image') !== -1) {
-                    const file = items[i].getAsFile();
-                    if (file) {
-                        processImageFile(file);
-                        e.preventDefault();
-                        break;
-                    }
+
+    const handlePasteEvent = (e) => {
+        const items = (e.clipboardData || e.originalEvent?.clipboardData)?.items;
+        if (!items) return;
+        for (let i = 0; i < items.length; i++) {
+            if (items[i].type && items[i].type.indexOf('image') !== -1) {
+                const file = items[i].getAsFile();
+                if (file) {
+                    currentModelHasVision = true;
+                    updateVisionUploadVisibility();
+                    processImageFile(file);
+                    e.preventDefault();
+                    if (chatInput) chatInput.focus();
+                    break;
                 }
             }
-        });
+        }
+    };
+
+    if (chatInput) {
+        chatInput.addEventListener('paste', handlePasteEvent);
     }
+    window.addEventListener('paste', (e) => {
+        // Fallback: If not already focused in another text input, catch paste on window
+        const activeTag = document.activeElement ? document.activeElement.tagName.toLowerCase() : '';
+        if (activeTag !== 'textarea' && activeTag !== 'input') {
+            handlePasteEvent(e);
+        }
+    });
 }
 
 // ════════════════════════════════════════════════════════════════════════════════

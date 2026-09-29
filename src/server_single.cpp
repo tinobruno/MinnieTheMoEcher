@@ -144,10 +144,11 @@ static void log_msg(const char* level, const char* fmt, ...) {
 //  Model Config (from manifest)
 // ════════════════════════════════════════════════════════════════════════════════
 
-enum class ModelArch { DEEPSEEK_V4, QWEN };
+enum class ModelArch { DEEPSEEK_V4, QWEN, QWEN2 };
 
 struct ModelConfig {
     ModelArch architecture = ModelArch::DEEPSEEK_V4;
+    bool is_qwen() const { return architecture == ModelArch::QWEN || architecture == ModelArch::QWEN2; }
     std::string model_name = "";
     std::string model_id = "";
     int vocab_size = 129280;
@@ -199,7 +200,9 @@ struct ModelConfig {
         };
         if (j.contains("architecture")) {
             std::string arch_str = j["architecture"].get<std::string>();
-            if (arch_str == "qwen2" || arch_str == "qwen" || arch_str == "qwen3" || arch_str == "llama") {
+            if (arch_str == "qwen2" || arch_str == "qwen2.5") {
+                architecture = ModelArch::QWEN2;
+            } else if (arch_str == "qwen" || arch_str == "qwen3" || arch_str == "llama") {
                 architecture = ModelArch::QWEN;
             } else {
                 architecture = ModelArch::DEEPSEEK_V4;
@@ -770,10 +773,15 @@ struct GPUTensor {
     ~GPUTensor() { free(); }
 
     __nv_bfloat16* bf16() { return (__nv_bfloat16*)data; }
+    const __nv_bfloat16* bf16() const { return (const __nv_bfloat16*)data; }
     float* f32() { return (float*)data; }
+    const float* f32() const { return (const float*)data; }
     uint8_t* u8() { return (uint8_t*)data; }
+    const uint8_t* u8() const { return (const uint8_t*)data; }
     int32_t* i32() { return (int32_t*)data; }
+    const int32_t* i32() const { return (const int32_t*)data; }
     int64_t* i64() { return (int64_t*)data; }
+    const int64_t* i64() const { return (const int64_t*)data; }
 };
 
 // ════════════════════════════════════════════════════════════════════════════════
@@ -831,6 +839,21 @@ public:
     // L2 victim cache: writeback stream for async VRAM→DRAM demotion
     cudaStream_t dram_writeback_stream_ = nullptr;
     cudaEvent_t writeback_event_ = nullptr;  // Ensures writeback completes before slot reuse
+
+    // ── Mixed Quantization Support (Hot: NVFP4, Cold: IQ2_XXS) ──
+    bool is_mixed_ = false;
+    moecher::platform::DirectFileHandle expert_file_cold_;
+    moecher::platform::DirectFileHandle expert_file_hot_;
+    int cold_block_size_ = 7077888;
+    int hot_block_size_ = 10223616;
+    void* hot_pool_gpu_ = nullptr;
+    void* cold_pool_gpu_ = nullptr;
+    std::vector<uint8_t> expert_type_map_host_;
+    GPUTensor expert_type_map_gpu_;
+
+    const uint8_t* expert_type_map_gpu() const {
+        return expert_type_map_gpu_.u8();
+    }
 
     int n_pinned_layers() const {
         return (n_experts_ > 0) ? std::min(n_layers_, cache_capacity_ / n_experts_) : 0;
@@ -1059,6 +1082,93 @@ public:
                 CUDA_CHECK(cudaMallocHost(&dma_staging_[i], block_size));
             }
         }
+        return true;
+    }
+
+    bool init_mixed(const std::string& cold_bin_path, int cold_block_size,
+                    const std::string& hot_bin_path, int hot_block_size,
+                    const std::string& map_file_path,
+                    int n_layers, int n_experts,
+                    bool use_buffered_io = false) {
+        is_mixed_ = true;
+        cold_block_size_ = cold_block_size;
+        hot_block_size_ = hot_block_size;
+        expert_block_size_ = cold_block_size; // For fallback compatibility
+        n_layers_ = n_layers;
+        n_experts_ = n_experts;
+
+        bool use_direct = !use_buffered_io;
+        if (!expert_file_cold_.open_read(cold_bin_path, use_direct)) {
+            LOG_ERROR("Cannot open cold expert bin: %s", cold_bin_path.c_str());
+            return false;
+        }
+        if (!expert_file_hot_.open_read(hot_bin_path, use_direct)) {
+            LOG_ERROR("Cannot open hot expert bin: %s", hot_bin_path.c_str());
+            return false;
+        }
+
+        // Read mixed expert map
+        int total_experts = n_layers * n_experts;
+        expert_type_map_host_.resize(total_experts, 0);
+
+        std::ifstream mf(map_file_path, std::ios::binary);
+        if (!mf.is_open()) {
+            LOG_ERROR("Cannot open mixed expert map file: %s", map_file_path.c_str());
+            return false;
+        }
+        mf.read(reinterpret_cast<char*>(expert_type_map_host_.data()), total_experts);
+        if (!mf) {
+            LOG_ERROR("Failed to read %d bytes from expert map: %s", total_experts, map_file_path.c_str());
+            return false;
+        }
+        mf.close();
+
+        int total_hot = 0;
+        int total_cold = 0;
+        for (int i = 0; i < total_experts; i++) {
+            if (expert_type_map_host_[i] == 1) total_hot++;
+            else total_cold++;
+        }
+
+        size_t hot_bytes = (size_t)total_hot * hot_block_size;
+        size_t cold_bytes = (size_t)total_cold * cold_block_size;
+        size_t total_bytes = hot_bytes + cold_bytes;
+
+        LOG_INFO("══════════════════════════════════════════════════════════════════════");
+        LOG_INFO("ExpertLoader: Initializing Mixed Quantization MoE (100%% VRAM Resident)");
+        LOG_INFO("  Total Experts : %d (%d layers x %d)", total_experts, n_layers, n_experts);
+        LOG_INFO("  Hot Experts   : %d (%.2f GB) in 2:4 Sparse NVFP4", total_hot, (double)hot_bytes / (1024.0 * 1024.0 * 1024.0));
+        LOG_INFO("  Cold Experts  : %d (%.2f GB) in IQ2_XXS + Q2_K", total_cold, (double)cold_bytes / (1024.0 * 1024.0 * 1024.0));
+        LOG_INFO("  Total MoE VRAM: %.2f GB", (double)total_bytes / (1024.0 * 1024.0 * 1024.0));
+        LOG_INFO("══════════════════════════════════════════════════════════════════════");
+
+        // Copy map to GPU
+        expert_type_map_gpu_.alloc(total_experts);
+        CUDA_CHECK(cudaMemcpy(expert_type_map_gpu_.data, expert_type_map_host_.data(),
+                              total_experts, cudaMemcpyHostToDevice));
+
+        // Allocate VRAM pools
+        CUDA_CHECK(cudaMalloc(&hot_pool_gpu_, hot_bytes));
+        CUDA_CHECK(cudaMalloc(&cold_pool_gpu_, cold_bytes));
+
+        // All resident capacity: 100% of all experts in VRAM
+        cache_capacity_ = total_experts;
+
+        flat_vram_ptrs_.assign(total_experts, nullptr);
+        flat_vram_ptrs_gpu_.alloc((size_t)total_experts * sizeof(void*));
+
+        int cur_hot = 0;
+        int cur_cold = 0;
+        for (int i = 0; i < total_experts; i++) {
+            if (expert_type_map_host_[i] == 1) {
+                flat_vram_ptrs_[i] = (char*)hot_pool_gpu_ + (size_t)cur_hot * hot_block_size;
+                cur_hot++;
+            } else {
+                flat_vram_ptrs_[i] = (char*)cold_pool_gpu_ + (size_t)cur_cold * cold_block_size;
+                cur_cold++;
+            }
+        }
+
         return true;
     }
 
@@ -1570,12 +1680,88 @@ public:
         return true;
     }
 
+    bool preload_all_mixed(int n_threads = 16) {
+        int total = n_layers_ * n_experts_;
+        LOG_INFO("Preloading %d mixed experts into VRAM (Hot: NVFP4, Cold: IQ2_XXS)...", total);
+
+        auto start = std::chrono::steady_clock::now();
+        std::atomic<int> loaded{0};
+
+        std::vector<std::thread> workers;
+        int chunk_size = (total + n_threads - 1) / n_threads;
+
+        for (int t = 0; t < n_threads; t++) {
+            int start_idx = t * chunk_size;
+            int end_idx = std::min(start_idx + chunk_size, total);
+            if (start_idx >= end_idx) continue;
+
+            workers.emplace_back([this, start_idx, end_idx, &loaded, total]() {
+                size_t max_block = std::max(hot_block_size_, cold_block_size_);
+                void* stage_ptr = nullptr;
+                cudaStream_t stream = nullptr;
+                CUDA_CHECK(cudaMallocHost(&stage_ptr, max_block));
+                CUDA_CHECK(cudaStreamCreate(&stream));
+
+                for (int i = start_idx; i < end_idx; i++) {
+                    uint8_t is_hot = expert_type_map_host_[i];
+                    void* dst = flat_vram_ptrs_[i];
+
+                    if (is_hot) {
+                        int64_t file_offset = (int64_t)i * hot_block_size_;
+                        int64_t bytes = expert_file_hot_.pread_exact(stage_ptr, hot_block_size_, file_offset);
+                        if (bytes == hot_block_size_) {
+                            CUDA_CHECK(cudaMemcpyAsync(dst, stage_ptr, hot_block_size_, cudaMemcpyHostToDevice, stream));
+                            CUDA_CHECK(cudaStreamSynchronize(stream));
+                        } else {
+                            LOG_ERROR("Failed reading hot expert %d at offset %lld (got %lld)", i, (long long)file_offset, (long long)bytes);
+                        }
+                    } else {
+                        int64_t file_offset = (int64_t)i * cold_block_size_;
+                        int64_t bytes = expert_file_cold_.pread_exact(stage_ptr, cold_block_size_, file_offset);
+                        if (bytes == cold_block_size_) {
+                            CUDA_CHECK(cudaMemcpyAsync(dst, stage_ptr, cold_block_size_, cudaMemcpyHostToDevice, stream));
+                            CUDA_CHECK(cudaStreamSynchronize(stream));
+                        } else {
+                            LOG_ERROR("Failed reading cold expert %d at offset %lld (got %lld)", i, (long long)file_offset, (long long)bytes);
+                        }
+                    }
+
+                    int done = ++loaded;
+                    if (done % 1000 == 0 || done == total) {
+                        LOG_INFO("  Preloaded %d/%d mixed experts into VRAM...", done, total);
+                    }
+                }
+                CUDA_CHECK(cudaStreamDestroy(stream));
+                CUDA_CHECK(cudaFreeHost(stage_ptr));
+            });
+        }
+
+        for (auto& w : workers) {
+            w.join();
+        }
+
+        // Copy flat pointer table to GPU for GPU-native kernel execution
+        CUDA_CHECK(cudaMemcpy(flat_vram_ptrs_gpu_.data, flat_vram_ptrs_.data(),
+                              flat_vram_ptrs_.size() * sizeof(void*), cudaMemcpyHostToDevice));
+
+        auto elapsed = std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now() - start).count();
+        LOG_INFO("Preload completed: 100%% VRAM Resident (11008 experts) in %.2f seconds", elapsed / 1000.0);
+        return true;
+    }
+
     const void* const* flat_vram_ptrs_gpu() const {
         return (const void* const*)flat_vram_ptrs_gpu_.data;
     }
 
     void cleanup() {
         expert_file_.close();
+        if (is_mixed_) {
+            expert_file_cold_.close();
+            expert_file_hot_.close();
+            if (hot_pool_gpu_) { cudaFree(hot_pool_gpu_); hot_pool_gpu_ = nullptr; }
+            if (cold_pool_gpu_) { cudaFree(cold_pool_gpu_); cold_pool_gpu_ = nullptr; }
+            expert_type_map_gpu_.free();
+        }
         if (cache_pool_gpu_) cudaFree(cache_pool_gpu_);
         if (dram_cache_pool_) {
             if (cudaFreeHost(dram_cache_pool_) != cudaSuccess) {
@@ -2667,6 +2853,9 @@ public:
 
     std::string get_model_id() const {
         if (!cfg_.model_id.empty()) return cfg_.model_id;
+        if (cfg_.architecture == ModelArch::QWEN2) {
+            return "qwen2.5-vl-3b";
+        }
         if (cfg_.architecture == ModelArch::QWEN) {
             if (model_dir_.find("q4") != std::string::npos || manifest_path_.find("q4") != std::string::npos) {
                 return "qwen3.8-27b-q4";
@@ -2684,6 +2873,9 @@ public:
 
     std::string get_model_display_name() const {
         if (!cfg_.model_name.empty()) return cfg_.model_name;
+        if (cfg_.architecture == ModelArch::QWEN2) {
+            return "Qwen 2.5 VL 3B";
+        }
         if (cfg_.architecture == ModelArch::QWEN) {
             if (model_dir_.find("q4") != std::string::npos || manifest_path_.find("q4") != std::string::npos) {
                 return "Qwen 3.8 27B Q4";
@@ -2712,7 +2904,12 @@ public:
     int visual_embed_start_pos_ = -1;
     int visual_embed_num_tokens_ = 0;
 
+    // In-process Vision Delegate Engine (Multimodal Delegation)
+    std::unique_ptr<MoecherEngine> vision_delegate_engine_;
+    bool has_vision_delegate() const { return vision_delegate_engine_ != nullptr; }
+
     bool has_vision() const { return has_vision_ && (vision_tower_ != nullptr); }
+    bool supports_vision() const { return has_vision() || has_vision_delegate(); }
 
     // Prompt-Lookup Drafting (PLD) Speculative Decoding
     bool enable_pld_ = true;
@@ -2913,6 +3110,7 @@ public:
         GPUTensor w_o, w_o_scale;           // [hidden, n_heads * head_dim]
         GPUTensor gqa_q_norm_w;  // [head_dim] BF16
         GPUTensor gqa_k_norm_w;  // [head_dim] BF16
+        GPUTensor gqa_q_bias, gqa_k_bias, gqa_v_bias; // [q_dim], [kv_dim], [kv_dim] BF16
         GPUTensor w_gate, w_gate_scale;        // [intermediate_size, hidden]
         GPUTensor w_up, w_up_scale;          // [intermediate_size, hidden]
         GPUTensor w_down, w_down_scale;        // [hidden, intermediate_size]
@@ -3044,6 +3242,7 @@ public:
     // Device-driven inputs for CUDA Graph & Device ArgMax
     GPUTensor buf_input_token_;  // [1] int32_t on GPU
     GPUTensor buf_input_pos_;    // [1] int32_t on GPU
+    GPUTensor buf_mrope_pos_;    // [2] int32_t on GPU [v_start, v_num]
     GPUTensor buf_track_flag_;   // [1] int32_t on GPU (1=track, 0=skip)
     GPUTensor buf_argmax_out_;   // [1] int32_t on GPU for 4-byte sampling
     cudaGraph_t graph_ = nullptr;
@@ -3253,9 +3452,9 @@ public:
         if (!expert_dtype_override.empty()) {
             cfg_.expert_dtype = expert_dtype_override;
         }
-        LOG_INFO("Model: %d layers, %d experts, %d active, hidden=%d, dtype=%s, max_seq_len=%d",
+        LOG_INFO("Model: %d layers, %d experts, %d active, hidden=%d, dtype=%s, max_seq_len=%d, sliding_window=%d",
                  cfg_.num_hidden_layers, cfg_.n_routed_experts,
-                 cfg_.num_experts_per_tok, cfg_.hidden_size, cfg_.expert_dtype.c_str(), cfg_.max_seq_len);
+                 cfg_.num_experts_per_tok, cfg_.hidden_size, cfg_.expert_dtype.c_str(), cfg_.max_seq_len, cfg_.sliding_window);
 
         std::filesystem::path manifest_p(manifest_path);
         std::filesystem::path base_dir = manifest_p.parent_path();
@@ -3307,8 +3506,11 @@ public:
                 }
             }
         }
-        if (manifest.contains("model_config") && manifest["model_config"].value("expert_dtype", "") == "fp4") {
-            model_requires_fp4 = true;
+        if (manifest.contains("model_config")) {
+            std::string edtype = manifest["model_config"].value("expert_dtype", "");
+            if (edtype == "fp4" || edtype == "sparse_nvfp4" || edtype == "mixed_nvfp4_iq2") {
+                model_requires_fp4 = true;
+            }
         }
 
         is_blackwell_tc_active_ = gpu_caps_.supports_fp4 && (gpu_caps_.major >= 12) && model_requires_fp4;
@@ -3383,6 +3585,9 @@ public:
         // Init expert loader with O_DIRECT
         std::string expert_path = manifest.value("expert_bin", "");
         std::string expert_full = expert_path.empty() ? "" : (base_dir / expert_path).string();
+        if (!expert_path.empty() && !std::filesystem::exists(expert_full) && std::filesystem::exists(expert_path)) {
+            expert_full = expert_path;
+        }
 
         // Allocate working buffers first
         alloc_buffers();
@@ -3414,7 +3619,54 @@ public:
         LOG_INFO("Expert L1 (VRAM) cache budget: %.1f GB", cache_budget / (1024.0 * 1024.0 * 1024.0));
         LOG_INFO("Expert L2 (DRAM) cache budget: %.1f GB", dram_cache_budget / (1024.0 * 1024.0 * 1024.0));
         
-        if (cfg_.n_routed_experts > 0 && !expert_full.empty()) {
+        if (cfg_.n_routed_experts > 0 && cfg_.expert_dtype == "mixed_nvfp4_iq2") {
+            std::string cold_path = "";
+            int cold_block_size = 7077888;
+            std::string hot_path = "";
+            int hot_block_size = 10223616;
+            if (manifest.contains("expert_bins")) {
+                if (manifest["expert_bins"].contains("cold")) {
+                    cold_path = manifest["expert_bins"]["cold"].value("path", "");
+                    cold_block_size = manifest["expert_bins"]["cold"].value("block_size", 7077888);
+                }
+                if (manifest["expert_bins"].contains("hot")) {
+                    hot_path = manifest["expert_bins"]["hot"].value("path", "");
+                    hot_block_size = manifest["expert_bins"]["hot"].value("block_size", 10223616);
+                }
+            }
+            std::string map_path = manifest.value("expert_map_file", "");
+
+            auto resolve_p = [&](const std::string& p) -> std::string {
+                if (p.empty()) return "";
+                if (std::filesystem::exists(p)) return p;
+                auto full = (base_dir / p).string();
+                if (std::filesystem::exists(full)) return full;
+                auto rel_root = (base_dir / ".." / ".." / p).string();
+                if (std::filesystem::exists(rel_root)) return rel_root;
+                return p;
+            };
+
+            cold_path = resolve_p(cold_path);
+            hot_path = resolve_p(hot_path);
+            map_path = resolve_p(map_path);
+
+            if (!expert_loader_.init_mixed(cold_path, cold_block_size,
+                                           hot_path, hot_block_size,
+                                           map_path,
+                                           expert_n_layers, expert_n_experts,
+                                           buffered_io)) {
+                return false;
+            }
+
+            expert_loader_.preload_all_mixed(16);
+
+            expert_token_counts_.resize(cfg_.num_hidden_layers);
+            for (int l = 0; l < cfg_.num_hidden_layers; l++) {
+                expert_token_counts_[l].resize(cfg_.n_routed_experts);
+            }
+            std::string json_profile_path = (base_dir / "expert_profile.json").string();
+            load_expert_profile_json(json_profile_path);
+        } else if (cfg_.n_routed_experts > 0 && !expert_full.empty()) {
             if (!expert_loader_.init(expert_full, expert_block_size,
                                       expert_n_layers, expert_n_experts,
                                       cache_budget, dram_cache_budget, buffered_io)) return false;
@@ -3493,23 +3745,72 @@ public:
             }
         }
 
-        // Auto-load Qwen Vision Tower if available in manifest
+        // Auto-load In-Process Vision Delegate Engine if specified in manifest
+        json delegate_cfg;
+        if (manifest.contains("vision_delegate")) {
+            delegate_cfg = manifest["vision_delegate"];
+        } else if (manifest.contains("model_config") && manifest["model_config"].contains("vision_delegate")) {
+            delegate_cfg = manifest["model_config"]["vision_delegate"];
+        }
+        if (!delegate_cfg.empty()) {
+            std::string delegate_rel = delegate_cfg.value("manifest", "");
+            std::string delegate_manifest_path = (base_dir / delegate_rel).string();
+            if (!std::ifstream(delegate_manifest_path).good()) {
+                delegate_manifest_path = delegate_rel;
+            }
+            if (std::ifstream(delegate_manifest_path).good()) {
+                LOG_INFO("[Vision Delegate] Found vision delegate manifest at: %s. Loading delegate engine...", delegate_manifest_path.c_str());
+                vision_delegate_engine_ = std::make_unique<MoecherEngine>();
+                int delegate_seq_len = (max_seq_len_override > 0) ? std::min(max_seq_len_override, 2048) : 2048;
+                if (vision_delegate_engine_->load(delegate_manifest_path, max_vram_gb, dram_cache_gb, expert_dtype_override, buffered_io, delegate_seq_len)) {
+                    LOG_INFO("[Vision Delegate] Vision delegate engine successfully loaded and operational!");
+                } else {
+                    LOG_ERROR("[Vision Delegate] Failed to load vision delegate engine!");
+                    vision_delegate_engine_.reset();
+                }
+            } else {
+                LOG_ERROR("[Vision Delegate] Vision delegate manifest file not found: %s", delegate_manifest_path.c_str());
+            }
+        }
+
+        // Auto-load Direct Vision Tower if available in manifest and no delegate is configured
         has_vision_ = false;
         bool vision_flag = (manifest.contains("model_config") && manifest["model_config"].value("has_vision", false)) ||
                            manifest.contains("visual_config") ||
+                           manifest.contains("vision_bin") ||
                            (manifest.contains("dense_tensors") && manifest["dense_tensors"].contains("model.visual.patch_embed.proj.weight"));
-        if (cfg_.architecture == ModelArch::QWEN && vision_flag) {
+        if (!has_vision_delegate() && (cfg_.is_qwen() || cfg_.architecture == ModelArch::DEEPSEEK_V4) && vision_flag) {
             if (manifest.contains("dense_tensors") && manifest["dense_tensors"].contains("model.visual.patch_embed.proj.weight")) {
-                std::string dense_path = manifest["dense_bin"].get<std::string>();
-                std::string dense_full = (base_dir / dense_path).string();
-                if (!std::ifstream(dense_full).good()) {
+                std::string dense_path = manifest.value("dense_bin", "");
+                std::string dense_full = dense_path.empty() ? "" : (base_dir / dense_path).string();
+                if (!dense_full.empty() && !std::ifstream(dense_full).good()) {
                     dense_full = dense_path;
                 }
-                LOG_INFO("[Vision] Qwen Vision configuration detected in manifest. Loading Vision Tower from %s...", dense_full.c_str());
+
+                std::string vision_bin = manifest.value("vision_bin", "");
+                std::string vision_full = vision_bin.empty() ? "" : (base_dir / vision_bin).string();
+                if (!vision_full.empty() && !std::ifstream(vision_full).good()) {
+                    vision_full = vision_bin;
+                }
+
+                std::string bridge_bin = manifest.value("bridge_bin", "");
+                std::string bridge_full = bridge_bin.empty() ? "" : (base_dir / bridge_bin).string();
+                if (!bridge_full.empty() && !std::ifstream(bridge_full).good()) {
+                    bridge_full = bridge_bin;
+                }
+
+                std::string embed_mean_bin = manifest.value("embed_mean_bin", "deepseek_embed_mean.bin");
+                std::string embed_mean_full = embed_mean_bin.empty() ? "" : (base_dir / embed_mean_bin).string();
+                if (!embed_mean_full.empty() && !std::ifstream(embed_mean_full).good()) {
+                    embed_mean_full = embed_mean_bin;
+                }
+
+                int output_dim = cfg_.hidden_size; // 4096 for DeepSeek, 5120 for Qwen, 2048 for Qwen2.5-VL
+                LOG_INFO("[Vision] Vision configuration detected in manifest. Loading Vision Tower (output_dim=%d)...", output_dim);
                 vision_tower_ = std::make_unique<moecher::vision::QwenVisionTower>();
-                if (vision_tower_->load_from_manifest(dense_full, manifest["dense_tensors"], cublas_handle_, main_stream_)) {
+                if (vision_tower_->load_from_manifest(dense_full, manifest["dense_tensors"], cublas_handle_, main_stream_, output_dim, vision_full, bridge_full, embed_mean_full)) {
                     has_vision_ = true;
-                    LOG_INFO("[Vision] Vision Tower successfully loaded and operational! (27 ViT blocks, 576 tokens output)");
+                    LOG_INFO("[Vision] Vision Tower successfully loaded and operational! (num_blocks=%d, 576 tokens output x %d dim)", vision_tower_->num_blocks_, output_dim);
                 } else {
                     LOG_WARN("[Vision] Failed to load Vision Tower weights. Disabling vision capabilities.");
                     vision_tower_.reset();
@@ -3617,7 +3918,7 @@ public:
 
     void init_cuda_graph() {
         init_mla_dynamic_shared_memory();
-        if (cfg_.architecture != ModelArch::QWEN && !expert_loader_.all_resident(cfg_.num_hidden_layers)) {
+        if (!cfg_.is_qwen() && !expert_loader_.all_resident(cfg_.num_hidden_layers)) {
             LOG_INFO("Running in eager mode for decode verification.");
             graph_captured_ = false;
             return;
@@ -3829,7 +4130,7 @@ public:
         int dim = cfg_.hidden_size;
         int hc = cfg_.hc_mult;
 
-        if (cfg_.architecture == ModelArch::QWEN) {
+        if (cfg_.is_qwen()) {
             // 1. Standard Embedding lookup
             if (embed_weight_.dtype == "fp4") {
                 embedding_fp4_cuda(buf_hidden_.bf16(), (const uint8_t*)embed_weight_.data, (const uint8_t*)embed_weight_scale_.data, buf_input_token_.i32(), 1, dim, main_stream_);
@@ -3881,6 +4182,22 @@ public:
         } else {
             embedding_broadcast_device_id_cuda(buf_hidden_.bf16(), buf_hc_state_.bf16(),
                                                embed_weight_.bf16(), buf_input_token_.i32(), dim, hc, main_stream_);
+        }
+
+        // Override with vision tower embedding for image tokens
+        if (active_visual_embeddings_ && position >= visual_embed_start_pos_ && position < visual_embed_start_pos_ + visual_embed_num_tokens_) {
+            int v_idx = position - visual_embed_start_pos_;
+            const __nv_bfloat16* src_vis = active_visual_embeddings_ + (size_t)v_idx * dim;
+            CUDA_CHECK(cudaMemcpyAsync(buf_hidden_.bf16(),
+                                       src_vis,
+                                       dim * sizeof(__nv_bfloat16),
+                                       cudaMemcpyDeviceToDevice, main_stream_));
+            for (int h = 0; h < hc; h++) {
+                CUDA_CHECK(cudaMemcpyAsync(buf_hc_state_.bf16() + (size_t)h * dim,
+                                           src_vis,
+                                           dim * sizeof(__nv_bfloat16),
+                                           cudaMemcpyDeviceToDevice, main_stream_));
+            }
         }
 
         // 3. Process each layer
@@ -4132,7 +4449,7 @@ public:
 
         auto prefill_start_time = std::chrono::steady_clock::now();
 
-        if (cfg_.architecture == ModelArch::QWEN) {
+        if (cfg_.is_qwen()) {
             size_t curr = 0;
             while (curr < prefix_tokens.size()) {
                 size_t remaining = prefix_tokens.size() - curr;
@@ -4197,10 +4514,15 @@ public:
         }
 
         // Configure visual embeddings for prompt prefill if present
-        if (visual_embeddings && visual_start_pos >= 0 && visual_num_tokens > 0) {
+        bool had_multimodal = (visual_embeddings && visual_start_pos >= 0 && visual_num_tokens > 0);
+        if (had_multimodal) {
             active_visual_embeddings_ = visual_embeddings;
             visual_embed_start_pos_ = visual_start_pos;
             visual_embed_num_tokens_ = visual_num_tokens;
+            if (buf_mrope_pos_.data) {
+                int h_mrope[2] = {visual_start_pos, visual_num_tokens};
+                CUDA_CHECK(cudaMemcpyAsync(buf_mrope_pos_.i32(), h_mrope, 2 * sizeof(int32_t), cudaMemcpyHostToDevice, main_stream_));
+            }
             reset_all_kv_caches();
             cached_tokens_.clear();
             LOG_INFO("[Engine] Multimodal input active: visual tokens injected at pos %d..%d (%d tokens)",
@@ -4209,6 +4531,10 @@ public:
             active_visual_embeddings_ = nullptr;
             visual_embed_start_pos_ = -1;
             visual_embed_num_tokens_ = 0;
+            if (buf_mrope_pos_.data) {
+                int h_mrope[2] = {-1, 0};
+                CUDA_CHECK(cudaMemcpyAsync(buf_mrope_pos_.i32(), h_mrope, 2 * sizeof(int32_t), cudaMemcpyHostToDevice, main_stream_));
+            }
         }
 
         // Reset debug flags for this request
@@ -4228,13 +4554,16 @@ public:
         // we can safely reuse the prefix when prefix_len == cached_tokens_.size() (exact continuation)
         // or for pure positional GQA.
         bool can_reuse_prefix = (prefix_len > 0);
-        if (cfg_.architecture == ModelArch::DEEPSEEK_V4 && prefix_len < cached_tokens_.size()) {
+        if (active_visual_embeddings_) {
+            can_reuse_prefix = false;
+            prefix_len = 0;
+        } else if (cfg_.architecture == ModelArch::DEEPSEEK_V4 && prefix_len < cached_tokens_.size()) {
             can_reuse_prefix = false;
             prefix_len = 0;
         }
 
         // If continuous prefix matching failed, check if prompt starts with the rolling Turn KV snapshot!
-        if (!can_reuse_prefix && turn_kv_snapshot_.valid && !turn_kv_snapshot_.tokens.empty()) {
+        if (!active_visual_embeddings_ && !can_reuse_prefix && turn_kv_snapshot_.valid && !turn_kv_snapshot_.tokens.empty()) {
             size_t turn_len = turn_kv_snapshot_.tokens.size();
             if (prompt.size() >= turn_len) {
                 bool turn_matches = true;
@@ -4262,7 +4591,7 @@ public:
         }
 
         // If turn snapshot matching failed, check if prompt starts with the pinned System KV snapshot!
-        if (!can_reuse_prefix && system_kv_snapshot_.valid && !system_kv_snapshot_.tokens.empty()) {
+        if (!active_visual_embeddings_ && !can_reuse_prefix && system_kv_snapshot_.valid && !system_kv_snapshot_.tokens.empty()) {
             size_t sys_len = system_kv_snapshot_.tokens.size();
             if (prompt.size() >= sys_len) {
                 bool sys_matches = true;
@@ -4321,7 +4650,7 @@ public:
 
             bool draft_model_active = (!mtp_drafter_.loaded_ && qwen_draft_.loaded_);
 
-            if (cfg_.architecture == ModelArch::QWEN) {
+            if (cfg_.is_qwen()) {
                 size_t curr = prefix_len;
                 // Prefill intermediate prompt tokens in chunks of up to 8 (skipping intermediate LM-head computation)
                 while (curr + 1 < prompt.size()) {
@@ -4424,7 +4753,11 @@ public:
         // Track whether we are inside a <think> block
         // DeepSeek V3/V4 thinking mode: the chat template appends <think> to the prompt,
         // so the model starts generation INSIDE the think block.
-        bool in_think_block = enable_thinking;
+        bool in_think_block = enable_thinking && !had_multimodal;
+        if (had_multimodal) {
+            enable_thinking = false;
+            max_thinking_tokens = 0;
+        }
         bool think_block_ended = false;
         std::string finish_reason = "length";
 
@@ -4601,8 +4934,8 @@ public:
                         history.push_back(think_end_id);
                     }
 
-                    // 2. Inject and stream "Allright, here is the solution:\n\n" as the beginning of CONTENT
-                    std::vector<int> transition_tokens = tokenizer_.encode("Allright, here is the solution:\n\n");
+                    // 2. Inject and stream "\n\n" as the beginning of CONTENT
+                    std::vector<int> transition_tokens = tokenizer_.encode("\n\n");
                     for (int tok_id : transition_tokens) {
                         track_current_token_ = false; // Synthetic transition tokens not tracked
                         forward_token(tok_id, position);
@@ -4626,6 +4959,16 @@ public:
 
             // Sample from logits if next_token is not pre-set
             if (next_token < 0) {
+                if (content_tokens_generated == 0 && had_multimodal) {
+                    float neg_inf = -1e9f;
+                    if (cfg_.eos_token_id >= 0) {
+                        CUDA_CHECK(cudaMemcpyAsync(buf_logits_.f32() + cfg_.eos_token_id, &neg_inf, sizeof(float), cudaMemcpyHostToDevice, main_stream_));
+                    }
+                    if (eos2_id >= 0) {
+                        CUDA_CHECK(cudaMemcpyAsync(buf_logits_.f32() + eos2_id, &neg_inf, sizeof(float), cudaMemcpyHostToDevice, main_stream_));
+                    }
+                    argmax_cache_valid_ = false;
+                }
                 next_token = sample_token(temperature, history, content_tokens_generated, in_think_block,
                                           top_k, top_p, min_p);
             }
@@ -4651,9 +4994,9 @@ public:
             }
 
             // Check all EOS and stop conditions in content mode
-            if (next_token == cfg_.eos_token_id || (eos2_id >= 0 && next_token == eos2_id)) {
-                LOG_WARN("Stop token hit: token=%d (cfg_eos=%d, eos2=%d) at step %d (content: %d/%d, think: %d/%d)",
-                         next_token, cfg_.eos_token_id, eos2_id, t,
+            if (next_token == cfg_.eos_token_id || (eos2_id >= 0 && next_token == eos2_id) || (im_end_id >= 0 && next_token == im_end_id)) {
+                LOG_WARN("Stop token hit: token=%d (cfg_eos=%d, eos2=%d, im_end=%d) at step %d (content: %d/%d, think: %d/%d)",
+                         next_token, cfg_.eos_token_id, eos2_id, im_end_id, t,
                          content_tokens_generated, max_tokens,
                          thinking_tokens_generated, max_thinking_tokens);
                 finish_reason = "stop";
@@ -4661,6 +5004,14 @@ public:
             }
 
             if (!enable_thinking && (next_token == think_start_id || next_token == think_end_id)) {
+                if (content_tokens_generated > 0) {
+                    LOG_WARN("Stop on think token in non-thinking mode: token=%d at step %d (content: %d)",
+                             next_token, t, content_tokens_generated);
+                    finish_reason = "stop";
+                    break;
+                }
+                float neg_inf = -1e9f;
+                CUDA_CHECK(cudaMemcpyAsync(buf_logits_.f32() + next_token, &neg_inf, sizeof(float), cudaMemcpyHostToDevice, main_stream_));
                 next_token = -1;
                 continue;
             }
@@ -4953,6 +5304,10 @@ public:
 
         cached_tokens_ = history;
         snapshot_kv(turn_kv_snapshot_, history);
+        if (buf_mrope_pos_.data) {
+            int h_mrope[2] = {-1, 0};
+            CUDA_CHECK(cudaMemcpyAsync(buf_mrope_pos_.i32(), h_mrope, 2 * sizeof(int32_t), cudaMemcpyHostToDevice, main_stream_));
+        }
         return result;
     }
 
@@ -4960,6 +5315,102 @@ public:
     int prompt_token_count_ = 0;
     int completion_token_count_ = 0;
     std::string last_finish_reason_ = "stop";
+
+    // ── Vision Perception Delegate Execution ─────────────────────────────────
+    std::string describe_image(const std::string& image_b64, const std::string& user_query = "") {
+        if (has_vision_delegate()) {
+            return vision_delegate_engine_->describe_image(image_b64, user_query);
+        }
+        if (!has_vision_ || !vision_tower_) {
+            LOG_WARN("[Vision Delegate] describe_image called but vision tower is not active!");
+            return "";
+        }
+
+        moecher::vision::ProcessedImage proc_img;
+        int img_sz = vision_tower_->image_size_;
+        if (!moecher::vision::preprocess_image_from_base64(image_b64, proc_img, img_sz)) {
+            LOG_WARN("[Vision Delegate] Failed to preprocess image from base64 (target size %d)!", img_sz);
+            return "";
+        }
+
+        const __nv_bfloat16* d_vis_out = vision_tower_->forward(proc_img, main_stream_);
+        if (!d_vis_out) {
+            LOG_WARN("[Vision Delegate] Vision tower forward returned null!");
+            return "";
+        }
+
+        int IM_START = tokenizer_.get_token_id("<|im_start|>");
+        int IM_END = tokenizer_.get_token_id("<|im_end|>");
+        int VIS_START = tokenizer_.get_token_id("<|vision_start|>");
+        int VIS_END = tokenizer_.get_token_id("<|vision_end|>");
+        int IMG_PAD = tokenizer_.get_token_id("<|image_pad|>");
+
+        if (IM_START < 0) IM_START = 151644;
+        if (IM_END < 0) IM_END = 151645;
+        if (VIS_START < 0) VIS_START = 151652;
+        if (VIS_END < 0) VIS_END = 151653;
+        if (IMG_PAD < 0) IMG_PAD = 151655;
+
+        std::vector<int> prompt;
+        auto append_str = [&](const std::string& s) {
+            auto enc = tokenizer_.encode(s);
+            prompt.insert(prompt.end(), enc.begin(), enc.end());
+        };
+
+        prompt.push_back(IM_START);
+        append_str("system\nYou are a helpful assistant.");
+        prompt.push_back(IM_END);
+        append_str("\n");
+
+        prompt.push_back(IM_START);
+        append_str("user\n");
+        prompt.push_back(VIS_START);
+        int visual_start_pos = (int)prompt.size();
+        int visual_num_tokens = vision_tower_->merged_patches_; // 576
+        prompt.insert(prompt.end(), visual_num_tokens, IMG_PAD);
+        prompt.push_back(VIS_END);
+
+        std::string qwen_instruction = "Describe this image in detail. Identify any vehicles (make, model, color, year), read exact text and license plates, and detail structural parts and environment.";
+        if (!user_query.empty()) {
+            qwen_instruction += "\nUser inquiry to address: " + user_query;
+        }
+        append_str(qwen_instruction);
+        prompt.push_back(IM_END);
+        append_str("\n");
+
+        prompt.push_back(IM_START);
+        append_str("assistant\n");
+
+        reset_all_kv_caches();
+        turn_kv_snapshot_.valid = false;
+        turn_kv_snapshot_.tokens.clear();
+
+        std::string perception = generate(
+            prompt,
+            /*max_tokens=*/512,
+            /*temperature=*/0.0f,
+            /*token_callback=*/nullptr,
+            /*repetition_penalty=*/1.10f,
+            /*enable_thinking=*/false,
+            /*max_thinking_tokens=*/0,
+            /*top_p=*/0.9f,
+            /*min_p=*/0.05f,
+            /*top_k=*/20,
+            d_vis_out,
+            visual_start_pos,
+            visual_num_tokens
+        );
+
+        while (!perception.empty() && (perception.front() == ' ' || perception.front() == '\n' || perception.front() == '\r')) {
+            perception.erase(perception.begin());
+        }
+        while (!perception.empty() && (perception.back() == ' ' || perception.back() == '\n' || perception.back() == '\r')) {
+            perception.pop_back();
+        }
+
+        LOG_INFO("[Vision Delegate] Perception output (%zu chars): \"%s\"", perception.size(), perception.c_str());
+        return perception;
+    }
 
 private:
     // ── Dense tensor loading ────────────────────────────────────────────────
@@ -5014,6 +5465,17 @@ private:
                 gpu_s.dtype = info.value("scale_dtype", dtype == "fp4" ? "F8_E8M0" : "bfloat16");
                 gpu_s.alloc(scale_nbytes);
                 CUDA_CHECK(cudaMemcpy(gpu_s.data, (char*)mapped + scale_offset, scale_nbytes, cudaMemcpyHostToDevice));
+            } else {
+                std::string scale_name = name + "_scale";
+                if (!tensor_map.contains(scale_name)) {
+                    size_t w_pos = name.rfind(".weight");
+                    if (w_pos != std::string::npos) {
+                        scale_name = name.substr(0, w_pos) + ".weight_scale";
+                    }
+                }
+                if (tensor_map.contains(scale_name)) {
+                    load_tensor(gpu_s, scale_name);
+                }
             }
             return true;
         };
@@ -5082,7 +5544,7 @@ private:
             CUDA_CHECK(cudaMemset(lw.d_comp_kv_count.data, 0, sizeof(int32_t)));
             CUDA_CHECK(cudaMemset(lw.d_attn_cache_len.data, 0, sizeof(int32_t)));
 
-            if (cfg_.architecture == ModelArch::QWEN) {
+            if (cfg_.is_qwen()) {
                 std::string hf_prefix = "model.layers." + std::to_string(l);
                 std::string lm_prefix = "model.language_model.layers." + std::to_string(l);
                 std::string alt_prefix = "layers." + std::to_string(l);
@@ -5157,6 +5619,15 @@ private:
                     }
                     if (!load_tensor(lw.gqa_k_norm_w, lm_prefix + ".self_attn.k_norm.weight")) {
                         load_tensor(lw.gqa_k_norm_w, hf_prefix + ".self_attn.k_norm.weight");
+                    }
+                    if (!load_tensor(lw.gqa_q_bias, lm_prefix + ".self_attn.q_proj.bias")) {
+                        load_tensor(lw.gqa_q_bias, hf_prefix + ".self_attn.q_proj.bias");
+                    }
+                    if (!load_tensor(lw.gqa_k_bias, lm_prefix + ".self_attn.k_proj.bias")) {
+                        load_tensor(lw.gqa_k_bias, hf_prefix + ".self_attn.k_proj.bias");
+                    }
+                    if (!load_tensor(lw.gqa_v_bias, lm_prefix + ".self_attn.v_proj.bias")) {
+                        load_tensor(lw.gqa_v_bias, hf_prefix + ".self_attn.v_proj.bias");
                     }
 
                     // Allocate GQA FP8 KV cache (1 byte per element)
@@ -5450,6 +5921,9 @@ private:
         buf_input_ids_.alloc(sizeof(int32_t));
         buf_input_token_.alloc(sizeof(int32_t));
         buf_input_pos_.alloc(sizeof(int32_t));
+        buf_mrope_pos_.alloc(2 * sizeof(int32_t));
+        int dummy_mrope[2] = {-1, 0};
+        CUDA_CHECK(cudaMemcpy(buf_mrope_pos_.i32(), dummy_mrope, 2 * sizeof(int32_t), cudaMemcpyHostToDevice));
         buf_hc_state_.alloc((size_t)hc * dim * sizeof(__nv_bfloat16));
         buf_hc_after_attn_.alloc((size_t)hc * dim * sizeof(__nv_bfloat16));  // static intermediate after attention
         buf_hc_pre_.alloc(hc * sizeof(float));
@@ -5789,8 +6263,13 @@ private:
         };
 
         // 1. Attention Pre-RMSNorm: buf_hidden_ -> buf_hidden2_
-        rms_norm_one_centered_cuda(buf_hidden2_.bf16(), buf_hidden_.bf16(),
-                                   lw.attn_norm_w.bf16(), dim, cfg_.rms_norm_eps, main_stream_);
+        if (cfg_.architecture == ModelArch::QWEN2) {
+            rms_norm_cuda(buf_hidden2_.bf16(), buf_hidden_.bf16(),
+                          lw.attn_norm_w.bf16(), dim, cfg_.rms_norm_eps, main_stream_);
+        } else {
+            rms_norm_one_centered_cuda(buf_hidden2_.bf16(), buf_hidden_.bf16(),
+                                       lw.attn_norm_w.bf16(), dim, cfg_.rms_norm_eps, main_stream_);
+        }
 
         if (is_blackwell_tc_active_) {
             quantize_bf16_to_fp4_e2m1_cuda(buf_activation_fp4_.u8(), buf_activation_scale_.u8(),
@@ -5850,6 +6329,79 @@ private:
                                         dim, 6144, main_stream_);
             } else {
                 matmul_proj(buf_hidden2_, buf_attn_out_, lw.linear_out_proj, lw.linear_out_proj_scale, dim, 6144);
+                vector_add_bf16_cuda(buf_hidden_.bf16(), buf_hidden2_.bf16(), dim, main_stream_);
+            }
+        } else if (cfg_.architecture == ModelArch::QWEN2) {
+            // Standard Full GQA Attention (Ungated) Projections
+            int q_dim = n_q_heads * head_dim;
+            int kv_dim = n_kv_heads * head_dim;
+            if (is_blackwell_tc_active_ && lw.w_q.dtype == "fp4") {
+                gemm_fp4_blackwell_tensorcore_cuda(buf_q_.bf16(), buf_activation_fp4_.u8(), buf_activation_scale_.u8(),
+                                                    (const uint8_t*)lw.w_q.data, (const uint8_t*)lw.w_q_scale.data,
+                                                    q_dim, dim, 1, main_stream_);
+            } else {
+                matmul_proj(buf_q_, buf_hidden2_, lw.w_q, lw.w_q_scale, q_dim, dim);
+            }
+            if (is_blackwell_tc_active_ && lw.w_k.dtype == "fp4") {
+                gemm_fp4_blackwell_tensorcore_cuda(buf_gate_.bf16(), buf_activation_fp4_.u8(), buf_activation_scale_.u8(),
+                                                    (const uint8_t*)lw.w_k.data, (const uint8_t*)lw.w_k_scale.data,
+                                                    kv_dim, dim, 1, main_stream_);
+            } else {
+                matmul_proj(buf_gate_, buf_hidden2_, lw.w_k, lw.w_k_scale, kv_dim, dim);
+            }
+            if (is_blackwell_tc_active_ && lw.w_v.dtype == "fp4") {
+                gemm_fp4_blackwell_tensorcore_cuda(buf_up_.bf16(), buf_activation_fp4_.u8(), buf_activation_scale_.u8(),
+                                                    (const uint8_t*)lw.w_v.data, (const uint8_t*)lw.w_v_scale.data,
+                                                    kv_dim, dim, 1, main_stream_);
+            } else {
+                matmul_proj(buf_up_, buf_hidden2_, lw.w_v, lw.w_v_scale, kv_dim, dim);
+            }
+
+            if (lw.gqa_q_bias.data) {
+                add_bias_bf16_cuda(buf_q_.bf16(), lw.gqa_q_bias.bf16(), 1, q_dim, main_stream_);
+            }
+            if (lw.gqa_k_bias.data) {
+                add_bias_bf16_cuda(buf_gate_.bf16(), lw.gqa_k_bias.bf16(), 1, kv_dim, main_stream_);
+            }
+            if (lw.gqa_v_bias.data) {
+                add_bias_bf16_cuda(buf_up_.bf16(), lw.gqa_v_bias.bf16(), 1, kv_dim, main_stream_);
+            }
+
+            // 3 & 4. QK Norm + RoPE + GQA FP8 Decode (Ungated)
+            qwen2_gqa_decode_fp8_cuda(
+                buf_attn_out_.bf16(),
+                buf_q_.bf16(),
+                buf_gate_.bf16(),
+                buf_up_.bf16(),
+                lw.gqa_q_norm_w.data ? lw.gqa_q_norm_w.bf16() : nullptr,
+                lw.gqa_k_norm_w.data ? lw.gqa_k_norm_w.bf16() : nullptr,
+                lw.k_cache_gqa.u8(),
+                lw.v_cache_gqa.u8(),
+                n_q_heads, n_kv_heads, head_dim,
+                buf_input_pos_.i32(), position, cfg_.max_seq_len,
+                cfg_.rope_theta, cfg_.rms_norm_eps,
+                buf_mrope_pos_.data ? buf_mrope_pos_.i32() : nullptr,
+                main_stream_);
+
+            // 5. Output Projection: in-place residual accumulation into buf_hidden_
+            if (lw.w_o.dtype == "fp4") {
+                if (is_blackwell_tc_active_) {
+                    quantize_bf16_to_fp4_e2m1_cuda(buf_activation_fp4_.u8(), buf_activation_scale_.u8(),
+                                                   buf_attn_out_.bf16(), 1, q_dim, main_stream_);
+                    gemm_fp4_residual_blackwell_tensorcore_cuda(buf_hidden_.bf16(), buf_activation_fp4_.u8(), buf_activation_scale_.u8(),
+                                                                (const uint8_t*)lw.w_o.data, (const uint8_t*)lw.w_o_scale.data,
+                                                                dim, q_dim, 1, main_stream_);
+                } else {
+                    gemv_fp4_residual_cuda(buf_hidden_.bf16(), buf_attn_out_.bf16(),
+                                            (const uint8_t*)lw.w_o.data, (const uint8_t*)lw.w_o_scale.data,
+                                            dim, q_dim, main_stream_);
+                }
+            } else if (lw.w_o.dtype == "int4") {
+                gemv_int4_residual_cuda(buf_hidden_.bf16(), buf_attn_out_.bf16(),
+                                        (const uint8_t*)lw.w_o.data, lw.w_o_scale.bf16(),
+                                        dim, q_dim, main_stream_);
+            } else {
+                matmul_proj(buf_hidden2_, buf_attn_out_, lw.w_o, lw.w_o_scale, dim, q_dim);
                 vector_add_bf16_cuda(buf_hidden_.bf16(), buf_hidden2_.bf16(), dim, main_stream_);
             }
         } else {
@@ -5914,8 +6466,13 @@ private:
         }
 
         // 7. FFN Pre-RMSNorm: buf_hidden_ -> buf_hidden2_
-        rms_norm_one_centered_cuda(buf_hidden2_.bf16(), buf_hidden_.bf16(),
-                                   lw.ffn_norm_w.bf16(), dim, cfg_.rms_norm_eps, main_stream_);
+        if (cfg_.architecture == ModelArch::QWEN2) {
+            rms_norm_cuda(buf_hidden2_.bf16(), buf_hidden_.bf16(),
+                          lw.ffn_norm_w.bf16(), dim, cfg_.rms_norm_eps, main_stream_);
+        } else {
+            rms_norm_one_centered_cuda(buf_hidden2_.bf16(), buf_hidden_.bf16(),
+                                       lw.ffn_norm_w.bf16(), dim, cfg_.rms_norm_eps, main_stream_);
+        }
 
         // 8 & 9. Gate & Up projections + Fused SiLU(Gate) * Up
         if (lw.w_gate.dtype == "fp4") {
@@ -6006,8 +6563,13 @@ private:
         };
 
         // 1. Attention Pre-RMSNorm: [M, dim] -> [M, dim]
-        rms_norm_one_centered_cuda_batched(buf_hidden2_batch_.bf16(), buf_hidden_batch_.bf16(),
-                                           lw.attn_norm_w.bf16(), M, dim, cfg_.rms_norm_eps, main_stream_);
+        if (cfg_.architecture == ModelArch::QWEN2) {
+            rms_norm_cuda_batched(buf_hidden2_batch_.bf16(), buf_hidden_batch_.bf16(),
+                                  lw.attn_norm_w.bf16(), M, dim, cfg_.rms_norm_eps, main_stream_);
+        } else {
+            rms_norm_one_centered_cuda_batched(buf_hidden2_batch_.bf16(), buf_hidden_batch_.bf16(),
+                                               lw.attn_norm_w.bf16(), M, dim, cfg_.rms_norm_eps, main_stream_);
+        }
 
         if (is_blackwell_tc_active_) {
             quantize_bf16_to_fp4_e2m1_cuda(buf_activation_fp4_.u8(), buf_activation_scale_.u8(),
@@ -6079,6 +6641,80 @@ private:
                 matmul_proj_batch(buf_hidden2_batch_, buf_attn_out_batch_, lw.linear_out_proj, lw.linear_out_proj_scale, dim, 6144);
                 vector_add_bf16_cuda(buf_hidden_batch_.bf16(), buf_hidden2_batch_.bf16(), M * dim, main_stream_);
             }
+        } else if (cfg_.architecture == ModelArch::QWEN2) {
+            // Full GQA Attention Projections for M tokens (Ungated)
+            int q_dim = n_q_heads * head_dim;
+            int kv_dim = n_kv_heads * head_dim;
+            if (is_blackwell_tc_active_ && lw.w_q.dtype == "fp4") {
+                gemm_fp4_blackwell_tensorcore_cuda(buf_q_batch_.bf16(), buf_activation_fp4_.u8(), buf_activation_scale_.u8(),
+                                                    (const uint8_t*)lw.w_q.data, (const uint8_t*)lw.w_q_scale.data,
+                                                    q_dim, dim, M, main_stream_);
+            } else {
+                matmul_proj_batch(buf_q_batch_, buf_hidden2_batch_, lw.w_q, lw.w_q_scale, q_dim, dim);
+            }
+            if (is_blackwell_tc_active_ && lw.w_k.dtype == "fp4") {
+                gemm_fp4_blackwell_tensorcore_cuda(buf_gate_batch_.bf16(), buf_activation_fp4_.u8(), buf_activation_scale_.u8(),
+                                                    (const uint8_t*)lw.w_k.data, (const uint8_t*)lw.w_k_scale.data,
+                                                    kv_dim, dim, M, main_stream_);
+            } else {
+                matmul_proj_batch(buf_gate_batch_, buf_hidden2_batch_, lw.w_k, lw.w_k_scale, kv_dim, dim);
+            }
+            if (is_blackwell_tc_active_ && lw.w_v.dtype == "fp4") {
+                gemm_fp4_blackwell_tensorcore_cuda(buf_up_batch_.bf16(), buf_activation_fp4_.u8(), buf_activation_scale_.u8(),
+                                                    (const uint8_t*)lw.w_v.data, (const uint8_t*)lw.w_v_scale.data,
+                                                    kv_dim, dim, M, main_stream_);
+            } else {
+                matmul_proj_batch(buf_up_batch_, buf_hidden2_batch_, lw.w_v, lw.w_v_scale, kv_dim, dim);
+            }
+
+            if (lw.gqa_q_bias.data) {
+                add_bias_bf16_cuda(buf_q_batch_.bf16(), lw.gqa_q_bias.bf16(), M, q_dim, main_stream_);
+            }
+            if (lw.gqa_k_bias.data) {
+                add_bias_bf16_cuda(buf_gate_batch_.bf16(), lw.gqa_k_bias.bf16(), M, kv_dim, main_stream_);
+            }
+            if (lw.gqa_v_bias.data) {
+                add_bias_bf16_cuda(buf_up_batch_.bf16(), lw.gqa_v_bias.bf16(), M, kv_dim, main_stream_);
+            }
+
+            qwen2_gqa_decode_fp8_batch_cuda(
+                buf_attn_out_batch_.bf16(),
+                buf_q_batch_.bf16(),
+                buf_gate_batch_.bf16(),
+                buf_up_batch_.bf16(),
+                lw.gqa_q_norm_w.data ? lw.gqa_q_norm_w.bf16() : nullptr,
+                lw.gqa_k_norm_w.data ? lw.gqa_k_norm_w.bf16() : nullptr,
+                lw.k_cache_gqa.u8(),
+                lw.v_cache_gqa.u8(),
+                n_q_heads, n_kv_heads, head_dim,
+                buf_input_pos_batch_.data ? buf_input_pos_batch_.i32() : nullptr,
+                position,
+                M,
+                cfg_.max_seq_len,
+                cfg_.rope_theta, cfg_.rms_norm_eps,
+                buf_mrope_pos_.data ? buf_mrope_pos_.i32() : nullptr,
+                main_stream_);
+
+            if (lw.w_o.dtype == "fp4") {
+                if (is_blackwell_tc_active_) {
+                    quantize_bf16_to_fp4_e2m1_cuda(buf_activation_fp4_.u8(), buf_activation_scale_.u8(),
+                                                   buf_attn_out_batch_.bf16(), M, q_dim, main_stream_);
+                    gemm_fp4_residual_blackwell_tensorcore_cuda(buf_hidden_batch_.bf16(), buf_activation_fp4_.u8(), buf_activation_scale_.u8(),
+                                                                (const uint8_t*)lw.w_o.data, (const uint8_t*)lw.w_o_scale.data,
+                                                                dim, q_dim, M, main_stream_);
+                } else if (M == 1) {
+                    gemv_fp4_residual_cuda(buf_hidden_batch_.bf16(), buf_attn_out_batch_.bf16(),
+                                           (const uint8_t*)lw.w_o.data, (const uint8_t*)lw.w_o_scale.data,
+                                           dim, q_dim, main_stream_);
+                } else {
+                    gemm_fp4_residual_batch_cuda(buf_hidden_batch_.bf16(), buf_attn_out_batch_.bf16(),
+                                                 (const uint8_t*)lw.w_o.data, (const uint8_t*)lw.w_o_scale.data,
+                                                 dim, q_dim, M, main_stream_);
+                }
+            } else {
+                matmul_proj_batch(buf_hidden2_batch_, buf_attn_out_batch_, lw.w_o, lw.w_o_scale, dim, q_dim);
+                vector_add_bf16_cuda(buf_hidden_batch_.bf16(), buf_hidden2_batch_.bf16(), M * dim, main_stream_);
+            }
         } else {
             // Full GQA Attention Projections for M tokens
             if (is_blackwell_tc_active_ && lw.w_q.dtype == "fp4") {
@@ -6141,8 +6777,13 @@ private:
             }
         }
 
-        rms_norm_one_centered_cuda_batched(buf_hidden2_batch_.bf16(), buf_hidden_batch_.bf16(),
-                                           lw.ffn_norm_w.bf16(), M, dim, cfg_.rms_norm_eps, main_stream_);
+        if (cfg_.architecture == ModelArch::QWEN2) {
+            rms_norm_cuda_batched(buf_hidden2_batch_.bf16(), buf_hidden_batch_.bf16(),
+                                  lw.ffn_norm_w.bf16(), M, dim, cfg_.rms_norm_eps, main_stream_);
+        } else {
+            rms_norm_one_centered_cuda_batched(buf_hidden2_batch_.bf16(), buf_hidden_batch_.bf16(),
+                                               lw.ffn_norm_w.bf16(), M, dim, cfg_.rms_norm_eps, main_stream_);
+        }
 
         // FFN SwiGLU for M tokens simultaneously:
         if (lw.w_gate.dtype == "fp4") {
@@ -6245,8 +6886,13 @@ private:
         if (!compute_logits) return;
 
         // 3. Final norm
-        rms_norm_one_centered_cuda_batched(buf_hidden_batch_.bf16(), buf_hidden_batch_.bf16(),
-                                           norm_weight_.bf16(), M, dim, cfg_.rms_norm_eps, main_stream_);
+        if (cfg_.architecture == ModelArch::QWEN2) {
+            rms_norm_cuda_batched(buf_hidden_batch_.bf16(), buf_hidden_batch_.bf16(),
+                                  norm_weight_.bf16(), M, dim, cfg_.rms_norm_eps, main_stream_);
+        } else {
+            rms_norm_one_centered_cuda_batched(buf_hidden_batch_.bf16(), buf_hidden_batch_.bf16(),
+                                               norm_weight_.bf16(), M, dim, cfg_.rms_norm_eps, main_stream_);
+        }
 
         // 4. Logits: hidden @ head_weight.T -> [M, vocab_size] in F32
         if (head_weight_.dtype == "fp4") {
@@ -6365,7 +7011,7 @@ private:
     // ── Forward one layer ───────────────────────────────────────────────────
 
     void forward_layer(int layer_id, int token_id, int position) {
-        if (cfg_.architecture == ModelArch::QWEN) {
+        if (cfg_.is_qwen()) {
             forward_layer_qwen(layer_id, position);
             return;
         }
@@ -6999,7 +7645,23 @@ private:
         auto& w2_info = expert_parts_["w2.weight"];
 
         if (expert_loader_.all_resident(cfg_.num_hidden_layers)) {
-            if (cfg_.expert_dtype == "iq2_xxs") {
+            if (cfg_.expert_dtype == "mixed_nvfp4_iq2") {
+                gemv_mixed_moe_swiglu_fused_batch_cuda(
+                    buf_gate_.bf16(), buf_hidden_.bf16(),
+                    w1_info.offset_in_block, w3_info.offset_in_block,
+                    moe_inter, dim, cfg_.swiglu_limit,
+                    buf_topk_idx_.i32(), flat_ptrs,
+                    expert_loader_.expert_type_map_gpu(),
+                    layer_id, n_experts, 1, main_stream_);
+
+                gemv_mixed_moe_down_batch_cuda(
+                    buf_down_.bf16(), buf_gate_.bf16(),
+                    buf_topk_idx_.i32(), flat_ptrs,
+                    expert_loader_.expert_type_map_gpu(),
+                    layer_id, n_experts,
+                    w2_info.offset_in_block,
+                    dim, moe_inter, 1, main_stream_);
+            } else if (cfg_.expert_dtype == "iq2_xxs") {
                 gemv_iq2_xxs_moe_swiglu_fused_cuda(
                     buf_gate_.bf16(), buf_hidden_.bf16(),
                     (const void* const*)buf_active_expert_ptrs_.data,
@@ -7071,6 +7733,31 @@ private:
             gemm_int2_dequant(my_up,   1, moe_inter, dim, buf_hidden_.bf16(), w3_data, (__nv_bfloat16*)w3_scale, block_size, stream);
             silu_mul_cuda(my_gate, my_gate, my_up, moe_inter, cfg_.swiglu_limit, stream);
             gemm_int2_dequant(my_down, 1, dim, moe_inter, my_gate, w2_data, (__nv_bfloat16*)w2_scale, block_size, stream);
+        } else if (cfg_.expert_dtype == "sparse_nvfp4") {
+            auto& w1m_info = expert_parts_["w1.meta"];
+            auto& w1s_info = expert_parts_["w1.scale"];
+            auto& w3m_info = expert_parts_["w3.meta"];
+            auto& w3s_info = expert_parts_["w3.scale"];
+            auto& w2m_info = expert_parts_["w2.meta"];
+            auto& w2s_info = expert_parts_["w2.scale"];
+
+            uint8_t* w1_meta  = block + w1m_info.offset_in_block;
+            uint8_t* w1_scale = block + w1s_info.offset_in_block;
+            uint8_t* w3_meta  = block + w3m_info.offset_in_block;
+            uint8_t* w3_scale = block + w3s_info.offset_in_block;
+            uint8_t* w2_meta  = block + w2m_info.offset_in_block;
+            uint8_t* w2_scale = block + w2s_info.offset_in_block;
+
+            gemv_sparse_nvfp4_swiglu_fused_cuda(
+                my_gate, buf_hidden_.bf16(),
+                w1_data, w1_meta, w1_scale,
+                w3_data, w3_meta, w3_scale,
+                moe_inter, dim, cfg_.swiglu_limit, stream);
+
+            gemv_sparse_nvfp4_cuda(
+                my_down, my_gate,
+                w2_data, w2_meta, w2_scale,
+                dim, moe_inter, stream);
         } else {
             auto& w1s_info = expert_parts_["w1.scale"];
             auto& w3s_info = expert_parts_["w3.scale"];
@@ -7173,6 +7860,27 @@ private:
                 embed_weight_.bf16(),
                 prefill_bufs_.buf_tokens.i32(),
                 M, dim, hc, main_stream_);
+
+            // Override with vision tower embedding for image tokens
+            if (active_visual_embeddings_) {
+                for (int m = 0; m < M; m++) {
+                    int pos = position + m;
+                    if (pos >= visual_embed_start_pos_ && pos < visual_embed_start_pos_ + visual_embed_num_tokens_) {
+                        int v_idx = pos - visual_embed_start_pos_;
+                        const __nv_bfloat16* src_vis = active_visual_embeddings_ + (size_t)v_idx * dim;
+                        CUDA_CHECK(cudaMemcpyAsync(prefill_bufs_.buf_hidden.bf16() + (size_t)m * dim,
+                                                   src_vis,
+                                                   dim * sizeof(__nv_bfloat16),
+                                                   cudaMemcpyDeviceToDevice, main_stream_));
+                        for (int h = 0; h < hc; h++) {
+                            CUDA_CHECK(cudaMemcpyAsync(prefill_bufs_.buf_hc_state.bf16() + (size_t)m * hc_dim + (size_t)h * dim,
+                                                       src_vis,
+                                                       dim * sizeof(__nv_bfloat16),
+                                                       cudaMemcpyDeviceToDevice, main_stream_));
+                        }
+                    }
+                }
+            }
 
             // 3. Process each layer
             for (int layer_id = 0; layer_id < cfg_.num_hidden_layers; layer_id++) {
@@ -7423,21 +8131,41 @@ private:
                 auto& w3_info = expert_parts_["w3.weight"];
                 auto& w2_info = expert_parts_["w2.weight"];
 
-                gemv_iq2_xxs_moe_swiglu_fused_batch_cuda(
-                    prefill_bufs_.buf_gate.bf16(),
-                    prefill_bufs_.buf_hidden.bf16(),
-                    w1_info.offset_in_block, w3_info.offset_in_block,
-                    moe_inter, dim, cfg_.swiglu_limit,
-                    prefill_bufs_.buf_topk_idx.i32(),
-                    flat_ptrs, layer_id, n_experts, M, main_stream_);
+                if (cfg_.expert_dtype == "mixed_nvfp4_iq2") {
+                    gemv_mixed_moe_swiglu_fused_batch_cuda(
+                        prefill_bufs_.buf_gate.bf16(),
+                        prefill_bufs_.buf_hidden.bf16(),
+                        w1_info.offset_in_block, w3_info.offset_in_block,
+                        moe_inter, dim, cfg_.swiglu_limit,
+                        prefill_bufs_.buf_topk_idx.i32(),
+                        flat_ptrs, expert_loader_.expert_type_map_gpu(),
+                        layer_id, n_experts, M, main_stream_);
 
-                gemv_q2_k_moe_batch_cuda(
-                    prefill_bufs_.buf_down.bf16(),
-                    prefill_bufs_.buf_gate.bf16(),
-                    prefill_bufs_.buf_topk_idx.i32(),
-                    flat_ptrs, layer_id, n_experts,
-                    w2_info.offset_in_block,
-                    dim, moe_inter, M, main_stream_);
+                    gemv_mixed_moe_down_batch_cuda(
+                        prefill_bufs_.buf_down.bf16(),
+                        prefill_bufs_.buf_gate.bf16(),
+                        prefill_bufs_.buf_topk_idx.i32(),
+                        flat_ptrs, expert_loader_.expert_type_map_gpu(),
+                        layer_id, n_experts,
+                        w2_info.offset_in_block,
+                        dim, moe_inter, M, main_stream_);
+                } else {
+                    gemv_iq2_xxs_moe_swiglu_fused_batch_cuda(
+                        prefill_bufs_.buf_gate.bf16(),
+                        prefill_bufs_.buf_hidden.bf16(),
+                        w1_info.offset_in_block, w3_info.offset_in_block,
+                        moe_inter, dim, cfg_.swiglu_limit,
+                        prefill_bufs_.buf_topk_idx.i32(),
+                        flat_ptrs, layer_id, n_experts, M, main_stream_);
+
+                    gemv_q2_k_moe_batch_cuda(
+                        prefill_bufs_.buf_down.bf16(),
+                        prefill_bufs_.buf_gate.bf16(),
+                        prefill_bufs_.buf_topk_idx.i32(),
+                        flat_ptrs, layer_id, n_experts,
+                        w2_info.offset_in_block,
+                        dim, moe_inter, M, main_stream_);
+                }
 
                 // ── Fused Accumulation (routed experts + shared expert) ──
                 fused_moe_accum_dynamic_batch_cuda(
@@ -7493,6 +8221,20 @@ private:
         static int32_t* h_sample_pin = nullptr;
         if (!h_sample_pin) {
             CUDA_CHECK(cudaMallocHost(&h_sample_pin, sizeof(int32_t)));
+        }
+
+        if (current_rep_penalty_ > 1.0f && !history.empty()) {
+            static int32_t* d_rep_hist = nullptr;
+            static const int MAX_REP_HIST = 256;
+            if (!d_rep_hist) {
+                CUDA_CHECK(cudaMalloc(&d_rep_hist, MAX_REP_HIST * sizeof(int32_t)));
+            }
+            int hist_len = (int)history.size();
+            int n_penalize = std::min(hist_len, MAX_REP_HIST);
+            const int* src_ptr = history.data() + (hist_len - n_penalize);
+            CUDA_CHECK(cudaMemcpyAsync(d_rep_hist, src_ptr, n_penalize * sizeof(int32_t), cudaMemcpyHostToDevice, main_stream_));
+            apply_repetition_penalty_cuda(logits_ptr, d_rep_hist, n_penalize, current_rep_penalty_, main_stream_);
+            argmax_cache_valid_ = false;
         }
 
         if (temperature <= 0.0f) {
@@ -8363,7 +9105,11 @@ static std::string build_dynamic_tools_prompt(const json& resolved_tools, bool i
 }
 
 static std::string g_base_system_prompt = 
-    "You are a helpful assistant.\n\n"
+    "You are FrankensTin, a powerful multimodal vision-language AI assistant with direct visual perception for detailed scene analysis, vehicle recognition, optical character recognition (OCR), and 3D modeling.\n\n"
+    "# Multimodal Visual Perception & Recognition Guidelines\n"
+    "- Directly perceive and report visual objects, colors, vehicle makes, models, and parts.\n"
+    "- For vehicles: clearly identify the vehicle make, vehicle color, and read the exact alphanumeric characters on its license plate accurately.\n"
+    "- Answer directly, concisely, and factually based on the visual evidence, without meta-commentary.\n\n"
     "# High-Fidelity Analytic 3D Modeling Instructions\n"
     "When asked to create, model, or reconstruct in 3D (or reconstruct an object from an image), "
     "always output Three.js representation code defining `function createModel(scene, THREE, inputImage, helpers) { ... }` inside a ```javascript code block "
@@ -8444,6 +9190,60 @@ static bool message_has_image(const json& msg) {
         }
     }
     return false;
+}
+
+static std::string extract_image_b64_from_message(const json& msg) {
+    if (!msg.is_object()) return "";
+    auto extract_from_url_str = [](const std::string& url) -> std::string {
+        if (url.empty()) return "";
+        size_t b64_pos = url.find("base64,");
+        if (b64_pos != std::string::npos) {
+            return url.substr(b64_pos + 7);
+        }
+        return url;
+    };
+
+    if (msg.contains("image")) {
+        if (msg["image"].is_string()) {
+            return extract_from_url_str(msg["image"].get<std::string>());
+        } else if (msg["image"].is_object()) {
+            return extract_from_url_str(msg["image"].value("url", ""));
+        }
+    }
+    if (msg.contains("image_url")) {
+        if (msg["image_url"].is_string()) {
+            return extract_from_url_str(msg["image_url"].get<std::string>());
+        } else if (msg["image_url"].is_object()) {
+            return extract_from_url_str(msg["image_url"].value("url", ""));
+        }
+    }
+    if (msg.contains("content") && msg["content"].is_array()) {
+        for (const auto& part : msg["content"]) {
+            if (part.is_object()) {
+                std::string ptype = part.value("type", "");
+                if (ptype == "image" || ptype == "image_url" || part.contains("image") || part.contains("image_url")) {
+                    if (part.contains("image_url")) {
+                        if (part["image_url"].is_string()) {
+                            return extract_from_url_str(part["image_url"].get<std::string>());
+                        } else if (part["image_url"].is_object()) {
+                            return extract_from_url_str(part["image_url"].value("url", ""));
+                        }
+                    }
+                    if (part.contains("image")) {
+                        if (part["image"].is_string()) {
+                            return extract_from_url_str(part["image"].get<std::string>());
+                        } else if (part["image"].is_object()) {
+                            return extract_from_url_str(part["image"].value("url", ""));
+                        }
+                    }
+                    if (part.contains("url") && part["url"].is_string()) {
+                        return extract_from_url_str(part["url"].get<std::string>());
+                    }
+                }
+            }
+        }
+    }
+    return "";
 }
 
 struct MultimodalPrompt {
@@ -8574,6 +9374,23 @@ static MultimodalPrompt apply_chat_template_multimodal(
             }
 
             std::string body = content_str;
+            if (model_has_vision && !extracted_image_b64.empty() && role == "user") {
+                std::string trimmed = body;
+                while (!trimmed.empty() && (trimmed.front() == ' ' || trimmed.front() == '\n' || trimmed.front() == '\r' || trimmed.front() == '\t')) trimmed.erase(trimmed.begin());
+                while (!trimmed.empty() && (trimmed.back() == ' ' || trimmed.back() == '\n' || trimmed.back() == '\r' || trimmed.back() == '\t' || trimmed.back() == '.' || trimmed.back() == '?' || trimmed.back() == '!')) trimmed.pop_back();
+                std::string lower = trimmed;
+                for (char& c : lower) c = (char)std::tolower((unsigned char)c);
+
+                if (lower.empty() ||
+                    lower == "describe this image" || lower == "describe the image" || lower == "describe image" ||
+                    lower == "describe this picture" || lower == "describe picture" || lower == "describe" ||
+                    lower == "what is this" || lower == "what is this image" || lower == "what is this picture" ||
+                    lower == "what's this" || lower == "what do you see" || lower == "what do you see in this image" ||
+                    lower == "what do you see in this picture" || lower == "analyze this image" || lower == "analyze image" ||
+                    lower == "describe what is depicted in this photo" || lower == "describe what you see in this image") {
+                    body = "What is shown in this image?";
+                }
+            }
             if (role == "assistant") {
                 if (messages[i].contains("reasoning_content") && messages[i]["reasoning_content"].is_string()) {
                     std::string r_content = messages[i]["reasoning_content"].get<std::string>();
@@ -8604,7 +9421,8 @@ static MultimodalPrompt apply_chat_template_multimodal(
                 result.push_back(IM_START);
                 auto asst_enc = tok.encode("assistant\n");
                 result.insert(result.end(), asst_enc.begin(), asst_enc.end());
-                if (enable_thinking) {
+                bool actual_thinking = enable_thinking && out.image_b64.empty();
+                if (actual_thinking) {
                     auto think_enc = tok.encode("<think>\n");
                     result.insert(result.end(), think_enc.begin(), think_enc.end());
                 } else {
@@ -8646,16 +9464,66 @@ static MultimodalPrompt apply_chat_template_multimodal(
     }
 
     bool has_system = (!messages.empty() && messages[0].value("role", "") == "system");
-    if (!has_system && has_tools) {
-        std::string default_sys = "You are a helpful assistant";
-        std::string sys_text = default_sys + tools_system_prompt;
-        auto enc = tok.encode(sys_text);
-        result.insert(result.end(), enc.begin(), enc.end());
+    if (!has_system) {
+        std::string default_sys = "";
+        if (has_tools) {
+            default_sys = g_base_system_prompt + tools_system_prompt;
+        } else {
+            default_sys = g_base_system_prompt;
+        }
+        if (!default_sys.empty()) {
+            auto enc = tok.encode(default_sys);
+            result.insert(result.end(), enc.begin(), enc.end());
+        }
     }
 
     for (size_t i = 0; i < messages.size(); i++) {
         std::string role = messages[i].value("role", "user");
-        std::string content = get_message_content_string(messages[i]);
+        std::string content = "";
+        std::string extracted_image_b64 = "";
+
+        if (messages[i].contains("content")) {
+            const auto& c = messages[i]["content"];
+            if (c.is_string()) {
+                content = c.get<std::string>();
+            } else if (c.is_array()) {
+                for (const auto& part : c) {
+                    if (part.is_object()) {
+                        std::string type = part.value("type", "text");
+                        if (type == "text") {
+                            content += part.value("text", "");
+                        } else if (type == "image_url" || type == "image") {
+                            std::string url = "";
+                            if (part.contains("image_url")) {
+                                if (part["image_url"].is_string()) {
+                                    url = part["image_url"].get<std::string>();
+                                } else if (part["image_url"].is_object()) {
+                                    url = part["image_url"].value("url", "");
+                                }
+                            } else if (part.contains("image")) {
+                                if (part["image"].is_string()) {
+                                    url = part["image"].get<std::string>();
+                                } else if (part["image"].is_object()) {
+                                    url = part["image"].value("url", "");
+                                }
+                            }
+                            if (!url.empty()) {
+                                size_t b64_pos = url.find("base64,");
+                                extracted_image_b64 = (b64_pos != std::string::npos) ? url.substr(b64_pos + 7) : url;
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        if (content.empty()) {
+            content = get_message_content_string(messages[i]);
+        }
+        if (extracted_image_b64.empty() && messages[i].contains("image") && messages[i]["image"].is_string()) {
+            std::string url = messages[i]["image"].get<std::string>();
+            size_t b64_pos = url.find("base64,");
+            extracted_image_b64 = (b64_pos != std::string::npos) ? url.substr(b64_pos + 7) : url;
+        }
 
         if (role == "system") {
             std::string sys_body = content;
@@ -8666,7 +9534,44 @@ static MultimodalPrompt apply_chat_template_multimodal(
             result.insert(result.end(), enc.begin(), enc.end());
         } else if (role == "user") {
             result.push_back(USER);
-            auto enc = tok.encode(content);
+            if (model_has_vision && !extracted_image_b64.empty()) {
+                int IMAGE_TOKEN = tok.get_token_id("<｜image｜>");
+                if (IMAGE_TOKEN < 0) IMAGE_TOKEN = 129279;
+
+                out.image_b64 = extracted_image_b64;
+                out.visual_start_pos = (int)result.size();
+                out.visual_num_tokens = 576;
+                result.insert(result.end(), 576, IMAGE_TOKEN);
+                auto newline_enc = tok.encode("\n");
+                result.insert(result.end(), newline_enc.begin(), newline_enc.end());
+
+                size_t img_tag = content.find("<image>");
+                if (img_tag != std::string::npos) {
+                    content.erase(img_tag, 7);
+                    if (img_tag < content.size() && content[img_tag] == '\n') {
+                        content.erase(img_tag, 1);
+                    }
+                }
+            }
+            std::string prompt_text = content;
+            if (model_has_vision && !extracted_image_b64.empty()) {
+                std::string trimmed = prompt_text;
+                while (!trimmed.empty() && (trimmed.front() == ' ' || trimmed.front() == '\n' || trimmed.front() == '\r' || trimmed.front() == '\t')) trimmed.erase(trimmed.begin());
+                while (!trimmed.empty() && (trimmed.back() == ' ' || trimmed.back() == '\n' || trimmed.back() == '\r' || trimmed.back() == '\t' || trimmed.back() == '.' || trimmed.back() == '?' || trimmed.back() == '!')) trimmed.pop_back();
+                std::string lower = trimmed;
+                for (char& c : lower) c = (char)std::tolower((unsigned char)c);
+
+                if (lower.empty() ||
+                    lower == "describe this image" || lower == "describe the image" || lower == "describe image" ||
+                    lower == "describe this picture" || lower == "describe picture" || lower == "describe" ||
+                    lower == "what is this" || lower == "what is this image" || lower == "what is this picture" ||
+                    lower == "what's this" || lower == "what do you see" || lower == "what do you see in this image" ||
+                    lower == "what do you see in this picture" || lower == "analyze this image" || lower == "analyze image" ||
+                    lower == "describe what is depicted in this photo" || lower == "describe what you see in this image") {
+                    prompt_text = "What is shown in this image?";
+                }
+            }
+            auto enc = tok.encode(prompt_text);
             result.insert(result.end(), enc.begin(), enc.end());
         } else if (role == "tool" || role == "function") {
             result.push_back(USER);
@@ -8708,14 +9613,18 @@ static MultimodalPrompt apply_chat_template_multimodal(
         std::string last_role = messages.back().value("role", "user");
         if (last_role == "user" || last_role == "tool" || last_role == "function") {
             result.push_back(ASSISTANT);
-            if (enable_thinking) {
+            bool actual_thinking = enable_thinking && out.image_b64.empty();
+            if (actual_thinking) {
                 result.push_back(THINK_BEGIN);
             } else {
                 result.push_back(THINK_BEGIN);
                 result.push_back(THINK_END);
+                auto nl = tok.encode("\n");
+                result.insert(result.end(), nl.begin(), nl.end());
             }
         }
     }
+
 
     out.prompt = result;
     return out;
@@ -11067,7 +11976,78 @@ static void run_server(MoecherEngine& engine, int port, int default_thinking_bud
         res.set_content(info.dump(), "application/json");
     });
 
-    svr.Get("/v1/models", [&engine](const httplib::Request&, httplib::Response& res) {
+    auto get_system_resource_telemetry = []() -> json {
+        json sys;
+        
+        // 1. GPU VRAM (CUDA)
+        size_t free_vram = 0, total_vram = 0;
+        cudaError_t cuda_err = cudaMemGetInfo(&free_vram, &total_vram);
+        if (cuda_err == cudaSuccess && total_vram > 0) {
+            sys["vram"] = {
+                {"free_bytes", free_vram},
+                {"total_bytes", total_vram},
+                {"used_bytes", total_vram > free_vram ? total_vram - free_vram : 0},
+                {"free_gb", (double)free_vram / (1024.0 * 1024.0 * 1024.0)},
+                {"total_gb", (double)total_vram / (1024.0 * 1024.0 * 1024.0)},
+                {"used_gb", (double)(total_vram > free_vram ? total_vram - free_vram : 0) / (1024.0 * 1024.0 * 1024.0)}
+            };
+        } else {
+            sys["vram"] = {
+                {"free_bytes", 0}, {"total_bytes", 0}, {"used_bytes", 0},
+                {"free_gb", 0.0}, {"total_gb", 0.0}, {"used_gb", 0.0}
+            };
+        }
+
+        // 2. System RAM
+        size_t ram_total_bytes = 0, ram_available_bytes = 0;
+#ifndef _WIN32
+        std::ifstream meminfo("/proc/meminfo");
+        if (meminfo.is_open()) {
+            std::string line;
+            size_t total_kb = 0, avail_kb = 0;
+            while (std::getline(meminfo, line)) {
+                if (line.rfind("MemTotal:", 0) == 0) {
+                    sscanf(line.c_str(), "MemTotal: %zu kB", &total_kb);
+                } else if (line.rfind("MemAvailable:", 0) == 0) {
+                    sscanf(line.c_str(), "MemAvailable: %zu kB", &avail_kb);
+                }
+            }
+            ram_total_bytes = total_kb * 1024;
+            ram_available_bytes = avail_kb * 1024;
+        }
+#else
+        MEMORYSTATUSEX memStatus;
+        memStatus.dwLength = sizeof(memStatus);
+        if (GlobalMemoryStatusEx(&memStatus)) {
+            ram_total_bytes = memStatus.ullTotalPhys;
+            ram_available_bytes = memStatus.ullAvailPhys;
+        }
+#endif
+        sys["ram"] = {
+            {"available_bytes", ram_available_bytes},
+            {"total_bytes", ram_total_bytes},
+            {"available_gb", (double)ram_available_bytes / (1024.0 * 1024.0 * 1024.0)},
+            {"total_gb", (double)ram_total_bytes / (1024.0 * 1024.0 * 1024.0)}
+        };
+
+        // 3. SSD / Disk Storage
+        size_t storage_available_bytes = 0, storage_total_bytes = 0;
+        try {
+            auto si = std::filesystem::space(".");
+            storage_available_bytes = si.available;
+            storage_total_bytes = si.capacity;
+        } catch (...) {}
+        sys["storage"] = {
+            {"available_bytes", storage_available_bytes},
+            {"total_bytes", storage_total_bytes},
+            {"available_gb", (double)storage_available_bytes / (1024.0 * 1024.0 * 1024.0)},
+            {"total_gb", (double)storage_total_bytes / (1024.0 * 1024.0 * 1024.0)}
+        };
+
+        return sys;
+    };
+
+    svr.Get("/v1/models", [&engine, get_system_resource_telemetry](const httplib::Request&, httplib::Response& res) {
         std::string model_id = engine.get_model_id();
         std::string display_name = engine.get_model_display_name();
         std::string arch_desc = (engine.cfg_.architecture == ModelArch::QWEN)
@@ -11075,26 +12055,29 @@ static void run_server(MoecherEngine& engine, int port, int default_thinking_bud
             : (model_id.find("coder") != std::string::npos
                 ? "MoE Coder (64 Experts)"
                 : "Sparse MoE (11,008 Experts) + MLA Latent Attention");
+        json sys_res = get_system_resource_telemetry();
+        json model_entry = {
+            {"id", model_id},
+            {"name", display_name},
+            {"display_name", display_name},
+            {"object", "model"},
+            {"owned_by", "moecher"},
+            {"architecture", arch_desc},
+            {"max_context_length", engine.cfg_.max_seq_len},
+            {"has_vision", engine.supports_vision()},
+            {"has_vision_delegate", engine.has_vision_delegate()},
+            {"active", true},
+            {"resources", sys_res}
+        };
         json body = {
             {"object", "list"},
-            {"data", {
-                {
-                    {"id", model_id},
-                    {"name", display_name},
-                    {"display_name", display_name},
-                    {"object", "model"},
-                    {"owned_by", "moecher"},
-                    {"architecture", arch_desc},
-                    {"max_context_length", engine.cfg_.max_seq_len},
-                    {"has_vision", engine.has_vision()},
-                    {"active", true}
-                }
-            }}
+            {"data", {model_entry}},
+            {"resources", sys_res}
         };
         res.set_content(body.dump(), "application/json");
     });
 
-    svr.Get("/api/model", [&engine](const httplib::Request&, httplib::Response& res) {
+    svr.Get("/api/model", [&engine, get_system_resource_telemetry](const httplib::Request&, httplib::Response& res) {
         std::string model_id = engine.get_model_id();
         std::string display_name = engine.get_model_display_name();
         std::string arch_desc = (engine.cfg_.architecture == ModelArch::QWEN)
@@ -11102,6 +12085,7 @@ static void run_server(MoecherEngine& engine, int port, int default_thinking_bud
             : (model_id.find("coder") != std::string::npos
                 ? "MoE Coder (64 Experts)"
                 : "Sparse MoE (11,008 Experts) + MLA Latent Attention");
+        json sys_res = get_system_resource_telemetry();
         json body = {
             {"id", model_id},
             {"name", display_name},
@@ -11110,10 +12094,17 @@ static void run_server(MoecherEngine& engine, int port, int default_thinking_bud
             {"max_context_length", engine.cfg_.max_seq_len},
             {"vocab_size", engine.cfg_.vocab_size},
             {"max_tool_rounds", g_max_tool_rounds},
-            {"has_vision", engine.has_vision()},
-            {"active", true}
+            {"has_vision", engine.supports_vision()},
+            {"has_vision_delegate", engine.has_vision_delegate()},
+            {"active", true},
+            {"resources", sys_res}
         };
         res.set_content(body.dump(), "application/json");
+    });
+
+    svr.Get("/api/system/resources", [get_system_resource_telemetry](const httplib::Request&, httplib::Response& res) {
+        json sys_res = get_system_resource_telemetry();
+        res.set_content(sys_res.dump(), "application/json");
     });
 
     // Expert Specialization & Profile endpoints
@@ -11457,6 +12448,10 @@ static void run_server(MoecherEngine& engine, int port, int default_thinking_bud
                 }
             }
 
+            if (request.contains("enable_thinking") && request["enable_thinking"].is_boolean()) {
+                enable_thinking = request["enable_thinking"].get<bool>();
+            }
+
             if (reasoning_effort == "none") {
                 enable_thinking = false;
                 max_thinking_tokens = 0;
@@ -11479,6 +12474,63 @@ static void run_server(MoecherEngine& engine, int port, int default_thinking_bud
             if (enable_thinking && request.contains("thinking_budget") && request["thinking_budget"].is_number_integer()) {
                 max_thinking_tokens = request["thinking_budget"].get<int>();
                 if (max_thinking_tokens <= 0) enable_thinking = false;
+            }
+
+            bool req_has_image = false;
+            if (messages.is_array()) {
+                for (const auto& msg : messages) {
+                    if (message_has_image(msg)) { req_has_image = true; break; }
+                }
+            }
+            bool had_image_originally = req_has_image;
+
+            if (engine.has_vision_delegate() && req_has_image && messages.is_array()) {
+                std::lock_guard<std::mutex> lock(g_engine_mutex);
+                for (size_t msg_idx = 0; msg_idx < messages.size(); ++msg_idx) {
+                    auto& msg = messages[msg_idx];
+                    if (message_has_image(msg)) {
+                        std::string cur_text = get_message_content_string(msg);
+                        bool already_has_perception = (cur_text.find("<visual_perception>") != std::string::npos);
+                        bool is_historical_turn = (msg_idx + 1 < messages.size() && messages[msg_idx + 1].value("role", "") == "assistant");
+
+                        if (!already_has_perception && !is_historical_turn) {
+                            std::string img_b64 = extract_image_b64_from_message(msg);
+                            if (!img_b64.empty()) {
+                                LOG_INFO("[Vision Delegation] Delegating visual perception (%zu b64 bytes) to Qwen2.5-VL...", img_b64.size());
+                                std::string perception = engine.vision_delegate_engine_->describe_image(img_b64, cur_text);
+                                if (!perception.empty()) {
+                                    if (cur_text.empty()) {
+                                        cur_text = "Please describe the image in detail.";
+                                    }
+                                    msg["content"] = "[Visual Perception Subsystem Analysis]:\n<visual_perception>\n" + perception + "\n</visual_perception>\n\nBased on the visual observation above, answer the user request:\n" + cur_text;
+                                    if (msg.contains("image")) msg.erase("image");
+                                    if (msg.contains("image_url")) msg.erase("image_url");
+                                    LOG_INFO("[Vision Delegation] Injected perception (%zu chars)", perception.size());
+                                }
+                            }
+                        } else {
+                            // Historical message or already processed: strip raw image to prevent re-delegation and save memory/context
+                            if (!cur_text.empty()) {
+                                msg["content"] = cur_text;
+                            }
+                            if (msg.contains("image")) msg.erase("image");
+                            if (msg.contains("image_url")) msg.erase("image_url");
+                        }
+                    }
+                }
+                // Re-evaluate req_has_image now that delegated images are in text format
+                req_has_image = false;
+                for (const auto& msg : messages) {
+                    if (message_has_image(msg)) { req_has_image = true; break; }
+                }
+            }
+
+            if ((req_has_image || had_image_originally) && !request.contains("enable_thinking") && !request.contains("thinking") && !request.contains("reasoning_effort")) {
+                enable_thinking = false;
+                max_thinking_tokens = 0;
+            }
+            if ((req_has_image || had_image_originally) && !request.contains("tools")) {
+                tools = json();
             }
 
             if (!enable_thinking) {
@@ -11629,6 +12681,13 @@ static void run_server(MoecherEngine& engine, int port, int default_thinking_bud
                             content_filter.on_status = status_cb;
                             reasoning_filter.on_status = status_cb;
 
+                            bool conv_has_image = false;
+                            for (const auto& m : current_messages) {
+                                if (message_has_image(m)) { conv_has_image = true; break; }
+                            }
+                            bool req_thinking = enable_thinking && !conv_has_image;
+                            int req_thinking_tokens = req_thinking ? max_thinking_tokens : 0;
+
                             engine.generate(prompt, max_tokens, temperature, [&](const std::string& text, bool is_reasoning) -> bool {
                                 if (g_stop_requested.load()) return false;
                                 if (text.empty()) return true;
@@ -11652,7 +12711,7 @@ static void run_server(MoecherEngine& engine, int port, int default_thinking_bud
                                         return send_sse_delta(sink, req_id, model_id, created_time_str, "content", text);
                                     }
                                 }
-                            }, repetition_penalty, enable_thinking, max_thinking_tokens, top_p, min_p, top_k,
+                            }, repetition_penalty, req_thinking, req_thinking_tokens, top_p, min_p, top_k,
                                d_vis_out, mm_prompt.visual_start_pos, mm_prompt.visual_num_tokens);
 
                             final_finish_reason = engine.last_finish_reason_.empty() ? "stop" : engine.last_finish_reason_;
@@ -12466,7 +13525,13 @@ static void run_server(MoecherEngine& engine, int port, int default_thinking_bud
                     std::string response_text;
                     {
                         std::lock_guard<std::mutex> lock(g_engine_mutex);
-                        response_text = engine.generate(prompt, max_tokens, temperature, nullptr, repetition_penalty, enable_thinking, max_thinking_tokens, top_p, min_p, top_k,
+                        bool conv_has_image = false;
+                        for (const auto& m : current_messages) {
+                            if (message_has_image(m)) { conv_has_image = true; break; }
+                        }
+                        bool req_thinking = enable_thinking && !conv_has_image;
+                        int req_thinking_tokens = req_thinking ? max_thinking_tokens : 0;
+                        response_text = engine.generate(prompt, max_tokens, temperature, nullptr, repetition_penalty, req_thinking, req_thinking_tokens, top_p, min_p, top_k,
                                                         d_vis_out, mm_prompt.visual_start_pos, mm_prompt.visual_num_tokens);
                         finish_reason = engine.last_finish_reason_;
                     }

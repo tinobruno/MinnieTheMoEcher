@@ -190,11 +190,38 @@
                                 <div class="model-item-title-row">
                                     <span class="model-item-title" id="dropdown-model-name">DeepSeek V4-Flash</span>
                                     <span class="model-badge-active"><span class="badge-dot"></span>Loaded</span>
+                                    <span class="model-badge-vision enabled" id="dropdown-model-vision" title="Multimodal vision capabilities">
+                                        <span class="material-symbols-outlined vision-icon">visibility</span>
+                                        <span id="dropdown-vision-text">Vision Enabled</span>
+                                    </span>
                                 </div>
                                 <div class="model-item-desc" id="dropdown-model-arch">MoE Architecture</div>
                                 <div class="model-item-meta">
                                     <span class="meta-tag" id="dropdown-model-id">deepseek-v4-flash</span>
                                     <span class="meta-tag" id="dropdown-model-ctx">32,768 ctx</span>
+                                </div>
+                                <div class="model-resources-grid" id="dropdown-model-resources">
+                                    <div class="resource-chip" id="dropdown-res-vram" title="Available GPU VRAM / Total VRAM">
+                                        <span class="material-symbols-outlined res-icon">memory</span>
+                                        <div class="res-body">
+                                            <span class="res-label">VRAM</span>
+                                            <span class="res-val" id="dropdown-vram-text">-- GB free</span>
+                                        </div>
+                                    </div>
+                                    <div class="resource-chip" id="dropdown-res-ram" title="Available System RAM / Total RAM">
+                                        <span class="material-symbols-outlined res-icon">developer_board</span>
+                                        <div class="res-body">
+                                            <span class="res-label">RAM</span>
+                                            <span class="res-val" id="dropdown-ram-text">-- GB free</span>
+                                        </div>
+                                    </div>
+                                    <div class="resource-chip" id="dropdown-res-ssd" title="Available SSD Storage">
+                                        <span class="material-symbols-outlined res-icon">hard_drive</span>
+                                        <div class="res-body">
+                                            <span class="res-label">SSD</span>
+                                            <span class="res-val" id="dropdown-ssd-text">-- GB free</span>
+                                        </div>
+                                    </div>
                                 </div>
                             </div>
                             <span class="material-symbols-outlined check-icon">check_circle</span>

@@ -4,19 +4,16 @@
       "name": "Default",
       "files": [
         "src/server_single.cpp",
-        "src/embedded_web.hpp",
-        "web/index.html",
-        "web/script.js",
-        "CMakeLists.txt",
-        "chat.py",
-        "web/style.css",
-        "src/cuda/vision_kernels.cu",
-        "src/cuda/vision_kernels.cuh",
-        "src/image_loader.hpp",
-        "src/stb_image.h",
-        "src/stb_image_resize2.h",
+        "src/cuda/activations.cu",
+        "src/cuda/activations.cuh",
+        "tinobruno-journal.md",
+        "scripts/quantize_deepseek_sparse_nvfp4.py",
+        ".vscode/changelists.json",
         "src/vision_tower.hpp",
-        ".vscode/changelists.json"
+        "scripts/create_frankenstin_manifest.py",
+        "scripts/extract_qwen_vision_tower.py",
+        "scripts/generate_frankenstino_bridge.py",
+        "scripts/generate_mixed_expert_plan.py"
       ]
     }
   ],
