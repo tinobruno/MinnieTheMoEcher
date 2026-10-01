@@ -1,6 +1,10 @@
 #pragma once
+#if defined(__APPLE__)
+#include "metal/metal_backend.h"
+#else
 #include <cuda_runtime.h>
 #include <cuda_bf16.h>
+#endif
 #include <cstdint>
 
 // LayerNorm with affine transform: out = (x - mean) / sqrt(var + eps) * gamma + beta

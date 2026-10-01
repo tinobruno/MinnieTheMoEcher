@@ -1,7 +1,11 @@
 #pragma once
+#if defined(__APPLE__)
+#include "metal/metal_backend.h"
+#else
 #include <cuda_runtime.h>
 #include <cublas_v2.h>
 #include <cuda_bf16.h>
+#endif
 #include <vector>
 #include <string>
 #include <unordered_map>

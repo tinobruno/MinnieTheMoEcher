@@ -24,7 +24,9 @@
     #include <unistd.h>
     #include <sys/mman.h>
     #include <sys/stat.h>
-    #include <immintrin.h>
+    #if defined(__x86_64__) || defined(_M_X64)
+        #include <immintrin.h>
+    #endif
 #endif
 
 namespace moecher {
@@ -198,19 +200,35 @@ public:
         is_direct_ = use_direct_io;
         return true;
 #else
+        fd_ = ::open(path.c_str(), O_RDONLY);
+        if (fd_ < 0) {
+            return false;
+        }
         if (use_direct_io) {
+#if defined(__APPLE__)
+            // macOS uses fcntl F_NOCACHE to bypass OS buffer cache
+            if (fcntl(fd_, F_NOCACHE, 1) == 0) {
+                is_direct_ = true;
+            } else {
+                is_direct_ = false;
+            }
+#elif defined(O_DIRECT)
+            // Re-open with O_DIRECT on Linux if supported
+            ::close(fd_);
             fd_ = ::open(path.c_str(), O_RDONLY | O_DIRECT);
             if (fd_ >= 0) {
                 is_direct_ = true;
-                return true;
+            } else {
+                fd_ = ::open(path.c_str(), O_RDONLY);
+                is_direct_ = false;
             }
-        }
-        fd_ = ::open(path.c_str(), O_RDONLY);
-        if (fd_ >= 0) {
+#else
             is_direct_ = false;
-            return true;
+#endif
+        } else {
+            is_direct_ = false;
         }
-        return false;
+        return true;
 #endif
     }
 

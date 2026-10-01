@@ -40,10 +40,16 @@
 #include <random>
 #include <atomic>
 
+#if defined(__APPLE__)
+#include "metal/metal_backend.h"
+#else
 #include <cuda_runtime.h>
 #include <cuda_bf16.h>
 #include <cublas_v2.h>
+#if defined(__x86_64__) || defined(_M_X64)
 #include <immintrin.h>
+#endif
+#endif
 #include <nlohmann/json.hpp>
 
 #ifndef CPPHTTPLIB_FORM_URL_ENCODED_PAYLOAD_MAX_LENGTH
@@ -2981,7 +2987,6 @@ public:
     // Prompt-Lookup Drafting (PLD) Speculative Decoding
     bool enable_pld_ = true;
     int pld_draft_tokens_ = 4;
-    bool enable_mtp_ = true;
     bool enable_spec_ = true;
     
     // Prompt Prefix KV Cache Tracking
@@ -13920,7 +13925,6 @@ int main(int argc, char** argv) {
     std::string batched_prefill_mode = "auto";
     int prefill_chunk_size = 512;
     int max_seq_len_override = 0;
-    bool enable_mtp = true;
     int mtp_k = 0;
 
     for (int i = 1; i < argc; i++) {
