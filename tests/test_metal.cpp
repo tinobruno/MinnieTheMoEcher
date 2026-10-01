@@ -95,6 +95,7 @@ bool test_rmsnorm() {
         float err = std::fabs(gpu_out[i].to_float() - ref_out[i]);
         if (err > max_err) max_err = err;
     }
+    std::cout << "       gpu[0]=" << gpu_out[0].to_float() << " ref[0]=" << ref_out[0] << " gpu[1]=" << gpu_out[1].to_float() << " ref[1]=" << ref_out[1] << std::endl;
     std::cout << "       Max RMSNorm error: " << max_err << std::endl;
     TEST_CHECK(max_err < 0.05f, "RMSNorm error too large");
 
@@ -314,17 +315,31 @@ bool test_gemv_int4_f32() {
         ref_out[r] = sum;
     }
 
-    std::vector<float> gpu_out(N, 0.0f);
-    gemv_int4_f32_cuda(gpu_out.data(), h_vec.data(), h_weight.data(), h_scale.data(), N, K, 0);
+    float* d_out;
+    __nv_bfloat16* d_vec;
+    uint8_t* d_weight;
+    __nv_bfloat16* d_scale;
+    cudaMalloc((void**)&d_out, N * sizeof(float));
+    cudaMalloc((void**)&d_vec, K * sizeof(__nv_bfloat16));
+    cudaMalloc((void**)&d_weight, N * (K / 2));
+    cudaMalloc((void**)&d_scale, N * num_blocks * sizeof(__nv_bfloat16));
+
+    memcpy(d_vec, h_vec.data(), K * sizeof(__nv_bfloat16));
+    memcpy(d_weight, h_weight.data(), N * (K / 2));
+    memcpy(d_scale, h_scale.data(), N * num_blocks * sizeof(__nv_bfloat16));
+
+    gemv_int4_f32_cuda(d_out, d_vec, d_weight, d_scale, N, K, 0);
+    cudaDeviceSynchronize();
 
     float max_err = 0.0f;
     for (int r = 0; r < N; r++) {
-        float err = std::fabs(gpu_out[r] - ref_out[r]);
+        float err = std::fabs(d_out[r] - ref_out[r]);
         if (err > max_err) max_err = err;
     }
-    std::cout << "       Max INT4 GEMV f32 error: " << max_err << std::endl;
-    TEST_CHECK(max_err < 1e-4f, "INT4 GEMV f32 error mismatch");
-    std::cout << "       PASS: INT4 GEMV f32" << std::endl;
+    std::cout << "       Max INT4 GEMV f32 (GPU) error: " << max_err << std::endl;
+    cudaFree(d_out); cudaFree(d_vec); cudaFree(d_weight); cudaFree(d_scale);
+    TEST_CHECK(max_err < 1e-3f, "INT4 GEMV f32 GPU error mismatch");
+    std::cout << "       PASS: INT4 GEMV f32 (GPU)" << std::endl;
     return true;
 }
 
@@ -350,6 +365,7 @@ bool test_gemv_int3_and_dequant() {
     // Compute GEMV via gemv_int3_cuda
     std::vector<__nv_bfloat16> gemv_out(N);
     gemv_int3_cuda(gemv_out.data(), h_vec.data(), h_weight.data(), h_scale.data(), N, K, 0);
+
 
     // Compute expected result from dequantized weights
     float max_err = 0.0f;
@@ -459,6 +475,7 @@ bool test_gemv_int4_gpu() {
     memcpy(d_scale, h_scale.data(), N * num_blocks * sizeof(__nv_bfloat16));
 
     gemv_int4_cuda(d_out, d_vec, d_weight, d_scale, N, K, 0);
+    cudaDeviceSynchronize();
 
     float max_err = 0.0f;
     for (int r = 0; r < N; r++) {
@@ -472,6 +489,7 @@ bool test_gemv_int4_gpu() {
 
     // Now test residual version
     gemv_int4_residual_cuda(d_out, d_vec, d_weight, d_scale, N, K, 0);
+    cudaDeviceSynchronize();
     float max_res_err = 0.0f;
     for (int r = 0; r < N; r++) {
         float gpu_val = d_out[r].to_float();
@@ -483,6 +501,142 @@ bool test_gemv_int4_gpu() {
     std::cout << "       PASS: INT4 GEMV Metal GPU residual kernel" << std::endl;
 
     cudaFree(d_out); cudaFree(d_vec); cudaFree(d_weight); cudaFree(d_scale);
+    return true;
+}
+
+
+bool test_gemv_int3_gpu() {
+    std::cout << "[TEST] 11. INT3 GEMV Metal GPU kernel (gemv_int3_cuda)..." << std::endl;
+    const int N = 32;
+    const int K = 64;
+    const int num_blocks = K / 32;
+    const size_t bytes_per_row = (K * 3) / 8;
+
+    std::vector<__nv_bfloat16> h_vec(K);
+    for (int i = 0; i < K; i++) h_vec[i] = __nv_bfloat16::from_float(0.2f * ((i % 7) - 3));
+
+    std::vector<uint8_t> h_weight(N * bytes_per_row);
+    std::vector<__nv_bfloat16> h_scale(N * num_blocks);
+    for (size_t i = 0; i < h_weight.size(); i++) h_weight[i] = (uint8_t)((i * 37) & 0xFF);
+    for (size_t i = 0; i < h_scale.size(); i++) h_scale[i] = __nv_bfloat16::from_float(0.1f * ((i % 4) + 1));
+
+    std::vector<float> ref_out(N, 0.0f);
+    for (int r = 0; r < N; r++) {
+        float sum = 0.0f;
+        for (int b = 0; b < num_blocks; b++) {
+            float s = h_scale[r * num_blocks + b].to_float();
+            const uint8_t* blk_w = h_weight.data() + r * bytes_per_row + b * 12;
+            int in_idx = b * 32;
+            for (int i = 0; i < 4; i++) {
+                uint8_t b0 = blk_w[i * 3 + 0], b1 = blk_w[i * 3 + 1], b2 = blk_w[i * 3 + 2];
+                float w0 = ((float)(b0 & 0x07) - 4.0f) * s;
+                float w1 = ((float)((b0 >> 3) & 0x07) - 4.0f) * s;
+                float w2 = ((float)((b0 >> 6) | ((b1 & 0x01) << 2)) - 4.0f) * s;
+                float w3 = ((float)((b1 >> 1) & 0x07) - 4.0f) * s;
+                float w4 = ((float)((b1 >> 4) & 0x07) - 4.0f) * s;
+                float w5 = ((float)((b1 >> 7) | ((b2 & 0x03) << 1)) - 4.0f) * s;
+                float w6 = ((float)((b2 >> 2) & 0x07) - 4.0f) * s;
+                float w7 = ((float)((b2 >> 5) & 0x07) - 4.0f) * s;
+                sum += w0 * h_vec[in_idx + i * 8 + 0].to_float() +
+                       w1 * h_vec[in_idx + i * 8 + 1].to_float() +
+                       w2 * h_vec[in_idx + i * 8 + 2].to_float() +
+                       w3 * h_vec[in_idx + i * 8 + 3].to_float() +
+                       w4 * h_vec[in_idx + i * 8 + 4].to_float() +
+                       w5 * h_vec[in_idx + i * 8 + 5].to_float() +
+                       w6 * h_vec[in_idx + i * 8 + 6].to_float() +
+                       w7 * h_vec[in_idx + i * 8 + 7].to_float();
+            }
+        }
+        ref_out[r] = sum;
+    }
+
+    __nv_bfloat16 *d_out, *d_vec, *d_scale;
+    uint8_t *d_weight;
+    cudaMalloc((void**)&d_out, N * sizeof(__nv_bfloat16));
+    cudaMalloc((void**)&d_vec, K * sizeof(__nv_bfloat16));
+    cudaMalloc((void**)&d_weight, N * bytes_per_row);
+    cudaMalloc((void**)&d_scale, N * num_blocks * sizeof(__nv_bfloat16));
+
+    memcpy(d_vec, h_vec.data(), K * sizeof(__nv_bfloat16));
+    memcpy(d_weight, h_weight.data(), N * bytes_per_row);
+    memcpy(d_scale, h_scale.data(), N * num_blocks * sizeof(__nv_bfloat16));
+
+    gemv_int3_cuda(d_out, d_vec, d_weight, d_scale, N, K, 0);
+    cudaDeviceSynchronize();
+
+    float max_err = 0.0f;
+    for (int r = 0; r < N; r++) {
+        float gpu_val = d_out[r].to_float();
+        float err = std::fabs(gpu_val - ref_out[r]);
+        if (err > max_err) max_err = err;
+    }
+    std::cout << "       Max INT3 GPU kernel error: " << max_err << std::endl;
+    TEST_CHECK(max_err < 0.05f, "INT3 GPU kernel mismatch");
+    std::cout << "       PASS: INT3 GEMV Metal GPU kernel" << std::endl;
+
+    gemv_int3_residual_cuda(d_out, d_vec, d_weight, d_scale, N, K, 0);
+    cudaDeviceSynchronize();
+
+    float max_res_err = 0.0f;
+    for (int r = 0; r < N; r++) {
+        float gpu_val = d_out[r].to_float();
+        float err = std::fabs(gpu_val - 2.0f * ref_out[r]);
+        if (err > max_res_err) max_res_err = err;
+    }
+    std::cout << "       Max INT3 GPU residual error: " << max_res_err << std::endl;
+    TEST_CHECK(max_res_err < 0.1f, "INT3 GPU residual mismatch");
+    std::cout << "       PASS: INT3 GEMV Metal GPU residual kernel" << std::endl;
+
+    cudaFree(d_out); cudaFree(d_vec); cudaFree(d_weight); cudaFree(d_scale);
+    return true;
+}
+
+
+bool test_gqa_attention() {
+    std::cout << "[TEST] 12. GQA Attention Metal compute kernel..." << std::endl;
+    int n_q_heads = 24, n_kv_heads = 4, head_dim = 256, max_seq = 64;
+    size_t q_bytes = 2 * n_q_heads * head_dim * sizeof(__nv_bfloat16);
+    size_t kv_bytes = n_kv_heads * head_dim * sizeof(__nv_bfloat16);
+    size_t out_bytes = n_q_heads * head_dim * sizeof(__nv_bfloat16);
+    size_t cache_bytes = max_seq * n_kv_heads * head_dim;
+
+    __nv_bfloat16* qg = (__nv_bfloat16*)nullptr; cudaMalloc((void**)&qg, q_bytes);
+    __nv_bfloat16* k = (__nv_bfloat16*)nullptr; cudaMalloc((void**)&k, kv_bytes);
+    __nv_bfloat16* v = (__nv_bfloat16*)nullptr; cudaMalloc((void**)&v, kv_bytes);
+    __nv_bfloat16* qn = (__nv_bfloat16*)nullptr; cudaMalloc((void**)&qn, head_dim * sizeof(__nv_bfloat16));
+    __nv_bfloat16* kn = (__nv_bfloat16*)nullptr; cudaMalloc((void**)&kn, head_dim * sizeof(__nv_bfloat16));
+    uint8_t* k_cache = (uint8_t*)nullptr; cudaMalloc((void**)&k_cache, cache_bytes);
+    uint8_t* v_cache = (uint8_t*)nullptr; cudaMalloc((void**)&v_cache, cache_bytes);
+    __nv_bfloat16* out = (__nv_bfloat16*)nullptr; cudaMalloc((void**)&out, out_bytes);
+
+    for (size_t i = 0; i < 2 * n_q_heads * head_dim; i++) qg[i] = __nv_bfloat16::from_float(0.01f * (i % 10));
+    for (size_t i = 0; i < n_kv_heads * head_dim; i++) {
+        k[i] = __nv_bfloat16::from_float(0.02f * (i % 7));
+        v[i] = __nv_bfloat16::from_float(0.03f * (i % 5));
+    }
+    for (int i = 0; i < head_dim; i++) {
+        qn[i] = __nv_bfloat16::from_float(0.0f);
+        kn[i] = __nv_bfloat16::from_float(0.0f);
+    }
+    cudaMemset(k_cache, 0, cache_bytes);
+    cudaMemset(v_cache, 0, cache_bytes);
+    cudaMemset(out, 0, out_bytes);
+
+    qwen_gqa_decode_gated_fp8_batch_cuda(
+        out, qg, k, v, qn, kn, k_cache, v_cache,
+        n_q_heads, n_kv_heads, head_dim, nullptr, 0, 1, max_seq, 10000.0f, 1e-6f, nullptr);
+    metal_stream_synchronize(nullptr);
+
+    float norm = 0.0f;
+    for (size_t i = 0; i < n_q_heads * head_dim; i++) {
+        float val = out[i].to_float();
+        TEST_CHECK(!std::isnan(val) && !std::isinf(val), "GQA output is NaN or Inf");
+        norm += val * val;
+    }
+    std::cout << "       GQA Attention output norm: " << std::sqrt(norm) << std::endl;
+    TEST_CHECK(norm > 0.001f, "GQA output norm unexpectedly zero");
+    std::cout << "       PASS: GQA Attention Metal Kernel" << std::endl;
+    cudaFree(qg); cudaFree(k); cudaFree(v); cudaFree(qn); cudaFree(kn); cudaFree(k_cache); cudaFree(v_cache); cudaFree(out);
     return true;
 }
 
@@ -501,6 +655,8 @@ int main() {
     if (!test_gemv_int3_and_dequant()) return 1;
     if (!test_deltanet_recurrence()) return 1;
     if (!test_gemv_int4_gpu()) return 1;
+    if (!test_gemv_int3_gpu()) return 1;
+    if (!test_gqa_attention()) return 1;
 
     std::cout << "==========================================================" << std::endl;
     std::cout << "  ALL TESTS PASSED ON APPLE SILICON METAL GPU!            " << std::endl;

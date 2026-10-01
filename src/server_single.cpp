@@ -114,6 +114,7 @@ bool g_server_ready = false;
 bool g_track_experts = false;
 bool g_track_reset = false;
 bool g_enable_tools = true;
+bool g_prewarm = true;
 bool g_server_exec = true;
 bool g_headless_browsing = false;
 int g_max_tool_rounds = 10;
@@ -2247,6 +2248,11 @@ public:
     }
 
     void init_cuda_graph(cudaStream_t stream = nullptr) {
+#ifdef __APPLE__
+        graph_captured_ = false;
+        for (int k = 0; k <= 8; ++k) draft_k_graph_captured_[k] = false;
+        return;
+#endif
         if (!loaded_) return;
         buf_input_pos_.alloc(sizeof(int32_t));
         buf_draft_k_tokens_.alloc(16 * sizeof(int32_t));
@@ -4008,6 +4014,10 @@ public:
     }
 
     void init_cuda_graph() {
+#ifdef __APPLE__
+        graph_captured_ = false;
+        return;
+#endif
         init_mla_dynamic_shared_memory();
         if (!cfg_.is_qwen() && !expert_loader_.all_resident(cfg_.num_hidden_layers)) {
             LOG_INFO("Running in eager mode for decode verification.");
@@ -4200,12 +4210,15 @@ public:
         }
     }
 
-    void forward_token_eager(int token_id, int position) {
+    void forward_token_eager(int token_id, int position, bool compute_logits_flag = true) {
         int track_flag = (track_expert_freq_ && track_current_token_) ? 1 : 0;
         CUDA_CHECK(cudaMemcpy(buf_track_flag_.i32(), &track_flag, sizeof(int32_t), cudaMemcpyHostToDevice));
         CUDA_CHECK(cudaMemcpy(buf_input_token_.i32(), &token_id, sizeof(int32_t), cudaMemcpyHostToDevice));
         CUDA_CHECK(cudaMemcpy(buf_input_pos_.i32(), &position, sizeof(int32_t), cudaMemcpyHostToDevice));
-        forward_token_device_body(token_id, position);
+        forward_token_device_body(token_id, position, compute_logits_flag);
+#ifdef __APPLE__
+        CUDA_CHECK(cudaStreamSynchronize(main_stream_));
+#endif
         if (track_expert_freq_ && step_topk_host_ && d_step_topk_.data) {
             int slot = decode_step_idx_ % 2;
             int n_layers = cfg_.num_hidden_layers;
@@ -4217,7 +4230,7 @@ public:
         }
     }
 
-    void forward_token_device_body(int token_id, int position) {
+    void forward_token_device_body(int token_id, int position, bool compute_logits_flag = true) {
         int dim = cfg_.hidden_size;
         int hc = cfg_.hc_mult;
 
@@ -4264,7 +4277,9 @@ public:
             }
 
             // 5. Logits: hidden @ head_weight.T -> [vocab_size]
-            compute_logits();
+            if (compute_logits_flag) {
+                compute_logits();
+            }
             return;
         }
 
@@ -4306,7 +4321,9 @@ public:
                       norm_weight_.bf16(), dim, cfg_.rms_norm_eps, main_stream_);
 
         // 6. Logits: hidden @ head_weight.T -> [vocab_size]
-        compute_logits();
+        if (compute_logits_flag) {
+            compute_logits();
+        }
 
         if (track_expert_freq_ && track_current_token_ && !is_control_token(token_id)) {
             expert_freq_total_tokens_++;
@@ -4543,6 +4560,11 @@ public:
         auto prefill_start_time = std::chrono::steady_clock::now();
 
         if (cfg_.is_qwen()) {
+#ifdef __APPLE__
+            for (size_t i = 0; i < prefix_tokens.size(); i++) {
+                forward_token_eager(prefix_tokens[i], (int)i, /*compute_logits_flag=*/false);
+            }
+#else
             size_t curr = 0;
             while (curr < prefix_tokens.size()) {
                 size_t remaining = prefix_tokens.size() - curr;
@@ -4554,6 +4576,7 @@ public:
                 forward_token_batch_qwen_device_body((int)curr, chunk_m, /*compute_logits=*/false);
                 curr += chunk_m;
             }
+#endif
         } else {
             // ModelArch::DEEPSEEK_V4
             if (enable_batched_prefill_ && prefix_tokens.size() > 1) {
@@ -4745,7 +4768,8 @@ public:
 
             if (cfg_.is_qwen()) {
                 for (size_t curr = prefix_len; curr < prompt.size(); curr++) {
-                    forward_token_eager(prompt[curr], (int)curr);
+                    bool need_logits = (curr == prompt.size() - 1);
+                    forward_token_eager(prompt[curr], (int)curr, need_logits);
                     if (draft_model_active) {
                         qwen_draft_.forward_token_async_pinned(&h_prefill_tok_[curr],
                                                                &h_prefill_pos_[curr],
@@ -4765,7 +4789,8 @@ public:
                             CUDA_CHECK(cudaMemcpyAsync(buf_input_pos_.i32(), &h_prefill_pos_[i], sizeof(int32_t), cudaMemcpyHostToDevice, main_stream_));
                             CUDA_CHECK(cudaGraphLaunch(graph_exec_, main_stream_));
                         } else {
-                            forward_token_eager(prompt[i], (int)i);
+                            bool need_logits = (i == prompt.size() - 1);
+                            forward_token_eager(prompt[i], (int)i, need_logits);
                         }
                     }
                 }
@@ -4934,7 +4959,7 @@ public:
             }
 
             if (is_complete) {
-                if (step_t > cfg_.bos_token_id) {
+                if (next_token != cfg_.bos_token_id) {
                     if (!g_quiet) {
                         printf("%s", token_buffer.c_str());
                         fflush(stdout);
@@ -7010,6 +7035,10 @@ private:
     }
 
     void init_batch_cuda_graphs() {
+#ifdef __APPLE__
+        for (int m = 0; m <= 8; ++m) batch_graph_captured_[m] = false;
+        return;
+#endif
         if (cfg_.architecture != ModelArch::QWEN) return;
         std::vector<int> target_batch_sizes;
         if (gpu_caps_.is_vram_constrained) {
@@ -8322,7 +8351,7 @@ private:
 
         std::uniform_real_distribution<float> dist(0.0f, 1.0f);
         float r = dist(rng_);
-        sample_multinomial_f32_cuda(buf_argmax_out_.i32(), logits_ptr, vocab, temperature, r, min_p, main_stream_);
+        sample_multinomial_f32_cuda(buf_argmax_out_.i32(), logits_ptr, vocab, temperature, r, min_p, main_stream_, top_k, top_p);
         CUDA_CHECK(cudaMemcpyAsync(h_sample_pin, buf_argmax_out_.i32(), sizeof(int32_t), cudaMemcpyDeviceToHost, main_stream_));
         CUDA_CHECK(cudaStreamSynchronize(main_stream_));
         return *h_sample_pin;
@@ -9350,8 +9379,8 @@ static MultimodalPrompt apply_chat_template_multimodal(
         // ChatML template (Qwen / Llama / SmolLM)
         std::vector<int> result;
         bool has_system = (!messages.empty() && messages[0].value("role", "") == "system");
-        if (!has_system && (enable_thinking || has_tools)) {
-            std::string sys_prompt = "You are a helpful assistant";
+        if (!has_system) {
+            std::string sys_prompt = "You are a helpful assistant.";
             if (has_tools) {
                 sys_prompt += tools_system_prompt;
             }
@@ -9497,9 +9526,6 @@ static MultimodalPrompt apply_chat_template_multimodal(
                 bool actual_thinking = enable_thinking && out.image_b64.empty();
                 if (actual_thinking) {
                     auto think_enc = tok.encode("<think>\n");
-                    result.insert(result.end(), think_enc.begin(), think_enc.end());
-                } else {
-                    auto think_enc = tok.encode("<think>\n\n</think>\n");
                     result.insert(result.end(), think_enc.begin(), think_enc.end());
                 }
             }
@@ -12652,8 +12678,40 @@ static void run_server(MoecherEngine& engine, int port, int default_thinking_bud
                 // Fast SSE delta writer avoiding heap-allocated JSON ASTs
                 auto send_sse_delta = [](httplib::DataSink& sink, const std::string& req_id, const std::string& model_id,
                                          const std::string& created_str, const char* field_name, const std::string& text) -> bool {
+                    std::string escaped_text;
+                    try {
+                        escaped_text = json(text).dump();
+                    } catch (...) {
+                        std::string sanitized;
+                        sanitized.reserve(text.size() * 2);
+                        for (size_t i = 0; i < text.size(); ) {
+                            unsigned char c = (unsigned char)text[i];
+                            if (c < 0x80) {
+                                sanitized += (char)c;
+                                i++;
+                            } else if ((c & 0xE0) == 0xC0 && i + 1 < text.size() && ((unsigned char)text[i+1] & 0xC0) == 0x80) {
+                                sanitized += text.substr(i, 2);
+                                i += 2;
+                            } else if ((c & 0xF0) == 0xE0 && i + 2 < text.size() && ((unsigned char)text[i+1] & 0xC0) == 0x80 && ((unsigned char)text[i+2] & 0xC0) == 0x80) {
+                                sanitized += text.substr(i, 3);
+                                i += 3;
+                            } else if ((c & 0xF8) == 0xF0 && i + 3 < text.size() && ((unsigned char)text[i+1] & 0xC0) == 0x80 && ((unsigned char)text[i+2] & 0xC0) == 0x80 && ((unsigned char)text[i+3] & 0xC0) == 0x80) {
+                                sanitized += text.substr(i, 4);
+                                i += 4;
+                            } else {
+                                sanitized += "\xEF\xBF\xBD";
+                                i++;
+                            }
+                        }
+                        try {
+                            escaped_text = json(sanitized).dump();
+                        } catch (...) {
+                            escaped_text = "\"\"";
+                        }
+                    }
+
                     std::string sse;
-                    sse.reserve(128 + text.size() * 2);
+                    sse.reserve(128 + escaped_text.size() + text.size());
                     sse.append("data: {\"id\":\"");
                     sse.append(req_id);
                     sse.append("\",\"object\":\"chat.completion.chunk\",\"created\":");
@@ -12663,7 +12721,7 @@ static void run_server(MoecherEngine& engine, int port, int default_thinking_bud
                     sse.append("\",\"choices\":[{\"index\":0,\"delta\":{\"");
                     sse.append(field_name);
                     sse.append("\":");
-                    sse.append(json(text).dump());
+                    sse.append(escaped_text);
                     sse.append("},\"finish_reason\":null}]}\n\n");
                     return sink.write(sse.data(), sse.size()) && !g_stop_requested.load();
                 };
@@ -13998,6 +14056,8 @@ int main(int argc, char** argv) {
             g_track_experts = true;
         } else if (std::string(argv[i]) == "--no-tools" || std::string(argv[i]) == "--disable-tools") {
             g_enable_tools = false;
+        } else if (std::string(argv[i]) == "--no-prewarm" || std::string(argv[i]) == "--disable-prewarm") {
+            g_prewarm = false;
         } else if (std::string(argv[i]) == "--tools") {
             g_enable_tools = true;
         } else if (std::string(argv[i]) == "--no-server-exec" || std::string(argv[i]) == "--disable-server-exec") {
@@ -14092,7 +14152,7 @@ int main(int argc, char** argv) {
     }
 
     // Pre-warm default system prompt and tooling into KV Cache for 0ms initial prefill latency
-    if (g_enable_tools) {
+    if (g_enable_tools && g_prewarm) {
         json default_tools = resolve_canonical_tools("default");
         json mcp_tools = mcp_mgr.get_openai_tools_schema();
         for (const auto& mt : mcp_tools) {

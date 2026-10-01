@@ -32,15 +32,20 @@ struct MetalStreamObj {
     id<MTLCommandQueue> queue;
     id<MTLCommandBuffer> current_cmd_buf;
     id<MTLComputeCommandEncoder> current_encoder;
+    id<MTLCommandBuffer> last_submitted_cmd_buf;
+    int encoder_count;
 
-    MetalStreamObj(id<MTLCommandQueue> q) : queue(q), current_cmd_buf(nil), current_encoder(nil) {}
+    MetalStreamObj(id<MTLCommandQueue> q)
+        : queue(q), current_cmd_buf(nil), current_encoder(nil), last_submitted_cmd_buf(nil), encoder_count(0) {}
 
     id<MTLComputeCommandEncoder> get_encoder() {
         if (!current_cmd_buf) {
             current_cmd_buf = [queue commandBuffer];
+            encoder_count = 0;
         }
         if (!current_encoder) {
             current_encoder = [current_cmd_buf computeCommandEncoder];
+            encoder_count++;
         }
         return current_encoder;
     }
@@ -52,12 +57,28 @@ struct MetalStreamObj {
         }
     }
 
-    void commit_and_wait() {
+    void commit_async() {
         end_encoder();
         if (current_cmd_buf) {
             [current_cmd_buf commit];
-            [current_cmd_buf waitUntilCompleted];
+            last_submitted_cmd_buf = current_cmd_buf;
             current_cmd_buf = nil;
+            encoder_count = 0;
+        }
+    }
+
+    void end_encoder_and_maybe_commit(int batch_limit = 16) {
+        end_encoder();
+        if (encoder_count >= batch_limit) {
+            commit_async();
+        }
+    }
+
+    void commit_and_wait() {
+        commit_async();
+        if (last_submitted_cmd_buf) {
+            [last_submitted_cmd_buf waitUntilCompleted];
+            last_submitted_cmd_buf = nil;
         }
     }
 };
@@ -200,7 +221,9 @@ void metal_memcpy(void* dst, const void* src, size_t bytes, cudaMemcpyKind kind)
 }
 
 void metal_memcpy_async(void* dst, const void* src, size_t bytes, cudaMemcpyKind kind, cudaStream_t stream) {
-    (void)stream;
+    if (kind == cudaMemcpyDeviceToHost) {
+        metal_stream_synchronize(stream);
+    }
     metal_memcpy(dst, src, bytes, kind);
 }
 
@@ -423,7 +446,7 @@ void rms_norm_cuda(
 
     NSUInteger threads = std::min(256, dim);
     [enc dispatchThreadgroups:MTLSizeMake(1, 1, 1) threadsPerThreadgroup:MTLSizeMake(threads, 1, 1)];
-    s->commit_and_wait();
+    s->end_encoder_and_maybe_commit();
 }
 
 void rms_norm_one_centered_cuda(
@@ -450,7 +473,7 @@ void rms_norm_one_centered_cuda(
 
     NSUInteger threads = std::min(256, dim);
     [enc dispatchThreadgroups:MTLSizeMake(1, 1, 1) threadsPerThreadgroup:MTLSizeMake(threads, 1, 1)];
-    s->commit_and_wait();
+    s->end_encoder_and_maybe_commit();
 }
 
 void rms_norm_cuda_batched(
@@ -478,7 +501,7 @@ void rms_norm_cuda_batched(
 
     NSUInteger threads = std::min(256, dim);
     [enc dispatchThreadgroups:MTLSizeMake(n, 1, 1) threadsPerThreadgroup:MTLSizeMake(threads, 1, 1)];
-    s->commit_and_wait();
+    s->end_encoder_and_maybe_commit();
 }
 
 void rms_norm_one_centered_cuda_batched(
@@ -506,7 +529,7 @@ void rms_norm_one_centered_cuda_batched(
 
     NSUInteger threads = std::min(256, dim);
     [enc dispatchThreadgroups:MTLSizeMake(n, 1, 1) threadsPerThreadgroup:MTLSizeMake(threads, 1, 1)];
-    s->commit_and_wait();
+    s->end_encoder_and_maybe_commit();
 }
 
 void rms_norm_f32_cuda(float* x, int dim, float eps, cudaStream_t stream) {
@@ -548,7 +571,7 @@ void rms_norm_unweighted_batched_cuda(
 
     NSUInteger threads = std::min(256, dim);
     [enc dispatchThreadgroups:MTLSizeMake(n, 1, 1) threadsPerThreadgroup:MTLSizeMake(threads, 1, 1)];
-    s->commit_and_wait();
+    s->end_encoder_and_maybe_commit();
 }
 
 void silu_mul_cuda(
@@ -576,7 +599,7 @@ void silu_mul_cuda(
     NSUInteger tg = 256;
     NSUInteger groups = (n + tg - 1) / tg;
     [enc dispatchThreadgroups:MTLSizeMake(groups, 1, 1) threadsPerThreadgroup:MTLSizeMake(tg, 1, 1)];
-    s->commit_and_wait();
+    s->end_encoder_and_maybe_commit();
 }
 
 void vector_add_bf16_cuda(__nv_bfloat16* a, const __nv_bfloat16* b, int n, cudaStream_t stream) {
@@ -598,7 +621,7 @@ void vector_add_bf16_cuda(__nv_bfloat16* a, const __nv_bfloat16* b, int n, cudaS
     NSUInteger tg = 256;
     NSUInteger groups = (n + tg - 1) / tg;
     [enc dispatchThreadgroups:MTLSizeMake(groups, 1, 1) threadsPerThreadgroup:MTLSizeMake(tg, 1, 1)];
-    s->commit_and_wait();
+    s->end_encoder_and_maybe_commit();
 }
 
 void weighted_add_cuda(__nv_bfloat16* out, const __nv_bfloat16* x, float weight, int dim, cudaStream_t stream) {
@@ -621,7 +644,7 @@ void weighted_add_cuda(__nv_bfloat16* out, const __nv_bfloat16* x, float weight,
     NSUInteger tg = 256;
     NSUInteger groups = (dim + tg - 1) / tg;
     [enc dispatchThreadgroups:MTLSizeMake(groups, 1, 1) threadsPerThreadgroup:MTLSizeMake(tg, 1, 1)];
-    s->commit_and_wait();
+    s->end_encoder_and_maybe_commit();
 }
 
 void add_cuda(__nv_bfloat16* out, const __nv_bfloat16* a, const __nv_bfloat16* b, int n, cudaStream_t stream) {
@@ -664,7 +687,7 @@ void rope_cuda(
     [enc setBytes:&inverse length:sizeof(inverse) atIndex:6];
 
     [enc dispatchThreadgroups:MTLSizeMake(n_vectors, 1, 1) threadsPerThreadgroup:MTLSizeMake(rope_dim / 2, 1, 1)];
-    s->commit_and_wait();
+    s->end_encoder_and_maybe_commit();
 }
 
 void rope_standard_cuda(
@@ -692,7 +715,7 @@ void rope_standard_cuda(
 
     int max_heads = std::max(n_q_heads, n_kv_heads);
     [enc dispatchThreadgroups:MTLSizeMake(max_heads, 1, 1) threadsPerThreadgroup:MTLSizeMake(head_dim / 2, 1, 1)];
-    s->commit_and_wait();
+    s->end_encoder_and_maybe_commit();
 }
 
 void embedding_cuda(
@@ -719,7 +742,7 @@ void embedding_cuda(
 
     NSUInteger tg = std::min(256, dim);
     [enc dispatchThreadgroups:MTLSizeMake(seq_len, 1, 1) threadsPerThreadgroup:MTLSizeMake(tg, 1, 1)];
-    s->commit_and_wait();
+    s->end_encoder_and_maybe_commit();
 }
 
 void embedding_broadcast_cuda(
@@ -747,7 +770,7 @@ void embedding_broadcast_cuda(
 
     NSUInteger tg = std::min(256, dim);
     [enc dispatchThreadgroups:MTLSizeMake(1, 1, 1) threadsPerThreadgroup:MTLSizeMake(tg, 1, 1)];
-    s->commit_and_wait();
+    s->end_encoder_and_maybe_commit();
 }
 
 void gemv_int4_cuda(
@@ -777,7 +800,7 @@ void gemv_int4_cuda(
     [enc setBytes:&is_residual length:sizeof(is_residual) atIndex:6];
 
     [enc dispatchThreadgroups:MTLSizeMake(N, 1, 1) threadsPerThreadgroup:MTLSizeMake(64, 1, 1)];
-    s->commit_and_wait();
+    s->end_encoder_and_maybe_commit();
 }
 
 void gemv_int4_residual_cuda(
@@ -794,6 +817,29 @@ void gemv_int4_residual_cuda(
     id<MTLBuffer> b_vec = ctx.get_buffer(vec, v_off);
     id<MTLBuffer> b_w = ctx.get_buffer(weight, w_off);
     id<MTLBuffer> b_s = ctx.get_buffer(scale, s_off);
+    if (!b_out || !b_vec || !b_w || !b_s) {
+        int num_blocks = K / 32;
+        dispatch_apply(N, dispatch_get_global_queue(QOS_CLASS_USER_INTERACTIVE, 0), ^(size_t r) {
+            const __nv_bfloat16* row_s = scale + r * num_blocks;
+            const uint8_t* row_w = weight + r * (K / 2);
+            float sum = 0.0f;
+            for (int b = 0; b < num_blocks; b++) {
+                float s = row_s[b].to_float();
+                int w_off = b * 16;
+                int a_off = b * 32;
+                float b_sum = 0.0f;
+                for (int i = 0; i < 16; i++) {
+                    uint8_t byte_val = row_w[w_off + i];
+                    float q0 = float(byte_val & 0x0F) - 8.0f;
+                    float q1 = float(byte_val >> 4) - 8.0f;
+                    b_sum += q0 * vec[a_off + i * 2].to_float() + q1 * vec[a_off + i * 2 + 1].to_float();
+                }
+                sum += b_sum * s;
+            }
+            inout[r] = __nv_bfloat16::from_float(inout[r].to_float() + sum);
+        });
+        return;
+    }
 
     bool is_residual = true;
     id<MTLComputeCommandEncoder> enc = s->get_encoder();
@@ -807,7 +853,7 @@ void gemv_int4_residual_cuda(
     [enc setBytes:&is_residual length:sizeof(is_residual) atIndex:6];
 
     [enc dispatchThreadgroups:MTLSizeMake(N, 1, 1) threadsPerThreadgroup:MTLSizeMake(64, 1, 1)];
-    s->commit_and_wait();
+    s->end_encoder_and_maybe_commit();
 }
 
 void gemv_int4_swiglu_fused_cuda(
@@ -842,34 +888,80 @@ void gemv_int4_swiglu_fused_cuda(
     [enc setBytes:&swiglu_limit length:sizeof(swiglu_limit) atIndex:8];
 
     [enc dispatchThreadgroups:MTLSizeMake(N, 1, 1) threadsPerThreadgroup:MTLSizeMake(64, 1, 1)];
-    s->commit_and_wait();
+    s->end_encoder_and_maybe_commit();
 }
 
 void gemv_int4_f32_cuda(
     float* out, const __nv_bfloat16* vec, const uint8_t* weight,
     const __nv_bfloat16* scale, int N, int K, cudaStream_t stream)
 {
-    (void)stream;
-    int num_blocks = K / 32;
-    dispatch_apply(N, dispatch_get_global_queue(QOS_CLASS_USER_INTERACTIVE, 0), ^(size_t r) {
-        const __nv_bfloat16* row_s = scale + r * num_blocks;
-        const uint8_t* row_w = weight + r * (K / 2);
-        float sum = 0.0f;
-        for (int b = 0; b < num_blocks; b++) {
-            float s = row_s[b].to_float();
-            int w_off = b * 16;
-            int a_off = b * 32;
-            float b_sum = 0.0f;
-            for (int i = 0; i < 16; i++) {
-                uint8_t byte_val = row_w[w_off + i];
-                float q0 = float(byte_val & 0x0F) - 8.0f;
-                float q1 = float(byte_val >> 4) - 8.0f;
-                b_sum += q0 * vec[a_off + i * 2].to_float() + q1 * vec[a_off + i * 2 + 1].to_float();
+    auto& ctx = MetalContext::instance();
+    MetalStreamObj* s = get_stream(stream);
+    id<MTLComputePipelineState> pso = ctx.get_pipeline("gemv_int4_f32_kernel");
+    if (!pso) {
+        int num_blocks = K / 32;
+        dispatch_apply(N, dispatch_get_global_queue(QOS_CLASS_USER_INTERACTIVE, 0), ^(size_t r) {
+            const __nv_bfloat16* row_s = scale + r * num_blocks;
+            const uint8_t* row_w = weight + r * (K / 2);
+            float sum = 0.0f;
+            for (int b = 0; b < num_blocks; b++) {
+                float s = row_s[b].to_float();
+                int w_off = b * 16;
+                int a_off = b * 32;
+                float b_sum = 0.0f;
+                for (int i = 0; i < 16; i++) {
+                    uint8_t byte_val = row_w[w_off + i];
+                    float q0 = float(byte_val & 0x0F) - 8.0f;
+                    float q1 = float(byte_val >> 4) - 8.0f;
+                    b_sum += q0 * vec[a_off + i * 2].to_float() + q1 * vec[a_off + i * 2 + 1].to_float();
+                }
+                sum += b_sum * s;
             }
-            sum += b_sum * s;
-        }
-        out[r] = sum;
-    });
+            out[r] = sum;
+        });
+        return;
+    }
+
+    size_t o_off, v_off, w_off, s_off;
+    id<MTLBuffer> b_out = ctx.get_buffer(out, o_off);
+    id<MTLBuffer> b_vec = ctx.get_buffer(vec, v_off);
+    id<MTLBuffer> b_w = ctx.get_buffer(weight, w_off);
+    id<MTLBuffer> b_s = ctx.get_buffer(scale, s_off);
+    if (!b_out || !b_vec || !b_w || !b_s) {
+        int num_blocks = K / 32;
+        dispatch_apply(N, dispatch_get_global_queue(QOS_CLASS_USER_INTERACTIVE, 0), ^(size_t r) {
+            const __nv_bfloat16* row_s = scale + r * num_blocks;
+            const uint8_t* row_w = weight + r * (K / 2);
+            float sum = 0.0f;
+            for (int b = 0; b < num_blocks; b++) {
+                float s = row_s[b].to_float();
+                int w_off = b * 16;
+                int a_off = b * 32;
+                float b_sum = 0.0f;
+                for (int i = 0; i < 16; i++) {
+                    uint8_t byte_val = row_w[w_off + i];
+                    float q0 = float(byte_val & 0x0F) - 8.0f;
+                    float q1 = float(byte_val >> 4) - 8.0f;
+                    b_sum += q0 * vec[a_off + i * 2].to_float() + q1 * vec[a_off + i * 2 + 1].to_float();
+                }
+                sum += b_sum * s;
+            }
+            out[r] = sum;
+        });
+        return;
+    }
+
+    id<MTLComputeCommandEncoder> enc = s->get_encoder();
+    [enc setComputePipelineState:pso];
+    [enc setBuffer:b_out offset:o_off atIndex:0];
+    [enc setBuffer:b_vec offset:v_off atIndex:1];
+    [enc setBuffer:b_w offset:w_off atIndex:2];
+    [enc setBuffer:b_s offset:s_off atIndex:3];
+    [enc setBytes:&N length:sizeof(N) atIndex:4];
+    [enc setBytes:&K length:sizeof(K) atIndex:5];
+
+    [enc dispatchThreadgroups:MTLSizeMake(N, 1, 1) threadsPerThreadgroup:MTLSizeMake(64, 1, 1)];
+    s->end_encoder_and_maybe_commit();
 }
 
 void gemm_int4_batch_cuda(
@@ -902,27 +994,95 @@ void gemm_int4_swiglu_fused_batch_cuda(
 }
 
 void gemv_bf16_cuda(float* out, const __nv_bfloat16* W, const __nv_bfloat16* x, int N, int K, cudaStream_t stream) {
-    (void)stream;
-    for (int r = 0; r < N; r++) {
-        float sum = 0.0f;
-        const __nv_bfloat16* row = W + r * K;
-        for (int c = 0; c < K; c++) {
-            sum += row[c].to_float() * x[c].to_float();
+    auto& ctx = MetalContext::instance();
+    MetalStreamObj* s = get_stream(stream);
+    id<MTLComputePipelineState> pso = ctx.get_pipeline("gemv_bf16_f32_kernel");
+    if (!pso) {
+        metal_stream_synchronize(stream);
+        for (int r = 0; r < N; r++) {
+            float sum = 0.0f;
+            const __nv_bfloat16* row = W + (size_t)r * K;
+            for (int c = 0; c < K; c++) {
+                sum += row[c].to_float() * x[c].to_float();
+            }
+            out[r] = sum;
         }
-        out[r] = sum;
+        return;
     }
+
+    size_t o_off, w_off, x_off;
+    id<MTLBuffer> b_out = ctx.get_buffer(out, o_off);
+    id<MTLBuffer> b_w = ctx.get_buffer(W, w_off);
+    id<MTLBuffer> b_x = ctx.get_buffer(x, x_off);
+    if (!b_out || !b_w || !b_x) {
+        metal_stream_synchronize(stream);
+        for (int r = 0; r < N; r++) {
+            float sum = 0.0f;
+            const __nv_bfloat16* row = W + (size_t)r * K;
+            for (int c = 0; c < K; c++) {
+                sum += row[c].to_float() * x[c].to_float();
+            }
+            out[r] = sum;
+        }
+        return;
+    }
+
+    id<MTLComputeCommandEncoder> enc = s->get_encoder();
+    [enc setComputePipelineState:pso];
+    [enc setBuffer:b_out offset:o_off atIndex:0];
+    [enc setBuffer:b_w offset:w_off atIndex:1];
+    [enc setBuffer:b_x offset:x_off atIndex:2];
+    [enc setBytes:&N length:sizeof(N) atIndex:3];
+    [enc setBytes:&K length:sizeof(K) atIndex:4];
+
+    [enc dispatchThreadgroups:MTLSizeMake(N, 1, 1) threadsPerThreadgroup:MTLSizeMake(64, 1, 1)];
+    s->end_encoder_and_maybe_commit();
 }
 
 void gemv_bf16_out_bf16_cuda(__nv_bfloat16* out, const __nv_bfloat16* W, const __nv_bfloat16* x, int N, int K, cudaStream_t stream) {
-    (void)stream;
-    for (int r = 0; r < N; r++) {
-        float sum = 0.0f;
-        const __nv_bfloat16* row = W + r * K;
-        for (int c = 0; c < K; c++) {
-            sum += row[c].to_float() * x[c].to_float();
+    auto& ctx = MetalContext::instance();
+    MetalStreamObj* s = get_stream(stream);
+    id<MTLComputePipelineState> pso = ctx.get_pipeline("gemv_bf16_out_bf16_kernel");
+    if (!pso) {
+        metal_stream_synchronize(stream);
+        for (int r = 0; r < N; r++) {
+            float sum = 0.0f;
+            const __nv_bfloat16* row = W + (size_t)r * K;
+            for (int c = 0; c < K; c++) {
+                sum += row[c].to_float() * x[c].to_float();
+            }
+            out[r] = __nv_bfloat16::from_float(sum);
         }
-        out[r] = __nv_bfloat16::from_float(sum);
+        return;
     }
+
+    size_t o_off, w_off, x_off;
+    id<MTLBuffer> b_out = ctx.get_buffer(out, o_off);
+    id<MTLBuffer> b_w = ctx.get_buffer(W, w_off);
+    id<MTLBuffer> b_x = ctx.get_buffer(x, x_off);
+    if (!b_out || !b_w || !b_x) {
+        metal_stream_synchronize(stream);
+        for (int r = 0; r < N; r++) {
+            float sum = 0.0f;
+            const __nv_bfloat16* row = W + (size_t)r * K;
+            for (int c = 0; c < K; c++) {
+                sum += row[c].to_float() * x[c].to_float();
+            }
+            out[r] = __nv_bfloat16::from_float(sum);
+        }
+        return;
+    }
+
+    id<MTLComputeCommandEncoder> enc = s->get_encoder();
+    [enc setComputePipelineState:pso];
+    [enc setBuffer:b_out offset:o_off atIndex:0];
+    [enc setBuffer:b_w offset:w_off atIndex:1];
+    [enc setBuffer:b_x offset:x_off atIndex:2];
+    [enc setBytes:&N length:sizeof(N) atIndex:3];
+    [enc setBytes:&K length:sizeof(K) atIndex:4];
+
+    [enc dispatchThreadgroups:MTLSizeMake(N, 1, 1) threadsPerThreadgroup:MTLSizeMake(64, 1, 1)];
+    s->end_encoder_and_maybe_commit();
 }
 
 void gemv_bf16_batch_cuda(float* out, const __nv_bfloat16* W, const __nv_bfloat16* X, int N, int K, int M, cudaStream_t stream) {
@@ -1150,6 +1310,67 @@ void deltanet_linear_attention_decode_cuda(
     const __nv_bfloat16* in_ssm_state, __nv_bfloat16* out_ssm_state,
     int num_k_heads, int num_v_heads, int head_dim, cudaStream_t stream)
 {
+    auto& ctx = MetalContext::instance();
+    MetalStreamObj* s = get_stream(stream);
+    id<MTLComputePipelineState> pso_conv = ctx.get_pipeline("deltanet_conv_kernel");
+    id<MTLComputePipelineState> pso_ssm = ctx.get_pipeline("deltanet_ssm_step_kernel");
+    int channels = (2 * num_k_heads + num_v_heads) * head_dim;
+
+    if (pso_conv && pso_ssm) {
+        size_t o_off, qkv_off, z_off, a_off, b_off, cw_off, ics_off, ocs_off, al_off, dt_off, nw_off, issm_off, ossm_off;
+        id<MTLBuffer> b_out = ctx.get_buffer(out, o_off);
+        id<MTLBuffer> b_qkv = ctx.get_buffer(in_qkv, qkv_off);
+        id<MTLBuffer> b_z = ctx.get_buffer(in_z, z_off);
+        id<MTLBuffer> b_a = ctx.get_buffer(in_a, a_off);
+        id<MTLBuffer> b_b = ctx.get_buffer(in_b, b_off);
+        id<MTLBuffer> b_cw = ctx.get_buffer(conv1d_w, cw_off);
+        id<MTLBuffer> b_ics = ctx.get_buffer(in_conv_state, ics_off);
+        id<MTLBuffer> b_ocs = ctx.get_buffer(out_conv_state, ocs_off);
+        id<MTLBuffer> b_al = ctx.get_buffer(A_log, al_off);
+        id<MTLBuffer> b_dt = ctx.get_buffer(dt_bias, dt_off);
+        id<MTLBuffer> b_nw = ctx.get_buffer(norm_w, nw_off);
+        id<MTLBuffer> b_issm = ctx.get_buffer(in_ssm_state, issm_off);
+        id<MTLBuffer> b_ossm = ctx.get_buffer(out_ssm_state, ossm_off);
+
+        if (b_out && b_qkv && b_z && b_a && b_b && b_cw && b_ics && b_ocs && b_al && b_dt && b_nw && b_issm && b_ossm) {
+            // Stage 1: Conv1D causal convolution across all channels (updates out_conv_state and overwrites b_qkv with silu_val in-place)
+            id<MTLComputeCommandEncoder> enc1 = s->get_encoder();
+            [enc1 setComputePipelineState:pso_conv];
+            [enc1 setBuffer:b_qkv offset:qkv_off atIndex:0]; // conv_out
+            [enc1 setBuffer:b_qkv offset:qkv_off atIndex:1]; // in_qkv
+            [enc1 setBuffer:b_cw offset:cw_off atIndex:2];
+            [enc1 setBuffer:b_ics offset:ics_off atIndex:3];
+            [enc1 setBuffer:b_ocs offset:ocs_off atIndex:4];
+            [enc1 setBytes:&channels length:sizeof(channels) atIndex:5];
+
+            NSUInteger tg = 256;
+            NSUInteger groups = (channels + tg - 1) / tg;
+            [enc1 dispatchThreadgroups:MTLSizeMake(groups, 1, 1) threadsPerThreadgroup:MTLSizeMake(tg, 1, 1)];
+            s->end_encoder_and_maybe_commit();
+
+            // Stage 2: SSM recurrent step across all num_v_heads
+            id<MTLComputeCommandEncoder> enc2 = s->get_encoder();
+            [enc2 setComputePipelineState:pso_ssm];
+            [enc2 setBuffer:b_out offset:o_off atIndex:0];
+            [enc2 setBuffer:b_qkv offset:qkv_off atIndex:1]; // conv_out
+            [enc2 setBuffer:b_z offset:z_off atIndex:2];
+            [enc2 setBuffer:b_a offset:a_off atIndex:3];
+            [enc2 setBuffer:b_b offset:b_off atIndex:4];
+            [enc2 setBuffer:b_al offset:al_off atIndex:5];
+            [enc2 setBuffer:b_dt offset:dt_off atIndex:6];
+            [enc2 setBuffer:b_nw offset:nw_off atIndex:7];
+            [enc2 setBuffer:b_issm offset:issm_off atIndex:8];
+            [enc2 setBuffer:b_ossm offset:ossm_off atIndex:9];
+            [enc2 setBytes:&num_k_heads length:sizeof(num_k_heads) atIndex:10];
+            [enc2 setBytes:&num_v_heads length:sizeof(num_v_heads) atIndex:11];
+            [enc2 setBytes:&head_dim length:sizeof(head_dim) atIndex:12];
+
+            [enc2 dispatchThreadgroups:MTLSizeMake(num_v_heads, 1, 1) threadsPerThreadgroup:MTLSizeMake(128, 1, 1)];
+            s->end_encoder_and_maybe_commit();
+            return;
+        }
+    }
+
     deltanet_linear_attention_decode_batch_cuda(
         out, in_qkv, in_z, in_a, in_b, conv1d_w,
         in_conv_state, out_conv_state,
@@ -1179,16 +1400,35 @@ void softmax_cuda(float* out, const float* x, int rows, int cols, cudaStream_t s
 }
 
 void argmax_f32_cuda(int32_t* out, const float* logits, int n, cudaStream_t stream) {
-    (void)stream;
-    int32_t best_idx = 0;
-    float best_val = logits[0];
-    for (int i = 1; i < n; i++) {
-        if (logits[i] > best_val) {
-            best_val = logits[i];
-            best_idx = i;
+    auto& ctx = MetalContext::instance();
+    MetalStreamObj* s = get_stream(stream);
+    id<MTLComputePipelineState> pso = ctx.get_pipeline("argmax_f32_kernel");
+    if (!pso) {
+        metal_stream_synchronize(stream);
+        int32_t best_idx = 0;
+        float best_val = logits[0];
+        for (int i = 1; i < n; i++) {
+            if (logits[i] > best_val) {
+                best_val = logits[i];
+                best_idx = i;
+            }
         }
+        *out = best_idx;
+        return;
     }
-    *out = best_idx;
+
+    size_t o_off, l_off;
+    id<MTLBuffer> b_out = ctx.get_buffer(out, o_off);
+    id<MTLBuffer> b_logits = ctx.get_buffer(logits, l_off);
+
+    id<MTLComputeCommandEncoder> enc = s->get_encoder();
+    [enc setComputePipelineState:pso];
+    [enc setBuffer:b_out offset:o_off atIndex:0];
+    [enc setBuffer:b_logits offset:l_off atIndex:1];
+    [enc setBytes:&n length:sizeof(n) atIndex:2];
+
+    [enc dispatchThreadgroups:MTLSizeMake(1, 1, 1) threadsPerThreadgroup:MTLSizeMake(256, 1, 1)];
+    s->end_encoder_and_maybe_commit();
 }
 
 void argmax_f32_batch_cuda(int32_t* out, const float* logits, int n, int M, cudaStream_t stream) {
@@ -1198,9 +1438,11 @@ void argmax_f32_batch_cuda(int32_t* out, const float* logits, int n, int M, cuda
 }
 
 void sample_multinomial_f32_cuda(
-    int32_t* out, float* logits, int n, float temperature, float rand_val, float min_p, cudaStream_t stream)
+    int32_t* out, float* logits, int n, float temperature, float rand_val, float min_p,
+    cudaStream_t stream, int top_k, float top_p)
 {
-    (void)stream;
+    metal_stream_synchronize(stream);
+
     if (temperature <= 0.0f) {
         int best_idx = 0;
         float best_val = logits[0];
@@ -1214,35 +1456,81 @@ void sample_multinomial_f32_cuda(
         return;
     }
 
-    float max_l = logits[0];
-    for (int i = 1; i < n; i++) if (logits[i] > max_l) max_l = logits[i];
+    int k_candidates = (top_k > 0) ? std::min(n, top_k) : std::min(n, 50);
 
+    struct Candidate {
+        float logit;
+        int32_t id;
+        bool operator>(const Candidate& o) const { return logit > o.logit; }
+    };
+    std::vector<Candidate> heap;
+    heap.reserve(k_candidates);
+
+    for (int i = 0; i < k_candidates; i++) {
+        heap.push_back({logits[i], (int32_t)i});
+    }
+    std::make_heap(heap.begin(), heap.end(), std::greater<Candidate>());
+
+    for (int i = k_candidates; i < n; i++) {
+        if (logits[i] > heap.front().logit) {
+            std::pop_heap(heap.begin(), heap.end(), std::greater<Candidate>());
+            heap.back() = {logits[i], (int32_t)i};
+            std::push_heap(heap.begin(), heap.end(), std::greater<Candidate>());
+        }
+    }
+
+    std::sort(heap.begin(), heap.end(), [](const Candidate& a, const Candidate& b) {
+        return a.logit > b.logit;
+    });
+
+    float max_l = heap[0].logit;
+    float inv_t = 1.0f / std::max(temperature, 1e-4f);
+
+    std::vector<float> probs(k_candidates);
     float sum_exp = 0.0f;
-    std::vector<float> probs(n);
-    float inv_t = 1.0f / temperature;
-    for (int i = 0; i < n; i++) {
-        float p = expf((logits[i] - max_l) * inv_t);
+    for (int i = 0; i < k_candidates; i++) {
+        float p = std::exp((heap[i].logit - max_l) * inv_t);
         probs[i] = p;
         sum_exp += p;
     }
-    float max_p = 0.0f;
-    for (int i = 0; i < n; i++) {
-        probs[i] /= sum_exp;
-        if (probs[i] > max_p) max_p = probs[i];
+
+    float inv_sum = 1.0f / (sum_exp > 0.0f ? sum_exp : 1.0f);
+    float max_p = probs[0] * inv_sum;
+
+    float cutoff = (min_p > 0.0f) ? (max_p * min_p) : 0.0f;
+    float effective_top_p = (top_p > 0.0f && top_p <= 1.0f) ? top_p : 0.95f;
+    float cum_p = 0.0f;
+    float valid_sum = 0.0f;
+    int num_valid = 0;
+
+    for (int i = 0; i < k_candidates; i++) {
+        float p = probs[i] * inv_sum;
+        if (p < cutoff && i > 0) {
+            probs[i] = 0.0f;
+            continue;
+        }
+        cum_p += p;
+        valid_sum += p;
+        num_valid++;
+        if (cum_p >= effective_top_p && i > 0) {
+            for (int j = i + 1; j < k_candidates; j++) probs[j] = 0.0f;
+            break;
+        }
     }
-    float cutoff = max_p * min_p;
-    float sum_valid = 0.0f;
-    for (int i = 0; i < n; i++) {
-        if (probs[i] >= cutoff) sum_valid += probs[i];
-        else probs[i] = 0.0f;
+
+    if (valid_sum <= 0.0f || num_valid == 0) {
+        *out = heap[0].id;
+        return;
     }
-    float r = rand_val * sum_valid;
+
+    float r = rand_val * valid_sum;
     float c = 0.0f;
-    int picked = 0;
-    for (int i = 0; i < n; i++) {
-        c += probs[i];
+    int picked = heap[0].id;
+    for (int i = 0; i < k_candidates; i++) {
+        if (probs[i] <= 0.0f) continue;
+        c += probs[i] * inv_sum;
         if (c >= r) {
-            picked = i;
+            picked = heap[i].id;
             break;
         }
     }
@@ -1366,7 +1654,7 @@ void add_bias_bf16_cuda(
     NSUInteger tg = 256;
     NSUInteger groups = (total + tg - 1) / tg;
     [enc dispatchThreadgroups:MTLSizeMake(groups, 1, 1) threadsPerThreadgroup:MTLSizeMake(tg, 1, 1)];
-    s->commit_and_wait();
+    s->end_encoder_and_maybe_commit();
 }
 
 void add_tensors_bf16_cuda(__nv_bfloat16* dst, const __nv_bfloat16* src, size_t count, cudaStream_t stream) {
@@ -2033,7 +2321,7 @@ static void qwen_gqa_decode_gated_generic(
     int n_q_heads, int n_kv_heads, int head_dim, const int32_t* d_pos,
     int pos_scalar, int M, int max_seq_len, float rope_theta, float eps, cudaStream_t stream)
 {
-    (void)stream;
+    metal_stream_synchronize(stream);
     int group_size = n_q_heads / n_kv_heads;
     float scale = 1.0f / sqrtf((float)head_dim);
     int rotary_dim = 64; // Qwen 3.8 partial RoPE
@@ -2191,6 +2479,79 @@ void qwen_gqa_decode_gated_fp8_batch_cuda(
     int n_q_heads, int n_kv_heads, int head_dim, const int32_t* d_pos,
     int pos_scalar, int M, int max_seq_len, float rope_theta, float eps, cudaStream_t stream)
 {
+    if (M <= 0) return;
+    auto& ctx = MetalContext::instance();
+    MetalStreamObj* s = get_stream(stream);
+    id<MTLComputePipelineState> pso_kv = ctx.get_pipeline("qwen_gqa_write_kv_fp8_batch_kernel");
+    id<MTLComputePipelineState> pso_q = ctx.get_pipeline("qwen_gqa_compute_attn_fp8_batch_kernel");
+
+    if (pso_kv && pso_q) {
+        size_t o_off, qg_off, k_off, v_off, qn_off = 0, kn_off = 0, kc_off, vc_off, dp_off = 0;
+        id<MTLBuffer> b_out = ctx.get_buffer(out, o_off);
+        id<MTLBuffer> b_qg = ctx.get_buffer(q_and_gate, qg_off);
+        id<MTLBuffer> b_k = ctx.get_buffer(k, k_off);
+        id<MTLBuffer> b_v = ctx.get_buffer(v, v_off);
+        id<MTLBuffer> b_qn = q_norm_w ? ctx.get_buffer(q_norm_w, qn_off) : nil;
+        id<MTLBuffer> b_kn = k_norm_w ? ctx.get_buffer(k_norm_w, kn_off) : nil;
+        id<MTLBuffer> b_kc = ctx.get_buffer(k_cache, kc_off);
+        id<MTLBuffer> b_vc = ctx.get_buffer(v_cache, vc_off);
+        id<MTLBuffer> b_dp = d_pos ? ctx.get_buffer(d_pos, dp_off) : nil;
+
+        if (b_out && b_qg && b_kc && b_vc) {
+            int has_kn = (b_kn != nil) ? 1 : 0;
+            int has_qn = (b_qn != nil) ? 1 : 0;
+            int has_dp = (b_dp != nil) ? 1 : 0;
+
+            // Stage 1: Write KV to FP8 cache in parallel
+            if (b_k && b_v) {
+                id<MTLComputeCommandEncoder> enc1 = s->get_encoder();
+                [enc1 setComputePipelineState:pso_kv];
+                [enc1 setBuffer:b_k offset:k_off atIndex:0];
+                [enc1 setBuffer:b_v offset:v_off atIndex:1];
+                [enc1 setBuffer:(b_kn ? b_kn : b_k) offset:(b_kn ? kn_off : k_off) atIndex:2];
+                [enc1 setBuffer:b_kc offset:kc_off atIndex:3];
+                [enc1 setBuffer:b_vc offset:vc_off atIndex:4];
+                [enc1 setBytes:&n_kv_heads length:sizeof(n_kv_heads) atIndex:5];
+                [enc1 setBytes:&head_dim length:sizeof(head_dim) atIndex:6];
+                [enc1 setBuffer:(b_dp ? b_dp : b_k) offset:(b_dp ? dp_off : k_off) atIndex:7];
+                [enc1 setBytes:&pos_scalar length:sizeof(pos_scalar) atIndex:8];
+                [enc1 setBytes:&M length:sizeof(M) atIndex:9];
+                [enc1 setBytes:&max_seq_len length:sizeof(max_seq_len) atIndex:10];
+                [enc1 setBytes:&rope_theta length:sizeof(rope_theta) atIndex:11];
+                [enc1 setBytes:&eps length:sizeof(eps) atIndex:12];
+                [enc1 setBytes:&has_kn length:sizeof(has_kn) atIndex:13];
+                [enc1 setBytes:&has_dp length:sizeof(has_dp) atIndex:14];
+
+                [enc1 dispatchThreadgroups:MTLSizeMake(n_kv_heads, M, 1) threadsPerThreadgroup:MTLSizeMake(128, 1, 1)];
+                s->end_encoder_and_maybe_commit();
+            }
+
+            // Stage 2: Compute Query Attention against FP8 cache
+            id<MTLComputeCommandEncoder> enc2 = s->get_encoder();
+            [enc2 setComputePipelineState:pso_q];
+            [enc2 setBuffer:b_out offset:o_off atIndex:0];
+            [enc2 setBuffer:b_qg offset:qg_off atIndex:1];
+            [enc2 setBuffer:(b_qn ? b_qn : b_out) offset:(b_qn ? qn_off : o_off) atIndex:2];
+            [enc2 setBuffer:b_kc offset:kc_off atIndex:3];
+            [enc2 setBuffer:b_vc offset:vc_off atIndex:4];
+            [enc2 setBytes:&n_q_heads length:sizeof(n_q_heads) atIndex:5];
+            [enc2 setBytes:&n_kv_heads length:sizeof(n_kv_heads) atIndex:6];
+            [enc2 setBytes:&head_dim length:sizeof(head_dim) atIndex:7];
+            [enc2 setBuffer:(b_dp ? b_dp : b_out) offset:(b_dp ? dp_off : o_off) atIndex:8];
+            [enc2 setBytes:&pos_scalar length:sizeof(pos_scalar) atIndex:9];
+            [enc2 setBytes:&M length:sizeof(M) atIndex:10];
+            [enc2 setBytes:&max_seq_len length:sizeof(max_seq_len) atIndex:11];
+            [enc2 setBytes:&rope_theta length:sizeof(rope_theta) atIndex:12];
+            [enc2 setBytes:&eps length:sizeof(eps) atIndex:13];
+            [enc2 setBytes:&has_qn length:sizeof(has_qn) atIndex:14];
+            [enc2 setBytes:&has_dp length:sizeof(has_dp) atIndex:15];
+
+            [enc2 dispatchThreadgroups:MTLSizeMake(n_q_heads, M, 1) threadsPerThreadgroup:MTLSizeMake(128, 1, 1)];
+            s->end_encoder_and_maybe_commit();
+            return;
+        }
+    }
+
     qwen_gqa_decode_gated_generic<uint8_t>(
         out, q_and_gate, k, v, q_norm_w, k_norm_w, k_cache, v_cache,
         n_q_heads, n_kv_heads, head_dim, d_pos, pos_scalar, M, max_seq_len, rope_theta, eps, stream);
@@ -2203,7 +2564,7 @@ void qwen_gqa_decode_gated_fp8_cuda(
     int n_q_heads, int n_kv_heads, int head_dim, const int32_t* d_pos,
     int pos_scalar, int max_seq_len, float rope_theta, float eps, cudaStream_t stream)
 {
-    qwen_gqa_decode_gated_generic<uint8_t>(
+    qwen_gqa_decode_gated_fp8_batch_cuda(
         out, q_and_gate, k, v, q_norm_w, k_norm_w, k_cache, v_cache,
         n_q_heads, n_kv_heads, head_dim, d_pos, pos_scalar, 1, max_seq_len, rope_theta, eps, stream);
 }
@@ -2521,26 +2882,74 @@ void embedding_int4_cuda(
     __nv_bfloat16* out, const uint8_t* weight, const __nv_bfloat16* scale,
     const int32_t* ids, int seq_len, int dim, cudaStream_t stream)
 {
-    (void)stream;
-    int num_blocks = dim / 32;
-    for (int s = 0; s < seq_len; s++) {
-        int token = ids[s];
-        const uint8_t* row_w = weight + token * (dim / 2);
-        const __nv_bfloat16* row_s = scale + token * num_blocks;
-        __nv_bfloat16* row_out = out + s * dim;
-        for (int b = 0; b < num_blocks; b++) {
-            float s_val = row_s[b].to_float();
-            int w_off = b * 16;
-            int a_off = b * 32;
-            for (int i = 0; i < 16; i++) {
-                uint8_t byte_val = row_w[w_off + i];
-                float q0 = (float(byte_val & 0x0F) - 8.0f) * s_val;
-                float q1 = (float(byte_val >> 4) - 8.0f) * s_val;
-                row_out[a_off + i * 2] = __nv_bfloat16::from_float(q0);
-                row_out[a_off + i * 2 + 1] = __nv_bfloat16::from_float(q1);
+    if (seq_len <= 0) return;
+    auto& ctx = MetalContext::instance();
+    MetalStreamObj* s = get_stream(stream);
+    id<MTLComputePipelineState> pso = ctx.get_pipeline("embedding_int4_kernel");
+    if (!pso) {
+        int num_blocks = dim / 32;
+        for (int s_idx = 0; s_idx < seq_len; s_idx++) {
+            int token = ids[s_idx];
+            const uint8_t* row_w = weight + (size_t)token * (dim / 2);
+            const __nv_bfloat16* row_s = scale + (size_t)token * num_blocks;
+            __nv_bfloat16* row_out = out + (size_t)s_idx * dim;
+            for (int b = 0; b < num_blocks; b++) {
+                float s_val = row_s[b].to_float();
+                int w_off = b * 16;
+                int a_off = b * 32;
+                for (int i = 0; i < 16; i++) {
+                    uint8_t byte_val = row_w[w_off + i];
+                    float q0 = (float(byte_val & 0x0F) - 8.0f) * s_val;
+                    float q1 = (float(byte_val >> 4) - 8.0f) * s_val;
+                    row_out[a_off + i * 2] = __nv_bfloat16::from_float(q0);
+                    row_out[a_off + i * 2 + 1] = __nv_bfloat16::from_float(q1);
+                }
             }
         }
+        return;
     }
+
+    size_t o_off, w_off, s_off, i_off;
+    id<MTLBuffer> b_out = ctx.get_buffer(out, o_off);
+    id<MTLBuffer> b_w = ctx.get_buffer(weight, w_off);
+    id<MTLBuffer> b_s = ctx.get_buffer(scale, s_off);
+    id<MTLBuffer> b_ids = ctx.get_buffer(ids, i_off);
+
+    if (!b_out || !b_w || !b_s || !b_ids) {
+        int num_blocks = dim / 32;
+        for (int s_idx = 0; s_idx < seq_len; s_idx++) {
+            int token = ids[s_idx];
+            const uint8_t* row_w = weight + (size_t)token * (dim / 2);
+            const __nv_bfloat16* row_s = scale + (size_t)token * num_blocks;
+            __nv_bfloat16* row_out = out + (size_t)s_idx * dim;
+            for (int b = 0; b < num_blocks; b++) {
+                float s_val = row_s[b].to_float();
+                int w_off = b * 16;
+                int a_off = b * 32;
+                for (int i = 0; i < 16; i++) {
+                    uint8_t byte_val = row_w[w_off + i];
+                    float q0 = (float(byte_val & 0x0F) - 8.0f) * s_val;
+                    float q1 = (float(byte_val >> 4) - 8.0f) * s_val;
+                    row_out[a_off + i * 2] = __nv_bfloat16::from_float(q0);
+                    row_out[a_off + i * 2 + 1] = __nv_bfloat16::from_float(q1);
+                }
+            }
+        }
+        return;
+    }
+
+    id<MTLComputeCommandEncoder> enc = s->get_encoder();
+    [enc setComputePipelineState:pso];
+    [enc setBuffer:b_out offset:o_off atIndex:0];
+    [enc setBuffer:b_w offset:w_off atIndex:1];
+    [enc setBuffer:b_s offset:s_off atIndex:2];
+    [enc setBuffer:b_ids offset:i_off atIndex:3];
+    [enc setBytes:&seq_len length:sizeof(seq_len) atIndex:4];
+    [enc setBytes:&dim length:sizeof(dim) atIndex:5];
+
+    NSUInteger tg = std::min(160, 256);
+    [enc dispatchThreadgroups:MTLSizeMake(seq_len, 1, 1) threadsPerThreadgroup:MTLSizeMake(tg, 1, 1)];
+    s->end_encoder_and_maybe_commit();
 }
 
 void embedding_int4_broadcast_device_id_cuda(
@@ -2668,142 +3077,220 @@ void dequant_int3_block_cuda(
 }
 
 void gemv_int3_cuda(__nv_bfloat16* out, const __nv_bfloat16* vec, const uint8_t* weight, const __nv_bfloat16* scale, int N, int K, cudaStream_t stream) {
-    (void)stream;
-    int blocks_per_row = K / 32;
-    dispatch_apply(N, dispatch_get_global_queue(QOS_CLASS_USER_INTERACTIVE, 0), ^(size_t r) {
-        const uint8_t* row_w = weight + (size_t)r * ((size_t)K * 3 / 8);
-        const __nv_bfloat16* row_s = scale + r * blocks_per_row;
-        float sum = 0.0f;
-        for (int b = 0; b < blocks_per_row; b++) {
-            float s = row_s[b].to_float();
-            const uint8_t* blk_w = row_w + b * 12;
-            int in_idx = b * 32;
-            for (int i = 0; i < 4; i++) {
-                uint8_t b0 = blk_w[i * 3 + 0];
-                uint8_t b1 = blk_w[i * 3 + 1];
-                uint8_t b2 = blk_w[i * 3 + 2];
+    auto& ctx = MetalContext::instance();
+    MetalStreamObj* s = get_stream(stream);
+    id<MTLComputePipelineState> pso = ctx.get_pipeline("gemv_int3_kernel");
+    size_t o_off, v_off, w_off, s_off;
+    id<MTLBuffer> b_out = ctx.get_buffer(out, o_off);
+    id<MTLBuffer> b_vec = ctx.get_buffer(vec, v_off);
+    id<MTLBuffer> b_w = ctx.get_buffer(weight, w_off);
+    id<MTLBuffer> b_s = ctx.get_buffer(scale, s_off);
 
-                float w0 = ((float)(b0 & 0x07) - 4.0f) * s;
-                float w1 = ((float)((b0 >> 3) & 0x07) - 4.0f) * s;
-                float w2 = ((float)((b0 >> 6) | ((b1 & 0x01) << 2)) - 4.0f) * s;
-                float w3 = ((float)((b1 >> 1) & 0x07) - 4.0f) * s;
-                float w4 = ((float)((b1 >> 4) & 0x07) - 4.0f) * s;
-                float w5 = ((float)((b1 >> 7) | ((b2 & 0x03) << 1)) - 4.0f) * s;
-                float w6 = ((float)((b2 >> 2) & 0x07) - 4.0f) * s;
-                float w7 = ((float)((b2 >> 5) & 0x07) - 4.0f) * s;
+    if (!pso || !b_out || !b_vec || !b_w || !b_s) {
+        int blocks_per_row = K / 32;
+        dispatch_apply(N, dispatch_get_global_queue(QOS_CLASS_USER_INTERACTIVE, 0), ^(size_t r) {
+            const uint8_t* row_w = weight + (size_t)r * ((size_t)K * 3 / 8);
+            const __nv_bfloat16* row_s = scale + r * blocks_per_row;
+            float sum = 0.0f;
+            for (int b = 0; b < blocks_per_row; b++) {
+                float s_val = row_s[b].to_float();
+                const uint8_t* blk_w = row_w + b * 12;
+                int in_idx = b * 32;
+                for (int i = 0; i < 4; i++) {
+                    uint8_t b0 = blk_w[i * 3 + 0];
+                    uint8_t b1 = blk_w[i * 3 + 1];
+                    uint8_t b2 = blk_w[i * 3 + 2];
 
-                sum += w0 * vec[in_idx + i * 8 + 0].to_float();
-                sum += w1 * vec[in_idx + i * 8 + 1].to_float();
-                sum += w2 * vec[in_idx + i * 8 + 2].to_float();
-                sum += w3 * vec[in_idx + i * 8 + 3].to_float();
-                sum += w4 * vec[in_idx + i * 8 + 4].to_float();
-                sum += w5 * vec[in_idx + i * 8 + 5].to_float();
-                sum += w6 * vec[in_idx + i * 8 + 6].to_float();
-                sum += w7 * vec[in_idx + i * 8 + 7].to_float();
+                    float w0 = ((float)(b0 & 0x07) - 4.0f) * s_val;
+                    float w1 = ((float)((b0 >> 3) & 0x07) - 4.0f) * s_val;
+                    float w2 = ((float)((b0 >> 6) | ((b1 & 0x01) << 2)) - 4.0f) * s_val;
+                    float w3 = ((float)((b1 >> 1) & 0x07) - 4.0f) * s_val;
+                    float w4 = ((float)((b1 >> 4) & 0x07) - 4.0f) * s_val;
+                    float w5 = ((float)((b1 >> 7) | ((b2 & 0x03) << 1)) - 4.0f) * s_val;
+                    float w6 = ((float)((b2 >> 2) & 0x07) - 4.0f) * s_val;
+                    float w7 = ((float)((b2 >> 5) & 0x07) - 4.0f) * s_val;
+
+                    sum += w0 * vec[in_idx + i * 8 + 0].to_float();
+                    sum += w1 * vec[in_idx + i * 8 + 1].to_float();
+                    sum += w2 * vec[in_idx + i * 8 + 2].to_float();
+                    sum += w3 * vec[in_idx + i * 8 + 3].to_float();
+                    sum += w4 * vec[in_idx + i * 8 + 4].to_float();
+                    sum += w5 * vec[in_idx + i * 8 + 5].to_float();
+                    sum += w6 * vec[in_idx + i * 8 + 6].to_float();
+                    sum += w7 * vec[in_idx + i * 8 + 7].to_float();
+                }
             }
-        }
-        out[r] = __nv_bfloat16::from_float(sum);
-    });
+            out[r] = __nv_bfloat16::from_float(sum);
+        });
+        return;
+    }
+
+    bool is_residual = false;
+    id<MTLComputeCommandEncoder> enc = s->get_encoder();
+    [enc setComputePipelineState:pso];
+    [enc setBuffer:b_out offset:o_off atIndex:0];
+    [enc setBuffer:b_vec offset:v_off atIndex:1];
+    [enc setBuffer:b_w offset:w_off atIndex:2];
+    [enc setBuffer:b_s offset:s_off atIndex:3];
+    [enc setBytes:&N length:sizeof(N) atIndex:4];
+    [enc setBytes:&K length:sizeof(K) atIndex:5];
+    [enc setBytes:&is_residual length:sizeof(is_residual) atIndex:6];
+
+    [enc dispatchThreadgroups:MTLSizeMake(N, 1, 1) threadsPerThreadgroup:MTLSizeMake(64, 1, 1)];
+    s->end_encoder_and_maybe_commit();
 }
 
 void gemv_int3_residual_cuda(__nv_bfloat16* inout, const __nv_bfloat16* vec, const uint8_t* weight, const __nv_bfloat16* scale, int N, int K, cudaStream_t stream) {
-    (void)stream;
-    int blocks_per_row = K / 32;
-    dispatch_apply(N, dispatch_get_global_queue(QOS_CLASS_USER_INTERACTIVE, 0), ^(size_t r) {
-        const uint8_t* row_w = weight + (size_t)r * ((size_t)K * 3 / 8);
-        const __nv_bfloat16* row_s = scale + r * blocks_per_row;
-        float sum = 0.0f;
-        for (int b = 0; b < blocks_per_row; b++) {
-            float s = row_s[b].to_float();
-            const uint8_t* blk_w = row_w + b * 12;
-            int in_idx = b * 32;
-            for (int i = 0; i < 4; i++) {
-                uint8_t b0 = blk_w[i * 3 + 0];
-                uint8_t b1 = blk_w[i * 3 + 1];
-                uint8_t b2 = blk_w[i * 3 + 2];
+    auto& ctx = MetalContext::instance();
+    MetalStreamObj* s = get_stream(stream);
+    id<MTLComputePipelineState> pso = ctx.get_pipeline("gemv_int3_kernel");
+    if (!pso) {
+        int blocks_per_row = K / 32;
+        dispatch_apply(N, dispatch_get_global_queue(QOS_CLASS_USER_INTERACTIVE, 0), ^(size_t r) {
+            const uint8_t* row_w = weight + (size_t)r * ((size_t)K * 3 / 8);
+            const __nv_bfloat16* row_s = scale + r * blocks_per_row;
+            float sum = 0.0f;
+            for (int b = 0; b < blocks_per_row; b++) {
+                float s_val = row_s[b].to_float();
+                const uint8_t* blk_w = row_w + b * 12;
+                int in_idx = b * 32;
+                for (int i = 0; i < 4; i++) {
+                    uint8_t b0 = blk_w[i * 3 + 0];
+                    uint8_t b1 = blk_w[i * 3 + 1];
+                    uint8_t b2 = blk_w[i * 3 + 2];
 
-                float w0 = ((float)(b0 & 0x07) - 4.0f) * s;
-                float w1 = ((float)((b0 >> 3) & 0x07) - 4.0f) * s;
-                float w2 = ((float)((b0 >> 6) | ((b1 & 0x01) << 2)) - 4.0f) * s;
-                float w3 = ((float)((b1 >> 1) & 0x07) - 4.0f) * s;
-                float w4 = ((float)((b1 >> 4) & 0x07) - 4.0f) * s;
-                float w5 = ((float)((b1 >> 7) | ((b2 & 0x03) << 1)) - 4.0f) * s;
-                float w6 = ((float)((b2 >> 2) & 0x07) - 4.0f) * s;
-                float w7 = ((float)((b2 >> 5) & 0x07) - 4.0f) * s;
+                    float w0 = ((float)(b0 & 0x07) - 4.0f) * s_val;
+                    float w1 = ((float)((b0 >> 3) & 0x07) - 4.0f) * s_val;
+                    float w2 = ((float)((b0 >> 6) | ((b1 & 0x01) << 2)) - 4.0f) * s_val;
+                    float w3 = ((float)((b1 >> 1) & 0x07) - 4.0f) * s_val;
+                    float w4 = ((float)((b1 >> 4) & 0x07) - 4.0f) * s_val;
+                    float w5 = ((float)((b1 >> 7) | ((b2 & 0x03) << 1)) - 4.0f) * s_val;
+                    float w6 = ((float)((b2 >> 2) & 0x07) - 4.0f) * s_val;
+                    float w7 = ((float)((b2 >> 5) & 0x07) - 4.0f) * s_val;
 
-                sum += w0 * vec[in_idx + i * 8 + 0].to_float();
-                sum += w1 * vec[in_idx + i * 8 + 1].to_float();
-                sum += w2 * vec[in_idx + i * 8 + 2].to_float();
-                sum += w3 * vec[in_idx + i * 8 + 3].to_float();
-                sum += w4 * vec[in_idx + i * 8 + 4].to_float();
-                sum += w5 * vec[in_idx + i * 8 + 5].to_float();
-                sum += w6 * vec[in_idx + i * 8 + 6].to_float();
-                sum += w7 * vec[in_idx + i * 8 + 7].to_float();
+                    sum += w0 * vec[in_idx + i * 8 + 0].to_float();
+                    sum += w1 * vec[in_idx + i * 8 + 1].to_float();
+                    sum += w2 * vec[in_idx + i * 8 + 2].to_float();
+                    sum += w3 * vec[in_idx + i * 8 + 3].to_float();
+                    sum += w4 * vec[in_idx + i * 8 + 4].to_float();
+                    sum += w5 * vec[in_idx + i * 8 + 5].to_float();
+                    sum += w6 * vec[in_idx + i * 8 + 6].to_float();
+                    sum += w7 * vec[in_idx + i * 8 + 7].to_float();
+                }
             }
-        }
-        inout[r] = __nv_bfloat16::from_float(inout[r].to_float() + sum);
-    });
+            inout[r] = __nv_bfloat16::from_float(inout[r].to_float() + sum);
+        });
+        return;
+    }
+
+    size_t o_off, v_off, w_off, s_off;
+    id<MTLBuffer> b_out = ctx.get_buffer(inout, o_off);
+    id<MTLBuffer> b_vec = ctx.get_buffer(vec, v_off);
+    id<MTLBuffer> b_w = ctx.get_buffer(weight, w_off);
+    id<MTLBuffer> b_s = ctx.get_buffer(scale, s_off);
+
+    bool is_residual = true;
+    id<MTLComputeCommandEncoder> enc = s->get_encoder();
+    [enc setComputePipelineState:pso];
+    [enc setBuffer:b_out offset:o_off atIndex:0];
+    [enc setBuffer:b_vec offset:v_off atIndex:1];
+    [enc setBuffer:b_w offset:w_off atIndex:2];
+    [enc setBuffer:b_s offset:s_off atIndex:3];
+    [enc setBytes:&N length:sizeof(N) atIndex:4];
+    [enc setBytes:&K length:sizeof(K) atIndex:5];
+    [enc setBytes:&is_residual length:sizeof(is_residual) atIndex:6];
+
+    [enc dispatchThreadgroups:MTLSizeMake(N, 1, 1) threadsPerThreadgroup:MTLSizeMake(64, 1, 1)];
+    s->end_encoder_and_maybe_commit();
 }
 
 void gemv_int3_swiglu_fused_cuda(__nv_bfloat16* out, const __nv_bfloat16* vec, const uint8_t* gate_weight, const __nv_bfloat16* gate_scale, const uint8_t* up_weight, const __nv_bfloat16* up_scale, int N, int K, float swiglu_limit, cudaStream_t stream) {
-    (void)stream;
-    int blocks_per_row = K / 32;
-    dispatch_apply(N, dispatch_get_global_queue(QOS_CLASS_USER_INTERACTIVE, 0), ^(size_t r) {
-        const uint8_t* g_row_w = gate_weight + (size_t)r * ((size_t)K * 3 / 8);
-        const __nv_bfloat16* g_row_s = gate_scale + r * blocks_per_row;
-        const uint8_t* u_row_w = up_weight + (size_t)r * ((size_t)K * 3 / 8);
-        const __nv_bfloat16* u_row_s = up_scale + r * blocks_per_row;
+    auto& ctx = MetalContext::instance();
+    MetalStreamObj* s = get_stream(stream);
+    id<MTLComputePipelineState> pso = ctx.get_pipeline("gemv_int3_swiglu_fused_kernel");
+    if (!pso) {
+        int blocks_per_row = K / 32;
+        dispatch_apply(N, dispatch_get_global_queue(QOS_CLASS_USER_INTERACTIVE, 0), ^(size_t r) {
+            const uint8_t* g_row_w = gate_weight + (size_t)r * ((size_t)K * 3 / 8);
+            const __nv_bfloat16* g_row_s = gate_scale + r * blocks_per_row;
+            const uint8_t* u_row_w = up_weight + (size_t)r * ((size_t)K * 3 / 8);
+            const __nv_bfloat16* u_row_s = up_scale + r * blocks_per_row;
 
-        float sum_g = 0.0f;
-        float sum_u = 0.0f;
-        for (int b = 0; b < blocks_per_row; b++) {
-            float sg = g_row_s[b].to_float();
-            float su = u_row_s[b].to_float();
-            const uint8_t* gb = g_row_w + b * 12;
-            const uint8_t* ub = u_row_w + b * 12;
-            int in_idx = b * 32;
-            for (int i = 0; i < 4; i++) {
-                uint8_t gb0 = gb[i * 3 + 0], gb1 = gb[i * 3 + 1], gb2 = gb[i * 3 + 2];
-                uint8_t ub0 = ub[i * 3 + 0], ub1 = ub[i * 3 + 1], ub2 = ub[i * 3 + 2];
+            float sum_g = 0.0f;
+            float sum_u = 0.0f;
+            for (int b = 0; b < blocks_per_row; b++) {
+                float sg = g_row_s[b].to_float();
+                float su = u_row_s[b].to_float();
+                const uint8_t* gb = g_row_w + b * 12;
+                const uint8_t* ub = u_row_w + b * 12;
+                int in_idx = b * 32;
+                for (int i = 0; i < 4; i++) {
+                    uint8_t gb0 = gb[i * 3 + 0], gb1 = gb[i * 3 + 1], gb2 = gb[i * 3 + 2];
+                    uint8_t ub0 = ub[i * 3 + 0], ub1 = ub[i * 3 + 1], ub2 = ub[i * 3 + 2];
 
-                float gw0 = ((float)(gb0 & 0x07) - 4.0f) * sg;
-                float gw1 = ((float)((gb0 >> 3) & 0x07) - 4.0f) * sg;
-                float gw2 = ((float)((gb0 >> 6) | ((gb1 & 0x01) << 2)) - 4.0f) * sg;
-                float gw3 = ((float)((gb1 >> 1) & 0x07) - 4.0f) * sg;
-                float gw4 = ((float)((gb1 >> 4) & 0x07) - 4.0f) * sg;
-                float gw5 = ((float)((gb1 >> 7) | ((gb2 & 0x03) << 1)) - 4.0f) * sg;
-                float gw6 = ((float)((gb2 >> 2) & 0x07) - 4.0f) * sg;
-                float gw7 = ((float)((gb2 >> 5) & 0x07) - 4.0f) * sg;
+                    float gw0 = ((float)(gb0 & 0x07) - 4.0f) * sg;
+                    float gw1 = ((float)((gb0 >> 3) & 0x07) - 4.0f) * sg;
+                    float gw2 = ((float)((gb0 >> 6) | ((gb1 & 0x01) << 2)) - 4.0f) * sg;
+                    float gw3 = ((float)((gb1 >> 1) & 0x07) - 4.0f) * sg;
+                    float gw4 = ((float)((gb1 >> 4) & 0x07) - 4.0f) * sg;
+                    float gw5 = ((float)((gb1 >> 7) | ((gb2 & 0x03) << 1)) - 4.0f) * sg;
+                    float gw6 = ((float)((gb2 >> 2) & 0x07) - 4.0f) * sg;
+                    float gw7 = ((float)((gb2 >> 5) & 0x07) - 4.0f) * sg;
 
-                float uw0 = ((float)(ub0 & 0x07) - 4.0f) * su;
-                float uw1 = ((float)((ub0 >> 3) & 0x07) - 4.0f) * su;
-                float uw2 = ((float)((ub0 >> 6) | ((ub1 & 0x01) << 2)) - 4.0f) * su;
-                float uw3 = ((float)((ub1 >> 1) & 0x07) - 4.0f) * su;
-                float uw4 = ((float)((ub1 >> 4) & 0x07) - 4.0f) * su;
-                float uw5 = ((float)((ub1 >> 7) | ((ub2 & 0x03) << 1)) - 4.0f) * su;
-                float uw6 = ((float)((ub2 >> 2) & 0x07) - 4.0f) * su;
-                float uw7 = ((float)((ub2 >> 5) & 0x07) - 4.0f) * su;
+                    float uw0 = ((float)(ub0 & 0x07) - 4.0f) * su;
+                    float uw1 = ((float)((ub0 >> 3) & 0x07) - 4.0f) * su;
+                    float uw2 = ((float)((ub0 >> 6) | ((ub1 & 0x01) << 2)) - 4.0f) * su;
+                    float uw3 = ((float)((ub1 >> 1) & 0x07) - 4.0f) * su;
+                    float uw4 = ((float)((ub1 >> 4) & 0x07) - 4.0f) * su;
+                    float uw5 = ((float)((ub1 >> 7) | ((ub2 & 0x03) << 1)) - 4.0f) * su;
+                    float uw6 = ((float)((ub2 >> 2) & 0x07) - 4.0f) * su;
+                    float uw7 = ((float)((ub2 >> 5) & 0x07) - 4.0f) * su;
 
-                float v0 = vec[in_idx + i * 8 + 0].to_float();
-                float v1 = vec[in_idx + i * 8 + 1].to_float();
-                float v2 = vec[in_idx + i * 8 + 2].to_float();
-                float v3 = vec[in_idx + i * 8 + 3].to_float();
-                float v4 = vec[in_idx + i * 8 + 4].to_float();
-                float v5 = vec[in_idx + i * 8 + 5].to_float();
-                float v6 = vec[in_idx + i * 8 + 6].to_float();
-                float v7 = vec[in_idx + i * 8 + 7].to_float();
+                    float v0 = vec[in_idx + i * 8 + 0].to_float();
+                    float v1 = vec[in_idx + i * 8 + 1].to_float();
+                    float v2 = vec[in_idx + i * 8 + 2].to_float();
+                    float v3 = vec[in_idx + i * 8 + 3].to_float();
+                    float v4 = vec[in_idx + i * 8 + 4].to_float();
+                    float v5 = vec[in_idx + i * 8 + 5].to_float();
+                    float v6 = vec[in_idx + i * 8 + 6].to_float();
+                    float v7 = vec[in_idx + i * 8 + 7].to_float();
 
-                sum_g += gw0 * v0 + gw1 * v1 + gw2 * v2 + gw3 * v3 + gw4 * v4 + gw5 * v5 + gw6 * v6 + gw7 * v7;
-                sum_u += uw0 * v0 + uw1 * v1 + uw2 * v2 + uw3 * v3 + uw4 * v4 + uw5 * v5 + uw6 * v6 + uw7 * v7;
+                    sum_g += gw0 * v0 + gw1 * v1 + gw2 * v2 + gw3 * v3 + gw4 * v4 + gw5 * v5 + gw6 * v6 + gw7 * v7;
+                    sum_u += uw0 * v0 + uw1 * v1 + uw2 * v2 + uw3 * v3 + uw4 * v4 + uw5 * v5 + uw6 * v6 + uw7 * v7;
+                }
             }
-        }
-        if (swiglu_limit > 0.0f) {
-            sum_g = std::min(sum_g, swiglu_limit);
-            sum_u = std::clamp(sum_u, -swiglu_limit, swiglu_limit);
-        }
-        float silu_g = sum_g / (1.0f + std::exp(-sum_g));
-        out[r] = __nv_bfloat16::from_float(silu_g * sum_u);
-    });
+            if (swiglu_limit > 0.0f) {
+                sum_g = std::min(sum_g, swiglu_limit);
+                sum_u = std::clamp(sum_u, -swiglu_limit, swiglu_limit);
+            }
+            float silu_g = sum_g / (1.0f + std::exp(-sum_g));
+            out[r] = __nv_bfloat16::from_float(silu_g * sum_u);
+        });
+        return;
+    }
+
+    size_t o_off, v_off, gw_off, gs_off, uw_off, us_off;
+    id<MTLBuffer> b_out = ctx.get_buffer(out, o_off);
+    id<MTLBuffer> b_vec = ctx.get_buffer(vec, v_off);
+    id<MTLBuffer> b_gw = ctx.get_buffer(gate_weight, gw_off);
+    id<MTLBuffer> b_gs = ctx.get_buffer(gate_scale, gs_off);
+    id<MTLBuffer> b_uw = ctx.get_buffer(up_weight, uw_off);
+    id<MTLBuffer> b_us = ctx.get_buffer(up_scale, us_off);
+
+    id<MTLComputeCommandEncoder> enc = s->get_encoder();
+    [enc setComputePipelineState:pso];
+    [enc setBuffer:b_out offset:o_off atIndex:0];
+    [enc setBuffer:b_vec offset:v_off atIndex:1];
+    [enc setBuffer:b_gw offset:gw_off atIndex:2];
+    [enc setBuffer:b_gs offset:gs_off atIndex:3];
+    [enc setBuffer:b_uw offset:uw_off atIndex:4];
+    [enc setBuffer:b_us offset:us_off atIndex:5];
+    [enc setBytes:&N length:sizeof(N) atIndex:6];
+    [enc setBytes:&K length:sizeof(K) atIndex:7];
+    [enc setBytes:&swiglu_limit length:sizeof(swiglu_limit) atIndex:8];
+
+    [enc dispatchThreadgroups:MTLSizeMake(N, 1, 1) threadsPerThreadgroup:MTLSizeMake(64, 1, 1)];
+    s->end_encoder_and_maybe_commit();
 }
 
 void gemm_int3_batch_cuda(__nv_bfloat16* out, const __nv_bfloat16* A, const uint8_t* weight, const __nv_bfloat16* scale, int N, int K, int M, cudaStream_t stream) {

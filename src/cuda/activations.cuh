@@ -581,7 +581,9 @@ void sample_multinomial_f32_cuda(
     float temperature,
     float rand_val,
     float min_p = 0.05f,
-    cudaStream_t stream = 0);
+    cudaStream_t stream = 0,
+    int top_k = 50,
+    float top_p = 0.95f);
 
 // ── sqrt(softplus(x)) scoring ──────────────────────────────────────────────────
 void sqrtsoftplus_cuda(
