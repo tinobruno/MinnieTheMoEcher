@@ -97,6 +97,54 @@ kernel void rms_norm_one_centered_kernel(
     }
 }
 
+kernel void rms_norm_one_centered_batched_kernel(
+    device bfloat* out [[buffer(0)]],
+    device const bfloat* x [[buffer(1)]],
+    device const bfloat* weight [[buffer(2)]],
+    constant int& n_rows [[buffer(3)]],
+    constant int& dim [[buffer(4)]],
+    constant float& eps [[buffer(5)]],
+    uint row [[threadgroup_position_in_grid]],
+    uint tid [[thread_position_in_threadgroup]],
+    uint threads_per_group [[threads_per_threadgroup]],
+    uint simd_lane [[thread_index_in_simdgroup]],
+    uint simd_id [[simdgroup_index_in_threadgroup]])
+{
+    if (row >= uint(n_rows)) return;
+    threadgroup float sdata[32];
+
+    device const bfloat* x_row = x + row * dim;
+    device bfloat* out_row = out + row * dim;
+
+    float sum_sq = 0.0f;
+    for (int i = tid; i < dim; i += threads_per_group) {
+        float v = float(x_row[i]);
+        sum_sq += v * v;
+    }
+
+    sum_sq = simd_sum(sum_sq);
+    if (simd_lane == 0) {
+        sdata[simd_id] = sum_sq;
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    if (simd_id == 0) {
+        float total = (simd_lane < (threads_per_group >> 5)) ? sdata[simd_lane] : 0.0f;
+        total = simd_sum(total);
+        if (simd_lane == 0) {
+            sdata[0] = rsqrt(total / float(dim) + eps);
+        }
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    float rsqrt_val = sdata[0];
+    for (int i = tid; i < dim; i += threads_per_group) {
+        float v = float(x_row[i]) * rsqrt_val;
+        float w = 1.0f + float(weight[i]);
+        out_row[i] = bfloat(v * w);
+    }
+}
+
 kernel void rms_norm_batched_kernel(
     device bfloat* out [[buffer(0)]],
     device const bfloat* x [[buffer(1)]],

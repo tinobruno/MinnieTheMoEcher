@@ -204,18 +204,22 @@ struct ModelConfig {
         auto get = [&](auto& field, const char* key) {
             if (j.contains(key) && !j.at(key).is_null()) j.at(key).get_to(field);
         };
+        get(model_name, "model_name");
+        get(model_id, "model_id");
+        if (model_name.empty()) get(model_name, "name");
+        if (model_id.empty()) get(model_id, "id");
         if (j.contains("architecture")) {
             std::string arch_str = j["architecture"].get<std::string>();
-            if (arch_str == "qwen2" || arch_str == "qwen2.5") {
+            if (model_id.find("qwen3") != std::string::npos || model_name.find("Qwen 3") != std::string::npos || arch_str == "qwen3") {
+                architecture = ModelArch::QWEN;
+            } else if (arch_str == "qwen2" || arch_str == "qwen2.5") {
                 architecture = ModelArch::QWEN2;
-            } else if (arch_str == "qwen" || arch_str == "qwen3" || arch_str == "llama") {
+            } else if (arch_str == "qwen" || arch_str == "llama") {
                 architecture = ModelArch::QWEN;
             } else {
                 architecture = ModelArch::DEEPSEEK_V4;
             }
         }
-        get(model_name, "model_name");
-        get(model_id, "model_id");
         if (model_name.empty()) get(model_name, "name");
         if (model_id.empty()) get(model_id, "id");
         get(vocab_size, "vocab_size");
@@ -2845,8 +2849,15 @@ public:
         }
 
         // 6. Final norm
-        rms_norm_one_centered_cuda(buf_mtp_hidden_.bf16(), buf_mtp_hidden_.bf16(),
-                                   mtp_norm_w_.bf16(), hidden_size_, rms_eps_, stream);
+        float sum_mtp_fn = 0.0f;
+        for (int d = 0; d < std::min(hidden_size_, 64); d++) sum_mtp_fn += mtp_norm_w_.bf16()[d].to_float();
+        if (sum_mtp_fn / 64.0f < 0.5f) {
+            rms_norm_one_centered_cuda(buf_mtp_hidden_.bf16(), buf_mtp_hidden_.bf16(),
+                                       mtp_norm_w_.bf16(), hidden_size_, rms_eps_, stream);
+        } else {
+            rms_norm_cuda(buf_mtp_hidden_.bf16(), buf_mtp_hidden_.bf16(),
+                          mtp_norm_w_.bf16(), hidden_size_, rms_eps_, stream);
+        }
 
         int active_vocab = use_draft_vocab_ ? draft_vocab_size_ : full_vocab_size_;
         const __nv_bfloat16* active_head = use_draft_vocab_ ? draft_lm_head_w_.bf16() : full_lm_head_w_;
@@ -4235,7 +4246,9 @@ public:
             }
 
             // 3. Final norm
-            if (cfg_.architecture == ModelArch::QWEN) {
+            float sum_fn_w = 0.0f;
+            for (int d = 0; d < std::min(dim, 64); d++) sum_fn_w += norm_weight_.bf16()[d].to_float();
+            if (sum_fn_w / 64.0f < 0.5f) {
                 rms_norm_one_centered_cuda(buf_hidden_.bf16(), buf_hidden_.bf16(),
                                            norm_weight_.bf16(), dim, cfg_.rms_norm_eps, main_stream_);
             } else {
@@ -4731,36 +4744,8 @@ public:
             bool draft_model_active = (!mtp_drafter_.loaded_ && qwen_draft_.loaded_);
 
             if (cfg_.is_qwen()) {
-                size_t curr = prefix_len;
-                // Prefill intermediate prompt tokens in chunks of up to 8 (skipping intermediate LM-head computation)
-                while (curr + 1 < prompt.size()) {
-                    size_t remaining = (prompt.size() - 1) - curr;
-                    int chunk_m = (remaining >= 8) ? 8 : (int)remaining;
-                    CUDA_CHECK(cudaMemcpyAsync(buf_input_pos_batch_.i32(), &h_prefill_pos_[curr],
-                                               chunk_m * sizeof(int32_t), cudaMemcpyHostToDevice, main_stream_));
-                    CUDA_CHECK(cudaMemcpyAsync(buf_input_tokens_batch_.i32(), &h_prefill_tok_[curr],
-                                               chunk_m * sizeof(int32_t), cudaMemcpyHostToDevice, main_stream_));
-                    forward_token_batch_qwen_device_body((int)curr, chunk_m, /*compute_logits=*/false);
-                    if (draft_model_active) {
-                        for (int m = 0; m < chunk_m; m++) {
-                            qwen_draft_.forward_token_async_pinned(&h_prefill_tok_[curr + m],
-                                                                   &h_prefill_pos_[curr + m],
-                                                                   (int)(curr + m), main_stream_);
-                        }
-                    }
-                    curr += chunk_m;
-                }
-
-                // Forward the very last token individually so buf_logits_ and buf_hidden2_ (for MTP) are populated
-                if (curr < prompt.size()) {
-                    if (graph_captured_) {
-                        CUDA_CHECK(cudaMemcpyAsync(buf_track_flag_.i32(), h_single_flag_, sizeof(int32_t), cudaMemcpyHostToDevice, main_stream_));
-                        CUDA_CHECK(cudaMemcpyAsync(buf_input_token_.i32(), &h_prefill_tok_[curr], sizeof(int32_t), cudaMemcpyHostToDevice, main_stream_));
-                        CUDA_CHECK(cudaMemcpyAsync(buf_input_pos_.i32(), &h_prefill_pos_[curr], sizeof(int32_t), cudaMemcpyHostToDevice, main_stream_));
-                        CUDA_CHECK(cudaGraphLaunch(graph_exec_, main_stream_));
-                    } else {
-                        forward_token_eager(prompt[curr], (int)curr);
-                    }
+                for (size_t curr = prefix_len; curr < prompt.size(); curr++) {
+                    forward_token_eager(prompt[curr], (int)curr);
                     if (draft_model_active) {
                         qwen_draft_.forward_token_async_pinned(&h_prefill_tok_[curr],
                                                                &h_prefill_pos_[curr],
@@ -5883,7 +5868,7 @@ private:
             }
         }
 
-        if (cfg_.architecture == ModelArch::QWEN) {
+        if (cfg_.is_qwen()) {
             int n_linear = 0;
             for (auto& lw : layers_) if (lw.is_linear_attn) n_linear++;
             if (n_linear > 0) {
@@ -5922,7 +5907,7 @@ private:
         }
 
         // Load MTP Self-Drafter weights from the same checkpoint
-        if (enable_mtp_ && cfg_.architecture == ModelArch::QWEN && embed_weight_.data) {
+        if (enable_mtp_ && cfg_.is_qwen() && embed_weight_.data) {
             std::string mtp_model_dir = model_dir_;
             if (mtp_model_dir.empty()) {
                 mtp_model_dir = ".";
@@ -6972,12 +6957,14 @@ private:
         if (!compute_logits) return;
 
         // 3. Final norm
-        if (cfg_.architecture == ModelArch::QWEN2) {
-            rms_norm_cuda_batched(buf_hidden_batch_.bf16(), buf_hidden_batch_.bf16(),
-                                  norm_weight_.bf16(), M, dim, cfg_.rms_norm_eps, main_stream_);
-        } else {
+        float sum_bfn_w = 0.0f;
+        for (int d = 0; d < std::min(dim, 64); d++) sum_bfn_w += norm_weight_.bf16()[d].to_float();
+        if (sum_bfn_w / 64.0f < 0.5f) {
             rms_norm_one_centered_cuda_batched(buf_hidden_batch_.bf16(), buf_hidden_batch_.bf16(),
                                                norm_weight_.bf16(), M, dim, cfg_.rms_norm_eps, main_stream_);
+        } else {
+            rms_norm_cuda_batched(buf_hidden_batch_.bf16(), buf_hidden_batch_.bf16(),
+                                  norm_weight_.bf16(), M, dim, cfg_.rms_norm_eps, main_stream_);
         }
 
         // 4. Logits: hidden @ head_weight.T -> [M, vocab_size] in F32

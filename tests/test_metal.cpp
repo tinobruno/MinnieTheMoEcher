@@ -280,6 +280,212 @@ bool test_rope() {
     return true;
 }
 
+
+bool test_gemv_int4_f32() {
+    std::cout << "[TEST] 7. INT4 GEMV f32 (LM Head)..." << std::endl;
+    const int N = 64;
+    const int K = 128;
+    const int num_blocks = K / 32;
+
+    std::vector<__nv_bfloat16> h_vec(K);
+    for (int i = 0; i < K; i++) h_vec[i] = __nv_bfloat16::from_float(0.1f * ((i % 5) - 2));
+
+    std::vector<uint8_t> h_weight(N * (K / 2));
+    std::vector<__nv_bfloat16> h_scale(N * num_blocks);
+    for (size_t i = 0; i < h_weight.size(); i++) h_weight[i] = (uint8_t)(i & 0xFF);
+    for (size_t i = 0; i < h_scale.size(); i++) h_scale[i] = __nv_bfloat16::from_float(0.05f * ((i % 3) + 1));
+
+    std::vector<float> ref_out(N, 0.0f);
+    for (int r = 0; r < N; r++) {
+        float sum = 0.0f;
+        for (int b = 0; b < num_blocks; b++) {
+            float s = h_scale[r * num_blocks + b].to_float();
+            int w_off = r * (K / 2) + b * 16;
+            int a_off = b * 32;
+            float b_sum = 0.0f;
+            for (int i = 0; i < 16; i++) {
+                uint8_t byte_val = h_weight[w_off + i];
+                float q0 = float(byte_val & 0x0F) - 8.0f;
+                float q1 = float(byte_val >> 4) - 8.0f;
+                b_sum += q0 * h_vec[a_off + i * 2].to_float() + q1 * h_vec[a_off + i * 2 + 1].to_float();
+            }
+            sum += b_sum * s;
+        }
+        ref_out[r] = sum;
+    }
+
+    std::vector<float> gpu_out(N, 0.0f);
+    gemv_int4_f32_cuda(gpu_out.data(), h_vec.data(), h_weight.data(), h_scale.data(), N, K, 0);
+
+    float max_err = 0.0f;
+    for (int r = 0; r < N; r++) {
+        float err = std::fabs(gpu_out[r] - ref_out[r]);
+        if (err > max_err) max_err = err;
+    }
+    std::cout << "       Max INT4 GEMV f32 error: " << max_err << std::endl;
+    TEST_CHECK(max_err < 1e-4f, "INT4 GEMV f32 error mismatch");
+    std::cout << "       PASS: INT4 GEMV f32" << std::endl;
+    return true;
+}
+
+bool test_gemv_int3_and_dequant() {
+    std::cout << "[TEST] 8. INT3 GEMV & Dequantization..." << std::endl;
+    const int N = 32;
+    const int K = 64;
+    const int num_blocks = K / 32; // 2 blocks
+    const size_t bytes_per_row = (K * 3) / 8; // 24 bytes
+
+    std::vector<__nv_bfloat16> h_vec(K);
+    for (int i = 0; i < K; i++) h_vec[i] = __nv_bfloat16::from_float(0.2f * ((i % 7) - 3));
+
+    std::vector<uint8_t> h_weight(N * bytes_per_row);
+    std::vector<__nv_bfloat16> h_scale(N * num_blocks);
+    for (size_t i = 0; i < h_weight.size(); i++) h_weight[i] = (uint8_t)((i * 37) & 0xFF);
+    for (size_t i = 0; i < h_scale.size(); i++) h_scale[i] = __nv_bfloat16::from_float(0.1f * ((i % 4) + 1));
+
+    // Dequantize to BF16
+    std::vector<__nv_bfloat16> dequant_out(N * K);
+    dequant_int3_block_cuda(dequant_out.data(), h_weight.data(), h_scale.data(), N, K, 32, 0);
+
+    // Compute GEMV via gemv_int3_cuda
+    std::vector<__nv_bfloat16> gemv_out(N);
+    gemv_int3_cuda(gemv_out.data(), h_vec.data(), h_weight.data(), h_scale.data(), N, K, 0);
+
+    // Compute expected result from dequantized weights
+    float max_err = 0.0f;
+    for (int r = 0; r < N; r++) {
+        float sum = 0.0f;
+        for (int c = 0; c < K; c++) {
+            sum += dequant_out[r * K + c].to_float() * h_vec[c].to_float();
+        }
+        float err = std::fabs(gemv_out[r].to_float() - sum);
+        if (err > max_err) max_err = err;
+    }
+    std::cout << "       Max INT3 GEMV vs Dequant error: " << max_err << std::endl;
+    TEST_CHECK(max_err < 0.05f, "INT3 GEMV vs Dequant mismatch");
+    std::cout << "       PASS: INT3 GEMV & Dequant" << std::endl;
+    return true;
+}
+
+bool test_deltanet_recurrence() {
+    std::cout << "[TEST] 9. DeltaNet Linear Attention recurrence..." << std::endl;
+    const int num_k_heads = 2, num_v_heads = 6, head_dim = 16;
+    const int channels = (2 * num_k_heads + num_v_heads) * head_dim; // 10 * 16 = 160
+    const int M = 3;
+
+    std::vector<__nv_bfloat16> in_qkv(M * channels);
+    for (size_t i = 0; i < in_qkv.size(); i++) in_qkv[i] = __nv_bfloat16::from_float(std::sin(float(i)));
+
+    std::vector<__nv_bfloat16> in_z(M * num_v_heads * head_dim);
+    for (size_t i = 0; i < in_z.size(); i++) in_z[i] = __nv_bfloat16::from_float(0.5f);
+
+    std::vector<__nv_bfloat16> in_a(M * num_v_heads, __nv_bfloat16::from_float(-1.0f));
+    std::vector<__nv_bfloat16> in_b(M * num_v_heads, __nv_bfloat16::from_float(0.0f));
+    std::vector<__nv_bfloat16> conv1d_w(channels * 4, __nv_bfloat16::from_float(0.25f));
+    std::vector<__nv_bfloat16> in_conv_state(channels * 4, __nv_bfloat16::from_float(0.0f));
+    std::vector<__nv_bfloat16> out_conv_state(channels * 4, __nv_bfloat16::from_float(0.0f));
+    std::vector<__nv_bfloat16> A_log(num_v_heads, __nv_bfloat16::from_float(-0.5f));
+    std::vector<__nv_bfloat16> dt_bias(num_v_heads, __nv_bfloat16::from_float(0.1f));
+    std::vector<__nv_bfloat16> norm_w(head_dim, __nv_bfloat16::from_float(1.0f));
+    std::vector<__nv_bfloat16> in_ssm_state(num_v_heads * head_dim * head_dim, __nv_bfloat16::from_float(0.0f));
+    std::vector<__nv_bfloat16> out_ssm_state(num_v_heads * head_dim * head_dim, __nv_bfloat16::from_float(0.0f));
+    std::vector<__nv_bfloat16> out(M * num_v_heads * head_dim, __nv_bfloat16::from_float(0.0f));
+
+    deltanet_linear_attention_decode_batch_cuda(
+        out.data(), in_qkv.data(), in_z.data(), in_a.data(), in_b.data(),
+        conv1d_w.data(), in_conv_state.data(), out_conv_state.data(),
+        nullptr, nullptr, nullptr, nullptr,
+        A_log.data(), dt_bias.data(), norm_w.data(),
+        in_ssm_state.data(), out_ssm_state.data(),
+        nullptr, nullptr, nullptr, nullptr,
+        num_k_heads, num_v_heads, head_dim, M, 0);
+
+    // Verify non-zero output and reasonable bounded values
+    float norm_sum = 0.0f;
+    for (size_t i = 0; i < out.size(); i++) {
+        float v = out[i].to_float();
+        TEST_CHECK(!std::isnan(v) && !std::isinf(v), "DeltaNet output is NaN or Inf");
+        norm_sum += v * v;
+    }
+    std::cout << "       DeltaNet output energy norm: " << std::sqrt(norm_sum) << std::endl;
+    TEST_CHECK(norm_sum > 0.01f, "DeltaNet output is unexpectedly zero");
+    std::cout << "       PASS: DeltaNet Recurrence" << std::endl;
+    return true;
+}
+
+
+bool test_gemv_int4_gpu() {
+    std::cout << "[TEST] 10. INT4 GEMV Metal GPU kernel (gemv_int4_cuda)..." << std::endl;
+    const int N = 64;
+    const int K = 128;
+    const int num_blocks = K / 32;
+
+    std::vector<__nv_bfloat16> h_vec(K);
+    for (int i = 0; i < K; i++) h_vec[i] = __nv_bfloat16::from_float(0.1f * ((i % 5) - 2));
+
+    std::vector<uint8_t> h_weight(N * (K / 2));
+    std::vector<__nv_bfloat16> h_scale(N * num_blocks);
+    for (size_t i = 0; i < h_weight.size(); i++) h_weight[i] = (uint8_t)(i & 0xFF);
+    for (size_t i = 0; i < h_scale.size(); i++) h_scale[i] = __nv_bfloat16::from_float(0.05f * ((i % 3) + 1));
+
+    std::vector<float> ref_out(N, 0.0f);
+    for (int r = 0; r < N; r++) {
+        float sum = 0.0f;
+        for (int b = 0; b < num_blocks; b++) {
+            float sc = h_scale[r * num_blocks + b].to_float();
+            int w_off = r * (K / 2) + b * 16;
+            int a_off = b * 32;
+            float b_sum = 0.0f;
+            for (int i = 0; i < 16; i++) {
+                uint8_t byte_val = h_weight[w_off + i];
+                float q0 = float(byte_val & 0x0F) - 8.0f;
+                float q1 = float(byte_val >> 4) - 8.0f;
+                b_sum += q0 * h_vec[a_off + i * 2].to_float() + q1 * h_vec[a_off + i * 2 + 1].to_float();
+            }
+            sum += b_sum * sc;
+        }
+        ref_out[r] = sum;
+    }
+
+    __nv_bfloat16 *d_out, *d_vec, *d_scale;
+    uint8_t *d_weight;
+    cudaMalloc((void**)&d_out, N * sizeof(__nv_bfloat16));
+    cudaMalloc((void**)&d_vec, K * sizeof(__nv_bfloat16));
+    cudaMalloc((void**)&d_weight, N * (K / 2));
+    cudaMalloc((void**)&d_scale, N * num_blocks * sizeof(__nv_bfloat16));
+
+    memcpy(d_vec, h_vec.data(), K * sizeof(__nv_bfloat16));
+    memcpy(d_weight, h_weight.data(), N * (K / 2));
+    memcpy(d_scale, h_scale.data(), N * num_blocks * sizeof(__nv_bfloat16));
+
+    gemv_int4_cuda(d_out, d_vec, d_weight, d_scale, N, K, 0);
+
+    float max_err = 0.0f;
+    for (int r = 0; r < N; r++) {
+        float gpu_val = d_out[r].to_float();
+        float err = std::fabs(gpu_val - ref_out[r]);
+        if (err > max_err) max_err = err;
+    }
+    std::cout << "       Max INT4 GPU kernel error: " << max_err << std::endl;
+    TEST_CHECK(max_err < 0.1f, "INT4 GPU kernel mismatch");
+    std::cout << "       PASS: INT4 GEMV Metal GPU kernel" << std::endl;
+
+    // Now test residual version
+    gemv_int4_residual_cuda(d_out, d_vec, d_weight, d_scale, N, K, 0);
+    float max_res_err = 0.0f;
+    for (int r = 0; r < N; r++) {
+        float gpu_val = d_out[r].to_float();
+        float err = std::fabs(gpu_val - 2.0f * ref_out[r]);
+        if (err > max_res_err) max_res_err = err;
+    }
+    std::cout << "       Max INT4 GPU residual error: " << max_res_err << std::endl;
+    TEST_CHECK(max_res_err < 0.2f, "INT4 GPU residual mismatch");
+    std::cout << "       PASS: INT4 GEMV Metal GPU residual kernel" << std::endl;
+
+    cudaFree(d_out); cudaFree(d_vec); cudaFree(d_weight); cudaFree(d_scale);
+    return true;
+}
+
 int main() {
     std::cout << "==========================================================" << std::endl;
     std::cout << "  MinnieTheMoEcher — Metal Backend Test Suite (Apple M6)  " << std::endl;
@@ -291,6 +497,10 @@ int main() {
     if (!test_accelerate_gemm()) return 1;
     if (!test_silu_mul()) return 1;
     if (!test_rope()) return 1;
+    if (!test_gemv_int4_f32()) return 1;
+    if (!test_gemv_int3_and_dequant()) return 1;
+    if (!test_deltanet_recurrence()) return 1;
+    if (!test_gemv_int4_gpu()) return 1;
 
     std::cout << "==========================================================" << std::endl;
     std::cout << "  ALL TESTS PASSED ON APPLE SILICON METAL GPU!            " << std::endl;

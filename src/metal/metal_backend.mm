@@ -3,6 +3,8 @@
 #import <Metal/Metal.h>
 #import <MetalPerformanceShaders/MetalPerformanceShaders.h>
 #include <Accelerate/Accelerate.h>
+#include <dispatch/dispatch.h>
+#include <arm_neon.h>
 
 #include "metal_backend.h"
 #include "activations.cuh"
@@ -421,6 +423,7 @@ void rms_norm_cuda(
 
     NSUInteger threads = std::min(256, dim);
     [enc dispatchThreadgroups:MTLSizeMake(1, 1, 1) threadsPerThreadgroup:MTLSizeMake(threads, 1, 1)];
+    s->commit_and_wait();
 }
 
 void rms_norm_one_centered_cuda(
@@ -447,6 +450,7 @@ void rms_norm_one_centered_cuda(
 
     NSUInteger threads = std::min(256, dim);
     [enc dispatchThreadgroups:MTLSizeMake(1, 1, 1) threadsPerThreadgroup:MTLSizeMake(threads, 1, 1)];
+    s->commit_and_wait();
 }
 
 void rms_norm_cuda_batched(
@@ -474,13 +478,35 @@ void rms_norm_cuda_batched(
 
     NSUInteger threads = std::min(256, dim);
     [enc dispatchThreadgroups:MTLSizeMake(n, 1, 1) threadsPerThreadgroup:MTLSizeMake(threads, 1, 1)];
+    s->commit_and_wait();
 }
 
 void rms_norm_one_centered_cuda_batched(
     __nv_bfloat16* out, const __nv_bfloat16* x, const __nv_bfloat16* weight,
     int n, int dim, float eps, cudaStream_t stream)
 {
-    rms_norm_cuda_batched(out, x, weight, n, dim, eps, stream);
+    auto& ctx = MetalContext::instance();
+    MetalStreamObj* s = get_stream(stream);
+    id<MTLComputePipelineState> pso = ctx.get_pipeline("rms_norm_one_centered_batched_kernel");
+    if (!pso) return;
+
+    size_t o_off, x_off, w_off;
+    id<MTLBuffer> b_out = ctx.get_buffer(out, o_off);
+    id<MTLBuffer> b_x = ctx.get_buffer(x, x_off);
+    id<MTLBuffer> b_w = ctx.get_buffer(weight, w_off);
+
+    id<MTLComputeCommandEncoder> enc = s->get_encoder();
+    [enc setComputePipelineState:pso];
+    [enc setBuffer:b_out offset:o_off atIndex:0];
+    [enc setBuffer:b_x offset:x_off atIndex:1];
+    [enc setBuffer:b_w offset:w_off atIndex:2];
+    [enc setBytes:&n length:sizeof(n) atIndex:3];
+    [enc setBytes:&dim length:sizeof(dim) atIndex:4];
+    [enc setBytes:&eps length:sizeof(eps) atIndex:5];
+
+    NSUInteger threads = std::min(256, dim);
+    [enc dispatchThreadgroups:MTLSizeMake(n, 1, 1) threadsPerThreadgroup:MTLSizeMake(threads, 1, 1)];
+    s->commit_and_wait();
 }
 
 void rms_norm_f32_cuda(float* x, int dim, float eps, cudaStream_t stream) {
@@ -522,6 +548,7 @@ void rms_norm_unweighted_batched_cuda(
 
     NSUInteger threads = std::min(256, dim);
     [enc dispatchThreadgroups:MTLSizeMake(n, 1, 1) threadsPerThreadgroup:MTLSizeMake(threads, 1, 1)];
+    s->commit_and_wait();
 }
 
 void silu_mul_cuda(
@@ -549,6 +576,7 @@ void silu_mul_cuda(
     NSUInteger tg = 256;
     NSUInteger groups = (n + tg - 1) / tg;
     [enc dispatchThreadgroups:MTLSizeMake(groups, 1, 1) threadsPerThreadgroup:MTLSizeMake(tg, 1, 1)];
+    s->commit_and_wait();
 }
 
 void vector_add_bf16_cuda(__nv_bfloat16* a, const __nv_bfloat16* b, int n, cudaStream_t stream) {
@@ -570,6 +598,7 @@ void vector_add_bf16_cuda(__nv_bfloat16* a, const __nv_bfloat16* b, int n, cudaS
     NSUInteger tg = 256;
     NSUInteger groups = (n + tg - 1) / tg;
     [enc dispatchThreadgroups:MTLSizeMake(groups, 1, 1) threadsPerThreadgroup:MTLSizeMake(tg, 1, 1)];
+    s->commit_and_wait();
 }
 
 void weighted_add_cuda(__nv_bfloat16* out, const __nv_bfloat16* x, float weight, int dim, cudaStream_t stream) {
@@ -592,6 +621,7 @@ void weighted_add_cuda(__nv_bfloat16* out, const __nv_bfloat16* x, float weight,
     NSUInteger tg = 256;
     NSUInteger groups = (dim + tg - 1) / tg;
     [enc dispatchThreadgroups:MTLSizeMake(groups, 1, 1) threadsPerThreadgroup:MTLSizeMake(tg, 1, 1)];
+    s->commit_and_wait();
 }
 
 void add_cuda(__nv_bfloat16* out, const __nv_bfloat16* a, const __nv_bfloat16* b, int n, cudaStream_t stream) {
@@ -634,6 +664,7 @@ void rope_cuda(
     [enc setBytes:&inverse length:sizeof(inverse) atIndex:6];
 
     [enc dispatchThreadgroups:MTLSizeMake(n_vectors, 1, 1) threadsPerThreadgroup:MTLSizeMake(rope_dim / 2, 1, 1)];
+    s->commit_and_wait();
 }
 
 void rope_standard_cuda(
@@ -661,6 +692,7 @@ void rope_standard_cuda(
 
     int max_heads = std::max(n_q_heads, n_kv_heads);
     [enc dispatchThreadgroups:MTLSizeMake(max_heads, 1, 1) threadsPerThreadgroup:MTLSizeMake(head_dim / 2, 1, 1)];
+    s->commit_and_wait();
 }
 
 void embedding_cuda(
@@ -687,6 +719,7 @@ void embedding_cuda(
 
     NSUInteger tg = std::min(256, dim);
     [enc dispatchThreadgroups:MTLSizeMake(seq_len, 1, 1) threadsPerThreadgroup:MTLSizeMake(tg, 1, 1)];
+    s->commit_and_wait();
 }
 
 void embedding_broadcast_cuda(
@@ -714,6 +747,7 @@ void embedding_broadcast_cuda(
 
     NSUInteger tg = std::min(256, dim);
     [enc dispatchThreadgroups:MTLSizeMake(1, 1, 1) threadsPerThreadgroup:MTLSizeMake(tg, 1, 1)];
+    s->commit_and_wait();
 }
 
 void gemv_int4_cuda(
@@ -743,6 +777,7 @@ void gemv_int4_cuda(
     [enc setBytes:&is_residual length:sizeof(is_residual) atIndex:6];
 
     [enc dispatchThreadgroups:MTLSizeMake(N, 1, 1) threadsPerThreadgroup:MTLSizeMake(64, 1, 1)];
+    s->commit_and_wait();
 }
 
 void gemv_int4_residual_cuda(
@@ -772,6 +807,7 @@ void gemv_int4_residual_cuda(
     [enc setBytes:&is_residual length:sizeof(is_residual) atIndex:6];
 
     [enc dispatchThreadgroups:MTLSizeMake(N, 1, 1) threadsPerThreadgroup:MTLSizeMake(64, 1, 1)];
+    s->commit_and_wait();
 }
 
 void gemv_int4_swiglu_fused_cuda(
@@ -806,6 +842,7 @@ void gemv_int4_swiglu_fused_cuda(
     [enc setBytes:&swiglu_limit length:sizeof(swiglu_limit) atIndex:8];
 
     [enc dispatchThreadgroups:MTLSizeMake(N, 1, 1) threadsPerThreadgroup:MTLSizeMake(64, 1, 1)];
+    s->commit_and_wait();
 }
 
 void gemv_int4_f32_cuda(
@@ -814,7 +851,7 @@ void gemv_int4_f32_cuda(
 {
     (void)stream;
     int num_blocks = K / 32;
-    for (int r = 0; r < N; r++) {
+    dispatch_apply(N, dispatch_get_global_queue(QOS_CLASS_USER_INTERACTIVE, 0), ^(size_t r) {
         const __nv_bfloat16* row_s = scale + r * num_blocks;
         const uint8_t* row_w = weight + r * (K / 2);
         float sum = 0.0f;
@@ -832,7 +869,7 @@ void gemv_int4_f32_cuda(
             sum += b_sum * s;
         }
         out[r] = sum;
-    }
+    });
 }
 
 void gemm_int4_batch_cuda(
@@ -920,56 +957,6 @@ void f32_to_bf16_cuda(__nv_bfloat16* out, const float* in, int n, cudaStream_t s
     for (int i = 0; i < n; i++) out[i] = __nv_bfloat16::from_float(in[i]);
 }
 
-void deltanet_linear_attention_decode_cuda(
-    __nv_bfloat16* out, const __nv_bfloat16* in_qkv, const __nv_bfloat16* in_z,
-    const __nv_bfloat16* in_a, const __nv_bfloat16* in_b,
-    const __nv_bfloat16* conv1d_w, const __nv_bfloat16* in_conv_state, __nv_bfloat16* out_conv_state,
-    const __nv_bfloat16* A_log, const __nv_bfloat16* dt_bias, const __nv_bfloat16* norm_w,
-    const __nv_bfloat16* in_ssm_state, __nv_bfloat16* out_ssm_state,
-    int num_k_heads, int num_v_heads, int head_dim, cudaStream_t stream)
-{
-    auto& ctx = MetalContext::instance();
-    MetalStreamObj* s = get_stream(stream);
-    id<MTLComputePipelineState> pso = ctx.get_pipeline("deltanet_decode_kernel");
-    if (!pso) return;
-
-    size_t o_off, qkv_off, z_off, a_off, b_off, cw_off, ics_off, ocs_off, al_off, dt_off, nw_off, iss_off, oss_off;
-    id<MTLBuffer> b_o = ctx.get_buffer(out, o_off);
-    id<MTLBuffer> b_qkv = ctx.get_buffer(in_qkv, qkv_off);
-    id<MTLBuffer> b_z = ctx.get_buffer(in_z, z_off);
-    id<MTLBuffer> b_a = ctx.get_buffer(in_a, a_off);
-    id<MTLBuffer> b_b = ctx.get_buffer(in_b, b_off);
-    id<MTLBuffer> b_cw = ctx.get_buffer(conv1d_w, cw_off);
-    id<MTLBuffer> b_ics = ctx.get_buffer(in_conv_state, ics_off);
-    id<MTLBuffer> b_ocs = ctx.get_buffer(out_conv_state, ocs_off);
-    id<MTLBuffer> b_al = ctx.get_buffer(A_log, al_off);
-    id<MTLBuffer> b_dt = ctx.get_buffer(dt_bias, dt_off);
-    id<MTLBuffer> b_nw = ctx.get_buffer(norm_w, nw_off);
-    id<MTLBuffer> b_iss = ctx.get_buffer(in_ssm_state, iss_off);
-    id<MTLBuffer> b_oss = ctx.get_buffer(out_ssm_state, oss_off);
-
-    id<MTLComputeCommandEncoder> enc = s->get_encoder();
-    [enc setComputePipelineState:pso];
-    [enc setBuffer:b_o offset:o_off atIndex:0];
-    [enc setBuffer:b_qkv offset:qkv_off atIndex:1];
-    [enc setBuffer:b_z offset:z_off atIndex:2];
-    [enc setBuffer:b_a offset:a_off atIndex:3];
-    [enc setBuffer:b_b offset:b_off atIndex:4];
-    [enc setBuffer:b_cw offset:cw_off atIndex:5];
-    [enc setBuffer:b_ics offset:ics_off atIndex:6];
-    [enc setBuffer:b_ocs offset:ocs_off atIndex:7];
-    [enc setBuffer:b_al offset:al_off atIndex:8];
-    [enc setBuffer:b_dt offset:dt_off atIndex:9];
-    [enc setBuffer:b_nw offset:nw_off atIndex:10];
-    [enc setBuffer:b_iss offset:iss_off atIndex:11];
-    [enc setBuffer:b_oss offset:oss_off atIndex:12];
-    [enc setBytes:&num_k_heads length:sizeof(num_k_heads) atIndex:13];
-    [enc setBytes:&num_v_heads length:sizeof(num_v_heads) atIndex:14];
-    [enc setBytes:&head_dim length:sizeof(head_dim) atIndex:15];
-
-    [enc dispatchThreadgroups:MTLSizeMake(num_v_heads, 1, 1) threadsPerThreadgroup:MTLSizeMake(head_dim, 1, 1)];
-}
-
 void deltanet_linear_attention_decode_batch_cuda(
     __nv_bfloat16* out, const __nv_bfloat16* in_qkv, const __nv_bfloat16* in_z,
     const __nv_bfloat16* in_a, const __nv_bfloat16* in_b,
@@ -982,62 +969,226 @@ void deltanet_linear_attention_decode_batch_cuda(
     __nv_bfloat16* slot_ssm_2, __nv_bfloat16* slot_ssm_3,
     int num_k_heads, int num_v_heads, int head_dim, int M, cudaStream_t stream)
 {
-    (void)slot_conv_0; (void)slot_conv_1; (void)slot_conv_2; (void)slot_conv_3;
-    (void)slot_ssm_0; (void)slot_ssm_1; (void)slot_ssm_2; (void)slot_ssm_3;
-    for (int m = 0; m < M; m++) {
-        deltanet_linear_attention_decode_cuda(
-            out + m * num_v_heads * head_dim,
-            in_qkv + m * (2 * num_k_heads + num_v_heads) * head_dim,
-            in_z + m * num_v_heads * head_dim,
-            in_a + m * num_v_heads,
-            in_b + m * num_v_heads,
-            conv1d_w,
-            in_conv_state, out_conv_state,
-            A_log, dt_bias, norm_w,
-            in_ssm_state, out_ssm_state,
-            num_k_heads, num_v_heads, head_dim, stream);
-    }
+    (void)stream;
+    if (!out || !in_qkv || !in_z || !in_a || !in_b || !conv1d_w || !in_conv_state || !in_ssm_state || !norm_w || !A_log || !dt_bias) return;
+    int channels = (2 * num_k_heads + num_v_heads) * head_dim;
+
+    // 1. Conv1D 1x4 depthwise causal convolution across M tokens
+    std::vector<__nv_bfloat16> conv_out((size_t)M * channels);
+    __nv_bfloat16* conv_out_ptr = conv_out.data();
+
+    dispatch_apply(channels, dispatch_get_global_queue(QOS_CLASS_USER_INTERACTIVE, 0), ^(size_t c) {
+        const __nv_bfloat16* in_cs = in_conv_state + c * 4;
+        const __nv_bfloat16* cw = conv1d_w + c * 4;
+
+        float s0 = in_cs[1].to_float();
+        float s1 = in_cs[2].to_float();
+        float s2 = in_cs[3].to_float();
+
+        float w0 = cw[0].to_float();
+        float w1 = cw[1].to_float();
+        float w2 = cw[2].to_float();
+        float w3 = cw[3].to_float();
+
+        for (int m = 0; m < M; m++) {
+            float s3 = in_qkv[(size_t)m * channels + c].to_float();
+            float val = s0 * w0 + s1 * w1 + s2 * w2 + s3 * w3;
+            float silu_val = val / (1.0f + std::exp(-val));
+            conv_out_ptr[(size_t)m * channels + c] = __nv_bfloat16::from_float(silu_val);
+
+            if (m == 0 && slot_conv_0) {
+                __nv_bfloat16* slot_cs = slot_conv_0 + c * 4;
+                slot_cs[0] = __nv_bfloat16::from_float(s0);
+                slot_cs[1] = __nv_bfloat16::from_float(s1);
+                slot_cs[2] = __nv_bfloat16::from_float(s2);
+                slot_cs[3] = __nv_bfloat16::from_float(s3);
+            } else if (m == 1 && slot_conv_1) {
+                __nv_bfloat16* slot_cs = slot_conv_1 + c * 4;
+                slot_cs[0] = __nv_bfloat16::from_float(s0);
+                slot_cs[1] = __nv_bfloat16::from_float(s1);
+                slot_cs[2] = __nv_bfloat16::from_float(s2);
+                slot_cs[3] = __nv_bfloat16::from_float(s3);
+            } else if (m == 2 && slot_conv_2) {
+                __nv_bfloat16* slot_cs = slot_conv_2 + c * 4;
+                slot_cs[0] = __nv_bfloat16::from_float(s0);
+                slot_cs[1] = __nv_bfloat16::from_float(s1);
+                slot_cs[2] = __nv_bfloat16::from_float(s2);
+                slot_cs[3] = __nv_bfloat16::from_float(s3);
+            } else if (m == 3 && slot_conv_3) {
+                __nv_bfloat16* slot_cs = slot_conv_3 + c * 4;
+                slot_cs[0] = __nv_bfloat16::from_float(s0);
+                slot_cs[1] = __nv_bfloat16::from_float(s1);
+                slot_cs[2] = __nv_bfloat16::from_float(s2);
+                slot_cs[3] = __nv_bfloat16::from_float(s3);
+            }
+
+            if (m == M - 1 && out_conv_state) {
+                __nv_bfloat16* out_cs = out_conv_state + c * 4;
+                out_cs[0] = __nv_bfloat16::from_float(s0);
+                out_cs[1] = __nv_bfloat16::from_float(s1);
+                out_cs[2] = __nv_bfloat16::from_float(s2);
+                out_cs[3] = __nv_bfloat16::from_float(s3);
+            }
+
+            s0 = s1;
+            s1 = s2;
+            s2 = s3;
+        }
+    });
+
+    // 2. SSM Recurrence per head across M tokens
+    int qkv_stride = channels;
+    int z_stride = num_v_heads * head_dim;
+
+    dispatch_apply(num_v_heads, dispatch_get_global_queue(QOS_CLASS_USER_INTERACTIVE, 0), ^(size_t h) {
+        int k_h = (int)h / (num_v_heads / num_k_heads);
+        const __nv_bfloat16* in_state_h = in_ssm_state + h * head_dim * head_dim;
+        std::vector<float> s_state(head_dim * head_dim);
+        for (int i = 0; i < head_dim * head_dim; i++) {
+            s_state[i] = in_state_h[i].to_float();
+        }
+
+        float dt_val = dt_bias[h].to_float();
+        float a_log_val = A_log[h].to_float();
+
+        int q_offset = k_h * head_dim;
+        int k_offset = (num_k_heads * head_dim) + k_h * head_dim;
+        int v_offset = (2 * num_k_heads * head_dim) + (int)h * head_dim;
+
+        for (int m = 0; m < M; m++) {
+            const __nv_bfloat16* m_conv = conv_out_ptr + (size_t)m * qkv_stride;
+            const __nv_bfloat16* m_z = in_z + (size_t)m * z_stride;
+            const __nv_bfloat16* m_a = in_a + (size_t)m * num_v_heads;
+            const __nv_bfloat16* m_b = in_b + (size_t)m * num_v_heads;
+
+            float a_val = m_a[h].to_float();
+            float b_val = m_b[h].to_float();
+            float beta = 1.0f / (1.0f + std::exp(-b_val));
+            float val_a = a_val + dt_val;
+            float softplus_a = (val_a > 20.0f) ? val_a : std::log1p(std::exp(val_a));
+            float g = -std::exp(a_log_val) * softplus_a;
+            float decay = std::exp(g);
+
+            std::vector<float> s_q(head_dim), s_k(head_dim), s_v(head_dim), s_z(head_dim);
+            float q_norm_sq = 0.0f, k_norm_sq = 0.0f;
+            for (int d = 0; d < head_dim; d++) {
+                float qd = m_conv[q_offset + d].to_float();
+                float kd = m_conv[k_offset + d].to_float();
+                s_q[d] = qd;
+                s_k[d] = kd;
+                s_v[d] = m_conv[v_offset + d].to_float();
+                s_z[d] = m_z[h * head_dim + d].to_float();
+                q_norm_sq += qd * qd;
+                k_norm_sq += kd * kd;
+            }
+
+            float r_q = (1.0f / std::sqrt(q_norm_sq + 1e-6f)) * (1.0f / std::sqrt((float)head_dim));
+            float r_k = 1.0f / std::sqrt(k_norm_sq + 1e-6f);
+            for (int d = 0; d < head_dim; d++) {
+                s_q[d] *= r_q;
+                s_k[d] *= r_k;
+            }
+
+            std::vector<float> s_out(head_dim, 0.0f);
+            float out_norm_sq = 0.0f;
+
+            for (int c = 0; c < head_dim; c++) {
+                float mem = 0.0f;
+                for (int r = 0; r < head_dim; r++) {
+                    float s_val = s_state[r * head_dim + c];
+                    mem += (decay * s_val) * s_k[r];
+                }
+                float delta_c = (s_v[c] - mem) * beta;
+                float out_c = 0.0f;
+                for (int r = 0; r < head_dim; r++) {
+                    float new_s = decay * s_state[r * head_dim + c] + s_k[r] * delta_c;
+                    s_state[r * head_dim + c] = new_s;
+                    out_c += new_s * s_q[r];
+                }
+                s_out[c] = out_c;
+                out_norm_sq += out_c * out_c;
+            }
+
+            if (m == 0 && slot_ssm_0) {
+                __nv_bfloat16* slot_state_h = slot_ssm_0 + h * head_dim * head_dim;
+                for (int i = 0; i < head_dim * head_dim; i++) slot_state_h[i] = __nv_bfloat16::from_float(s_state[i]);
+            } else if (m == 1 && slot_ssm_1) {
+                __nv_bfloat16* slot_state_h = slot_ssm_1 + h * head_dim * head_dim;
+                for (int i = 0; i < head_dim * head_dim; i++) slot_state_h[i] = __nv_bfloat16::from_float(s_state[i]);
+            } else if (m == 2 && slot_ssm_2) {
+                __nv_bfloat16* slot_state_h = slot_ssm_2 + h * head_dim * head_dim;
+                for (int i = 0; i < head_dim * head_dim; i++) slot_state_h[i] = __nv_bfloat16::from_float(s_state[i]);
+            } else if (m == 3 && slot_ssm_3) {
+                __nv_bfloat16* slot_state_h = slot_ssm_3 + h * head_dim * head_dim;
+                for (int i = 0; i < head_dim * head_dim; i++) slot_state_h[i] = __nv_bfloat16::from_float(s_state[i]);
+            }
+
+            float r_out = 1.0f / std::sqrt(out_norm_sq / (float)head_dim + 1e-6f);
+            __nv_bfloat16* m_out = out + (size_t)m * z_stride + h * head_dim;
+            for (int d = 0; d < head_dim; d++) {
+                float normed = s_out[d] * r_out * norm_w[d].to_float();
+                float z = s_z[d];
+                float silu_z = z / (1.0f + std::exp(-z));
+                m_out[d] = __nv_bfloat16::from_float(normed * silu_z);
+            }
+        }
+
+        if (out_ssm_state) {
+            __nv_bfloat16* out_state_h = out_ssm_state + h * head_dim * head_dim;
+            for (int i = 0; i < head_dim * head_dim; i++) {
+                out_state_h[i] = __nv_bfloat16::from_float(s_state[i]);
+            }
+        }
+    });
+}
+
+void deltanet_linear_attention_decode_cuda(
+    __nv_bfloat16* out, const __nv_bfloat16* in_qkv, const __nv_bfloat16* in_z,
+    const __nv_bfloat16* in_a, const __nv_bfloat16* in_b,
+    const __nv_bfloat16* conv1d_w, const __nv_bfloat16* in_conv_state, __nv_bfloat16* out_conv_state,
+    const __nv_bfloat16* A_log, const __nv_bfloat16* dt_bias, const __nv_bfloat16* norm_w,
+    const __nv_bfloat16* in_ssm_state, __nv_bfloat16* out_ssm_state,
+    int num_k_heads, int num_v_heads, int head_dim, cudaStream_t stream)
+{
+    deltanet_linear_attention_decode_batch_cuda(
+        out, in_qkv, in_z, in_a, in_b, conv1d_w,
+        in_conv_state, out_conv_state,
+        nullptr, nullptr, nullptr, nullptr,
+        A_log, dt_bias, norm_w,
+        in_ssm_state, out_ssm_state,
+        nullptr, nullptr, nullptr, nullptr,
+        num_k_heads, num_v_heads, head_dim, 1, stream);
 }
 
 void softmax_cuda(float* out, const float* x, int rows, int cols, cudaStream_t stream) {
-    auto& ctx = MetalContext::instance();
-    MetalStreamObj* s = get_stream(stream);
-    id<MTLComputePipelineState> pso = ctx.get_pipeline("softmax_kernel");
-    if (!pso) return;
-
-    size_t o_off, x_off;
-    id<MTLBuffer> b_o = ctx.get_buffer(out, o_off);
-    id<MTLBuffer> b_x = ctx.get_buffer(x, x_off);
-
-    id<MTLComputeCommandEncoder> enc = s->get_encoder();
-    [enc setComputePipelineState:pso];
-    [enc setBuffer:b_o offset:o_off atIndex:0];
-    [enc setBuffer:b_x offset:x_off atIndex:1];
-    [enc setBytes:&rows length:sizeof(rows) atIndex:2];
-    [enc setBytes:&cols length:sizeof(cols) atIndex:3];
-
-    NSUInteger tg = std::min(256, cols);
-    [enc dispatchThreadgroups:MTLSizeMake(rows, 1, 1) threadsPerThreadgroup:MTLSizeMake(tg, 1, 1)];
+    (void)stream;
+    for (int r = 0; r < rows; r++) {
+        const float* in_row = x + r * cols;
+        float* out_row = out + r * cols;
+        float max_val = in_row[0];
+        for (int c = 1; c < cols; c++) if (in_row[c] > max_val) max_val = in_row[c];
+        float sum = 0.0f;
+        for (int c = 0; c < cols; c++) {
+            float e = std::exp(in_row[c] - max_val);
+            out_row[c] = e;
+            sum += e;
+        }
+        float inv = 1.0f / (sum + 1e-9f);
+        for (int c = 0; c < cols; c++) out_row[c] *= inv;
+    }
 }
 
 void argmax_f32_cuda(int32_t* out, const float* logits, int n, cudaStream_t stream) {
-    auto& ctx = MetalContext::instance();
-    MetalStreamObj* s = get_stream(stream);
-    id<MTLComputePipelineState> pso = ctx.get_pipeline("argmax_f32_kernel");
-    if (!pso) return;
-
-    size_t o_off, l_off;
-    id<MTLBuffer> b_o = ctx.get_buffer(out, o_off);
-    id<MTLBuffer> b_l = ctx.get_buffer(logits, l_off);
-
-    id<MTLComputeCommandEncoder> enc = s->get_encoder();
-    [enc setComputePipelineState:pso];
-    [enc setBuffer:b_o offset:o_off atIndex:0];
-    [enc setBuffer:b_l offset:l_off atIndex:1];
-    [enc setBytes:&n length:sizeof(n) atIndex:2];
-
-    NSUInteger tg = 256;
-    [enc dispatchThreadgroups:MTLSizeMake(1, 1, 1) threadsPerThreadgroup:MTLSizeMake(tg, 1, 1)];
+    (void)stream;
+    int32_t best_idx = 0;
+    float best_val = logits[0];
+    for (int i = 1; i < n; i++) {
+        if (logits[i] > best_val) {
+            best_val = logits[i];
+            best_idx = i;
+        }
+    }
+    *out = best_idx;
 }
 
 void argmax_f32_batch_cuda(int32_t* out, const float* logits, int n, int M, cudaStream_t stream) {
@@ -1215,6 +1366,7 @@ void add_bias_bf16_cuda(
     NSUInteger tg = 256;
     NSUInteger groups = (total + tg - 1) / tg;
     [enc dispatchThreadgroups:MTLSizeMake(groups, 1, 1) threadsPerThreadgroup:MTLSizeMake(tg, 1, 1)];
+    s->commit_and_wait();
 }
 
 void add_tensors_bf16_cuda(__nv_bfloat16* dst, const __nv_bfloat16* src, size_t count, cudaStream_t stream) {
@@ -1751,7 +1903,6 @@ void gqa_attention_decode_cuda(
     int group_size = n_q_heads / n_kv_heads;
     float scale = 1.0f / sqrtf((float)head_dim);
 
-    // Write new token to KV cache
     if (new_k && k_cache) {
         std::memcpy(k_cache + size_t(pos) * n_kv_heads * head_dim, new_k, n_kv_heads * head_dim * sizeof(__nv_bfloat16));
     }
@@ -1759,17 +1910,44 @@ void gqa_attention_decode_cuda(
         std::memcpy(v_cache + size_t(pos) * n_kv_heads * head_dim, new_v, n_kv_heads * head_dim * sizeof(__nv_bfloat16));
     }
 
+    static thread_local std::vector<float> scores_buf;
+    if ((int)scores_buf.size() <= pos) scores_buf.resize((pos + 1) * 2);
+    float* scores = scores_buf.data();
+
+    std::vector<float> q_f(head_dim);
+    std::vector<float> out_f(head_dim);
+
     for (int qh = 0; qh < n_q_heads; qh++) {
         int kv_h = qh / group_size;
         const __nv_bfloat16* q_head = q + qh * head_dim;
-        std::vector<float> scores(pos + 1);
-        float max_s = -1e38f;
 
+        for (int d = 0; d < head_dim; d++) {
+            uint32_t u = ((uint32_t)*(const uint16_t*)&q_head[d]) << 16;
+            q_f[d] = *(float*)&u;
+        }
+
+        float max_s = -1e38f;
         for (int t = 0; t <= pos; t++) {
             const __nv_bfloat16* k_head = k_cache + ((size_t)t * n_kv_heads + kv_h) * head_dim;
             float dot = 0.0f;
-            for (int d = 0; d < head_dim; d++) {
-                dot += q_head[d].to_float() * k_head[d].to_float();
+            int d = 0;
+#if defined(__ARM_NEON)
+            float32x4_t sum0 = vdupq_n_f32(0.0f);
+            float32x4_t sum1 = vdupq_n_f32(0.0f);
+            for (; d <= head_dim - 8; d += 8) {
+                uint16x8_t kv = vld1q_u16((const uint16_t*)&k_head[d]);
+                float32x4_t k0 = vreinterpretq_f32_u32(vshll_n_u16(vget_low_u16(kv), 16));
+                float32x4_t k1 = vreinterpretq_f32_u32(vshll_n_u16(vget_high_u16(kv), 16));
+                float32x4_t q0 = vld1q_f32(&q_f[d]);
+                float32x4_t q1 = vld1q_f32(&q_f[d + 4]);
+                sum0 = vmlaq_f32(sum0, k0, q0);
+                sum1 = vmlaq_f32(sum1, k1, q1);
+            }
+            dot = vaddvq_f32(vaddq_f32(sum0, sum1));
+#endif
+            for (; d < head_dim; d++) {
+                uint32_t u = ((uint32_t)*(const uint16_t*)&k_head[d]) << 16;
+                dot += q_f[d] * (*(float*)&u);
             }
             dot *= scale;
             scores[t] = dot;
@@ -1778,41 +1956,244 @@ void gqa_attention_decode_cuda(
 
         float sum_exp = 0.0f;
         for (int t = 0; t <= pos; t++) {
-            scores[t] = expf(scores[t] - max_s);
-            sum_exp += scores[t];
+            float exp_val = expf(scores[t] - max_s);
+            scores[t] = exp_val;
+            sum_exp += exp_val;
         }
         float inv_sum = 1.0f / (sum_exp + 1e-9f);
 
+        std::fill(out_f.begin(), out_f.end(), 0.0f);
+        for (int t = 0; t <= pos; t++) {
+            float w = scores[t] * inv_sum;
+            const __nv_bfloat16* v_head = v_cache + ((size_t)t * n_kv_heads + kv_h) * head_dim;
+            int d = 0;
+#if defined(__ARM_NEON)
+            float32x4_t wv = vdupq_n_f32(w);
+            for (; d <= head_dim - 8; d += 8) {
+                uint16x8_t vv = vld1q_u16((const uint16_t*)&v_head[d]);
+                float32x4_t v0 = vreinterpretq_f32_u32(vshll_n_u16(vget_low_u16(vv), 16));
+                float32x4_t v1 = vreinterpretq_f32_u32(vshll_n_u16(vget_high_u16(vv), 16));
+                float32x4_t o0 = vld1q_f32(&out_f[d]);
+                float32x4_t o1 = vld1q_f32(&out_f[d + 4]);
+                vst1q_f32(&out_f[d], vmlaq_f32(o0, v0, wv));
+                vst1q_f32(&out_f[d + 4], vmlaq_f32(o1, v1, wv));
+            }
+#endif
+            for (; d < head_dim; d++) {
+                uint32_t u = ((uint32_t)*(const uint16_t*)&v_head[d]) << 16;
+                out_f[d] += w * (*(float*)&u);
+            }
+        }
+
         __nv_bfloat16* out_head = out + qh * head_dim;
         for (int d = 0; d < head_dim; d++) {
-            float val = 0.0f;
-            for (int t = 0; t <= pos; t++) {
-                const __nv_bfloat16* v_head = v_cache + ((size_t)t * n_kv_heads + kv_h) * head_dim;
-                val += (scores[t] * inv_sum) * v_head[d].to_float();
-            }
-            out_head[d] = __nv_bfloat16::from_float(val);
+            out_head[d] = __nv_bfloat16::from_float(out_f[d]);
         }
     }
 }
 
-void qwen_gqa_decode_gated_cuda(
+
+
+static inline float fp8_e4m3_to_float_host(uint8_t val) {
+    if (val == 0) return 0.0f;
+    uint32_t sign = (uint32_t)(val & 0x80) << 24;
+    uint32_t body = ((uint32_t)(val & 0x7F) << 20) + 0x3C000000U;
+    float f;
+    uint32_t u = sign | body;
+    std::memcpy(&f, &u, sizeof(f));
+    return f;
+}
+
+static inline uint8_t float_to_fp8_e4m3_host(float val) {
+    uint32_t u;
+    std::memcpy(&u, &val, sizeof(u));
+    uint32_t sign = (u >> 24) & 0x80;
+    u &= 0x7FFFFFFF;
+    if (u == 0) return (uint8_t)sign;
+
+    u += (1U << 19);
+    int exp = ((u >> 23) & 0xFF) - 127 + 7;
+    uint32_t mant = (u >> 20) & 0x7;
+
+    if (exp >= 15) {
+        return (uint8_t)(sign | 0x7E);
+    } else if (exp <= 0) {
+        if (exp < -3) return (uint8_t)sign;
+        mant = ((u & 0x007FFFFF) | 0x00800000) >> (21 - exp);
+        return (uint8_t)(sign | mant);
+    }
+    return (uint8_t)(sign | (exp << 3) | mant);
+}
+
+template <typename TCache>
+static void qwen_gqa_decode_gated_generic(
     __nv_bfloat16* out, const __nv_bfloat16* q_and_gate, __nv_bfloat16* k, const __nv_bfloat16* v,
     const __nv_bfloat16* q_norm_w, const __nv_bfloat16* k_norm_w,
-    __nv_bfloat16* k_cache, __nv_bfloat16* v_cache,
+    TCache* k_cache, TCache* v_cache,
     int n_q_heads, int n_kv_heads, int head_dim, const int32_t* d_pos,
-    int pos_scalar, int max_seq_len, float rope_theta, float eps, cudaStream_t stream)
+    int pos_scalar, int M, int max_seq_len, float rope_theta, float eps, cudaStream_t stream)
 {
-    (void)q_norm_w; (void)k_norm_w; (void)d_pos; (void)rope_theta; (void)eps;
-    int pos = pos_scalar;
-    gqa_attention_decode_cuda(out, q_and_gate, k_cache, v_cache, k, v, n_q_heads, n_kv_heads, head_dim, pos, max_seq_len, stream);
+    (void)stream;
+    int group_size = n_q_heads / n_kv_heads;
+    float scale = 1.0f / sqrtf((float)head_dim);
+    int rotary_dim = 64; // Qwen 3.8 partial RoPE
+    int half_rotary = rotary_dim / 2; // 32
 
-    // Apply gate: out = out * silu(gate)
-    const __nv_bfloat16* gate = q_and_gate + n_q_heads * head_dim;
-    for (int i = 0; i < n_q_heads * head_dim; i++) {
-        float g = gate[i].to_float();
-        float silu_g = g / (1.0f + expf(-g));
-        out[i] = __nv_bfloat16::from_float(out[i].to_float() * silu_g);
+    // 1. Process K and V for all M tokens and store into cache
+    for (int m = 0; m < M; m++) {
+        int pos = d_pos ? d_pos[m] : (pos_scalar + m);
+        if (pos >= max_seq_len) pos = max_seq_len - 1;
+
+        if (k && v && k_cache && v_cache) {
+            for (int kv_h = 0; kv_h < n_kv_heads; kv_h++) {
+                const __nv_bfloat16* k_in = k + (size_t)m * n_kv_heads * head_dim + kv_h * head_dim;
+                const __nv_bfloat16* v_in = v + (size_t)m * n_kv_heads * head_dim + kv_h * head_dim;
+                std::vector<float> k_vec(head_dim);
+
+                if (k_norm_w) {
+                    float sum_sq = 0.0f;
+                    for (int d = 0; d < head_dim; d++) {
+                        float val = k_in[d].to_float();
+                        k_vec[d] = val;
+                        sum_sq += val * val;
+                    }
+                    float rrms = 1.0f / sqrtf(sum_sq / (float)head_dim + eps);
+                    for (int d = 0; d < head_dim; d++) {
+                        k_vec[d] = k_vec[d] * rrms * (1.0f + k_norm_w[d].to_float());
+                    }
+                } else {
+                    for (int d = 0; d < head_dim; d++) {
+                        k_vec[d] = k_in[d].to_float();
+                    }
+                }
+
+                for (int i = 0; i < half_rotary; i++) {
+                    float freq = 1.0f / powf(rope_theta, (float)(2 * i) / (float)rotary_dim);
+                    float angle = (float)pos * freq;
+                    float cos_a = cosf(angle);
+                    float sin_a = sinf(angle);
+                    float k0 = k_vec[i];
+                    float k1 = k_vec[i + half_rotary];
+                    k_vec[i] = k0 * cos_a - k1 * sin_a;
+                    k_vec[i + half_rotary] = k0 * sin_a + k1 * cos_a;
+                }
+
+                size_t cache_off = ((size_t)pos * n_kv_heads + kv_h) * head_dim;
+                for (int d = 0; d < head_dim; d++) {
+                    if constexpr (std::is_same_v<TCache, uint8_t>) {
+                        k_cache[cache_off + d] = float_to_fp8_e4m3_host(k_vec[d]);
+                        v_cache[cache_off + d] = float_to_fp8_e4m3_host(v_in[d].to_float());
+                    } else {
+                        k_cache[cache_off + d] = __nv_bfloat16::from_float(k_vec[d]);
+                        v_cache[cache_off + d] = v_in[d];
+                    }
+                }
+            }
+        }
     }
+
+    // 2. Process Q and compute causal attention with Sigmoid Gate for all M tokens
+    for (int m = 0; m < M; m++) {
+        int pos = d_pos ? d_pos[m] : (pos_scalar + m);
+        if (pos >= max_seq_len) pos = max_seq_len - 1;
+
+        dispatch_apply(n_q_heads, dispatch_get_global_queue(QOS_CLASS_USER_INTERACTIVE, 0), ^(size_t qh) {
+            int kv_h = (int)qh / group_size;
+            size_t q_offset = (size_t)m * (2 * n_q_heads * head_dim) + (size_t)qh * (2 * head_dim);
+            const __nv_bfloat16* q_in = q_and_gate + q_offset;
+            const __nv_bfloat16* gate_in = q_in + head_dim;
+            std::vector<float> q_vec(head_dim);
+
+            if (q_norm_w) {
+                float sum_sq = 0.0f;
+                for (int d = 0; d < head_dim; d++) {
+                    float val = q_in[d].to_float();
+                    q_vec[d] = val;
+                    sum_sq += val * val;
+                }
+                float rrms = 1.0f / sqrtf(sum_sq / (float)head_dim + eps);
+                for (int d = 0; d < head_dim; d++) {
+                    q_vec[d] = q_vec[d] * rrms * (1.0f + q_norm_w[d].to_float());
+                }
+            } else {
+                for (int d = 0; d < head_dim; d++) {
+                    q_vec[d] = q_in[d].to_float();
+                }
+            }
+
+            for (int i = 0; i < half_rotary; i++) {
+                float freq = 1.0f / powf(rope_theta, (float)(2 * i) / (float)rotary_dim);
+                float angle = (float)pos * freq;
+                float cos_a = cosf(angle);
+                float sin_a = sinf(angle);
+                float q0 = q_vec[i];
+                float q1 = q_vec[i + half_rotary];
+                q_vec[i] = q0 * cos_a - q1 * sin_a;
+                q_vec[i + half_rotary] = q0 * sin_a + q1 * cos_a;
+            }
+
+            std::vector<float> scores(pos + 1);
+            float max_s = -1e30f;
+            for (int t = 0; t <= pos; t++) {
+                const TCache* k_head = k_cache + ((size_t)t * n_kv_heads + kv_h) * head_dim;
+                float dot = 0.0f;
+                for (int d = 0; d < head_dim; d++) {
+                    float k_val;
+                    if constexpr (std::is_same_v<TCache, uint8_t>) {
+                        k_val = fp8_e4m3_to_float_host(k_head[d]);
+                    } else {
+                        k_val = k_head[d].to_float();
+                    }
+                    dot += q_vec[d] * k_val;
+                }
+                dot *= scale;
+                scores[t] = dot;
+                if (dot > max_s) max_s = dot;
+            }
+
+            float sum_exp = 0.0f;
+            for (int t = 0; t <= pos; t++) {
+                float e = expf(scores[t] - max_s);
+                scores[t] = e;
+                sum_exp += e;
+            }
+            float inv_sum = 1.0f / (sum_exp + 1e-9f);
+
+            std::vector<float> out_f(head_dim, 0.0f);
+            for (int t = 0; t <= pos; t++) {
+                float w = scores[t] * inv_sum;
+                const TCache* v_head = v_cache + ((size_t)t * n_kv_heads + kv_h) * head_dim;
+                for (int d = 0; d < head_dim; d++) {
+                    float v_val;
+                    if constexpr (std::is_same_v<TCache, uint8_t>) {
+                        v_val = fp8_e4m3_to_float_host(v_head[d]);
+                    } else {
+                        v_val = v_head[d].to_float();
+                    }
+                    out_f[d] += w * v_val;
+                }
+            }
+
+            __nv_bfloat16* out_head = out + (size_t)m * n_q_heads * head_dim + qh * head_dim;
+            for (int d = 0; d < head_dim; d++) {
+                float g = gate_in[d].to_float();
+                float sig = 1.0f / (1.0f + expf(-g));
+                out_head[d] = __nv_bfloat16::from_float(out_f[d] * sig);
+            }
+        });
+    }
+}
+
+void qwen_gqa_decode_gated_fp8_batch_cuda(
+    __nv_bfloat16* out, const __nv_bfloat16* q_and_gate, __nv_bfloat16* k, const __nv_bfloat16* v,
+    const __nv_bfloat16* q_norm_w, const __nv_bfloat16* k_norm_w,
+    uint8_t* k_cache, uint8_t* v_cache,
+    int n_q_heads, int n_kv_heads, int head_dim, const int32_t* d_pos,
+    int pos_scalar, int M, int max_seq_len, float rope_theta, float eps, cudaStream_t stream)
+{
+    qwen_gqa_decode_gated_generic<uint8_t>(
+        out, q_and_gate, k, v, q_norm_w, k_norm_w, k_cache, v_cache,
+        n_q_heads, n_kv_heads, head_dim, d_pos, pos_scalar, M, max_seq_len, rope_theta, eps, stream);
 }
 
 void qwen_gqa_decode_gated_fp8_cuda(
@@ -1822,28 +2203,199 @@ void qwen_gqa_decode_gated_fp8_cuda(
     int n_q_heads, int n_kv_heads, int head_dim, const int32_t* d_pos,
     int pos_scalar, int max_seq_len, float rope_theta, float eps, cudaStream_t stream)
 {
-    (void)k_cache; (void)v_cache;
-    // Fall back to standard decoding logic
-    qwen_gqa_decode_gated_cuda(out, q_and_gate, k, v, q_norm_w, k_norm_w, (__nv_bfloat16*)k_cache, (__nv_bfloat16*)v_cache,
-                               n_q_heads, n_kv_heads, head_dim, d_pos, pos_scalar, max_seq_len, rope_theta, eps, stream);
+    qwen_gqa_decode_gated_generic<uint8_t>(
+        out, q_and_gate, k, v, q_norm_w, k_norm_w, k_cache, v_cache,
+        n_q_heads, n_kv_heads, head_dim, d_pos, pos_scalar, 1, max_seq_len, rope_theta, eps, stream);
 }
 
-void qwen_gqa_decode_gated_fp8_batch_cuda(
+void qwen_gqa_decode_gated_cuda(
     __nv_bfloat16* out, const __nv_bfloat16* q_and_gate, __nv_bfloat16* k, const __nv_bfloat16* v,
+    const __nv_bfloat16* q_norm_w, const __nv_bfloat16* k_norm_w,
+    __nv_bfloat16* k_cache, __nv_bfloat16* v_cache,
+    int n_q_heads, int n_kv_heads, int head_dim, const int32_t* d_pos,
+    int pos_scalar, int max_seq_len, float rope_theta, float eps, cudaStream_t stream)
+{
+    qwen_gqa_decode_gated_generic<__nv_bfloat16>(
+        out, q_and_gate, k, v, q_norm_w, k_norm_w, k_cache, v_cache,
+        n_q_heads, n_kv_heads, head_dim, d_pos, pos_scalar, 1, max_seq_len, rope_theta, eps, stream);
+}
+
+
+
+void qwen2_gqa_decode_fp8_batch_cuda(
+    __nv_bfloat16* out, const __nv_bfloat16* q, __nv_bfloat16* k, const __nv_bfloat16* v,
     const __nv_bfloat16* q_norm_w, const __nv_bfloat16* k_norm_w,
     uint8_t* k_cache, uint8_t* v_cache,
     int n_q_heads, int n_kv_heads, int head_dim, const int32_t* d_pos,
-    int pos_scalar, int max_seq_len, int M, float rope_theta, float eps, cudaStream_t stream)
+    int pos_scalar, int M, int max_seq_len, float rope_theta, float eps, const int32_t* d_mrope_pos,
+    cudaStream_t stream)
 {
+    (void)stream;
+    int group_size = n_q_heads / n_kv_heads;
+    float scale = 1.0f / sqrtf((float)head_dim);
+
+    int v_start = -1;
+    int v_num = 0;
+    if (d_mrope_pos) {
+        v_start = d_mrope_pos[0];
+        v_num = d_mrope_pos[1];
+    }
+    int rotary_dim = head_dim;
+    int half_rotary = rotary_dim / 2;
+
+    // 1. Process K and V for all M tokens and store into FP8 cache
     for (int m = 0; m < M; m++) {
-        qwen_gqa_decode_gated_fp8_cuda(
-            out + m * n_q_heads * head_dim,
-            q_and_gate + m * 2 * n_q_heads * head_dim,
-            k + m * n_kv_heads * head_dim,
-            v + m * n_kv_heads * head_dim,
-            q_norm_w, k_norm_w, k_cache, v_cache,
-            n_q_heads, n_kv_heads, head_dim, d_pos,
-            pos_scalar + m, max_seq_len, rope_theta, eps, stream);
+        int pos = d_pos ? d_pos[m] : (pos_scalar + m);
+        if (pos >= max_seq_len) pos = max_seq_len - 1;
+
+        if (k && v && k_cache && v_cache) {
+            for (int kv_h = 0; kv_h < n_kv_heads; kv_h++) {
+                const __nv_bfloat16* k_in = k + (size_t)m * n_kv_heads * head_dim + kv_h * head_dim;
+                const __nv_bfloat16* v_in = v + (size_t)m * n_kv_heads * head_dim + kv_h * head_dim;
+                std::vector<float> k_vec(head_dim);
+
+                if (k_norm_w) {
+                    float sum_sq = 0.0f;
+                    for (int d = 0; d < head_dim; d++) {
+                        float val = k_in[d].to_float();
+                        k_vec[d] = val;
+                        sum_sq += val * val;
+                    }
+                    float rrms = 1.0f / sqrtf(sum_sq / (float)head_dim + eps);
+                    for (int d = 0; d < head_dim; d++) {
+                        k_vec[d] = k_vec[d] * rrms * k_norm_w[d].to_float();
+                    }
+                } else {
+                    for (int d = 0; d < head_dim; d++) {
+                        k_vec[d] = k_in[d].to_float();
+                    }
+                }
+
+                for (int i = 0; i < half_rotary; i++) {
+                    int eff_pos = pos;
+                    if (v_num > 0 && v_start >= 0) {
+                        if (pos >= v_start && pos < v_start + v_num) {
+                            int v_idx = pos - v_start;
+                            int grid_size = (v_num == 576) ? 24 : (int)roundf(sqrtf((float)v_num));
+                            int r = v_idx / grid_size;
+                            int c = v_idx % grid_size;
+                            if (i < 16) eff_pos = v_start;
+                            else if (i < 40) eff_pos = v_start + r;
+                            else eff_pos = v_start + c;
+                        } else if (pos >= v_start + v_num) {
+                            int grid_size = (v_num == 576) ? 24 : (int)roundf(sqrtf((float)v_num));
+                            int delta = v_num - grid_size;
+                            eff_pos = pos - delta;
+                        }
+                    }
+                    float freq = 1.0f / powf(rope_theta, (float)(2 * i) / (float)rotary_dim);
+                    float angle = (float)eff_pos * freq;
+                    float cos_a = cosf(angle);
+                    float sin_a = sinf(angle);
+                    float k0 = k_vec[i];
+                    float k1 = k_vec[i + half_rotary];
+                    k_vec[i] = k0 * cos_a - k1 * sin_a;
+                    k_vec[i + half_rotary] = k0 * sin_a + k1 * cos_a;
+                }
+
+                size_t cache_off = ((size_t)pos * n_kv_heads + kv_h) * head_dim;
+                for (int d = 0; d < head_dim; d++) {
+                    k_cache[cache_off + d] = float_to_fp8_e4m3_host(k_vec[d]);
+                    v_cache[cache_off + d] = float_to_fp8_e4m3_host(v_in[d].to_float());
+                }
+            }
+        }
+    }
+
+    // 2. Process Q and compute Attention for all M tokens
+    for (int m = 0; m < M; m++) {
+        int pos = d_pos ? d_pos[m] : (pos_scalar + m);
+        if (pos >= max_seq_len) pos = max_seq_len - 1;
+
+        dispatch_apply(n_q_heads, dispatch_get_global_queue(QOS_CLASS_USER_INTERACTIVE, 0), ^(size_t qh) {
+            int kv_h = (int)qh / group_size;
+            const __nv_bfloat16* q_in = q + (size_t)m * n_q_heads * head_dim + qh * head_dim;
+            std::vector<float> q_vec(head_dim);
+
+            if (q_norm_w) {
+                float sum_sq = 0.0f;
+                for (int d = 0; d < head_dim; d++) {
+                    float val = q_in[d].to_float();
+                    q_vec[d] = val;
+                    sum_sq += val * val;
+                }
+                float rrms = 1.0f / sqrtf(sum_sq / (float)head_dim + eps);
+                for (int d = 0; d < head_dim; d++) {
+                    q_vec[d] = q_vec[d] * rrms * q_norm_w[d].to_float();
+                }
+            } else {
+                for (int d = 0; d < head_dim; d++) {
+                    q_vec[d] = q_in[d].to_float();
+                }
+            }
+
+            for (int i = 0; i < half_rotary; i++) {
+                int eff_pos = pos;
+                if (v_num > 0 && v_start >= 0) {
+                    if (pos >= v_start && pos < v_start + v_num) {
+                        int v_idx = pos - v_start;
+                        int grid_size = (v_num == 576) ? 24 : (int)roundf(sqrtf((float)v_num));
+                        int r = v_idx / grid_size;
+                        int c = v_idx % grid_size;
+                        if (i < 16) eff_pos = v_start;
+                        else if (i < 40) eff_pos = v_start + r;
+                        else eff_pos = v_start + c;
+                    } else if (pos >= v_start + v_num) {
+                        int grid_size = (v_num == 576) ? 24 : (int)roundf(sqrtf((float)v_num));
+                        int delta = v_num - grid_size;
+                        eff_pos = pos - delta;
+                    }
+                }
+                float freq = 1.0f / powf(rope_theta, (float)(2 * i) / (float)rotary_dim);
+                float angle = (float)eff_pos * freq;
+                float cos_a = cosf(angle);
+                float sin_a = sinf(angle);
+                float q0 = q_vec[i];
+                float q1 = q_vec[i + half_rotary];
+                q_vec[i] = q0 * cos_a - q1 * sin_a;
+                q_vec[i + half_rotary] = q0 * sin_a + q1 * cos_a;
+            }
+
+            std::vector<float> scores(pos + 1);
+            float max_s = -1e30f;
+            for (int t = 0; t <= pos; t++) {
+                const uint8_t* k_head = k_cache + ((size_t)t * n_kv_heads + kv_h) * head_dim;
+                float dot = 0.0f;
+                for (int d = 0; d < head_dim; d++) {
+                    dot += q_vec[d] * fp8_e4m3_to_float_host(k_head[d]);
+                }
+                dot *= scale;
+                scores[t] = dot;
+                if (dot > max_s) max_s = dot;
+            }
+
+            float sum_exp = 0.0f;
+            for (int t = 0; t <= pos; t++) {
+                float e = expf(scores[t] - max_s);
+                scores[t] = e;
+                sum_exp += e;
+            }
+            float inv_sum = 1.0f / (sum_exp + 1e-9f);
+
+            std::vector<float> out_f(head_dim, 0.0f);
+            for (int t = 0; t <= pos; t++) {
+                float w = scores[t] * inv_sum;
+                const uint8_t* v_head = v_cache + ((size_t)t * n_kv_heads + kv_h) * head_dim;
+                for (int d = 0; d < head_dim; d++) {
+                    out_f[d] += w * fp8_e4m3_to_float_host(v_head[d]);
+                }
+            }
+
+            __nv_bfloat16* out_head = out + (size_t)m * n_q_heads * head_dim + qh * head_dim;
+            for (int d = 0; d < head_dim; d++) {
+                out_head[d] = __nv_bfloat16::from_float(out_f[d]);
+            }
+        });
     }
 }
 
@@ -1855,23 +2407,10 @@ void qwen2_gqa_decode_fp8_cuda(
     int pos_scalar, int max_seq_len, float rope_theta, float eps, const int32_t* d_mrope_pos,
     cudaStream_t stream)
 {
-    (void)q_norm_w; (void)k_norm_w; (void)d_pos; (void)rope_theta; (void)eps; (void)d_mrope_pos;
-    gqa_attention_decode_cuda(out, q, (__nv_bfloat16*)k_cache, (__nv_bfloat16*)v_cache, k, v, n_q_heads, n_kv_heads, head_dim, pos_scalar, max_seq_len, stream);
-}
-
-void qwen2_gqa_decode_fp8_batch_cuda(
-    __nv_bfloat16* out, const __nv_bfloat16* q, __nv_bfloat16* k, const __nv_bfloat16* v,
-    const __nv_bfloat16* q_norm_w, const __nv_bfloat16* k_norm_w,
-    uint8_t* k_cache, uint8_t* v_cache,
-    int n_q_heads, int n_kv_heads, int head_dim, const int32_t* d_pos,
-    int pos_scalar, int M, int max_seq_len, float rope_theta, float eps, const int32_t* d_mrope_pos,
-    cudaStream_t stream)
-{
-    for (int m = 0; m < M; m++) {
-        qwen2_gqa_decode_fp8_cuda(
-            out + m * n_q_heads * head_dim, q + m * n_q_heads * head_dim, k + m * n_kv_heads * head_dim, v + m * n_kv_heads * head_dim,
-            q_norm_w, k_norm_w, k_cache, v_cache, n_q_heads, n_kv_heads, head_dim, d_pos, pos_scalar + m, max_seq_len, rope_theta, eps, d_mrope_pos, stream);
-    }
+    qwen2_gqa_decode_fp8_batch_cuda(
+        out, q, k, v, q_norm_w, k_norm_w,
+        k_cache, v_cache, n_q_heads, n_kv_heads, head_dim,
+        d_pos, pos_scalar, 1, max_seq_len, rope_theta, eps, d_mrope_pos, stream);
 }
 
 // ── Additional Helpers ──────────────────────────────────────────────────────
@@ -2087,20 +2626,196 @@ void gemv_mixed_moe_down_batch_cuda(
     (void)expert_type_map; (void)layer_id; (void)n_experts; (void)w2_cold_offset;
     (void)N; (void)K; (void)M; (void)stream;
 }
+void dequant_int3_block_cuda(
+    __nv_bfloat16* out, const uint8_t* weight, const __nv_bfloat16* scale,
+    int N, int K, int block_size, cudaStream_t stream)
+{
+    (void)block_size; (void)stream;
+    int blocks_per_row = K / 32;
+    dispatch_apply(N, dispatch_get_global_queue(QOS_CLASS_USER_INTERACTIVE, 0), ^(size_t r) {
+        const uint8_t* row_w = weight + (size_t)r * ((size_t)K * 3 / 8);
+        const __nv_bfloat16* row_s = scale + r * blocks_per_row;
+        __nv_bfloat16* row_out = out + r * K;
+        for (int b = 0; b < blocks_per_row; b++) {
+            float s = row_s[b].to_float();
+            const uint8_t* blk_w = row_w + b * 12;
+            int out_idx = b * 32;
+            for (int i = 0; i < 4; i++) {
+                uint8_t b0 = blk_w[i * 3 + 0];
+                uint8_t b1 = blk_w[i * 3 + 1];
+                uint8_t b2 = blk_w[i * 3 + 2];
+
+                float w0 = ((float)(b0 & 0x07) - 4.0f) * s;
+                float w1 = ((float)((b0 >> 3) & 0x07) - 4.0f) * s;
+                float w2 = ((float)((b0 >> 6) | ((b1 & 0x01) << 2)) - 4.0f) * s;
+                float w3 = ((float)((b1 >> 1) & 0x07) - 4.0f) * s;
+                float w4 = ((float)((b1 >> 4) & 0x07) - 4.0f) * s;
+                float w5 = ((float)((b1 >> 7) | ((b2 & 0x03) << 1)) - 4.0f) * s;
+                float w6 = ((float)((b2 >> 2) & 0x07) - 4.0f) * s;
+                float w7 = ((float)((b2 >> 5) & 0x07) - 4.0f) * s;
+
+                row_out[out_idx + i * 8 + 0] = __nv_bfloat16::from_float(w0);
+                row_out[out_idx + i * 8 + 1] = __nv_bfloat16::from_float(w1);
+                row_out[out_idx + i * 8 + 2] = __nv_bfloat16::from_float(w2);
+                row_out[out_idx + i * 8 + 3] = __nv_bfloat16::from_float(w3);
+                row_out[out_idx + i * 8 + 4] = __nv_bfloat16::from_float(w4);
+                row_out[out_idx + i * 8 + 5] = __nv_bfloat16::from_float(w5);
+                row_out[out_idx + i * 8 + 6] = __nv_bfloat16::from_float(w6);
+                row_out[out_idx + i * 8 + 7] = __nv_bfloat16::from_float(w7);
+            }
+        }
+    });
+}
+
 void gemv_int3_cuda(__nv_bfloat16* out, const __nv_bfloat16* vec, const uint8_t* weight, const __nv_bfloat16* scale, int N, int K, cudaStream_t stream) {
-    (void)out; (void)vec; (void)weight; (void)scale; (void)N; (void)K; (void)stream;
+    (void)stream;
+    int blocks_per_row = K / 32;
+    dispatch_apply(N, dispatch_get_global_queue(QOS_CLASS_USER_INTERACTIVE, 0), ^(size_t r) {
+        const uint8_t* row_w = weight + (size_t)r * ((size_t)K * 3 / 8);
+        const __nv_bfloat16* row_s = scale + r * blocks_per_row;
+        float sum = 0.0f;
+        for (int b = 0; b < blocks_per_row; b++) {
+            float s = row_s[b].to_float();
+            const uint8_t* blk_w = row_w + b * 12;
+            int in_idx = b * 32;
+            for (int i = 0; i < 4; i++) {
+                uint8_t b0 = blk_w[i * 3 + 0];
+                uint8_t b1 = blk_w[i * 3 + 1];
+                uint8_t b2 = blk_w[i * 3 + 2];
+
+                float w0 = ((float)(b0 & 0x07) - 4.0f) * s;
+                float w1 = ((float)((b0 >> 3) & 0x07) - 4.0f) * s;
+                float w2 = ((float)((b0 >> 6) | ((b1 & 0x01) << 2)) - 4.0f) * s;
+                float w3 = ((float)((b1 >> 1) & 0x07) - 4.0f) * s;
+                float w4 = ((float)((b1 >> 4) & 0x07) - 4.0f) * s;
+                float w5 = ((float)((b1 >> 7) | ((b2 & 0x03) << 1)) - 4.0f) * s;
+                float w6 = ((float)((b2 >> 2) & 0x07) - 4.0f) * s;
+                float w7 = ((float)((b2 >> 5) & 0x07) - 4.0f) * s;
+
+                sum += w0 * vec[in_idx + i * 8 + 0].to_float();
+                sum += w1 * vec[in_idx + i * 8 + 1].to_float();
+                sum += w2 * vec[in_idx + i * 8 + 2].to_float();
+                sum += w3 * vec[in_idx + i * 8 + 3].to_float();
+                sum += w4 * vec[in_idx + i * 8 + 4].to_float();
+                sum += w5 * vec[in_idx + i * 8 + 5].to_float();
+                sum += w6 * vec[in_idx + i * 8 + 6].to_float();
+                sum += w7 * vec[in_idx + i * 8 + 7].to_float();
+            }
+        }
+        out[r] = __nv_bfloat16::from_float(sum);
+    });
 }
+
 void gemv_int3_residual_cuda(__nv_bfloat16* inout, const __nv_bfloat16* vec, const uint8_t* weight, const __nv_bfloat16* scale, int N, int K, cudaStream_t stream) {
-    (void)inout; (void)vec; (void)weight; (void)scale; (void)N; (void)K; (void)stream;
+    (void)stream;
+    int blocks_per_row = K / 32;
+    dispatch_apply(N, dispatch_get_global_queue(QOS_CLASS_USER_INTERACTIVE, 0), ^(size_t r) {
+        const uint8_t* row_w = weight + (size_t)r * ((size_t)K * 3 / 8);
+        const __nv_bfloat16* row_s = scale + r * blocks_per_row;
+        float sum = 0.0f;
+        for (int b = 0; b < blocks_per_row; b++) {
+            float s = row_s[b].to_float();
+            const uint8_t* blk_w = row_w + b * 12;
+            int in_idx = b * 32;
+            for (int i = 0; i < 4; i++) {
+                uint8_t b0 = blk_w[i * 3 + 0];
+                uint8_t b1 = blk_w[i * 3 + 1];
+                uint8_t b2 = blk_w[i * 3 + 2];
+
+                float w0 = ((float)(b0 & 0x07) - 4.0f) * s;
+                float w1 = ((float)((b0 >> 3) & 0x07) - 4.0f) * s;
+                float w2 = ((float)((b0 >> 6) | ((b1 & 0x01) << 2)) - 4.0f) * s;
+                float w3 = ((float)((b1 >> 1) & 0x07) - 4.0f) * s;
+                float w4 = ((float)((b1 >> 4) & 0x07) - 4.0f) * s;
+                float w5 = ((float)((b1 >> 7) | ((b2 & 0x03) << 1)) - 4.0f) * s;
+                float w6 = ((float)((b2 >> 2) & 0x07) - 4.0f) * s;
+                float w7 = ((float)((b2 >> 5) & 0x07) - 4.0f) * s;
+
+                sum += w0 * vec[in_idx + i * 8 + 0].to_float();
+                sum += w1 * vec[in_idx + i * 8 + 1].to_float();
+                sum += w2 * vec[in_idx + i * 8 + 2].to_float();
+                sum += w3 * vec[in_idx + i * 8 + 3].to_float();
+                sum += w4 * vec[in_idx + i * 8 + 4].to_float();
+                sum += w5 * vec[in_idx + i * 8 + 5].to_float();
+                sum += w6 * vec[in_idx + i * 8 + 6].to_float();
+                sum += w7 * vec[in_idx + i * 8 + 7].to_float();
+            }
+        }
+        inout[r] = __nv_bfloat16::from_float(inout[r].to_float() + sum);
+    });
 }
+
 void gemv_int3_swiglu_fused_cuda(__nv_bfloat16* out, const __nv_bfloat16* vec, const uint8_t* gate_weight, const __nv_bfloat16* gate_scale, const uint8_t* up_weight, const __nv_bfloat16* up_scale, int N, int K, float swiglu_limit, cudaStream_t stream) {
-    (void)out; (void)vec; (void)gate_weight; (void)gate_scale; (void)up_weight; (void)up_scale; (void)N; (void)K; (void)swiglu_limit; (void)stream;
+    (void)stream;
+    int blocks_per_row = K / 32;
+    dispatch_apply(N, dispatch_get_global_queue(QOS_CLASS_USER_INTERACTIVE, 0), ^(size_t r) {
+        const uint8_t* g_row_w = gate_weight + (size_t)r * ((size_t)K * 3 / 8);
+        const __nv_bfloat16* g_row_s = gate_scale + r * blocks_per_row;
+        const uint8_t* u_row_w = up_weight + (size_t)r * ((size_t)K * 3 / 8);
+        const __nv_bfloat16* u_row_s = up_scale + r * blocks_per_row;
+
+        float sum_g = 0.0f;
+        float sum_u = 0.0f;
+        for (int b = 0; b < blocks_per_row; b++) {
+            float sg = g_row_s[b].to_float();
+            float su = u_row_s[b].to_float();
+            const uint8_t* gb = g_row_w + b * 12;
+            const uint8_t* ub = u_row_w + b * 12;
+            int in_idx = b * 32;
+            for (int i = 0; i < 4; i++) {
+                uint8_t gb0 = gb[i * 3 + 0], gb1 = gb[i * 3 + 1], gb2 = gb[i * 3 + 2];
+                uint8_t ub0 = ub[i * 3 + 0], ub1 = ub[i * 3 + 1], ub2 = ub[i * 3 + 2];
+
+                float gw0 = ((float)(gb0 & 0x07) - 4.0f) * sg;
+                float gw1 = ((float)((gb0 >> 3) & 0x07) - 4.0f) * sg;
+                float gw2 = ((float)((gb0 >> 6) | ((gb1 & 0x01) << 2)) - 4.0f) * sg;
+                float gw3 = ((float)((gb1 >> 1) & 0x07) - 4.0f) * sg;
+                float gw4 = ((float)((gb1 >> 4) & 0x07) - 4.0f) * sg;
+                float gw5 = ((float)((gb1 >> 7) | ((gb2 & 0x03) << 1)) - 4.0f) * sg;
+                float gw6 = ((float)((gb2 >> 2) & 0x07) - 4.0f) * sg;
+                float gw7 = ((float)((gb2 >> 5) & 0x07) - 4.0f) * sg;
+
+                float uw0 = ((float)(ub0 & 0x07) - 4.0f) * su;
+                float uw1 = ((float)((ub0 >> 3) & 0x07) - 4.0f) * su;
+                float uw2 = ((float)((ub0 >> 6) | ((ub1 & 0x01) << 2)) - 4.0f) * su;
+                float uw3 = ((float)((ub1 >> 1) & 0x07) - 4.0f) * su;
+                float uw4 = ((float)((ub1 >> 4) & 0x07) - 4.0f) * su;
+                float uw5 = ((float)((ub1 >> 7) | ((ub2 & 0x03) << 1)) - 4.0f) * su;
+                float uw6 = ((float)((ub2 >> 2) & 0x07) - 4.0f) * su;
+                float uw7 = ((float)((ub2 >> 5) & 0x07) - 4.0f) * su;
+
+                float v0 = vec[in_idx + i * 8 + 0].to_float();
+                float v1 = vec[in_idx + i * 8 + 1].to_float();
+                float v2 = vec[in_idx + i * 8 + 2].to_float();
+                float v3 = vec[in_idx + i * 8 + 3].to_float();
+                float v4 = vec[in_idx + i * 8 + 4].to_float();
+                float v5 = vec[in_idx + i * 8 + 5].to_float();
+                float v6 = vec[in_idx + i * 8 + 6].to_float();
+                float v7 = vec[in_idx + i * 8 + 7].to_float();
+
+                sum_g += gw0 * v0 + gw1 * v1 + gw2 * v2 + gw3 * v3 + gw4 * v4 + gw5 * v5 + gw6 * v6 + gw7 * v7;
+                sum_u += uw0 * v0 + uw1 * v1 + uw2 * v2 + uw3 * v3 + uw4 * v4 + uw5 * v5 + uw6 * v6 + uw7 * v7;
+            }
+        }
+        if (swiglu_limit > 0.0f) {
+            sum_g = std::min(sum_g, swiglu_limit);
+            sum_u = std::clamp(sum_u, -swiglu_limit, swiglu_limit);
+        }
+        float silu_g = sum_g / (1.0f + std::exp(-sum_g));
+        out[r] = __nv_bfloat16::from_float(silu_g * sum_u);
+    });
 }
+
 void gemm_int3_batch_cuda(__nv_bfloat16* out, const __nv_bfloat16* A, const uint8_t* weight, const __nv_bfloat16* scale, int N, int K, int M, cudaStream_t stream) {
-    (void)out; (void)A; (void)weight; (void)scale; (void)N; (void)K; (void)M; (void)stream;
+    for (int m = 0; m < M; m++) {
+        gemv_int3_cuda(out + m * N, A + m * K, weight, scale, N, K, stream);
+    }
 }
+
 void gemm_int3_swiglu_fused_batch_cuda(__nv_bfloat16* out, const __nv_bfloat16* A, const uint8_t* gate_weight, const __nv_bfloat16* gate_scale, const uint8_t* up_weight, const __nv_bfloat16* up_scale, int N, int K, int M, float swiglu_limit, cudaStream_t stream) {
-    (void)out; (void)A; (void)gate_weight; (void)gate_scale; (void)up_weight; (void)up_scale; (void)N; (void)K; (void)M; (void)swiglu_limit; (void)stream;
+    for (int m = 0; m < M; m++) {
+        gemv_int3_swiglu_fused_cuda(out + m * N, A + m * K, gate_weight, gate_scale, up_weight, up_scale, N, K, swiglu_limit, stream);
+    }
 }
 void gemv_fp4_cuda(__nv_bfloat16* out, const __nv_bfloat16* vec, const uint8_t* weight, const uint8_t* scale, int N, int K, cudaStream_t stream) {
     (void)out; (void)vec; (void)weight; (void)scale; (void)N; (void)K; (void)stream;
@@ -2172,9 +2887,7 @@ void dequant_int4_block_cuda(__nv_bfloat16* out, const uint8_t* weight, const __
         }
     }
 }
-void dequant_int3_block_cuda(__nv_bfloat16* out, const uint8_t* weight, const __nv_bfloat16* scale, int N, int K, int block_size, cudaStream_t stream) {
-    (void)out; (void)weight; (void)scale; (void)N; (void)K; (void)block_size; (void)stream;
-}
+
 void apply_repetition_penalty_cuda(float* logits, const int32_t* history_tokens, int num_history, float penalty, cudaStream_t stream) {
     (void)stream;
     for (int i = 0; i < num_history; i++) {
