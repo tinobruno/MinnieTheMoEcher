@@ -45,6 +45,11 @@ if exist build\moecher.exe (
         copy /y build\moecher.exe "F:\Moecher\moecher.exe" >nul 2>nul
         echo [INFO] Attempted copy to F:\Moecher\moecher.exe
     )
+    if not exist "Y:\Moecher\LastRelease" mkdir "Y:\Moecher\LastRelease" 2>nul
+    if exist "Y:\Moecher\LastRelease" (
+        copy /y build\moecher.exe "Y:\Moecher\LastRelease\moecher.exe" >nul 2>nul
+        echo [INFO] Copied build\moecher.exe to Y:\Moecher\LastRelease\moecher.exe
+    )
 )
 
 echo [SUCCESS] Build completed successfully with CUDA 13.3!
