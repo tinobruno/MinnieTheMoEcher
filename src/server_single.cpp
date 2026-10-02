@@ -4623,7 +4623,8 @@ public:
                          int top_k = 1024,
                          const __nv_bfloat16* visual_embeddings = nullptr,
                          int visual_start_pos = -1,
-                         int visual_num_tokens = 0) {
+                         int visual_num_tokens = 0,
+                         bool ignore_eos = false) {
         // Ensure prompt fits within max_seq_len (defense-in-depth safety clamp)
         std::vector<int> prompt = prompt_in;
         if (prompt.size() > (size_t)cfg_.max_seq_len) {
@@ -5095,7 +5096,7 @@ public:
             }
 
             // Check all EOS and stop conditions in content mode
-            if (next_token == cfg_.eos_token_id || (eos2_id >= 0 && next_token == eos2_id) || (im_end_id >= 0 && next_token == im_end_id)) {
+            if (!ignore_eos && (next_token == cfg_.eos_token_id || (eos2_id >= 0 && next_token == eos2_id) || (im_end_id >= 0 && next_token == im_end_id))) {
                 LOG_WARN("Stop token hit: token=%d (cfg_eos=%d, eos2=%d, im_end=%d) at step %d (content: %d/%d, think: %d/%d)",
                          next_token, cfg_.eos_token_id, eos2_id, im_end_id, t,
                          content_tokens_generated, max_tokens,
@@ -12590,10 +12591,14 @@ static void run_server(MoecherEngine& engine, int port, int default_thinking_bud
             float min_p = request.value("min_p", 0.05f);
             int top_k = request.value("top_k", 1024);
             int max_tokens = request.value("max_tokens", 20000);
+            if (request.contains("max_completion_tokens") && request["max_completion_tokens"].is_number_integer()) {
+                max_tokens = request["max_completion_tokens"].get<int>();
+            }
+            bool ignore_eos = request.value("ignore_eos", false);
             bool stream = request.value("stream", false);
             float repetition_penalty = request.value("repetition_penalty", 1.0f);
-            std::string reasoning_effort = request.value("reasoning_effort", "high");
-            bool enable_thinking = true;
+            std::string reasoning_effort = request.value("reasoning_effort", default_thinking_budget > 0 ? "high" : "none");
+            bool enable_thinking = (default_thinking_budget > 0);
             int max_thinking_tokens = default_thinking_budget;
 
             json tools = json::array();
@@ -12651,6 +12656,9 @@ static void run_server(MoecherEngine& engine, int port, int default_thinking_bud
             if (enable_thinking && request.contains("thinking_budget") && request["thinking_budget"].is_number_integer()) {
                 max_thinking_tokens = request["thinking_budget"].get<int>();
                 if (max_thinking_tokens <= 0) enable_thinking = false;
+            }
+            if (enable_thinking && max_tokens < 20000 && max_tokens > 0) {
+                max_thinking_tokens = std::min(max_thinking_tokens, max_tokens);
             }
 
             bool req_has_image = false;
@@ -12807,7 +12815,7 @@ static void run_server(MoecherEngine& engine, int port, int default_thinking_bud
                 // SSE streaming
                 res.set_chunked_content_provider(
                     "text/event-stream",
-                    [&engine, messages, tools, max_tokens, temperature, req_id, repetition_penalty, enable_thinking, max_thinking_tokens, top_p, min_p, top_k, reasoning_effort, model_id, execution_timeout_ms, require_external_authorization, workspace_boundary_enforced, authorized_paths, do_server_exec, req_max_tool_rounds, busy_guard, send_sse_delta](size_t offset, httplib::DataSink &sink) {
+                    [&engine, messages, tools, max_tokens, temperature, req_id, repetition_penalty, enable_thinking, max_thinking_tokens, top_p, min_p, top_k, reasoning_effort, model_id, execution_timeout_ms, require_external_authorization, workspace_boundary_enforced, authorized_paths, do_server_exec, req_max_tool_rounds, busy_guard, send_sse_delta, ignore_eos](size_t offset, httplib::DataSink &sink) {
                         if (offset > 0) return false;
                         std::lock_guard<std::mutex> lock(g_engine_mutex);
 
@@ -12921,7 +12929,7 @@ static void run_server(MoecherEngine& engine, int port, int default_thinking_bud
                                     }
                                 }
                             }, repetition_penalty, req_thinking, req_thinking_tokens, top_p, min_p, top_k,
-                               d_vis_out, mm_prompt.visual_start_pos, mm_prompt.visual_num_tokens);
+                               d_vis_out, mm_prompt.visual_start_pos, mm_prompt.visual_num_tokens, ignore_eos);
 
                             final_finish_reason = engine.last_finish_reason_.empty() ? "stop" : engine.last_finish_reason_;
 
@@ -13741,7 +13749,7 @@ static void run_server(MoecherEngine& engine, int port, int default_thinking_bud
                         bool req_thinking = enable_thinking && !conv_has_image;
                         int req_thinking_tokens = req_thinking ? max_thinking_tokens : 0;
                         response_text = engine.generate(prompt, max_tokens, temperature, nullptr, repetition_penalty, req_thinking, req_thinking_tokens, top_p, min_p, top_k,
-                                                        d_vis_out, mm_prompt.visual_start_pos, mm_prompt.visual_num_tokens);
+                                                        d_vis_out, mm_prompt.visual_start_pos, mm_prompt.visual_num_tokens, ignore_eos);
                         finish_reason = engine.last_finish_reason_;
                     }
 
