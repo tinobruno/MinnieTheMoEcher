@@ -1,5 +1,9 @@
 #include <metal_stdlib>
+#include <metal_tensor>
+#include <MetalPerformancePrimitives/MetalPerformancePrimitives.h>
+
 using namespace metal;
+using namespace mpp::tensor_ops;
 
 // ════════════════════════════════════════════════════════════════════════════════
 //  Helpers & Conversions
@@ -1615,6 +1619,171 @@ kernel void gemm_int4_batch_kernel(
             }
         }
     }
+}
+
+// ════════════════════════════════════════════════════════════════════════════════
+//  Hardware MPP (MetalPerformancePrimitives) Tiled INT4 & INT3 GEMM Kernels
+// ════════════════════════════════════════════════════════════════════════════════
+
+kernel void gemm_int4_mpp_kernel(
+    device bfloat* C [[buffer(0)]],            // [M, N]
+    device const bfloat* A [[buffer(1)]],      // [M, K]
+    device const uint8_t* W [[buffer(2)]],     // [N, K/2]
+    device const bfloat* scales [[buffer(3)]], // [N, K/32]
+    constant int& M [[buffer(4)]],
+    constant int& N [[buffer(5)]],
+    constant int& K [[buffer(6)]],
+    threadgroup char* shmem [[threadgroup(0)]],
+    uint3 tgpig [[threadgroup_position_in_grid]],
+    ushort tiitg [[thread_index_in_threadgroup]],
+    ushort sgitg [[simdgroup_index_in_threadgroup]])
+{
+    constexpr int NRA = 64; // N tile (weights)
+    constexpr int NRB = 32; // M tile (tokens)
+    constexpr int NK  = 32; // K tile (one scale block of 32 weights)
+
+    const int ra = tgpig.y * NRA; // N offset
+    const int rb = tgpig.x * NRB; // M offset
+
+    if (ra >= N || rb >= M) return;
+
+    // Threadgroup memory for dequantized W tile: [NRA, NK] = [64, 32] bfloats = 4096 bytes
+    threadgroup bfloat* s_w = (threadgroup bfloat*)shmem;
+    auto tW = tensor(s_w, dextents<int32_t, 2>(NK, NRA));
+
+    device bfloat* ptrA = (device bfloat*)(A + rb * K);
+    auto tA = tensor(ptrA, dextents<int32_t, 2>(K, M - rb), array<int, 2>({1, K}));
+
+    matmul2d<
+        matmul2d_descriptor(NRB, NRA, dynamic_extent, false, true, true,
+                            matmul2d_descriptor::mode::multiply_accumulate),
+        execution_simdgroups<4>> mm;
+
+    auto cT = mm.get_destination_cooperative_tensor<decltype(tA), decltype(tW), bfloat>();
+
+    // 128 threads in threadgroup (4 simdgroups)
+    // Dequantize 64 rows of W x 32 elements = 2048 bfloats = 16 bfloats per thread
+    for (int loop_k = 0; loop_k < K; loop_k += NK) {
+        int row_idx = tiitg >> 1;  // 0..63
+        int sub_block = tiitg & 1; // 0 or 1 (16 elements each = 8 bytes of INT4)
+
+        int global_row = ra + row_idx;
+        if (global_row < N) {
+            float s = float(scales[global_row * (K / 32) + (loop_k / 32)]);
+            device const uint8_t* src = W + (size_t)global_row * (K / 2) + (loop_k / 2) + sub_block * 8;
+            threadgroup bfloat* dst = s_w + row_idx * NK + sub_block * 16;
+            #pragma unroll
+            for (int i = 0; i < 8; i++) {
+                uint8_t byte_val = src[i];
+                dst[i * 2 + 0] = bfloat((float(byte_val & 0x0F) - 8.0f) * s);
+                dst[i * 2 + 1] = bfloat((float(byte_val >> 4) - 8.0f) * s);
+            }
+        } else {
+            threadgroup bfloat* dst = s_w + row_idx * NK + sub_block * 16;
+            #pragma unroll
+            for (int i = 0; i < 16; i++) dst[i] = 0.0bf;
+        }
+
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+
+        const int kExt = min(NK, K - loop_k);
+        auto tWv = tensor(s_w, dextents<int32_t, 2>(kExt, NRA), array<int, 2>({1, NK}));
+        auto tAv = tensor(ptrA + loop_k, dextents<int32_t, 2>(kExt, M - rb), array<int, 2>({1, K}));
+
+        mm.run(tAv, tWv, cT);
+
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+    }
+
+    device bfloat* dstC = C + rb * N + ra;
+    auto tC = tensor(dstC, dextents<int32_t, 2>(N - ra, M - rb), array<int, 2>({1, N}));
+    cT.store(tC);
+}
+
+kernel void gemm_int3_mpp_kernel(
+    device bfloat* C [[buffer(0)]],            // [M, N]
+    device const bfloat* A [[buffer(1)]],      // [M, K]
+    device const uint8_t* W [[buffer(2)]],     // [N, K*3/8]
+    device const bfloat* scales [[buffer(3)]], // [N, K/32]
+    constant int& M [[buffer(4)]],
+    constant int& N [[buffer(5)]],
+    constant int& K [[buffer(6)]],
+    threadgroup char* shmem [[threadgroup(0)]],
+    uint3 tgpig [[threadgroup_position_in_grid]],
+    ushort tiitg [[thread_index_in_threadgroup]],
+    ushort sgitg [[simdgroup_index_in_threadgroup]])
+{
+    constexpr int NRA = 64; // N tile (weights)
+    constexpr int NRB = 32; // M tile (tokens)
+    constexpr int NK  = 32; // K tile (one scale block of 32 weights)
+
+    const int ra = tgpig.y * NRA; // N offset
+    const int rb = tgpig.x * NRB; // M offset
+
+    if (ra >= N || rb >= M) return;
+
+    // Threadgroup memory for dequantized W tile: [NRA, NK] = [64, 32] bfloats = 4096 bytes
+    threadgroup bfloat* s_w = (threadgroup bfloat*)shmem;
+    auto tW = tensor(s_w, dextents<int32_t, 2>(NK, NRA));
+
+    device bfloat* ptrA = (device bfloat*)(A + rb * K);
+    auto tA = tensor(ptrA, dextents<int32_t, 2>(K, M - rb), array<int, 2>({1, K}));
+
+    matmul2d<
+        matmul2d_descriptor(NRB, NRA, dynamic_extent, false, true, true,
+                            matmul2d_descriptor::mode::multiply_accumulate),
+        execution_simdgroups<4>> mm;
+
+    auto cT = mm.get_destination_cooperative_tensor<decltype(tA), decltype(tW), bfloat>();
+
+    // 128 threads in threadgroup
+    // Dequantize 64 rows of W x 32 elements = 2048 bfloats = 16 bfloats per thread
+    for (int loop_k = 0; loop_k < K; loop_k += NK) {
+        int row_idx = tiitg >> 1;  // 0..63
+        int sub_block = tiitg & 1; // 0 or 1 (16 elements each = 6 bytes of INT3)
+
+        int global_row = ra + row_idx;
+        if (global_row < N) {
+            float s = float(scales[global_row * (K / 32) + (loop_k / 32)]);
+            device const uint8_t* src = W + (size_t)global_row * (K * 3 / 8) + (loop_k * 3 / 8) + sub_block * 6;
+            threadgroup bfloat* dst = s_w + row_idx * NK + sub_block * 16;
+
+            #pragma unroll
+            for (int i = 0; i < 2; i++) {
+                uint8_t b0 = src[i * 3 + 0];
+                uint8_t b1 = src[i * 3 + 1];
+                uint8_t b2 = src[i * 3 + 2];
+
+                dst[i * 8 + 0] = bfloat((float(b0 & 0x07) - 4.0f) * s);
+                dst[i * 8 + 1] = bfloat((float((b0 >> 3) & 0x07) - 4.0f) * s);
+                dst[i * 8 + 2] = bfloat((float((b0 >> 6) | ((b1 & 0x01) << 2)) - 4.0f) * s);
+                dst[i * 8 + 3] = bfloat((float((b1 >> 1) & 0x07) - 4.0f) * s);
+
+                dst[i * 8 + 4] = bfloat((float((b1 >> 4) & 0x07) - 4.0f) * s);
+                dst[i * 8 + 5] = bfloat((float((b1 >> 7) | ((b2 & 0x03) << 1)) - 4.0f) * s);
+                dst[i * 8 + 6] = bfloat((float((b2 >> 2) & 0x07) - 4.0f) * s);
+                dst[i * 8 + 7] = bfloat((float((b2 >> 5) & 0x07) - 4.0f) * s);
+            }
+        } else {
+            threadgroup bfloat* dst = s_w + row_idx * NK + sub_block * 16;
+            #pragma unroll
+            for (int i = 0; i < 16; i++) dst[i] = 0.0bf;
+        }
+
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+
+        const int kExt = min(NK, K - loop_k);
+        auto tWv = tensor(s_w, dextents<int32_t, 2>(kExt, NRA), array<int, 2>({1, NK}));
+        auto tAv = tensor(ptrA + loop_k, dextents<int32_t, 2>(kExt, M - rb), array<int, 2>({1, K}));
+
+        mm.run(tAv, tWv, cT);
+
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+    }
+
+    device bfloat* dstC = C + rb * N + ra;
+    auto tC = tensor(dstC, dextents<int32_t, 2>(N - ra, M - rb), array<int, 2>({1, N}));
+    cT.store(tC);
 }
 
 kernel void gemm_int4_f32_batch_kernel(
