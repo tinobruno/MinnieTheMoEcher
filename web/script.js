@@ -4001,7 +4001,8 @@ async function sendMessage() {
                     let completedLabel = 'Completed';
 
                     try {
-                        const parsedArgs = typeof tc.arguments === 'string' ? JSON.parse(tc.arguments) : tc.arguments;
+                        const parsedArgs = typeof tc.arguments === 'string' ? JSON.parse(tc.arguments) : (tc.arguments || {});
+                        const queryStr = parsedArgs.query || parsedArgs.q || '';
                         let isDirectMedia = (tc.name === 'youtube_search' && activeTools.includes('youtube_search') && agenticSettings.fastMediaSearch !== false) ||
                             ((tc.name === 'web_search' || tc.name === 'google_search') && activeTools.includes(tc.name) && (agenticSettings.fastMediaSearch !== false) && isMediaSearchQuery(queryStr));
                         if (tc.name === 'youtube_search' && !isMediaSearchQuery(queryStr)) {

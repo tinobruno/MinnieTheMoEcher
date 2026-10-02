@@ -2819,20 +2819,26 @@ inline RetrievedDocument search_youtube_direct(const std::string& clean_q, int m
     return doc;
 }
 
+inline RetrievedDocument search_searxng(const std::string& clean_q, int num_results, const std::string& custom_instance_url);
+
 inline RetrievedDocument search_tavily(const std::string& clean_q, int num_results, const std::string& api_key) {
     RetrievedDocument doc;
     doc.url = "https://tavily.com";
     doc.title = "Tavily Search: " + clean_q;
 
     if (api_key.empty()) {
-        doc.clean_text = "[Tavily Search API Key Not Configured]\n\n"
-                         "Tavily provides 1,000 free web searches monthly for AI agents without requiring a credit card.\n"
-                         "1. Get your free key at: https://tavily.com\n"
-                         "2. Save your API key in the Web UI Settings panel (or set TAVILY_API_KEY).\n"
-                         "Tip: You can also switch to 'SearXNG' in Settings to search with 0 API keys.";
+        // Zero-config fallback: try SearXNG metasearch before giving up
+        RetrievedDocument sx_doc = search_searxng(clean_q, num_results, g_searxng_url);
+        if (!sx_doc.clean_text.empty() && sx_doc.clean_text.find("No public instance response") == std::string::npos && sx_doc.clean_text.find("Error parsing") == std::string::npos) {
+            return sx_doc;
+        }
+
+        doc.clean_text = "[Web Search: \"" + clean_q + "\"]\n"
+                         "(Note: Search engine API key is not configured and public metasearch is unreachable).\n\n"
+                         "Instruction for assistant: Do not call search or fetch tools again. Immediately answer the user's question directly using your internal knowledge and facts.";
         doc.raw_html = "<div style=\"padding:20px; font-family:sans-serif; color:#e2e8f0; background:#1e293b; border-radius:8px;\">"
-                       "<h3>Tavily API Key Not Configured</h3>"
-                       "<p>Get 1,000 free monthly searches at <a href=\"https://tavily.com\" target=\"_blank\" style=\"color:#60a5fa;\">tavily.com</a> (No credit card required).</p>"
+                       "<h3>Web Search: " + clean_q + "</h3>"
+                       "<p>Search provider unconfigured. Answered using internal knowledge.</p>"
                        "</div>";
         return doc;
     }
@@ -2972,14 +2978,13 @@ inline RetrievedDocument search_brave(const std::string& clean_q, int num_result
     doc.title = "Brave Search: " + clean_q;
 
     if (api_key.empty()) {
-        doc.clean_text = "[Brave Search API Key Not Configured]\n\n"
-                         "Brave Search offers $5/month in free API credits (~1,000 searches).\n"
-                         "1. Get your API key at: https://brave.com/search/api/\n"
-                         "2. Save your API key in Settings (or set BRAVE_API_KEY).";
-        doc.raw_html = "<div style=\"padding:20px; font-family:sans-serif; color:#e2e8f0; background:#1e293b; border-radius:8px;\">"
-                       "<h3>Brave Search API Key Not Configured</h3>"
-                       "<p>Configure your key at <a href=\"https://brave.com/search/api/\" target=\"_blank\" style=\"color:#60a5fa;\">brave.com/search/api</a>.</p>"
-                       "</div>";
+        RetrievedDocument sx_doc = search_searxng(clean_q, num_results, g_searxng_url);
+        if (!sx_doc.clean_text.empty() && sx_doc.clean_text.find("No public instance response") == std::string::npos && sx_doc.clean_text.find("Error parsing") == std::string::npos) {
+            return sx_doc;
+        }
+        doc.clean_text = "[Brave Search: \"" + clean_q + "\"]\n"
+                         "(Note: Search engine API key is not configured and metasearch is unreachable).\n\n"
+                         "Instruction for assistant: Do not call search or fetch tools again. Immediately answer the user's question directly using your internal knowledge and facts.";
         return doc;
     }
 
@@ -3108,14 +3113,13 @@ inline RetrievedDocument search_serper(const std::string& clean_q, int num_resul
     doc.title = "Serper (Google Search): " + clean_q;
 
     if (api_key.empty()) {
-        doc.clean_text = "[Serper.dev API Key Not Configured]\n\n"
-                         "Serper.dev provides 2,500 free Google searches on signup.\n"
-                         "1. Get your API key at: https://serper.dev\n"
-                         "2. Save your API key in Settings (or set SERPER_API_KEY).";
-        doc.raw_html = "<div style=\"padding:20px; font-family:sans-serif; color:#e2e8f0; background:#1e293b; border-radius:8px;\">"
-                       "<h3>Serper.dev API Key Not Configured</h3>"
-                       "<p>Get 2,500 free searches at <a href=\"https://serper.dev\" target=\"_blank\" style=\"color:#60a5fa;\">serper.dev</a>.</p>"
-                       "</div>";
+        RetrievedDocument sx_doc = search_searxng(clean_q, num_results, g_searxng_url);
+        if (!sx_doc.clean_text.empty() && sx_doc.clean_text.find("No public instance response") == std::string::npos && sx_doc.clean_text.find("Error parsing") == std::string::npos) {
+            return sx_doc;
+        }
+        doc.clean_text = "[Serper Search: \"" + clean_q + "\"]\n"
+                         "(Note: Search engine API key is not configured and metasearch is unreachable).\n\n"
+                         "Instruction for assistant: Do not call search or fetch tools again. Immediately answer the user's question directly using your internal knowledge and facts.";
         return doc;
     }
 
@@ -3179,12 +3183,16 @@ inline RetrievedDocument search_google(const std::string& clean_q, int num_resul
     doc.title = "Google Search: " + clean_q;
 
     if (api_key.empty() || cx.empty()) {
-        doc.clean_text = "[Google Custom Search API Not Configured]\n\n"
-                         "1. Enter Google API Key and Search Engine ID (CX) in Settings.\n"
-                         "Tip: We recommend selecting 'Tavily' or 'SearXNG' in Settings for free, immediate web searching.";
+        RetrievedDocument sx_doc = search_searxng(clean_q, num_results, g_searxng_url);
+        if (!sx_doc.clean_text.empty() && sx_doc.clean_text.find("No public instance response") == std::string::npos && sx_doc.clean_text.find("Error parsing") == std::string::npos) {
+            return sx_doc;
+        }
+        doc.clean_text = "[Google Search: \"" + clean_q + "\"]\n"
+                         "(Note: Google Search API key is not configured and public metasearch is unreachable).\n\n"
+                         "Instruction for assistant: Do not call search or fetch tools again. Immediately answer the user's question directly using your internal knowledge and facts.";
         doc.raw_html = "<div style=\"padding:20px; font-family:sans-serif; color:#e2e8f0; background:#1e293b; border-radius:8px;\">"
-                       "<h3>Google Custom Search API Not Configured</h3>"
-                       "<p>Tip: Switch to <strong>Tavily</strong> (1,000 free queries/mo) or <strong>SearXNG</strong> (100% Free, No key needed) in Settings.</p>"
+                       "<h3>Google Search: " + clean_q + "</h3>"
+                       "<p>Google Search API not configured. Answered using internal knowledge.</p>"
                        "</div>";
         return doc;
     }

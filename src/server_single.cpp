@@ -5269,7 +5269,7 @@ public:
 
             if (allow_draft) {
                 if (!emit_token_cpu(next_token, t)) {
-                    finish_reason = "stop";
+                    if (finish_reason != "tool_calls") finish_reason = "stop";
                     break;
                 }
 
@@ -5469,7 +5469,7 @@ public:
             if (draft_streak < 0) draft_streak++;
 
             if (!emit_token(next_token, t)) {
-                finish_reason = "stop";
+                if (finish_reason != "tool_calls") finish_reason = "stop";
                 break;
             }
             next_token = -1;
@@ -9364,11 +9364,15 @@ static std::string build_dynamic_tools_prompt(const json& resolved_tools, bool i
             "</tool_call>\n\n";
     }
 
+    prompt +=
+        "## Tool Usage Instructions:\n";
     if (has_yt) {
         prompt +=
-            "## Tool Usage Instructions:\n"
             "- When the user asks to play music, a song, or a video, invoke `youtube_search` directly. The video will automatically load and play in the user's preview panel with autoplay.\n";
     }
+    prompt +=
+        "- For factual, general knowledge, or common schedule questions that you know accurately, answer directly without invoking tools.\n"
+        "- If a search tool returns no results, fails, or indicates an unconfigured API key, do not retry or repeat tool calls; immediately answer the user's question directly with your own knowledge.\n";
 
     return prompt;
 }
@@ -14102,7 +14106,7 @@ static void run_server(MoecherEngine& engine, int port, int default_thinking_bud
                     {"finish_reason", finish_reason}
                 };
 
-                if (!emitted_tool_calls.empty() && (!g_server_exec || finish_reason == "tool_calls")) {
+                if (!emitted_tool_calls.empty() && (!do_server_exec || finish_reason == "tool_calls")) {
                     json tc_arr = json::array();
                     for (const auto& tc : emitted_tool_calls) {
                         tc_arr.push_back({
