@@ -4609,7 +4609,7 @@ public:
     std::string generate(const std::vector<int>& prompt_in, int max_tokens = 20000,
                          float temperature = 1.0f,
                          std::function<bool(const std::string&,bool)> on_token = nullptr,
-                         float repetition_penalty = 1.10f,
+                         float repetition_penalty = 1.0f,
                          bool enable_thinking = true,
                          int max_thinking_tokens = 2048,
                          float top_p = 0.95f,
@@ -4883,7 +4883,6 @@ public:
         int draft_streak = 0;
 
         std::string last_think_token_str;
-        int think_tokens_without_punct = 0;
 
         auto gen_start_time = std::chrono::steady_clock::now();
         int spec_cycles = 0;
@@ -5003,23 +5002,7 @@ public:
             }
 
             std::string token_text = tokenizer_.decode({next_token});
-            if (in_think_block) {
-                bool has_punct = false;
-                for (char c : token_text) {
-                    if (c == '.' || c == '?' || c == '!' || c == '\n' || c == ':' || c == ';') {
-                        has_punct = true;
-                        break;
-                    }
-                }
-                if (has_punct) {
-                    think_tokens_without_punct = 0;
-                } else {
-                    think_tokens_without_punct++;
-                    if (think_tokens_without_punct >= 40) {
-                        think_loop_detected = true;
-                    }
-                }
-            }
+
             if (in_think_block && (token_text.find("</think>") != std::string::npos ||
                                    token_text.find("</output>") != std::string::npos ||
                                    token_text.find("</response>") != std::string::npos ||
@@ -5231,8 +5214,17 @@ public:
 
             // Check all EOS and stop conditions in content mode
             if (!ignore_eos && (next_token == cfg_.eos_token_id || (eos2_id >= 0 && next_token == eos2_id) || (im_end_id >= 0 && next_token == im_end_id))) {
-                if (content_tokens_generated == 0) {
-                    LOG_WARN("EOS hit with 0 content tokens at step %d. Suppressing EOS and forcing content generation.", t);
+                bool ends_with_punct = false;
+                if (!generated_text.empty()) {
+                    char c = generated_text.back();
+                    if (c == '.' || c == '!' || c == '?' || c == '\n' || c == '}' || c == '"' || c == '\'') {
+                        ends_with_punct = true;
+                    }
+                }
+                if (content_tokens_generated == 0 ||
+                    (content_tokens_generated < 64 && !ends_with_punct && generated_text.find("<tool_call>") == std::string::npos)) {
+                    LOG_WARN("Premature EOS hit at step %d with %d content tokens. Suppressing EOS and forcing continuation.",
+                             t, content_tokens_generated);
                     float neg_inf = -1e9f;
                     if (cfg_.eos_token_id >= 0) {
                         CUDA_CHECK(cudaMemcpyAsync(buf_logits_.f32() + cfg_.eos_token_id, &neg_inf, sizeof(float), cudaMemcpyHostToDevice, main_stream_));
@@ -5640,7 +5632,7 @@ public:
             /*max_tokens=*/512,
             /*temperature=*/0.0f,
             /*token_callback=*/nullptr,
-            /*repetition_penalty=*/1.10f,
+            /*repetition_penalty=*/1.0f,
             /*enable_thinking=*/false,
             /*max_thinking_tokens=*/0,
             /*top_p=*/0.9f,
@@ -8494,33 +8486,55 @@ private:
 
     // ── Sample from logits ──────────────────────────────────────────────────
 
-    float current_rep_penalty_ = 1.10f;  // Set per-request by generate()
+    bool is_syntax_or_punct_token(int token_id) const {
+        if (token_id < 0 || token_id >= cfg_.vocab_size) return true;
+        if (token_id == cfg_.eos_token_id) return true;
+        std::string s = tokenizer_.decode_token_str(token_id);
+        if (s.empty()) return true;
+        for (char c : s) {
+            if (isalnum((unsigned char)c)) {
+                return false;
+            }
+        }
+        return true;
+    }
+
+    float current_rep_penalty_ = 1.0f;  // Set per-request by generate()
 
     int sample_token(float temperature, const std::vector<int>& history, int step = 0, bool is_reasoning = true,
-                     int top_k = 1024, float top_p = 0.95f, float min_p = 0.05f) {
+                     int top_k = 40, float top_p = 0.90f, float min_p = 0.05f) {
         return sample_from_logits_ptr(buf_logits_.f32(), temperature, history, step, is_reasoning, top_k, top_p, min_p);
     }
 
     int sample_from_logits_ptr(float* logits_ptr, float temperature, const std::vector<int>& history, int step = 0, bool is_reasoning = true,
-                               int top_k = 1024, float top_p = 0.95f, float min_p = 0.05f) {
+                               int top_k = 40, float top_p = 0.90f, float min_p = 0.05f) {
         int vocab = cfg_.vocab_size;
         static int32_t* h_sample_pin = nullptr;
         if (!h_sample_pin) {
             CUDA_CHECK(cudaMallocHost(&h_sample_pin, sizeof(int32_t)));
         }
 
-        if (current_rep_penalty_ > 1.0f && !history.empty()) {
+        if (!is_reasoning && current_rep_penalty_ > 1.0f && !history.empty()) {
             static int32_t* d_rep_hist = nullptr;
             static const int MAX_REP_HIST = 64;
             if (!d_rep_hist) {
                 CUDA_CHECK(cudaMalloc(&d_rep_hist, MAX_REP_HIST * sizeof(int32_t)));
             }
-            int hist_len = (int)history.size();
-            int n_penalize = std::min(hist_len, MAX_REP_HIST);
-            const int* src_ptr = history.data() + (hist_len - n_penalize);
-            CUDA_CHECK(cudaMemcpyAsync(d_rep_hist, src_ptr, n_penalize * sizeof(int32_t), cudaMemcpyHostToDevice, main_stream_));
-            apply_repetition_penalty_cuda(logits_ptr, d_rep_hist, n_penalize, current_rep_penalty_, main_stream_);
-            argmax_cache_valid_ = false;
+            thread_local std::vector<int32_t> filtered_hist;
+            filtered_hist.clear();
+            filtered_hist.reserve(MAX_REP_HIST);
+            for (int i = (int)history.size() - 1; i >= 0 && (int)filtered_hist.size() < MAX_REP_HIST; --i) {
+                int tok = history[i];
+                if (!is_syntax_or_punct_token(tok)) {
+                    filtered_hist.push_back(tok);
+                }
+            }
+            int n_penalize = (int)filtered_hist.size();
+            if (n_penalize > 0) {
+                CUDA_CHECK(cudaMemcpyAsync(d_rep_hist, filtered_hist.data(), n_penalize * sizeof(int32_t), cudaMemcpyHostToDevice, main_stream_));
+                apply_repetition_penalty_cuda(logits_ptr, d_rep_hist, n_penalize, current_rep_penalty_, main_stream_);
+                argmax_cache_valid_ = false;
+            }
         }
 
         if (temperature <= 0.0f) {
@@ -9372,12 +9386,14 @@ static std::string build_dynamic_tools_prompt(const json& resolved_tools, bool i
     }
     prompt +=
         "- For factual, general knowledge, or common schedule questions that you know accurately, answer directly without invoking tools.\n"
-        "- If a search tool returns no results, fails, or indicates an unconfigured API key, do not retry or repeat tool calls; immediately answer the user's question directly with your own knowledge.\n";
+        "- If a search tool returns no results, fails, or indicates an unconfigured API key, do not retry or repeat tool calls; immediately answer the user's question directly with your own knowledge.\n"
+        "- Always provide comprehensive, thorough, and complete answers directly in full detail.\n"
+        "- When continuing a previous response, immediately provide the full narrative and substantive information without meta-introductory remarks.\n";
 
     return prompt;
 }
 
-static std::string g_base_system_prompt = "You are a helpful assistant";
+static std::string g_base_system_prompt = "You are a helpful assistant. Always provide comprehensive, thorough, and complete answers directly without asking for permission to proceed or stopping at introductory announcements. When asked to continue or keep going, immediately provide the full narrative and substantive information without meta-introductory remarks.";
 static std::string g_current_system_prompt = "";
 static json g_current_active_tools = json::array();
 static const std::string g_server_instance_id = std::to_string(std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::system_clock::now().time_since_epoch()).count());
@@ -12738,7 +12754,7 @@ static void run_server(MoecherEngine& engine, int port, int default_thinking_bud
             }
             bool ignore_eos = request.value("ignore_eos", false);
             bool stream = request.value("stream", false);
-            float repetition_penalty = request.value("repetition_penalty", 1.10f);
+            float repetition_penalty = request.value("repetition_penalty", 1.0f);
             std::string reasoning_effort = request.value("reasoning_effort", default_thinking_budget > 0 ? "high" : "none");
             bool enable_thinking = (default_thinking_budget > 0);
             int max_thinking_tokens = default_thinking_budget;

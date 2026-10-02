@@ -283,6 +283,7 @@
                             <div class="voice-wave-bars">
                                 <span></span><span></span><span></span><span></span><span></span>
                             </div>
+                            <span id="voice-silence-countdown" class="voice-countdown-badge hidden">2.0s</span>
                             <button type="button" class="voice-indicator-btn voice-btn-done" onclick="stopVoiceRecognition()" title="Finish dictating">
                                 <span class="material-symbols-outlined">check</span> Done
                             </button>
@@ -824,8 +825,8 @@
                             <div class="setting-item">
                                 <label>Repetition Penalty</label>
                                 <div class="slider-container">
-                                    <input type="range" id="rep-penalty-slider" min="1.0" max="1.3" step="0.02" value="1.10">
-                                    <span id="rep-penalty-val">1.10</span>
+                                    <input type="range" id="rep-penalty-slider" min="1.0" max="1.3" step="0.02" value="1.00">
+                                    <span id="rep-penalty-val">1.00</span>
                                 </div>
                             </div>
                             
@@ -853,7 +854,7 @@
                             
                             <div class="setting-item">
                                 <label class="checkbox-label">
-                                    <input type="checkbox" id="thinking-enabled">
+                                    <input type="checkbox" id="thinking-enabled" checked>
                                     Enable Thinking
                                 </label>
                             </div>
@@ -904,16 +905,34 @@
                             </div>
 
                             <div class="setting-item">
-                                <label class="checkbox-label" title="Automatically send your message after you stop speaking for 2 seconds">
+                                <label class="checkbox-label" title="Automatically send your message after you stop speaking">
                                     <input type="checkbox" id="voice-auto-send" onchange="onVoiceAutoSendChange(this.checked)">
-                                    Auto-send after speech pause (2s silence)
+                                    Auto-send prompt after speech pause
                                 </label>
+                            </div>
+
+                            <div class="setting-item" id="voice-silence-delay-row">
+                                <div style="display: flex; justify-content: space-between; align-items: center; margin-bottom: 4px;">
+                                    <label for="voice-silence-delay-slider" style="margin-bottom: 0;">Auto-Send Silence Wait Time</label>
+                                    <span id="voice-silence-delay-val" style="font-size: 12px; font-weight: 600; color: #34d399;">2.0s</span>
+                                </div>
+                                <div class="slider-container">
+                                    <input type="range" id="voice-silence-delay-slider" min="0.5" max="5.0" step="0.25" value="2.0" oninput="onVoiceSilenceDelayChange(this.value)">
+                                </div>
+                                <small style="color: var(--text-secondary); font-size: 11px;">Seconds of silence to wait after speaking before automatically sending.</small>
                             </div>
 
                             <div class="setting-item">
                                 <label class="checkbox-label" title="Automatically read aloud the model's response using Text-to-Speech">
                                     <input type="checkbox" id="voice-auto-read" onchange="onVoiceAutoReadChange(this.checked)">
                                     Voice Mode (Read aloud model responses automatically)
+                                </label>
+                            </div>
+
+                            <div class="setting-item">
+                                <label class="checkbox-label" title="Speaks sentences in real-time as tokens arrive rather than waiting for generation to finish">
+                                    <input type="checkbox" id="voice-streaming-tts" checked onchange="onVoiceStreamingTtsChange(this.checked)">
+                                    Low-Latency Streaming TTS (Speak while generating)
                                 </label>
                             </div>
 

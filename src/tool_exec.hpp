@@ -2819,6 +2819,69 @@ inline RetrievedDocument search_youtube_direct(const std::string& clean_q, int m
     return doc;
 }
 
+inline RetrievedDocument search_wikipedia(const std::string& clean_q, int num_results = 5) {
+    RetrievedDocument doc;
+    std::string q = clean_q;
+    size_t site_pos = q.find("site:");
+    if (site_pos != std::string::npos) {
+        size_t space_pos = q.find(' ', site_pos);
+        if (space_pos != std::string::npos) {
+            q.erase(site_pos, space_pos - site_pos + 1);
+        } else {
+            q.erase(site_pos);
+        }
+    }
+    while (!q.empty() && (q.back() == ' ' || q.back() == '\t')) q.pop_back();
+
+    doc.url = "https://en.wikipedia.org/wiki/Special:Search?search=" + url_encode(q);
+    doc.title = "Wikipedia Search: " + q;
+
+    std::string api_url = "https://en.wikipedia.org/w/api.php?action=query&list=search&srsearch=" +
+                          url_encode(q) + "&utf8=&format=json&srlimit=" + std::to_string(std::min(num_results, 5));
+    std::string resp = http_request_native("GET", api_url, "", {"User-Agent: MinnieTheMoecher/1.0", "Accept: application/json"}, 5000);
+    if (resp.empty()) return doc;
+
+    try {
+        json j = json::parse(resp);
+        if (!j.contains("query") || !j["query"].contains("search") || !j["query"]["search"].is_array()) {
+            return doc;
+        }
+        const auto& results = j["query"]["search"];
+        if (results.empty()) return doc;
+
+        std::string text_out = "[Wikipedia Search: \"" + q + "\"]\n\n";
+        std::string html_cards = "<div style=\"display:flex; flex-direction:column; gap:12px;\">\n";
+
+        for (const auto& item : results) {
+            std::string title = item.value("title", "");
+            std::string snippet = item.value("snippet", "");
+            std::string clean_snippet;
+            bool in_tag = false;
+            for (char c : snippet) {
+                if (c == '<') in_tag = true;
+                else if (c == '>') in_tag = false;
+                else if (!in_tag) clean_snippet += c;
+            }
+            std::string page_url = "https://en.wikipedia.org/wiki/" + url_encode(title);
+            text_out += "### " + title + "\n";
+            text_out += "Source: " + page_url + "\n";
+            text_out += clean_snippet + "\n\n";
+
+            html_cards += "<div style=\"padding:12px; background:rgba(255,255,255,0.05); border-radius:8px;\">";
+            html_cards += "<a href=\"" + page_url + "\" target=\"_blank\" style=\"color:#38bdf8; font-weight:600;\">" + title + "</a>";
+            html_cards += "<p style=\"margin:6px 0 0 0; color:#cbd5e1; font-size:13px;\">" + clean_snippet + "</p>";
+            html_cards += "</div>\n";
+        }
+        html_cards += "</div>";
+
+        doc.clean_text = text_out;
+        doc.raw_html = html_cards;
+        return doc;
+    } catch (...) {
+        return doc;
+    }
+}
+
 inline RetrievedDocument search_searxng(const std::string& clean_q, int num_results, const std::string& custom_instance_url);
 
 inline RetrievedDocument search_tavily(const std::string& clean_q, int num_results, const std::string& api_key) {
@@ -3063,6 +3126,10 @@ inline RetrievedDocument search_searxng(const std::string& clean_q, int num_resu
     }
 
     if (resp.empty()) {
+        RetrievedDocument wiki_doc = search_wikipedia(clean_q, num_results);
+        if (!wiki_doc.clean_text.empty()) {
+            return wiki_doc;
+        }
         doc.clean_text = "[SearXNG Search: No public instance response received. Please configure a custom instance (e.g. local Docker http://localhost:8080) or switch to Tavily AI (1,000 free queries/mo) in Settings.]";
         return doc;
     }

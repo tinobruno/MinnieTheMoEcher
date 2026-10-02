@@ -2893,17 +2893,17 @@ function buildOptimizedMessagesPayload() {
         }
 
         // Compact past bulky tool outputs from older turns (skip the immediate prior turn to preserve KV cache prefix)
-        const isImmediatePriorTurn = (idx >= historySlice.length - 3);
+        const isImmediatePriorTurn = (idx >= historySlice.length - 4);
         if (agenticSettings.compactToolOutputs !== false && !isCurrentActiveTurn && !isImmediatePriorTurn) {
             if (cleanedMsg.role === 'tool' || cleanedMsg.role === 'function') {
-                if (cleanedMsg.content && cleanedMsg.content.length > 250) {
-                    cleanedMsg.content = cleanedMsg.content.slice(0, 250) + `\n... [Content compacted for context window: total ${cleanedMsg.content.length} chars]`;
+                if (cleanedMsg.content && cleanedMsg.content.length > 3000) {
+                    cleanedMsg.content = cleanedMsg.content.slice(0, 2000) + `\n... [Content compacted for context window: total ${cleanedMsg.content.length} chars]`;
                 }
             } else if (cleanedMsg.role === 'assistant' || cleanedMsg.role === 'user') {
                 if (cleanedMsg.content && cleanedMsg.content.includes('<tool_response>')) {
                     cleanedMsg.content = cleanedMsg.content.replace(/<tool_response>([\s\S]*?)<\/tool_response>/g, (match, p1) => {
-                        if (p1.length > 250) {
-                            return `<tool_response>\n${p1.slice(0, 250)}\n... [Output compacted for context: ${p1.length} chars]\n</tool_response>`;
+                        if (p1.length > 3000) {
+                            return `<tool_response>\n${p1.slice(0, 2000)}\n... [Output compacted for context: ${p1.length} chars]\n</tool_response>`;
                         }
                         return match;
                     });
@@ -3617,6 +3617,9 @@ async function sendMessage() {
     // Create assistant message container
     const assistantMsgDiv = createMessageContainer('assistant');
     messagesContainer.appendChild(assistantMsgDiv);
+    if (typeof resetStreamingTtsSession === 'function') {
+        resetStreamingTtsSession(assistantMsgDiv);
+    }
 
     // Add reasoning block (hidden initially)
     let reasoningBlock = null;
@@ -3693,7 +3696,7 @@ async function sendMessage() {
                 messages: messagesToSend,
                 max_tokens: parseInt(tokensInput ? tokensInput.value : 20000, 10) || 20000,
                 temperature: parseFloat(tempSlider.value),
-                repetition_penalty: parseFloat(repPenaltySlider ? repPenaltySlider.value : 1.10),
+                repetition_penalty: parseFloat(repPenaltySlider ? repPenaltySlider.value : 1.00),
                 stream: true,
                 thinking: {
                     type: isThinking ? "enabled" : "disabled",
@@ -3940,6 +3943,7 @@ async function sendMessage() {
                                             if (summary) summary.innerHTML = 'Thought process';
                                         }
                                         roundContent += delta.content;
+                                        lastRoundContent = roundContent;
 
                                         // Filter out raw tool call JSON so it never pollutes the chat UI
                                         const displayContent = stripToolCallsFromText(roundContent);
@@ -3947,6 +3951,11 @@ async function sendMessage() {
                                             renderMarkdownContent(displayContent, mainContent);
                                         } else if (isRawToolCallString(roundContent)) {
                                             mainContent.innerHTML = '';
+                                        }
+
+                                        // Real-time streaming text-to-speech (speaks sentences as tokens arrive)
+                                        if (typeof voiceSettings !== 'undefined' && voiceSettings.autoRead && voiceSettings.streamingTts) {
+                                            processStreamingTtsChunk(displayContent, assistantMsgDiv);
                                         }
                                     }
                                 }
@@ -4265,9 +4274,13 @@ async function sendMessage() {
             attachAssistantMessageActions(assistantMsgDiv, lastRoundContent);
         }
 
-        // If Voice Mode / Auto-read is enabled, speak the assistant's answer
+        // If Voice Mode / Auto-read is enabled, flush remaining streaming speech or speak full response
         if (typeof voiceSettings !== 'undefined' && voiceSettings.autoRead && lastRoundContent) {
-            speakAssistantMessage(lastRoundContent, assistantMsgDiv);
+            if (voiceSettings.streamingTts && typeof flushStreamingTts === 'function') {
+                flushStreamingTts(lastRoundContent, assistantMsgDiv);
+            } else {
+                speakAssistantMessage(lastRoundContent, assistantMsgDiv);
+            }
         }
 
     } catch (err) {
@@ -8101,7 +8114,9 @@ const ThreeStudio = {
 let voiceSettings = {
     lang: localStorage.getItem('moecher_voice_lang') || 'auto',
     autoSend: localStorage.getItem('moecher_voice_auto_send') === 'true',
+    silenceDelay: parseFloat(localStorage.getItem('moecher_voice_silence_delay') || '2.0'),
     autoRead: localStorage.getItem('moecher_voice_auto_read') === 'true',
+    streamingTts: localStorage.getItem('moecher_voice_streaming_tts') !== 'false',
     ttsVoice: localStorage.getItem('moecher_tts_voice') || 'default',
     ttsRate: parseFloat(localStorage.getItem('moecher_tts_rate') || '1.0')
 };
@@ -8111,6 +8126,7 @@ let isVoiceRecording = false;
 let preSpeechInputValue = '';
 let speechFinalTranscript = '';
 let speechSilenceTimer = null;
+let speechCountdownInterval = null;
 let currentPlayingUtterance = null;
 let currentPlayingMessageDiv = null;
 
@@ -8128,12 +8144,18 @@ function initVoiceRecognitionUI() {
     const langSelect = document.getElementById('voice-lang-select');
     const autoSendCheck = document.getElementById('voice-auto-send');
     const autoReadCheck = document.getElementById('voice-auto-read');
+    const silenceSlider = document.getElementById('voice-silence-delay-slider');
+    const silenceVal = document.getElementById('voice-silence-delay-val');
+    const streamingCheck = document.getElementById('voice-streaming-tts');
     const rateSlider = document.getElementById('tts-rate-slider');
     const rateVal = document.getElementById('tts-rate-val');
 
     if (langSelect) langSelect.value = voiceSettings.lang;
     if (autoSendCheck) autoSendCheck.checked = voiceSettings.autoSend;
     if (autoReadCheck) autoReadCheck.checked = voiceSettings.autoRead;
+    if (silenceSlider) silenceSlider.value = voiceSettings.silenceDelay;
+    if (silenceVal) silenceVal.textContent = `${voiceSettings.silenceDelay.toFixed(2).replace(/\.?0+$/, '')}s`;
+    if (streamingCheck) streamingCheck.checked = voiceSettings.streamingTts !== false;
     if (rateSlider) rateSlider.value = voiceSettings.ttsRate;
     if (rateVal) rateVal.textContent = `${voiceSettings.ttsRate.toFixed(1)}x`;
 
@@ -8157,7 +8179,7 @@ function updateVoiceModeButtonUI() {
     if (voiceSettings.autoRead) {
         voiceModeBtn.classList.add('active');
         voiceModeIcon.textContent = 'volume_up';
-        voiceModeBtn.title = 'Voice Mode ON (Model responses are read aloud)';
+        voiceModeBtn.title = 'Voice Mode ON (Model responses are read aloud while streaming)';
     } else {
         voiceModeBtn.classList.remove('active');
         voiceModeIcon.textContent = 'volume_off';
@@ -8171,7 +8193,7 @@ function toggleVoiceMode() {
     const autoReadCheck = document.getElementById('voice-auto-read');
     if (autoReadCheck) autoReadCheck.checked = voiceSettings.autoRead;
     updateVoiceModeButtonUI();
-    showToast(voiceSettings.autoRead ? "Voice Mode enabled: Responses will be read aloud." : "Voice Mode disabled.");
+    showToast(voiceSettings.autoRead ? "Voice Mode enabled: Responses will stream aloud in real-time." : "Voice Mode disabled.");
     if (!voiceSettings.autoRead) {
         stopTtsAudio();
     }
@@ -8191,10 +8213,23 @@ function onVoiceAutoSendChange(checked) {
     localStorage.setItem('moecher_voice_auto_send', checked);
 }
 
+function onVoiceSilenceDelayChange(val) {
+    voiceSettings.silenceDelay = parseFloat(val) || 2.0;
+    localStorage.setItem('moecher_voice_silence_delay', voiceSettings.silenceDelay);
+    const delayVal = document.getElementById('voice-silence-delay-val');
+    if (delayVal) delayVal.textContent = `${voiceSettings.silenceDelay.toFixed(2).replace(/\.?0+$/, '')}s`;
+}
+
 function onVoiceAutoReadChange(checked) {
     voiceSettings.autoRead = checked;
     localStorage.setItem('moecher_voice_auto_read', checked);
     updateVoiceModeButtonUI();
+}
+
+function onVoiceStreamingTtsChange(checked) {
+    voiceSettings.streamingTts = checked;
+    localStorage.setItem('moecher_voice_streaming_tts', checked);
+    showToast(checked ? "Low-Latency Streaming TTS enabled (speaks while generating)." : "Streaming speech disabled (speaks at end).");
 }
 
 function onTtsVoiceChange(val) {
@@ -8319,12 +8354,40 @@ async function startVoiceRecognition() {
             // Handle silence auto-send if enabled
             if (voiceSettings.autoSend && currentSpoken.length > 0) {
                 if (speechSilenceTimer) clearTimeout(speechSilenceTimer);
+                if (speechCountdownInterval) clearInterval(speechCountdownInterval);
+
+                const countdownBadge = document.getElementById('voice-silence-countdown');
+                const delayMs = Math.max(500, Math.round((voiceSettings.silenceDelay || 2.0) * 1000));
+                const startTime = performance.now();
+
+                if (countdownBadge) {
+                    countdownBadge.textContent = `${(delayMs / 1000).toFixed(1)}s`;
+                    countdownBadge.classList.remove('hidden');
+                }
+
+                speechCountdownInterval = setInterval(() => {
+                    const elapsed = performance.now() - startTime;
+                    const remaining = Math.max(0, (delayMs - elapsed) / 1000);
+                    if (countdownBadge) {
+                        countdownBadge.textContent = `${remaining.toFixed(1)}s`;
+                    }
+                    if (remaining <= 0) {
+                        clearInterval(speechCountdownInterval);
+                        speechCountdownInterval = null;
+                    }
+                }, 100);
+
                 speechSilenceTimer = setTimeout(() => {
+                    if (countdownBadge) countdownBadge.classList.add('hidden');
+                    if (speechCountdownInterval) {
+                        clearInterval(speechCountdownInterval);
+                        speechCountdownInterval = null;
+                    }
                     if (isVoiceRecording && chatInput.value.trim().length > 0) {
                         stopVoiceRecognition();
                         sendMessage();
                     }
-                }, 2000);
+                }, delayMs);
             }
         };
 
@@ -8377,6 +8440,13 @@ function stopVoiceRecognition() {
         clearTimeout(speechSilenceTimer);
         speechSilenceTimer = null;
     }
+    if (speechCountdownInterval) {
+        clearInterval(speechCountdownInterval);
+        speechCountdownInterval = null;
+    }
+    const countdownBadge = document.getElementById('voice-silence-countdown');
+    if (countdownBadge) countdownBadge.classList.add('hidden');
+
     if (speechRecognitionInstance) {
         try { speechRecognitionInstance.stop(); } catch (e) {}
     }
@@ -8390,6 +8460,13 @@ function cancelVoiceRecognition() {
         clearTimeout(speechSilenceTimer);
         speechSilenceTimer = null;
     }
+    if (speechCountdownInterval) {
+        clearInterval(speechCountdownInterval);
+        speechCountdownInterval = null;
+    }
+    const countdownBadge = document.getElementById('voice-silence-countdown');
+    if (countdownBadge) countdownBadge.classList.add('hidden');
+
     if (speechRecognitionInstance) {
         try { speechRecognitionInstance.abort(); } catch (e) {}
     }
@@ -8496,6 +8573,8 @@ function initTtsVoices() {
 }
 
 function stopTtsAudio() {
+    streamingTtsQueue = [];
+    isStreamingTtsPlaying = false;
     if (typeof window !== 'undefined' && 'speechSynthesis' in window) {
         window.speechSynthesis.cancel();
     }
@@ -8512,6 +8591,172 @@ function stopTtsAudio() {
         }
         currentPlayingMessageDiv = null;
     }
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Real-Time Streaming Text-To-Speech (TTS) Engine
+// ─────────────────────────────────────────────────────────────────────────────
+
+let streamingTtsState = {
+    processedCursor: 0,
+    targetDiv: null,
+    isGenerationDone: false
+};
+
+let streamingTtsQueue = [];
+let isStreamingTtsPlaying = false;
+
+function resetStreamingTtsSession(targetDiv) {
+    stopTtsAudio();
+    streamingTtsState = {
+        processedCursor: 0,
+        targetDiv: targetDiv,
+        isGenerationDone: false
+    };
+    streamingTtsQueue = [];
+    isStreamingTtsPlaying = false;
+}
+
+function findSentenceCut(text) {
+    // 1. Primary sentence terminators: . ! ? followed by space, newline, or paragraph break
+    const primaryRegex = /([.!?]+(?:\s+|\n+)|(?:\n\s*\n)|(?::\s*\n+))/;
+    const match = primaryRegex.exec(text);
+    if (match && match.index !== undefined) {
+        return match.index + match[0].length;
+    }
+
+    // 2. Secondary break: if buffer is getting long (> 90 chars), break cleanly at comma, semicolon, or dash
+    if (text.length > 90) {
+        const secondaryRegex = /([,;—]\s+|\n+)/;
+        const secMatch = secondaryRegex.exec(text);
+        if (secMatch && secMatch.index >= 35) {
+            return secMatch.index + secMatch[0].length;
+        }
+    }
+
+    return -1;
+}
+
+function processStreamingTtsChunk(currentFullText, assistantMsgDiv) {
+    if (!voiceSettings.autoRead || !voiceSettings.streamingTts) return;
+    if (typeof window === 'undefined' || !('speechSynthesis' in window)) return;
+
+    // Check if currently inside an open code block (odd number of ```)
+    const tripleTicks = (currentFullText.match(/```/g) || []).length;
+    const isInsideCodeBlock = (tripleTicks % 2 === 1);
+
+    while (true) {
+        const textFromCursor = currentFullText.slice(streamingTtsState.processedCursor);
+        if (!textFromCursor || textFromCursor.length === 0) break;
+
+        // If inside code block, wait until the code block is closed
+        if (isInsideCodeBlock) {
+            break;
+        }
+
+        const cutLength = findSentenceCut(textFromCursor);
+        if (cutLength <= 0) {
+            break; // No complete sentence boundary yet, wait for more incoming tokens
+        }
+
+        const rawSentence = textFromCursor.slice(0, cutLength);
+        streamingTtsState.processedCursor += cutLength;
+
+        const cleaned = cleanTextForSpeech(rawSentence);
+        if (cleaned && cleaned.trim().length > 0 && /[a-zA-Z0-9\u00C0-\u024F\u4e00-\u9fa5]/.test(cleaned)) {
+            enqueueStreamingTts(cleaned.trim(), assistantMsgDiv);
+        }
+    }
+}
+
+function flushStreamingTts(finalFullText, assistantMsgDiv) {
+    if (!voiceSettings.autoRead) return;
+    if (typeof window === 'undefined' || !('speechSynthesis' in window)) return;
+
+    if (!voiceSettings.streamingTts) {
+        // Fallback to reading entire message
+        speakAssistantMessage(finalFullText, assistantMsgDiv);
+        return;
+    }
+
+    streamingTtsState.isGenerationDone = true;
+
+    // Grab any remaining tail text after the last sentence cut
+    const remaining = finalFullText.slice(streamingTtsState.processedCursor);
+    if (remaining && remaining.trim().length > 0) {
+        const cleaned = cleanTextForSpeech(remaining);
+        if (cleaned && cleaned.trim().length > 0 && /[a-zA-Z0-9\u00C0-\u024F\u4e00-\u9fa5]/.test(cleaned)) {
+            enqueueStreamingTts(cleaned.trim(), assistantMsgDiv);
+        }
+    }
+    streamingTtsState.processedCursor = finalFullText.length;
+}
+
+function enqueueStreamingTts(textChunk, assistantMsgDiv) {
+    streamingTtsQueue.push({ text: textChunk, msgDiv: assistantMsgDiv });
+    if (!isStreamingTtsPlaying) {
+        playNextStreamingChunk();
+    }
+}
+
+function playNextStreamingChunk() {
+    if (typeof window === 'undefined' || !('speechSynthesis' in window)) return;
+
+    if (streamingTtsQueue.length === 0) {
+        isStreamingTtsPlaying = false;
+        const voiceModeBtn = document.getElementById('voice-mode-btn');
+        if (voiceModeBtn) voiceModeBtn.classList.remove('speaking');
+        if (currentPlayingMessageDiv) {
+            const playBtn = currentPlayingMessageDiv.querySelector('.read-aloud-btn');
+            if (playBtn) {
+                playBtn.classList.remove('playing');
+                const icon = playBtn.querySelector('.material-symbols-outlined');
+                if (icon) icon.textContent = 'volume_up';
+            }
+            currentPlayingMessageDiv = null;
+        }
+        return;
+    }
+
+    isStreamingTtsPlaying = true;
+    const item = streamingTtsQueue.shift();
+
+    const utterance = new SpeechSynthesisUtterance(item.text);
+    utterance.rate = voiceSettings.ttsRate || 1.0;
+
+    // Pick voice if selected
+    if (voiceSettings.ttsVoice && voiceSettings.ttsVoice !== 'default') {
+        const voices = window.speechSynthesis.getVoices();
+        const matched = voices.find(v => v.voiceURI === voiceSettings.ttsVoice);
+        if (matched) utterance.voice = matched;
+    } else if (voiceSettings.lang && voiceSettings.lang !== 'auto') {
+        utterance.lang = voiceSettings.lang;
+    }
+
+    const voiceModeBtn = document.getElementById('voice-mode-btn');
+    if (voiceModeBtn) voiceModeBtn.classList.add('speaking');
+
+    if (item.msgDiv) {
+        currentPlayingMessageDiv = item.msgDiv;
+        const playBtn = item.msgDiv.querySelector('.read-aloud-btn');
+        if (playBtn) {
+            playBtn.classList.add('playing');
+            const icon = playBtn.querySelector('.material-symbols-outlined');
+            if (icon) icon.textContent = 'pause';
+        }
+    }
+
+    utterance.onend = () => {
+        playNextStreamingChunk();
+    };
+
+    utterance.onerror = (e) => {
+        console.warn("Streaming TTS error on utterance:", e);
+        playNextStreamingChunk();
+    };
+
+    currentPlayingUtterance = utterance;
+    window.speechSynthesis.speak(utterance);
 }
 
 function speakAssistantMessage(rawText, messageElement = null) {

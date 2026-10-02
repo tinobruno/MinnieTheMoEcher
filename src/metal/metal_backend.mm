@@ -1769,8 +1769,6 @@ void sample_multinomial_f32_cuda(
     int32_t* out, float* logits, int n, float temperature, float rand_val, float min_p,
     cudaStream_t stream, int top_k, float top_p)
 {
-    (void)top_k;
-    (void)top_p;
     metal_stream_synchronize(stream);
 
     if (temperature <= 0.0f) {
@@ -1786,41 +1784,85 @@ void sample_multinomial_f32_cuda(
         return;
     }
 
-    float inv_t = 1.0f / std::max(temperature, 1e-4f);
+    if (top_k <= 0 || top_k > 64) top_k = 40;
 
-    float max_l = logits[0];
-    int best_idx = 0;
-    for (int i = 1; i < n; i++) {
-        if (logits[i] > max_l) {
-            max_l = logits[i];
-            best_idx = i;
+    struct Candidate {
+        float logit;
+        int idx;
+        bool operator>(const Candidate& o) const { return logit > o.logit; }
+        bool operator<(const Candidate& o) const { return logit < o.logit; }
+    };
+
+    thread_local std::vector<Candidate> heap;
+    heap.clear();
+    heap.reserve(top_k);
+
+    for (int i = 0; i < n; i++) {
+        float val = logits[i];
+        if (val < -1e8f) continue;
+        if ((int)heap.size() < top_k) {
+            heap.push_back({val, i});
+            if ((int)heap.size() == top_k) {
+                std::make_heap(heap.begin(), heap.end(), std::greater<Candidate>());
+            }
+        } else if (val > heap.front().logit) {
+            std::pop_heap(heap.begin(), heap.end(), std::greater<Candidate>());
+            heap.back() = {val, i};
+            std::push_heap(heap.begin(), heap.end(), std::greater<Candidate>());
         }
     }
 
-    thread_local std::vector<float> exps;
-    if ((int)exps.size() < n) exps.resize(n);
+    if (heap.empty()) {
+        *out = 0;
+        return;
+    }
+
+    std::sort(heap.begin(), heap.end(), [](const Candidate& a, const Candidate& b) {
+        return a.logit > b.logit;
+    });
+
+    float max_l = heap[0].logit;
+    float inv_t = 1.0f / std::max(temperature, 1e-4f);
+
+    thread_local std::vector<float> probs;
+    probs.resize(heap.size());
     float sum_exp = 0.0f;
-    for (int i = 0; i < n; i++) {
-        float e = std::exp((logits[i] - max_l) * inv_t);
+    for (size_t i = 0; i < heap.size(); i++) {
+        float e = std::exp((heap[i].logit - max_l) * inv_t);
         if (min_p > 0.0f && e < min_p) {
             e = 0.0f;
         }
-        exps[i] = e;
+        probs[i] = e;
         sum_exp += e;
     }
 
     if (sum_exp <= 0.0f) {
-        *out = best_idx;
+        *out = heap[0].idx;
         return;
+    }
+
+    // Apply top_p truncation to prune distribution tail
+    if (top_p > 0.0f && top_p < 1.0f) {
+        float cutoff = top_p * sum_exp;
+        float running = 0.0f;
+        size_t last_valid = 0;
+        for (size_t i = 0; i < probs.size(); i++) {
+            running += probs[i];
+            last_valid = i;
+            if (running >= cutoff) break;
+        }
+        sum_exp = running;
+        probs.resize(last_valid + 1);
+        heap.resize(last_valid + 1);
     }
 
     float target = rand_val * sum_exp;
     float cum = 0.0f;
-    int picked = best_idx;
-    for (int i = 0; i < n; i++) {
-        cum += exps[i];
+    int picked = heap[0].idx;
+    for (size_t i = 0; i < probs.size(); i++) {
+        cum += probs[i];
         if (cum >= target) {
-            picked = i;
+            picked = heap[i].idx;
             break;
         }
     }
