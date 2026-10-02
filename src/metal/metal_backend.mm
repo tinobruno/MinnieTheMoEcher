@@ -2587,7 +2587,7 @@ void qwen2_gqa_decode_fp8_batch_cuda(
                     }
                     float rrms = 1.0f / sqrtf(sum_sq / (float)head_dim + eps);
                     for (int d = 0; d < head_dim; d++) {
-                        k_vec[d] = k_vec[d] * rrms * k_norm_w[d].to_float();
+                        k_vec[d] = k_vec[d] * rrms * (1.0f + k_norm_w[d].to_float());
                     }
                 } else {
                     for (int d = 0; d < head_dim; d++) {
@@ -2650,7 +2650,7 @@ void qwen2_gqa_decode_fp8_batch_cuda(
                 }
                 float rrms = 1.0f / sqrtf(sum_sq / (float)head_dim + eps);
                 for (int d = 0; d < head_dim; d++) {
-                    q_vec[d] = q_vec[d] * rrms * q_norm_w[d].to_float();
+                    q_vec[d] = q_vec[d] * rrms * (1.0f + q_norm_w[d].to_float());
                 }
             } else {
                 for (int d = 0; d < head_dim; d++) {
