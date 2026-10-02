@@ -8324,12 +8324,12 @@ private:
     float current_rep_penalty_ = 1.0f;  // Set per-request by generate()
 
     int sample_token(float temperature, const std::vector<int>& history, int step = 0, bool is_reasoning = true,
-                     int top_k = 40, float top_p = 0.95f, float min_p = 0.05f) {
+                     int top_k = 1024, float top_p = 0.95f, float min_p = 0.05f) {
         return sample_from_logits_ptr(buf_logits_.f32(), temperature, history, step, is_reasoning, top_k, top_p, min_p);
     }
 
     int sample_from_logits_ptr(float* logits_ptr, float temperature, const std::vector<int>& history, int step = 0, bool is_reasoning = true,
-                               int top_k = 40, float top_p = 0.95f, float min_p = 0.05f) {
+                               int top_k = 1024, float top_p = 0.95f, float min_p = 0.05f) {
         int vocab = cfg_.vocab_size;
         static int32_t* h_sample_pin = nullptr;
         if (!h_sample_pin) {
@@ -9544,6 +9544,9 @@ static MultimodalPrompt apply_chat_template_multimodal(
                 bool actual_thinking = enable_thinking && out.image_b64.empty();
                 if (actual_thinking) {
                     auto think_enc = tok.encode("<think>\n");
+                    result.insert(result.end(), think_enc.begin(), think_enc.end());
+                } else {
+                    auto think_enc = tok.encode("<think>\n\n</think>\n");
                     result.insert(result.end(), think_enc.begin(), think_enc.end());
                 }
             }
@@ -12585,15 +12588,10 @@ static void run_server(MoecherEngine& engine, int port, int default_thinking_bud
             float temperature = request.value("temperature", 0.7f);
             float top_p = request.value("top_p", 0.95f);
             float min_p = request.value("min_p", 0.05f);
-            int top_k = request.value("top_k", 40);
-            if (temperature > 0.0f) {
-                if (min_p < 0.05f) min_p = 0.05f;
-                if (top_k <= 0 || top_k > 40) top_k = 40;
-            }
+            int top_k = request.value("top_k", 1024);
             int max_tokens = request.value("max_tokens", 20000);
             bool stream = request.value("stream", false);
-            float repetition_penalty = request.value("repetition_penalty", 1.05f);
-            if (repetition_penalty <= 1.0f) repetition_penalty = 1.05f;
+            float repetition_penalty = request.value("repetition_penalty", 1.0f);
             std::string reasoning_effort = request.value("reasoning_effort", "high");
             bool enable_thinking = true;
             int max_thinking_tokens = default_thinking_budget;
@@ -14228,7 +14226,7 @@ int main(int argc, char** argv) {
         std::vector<int> prompt = apply_chat_template(messages, engine.tokenizer_, test_thinking, "high");
         LOG_INFO("Running test generation for prompt: '%s' (%zu prompt tokens, temp=%.2f, max_tokens=%d, thinking=%d)...",
                  prompt_str.c_str(), prompt.size(), test_temp, test_max_tokens, test_thinking ? 1 : 0);
-        std::string result = engine.generate(prompt, test_max_tokens, test_temp, nullptr, 1.0f, test_thinking, default_thinking_budget, 0.95f, 0.05f, 40);
+        std::string result = engine.generate(prompt, test_max_tokens, test_temp, nullptr, 1.0f, test_thinking, default_thinking_budget, 0.95f, 0.0f, 1024);
         printf("\n\n--- Output ---\n%s\n--------------\n", result.c_str());
         return 0;
     }

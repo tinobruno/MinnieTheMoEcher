@@ -1130,7 +1130,7 @@ void deltanet_linear_attention_decode_batch_cuda(
     __nv_bfloat16* slot_ssm_2, __nv_bfloat16* slot_ssm_3,
     int num_k_heads, int num_v_heads, int head_dim, int M, cudaStream_t stream)
 {
-    (void)stream;
+    metal_stream_synchronize(stream);
     if (!out || !in_qkv || !in_z || !in_a || !in_b || !conv1d_w || !in_conv_state || !in_ssm_state || !norm_w || !A_log || !dt_bias) return;
     int channels = (2 * num_k_heads + num_v_heads) * head_dim;
 
@@ -1442,6 +1442,8 @@ void sample_multinomial_f32_cuda(
     int32_t* out, float* logits, int n, float temperature, float rand_val, float min_p,
     cudaStream_t stream, int top_k, float top_p)
 {
+    (void)top_k;
+    (void)top_p;
     metal_stream_synchronize(stream);
 
     if (temperature <= 0.0f) {
@@ -1457,81 +1459,41 @@ void sample_multinomial_f32_cuda(
         return;
     }
 
-    int k_candidates = (top_k > 0) ? std::min(n, top_k) : std::min(n, 50);
-
-    struct Candidate {
-        float logit;
-        int32_t id;
-        bool operator>(const Candidate& o) const { return logit > o.logit; }
-    };
-    std::vector<Candidate> heap;
-    heap.reserve(k_candidates);
-
-    for (int i = 0; i < k_candidates; i++) {
-        heap.push_back({logits[i], (int32_t)i});
-    }
-    std::make_heap(heap.begin(), heap.end(), std::greater<Candidate>());
-
-    for (int i = k_candidates; i < n; i++) {
-        if (logits[i] > heap.front().logit) {
-            std::pop_heap(heap.begin(), heap.end(), std::greater<Candidate>());
-            heap.back() = {logits[i], (int32_t)i};
-            std::push_heap(heap.begin(), heap.end(), std::greater<Candidate>());
-        }
-    }
-
-    std::sort(heap.begin(), heap.end(), [](const Candidate& a, const Candidate& b) {
-        return a.logit > b.logit;
-    });
-
-    float max_l = heap[0].logit;
     float inv_t = 1.0f / std::max(temperature, 1e-4f);
 
-    std::vector<float> probs(k_candidates);
+    float max_l = logits[0];
+    int best_idx = 0;
+    for (int i = 1; i < n; i++) {
+        if (logits[i] > max_l) {
+            max_l = logits[i];
+            best_idx = i;
+        }
+    }
+
+    thread_local std::vector<float> exps;
+    if ((int)exps.size() < n) exps.resize(n);
     float sum_exp = 0.0f;
-    for (int i = 0; i < k_candidates; i++) {
-        float p = std::exp((heap[i].logit - max_l) * inv_t);
-        probs[i] = p;
-        sum_exp += p;
+    for (int i = 0; i < n; i++) {
+        float e = std::exp((logits[i] - max_l) * inv_t);
+        if (min_p > 0.0f && e < min_p) {
+            e = 0.0f;
+        }
+        exps[i] = e;
+        sum_exp += e;
     }
 
-    float inv_sum = 1.0f / (sum_exp > 0.0f ? sum_exp : 1.0f);
-    float max_p = probs[0] * inv_sum;
-
-    float cutoff = (min_p > 0.0f) ? (max_p * min_p) : 0.0f;
-    float effective_top_p = (top_p > 0.0f && top_p <= 1.0f) ? top_p : 0.95f;
-    float cum_p = 0.0f;
-    float valid_sum = 0.0f;
-    int num_valid = 0;
-
-    for (int i = 0; i < k_candidates; i++) {
-        float p = probs[i] * inv_sum;
-        if (p < cutoff && i > 0) {
-            probs[i] = 0.0f;
-            continue;
-        }
-        cum_p += p;
-        valid_sum += p;
-        num_valid++;
-        if (cum_p >= effective_top_p && i > 0) {
-            for (int j = i + 1; j < k_candidates; j++) probs[j] = 0.0f;
-            break;
-        }
-    }
-
-    if (valid_sum <= 0.0f || num_valid == 0) {
-        *out = heap[0].id;
+    if (sum_exp <= 0.0f) {
+        *out = best_idx;
         return;
     }
 
-    float r = rand_val * valid_sum;
-    float c = 0.0f;
-    int picked = heap[0].id;
-    for (int i = 0; i < k_candidates; i++) {
-        if (probs[i] <= 0.0f) continue;
-        c += probs[i] * inv_sum;
-        if (c >= r) {
-            picked = heap[i].id;
+    float target = rand_val * sum_exp;
+    float cum = 0.0f;
+    int picked = best_idx;
+    for (int i = 0; i < n; i++) {
+        cum += exps[i];
+        if (cum >= target) {
+            picked = i;
             break;
         }
     }
@@ -2592,7 +2554,7 @@ void qwen2_gqa_decode_fp8_batch_cuda(
     int pos_scalar, int M, int max_seq_len, float rope_theta, float eps, const int32_t* d_mrope_pos,
     cudaStream_t stream)
 {
-    (void)stream;
+    metal_stream_synchronize(stream);
     int group_size = n_q_heads / n_kv_heads;
     float scale = 1.0f / sqrtf((float)head_dim);
 
