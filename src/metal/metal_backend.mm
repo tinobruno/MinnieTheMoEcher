@@ -969,8 +969,54 @@ void gemm_int4_batch_cuda(
     __nv_bfloat16* out, const __nv_bfloat16* A, const uint8_t* weight,
     const __nv_bfloat16* scale, int N, int K, int M, cudaStream_t stream)
 {
-    for (int m = 0; m < M; m++) {
-        gemv_int4_cuda(out + m * N, A + m * K, weight, scale, N, K, stream);
+    if (M <= 0) return;
+    if (M == 1) {
+        gemv_int4_cuda(out, A, weight, scale, N, K, stream);
+        return;
+    }
+
+    auto& ctx = MetalContext::instance();
+    MetalStreamObj* s = get_stream(stream);
+    id<MTLComputePipelineState> pso = ctx.get_pipeline("gemm_int4_batch_kernel");
+    if (!pso) {
+        for (int m = 0; m < M; m++) {
+            gemv_int4_cuda(out + m * N, A + m * K, weight, scale, N, K, stream);
+        }
+        return;
+    }
+
+    for (int offset = 0; offset < M; offset += 8) {
+        int cur_m = std::min(8, M - offset);
+        __nv_bfloat16* cur_out = out + (size_t)offset * N;
+        const __nv_bfloat16* cur_A = A + (size_t)offset * K;
+
+        size_t o_off, a_off, w_off, s_off;
+        id<MTLBuffer> b_out = ctx.get_buffer(cur_out, o_off);
+        id<MTLBuffer> b_a = ctx.get_buffer(cur_A, a_off);
+        id<MTLBuffer> b_w = ctx.get_buffer(weight, w_off);
+        id<MTLBuffer> b_s = ctx.get_buffer(scale, s_off);
+
+        if (!b_out || !b_a || !b_w || !b_s) {
+            for (int m = 0; m < cur_m; m++) {
+                gemv_int4_cuda(cur_out + m * N, cur_A + m * K, weight, scale, N, K, stream);
+            }
+            continue;
+        }
+
+        id<MTLComputeCommandEncoder> enc = s->get_encoder();
+        [enc setComputePipelineState:pso];
+        [enc setBuffer:b_out offset:o_off atIndex:0];
+        [enc setBuffer:b_a offset:a_off atIndex:1];
+        [enc setBuffer:b_w offset:w_off atIndex:2];
+        [enc setBuffer:b_s offset:s_off atIndex:3];
+        [enc setBytes:&N length:sizeof(N) atIndex:4];
+        [enc setBytes:&K length:sizeof(K) atIndex:5];
+        [enc setBytes:&cur_m length:sizeof(cur_m) atIndex:6];
+        bool is_res = false;
+        [enc setBytes:&is_res length:sizeof(is_res) atIndex:7];
+
+        [enc dispatchThreadgroups:MTLSizeMake(N, 1, 1) threadsPerThreadgroup:MTLSizeMake(64, 1, 1)];
+        s->end_encoder_and_maybe_commit();
     }
 }
 
@@ -978,8 +1024,52 @@ void gemm_int4_f32_batch_cuda(
     float* out, const __nv_bfloat16* A, const uint8_t* weight,
     const __nv_bfloat16* scale, int N, int K, int M, cudaStream_t stream)
 {
-    for (int m = 0; m < M; m++) {
-        gemv_int4_f32_cuda(out + m * N, A + m * K, weight, scale, N, K, stream);
+    if (M <= 0) return;
+    if (M == 1) {
+        gemv_int4_f32_cuda(out, A, weight, scale, N, K, stream);
+        return;
+    }
+
+    auto& ctx = MetalContext::instance();
+    MetalStreamObj* s = get_stream(stream);
+    id<MTLComputePipelineState> pso = ctx.get_pipeline("gemm_int4_f32_batch_kernel");
+    if (!pso) {
+        for (int m = 0; m < M; m++) {
+            gemv_int4_f32_cuda(out + m * N, A + m * K, weight, scale, N, K, stream);
+        }
+        return;
+    }
+
+    for (int offset = 0; offset < M; offset += 8) {
+        int cur_m = std::min(8, M - offset);
+        float* cur_out = out + (size_t)offset * N;
+        const __nv_bfloat16* cur_A = A + (size_t)offset * K;
+
+        size_t o_off, a_off, w_off, s_off;
+        id<MTLBuffer> b_out = ctx.get_buffer(cur_out, o_off);
+        id<MTLBuffer> b_a = ctx.get_buffer(cur_A, a_off);
+        id<MTLBuffer> b_w = ctx.get_buffer(weight, w_off);
+        id<MTLBuffer> b_s = ctx.get_buffer(scale, s_off);
+
+        if (!b_out || !b_a || !b_w || !b_s) {
+            for (int m = 0; m < cur_m; m++) {
+                gemv_int4_f32_cuda(cur_out + m * N, cur_A + m * K, weight, scale, N, K, stream);
+            }
+            continue;
+        }
+
+        id<MTLComputeCommandEncoder> enc = s->get_encoder();
+        [enc setComputePipelineState:pso];
+        [enc setBuffer:b_out offset:o_off atIndex:0];
+        [enc setBuffer:b_a offset:a_off atIndex:1];
+        [enc setBuffer:b_w offset:w_off atIndex:2];
+        [enc setBuffer:b_s offset:s_off atIndex:3];
+        [enc setBytes:&N length:sizeof(N) atIndex:4];
+        [enc setBytes:&K length:sizeof(K) atIndex:5];
+        [enc setBytes:&cur_m length:sizeof(cur_m) atIndex:6];
+
+        [enc dispatchThreadgroups:MTLSizeMake(N, 1, 1) threadsPerThreadgroup:MTLSizeMake(64, 1, 1)];
+        s->end_encoder_and_maybe_commit();
     }
 }
 
@@ -989,8 +1079,57 @@ void gemm_int4_swiglu_fused_batch_cuda(
     const uint8_t* up_weight, const __nv_bfloat16* up_scale,
     int N, int K, int M, float swiglu_limit, cudaStream_t stream)
 {
-    for (int m = 0; m < M; m++) {
-        gemv_int4_swiglu_fused_cuda(out + m * N, A + m * K, gate_weight, gate_scale, up_weight, up_scale, N, K, swiglu_limit, stream);
+    if (M <= 0) return;
+    if (M == 1) {
+        gemv_int4_swiglu_fused_cuda(out, A, gate_weight, gate_scale, up_weight, up_scale, N, K, swiglu_limit, stream);
+        return;
+    }
+
+    auto& ctx = MetalContext::instance();
+    MetalStreamObj* s = get_stream(stream);
+    id<MTLComputePipelineState> pso = ctx.get_pipeline("gemm_int4_swiglu_fused_batch_kernel");
+    if (!pso) {
+        for (int m = 0; m < M; m++) {
+            gemv_int4_swiglu_fused_cuda(out + m * N, A + m * K, gate_weight, gate_scale, up_weight, up_scale, N, K, swiglu_limit, stream);
+        }
+        return;
+    }
+
+    for (int offset = 0; offset < M; offset += 8) {
+        int cur_m = std::min(8, M - offset);
+        __nv_bfloat16* cur_out = out + (size_t)offset * N;
+        const __nv_bfloat16* cur_A = A + (size_t)offset * K;
+
+        size_t o_off, a_off, gw_off, gs_off, uw_off, us_off;
+        id<MTLBuffer> b_out = ctx.get_buffer(cur_out, o_off);
+        id<MTLBuffer> b_a = ctx.get_buffer(cur_A, a_off);
+        id<MTLBuffer> b_gw = ctx.get_buffer(gate_weight, gw_off);
+        id<MTLBuffer> b_gs = ctx.get_buffer(gate_scale, gs_off);
+        id<MTLBuffer> b_uw = ctx.get_buffer(up_weight, uw_off);
+        id<MTLBuffer> b_us = ctx.get_buffer(up_scale, us_off);
+
+        if (!b_out || !b_a || !b_gw || !b_gs || !b_uw || !b_us) {
+            for (int m = 0; m < cur_m; m++) {
+                gemv_int4_swiglu_fused_cuda(cur_out + m * N, cur_A + m * K, gate_weight, gate_scale, up_weight, up_scale, N, K, swiglu_limit, stream);
+            }
+            continue;
+        }
+
+        id<MTLComputeCommandEncoder> enc = s->get_encoder();
+        [enc setComputePipelineState:pso];
+        [enc setBuffer:b_out offset:o_off atIndex:0];
+        [enc setBuffer:b_a offset:a_off atIndex:1];
+        [enc setBuffer:b_gw offset:gw_off atIndex:2];
+        [enc setBuffer:b_gs offset:gs_off atIndex:3];
+        [enc setBuffer:b_uw offset:uw_off atIndex:4];
+        [enc setBuffer:b_us offset:us_off atIndex:5];
+        [enc setBytes:&N length:sizeof(N) atIndex:6];
+        [enc setBytes:&K length:sizeof(K) atIndex:7];
+        [enc setBytes:&cur_m length:sizeof(cur_m) atIndex:8];
+        [enc setBytes:&swiglu_limit length:sizeof(swiglu_limit) atIndex:9];
+
+        [enc dispatchThreadgroups:MTLSizeMake(N, 1, 1) threadsPerThreadgroup:MTLSizeMake(64, 1, 1)];
+        s->end_encoder_and_maybe_commit();
     }
 }
 
@@ -1093,8 +1232,50 @@ void gemv_bf16_batch_cuda(float* out, const __nv_bfloat16* W, const __nv_bfloat1
 }
 
 void gemv_bf16_out_bf16_batch_cuda(__nv_bfloat16* out, const __nv_bfloat16* W, const __nv_bfloat16* X, int N, int K, int M, cudaStream_t stream) {
-    for (int m = 0; m < M; m++) {
-        gemv_bf16_out_bf16_cuda(out + m * N, W, X + m * K, N, K, stream);
+    if (M <= 0) return;
+    if (M == 1) {
+        gemv_bf16_out_bf16_cuda(out, W, X, N, K, stream);
+        return;
+    }
+
+    auto& ctx = MetalContext::instance();
+    MetalStreamObj* s = get_stream(stream);
+    id<MTLComputePipelineState> pso = ctx.get_pipeline("gemv_bf16_out_bf16_batch_kernel");
+    if (!pso) {
+        for (int m = 0; m < M; m++) {
+            gemv_bf16_out_bf16_cuda(out + m * N, W, X + m * K, N, K, stream);
+        }
+        return;
+    }
+
+    for (int offset = 0; offset < M; offset += 8) {
+        int cur_m = std::min(8, M - offset);
+        __nv_bfloat16* cur_out = out + (size_t)offset * N;
+        const __nv_bfloat16* cur_X = X + (size_t)offset * K;
+
+        size_t o_off, w_off, x_off;
+        id<MTLBuffer> b_out = ctx.get_buffer(cur_out, o_off);
+        id<MTLBuffer> b_w = ctx.get_buffer(W, w_off);
+        id<MTLBuffer> b_x = ctx.get_buffer(cur_X, x_off);
+
+        if (!b_out || !b_w || !b_x) {
+            for (int m = 0; m < cur_m; m++) {
+                gemv_bf16_out_bf16_cuda(cur_out + m * N, W, cur_X + m * K, N, K, stream);
+            }
+            continue;
+        }
+
+        id<MTLComputeCommandEncoder> enc = s->get_encoder();
+        [enc setComputePipelineState:pso];
+        [enc setBuffer:b_out offset:o_off atIndex:0];
+        [enc setBuffer:b_w offset:w_off atIndex:1];
+        [enc setBuffer:b_x offset:x_off atIndex:2];
+        [enc setBytes:&N length:sizeof(N) atIndex:3];
+        [enc setBytes:&K length:sizeof(K) atIndex:4];
+        [enc setBytes:&cur_m length:sizeof(cur_m) atIndex:5];
+
+        [enc dispatchThreadgroups:MTLSizeMake(N, 1, 1) threadsPerThreadgroup:MTLSizeMake(64, 1, 1)];
+        s->end_encoder_and_maybe_commit();
     }
 }
 
@@ -1118,6 +1299,14 @@ void f32_to_bf16_cuda(__nv_bfloat16* out, const float* in, int n, cudaStream_t s
     for (int i = 0; i < n; i++) out[i] = __nv_bfloat16::from_float(in[i]);
 }
 
+void deltanet_linear_attention_decode_cuda(
+    __nv_bfloat16* out, const __nv_bfloat16* in_qkv, const __nv_bfloat16* in_z,
+    const __nv_bfloat16* in_a, const __nv_bfloat16* in_b,
+    const __nv_bfloat16* conv1d_w, const __nv_bfloat16* in_conv_state, __nv_bfloat16* out_conv_state,
+    const __nv_bfloat16* A_log, const __nv_bfloat16* dt_bias, const __nv_bfloat16* norm_w,
+    const __nv_bfloat16* in_ssm_state, __nv_bfloat16* out_ssm_state,
+    int num_k_heads, int num_v_heads, int head_dim, cudaStream_t stream);
+
 void deltanet_linear_attention_decode_batch_cuda(
     __nv_bfloat16* out, const __nv_bfloat16* in_qkv, const __nv_bfloat16* in_z,
     const __nv_bfloat16* in_a, const __nv_bfloat16* in_b,
@@ -1130,10 +1319,50 @@ void deltanet_linear_attention_decode_batch_cuda(
     __nv_bfloat16* slot_ssm_2, __nv_bfloat16* slot_ssm_3,
     int num_k_heads, int num_v_heads, int head_dim, int M, cudaStream_t stream)
 {
+    if (M <= 0) return;
+    auto& ctx = MetalContext::instance();
+    MetalStreamObj* s = get_stream(stream);
+    id<MTLComputePipelineState> pso_conv = ctx.get_pipeline("deltanet_conv_kernel");
+    id<MTLComputePipelineState> pso_ssm = ctx.get_pipeline("deltanet_ssm_step_kernel");
+    int channels = (2 * num_k_heads + num_v_heads) * head_dim;
+    int z_stride = num_v_heads * head_dim;
+
+    size_t o_off, qkv_off, z_off, a_off, b_off, cw_off, ics_off, ocs_off, al_off, dt_off, nw_off, issm_off, ossm_off;
+    id<MTLBuffer> b_out = ctx.get_buffer(out, o_off);
+    id<MTLBuffer> b_qkv = ctx.get_buffer(in_qkv, qkv_off);
+    id<MTLBuffer> b_z = ctx.get_buffer(in_z, z_off);
+    id<MTLBuffer> b_a = ctx.get_buffer(in_a, a_off);
+    id<MTLBuffer> b_b = ctx.get_buffer(in_b, b_off);
+    id<MTLBuffer> b_cw = ctx.get_buffer(conv1d_w, cw_off);
+    id<MTLBuffer> b_ics = ctx.get_buffer(in_conv_state, ics_off);
+    id<MTLBuffer> b_ocs = ctx.get_buffer(out_conv_state, ocs_off);
+    id<MTLBuffer> b_al = ctx.get_buffer(A_log, al_off);
+    id<MTLBuffer> b_dt = ctx.get_buffer(dt_bias, dt_off);
+    id<MTLBuffer> b_nw = ctx.get_buffer(norm_w, nw_off);
+    id<MTLBuffer> b_issm = ctx.get_buffer(in_ssm_state, issm_off);
+    id<MTLBuffer> b_ossm = ctx.get_buffer(out_ssm_state, ossm_off);
+
+    if (pso_conv && pso_ssm && b_out && b_qkv && b_z && b_a && b_b && b_cw && b_ics && b_ocs && b_al && b_dt && b_nw && b_issm && b_ossm) {
+        for (int m = 0; m < M; m++) {
+            deltanet_linear_attention_decode_cuda(
+                out + (size_t)m * z_stride,
+                in_qkv + (size_t)m * channels,
+                in_z + (size_t)m * z_stride,
+                in_a + (size_t)m * num_v_heads,
+                in_b + (size_t)m * num_v_heads,
+                conv1d_w,
+                (m == 0) ? in_conv_state : out_conv_state,
+                out_conv_state,
+                A_log, dt_bias, norm_w,
+                (m == 0) ? in_ssm_state : out_ssm_state,
+                out_ssm_state,
+                num_k_heads, num_v_heads, head_dim, stream);
+        }
+        return;
+    }
+
     metal_stream_synchronize(stream);
     if (!out || !in_qkv || !in_z || !in_a || !in_b || !conv1d_w || !in_conv_state || !in_ssm_state || !norm_w || !A_log || !dt_bias) return;
-    int channels = (2 * num_k_heads + num_v_heads) * head_dim;
-
     // 1. Conv1D 1x4 depthwise causal convolution across M tokens
     std::vector<__nv_bfloat16> conv_out((size_t)M * channels);
     __nv_bfloat16* conv_out_ptr = conv_out.data();
@@ -1199,8 +1428,6 @@ void deltanet_linear_attention_decode_batch_cuda(
 
     // 2. SSM Recurrence per head across M tokens
     int qkv_stride = channels;
-    int z_stride = num_v_heads * head_dim;
-
     dispatch_apply(num_v_heads, dispatch_get_global_queue(QOS_CLASS_USER_INTERACTIVE, 0), ^(size_t h) {
         int k_h = (int)h / (num_v_heads / num_k_heads);
         const __nv_bfloat16* in_state_h = in_ssm_state + h * head_dim * head_dim;
@@ -3257,14 +3484,109 @@ void gemv_int3_swiglu_fused_cuda(__nv_bfloat16* out, const __nv_bfloat16* vec, c
 }
 
 void gemm_int3_batch_cuda(__nv_bfloat16* out, const __nv_bfloat16* A, const uint8_t* weight, const __nv_bfloat16* scale, int N, int K, int M, cudaStream_t stream) {
-    for (int m = 0; m < M; m++) {
-        gemv_int3_cuda(out + m * N, A + m * K, weight, scale, N, K, stream);
+    if (M <= 0) return;
+    if (M == 1) {
+        gemv_int3_cuda(out, A, weight, scale, N, K, stream);
+        return;
+    }
+
+    auto& ctx = MetalContext::instance();
+    MetalStreamObj* s = get_stream(stream);
+    id<MTLComputePipelineState> pso = ctx.get_pipeline("gemm_int3_batch_kernel");
+    if (!pso) {
+        for (int m = 0; m < M; m++) {
+            gemv_int3_cuda(out + m * N, A + m * K, weight, scale, N, K, stream);
+        }
+        return;
+    }
+
+    for (int offset = 0; offset < M; offset += 8) {
+        int cur_m = std::min(8, M - offset);
+        __nv_bfloat16* cur_out = out + (size_t)offset * N;
+        const __nv_bfloat16* cur_A = A + (size_t)offset * K;
+
+        size_t o_off, a_off, w_off, s_off;
+        id<MTLBuffer> b_out = ctx.get_buffer(cur_out, o_off);
+        id<MTLBuffer> b_a = ctx.get_buffer(cur_A, a_off);
+        id<MTLBuffer> b_w = ctx.get_buffer(weight, w_off);
+        id<MTLBuffer> b_s = ctx.get_buffer(scale, s_off);
+
+        if (!b_out || !b_a || !b_w || !b_s) {
+            for (int m = 0; m < cur_m; m++) {
+                gemv_int3_cuda(cur_out + m * N, cur_A + m * K, weight, scale, N, K, stream);
+            }
+            continue;
+        }
+
+        id<MTLComputeCommandEncoder> enc = s->get_encoder();
+        [enc setComputePipelineState:pso];
+        [enc setBuffer:b_out offset:o_off atIndex:0];
+        [enc setBuffer:b_a offset:a_off atIndex:1];
+        [enc setBuffer:b_w offset:w_off atIndex:2];
+        [enc setBuffer:b_s offset:s_off atIndex:3];
+        [enc setBytes:&N length:sizeof(N) atIndex:4];
+        [enc setBytes:&K length:sizeof(K) atIndex:5];
+        [enc setBytes:&cur_m length:sizeof(cur_m) atIndex:6];
+        bool is_res = false;
+        [enc setBytes:&is_res length:sizeof(is_res) atIndex:7];
+
+        [enc dispatchThreadgroups:MTLSizeMake(N, 1, 1) threadsPerThreadgroup:MTLSizeMake(64, 1, 1)];
+        s->end_encoder_and_maybe_commit();
     }
 }
 
 void gemm_int3_swiglu_fused_batch_cuda(__nv_bfloat16* out, const __nv_bfloat16* A, const uint8_t* gate_weight, const __nv_bfloat16* gate_scale, const uint8_t* up_weight, const __nv_bfloat16* up_scale, int N, int K, int M, float swiglu_limit, cudaStream_t stream) {
-    for (int m = 0; m < M; m++) {
-        gemv_int3_swiglu_fused_cuda(out + m * N, A + m * K, gate_weight, gate_scale, up_weight, up_scale, N, K, swiglu_limit, stream);
+    if (M <= 0) return;
+    if (M == 1) {
+        gemv_int3_swiglu_fused_cuda(out, A, gate_weight, gate_scale, up_weight, up_scale, N, K, swiglu_limit, stream);
+        return;
+    }
+
+    auto& ctx = MetalContext::instance();
+    MetalStreamObj* s = get_stream(stream);
+    id<MTLComputePipelineState> pso = ctx.get_pipeline("gemm_int3_swiglu_fused_batch_kernel");
+    if (!pso) {
+        for (int m = 0; m < M; m++) {
+            gemv_int3_swiglu_fused_cuda(out + m * N, A + m * K, gate_weight, gate_scale, up_weight, up_scale, N, K, swiglu_limit, stream);
+        }
+        return;
+    }
+
+    for (int offset = 0; offset < M; offset += 8) {
+        int cur_m = std::min(8, M - offset);
+        __nv_bfloat16* cur_out = out + (size_t)offset * N;
+        const __nv_bfloat16* cur_A = A + (size_t)offset * K;
+
+        size_t o_off, a_off, gw_off, gs_off, uw_off, us_off;
+        id<MTLBuffer> b_out = ctx.get_buffer(cur_out, o_off);
+        id<MTLBuffer> b_a = ctx.get_buffer(cur_A, a_off);
+        id<MTLBuffer> b_gw = ctx.get_buffer(gate_weight, gw_off);
+        id<MTLBuffer> b_gs = ctx.get_buffer(gate_scale, gs_off);
+        id<MTLBuffer> b_uw = ctx.get_buffer(up_weight, uw_off);
+        id<MTLBuffer> b_us = ctx.get_buffer(up_scale, us_off);
+
+        if (!b_out || !b_a || !b_gw || !b_gs || !b_uw || !b_us) {
+            for (int m = 0; m < cur_m; m++) {
+                gemv_int3_swiglu_fused_cuda(cur_out + m * N, cur_A + m * K, gate_weight, gate_scale, up_weight, up_scale, N, K, swiglu_limit, stream);
+            }
+            continue;
+        }
+
+        id<MTLComputeCommandEncoder> enc = s->get_encoder();
+        [enc setComputePipelineState:pso];
+        [enc setBuffer:b_out offset:o_off atIndex:0];
+        [enc setBuffer:b_a offset:a_off atIndex:1];
+        [enc setBuffer:b_gw offset:gw_off atIndex:2];
+        [enc setBuffer:b_gs offset:gs_off atIndex:3];
+        [enc setBuffer:b_uw offset:uw_off atIndex:4];
+        [enc setBuffer:b_us offset:us_off atIndex:5];
+        [enc setBytes:&N length:sizeof(N) atIndex:6];
+        [enc setBytes:&K length:sizeof(K) atIndex:7];
+        [enc setBytes:&cur_m length:sizeof(cur_m) atIndex:8];
+        [enc setBytes:&swiglu_limit length:sizeof(swiglu_limit) atIndex:9];
+
+        [enc dispatchThreadgroups:MTLSizeMake(N, 1, 1) threadsPerThreadgroup:MTLSizeMake(64, 1, 1)];
+        s->end_encoder_and_maybe_commit();
     }
 }
 void gemv_fp4_cuda(__nv_bfloat16* out, const __nv_bfloat16* vec, const uint8_t* weight, const uint8_t* scale, int N, int K, cudaStream_t stream) {

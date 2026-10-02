@@ -4564,11 +4564,6 @@ public:
         auto prefill_start_time = std::chrono::steady_clock::now();
 
         if (cfg_.is_qwen()) {
-#ifdef __APPLE__
-            for (size_t i = 0; i < prefix_tokens.size(); i++) {
-                forward_token_eager(prefix_tokens[i], (int)i, /*compute_logits_flag=*/false);
-            }
-#else
             size_t curr = 0;
             while (curr < prefix_tokens.size()) {
                 size_t remaining = prefix_tokens.size() - curr;
@@ -4580,7 +4575,6 @@ public:
                 forward_token_batch_qwen_device_body((int)curr, chunk_m, /*compute_logits=*/false);
                 curr += chunk_m;
             }
-#endif
         } else {
             // ModelArch::DEEPSEEK_V4
             if (enable_batched_prefill_ && prefix_tokens.size() > 1) {
@@ -4772,14 +4766,33 @@ public:
             bool draft_model_active = (!mtp_drafter_.loaded_ && qwen_draft_.loaded_);
 
             if (cfg_.is_qwen()) {
-                for (size_t curr = prefix_len; curr < prompt.size(); curr++) {
-                    bool need_logits = (curr == prompt.size() - 1);
-                    forward_token_eager(prompt[curr], (int)curr, need_logits);
-                    if (draft_model_active) {
-                        qwen_draft_.forward_token_async_pinned(&h_prefill_tok_[curr],
-                                                               &h_prefill_pos_[curr],
-                                                               (int)curr, main_stream_);
+                size_t curr = prefix_len;
+                while (curr < prompt.size()) {
+                    size_t remaining = prompt.size() - curr;
+                    int chunk_m = (remaining >= 8) ? 8 : (int)remaining;
+                    bool need_logits = (curr + chunk_m == prompt.size());
+
+                    CUDA_CHECK(cudaMemcpyAsync(buf_input_pos_batch_.i32(), &h_prefill_pos_[curr],
+                                               chunk_m * sizeof(int32_t), cudaMemcpyHostToDevice, main_stream_));
+                    CUDA_CHECK(cudaMemcpyAsync(buf_input_tokens_batch_.i32(), &h_prefill_tok_[curr],
+                                               chunk_m * sizeof(int32_t), cudaMemcpyHostToDevice, main_stream_));
+                    forward_token_batch_qwen_device_body((int)curr, chunk_m, need_logits);
+
+                    if (need_logits) {
+                        CUDA_CHECK(cudaMemcpyAsync(buf_logits_.f32(),
+                                                   buf_logits_batch_.f32() + (size_t)(chunk_m - 1) * cfg_.vocab_size,
+                                                   cfg_.vocab_size * sizeof(float),
+                                                   cudaMemcpyDeviceToDevice, main_stream_));
                     }
+
+                    if (draft_model_active) {
+                        for (int m = 0; m < chunk_m; m++) {
+                            qwen_draft_.forward_token_async_pinned(&h_prefill_tok_[curr + m],
+                                                                   &h_prefill_pos_[curr + m],
+                                                                   (int)(curr + m), main_stream_);
+                        }
+                    }
+                    curr += chunk_m;
                 }
             } else {
                 // ModelArch::DEEPSEEK_V4
