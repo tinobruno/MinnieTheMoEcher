@@ -661,6 +661,15 @@ void gemv_bf16_batch_cuda(
     int N, int K, int M,
     cudaStream_t stream = 0);
 
+void deltanet_in_proj_ab_batch_cuda(
+    __nv_bfloat16* out_a,
+    __nv_bfloat16* out_b,
+    const __nv_bfloat16* Wa,
+    const __nv_bfloat16* Wb,
+    const __nv_bfloat16* X,
+    int N, int K, int M,
+    cudaStream_t stream = 0);
+
 void gemv_bf16_out_bf16_batch_cuda(
     __nv_bfloat16* out,            // [M, N] BF16 output
     const __nv_bfloat16* W,        // [N, K] BF16 weight matrix (row-major)

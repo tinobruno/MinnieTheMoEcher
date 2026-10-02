@@ -1539,67 +1539,78 @@ kernel void qwen_gqa_compute_attn_fp8_batch_kernel(
 // ============================================================================
 
 kernel void gemm_int4_batch_kernel(
-    device bfloat* out [[buffer(0)]],
-    device const bfloat* A [[buffer(1)]],
-    device const uint8_t* weight [[buffer(2)]],
-    device const bfloat* scale [[buffer(3)]],
+    device bfloat* C [[buffer(0)]],            // [M, N]
+    device const bfloat* A [[buffer(1)]],      // [M, K]
+    device const uint8_t* W [[buffer(2)]],     // [N, K/2]
+    device const bfloat* scales [[buffer(3)]], // [N, K/32]
     constant int& N [[buffer(4)]],
     constant int& K [[buffer(5)]],
     constant int& M [[buffer(6)]],
     constant bool& is_residual [[buffer(7)]],
-    uint row [[threadgroup_position_in_grid]],
-    uint tid [[thread_position_in_threadgroup]],
-    uint threads_per_group [[threads_per_threadgroup]])
+    uint3 tg_pos [[threadgroup_position_in_grid]],
+    uint3 tid_in_tg [[thread_position_in_threadgroup]])
 {
-    if (row >= uint(N)) return;
+    uint tid = tid_in_tg.x;
+    uint n_block = tg_pos.x; // tile of 32 output channels
+    uint m_block = tg_pos.y; // tile of 8 tokens
+
+    uint n_base = n_block * 32;
+    uint m_base = m_block * 8;
+
+    uint col = tid & 31;      // output channel (0..31) in tile
+    uint simd_id = tid >> 5;  // 0 or 1 (splits K reduction across 2 SIMD-groups)
+
+    uint global_n = n_base + col;
+    if (global_n >= uint(N) || m_base >= uint(M)) return;
+
     int num_blocks = K / 32;
-    int eff_M = min(M, 8);
+    device const uint8_t* row_w = W + global_n * (K / 2);
+    device const bfloat* row_s = scales + global_n * num_blocks;
 
-    device const bfloat* row_scales = scale + row * num_blocks;
-    device const uint8_t* row_w = weight + row * (K / 2);
+    float acc[8] = {0.0f};
 
-    float sum[8] = {0.0f};
+    for (int b = simd_id; b < num_blocks; b += 2) {
+        float s = float(row_s[b]);
+        int w_offset = b * 16;
+        int a_offset = b * 32;
 
-    for (int block = tid; block < num_blocks; block += threads_per_group) {
-        float s = float(row_scales[block]);
-        int w_offset = block * 16;
-        int a_offset = block * 32;
-
+        float qw[32];
         for (int i = 0; i < 16; i++) {
             uint8_t byte_val = row_w[w_offset + i];
-            float q0 = (float(byte_val & 0x0F) - 8.0f) * s;
-            float q1 = (float(byte_val >> 4) - 8.0f) * s;
-            int a_idx = a_offset + i * 2;
+            qw[i * 2 + 0] = (float(byte_val & 0x0F) - 8.0f) * s;
+            qw[i * 2 + 1] = (float(byte_val >> 4) - 8.0f) * s;
+        }
 
-            for (int m = 0; m < eff_M; m++) {
-                device const bfloat* vec_m = A + (size_t)m * K + a_idx;
-                sum[m] += q0 * float(vec_m[0]) + q1 * float(vec_m[1]);
+        #pragma unroll
+        for (int m = 0; m < 8; m++) {
+            uint cur_m = m_base + m;
+            if (cur_m < uint(M)) {
+                device const bfloat* a_ptr = A + (size_t)cur_m * K + a_offset;
+                float sum = 0.0f;
+                #pragma unroll
+                for (int i = 0; i < 32; i++) {
+                    sum += qw[i] * float(a_ptr[i]);
+                }
+                acc[m] += sum;
             }
         }
     }
 
-    threadgroup float sdata[8][32];
-    uint simd_lane = tid & 31;
-    uint simd_id = tid >> 5;
-
-    for (int m = 0; m < eff_M; m++) {
-        float s_val = simd_sum(sum[m]);
-        if (simd_lane == 0) {
-            sdata[m][simd_id] = s_val;
-        }
+    threadgroup float s_acc[8][64];
+    for (int m = 0; m < 8; m++) {
+        s_acc[m][tid] = acc[m];
     }
     threadgroup_barrier(mem_flags::mem_threadgroup);
 
     if (simd_id == 0) {
-        uint num_simd = threads_per_group >> 5;
-        for (int m = 0; m < eff_M; m++) {
-            float total = (simd_lane < num_simd) ? sdata[m][simd_lane] : 0.0f;
-            total = simd_sum(total);
-            if (simd_lane == 0) {
+        for (int m = 0; m < 8; m++) {
+            uint cur_m = m_base + m;
+            if (cur_m < uint(M)) {
+                float total = s_acc[m][col] + s_acc[m][col + 32];
                 if (is_residual) {
-                    out[(size_t)m * N + row] = bfloat(float(out[(size_t)m * N + row]) + total);
+                    C[(size_t)cur_m * N + global_n] = bfloat(float(C[(size_t)cur_m * N + global_n]) + total);
                 } else {
-                    out[(size_t)m * N + row] = bfloat(total);
+                    C[(size_t)cur_m * N + global_n] = bfloat(total);
                 }
             }
         }
@@ -1607,140 +1618,161 @@ kernel void gemm_int4_batch_kernel(
 }
 
 kernel void gemm_int4_f32_batch_kernel(
-    device float* out [[buffer(0)]],
-    device const bfloat* A [[buffer(1)]],
-    device const uint8_t* weight [[buffer(2)]],
-    device const bfloat* scale [[buffer(3)]],
+    device float* C [[buffer(0)]],             // [M, N]
+    device const bfloat* A [[buffer(1)]],      // [M, K]
+    device const uint8_t* W [[buffer(2)]],     // [N, K/2]
+    device const bfloat* scales [[buffer(3)]], // [N, K/32]
     constant int& N [[buffer(4)]],
     constant int& K [[buffer(5)]],
     constant int& M [[buffer(6)]],
-    uint row [[threadgroup_position_in_grid]],
-    uint tid [[thread_position_in_threadgroup]],
-    uint threads_per_group [[threads_per_threadgroup]])
+    uint3 tg_pos [[threadgroup_position_in_grid]],
+    uint3 tid_in_tg [[thread_position_in_threadgroup]])
 {
-    if (row >= uint(N)) return;
+    uint tid = tid_in_tg.x;
+    uint n_block = tg_pos.x; // tile of 32 output channels
+    uint m_block = tg_pos.y; // tile of 8 tokens
+
+    uint n_base = n_block * 32;
+    uint m_base = m_block * 8;
+
+    uint col = tid & 31;
+    uint simd_id = tid >> 5;
+
+    uint global_n = n_base + col;
+    if (global_n >= uint(N) || m_base >= uint(M)) return;
+
     int num_blocks = K / 32;
-    int eff_M = min(M, 8);
+    device const uint8_t* row_w = W + global_n * (K / 2);
+    device const bfloat* row_s = scales + global_n * num_blocks;
 
-    device const bfloat* row_scales = scale + row * num_blocks;
-    device const uint8_t* row_w = weight + row * (K / 2);
+    float acc[8] = {0.0f};
 
-    float sum[8] = {0.0f};
+    for (int b = simd_id; b < num_blocks; b += 2) {
+        float s = float(row_s[b]);
+        int w_offset = b * 16;
+        int a_offset = b * 32;
 
-    for (int block = tid; block < num_blocks; block += threads_per_group) {
-        float s = float(row_scales[block]);
-        int w_offset = block * 16;
-        int a_offset = block * 32;
-
+        float qw[32];
         for (int i = 0; i < 16; i++) {
             uint8_t byte_val = row_w[w_offset + i];
-            float q0 = (float(byte_val & 0x0F) - 8.0f) * s;
-            float q1 = (float(byte_val >> 4) - 8.0f) * s;
-            int a_idx = a_offset + i * 2;
+            qw[i * 2 + 0] = (float(byte_val & 0x0F) - 8.0f) * s;
+            qw[i * 2 + 1] = (float(byte_val >> 4) - 8.0f) * s;
+        }
 
-            for (int m = 0; m < eff_M; m++) {
-                device const bfloat* vec_m = A + (size_t)m * K + a_idx;
-                sum[m] += q0 * float(vec_m[0]) + q1 * float(vec_m[1]);
+        #pragma unroll
+        for (int m = 0; m < 8; m++) {
+            uint cur_m = m_base + m;
+            if (cur_m < uint(M)) {
+                device const bfloat* a_ptr = A + (size_t)cur_m * K + a_offset;
+                float sum = 0.0f;
+                #pragma unroll
+                for (int i = 0; i < 32; i++) {
+                    sum += qw[i] * float(a_ptr[i]);
+                }
+                acc[m] += sum;
             }
         }
     }
 
-    threadgroup float sdata[8][32];
-    uint simd_lane = tid & 31;
-    uint simd_id = tid >> 5;
-
-    for (int m = 0; m < eff_M; m++) {
-        float s_val = simd_sum(sum[m]);
-        if (simd_lane == 0) {
-            sdata[m][simd_id] = s_val;
-        }
+    threadgroup float s_acc[8][64];
+    for (int m = 0; m < 8; m++) {
+        s_acc[m][tid] = acc[m];
     }
     threadgroup_barrier(mem_flags::mem_threadgroup);
 
     if (simd_id == 0) {
-        uint num_simd = threads_per_group >> 5;
-        for (int m = 0; m < eff_M; m++) {
-            float total = (simd_lane < num_simd) ? sdata[m][simd_lane] : 0.0f;
-            total = simd_sum(total);
-            if (simd_lane == 0) {
-                out[(size_t)m * N + row] = total;
+        for (int m = 0; m < 8; m++) {
+            uint cur_m = m_base + m;
+            if (cur_m < uint(M)) {
+                float total = s_acc[m][col] + s_acc[m][col + 32];
+                C[(size_t)cur_m * N + global_n] = total;
             }
         }
     }
 }
 
 kernel void gemm_int3_batch_kernel(
-    device bfloat* out [[buffer(0)]],
-    device const bfloat* A [[buffer(1)]],
-    device const uint8_t* weight [[buffer(2)]],
-    device const bfloat* scale [[buffer(3)]],
+    device bfloat* C [[buffer(0)]],            // [M, N]
+    device const bfloat* A [[buffer(1)]],      // [M, K]
+    device const uint8_t* W [[buffer(2)]],     // [N, K * 3 / 8]
+    device const bfloat* scales [[buffer(3)]], // [N, K / 32]
     constant int& N [[buffer(4)]],
     constant int& K [[buffer(5)]],
     constant int& M [[buffer(6)]],
     constant bool& is_residual [[buffer(7)]],
-    uint row [[threadgroup_position_in_grid]],
-    uint tid [[thread_position_in_threadgroup]],
-    uint threads_per_group [[threads_per_threadgroup]])
+    uint3 tg_pos [[threadgroup_position_in_grid]],
+    uint3 tid_in_tg [[thread_position_in_threadgroup]])
 {
-    if (row >= uint(N)) return;
-    int blocks_per_row = K / 32;
-    int eff_M = min(M, 8);
+    uint tid = tid_in_tg.x;
+    uint n_block = tg_pos.x; // tile of 32 output channels
+    uint m_block = tg_pos.y; // tile of 8 tokens
 
-    device const bfloat* row_s = scale + row * blocks_per_row;
-    device const uint8_t* row_w = weight + size_t(row) * (size_t(K) * 3 / 8);
+    uint n_base = n_block * 32;
+    uint m_base = m_block * 8;
 
-    float sum[8] = {0.0f};
+    uint col = tid & 31;      // output channel (0..31) in tile
+    uint simd_id = tid >> 5;  // 0 or 1 (splits K reduction across 2 SIMD-groups)
 
-    for (int b = tid; b < blocks_per_row; b += threads_per_group) {
+    uint global_n = n_base + col;
+    if (global_n >= uint(N) || m_base >= uint(M)) return;
+
+    int num_blocks = K / 32;
+    device const uint8_t* row_w = W + (size_t)global_n * ((size_t)K * 3 / 8);
+    device const bfloat* row_s = scales + global_n * num_blocks;
+
+    float acc[8] = {0.0f};
+
+    for (int b = simd_id; b < num_blocks; b += 2) {
         float s = float(row_s[b]);
-        device const uint8_t* blk_w = row_w + b * 12;
+        int w_offset = b * 12;
         int a_offset = b * 32;
 
+        float qw[32];
         for (int i = 0; i < 4; i++) {
-            uint8_t b0 = blk_w[i * 3 + 0];
-            uint8_t b1 = blk_w[i * 3 + 1];
-            uint8_t b2 = blk_w[i * 3 + 2];
+            uint8_t b0 = row_w[w_offset + i * 3 + 0];
+            uint8_t b1 = row_w[w_offset + i * 3 + 1];
+            uint8_t b2 = row_w[w_offset + i * 3 + 2];
 
-            float w0 = (float(b0 & 0x07) - 4.0f) * s;
-            float w1 = (float((b0 >> 3) & 0x07) - 4.0f) * s;
-            float w2 = (float((b0 >> 6) | ((b1 & 0x01) << 2)) - 4.0f) * s;
-            float w3 = (float((b1 >> 1) & 0x07) - 4.0f) * s;
-            float w4 = (float((b1 >> 4) & 0x07) - 4.0f) * s;
-            float w5 = (float((b1 >> 7) | ((b2 & 0x03) << 1)) - 4.0f) * s;
-            float w6 = (float((b2 >> 2) & 0x07) - 4.0f) * s;
-            float w7 = (float((b2 >> 5) & 0x07) - 4.0f) * s;
+            qw[i * 8 + 0] = ((float)(b0 & 0x07) - 4.0f) * s;
+            qw[i * 8 + 1] = ((float)((b0 >> 3) & 0x07) - 4.0f) * s;
+            qw[i * 8 + 2] = ((float)((b0 >> 6) | ((b1 & 0x01) << 2)) - 4.0f) * s;
+            qw[i * 8 + 3] = ((float)((b1 >> 1) & 0x07) - 4.0f) * s;
+            qw[i * 8 + 4] = ((float)((b1 >> 4) & 0x07) - 4.0f) * s;
+            qw[i * 8 + 5] = ((float)((b1 >> 7) | ((b2 & 0x03) << 1)) - 4.0f) * s;
+            qw[i * 8 + 6] = ((float)((b2 >> 2) & 0x07) - 4.0f) * s;
+            qw[i * 8 + 7] = ((float)((b2 >> 5) & 0x07) - 4.0f) * s;
+        }
 
-            int a_sub = a_offset + i * 8;
-            for (int m = 0; m < eff_M; m++) {
-                device const bfloat* v = A + (size_t)m * K + a_sub;
-                sum[m] += w0 * float(v[0]) + w1 * float(v[1]) + w2 * float(v[2]) + w3 * float(v[3])
-                        + w4 * float(v[4]) + w5 * float(v[5]) + w6 * float(v[6]) + w7 * float(v[7]);
+        #pragma unroll
+        for (int m = 0; m < 8; m++) {
+            uint cur_m = m_base + m;
+            if (cur_m < uint(M)) {
+                device const bfloat* a_ptr = A + (size_t)cur_m * K + a_offset;
+                float sum = 0.0f;
+                #pragma unroll
+                for (int i = 0; i < 32; i++) {
+                    sum += qw[i] * float(a_ptr[i]);
+                }
+                acc[m] += sum;
             }
         }
     }
 
-    threadgroup float sdata[8][32];
-    uint simd_lane = tid & 31;
-    uint simd_id = tid >> 5;
-
-    for (int m = 0; m < eff_M; m++) {
-        float s_val = simd_sum(sum[m]);
-        if (simd_lane == 0) {
-            sdata[m][simd_id] = s_val;
-        }
+    threadgroup float s_acc[8][64];
+    for (int m = 0; m < 8; m++) {
+        s_acc[m][tid] = acc[m];
     }
     threadgroup_barrier(mem_flags::mem_threadgroup);
 
     if (simd_id == 0) {
-        uint num_simd = threads_per_group >> 5;
-        for (int m = 0; m < eff_M; m++) {
-            float total = (simd_lane < num_simd) ? sdata[m][simd_lane] : 0.0f;
-            total = simd_sum(total);
-            if (simd_lane == 0) {
+        for (int m = 0; m < 8; m++) {
+            uint cur_m = m_base + m;
+            if (cur_m < uint(M)) {
+                float total = s_acc[m][col] + s_acc[m][col + 32];
                 if (is_residual) {
-                    out[(size_t)m * N + row] = bfloat(float(out[(size_t)m * N + row]) + total);
+                    C[(size_t)cur_m * N + global_n] = bfloat(float(C[(size_t)cur_m * N + global_n]) + total);
                 } else {
-                    out[(size_t)m * N + row] = bfloat(total);
+                    C[(size_t)cur_m * N + global_n] = bfloat(total);
                 }
             }
         }
@@ -1748,101 +1780,115 @@ kernel void gemm_int3_batch_kernel(
 }
 
 kernel void gemm_int3_swiglu_fused_batch_kernel(
-    device bfloat* out [[buffer(0)]],
-    device const bfloat* A [[buffer(1)]],
-    device const uint8_t* gate_w [[buffer(2)]],
-    device const bfloat* gate_s [[buffer(3)]],
-    device const uint8_t* up_w [[buffer(4)]],
-    device const bfloat* up_s [[buffer(5)]],
+    device bfloat* out [[buffer(0)]],                  // [M, N]
+    device const bfloat* A [[buffer(1)]],              // [M, K]
+    device const uint8_t* gate_weight [[buffer(2)]],   // [N, K * 3 / 8]
+    device const bfloat* gate_scale [[buffer(3)]],     // [N, K / 32]
+    device const uint8_t* up_weight [[buffer(4)]],     // [N, K * 3 / 8]
+    device const bfloat* up_scale [[buffer(5)]],       // [N, K / 32]
     constant int& N [[buffer(6)]],
     constant int& K [[buffer(7)]],
     constant int& M [[buffer(8)]],
     constant float& swiglu_limit [[buffer(9)]],
-    uint row [[threadgroup_position_in_grid]],
-    uint tid [[thread_position_in_threadgroup]],
-    uint threads_per_group [[threads_per_threadgroup]])
+    uint3 tg_pos [[threadgroup_position_in_grid]],
+    uint3 tid_in_tg [[thread_position_in_threadgroup]])
 {
-    if (row >= uint(N)) return;
-    int blocks_per_row = K / 32;
-    int eff_M = min(M, 8);
+    uint tid = tid_in_tg.x;
+    uint n_block = tg_pos.x; // tile of 32 output channels
+    uint m_block = tg_pos.y; // tile of 8 tokens
 
-    device const bfloat* g_scales = gate_s + row * blocks_per_row;
-    device const uint8_t* g_row_w = gate_w + size_t(row) * (size_t(K) * 3 / 8);
-    device const bfloat* u_scales = up_s + row * blocks_per_row;
-    device const uint8_t* u_row_w = up_w + size_t(row) * (size_t(K) * 3 / 8);
+    uint n_base = n_block * 32;
+    uint m_base = m_block * 8;
 
-    float sum_g[8] = {0.0f};
-    float sum_u[8] = {0.0f};
+    uint col = tid & 31;
+    uint simd_id = tid >> 5;
 
-    for (int b = tid; b < blocks_per_row; b += threads_per_group) {
-        float sg = float(g_scales[b]);
-        float su = float(u_scales[b]);
-        device const uint8_t* blk_gw = g_row_w + b * 12;
-        device const uint8_t* blk_uw = u_row_w + b * 12;
+    uint global_n = n_base + col;
+    if (global_n >= uint(N) || m_base >= uint(M)) return;
+
+    int num_blocks = K / 32;
+    device const uint8_t* gw = gate_weight + (size_t)global_n * ((size_t)K * 3 / 8);
+    device const bfloat* gs = gate_scale + global_n * num_blocks;
+    device const uint8_t* uw = up_weight + (size_t)global_n * ((size_t)K * 3 / 8);
+    device const bfloat* us = up_scale + global_n * num_blocks;
+
+    float acc_g[8] = {0.0f};
+    float acc_u[8] = {0.0f};
+
+    for (int b = simd_id; b < num_blocks; b += 2) {
+        float sg = float(gs[b]);
+        float su = float(us[b]);
+        int w_offset = b * 12;
         int a_offset = b * 32;
 
+        float qg[32], qu[32];
         for (int i = 0; i < 4; i++) {
-            uint8_t gb0 = blk_gw[i * 3 + 0], gb1 = blk_gw[i * 3 + 1], gb2 = blk_gw[i * 3 + 2];
-            uint8_t ub0 = blk_uw[i * 3 + 0], ub1 = blk_uw[i * 3 + 1], ub2 = blk_uw[i * 3 + 2];
+            uint8_t gb0 = gw[w_offset + i * 3 + 0];
+            uint8_t gb1 = gw[w_offset + i * 3 + 1];
+            uint8_t gb2 = gw[w_offset + i * 3 + 2];
 
-            float gw0 = (float(gb0 & 0x07) - 4.0f) * sg;
-            float gw1 = (float((gb0 >> 3) & 0x07) - 4.0f) * sg;
-            float gw2 = (float((gb0 >> 6) | ((gb1 & 0x01) << 2)) - 4.0f) * sg;
-            float gw3 = (float((gb1 >> 1) & 0x07) - 4.0f) * sg;
-            float gw4 = (float((gb1 >> 4) & 0x07) - 4.0f) * sg;
-            float gw5 = (float((gb1 >> 7) | ((gb2 & 0x03) << 1)) - 4.0f) * sg;
-            float gw6 = (float((gb2 >> 2) & 0x07) - 4.0f) * sg;
-            float gw7 = (float((gb2 >> 5) & 0x07) - 4.0f) * sg;
+            qg[i * 8 + 0] = ((float)(gb0 & 0x07) - 4.0f) * sg;
+            qg[i * 8 + 1] = ((float)((gb0 >> 3) & 0x07) - 4.0f) * sg;
+            qg[i * 8 + 2] = ((float)((gb0 >> 6) | ((gb1 & 0x01) << 2)) - 4.0f) * sg;
+            qg[i * 8 + 3] = ((float)((gb1 >> 1) & 0x07) - 4.0f) * sg;
+            qg[i * 8 + 4] = ((float)((gb1 >> 4) & 0x07) - 4.0f) * sg;
+            qg[i * 8 + 5] = ((float)((gb1 >> 7) | ((gb2 & 0x03) << 1)) - 4.0f) * sg;
+            qg[i * 8 + 6] = ((float)((gb2 >> 2) & 0x07) - 4.0f) * sg;
+            qg[i * 8 + 7] = ((float)((gb2 >> 5) & 0x07) - 4.0f) * sg;
 
-            float uw0 = (float(ub0 & 0x07) - 4.0f) * su;
-            float uw1 = (float((ub0 >> 3) & 0x07) - 4.0f) * su;
-            float uw2 = (float((ub0 >> 6) | ((ub1 & 0x01) << 2)) - 4.0f) * su;
-            float uw3 = (float((ub1 >> 1) & 0x07) - 4.0f) * su;
-            float uw4 = (float((ub1 >> 4) & 0x07) - 4.0f) * su;
-            float uw5 = (float((ub1 >> 7) | ((ub2 & 0x03) << 1)) - 4.0f) * su;
-            float uw6 = (float((ub2 >> 2) & 0x07) - 4.0f) * su;
-            float uw7 = (float((ub2 >> 5) & 0x07) - 4.0f) * su;
+            uint8_t ub0 = uw[w_offset + i * 3 + 0];
+            uint8_t ub1 = uw[w_offset + i * 3 + 1];
+            uint8_t ub2 = uw[w_offset + i * 3 + 2];
 
-            int a_sub = a_offset + i * 8;
-            for (int m = 0; m < eff_M; m++) {
-                device const bfloat* v = A + (size_t)m * K + a_sub;
-                float v0 = float(v[0]), v1 = float(v[1]), v2 = float(v[2]), v3 = float(v[3]);
-                float v4 = float(v[4]), v5 = float(v[5]), v6 = float(v[6]), v7 = float(v[7]);
+            qu[i * 8 + 0] = ((float)(ub0 & 0x07) - 4.0f) * su;
+            qu[i * 8 + 1] = ((float)((ub0 >> 3) & 0x07) - 4.0f) * su;
+            qu[i * 8 + 2] = ((float)((ub0 >> 6) | ((ub1 & 0x01) << 2)) - 4.0f) * su;
+            qu[i * 8 + 3] = ((float)((ub1 >> 1) & 0x07) - 4.0f) * su;
+            qu[i * 8 + 4] = ((float)((ub1 >> 4) & 0x07) - 4.0f) * su;
+            qu[i * 8 + 5] = ((float)((ub1 >> 7) | ((gb2 & 0x03) << 1)) - 4.0f) * su;
+            qu[i * 8 + 6] = ((float)((ub2 >> 2) & 0x07) - 4.0f) * su;
+            qu[i * 8 + 7] = ((float)((ub2 >> 5) & 0x07) - 4.0f) * su;
+        }
 
-                sum_g[m] += gw0 * v0 + gw1 * v1 + gw2 * v2 + gw3 * v3 + gw4 * v4 + gw5 * v5 + gw6 * v6 + gw7 * v7;
-                sum_u[m] += uw0 * v0 + uw1 * v1 + uw2 * v2 + uw3 * v3 + uw4 * v4 + uw5 * v5 + uw6 * v6 + uw7 * v7;
+        #pragma unroll
+        for (int m = 0; m < 8; m++) {
+            uint cur_m = m_base + m;
+            if (cur_m < uint(M)) {
+                device const bfloat* a_ptr = A + (size_t)cur_m * K + a_offset;
+                float sum_g = 0.0f;
+                float sum_u = 0.0f;
+                #pragma unroll
+                for (int i = 0; i < 32; i++) {
+                    float a_val = float(a_ptr[i]);
+                    sum_g += qg[i] * a_val;
+                    sum_u += qu[i] * a_val;
+                }
+                acc_g[m] += sum_g;
+                acc_u[m] += sum_u;
             }
         }
     }
 
-    threadgroup float sdata_g[8][32];
-    threadgroup float sdata_u[8][32];
-    uint simd_lane = tid & 31;
-    uint simd_id = tid >> 5;
-
-    for (int m = 0; m < eff_M; m++) {
-        float sg_val = simd_sum(sum_g[m]);
-        float su_val = simd_sum(sum_u[m]);
-        if (simd_lane == 0) {
-            sdata_g[m][simd_id] = sg_val;
-            sdata_u[m][simd_id] = su_val;
-        }
+    threadgroup float s_acc_g[8][64];
+    threadgroup float s_acc_u[8][64];
+    for (int m = 0; m < 8; m++) {
+        s_acc_g[m][tid] = acc_g[m];
+        s_acc_u[m][tid] = acc_u[m];
     }
     threadgroup_barrier(mem_flags::mem_threadgroup);
 
     if (simd_id == 0) {
-        uint num_simd = threads_per_group >> 5;
-        for (int m = 0; m < eff_M; m++) {
-            float total_g = (simd_lane < num_simd) ? sdata_g[m][simd_lane] : 0.0f;
-            float total_u = (simd_lane < num_simd) ? sdata_u[m][simd_lane] : 0.0f;
-            total_g = simd_sum(total_g);
-            total_u = simd_sum(total_u);
-            if (simd_lane == 0) {
+        for (int m = 0; m < 8; m++) {
+            uint cur_m = m_base + m;
+            if (cur_m < uint(M)) {
+                float total_g = s_acc_g[m][col] + s_acc_g[m][col + 32];
+                float total_u = s_acc_u[m][col] + s_acc_u[m][col + 32];
                 if (swiglu_limit > 0.0f) {
                     total_g = min(total_g, swiglu_limit);
                     total_u = clamp(total_u, -swiglu_limit, swiglu_limit);
                 }
-                out[(size_t)m * N + row] = bfloat(silu(total_g) * total_u);
+                float silu_g = total_g / (1.0f + exp(-total_g));
+                out[(size_t)cur_m * N + global_n] = bfloat(silu_g * total_u);
             }
         }
     }
@@ -1855,42 +1901,57 @@ kernel void gemv_bf16_out_bf16_batch_kernel(
     constant int& N [[buffer(3)]],
     constant int& K [[buffer(4)]],
     constant int& M [[buffer(5)]],
-    uint row [[threadgroup_position_in_grid]],
-    uint tid [[thread_position_in_threadgroup]],
-    uint threads_per_group [[threads_per_threadgroup]])
+    uint3 tg_pos [[threadgroup_position_in_grid]],
+    uint3 tid_in_tg [[thread_position_in_threadgroup]])
 {
-    if (row >= uint(N)) return;
-    int eff_M = min(M, 8);
+    uint tid = tid_in_tg.x;
+    uint n_block = tg_pos.x; // tile of 32 output channels
+    uint m_block = tg_pos.y; // tile of 8 tokens
 
-    device const bfloat* row_w = W + (size_t)row * K;
-    float sum[8] = {0.0f};
+    uint n_base = n_block * 32;
+    uint m_base = m_block * 8;
 
-    for (int col = tid; col < K; col += threads_per_group) {
-        float w_val = float(row_w[col]);
-        for (int m = 0; m < eff_M; m++) {
-            sum[m] += w_val * float(X[(size_t)m * K + col]);
+    uint col = tid & 31;
+    uint simd_id = tid >> 5;
+
+    uint global_n = n_base + col;
+    if (global_n >= uint(N) || m_base >= uint(M)) return;
+
+    device const bfloat* row_w = W + (size_t)global_n * K;
+    float acc[8] = {0.0f};
+
+    for (int k_blk = simd_id * 16; k_blk < K; k_blk += 32) {
+        int k_end = min(k_blk + 16, K);
+        float w_val[16];
+        for (int k = k_blk; k < k_end; k++) {
+            w_val[k - k_blk] = float(row_w[k]);
+        }
+        #pragma unroll
+        for (int m = 0; m < 8; m++) {
+            uint cur_m = m_base + m;
+            if (cur_m < uint(M)) {
+                device const bfloat* x_ptr = X + (size_t)cur_m * K;
+                float sum = 0.0f;
+                for (int k = k_blk; k < k_end; k++) {
+                    sum += w_val[k - k_blk] * float(x_ptr[k]);
+                }
+                acc[m] += sum;
+            }
         }
     }
 
-    threadgroup float sdata[8][32];
-    uint simd_lane = tid & 31;
-    uint simd_id = tid >> 5;
-
-    for (int m = 0; m < eff_M; m++) {
-        float s_val = simd_sum(sum[m]);
-        if (simd_lane == 0) {
-            sdata[m][simd_id] = s_val;
-        }
+    threadgroup float s_acc[8][64];
+    for (int m = 0; m < 8; m++) {
+        s_acc[m][tid] = acc[m];
     }
     threadgroup_barrier(mem_flags::mem_threadgroup);
 
     if (simd_id == 0) {
-        uint num_simd = threads_per_group >> 5;
-        for (int m = 0; m < eff_M; m++) {
-            float total = (simd_lane < num_simd) ? sdata[m][simd_lane] : 0.0f;
-            total = simd_sum(total);
-            if (simd_lane == 0) {
-                out[(size_t)m * N + row] = bfloat(total);
+        for (int m = 0; m < 8; m++) {
+            uint cur_m = m_base + m;
+            if (cur_m < uint(M)) {
+                float total = s_acc[m][col] + s_acc[m][col + 32];
+                out[(size_t)cur_m * N + global_n] = bfloat(total);
             }
         }
     }
@@ -1907,75 +1968,292 @@ kernel void gemm_int4_swiglu_fused_batch_kernel(
     constant int& K [[buffer(7)]],
     constant int& M [[buffer(8)]],
     constant float& swiglu_limit [[buffer(9)]],
-    uint row [[threadgroup_position_in_grid]],
-    uint tid [[thread_position_in_threadgroup]],
-    uint threads_per_group [[threads_per_threadgroup]])
+    uint3 tg_pos [[threadgroup_position_in_grid]],
+    uint3 tid_in_tg [[thread_position_in_threadgroup]])
 {
-    if (row >= uint(N)) return;
+    uint tid = tid_in_tg.x;
+    uint n_block = tg_pos.x; // tile of 32 output channels
+    uint m_block = tg_pos.y; // tile of 8 tokens
+
+    uint n_base = n_block * 32;
+    uint m_base = m_block * 8;
+
+    uint col = tid & 31;
+    uint simd_id = tid >> 5;
+
+    uint global_n = n_base + col;
+    if (global_n >= uint(N) || m_base >= uint(M)) return;
+
     int num_blocks = K / 32;
-    int eff_M = min(M, 8);
+    device const uint8_t* gw = gate_w + global_n * (K / 2);
+    device const bfloat* gs = gate_s + global_n * num_blocks;
+    device const uint8_t* uw = up_w + global_n * (K / 2);
+    device const bfloat* us = up_s + global_n * num_blocks;
 
-    device const bfloat* g_scales = gate_s + row * num_blocks;
-    device const uint8_t* g_row_w = gate_w + row * (K / 2);
-    device const bfloat* u_scales = up_s + row * num_blocks;
-    device const uint8_t* u_row_w = up_w + row * (K / 2);
+    float acc_g[8] = {0.0f};
+    float acc_u[8] = {0.0f};
 
-    float sum_g[8] = {0.0f};
-    float sum_u[8] = {0.0f};
+    for (int b = simd_id; b < num_blocks; b += 2) {
+        float sg = float(gs[b]);
+        float su = float(us[b]);
+        int w_offset = b * 16;
+        int a_offset = b * 32;
 
-    for (int block = tid; block < num_blocks; block += threads_per_group) {
-        float s_g = float(g_scales[block]);
-        float s_u = float(u_scales[block]);
-        int w_offset = block * 16;
-        int a_offset = block * 32;
-
+        float qg[32], qu[32];
         for (int i = 0; i < 16; i++) {
-            uint8_t byte_g = g_row_w[w_offset + i];
-            uint8_t byte_u = u_row_w[w_offset + i];
-            float qg0 = (float(byte_g & 0x0F) - 8.0f) * s_g;
-            float qg1 = (float(byte_g >> 4) - 8.0f) * s_g;
-            float qu0 = (float(byte_u & 0x0F) - 8.0f) * s_u;
-            float qu1 = (float(byte_u >> 4) - 8.0f) * s_u;
-            int a_idx = a_offset + i * 2;
+            uint8_t gb = gw[w_offset + i];
+            uint8_t ub = uw[w_offset + i];
+            qg[i * 2 + 0] = (float(gb & 0x0F) - 8.0f) * sg;
+            qg[i * 2 + 1] = (float(gb >> 4) - 8.0f) * sg;
+            qu[i * 2 + 0] = (float(ub & 0x0F) - 8.0f) * su;
+            qu[i * 2 + 1] = (float(ub >> 4) - 8.0f) * su;
+        }
 
-            for (int m = 0; m < eff_M; m++) {
-                device const bfloat* vec_m = A + (size_t)m * K + a_idx;
-                float v0 = float(vec_m[0]), v1 = float(vec_m[1]);
-                sum_g[m] += qg0 * v0 + qg1 * v1;
-                sum_u[m] += qu0 * v0 + qu1 * v1;
+        #pragma unroll
+        for (int m = 0; m < 8; m++) {
+            uint cur_m = m_base + m;
+            if (cur_m < uint(M)) {
+                device const bfloat* a_ptr = A + (size_t)cur_m * K + a_offset;
+                float sum_g = 0.0f;
+                float sum_u = 0.0f;
+                #pragma unroll
+                for (int i = 0; i < 32; i++) {
+                    float a_val = float(a_ptr[i]);
+                    sum_g += qg[i] * a_val;
+                    sum_u += qu[i] * a_val;
+                }
+                acc_g[m] += sum_g;
+                acc_u[m] += sum_u;
             }
         }
     }
 
-    threadgroup float sdata_g[8][32];
-    threadgroup float sdata_u[8][32];
-    uint simd_lane = tid & 31;
-    uint simd_id = tid >> 5;
-
-    for (int m = 0; m < eff_M; m++) {
-        float sg_val = simd_sum(sum_g[m]);
-        float su_val = simd_sum(sum_u[m]);
-        if (simd_lane == 0) {
-            sdata_g[m][simd_id] = sg_val;
-            sdata_u[m][simd_id] = su_val;
-        }
+    threadgroup float s_acc_g[8][64];
+    threadgroup float s_acc_u[8][64];
+    for (int m = 0; m < 8; m++) {
+        s_acc_g[m][tid] = acc_g[m];
+        s_acc_u[m][tid] = acc_u[m];
     }
     threadgroup_barrier(mem_flags::mem_threadgroup);
 
     if (simd_id == 0) {
-        uint num_simd = threads_per_group >> 5;
-        for (int m = 0; m < eff_M; m++) {
-            float total_g = (simd_lane < num_simd) ? sdata_g[m][simd_lane] : 0.0f;
-            float total_u = (simd_lane < num_simd) ? sdata_u[m][simd_lane] : 0.0f;
-            total_g = simd_sum(total_g);
-            total_u = simd_sum(total_u);
-            if (simd_lane == 0) {
+        for (int m = 0; m < 8; m++) {
+            uint cur_m = m_base + m;
+            if (cur_m < uint(M)) {
+                float total_g = s_acc_g[m][col] + s_acc_g[m][col + 32];
+                float total_u = s_acc_u[m][col] + s_acc_u[m][col + 32];
                 if (swiglu_limit > 0.0f) {
                     total_g = min(total_g, swiglu_limit);
                     total_u = clamp(total_u, -swiglu_limit, swiglu_limit);
                 }
-                out[(size_t)m * N + row] = bfloat(silu(total_g) * total_u);
+                float silu_g = total_g / (1.0f + exp(-total_g));
+                out[(size_t)cur_m * N + global_n] = bfloat(silu_g * total_u);
             }
         }
+    }
+}
+
+// =====================================================================
+// High-Performance Prefill MPS / Dequantization Kernels
+// =====================================================================
+
+kernel void dequant_int4_to_fp16_kernel(
+    device half* out [[buffer(0)]],            // [N, K]
+    device const uint8_t* W [[buffer(1)]],     // [N, K/2]
+    device const bfloat* scales [[buffer(2)]], // [N, K/32]
+    constant int& N [[buffer(3)]],
+    constant int& K [[buffer(4)]],
+    uint3 id [[thread_position_in_grid]])
+{
+    uint row = id.y;
+    uint block2 = id.x; // pair of 32-element blocks
+    if (row >= uint(N) || block2 >= uint(K / 64)) return;
+
+    uint b0_idx = block2 * 2;
+    uint b1_idx = b0_idx + 1;
+
+    half s0 = half(float(scales[row * (K / 32) + b0_idx]));
+    half s1 = half(float(scales[row * (K / 32) + b1_idx]));
+
+    device const uint8_t* src = W + (size_t)row * (K / 2) + b0_idx * 16;
+    device half4* dst = (device half4*)(out + (size_t)row * K + b0_idx * 32);
+
+    #pragma unroll
+    for (int i = 0; i < 4; i++) {
+        uint8_t byte0 = src[i * 4 + 0];
+        uint8_t byte1 = src[i * 4 + 1];
+        uint8_t byte2 = src[i * 4 + 2];
+        uint8_t byte3 = src[i * 4 + 3];
+
+        half4 v0, v1;
+        v0[0] = (half(float(byte0 & 0x0F)) - 8.0h) * s0;
+        v0[1] = (half(float(byte0 >> 4)) - 8.0h) * s0;
+        v0[2] = (half(float(byte1 & 0x0F)) - 8.0h) * s0;
+        v0[3] = (half(float(byte1 >> 4)) - 8.0h) * s0;
+
+        v1[0] = (half(float(byte2 & 0x0F)) - 8.0h) * s0;
+        v1[1] = (half(float(byte2 >> 4)) - 8.0h) * s0;
+        v1[2] = (half(float(byte3 & 0x0F)) - 8.0h) * s0;
+        v1[3] = (half(float(byte3 >> 4)) - 8.0h) * s0;
+
+        dst[i * 2 + 0] = v0;
+        dst[i * 2 + 1] = v1;
+    }
+
+    src += 16;
+    dst += 8;
+    #pragma unroll
+    for (int i = 0; i < 4; i++) {
+        uint8_t byte0 = src[i * 4 + 0];
+        uint8_t byte1 = src[i * 4 + 1];
+        uint8_t byte2 = src[i * 4 + 2];
+        uint8_t byte3 = src[i * 4 + 3];
+
+        half4 v0, v1;
+        v0[0] = (half(float(byte0 & 0x0F)) - 8.0h) * s1;
+        v0[1] = (half(float(byte0 >> 4)) - 8.0h) * s1;
+        v0[2] = (half(float(byte1 & 0x0F)) - 8.0h) * s1;
+        v0[3] = (half(float(byte1 >> 4)) - 8.0h) * s1;
+
+        v1[0] = (half(float(byte2 & 0x0F)) - 8.0h) * s1;
+        v1[1] = (half(float(byte2 >> 4)) - 8.0h) * s1;
+        v1[2] = (half(float(byte3 & 0x0F)) - 8.0h) * s1;
+        v1[3] = (half(float(byte3 >> 4)) - 8.0h) * s1;
+
+        dst[i * 2 + 0] = v0;
+        dst[i * 2 + 1] = v1;
+    }
+}
+
+kernel void dequant_int3_to_fp16_kernel(
+    device half* out [[buffer(0)]],            // [N, K]
+    device const uint8_t* W [[buffer(1)]],     // [N, K * 3 / 8]
+    device const bfloat* scales [[buffer(2)]], // [N, K / 32]
+    constant int& N [[buffer(3)]],
+    constant int& K [[buffer(4)]],
+    uint3 id [[thread_position_in_grid]])
+{
+    uint row = id.y;
+    uint block = id.x; // block of 32 elements
+    if (row >= uint(N) || block >= uint(K / 32)) return;
+
+    half s = half(float(scales[row * (K / 32) + block]));
+    device const uint8_t* src = W + (size_t)row * (K * 3 / 8) + block * 12;
+    device half4* dst = (device half4*)(out + (size_t)row * K + block * 32);
+
+    #pragma unroll
+    for (int i = 0; i < 4; i++) {
+        uint8_t b0 = src[i * 3 + 0];
+        uint8_t b1 = src[i * 3 + 1];
+        uint8_t b2 = src[i * 3 + 2];
+
+        half4 v0, v1;
+        v0[0] = (half(float(b0 & 0x07)) - 4.0h) * s;
+        v0[1] = (half(float((b0 >> 3) & 0x07)) - 4.0h) * s;
+        v0[2] = (half(float((b0 >> 6) | ((b1 & 0x01) << 2))) - 4.0h) * s;
+        v0[3] = (half(float((b1 >> 1) & 0x07)) - 4.0h) * s;
+
+        v1[0] = (half(float((b1 >> 4) & 0x07)) - 4.0h) * s;
+        v1[1] = (half(float((b1 >> 7) | ((b2 & 0x03) << 1))) - 4.0h) * s;
+        v1[2] = (half(float((b2 >> 2) & 0x07)) - 4.0h) * s;
+        v1[3] = (half(float((b2 >> 5) & 0x07)) - 4.0h) * s;
+
+        dst[i * 2 + 0] = v0;
+        dst[i * 2 + 1] = v1;
+    }
+}
+
+kernel void bf16_to_fp16_kernel(
+    device half* out [[buffer(0)]],
+    device const bfloat* in [[buffer(1)]],
+    constant int& count [[buffer(2)]],
+    uint id [[thread_position_in_grid]])
+{
+    if (id < uint(count)) {
+        out[id] = half(float(in[id]));
+    }
+}
+
+kernel void fp16_to_bf16_kernel(
+    device bfloat* out [[buffer(0)]],
+    device const half* in [[buffer(1)]],
+    constant int& count [[buffer(2)]],
+    constant bool& is_residual [[buffer(3)]],
+    uint id [[thread_position_in_grid]])
+{
+    if (id < uint(count)) {
+        if (is_residual) {
+            out[id] = bfloat(float(out[id]) + float(in[id]));
+        } else {
+            out[id] = bfloat(float(in[id]));
+        }
+    }
+}
+
+kernel void swiglu_fp16_to_bf16_kernel(
+    device bfloat* out [[buffer(0)]],
+    device const half* gate [[buffer(1)]],
+    device const half* up [[buffer(2)]],
+    constant int& count [[buffer(3)]],
+    constant float& swiglu_limit [[buffer(4)]],
+    uint id [[thread_position_in_grid]])
+{
+    if (id < uint(count)) {
+        float g = float(gate[id]);
+        float u = float(up[id]);
+        if (swiglu_limit > 0.0f) {
+            g = min(g, swiglu_limit);
+            u = clamp(u, -swiglu_limit, swiglu_limit);
+        }
+        float silu_g = g / (1.0f + exp(-g));
+        out[id] = bfloat(silu_g * u);
+    }
+}
+
+// Fast SIMD-reduced fused A and B linear attention input projections
+kernel void deltanet_in_proj_ab_batch_kernel(
+    device bfloat* out_a [[buffer(0)]],
+    device bfloat* out_b [[buffer(1)]],
+    device const bfloat* Wa [[buffer(2)]],
+    device const bfloat* Wb [[buffer(3)]],
+    device const bfloat* X [[buffer(4)]],
+    constant int& N [[buffer(5)]],
+    constant int& K [[buffer(6)]],
+    constant int& M [[buffer(7)]],
+    uint3 tid_in_tg [[thread_position_in_threadgroup]],
+    uint3 tg_pos [[threadgroup_position_in_grid]])
+{
+    uint n = tg_pos.x;
+    uint m = tg_pos.y;
+    if (n >= uint(N) || m >= uint(M)) return;
+
+    uint lane = tid_in_tg.x; // 0..31
+    device const bfloat* row_wa = Wa + (size_t)n * K;
+    device const bfloat* row_wb = Wb + (size_t)n * K;
+    device const bfloat* row_x  = X + (size_t)m * K;
+
+    device const bfloat4* vec_wa = (device const bfloat4*)row_wa;
+    device const bfloat4* vec_wb = (device const bfloat4*)row_wb;
+    device const bfloat4* vec_x  = (device const bfloat4*)row_x;
+    int k_vec = K / 4;
+
+    float sum_a = 0.0f;
+    float sum_b = 0.0f;
+    for (int k = lane; k < k_vec; k += 32) {
+        bfloat4 wa = vec_wa[k];
+        bfloat4 wb = vec_wb[k];
+        bfloat4 x  = vec_x[k];
+        sum_a += float(wa[0]) * float(x[0]) + float(wa[1]) * float(x[1]) +
+                 float(wa[2]) * float(x[2]) + float(wa[3]) * float(x[3]);
+        sum_b += float(wb[0]) * float(x[0]) + float(wb[1]) * float(x[1]) +
+                 float(wb[2]) * float(x[2]) + float(wb[3]) * float(x[3]);
+    }
+
+    sum_a = simd_sum(sum_a);
+    sum_b = simd_sum(sum_b);
+
+    if (lane == 0) {
+        out_a[(size_t)m * N + n] = bfloat(sum_a);
+        out_b[(size_t)m * N + n] = bfloat(sum_b);
     }
 }

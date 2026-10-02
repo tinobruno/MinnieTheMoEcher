@@ -75,6 +75,15 @@ struct MetalStreamObj {
         }
     }
 
+    id<MTLCommandBuffer> get_command_buffer() {
+        if (!current_cmd_buf) {
+            current_cmd_buf = [queue commandBuffer];
+            encoder_count = 0;
+        }
+        end_encoder();
+        return current_cmd_buf;
+    }
+
     void commit_and_wait() {
         commit_async();
         if (last_submitted_cmd_buf) {
@@ -100,6 +109,26 @@ public:
     std::unordered_map<std::string, id<MTLComputePipelineState>> pipelines;
     std::mutex buf_mutex;
     std::mutex pipe_mutex;
+
+    id<MTLBuffer> mps_scratch_w_fp16 = nil;
+    id<MTLBuffer> mps_scratch_w_up_fp16 = nil;
+    id<MTLBuffer> mps_scratch_a_fp16 = nil;
+    id<MTLBuffer> mps_scratch_c_fp16 = nil;
+    id<MTLBuffer> mps_scratch_gate_fp16 = nil;
+    std::mutex mps_mutex;
+
+    void ensure_mps_scratch() {
+        if (mps_scratch_w_fp16) return;
+        std::lock_guard<std::mutex> lock(mps_mutex);
+        if (mps_scratch_w_fp16) return;
+        @autoreleasepool {
+            mps_scratch_w_fp16 = [device newBufferWithLength:(size_t)17408 * 5120 * sizeof(uint16_t) options:MTLResourceStorageModeShared];
+            mps_scratch_w_up_fp16 = [device newBufferWithLength:(size_t)17408 * 5120 * sizeof(uint16_t) options:MTLResourceStorageModeShared];
+            mps_scratch_a_fp16 = [device newBufferWithLength:(size_t)512 * 17408 * sizeof(uint16_t) options:MTLResourceStorageModeShared];
+            mps_scratch_c_fp16 = [device newBufferWithLength:(size_t)512 * 17408 * sizeof(uint16_t) options:MTLResourceStorageModeShared];
+            mps_scratch_gate_fp16 = [device newBufferWithLength:(size_t)512 * 17408 * sizeof(uint16_t) options:MTLResourceStorageModeShared];
+        }
+    }
 
     MetalContext() {
         @autoreleasepool {
@@ -977,47 +1006,104 @@ void gemm_int4_batch_cuda(
 
     auto& ctx = MetalContext::instance();
     MetalStreamObj* s = get_stream(stream);
+
+    // Ultra-fast Hardware MPS Tensor Core path for prefill (M >= 4)
+    if (M >= 4) {
+        id<MTLComputePipelineState> pso_dequant4 = ctx.get_pipeline("dequant_int4_to_fp16_kernel");
+        id<MTLComputePipelineState> pso_b2f = ctx.get_pipeline("bf16_to_fp16_kernel");
+        id<MTLComputePipelineState> pso_f2b = ctx.get_pipeline("fp16_to_bf16_kernel");
+
+        size_t o_off, a_off, w_off, s_off;
+        id<MTLBuffer> b_out = ctx.get_buffer(out, o_off);
+        id<MTLBuffer> b_a = ctx.get_buffer(A, a_off);
+        id<MTLBuffer> b_w = ctx.get_buffer(weight, w_off);
+        id<MTLBuffer> b_s = ctx.get_buffer(scale, s_off);
+
+        if (pso_dequant4 && pso_b2f && pso_f2b && b_out && b_a && b_w && b_s && N <= 17408 && K <= 17408 && M <= 512) {
+            ctx.ensure_mps_scratch();
+
+            // 1. Convert A to FP16 and Dequantize W to FP16 in 1 compute encoder
+            id<MTLComputeCommandEncoder> enc = s->get_encoder();
+            [enc setComputePipelineState:pso_b2f];
+            [enc setBuffer:ctx.mps_scratch_a_fp16 offset:0 atIndex:0];
+            [enc setBuffer:b_a offset:a_off atIndex:1];
+            int count_a = M * K;
+            [enc setBytes:&count_a length:4 atIndex:2];
+            [enc dispatchThreads:MTLSizeMake(count_a, 1, 1) threadsPerThreadgroup:MTLSizeMake(256, 1, 1)];
+
+            [enc setComputePipelineState:pso_dequant4];
+            [enc setBuffer:ctx.mps_scratch_w_fp16 offset:0 atIndex:0];
+            [enc setBuffer:b_w offset:w_off atIndex:1];
+            [enc setBuffer:b_s offset:s_off atIndex:2];
+            [enc setBytes:&N length:4 atIndex:3];
+            [enc setBytes:&K length:4 atIndex:4];
+            MTLSize grid = MTLSizeMake(K / 64, N, 1);
+            MTLSize tg = MTLSizeMake(16, 8, 1);
+            [enc dispatchThreads:grid threadsPerThreadgroup:tg];
+            // 2. Hardware MPS GEMM: C = A * W^T
+            id<MTLCommandBuffer> cb = s->get_command_buffer();
+            MPSMatrixDescriptor* descA = [MPSMatrixDescriptor matrixDescriptorWithRows:M columns:K rowBytes:K * sizeof(uint16_t) dataType:MPSDataTypeFloat16];
+            MPSMatrixDescriptor* descW = [MPSMatrixDescriptor matrixDescriptorWithRows:N columns:K rowBytes:K * sizeof(uint16_t) dataType:MPSDataTypeFloat16];
+            MPSMatrixDescriptor* descC = [MPSMatrixDescriptor matrixDescriptorWithRows:M columns:N rowBytes:N * sizeof(uint16_t) dataType:MPSDataTypeFloat16];
+
+            MPSMatrix* matA = [[MPSMatrix alloc] initWithBuffer:ctx.mps_scratch_a_fp16 descriptor:descA];
+            MPSMatrix* matW = [[MPSMatrix alloc] initWithBuffer:ctx.mps_scratch_w_fp16 descriptor:descW];
+            MPSMatrix* matC = [[MPSMatrix alloc] initWithBuffer:ctx.mps_scratch_c_fp16 descriptor:descC];
+
+            MPSMatrixMultiplication* mul = [[MPSMatrixMultiplication alloc] initWithDevice:ctx.device transposeLeft:false transposeRight:true resultRows:M resultColumns:N interiorColumns:K alpha:1.0f beta:0.0f];
+            [mul encodeToCommandBuffer:cb leftMatrix:matA rightMatrix:matW resultMatrix:matC];
+
+            // 3. Convert C back to BF16 (into out)
+            id<MTLComputeCommandEncoder> enc2 = s->get_encoder();
+            [enc2 setComputePipelineState:pso_f2b];
+            [enc2 setBuffer:b_out offset:o_off atIndex:0];
+            [enc2 setBuffer:ctx.mps_scratch_c_fp16 offset:0 atIndex:1];
+            int count_out = M * N;
+            [enc2 setBytes:&count_out length:4 atIndex:2];
+            bool is_res = false;
+            [enc2 setBytes:&is_res length:sizeof(is_res) atIndex:3];
+            [enc2 dispatchThreads:MTLSizeMake(count_out, 1, 1) threadsPerThreadgroup:MTLSizeMake(256, 1, 1)];
+            s->end_encoder_and_maybe_commit();
+            return;
+        }
+    }
+
+    fprintf(stderr, "[WARN] gemm_int4_batch_cuda MPS BYPASSED! M=%d\n", M);
     id<MTLComputePipelineState> pso = ctx.get_pipeline("gemm_int4_batch_kernel");
     if (!pso) {
         for (int m = 0; m < M; m++) {
-            gemv_int4_cuda(out + m * N, A + m * K, weight, scale, N, K, stream);
+            gemv_int4_cuda(out + (size_t)m * N, A + (size_t)m * K, weight, scale, N, K, stream);
         }
         return;
     }
 
-    for (int offset = 0; offset < M; offset += 8) {
-        int cur_m = std::min(8, M - offset);
-        __nv_bfloat16* cur_out = out + (size_t)offset * N;
-        const __nv_bfloat16* cur_A = A + (size_t)offset * K;
+    size_t o_off, a_off, w_off, s_off;
+    id<MTLBuffer> b_out = ctx.get_buffer(out, o_off);
+    id<MTLBuffer> b_a = ctx.get_buffer(A, a_off);
+    id<MTLBuffer> b_w = ctx.get_buffer(weight, w_off);
+    id<MTLBuffer> b_s = ctx.get_buffer(scale, s_off);
 
-        size_t o_off, a_off, w_off, s_off;
-        id<MTLBuffer> b_out = ctx.get_buffer(cur_out, o_off);
-        id<MTLBuffer> b_a = ctx.get_buffer(cur_A, a_off);
-        id<MTLBuffer> b_w = ctx.get_buffer(weight, w_off);
-        id<MTLBuffer> b_s = ctx.get_buffer(scale, s_off);
-
-        if (!b_out || !b_a || !b_w || !b_s) {
-            for (int m = 0; m < cur_m; m++) {
-                gemv_int4_cuda(cur_out + m * N, cur_A + m * K, weight, scale, N, K, stream);
-            }
-            continue;
+    if (!b_out || !b_a || !b_w || !b_s) {
+        for (int m = 0; m < M; m++) {
+            gemv_int4_cuda(out + (size_t)m * N, A + (size_t)m * K, weight, scale, N, K, stream);
         }
-
-        id<MTLComputeCommandEncoder> enc = s->get_encoder();
-        [enc setComputePipelineState:pso];
-        [enc setBuffer:b_out offset:o_off atIndex:0];
-        [enc setBuffer:b_a offset:a_off atIndex:1];
-        [enc setBuffer:b_w offset:w_off atIndex:2];
-        [enc setBuffer:b_s offset:s_off atIndex:3];
-        [enc setBytes:&N length:sizeof(N) atIndex:4];
-        [enc setBytes:&K length:sizeof(K) atIndex:5];
-        [enc setBytes:&cur_m length:sizeof(cur_m) atIndex:6];
-        bool is_res = false;
-        [enc setBytes:&is_res length:sizeof(is_res) atIndex:7];
-
-        [enc dispatchThreadgroups:MTLSizeMake(N, 1, 1) threadsPerThreadgroup:MTLSizeMake(64, 1, 1)];
-        s->end_encoder_and_maybe_commit();
+        return;
     }
+
+    id<MTLComputeCommandEncoder> enc = s->get_encoder();
+    [enc setComputePipelineState:pso];
+    [enc setBuffer:b_out offset:o_off atIndex:0];
+    [enc setBuffer:b_a offset:a_off atIndex:1];
+    [enc setBuffer:b_w offset:w_off atIndex:2];
+    [enc setBuffer:b_s offset:s_off atIndex:3];
+    [enc setBytes:&N length:sizeof(N) atIndex:4];
+    [enc setBytes:&K length:sizeof(K) atIndex:5];
+    [enc setBytes:&M length:sizeof(M) atIndex:6];
+    bool is_res = false;
+    [enc setBytes:&is_res length:sizeof(is_res) atIndex:7];
+
+    [enc dispatchThreadgroups:MTLSizeMake((N + 31) / 32, (M + 7) / 8, 1) threadsPerThreadgroup:MTLSizeMake(64, 1, 1)];
+    s->end_encoder_and_maybe_commit();
 }
 
 void gemm_int4_f32_batch_cuda(
@@ -1035,42 +1121,36 @@ void gemm_int4_f32_batch_cuda(
     id<MTLComputePipelineState> pso = ctx.get_pipeline("gemm_int4_f32_batch_kernel");
     if (!pso) {
         for (int m = 0; m < M; m++) {
-            gemv_int4_f32_cuda(out + m * N, A + m * K, weight, scale, N, K, stream);
+            gemv_int4_f32_cuda(out + (size_t)m * N, A + (size_t)m * K, weight, scale, N, K, stream);
         }
         return;
     }
 
-    for (int offset = 0; offset < M; offset += 8) {
-        int cur_m = std::min(8, M - offset);
-        float* cur_out = out + (size_t)offset * N;
-        const __nv_bfloat16* cur_A = A + (size_t)offset * K;
+    size_t o_off, a_off, w_off, s_off;
+    id<MTLBuffer> b_out = ctx.get_buffer(out, o_off);
+    id<MTLBuffer> b_a = ctx.get_buffer(A, a_off);
+    id<MTLBuffer> b_w = ctx.get_buffer(weight, w_off);
+    id<MTLBuffer> b_s = ctx.get_buffer(scale, s_off);
 
-        size_t o_off, a_off, w_off, s_off;
-        id<MTLBuffer> b_out = ctx.get_buffer(cur_out, o_off);
-        id<MTLBuffer> b_a = ctx.get_buffer(cur_A, a_off);
-        id<MTLBuffer> b_w = ctx.get_buffer(weight, w_off);
-        id<MTLBuffer> b_s = ctx.get_buffer(scale, s_off);
-
-        if (!b_out || !b_a || !b_w || !b_s) {
-            for (int m = 0; m < cur_m; m++) {
-                gemv_int4_f32_cuda(cur_out + m * N, cur_A + m * K, weight, scale, N, K, stream);
-            }
-            continue;
+    if (!b_out || !b_a || !b_w || !b_s) {
+        for (int m = 0; m < M; m++) {
+            gemv_int4_f32_cuda(out + (size_t)m * N, A + (size_t)m * K, weight, scale, N, K, stream);
         }
-
-        id<MTLComputeCommandEncoder> enc = s->get_encoder();
-        [enc setComputePipelineState:pso];
-        [enc setBuffer:b_out offset:o_off atIndex:0];
-        [enc setBuffer:b_a offset:a_off atIndex:1];
-        [enc setBuffer:b_w offset:w_off atIndex:2];
-        [enc setBuffer:b_s offset:s_off atIndex:3];
-        [enc setBytes:&N length:sizeof(N) atIndex:4];
-        [enc setBytes:&K length:sizeof(K) atIndex:5];
-        [enc setBytes:&cur_m length:sizeof(cur_m) atIndex:6];
-
-        [enc dispatchThreadgroups:MTLSizeMake(N, 1, 1) threadsPerThreadgroup:MTLSizeMake(64, 1, 1)];
-        s->end_encoder_and_maybe_commit();
+        return;
     }
+
+    id<MTLComputeCommandEncoder> enc = s->get_encoder();
+    [enc setComputePipelineState:pso];
+    [enc setBuffer:b_out offset:o_off atIndex:0];
+    [enc setBuffer:b_a offset:a_off atIndex:1];
+    [enc setBuffer:b_w offset:w_off atIndex:2];
+    [enc setBuffer:b_s offset:s_off atIndex:3];
+    [enc setBytes:&N length:sizeof(N) atIndex:4];
+    [enc setBytes:&K length:sizeof(K) atIndex:5];
+    [enc setBytes:&M length:sizeof(M) atIndex:6];
+
+    [enc dispatchThreadgroups:MTLSizeMake((N + 31) / 32, (M + 7) / 8, 1) threadsPerThreadgroup:MTLSizeMake(64, 1, 1)];
+    s->end_encoder_and_maybe_commit();
 }
 
 void gemm_int4_swiglu_fused_batch_cuda(
@@ -1090,47 +1170,41 @@ void gemm_int4_swiglu_fused_batch_cuda(
     id<MTLComputePipelineState> pso = ctx.get_pipeline("gemm_int4_swiglu_fused_batch_kernel");
     if (!pso) {
         for (int m = 0; m < M; m++) {
-            gemv_int4_swiglu_fused_cuda(out + m * N, A + m * K, gate_weight, gate_scale, up_weight, up_scale, N, K, swiglu_limit, stream);
+            gemv_int4_swiglu_fused_cuda(out + (size_t)m * N, A + (size_t)m * K, gate_weight, gate_scale, up_weight, up_scale, N, K, swiglu_limit, stream);
         }
         return;
     }
 
-    for (int offset = 0; offset < M; offset += 8) {
-        int cur_m = std::min(8, M - offset);
-        __nv_bfloat16* cur_out = out + (size_t)offset * N;
-        const __nv_bfloat16* cur_A = A + (size_t)offset * K;
+    size_t o_off, a_off, gw_off, gs_off, uw_off, us_off;
+    id<MTLBuffer> b_out = ctx.get_buffer(out, o_off);
+    id<MTLBuffer> b_a = ctx.get_buffer(A, a_off);
+    id<MTLBuffer> b_gw = ctx.get_buffer(gate_weight, gw_off);
+    id<MTLBuffer> b_gs = ctx.get_buffer(gate_scale, gs_off);
+    id<MTLBuffer> b_uw = ctx.get_buffer(up_weight, uw_off);
+    id<MTLBuffer> b_us = ctx.get_buffer(up_scale, us_off);
 
-        size_t o_off, a_off, gw_off, gs_off, uw_off, us_off;
-        id<MTLBuffer> b_out = ctx.get_buffer(cur_out, o_off);
-        id<MTLBuffer> b_a = ctx.get_buffer(cur_A, a_off);
-        id<MTLBuffer> b_gw = ctx.get_buffer(gate_weight, gw_off);
-        id<MTLBuffer> b_gs = ctx.get_buffer(gate_scale, gs_off);
-        id<MTLBuffer> b_uw = ctx.get_buffer(up_weight, uw_off);
-        id<MTLBuffer> b_us = ctx.get_buffer(up_scale, us_off);
-
-        if (!b_out || !b_a || !b_gw || !b_gs || !b_uw || !b_us) {
-            for (int m = 0; m < cur_m; m++) {
-                gemv_int4_swiglu_fused_cuda(cur_out + m * N, cur_A + m * K, gate_weight, gate_scale, up_weight, up_scale, N, K, swiglu_limit, stream);
-            }
-            continue;
+    if (!b_out || !b_a || !b_gw || !b_gs || !b_uw || !b_us) {
+        for (int m = 0; m < M; m++) {
+            gemv_int4_swiglu_fused_cuda(out + (size_t)m * N, A + (size_t)m * K, gate_weight, gate_scale, up_weight, up_scale, N, K, swiglu_limit, stream);
         }
-
-        id<MTLComputeCommandEncoder> enc = s->get_encoder();
-        [enc setComputePipelineState:pso];
-        [enc setBuffer:b_out offset:o_off atIndex:0];
-        [enc setBuffer:b_a offset:a_off atIndex:1];
-        [enc setBuffer:b_gw offset:gw_off atIndex:2];
-        [enc setBuffer:b_gs offset:gs_off atIndex:3];
-        [enc setBuffer:b_uw offset:uw_off atIndex:4];
-        [enc setBuffer:b_us offset:us_off atIndex:5];
-        [enc setBytes:&N length:sizeof(N) atIndex:6];
-        [enc setBytes:&K length:sizeof(K) atIndex:7];
-        [enc setBytes:&cur_m length:sizeof(cur_m) atIndex:8];
-        [enc setBytes:&swiglu_limit length:sizeof(swiglu_limit) atIndex:9];
-
-        [enc dispatchThreadgroups:MTLSizeMake(N, 1, 1) threadsPerThreadgroup:MTLSizeMake(64, 1, 1)];
-        s->end_encoder_and_maybe_commit();
+        return;
     }
+
+    id<MTLComputeCommandEncoder> enc = s->get_encoder();
+    [enc setComputePipelineState:pso];
+    [enc setBuffer:b_out offset:o_off atIndex:0];
+    [enc setBuffer:b_a offset:a_off atIndex:1];
+    [enc setBuffer:b_gw offset:gw_off atIndex:2];
+    [enc setBuffer:b_gs offset:gs_off atIndex:3];
+    [enc setBuffer:b_uw offset:uw_off atIndex:4];
+    [enc setBuffer:b_us offset:us_off atIndex:5];
+    [enc setBytes:&N length:sizeof(N) atIndex:6];
+    [enc setBytes:&K length:sizeof(K) atIndex:7];
+    [enc setBytes:&M length:sizeof(M) atIndex:8];
+    [enc setBytes:&swiglu_limit length:sizeof(swiglu_limit) atIndex:9];
+
+    [enc dispatchThreadgroups:MTLSizeMake((N + 31) / 32, (M + 7) / 8, 1) threadsPerThreadgroup:MTLSizeMake(64, 1, 1)];
+    s->end_encoder_and_maybe_commit();
 }
 
 void gemv_bf16_cuda(float* out, const __nv_bfloat16* W, const __nv_bfloat16* x, int N, int K, cudaStream_t stream) {
@@ -1231,6 +1305,56 @@ void gemv_bf16_batch_cuda(float* out, const __nv_bfloat16* W, const __nv_bfloat1
     }
 }
 
+
+void deltanet_in_proj_ab_batch_cuda(
+    __nv_bfloat16* out_a, __nv_bfloat16* out_b,
+    const __nv_bfloat16* Wa, const __nv_bfloat16* Wb, const __nv_bfloat16* X,
+    int N, int K, int M, cudaStream_t stream)
+{
+    if (M <= 0) return;
+    if (M == 1) {
+        gemv_bf16_out_bf16_cuda(out_a, Wa, X, N, K, stream);
+        gemv_bf16_out_bf16_cuda(out_b, Wb, X, N, K, stream);
+        return;
+    }
+
+    auto& ctx = MetalContext::instance();
+    MetalStreamObj* s = get_stream(stream);
+    id<MTLComputePipelineState> pso = ctx.get_pipeline("deltanet_in_proj_ab_batch_kernel");
+    if (!pso) {
+        gemv_bf16_out_bf16_batch_cuda(out_a, Wa, X, N, K, M, stream);
+        gemv_bf16_out_bf16_batch_cuda(out_b, Wb, X, N, K, M, stream);
+        return;
+    }
+
+    size_t oa_off, ob_off, wa_off, wb_off, x_off;
+    id<MTLBuffer> b_oa = ctx.get_buffer(out_a, oa_off);
+    id<MTLBuffer> b_ob = ctx.get_buffer(out_b, ob_off);
+    id<MTLBuffer> b_wa = ctx.get_buffer(Wa, wa_off);
+    id<MTLBuffer> b_wb = ctx.get_buffer(Wb, wb_off);
+    id<MTLBuffer> b_x  = ctx.get_buffer(X, x_off);
+
+    if (!b_oa || !b_ob || !b_wa || !b_wb || !b_x) {
+        gemv_bf16_out_bf16_batch_cuda(out_a, Wa, X, N, K, M, stream);
+        gemv_bf16_out_bf16_batch_cuda(out_b, Wb, X, N, K, M, stream);
+        return;
+    }
+
+    id<MTLComputeCommandEncoder> enc = s->get_encoder();
+    [enc setComputePipelineState:pso];
+    [enc setBuffer:b_oa offset:oa_off atIndex:0];
+    [enc setBuffer:b_ob offset:ob_off atIndex:1];
+    [enc setBuffer:b_wa offset:wa_off atIndex:2];
+    [enc setBuffer:b_wb offset:wb_off atIndex:3];
+    [enc setBuffer:b_x  offset:x_off  atIndex:4];
+    [enc setBytes:&N length:sizeof(N) atIndex:5];
+    [enc setBytes:&K length:sizeof(K) atIndex:6];
+    [enc setBytes:&M length:sizeof(M) atIndex:7];
+
+    [enc dispatchThreadgroups:MTLSizeMake(N, M, 1) threadsPerThreadgroup:MTLSizeMake(32, 1, 1)];
+    s->end_encoder_and_maybe_commit();
+}
+
 void gemv_bf16_out_bf16_batch_cuda(__nv_bfloat16* out, const __nv_bfloat16* W, const __nv_bfloat16* X, int N, int K, int M, cudaStream_t stream) {
     if (M <= 0) return;
     if (M == 1) {
@@ -1243,40 +1367,34 @@ void gemv_bf16_out_bf16_batch_cuda(__nv_bfloat16* out, const __nv_bfloat16* W, c
     id<MTLComputePipelineState> pso = ctx.get_pipeline("gemv_bf16_out_bf16_batch_kernel");
     if (!pso) {
         for (int m = 0; m < M; m++) {
-            gemv_bf16_out_bf16_cuda(out + m * N, W, X + m * K, N, K, stream);
+            gemv_bf16_out_bf16_cuda(out + (size_t)m * N, W, X + (size_t)m * K, N, K, stream);
         }
         return;
     }
 
-    for (int offset = 0; offset < M; offset += 8) {
-        int cur_m = std::min(8, M - offset);
-        __nv_bfloat16* cur_out = out + (size_t)offset * N;
-        const __nv_bfloat16* cur_X = X + (size_t)offset * K;
+    size_t o_off, w_off, x_off;
+    id<MTLBuffer> b_out = ctx.get_buffer(out, o_off);
+    id<MTLBuffer> b_w = ctx.get_buffer(W, w_off);
+    id<MTLBuffer> b_x = ctx.get_buffer(X, x_off);
 
-        size_t o_off, w_off, x_off;
-        id<MTLBuffer> b_out = ctx.get_buffer(cur_out, o_off);
-        id<MTLBuffer> b_w = ctx.get_buffer(W, w_off);
-        id<MTLBuffer> b_x = ctx.get_buffer(cur_X, x_off);
-
-        if (!b_out || !b_w || !b_x) {
-            for (int m = 0; m < cur_m; m++) {
-                gemv_bf16_out_bf16_cuda(cur_out + m * N, W, cur_X + m * K, N, K, stream);
-            }
-            continue;
+    if (!b_out || !b_w || !b_x) {
+        for (int m = 0; m < M; m++) {
+            gemv_bf16_out_bf16_cuda(out + (size_t)m * N, W, X + (size_t)m * K, N, K, stream);
         }
-
-        id<MTLComputeCommandEncoder> enc = s->get_encoder();
-        [enc setComputePipelineState:pso];
-        [enc setBuffer:b_out offset:o_off atIndex:0];
-        [enc setBuffer:b_w offset:w_off atIndex:1];
-        [enc setBuffer:b_x offset:x_off atIndex:2];
-        [enc setBytes:&N length:sizeof(N) atIndex:3];
-        [enc setBytes:&K length:sizeof(K) atIndex:4];
-        [enc setBytes:&cur_m length:sizeof(cur_m) atIndex:5];
-
-        [enc dispatchThreadgroups:MTLSizeMake(N, 1, 1) threadsPerThreadgroup:MTLSizeMake(64, 1, 1)];
-        s->end_encoder_and_maybe_commit();
+        return;
     }
+
+    id<MTLComputeCommandEncoder> enc = s->get_encoder();
+    [enc setComputePipelineState:pso];
+    [enc setBuffer:b_out offset:o_off atIndex:0];
+    [enc setBuffer:b_w offset:w_off atIndex:1];
+    [enc setBuffer:b_x offset:x_off atIndex:2];
+    [enc setBytes:&N length:sizeof(N) atIndex:3];
+    [enc setBytes:&K length:sizeof(K) atIndex:4];
+    [enc setBytes:&M length:sizeof(M) atIndex:5];
+
+    [enc dispatchThreadgroups:MTLSizeMake((N + 31) / 32, (M + 7) / 8, 1) threadsPerThreadgroup:MTLSizeMake(64, 1, 1)];
+    s->end_encoder_and_maybe_commit();
 }
 
 void gemv_f32_cuda(float* out, const float* vec, const float* matrix, int M, int K, cudaStream_t stream) {
@@ -1343,24 +1461,40 @@ void deltanet_linear_attention_decode_batch_cuda(
     id<MTLBuffer> b_ossm = ctx.get_buffer(out_ssm_state, ossm_off);
 
     if (pso_conv && pso_ssm && b_out && b_qkv && b_z && b_a && b_b && b_cw && b_ics && b_ocs && b_al && b_dt && b_nw && b_issm && b_ossm) {
+        id<MTLComputeCommandEncoder> enc = s->get_encoder();
         for (int m = 0; m < M; m++) {
-            deltanet_linear_attention_decode_cuda(
-                out + (size_t)m * z_stride,
-                in_qkv + (size_t)m * channels,
-                in_z + (size_t)m * z_stride,
-                in_a + (size_t)m * num_v_heads,
-                in_b + (size_t)m * num_v_heads,
-                conv1d_w,
-                (m == 0) ? in_conv_state : out_conv_state,
-                out_conv_state,
-                A_log, dt_bias, norm_w,
-                (m == 0) ? in_ssm_state : out_ssm_state,
-                out_ssm_state,
-                num_k_heads, num_v_heads, head_dim, stream);
+            // Conv step m
+            [enc setComputePipelineState:pso_conv];
+            [enc setBuffer:b_qkv offset:qkv_off + (size_t)m * channels * 2 atIndex:0];
+            [enc setBuffer:b_qkv offset:qkv_off + (size_t)m * channels * 2 atIndex:1];
+            [enc setBuffer:b_cw offset:cw_off atIndex:2];
+            [enc setBuffer:(m == 0 ? b_ics : b_ocs) offset:(m == 0 ? ics_off : ocs_off) atIndex:3];
+            [enc setBuffer:b_ocs offset:ocs_off atIndex:4];
+            [enc setBytes:&channels length:sizeof(channels) atIndex:5];
+            [enc dispatchThreadgroups:MTLSizeMake((channels + 127) / 128, 1, 1) threadsPerThreadgroup:MTLSizeMake(128, 1, 1)];
+
+            // SSM step m
+            [enc setComputePipelineState:pso_ssm];
+            [enc setBuffer:b_out offset:o_off + (size_t)m * z_stride * 2 atIndex:0];
+            [enc setBuffer:b_qkv offset:qkv_off + (size_t)m * channels * 2 atIndex:1];
+            [enc setBuffer:b_z offset:z_off + (size_t)m * z_stride * 2 atIndex:2];
+            [enc setBuffer:b_a offset:a_off + (size_t)m * num_v_heads * 2 atIndex:3];
+            [enc setBuffer:b_b offset:b_off + (size_t)m * num_v_heads * 2 atIndex:4];
+            [enc setBuffer:b_al offset:al_off atIndex:5];
+            [enc setBuffer:b_dt offset:dt_off atIndex:6];
+            [enc setBuffer:b_nw offset:nw_off atIndex:7];
+            [enc setBuffer:(m == 0 ? b_issm : b_ossm) offset:(m == 0 ? issm_off : ossm_off) atIndex:8];
+            [enc setBuffer:b_ossm offset:ossm_off atIndex:9];
+            [enc setBytes:&num_k_heads length:sizeof(num_k_heads) atIndex:10];
+            [enc setBytes:&num_v_heads length:sizeof(num_v_heads) atIndex:11];
+            [enc setBytes:&head_dim length:sizeof(head_dim) atIndex:12];
+            [enc dispatchThreadgroups:MTLSizeMake(num_v_heads, 1, 1) threadsPerThreadgroup:MTLSizeMake(128, 1, 1)];
         }
+        s->end_encoder_and_maybe_commit();
         return;
     }
 
+    fprintf(stderr, "[WARN] deltanet_linear_attention_decode_batch_cuda FALLBACK TO CPU! M=%d\n", M);
     metal_stream_synchronize(stream);
     if (!out || !in_qkv || !in_z || !in_a || !in_b || !conv1d_w || !in_conv_state || !in_ssm_state || !norm_w || !A_log || !dt_bias) return;
     // 1. Conv1D 1x4 depthwise causal convolution across M tokens
@@ -3492,47 +3626,104 @@ void gemm_int3_batch_cuda(__nv_bfloat16* out, const __nv_bfloat16* A, const uint
 
     auto& ctx = MetalContext::instance();
     MetalStreamObj* s = get_stream(stream);
+
+    // Ultra-fast Hardware MPS Tensor Core path for prefill (M >= 4)
+    if (M >= 4) {
+        id<MTLComputePipelineState> pso_dequant3 = ctx.get_pipeline("dequant_int3_to_fp16_kernel");
+        id<MTLComputePipelineState> pso_b2f = ctx.get_pipeline("bf16_to_fp16_kernel");
+        id<MTLComputePipelineState> pso_f2b = ctx.get_pipeline("fp16_to_bf16_kernel");
+
+        size_t o_off, a_off, w_off, s_off;
+        id<MTLBuffer> b_out = ctx.get_buffer(out, o_off);
+        id<MTLBuffer> b_a = ctx.get_buffer(A, a_off);
+        id<MTLBuffer> b_w = ctx.get_buffer(weight, w_off);
+        id<MTLBuffer> b_s = ctx.get_buffer(scale, s_off);
+
+        if (pso_dequant3 && pso_b2f && pso_f2b && b_out && b_a && b_w && b_s && N <= 17408 && K <= 17408 && M <= 512) {
+            ctx.ensure_mps_scratch();
+
+            // 1. Convert A to FP16 and Dequantize W to FP16 in 1 compute encoder
+            id<MTLComputeCommandEncoder> enc = s->get_encoder();
+            [enc setComputePipelineState:pso_b2f];
+            [enc setBuffer:ctx.mps_scratch_a_fp16 offset:0 atIndex:0];
+            [enc setBuffer:b_a offset:a_off atIndex:1];
+            int count_a = M * K;
+            [enc setBytes:&count_a length:4 atIndex:2];
+            [enc dispatchThreads:MTLSizeMake(count_a, 1, 1) threadsPerThreadgroup:MTLSizeMake(256, 1, 1)];
+
+            [enc setComputePipelineState:pso_dequant3];
+            [enc setBuffer:ctx.mps_scratch_w_fp16 offset:0 atIndex:0];
+            [enc setBuffer:b_w offset:w_off atIndex:1];
+            [enc setBuffer:b_s offset:s_off atIndex:2];
+            [enc setBytes:&N length:4 atIndex:3];
+            [enc setBytes:&K length:4 atIndex:4];
+            MTLSize grid = MTLSizeMake(K / 32, N, 1);
+            MTLSize tg = MTLSizeMake(32, 4, 1);
+            [enc dispatchThreads:grid threadsPerThreadgroup:tg];
+            // 2. Hardware MPS GEMM: C = A * W^T
+            id<MTLCommandBuffer> cb = s->get_command_buffer();
+            MPSMatrixDescriptor* descA = [MPSMatrixDescriptor matrixDescriptorWithRows:M columns:K rowBytes:K * sizeof(uint16_t) dataType:MPSDataTypeFloat16];
+            MPSMatrixDescriptor* descW = [MPSMatrixDescriptor matrixDescriptorWithRows:N columns:K rowBytes:K * sizeof(uint16_t) dataType:MPSDataTypeFloat16];
+            MPSMatrixDescriptor* descC = [MPSMatrixDescriptor matrixDescriptorWithRows:M columns:N rowBytes:N * sizeof(uint16_t) dataType:MPSDataTypeFloat16];
+
+            MPSMatrix* matA = [[MPSMatrix alloc] initWithBuffer:ctx.mps_scratch_a_fp16 descriptor:descA];
+            MPSMatrix* matW = [[MPSMatrix alloc] initWithBuffer:ctx.mps_scratch_w_fp16 descriptor:descW];
+            MPSMatrix* matC = [[MPSMatrix alloc] initWithBuffer:ctx.mps_scratch_c_fp16 descriptor:descC];
+
+            MPSMatrixMultiplication* mul = [[MPSMatrixMultiplication alloc] initWithDevice:ctx.device transposeLeft:false transposeRight:true resultRows:M resultColumns:N interiorColumns:K alpha:1.0f beta:0.0f];
+            [mul encodeToCommandBuffer:cb leftMatrix:matA rightMatrix:matW resultMatrix:matC];
+
+            // 3. Convert C back to BF16 (into out)
+            id<MTLComputeCommandEncoder> enc2 = s->get_encoder();
+            [enc2 setComputePipelineState:pso_f2b];
+            [enc2 setBuffer:b_out offset:o_off atIndex:0];
+            [enc2 setBuffer:ctx.mps_scratch_c_fp16 offset:0 atIndex:1];
+            int count_out = M * N;
+            [enc2 setBytes:&count_out length:4 atIndex:2];
+            bool is_res = false;
+            [enc2 setBytes:&is_res length:sizeof(is_res) atIndex:3];
+            [enc2 dispatchThreads:MTLSizeMake(count_out, 1, 1) threadsPerThreadgroup:MTLSizeMake(256, 1, 1)];
+            s->end_encoder_and_maybe_commit();
+            return;
+        }
+    }
+
+    fprintf(stderr, "[WARN] gemm_int3_batch_cuda MPS BYPASSED! M=%d\n", M);
     id<MTLComputePipelineState> pso = ctx.get_pipeline("gemm_int3_batch_kernel");
     if (!pso) {
         for (int m = 0; m < M; m++) {
-            gemv_int3_cuda(out + m * N, A + m * K, weight, scale, N, K, stream);
+            gemv_int3_cuda(out + (size_t)m * N, A + (size_t)m * K, weight, scale, N, K, stream);
         }
         return;
     }
 
-    for (int offset = 0; offset < M; offset += 8) {
-        int cur_m = std::min(8, M - offset);
-        __nv_bfloat16* cur_out = out + (size_t)offset * N;
-        const __nv_bfloat16* cur_A = A + (size_t)offset * K;
+    size_t o_off, a_off, w_off, s_off;
+    id<MTLBuffer> b_out = ctx.get_buffer(out, o_off);
+    id<MTLBuffer> b_a = ctx.get_buffer(A, a_off);
+    id<MTLBuffer> b_w = ctx.get_buffer(weight, w_off);
+    id<MTLBuffer> b_s = ctx.get_buffer(scale, s_off);
 
-        size_t o_off, a_off, w_off, s_off;
-        id<MTLBuffer> b_out = ctx.get_buffer(cur_out, o_off);
-        id<MTLBuffer> b_a = ctx.get_buffer(cur_A, a_off);
-        id<MTLBuffer> b_w = ctx.get_buffer(weight, w_off);
-        id<MTLBuffer> b_s = ctx.get_buffer(scale, s_off);
-
-        if (!b_out || !b_a || !b_w || !b_s) {
-            for (int m = 0; m < cur_m; m++) {
-                gemv_int3_cuda(cur_out + m * N, cur_A + m * K, weight, scale, N, K, stream);
-            }
-            continue;
+    if (!b_out || !b_a || !b_w || !b_s) {
+        for (int m = 0; m < M; m++) {
+            gemv_int3_cuda(out + (size_t)m * N, A + (size_t)m * K, weight, scale, N, K, stream);
         }
-
-        id<MTLComputeCommandEncoder> enc = s->get_encoder();
-        [enc setComputePipelineState:pso];
-        [enc setBuffer:b_out offset:o_off atIndex:0];
-        [enc setBuffer:b_a offset:a_off atIndex:1];
-        [enc setBuffer:b_w offset:w_off atIndex:2];
-        [enc setBuffer:b_s offset:s_off atIndex:3];
-        [enc setBytes:&N length:sizeof(N) atIndex:4];
-        [enc setBytes:&K length:sizeof(K) atIndex:5];
-        [enc setBytes:&cur_m length:sizeof(cur_m) atIndex:6];
-        bool is_res = false;
-        [enc setBytes:&is_res length:sizeof(is_res) atIndex:7];
-
-        [enc dispatchThreadgroups:MTLSizeMake(N, 1, 1) threadsPerThreadgroup:MTLSizeMake(64, 1, 1)];
-        s->end_encoder_and_maybe_commit();
+        return;
     }
+
+    id<MTLComputeCommandEncoder> enc = s->get_encoder();
+    [enc setComputePipelineState:pso];
+    [enc setBuffer:b_out offset:o_off atIndex:0];
+    [enc setBuffer:b_a offset:a_off atIndex:1];
+    [enc setBuffer:b_w offset:w_off atIndex:2];
+    [enc setBuffer:b_s offset:s_off atIndex:3];
+    [enc setBytes:&N length:sizeof(N) atIndex:4];
+    [enc setBytes:&K length:sizeof(K) atIndex:5];
+    [enc setBytes:&M length:sizeof(M) atIndex:6];
+    bool is_res = false;
+    [enc setBytes:&is_res length:sizeof(is_res) atIndex:7];
+
+    [enc dispatchThreadgroups:MTLSizeMake((N + 31) / 32, (M + 7) / 8, 1) threadsPerThreadgroup:MTLSizeMake(64, 1, 1)];
+    s->end_encoder_and_maybe_commit();
 }
 
 void gemm_int3_swiglu_fused_batch_cuda(__nv_bfloat16* out, const __nv_bfloat16* A, const uint8_t* gate_weight, const __nv_bfloat16* gate_scale, const uint8_t* up_weight, const __nv_bfloat16* up_scale, int N, int K, int M, float swiglu_limit, cudaStream_t stream) {
@@ -3544,50 +3735,116 @@ void gemm_int3_swiglu_fused_batch_cuda(__nv_bfloat16* out, const __nv_bfloat16* 
 
     auto& ctx = MetalContext::instance();
     MetalStreamObj* s = get_stream(stream);
-    id<MTLComputePipelineState> pso = ctx.get_pipeline("gemm_int3_swiglu_fused_batch_kernel");
-    if (!pso) {
-        for (int m = 0; m < M; m++) {
-            gemv_int3_swiglu_fused_cuda(out + m * N, A + m * K, gate_weight, gate_scale, up_weight, up_scale, N, K, swiglu_limit, stream);
-        }
-        return;
-    }
 
-    for (int offset = 0; offset < M; offset += 8) {
-        int cur_m = std::min(8, M - offset);
-        __nv_bfloat16* cur_out = out + (size_t)offset * N;
-        const __nv_bfloat16* cur_A = A + (size_t)offset * K;
+    // Ultra-fast Hardware MPS Tensor Core path for prefill (M >= 4)
+    if (M >= 4) {
+        id<MTLComputePipelineState> pso_dequant3 = ctx.get_pipeline("dequant_int3_to_fp16_kernel");
+        id<MTLComputePipelineState> pso_b2f = ctx.get_pipeline("bf16_to_fp16_kernel");
+        id<MTLComputePipelineState> pso_swiglu = ctx.get_pipeline("swiglu_fp16_to_bf16_kernel");
 
         size_t o_off, a_off, gw_off, gs_off, uw_off, us_off;
-        id<MTLBuffer> b_out = ctx.get_buffer(cur_out, o_off);
-        id<MTLBuffer> b_a = ctx.get_buffer(cur_A, a_off);
+        id<MTLBuffer> b_out = ctx.get_buffer(out, o_off);
+        id<MTLBuffer> b_a = ctx.get_buffer(A, a_off);
         id<MTLBuffer> b_gw = ctx.get_buffer(gate_weight, gw_off);
         id<MTLBuffer> b_gs = ctx.get_buffer(gate_scale, gs_off);
         id<MTLBuffer> b_uw = ctx.get_buffer(up_weight, uw_off);
         id<MTLBuffer> b_us = ctx.get_buffer(up_scale, us_off);
 
-        if (!b_out || !b_a || !b_gw || !b_gs || !b_uw || !b_us) {
-            for (int m = 0; m < cur_m; m++) {
-                gemv_int3_swiglu_fused_cuda(cur_out + m * N, cur_A + m * K, gate_weight, gate_scale, up_weight, up_scale, N, K, swiglu_limit, stream);
-            }
-            continue;
+        if (pso_dequant3 && pso_b2f && pso_swiglu && b_out && b_a && b_gw && b_gs && b_uw && b_us && N <= 17408 && K <= 17408 && M <= 512) {
+            ctx.ensure_mps_scratch();
+
+            // 1. Convert A to FP16, Dequant Gate to FP16, Dequant Up to FP16 in 1 compute encoder
+            id<MTLComputeCommandEncoder> enc = s->get_encoder();
+            [enc setComputePipelineState:pso_b2f];
+            [enc setBuffer:ctx.mps_scratch_a_fp16 offset:0 atIndex:0];
+            [enc setBuffer:b_a offset:a_off atIndex:1];
+            int count_a = M * K;
+            [enc setBytes:&count_a length:4 atIndex:2];
+            [enc dispatchThreads:MTLSizeMake(count_a, 1, 1) threadsPerThreadgroup:MTLSizeMake(256, 1, 1)];
+
+            [enc setComputePipelineState:pso_dequant3];
+            [enc setBuffer:ctx.mps_scratch_w_fp16 offset:0 atIndex:0];
+            [enc setBuffer:b_gw offset:gw_off atIndex:1];
+            [enc setBuffer:b_gs offset:gs_off atIndex:2];
+            [enc setBytes:&N length:4 atIndex:3];
+            [enc setBytes:&K length:4 atIndex:4];
+            MTLSize grid = MTLSizeMake(K / 32, N, 1);
+            MTLSize tg = MTLSizeMake(32, 4, 1);
+            [enc dispatchThreads:grid threadsPerThreadgroup:tg];
+
+            [enc setBuffer:ctx.mps_scratch_w_up_fp16 offset:0 atIndex:0];
+            [enc setBuffer:b_uw offset:uw_off atIndex:1];
+            [enc setBuffer:b_us offset:us_off atIndex:2];
+            [enc dispatchThreads:grid threadsPerThreadgroup:tg];
+            // 2. Hardware MPS GEMM: Gate = A * W_gate^T and Up = A * W_up^T
+            id<MTLCommandBuffer> cb = s->get_command_buffer();
+            MPSMatrixDescriptor* descA = [MPSMatrixDescriptor matrixDescriptorWithRows:M columns:K rowBytes:K * sizeof(uint16_t) dataType:MPSDataTypeFloat16];
+            MPSMatrixDescriptor* descW = [MPSMatrixDescriptor matrixDescriptorWithRows:N columns:K rowBytes:K * sizeof(uint16_t) dataType:MPSDataTypeFloat16];
+            MPSMatrixDescriptor* descC = [MPSMatrixDescriptor matrixDescriptorWithRows:M columns:N rowBytes:N * sizeof(uint16_t) dataType:MPSDataTypeFloat16];
+
+            MPSMatrix* matA = [[MPSMatrix alloc] initWithBuffer:ctx.mps_scratch_a_fp16 descriptor:descA];
+            MPSMatrix* matGw = [[MPSMatrix alloc] initWithBuffer:ctx.mps_scratch_w_fp16 descriptor:descW];
+            MPSMatrix* matUw = [[MPSMatrix alloc] initWithBuffer:ctx.mps_scratch_w_up_fp16 descriptor:descW];
+            MPSMatrix* matGateOut = [[MPSMatrix alloc] initWithBuffer:ctx.mps_scratch_gate_fp16 descriptor:descC];
+            MPSMatrix* matUpOut = [[MPSMatrix alloc] initWithBuffer:ctx.mps_scratch_c_fp16 descriptor:descC];
+
+            MPSMatrixMultiplication* mul = [[MPSMatrixMultiplication alloc] initWithDevice:ctx.device transposeLeft:false transposeRight:true resultRows:M resultColumns:N interiorColumns:K alpha:1.0f beta:0.0f];
+            [mul encodeToCommandBuffer:cb leftMatrix:matA rightMatrix:matGw resultMatrix:matGateOut];
+            [mul encodeToCommandBuffer:cb leftMatrix:matA rightMatrix:matUw resultMatrix:matUpOut];
+
+            // 3. Fused SwiGLU activation + output conversion: out = bfloat(silu(gate) * up)
+            id<MTLComputeCommandEncoder> enc2 = s->get_encoder();
+            [enc2 setComputePipelineState:pso_swiglu];
+            [enc2 setBuffer:b_out offset:o_off atIndex:0];
+            [enc2 setBuffer:ctx.mps_scratch_gate_fp16 offset:0 atIndex:1];
+            [enc2 setBuffer:ctx.mps_scratch_c_fp16 offset:0 atIndex:2];
+            int count_out = M * N;
+            [enc2 setBytes:&count_out length:4 atIndex:3];
+            [enc2 setBytes:&swiglu_limit length:4 atIndex:4];
+            [enc2 dispatchThreads:MTLSizeMake(count_out, 1, 1) threadsPerThreadgroup:MTLSizeMake(256, 1, 1)];
+            s->end_encoder_and_maybe_commit();
+            return;
         }
-
-        id<MTLComputeCommandEncoder> enc = s->get_encoder();
-        [enc setComputePipelineState:pso];
-        [enc setBuffer:b_out offset:o_off atIndex:0];
-        [enc setBuffer:b_a offset:a_off atIndex:1];
-        [enc setBuffer:b_gw offset:gw_off atIndex:2];
-        [enc setBuffer:b_gs offset:gs_off atIndex:3];
-        [enc setBuffer:b_uw offset:uw_off atIndex:4];
-        [enc setBuffer:b_us offset:us_off atIndex:5];
-        [enc setBytes:&N length:sizeof(N) atIndex:6];
-        [enc setBytes:&K length:sizeof(K) atIndex:7];
-        [enc setBytes:&cur_m length:sizeof(cur_m) atIndex:8];
-        [enc setBytes:&swiglu_limit length:sizeof(swiglu_limit) atIndex:9];
-
-        [enc dispatchThreadgroups:MTLSizeMake(N, 1, 1) threadsPerThreadgroup:MTLSizeMake(64, 1, 1)];
-        s->end_encoder_and_maybe_commit();
     }
+
+    id<MTLComputePipelineState> pso = ctx.get_pipeline("gemm_int3_swiglu_fused_batch_kernel");
+    if (!pso) {
+        for (int m = 0; m < M; m++) {
+            gemv_int3_swiglu_fused_cuda(out + (size_t)m * N, A + (size_t)m * K, gate_weight, gate_scale, up_weight, up_scale, N, K, swiglu_limit, stream);
+        }
+        return;
+    }
+
+    size_t o_off, a_off, gw_off, gs_off, uw_off, us_off;
+    id<MTLBuffer> b_out = ctx.get_buffer(out, o_off);
+    id<MTLBuffer> b_a = ctx.get_buffer(A, a_off);
+    id<MTLBuffer> b_gw = ctx.get_buffer(gate_weight, gw_off);
+    id<MTLBuffer> b_gs = ctx.get_buffer(gate_scale, gs_off);
+    id<MTLBuffer> b_uw = ctx.get_buffer(up_weight, uw_off);
+    id<MTLBuffer> b_us = ctx.get_buffer(up_scale, us_off);
+
+    if (!b_out || !b_a || !b_gw || !b_gs || !b_uw || !b_us) {
+        for (int m = 0; m < M; m++) {
+            gemv_int3_swiglu_fused_cuda(out + (size_t)m * N, A + (size_t)m * K, gate_weight, gate_scale, up_weight, up_scale, N, K, swiglu_limit, stream);
+        }
+        return;
+    }
+
+    id<MTLComputeCommandEncoder> enc = s->get_encoder();
+    [enc setComputePipelineState:pso];
+    [enc setBuffer:b_out offset:o_off atIndex:0];
+    [enc setBuffer:b_a offset:a_off atIndex:1];
+    [enc setBuffer:b_gw offset:gw_off atIndex:2];
+    [enc setBuffer:b_gs offset:gs_off atIndex:3];
+    [enc setBuffer:b_uw offset:uw_off atIndex:4];
+    [enc setBuffer:b_us offset:us_off atIndex:5];
+    [enc setBytes:&N length:sizeof(N) atIndex:6];
+    [enc setBytes:&K length:sizeof(K) atIndex:7];
+    [enc setBytes:&M length:sizeof(M) atIndex:8];
+    [enc setBytes:&swiglu_limit length:sizeof(swiglu_limit) atIndex:9];
+
+    [enc dispatchThreadgroups:MTLSizeMake((N + 31) / 32, (M + 7) / 8, 1) threadsPerThreadgroup:MTLSizeMake(64, 1, 1)];
+    s->end_encoder_and_maybe_commit();
 }
 void gemv_fp4_cuda(__nv_bfloat16* out, const __nv_bfloat16* vec, const uint8_t* weight, const uint8_t* scale, int N, int K, cudaStream_t stream) {
     (void)out; (void)vec; (void)weight; (void)scale; (void)N; (void)K; (void)stream;
