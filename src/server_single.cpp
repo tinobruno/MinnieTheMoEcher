@@ -2984,7 +2984,11 @@ public:
 
     // MTP Self-Drafter (new, faster)
     MTPSelfDrafter mtp_drafter_;
+#ifdef __APPLE__
+    bool enable_mtp_ = false;
+#else
     bool enable_mtp_ = true;
+#endif
     int mtp_k_ = 0; // 0 = auto (1 for 16GB GPUs, 4 for >= 24GB GPUs)
 
     // Qwen Vision Tower (Multimodal)
@@ -13955,10 +13959,17 @@ int main(int argc, char** argv) {
     std::string imatrix_dataset = "";
     std::string imatrix_out = "";
     int imatrix_max_tokens = -1;
+#ifdef __APPLE__
+    bool enable_pld = false;
+    int pld_draft_tokens = 4;
+    bool enable_mtp = false;
+    bool enable_spec = false;
+#else
     bool enable_pld = true;
     int pld_draft_tokens = 4;
     bool enable_mtp = true;
     bool enable_spec = true;
+#endif
     std::string test_prompt = "";
     bool benchmark_mode = false;
     float test_temp = 0.7f;
@@ -13996,6 +14007,14 @@ int main(int argc, char** argv) {
             proxy_port = std::stoi(argv[++i]);
         } else if (std::string(argv[i]) == "--no-mtp" || std::string(argv[i]) == "--disable-mtp") {
             enable_mtp = false;
+        } else if (std::string(argv[i]) == "--mtp" || std::string(argv[i]) == "--enable-mtp") {
+            enable_mtp = true;
+            enable_spec = true;
+        } else if (std::string(argv[i]) == "--pld" || std::string(argv[i]) == "--enable-pld") {
+            enable_pld = true;
+            enable_spec = true;
+        } else if (std::string(argv[i]) == "--spec" || std::string(argv[i]) == "--enable-spec") {
+            enable_spec = true;
         } else if ((std::string(argv[i]) == "--mtp-k" || std::string(argv[i]) == "--mtp-depth") && i + 1 < argc) {
             mtp_k = std::stoi(argv[++i]);
         } else if (std::string(argv[i]) == "--no-proxy" || std::string(argv[i]) == "--disable-proxy") {

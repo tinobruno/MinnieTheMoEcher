@@ -3376,11 +3376,14 @@ void dequant_int4_block_cuda(__nv_bfloat16* out, const uint8_t* weight, const __
 }
 
 void apply_repetition_penalty_cuda(float* logits, const int32_t* history_tokens, int num_history, float penalty, cudaStream_t stream) {
-    (void)stream;
+    if (penalty == 1.0f || !logits || !history_tokens || num_history <= 0) return;
+    metal_stream_synchronize(stream);
     for (int i = 0; i < num_history; i++) {
         int token = history_tokens[i];
-        if (logits[token] > 0.0f) logits[token] /= penalty;
-        else logits[token] *= penalty;
+        if (token >= 0 && token < 250000) {
+            if (logits[token] > 0.0f) logits[token] /= penalty;
+            else logits[token] *= penalty;
+        }
     }
 }
 void hc_split_sinkhorn_cuda(float* pre, float* post, float* comb, const float* mixes, const float* scale, const float* base, int hc_mult, int sinkhorn_iters, float eps, cudaStream_t stream) {
