@@ -4859,7 +4859,7 @@ public:
             enable_thinking = false;
             max_thinking_tokens = 0;
         }
-        bool think_block_ended = false;
+        bool think_block_ended = !in_think_block;
         std::string finish_reason = "length";
 
         // Set per-request repetition penalty
@@ -5206,7 +5206,17 @@ public:
                     }
                     argmax_cache_valid_ = false;
                 }
-                next_token = sample_token(temperature, history, content_tokens_generated, in_think_block,
+                if (!enable_thinking) {
+                    float neg_inf = -1e9f;
+                    if (think_start_id >= 0) {
+                        CUDA_CHECK(cudaMemcpyAsync(buf_logits_.f32() + think_start_id, &neg_inf, sizeof(float), cudaMemcpyHostToDevice, main_stream_));
+                    }
+                    if (think_end_id >= 0) {
+                        CUDA_CHECK(cudaMemcpyAsync(buf_logits_.f32() + think_end_id, &neg_inf, sizeof(float), cudaMemcpyHostToDevice, main_stream_));
+                    }
+                    argmax_cache_valid_ = false;
+                }
+                next_token = sample_token(temperature, output_ids, content_tokens_generated, in_think_block,
                                           top_k, top_p, min_p);
             }
             
@@ -5246,14 +5256,9 @@ public:
             }
 
             if (!enable_thinking && (next_token == think_start_id || next_token == think_end_id)) {
-                if (content_tokens_generated > 0) {
-                    LOG_WARN("Stop on think token in non-thinking mode: token=%d at step %d (content: %d)",
-                             next_token, t, content_tokens_generated);
-                    finish_reason = "stop";
-                    break;
-                }
                 float neg_inf = -1e9f;
                 CUDA_CHECK(cudaMemcpyAsync(buf_logits_.f32() + next_token, &neg_inf, sizeof(float), cudaMemcpyHostToDevice, main_stream_));
+                argmax_cache_valid_ = false;
                 next_token = -1;
                 continue;
             }
@@ -5403,7 +5408,7 @@ public:
                                                        cudaMemcpyDeviceToDevice, main_stream_));
                             CUDA_CHECK(cudaStreamSynchronize(main_stream_));
                             argmax_cache_valid_ = false;
-                            next_token = sample_token(temperature, history, content_tokens_generated, in_think_block,
+                            next_token = sample_token(temperature, output_ids, content_tokens_generated, in_think_block,
                                                       top_k, top_p, min_p);
                         }
 
@@ -8506,7 +8511,7 @@ private:
 
         if (current_rep_penalty_ > 1.0f && !history.empty()) {
             static int32_t* d_rep_hist = nullptr;
-            static const int MAX_REP_HIST = 512;
+            static const int MAX_REP_HIST = 64;
             if (!d_rep_hist) {
                 CUDA_CHECK(cudaMalloc(&d_rep_hist, MAX_REP_HIST * sizeof(int32_t)));
             }
@@ -9522,7 +9527,7 @@ static MultimodalPrompt apply_chat_template_multimodal(
         std::vector<int> result;
         bool has_system = (!messages.empty() && messages[0].value("role", "") == "system");
         if (!has_system) {
-            std::string sys_prompt = (!g_enable_tools) ? "You are an assistant." : "You are a helpful assistant.";
+            std::string sys_prompt = (!g_enable_tools) ? "You are an assistant." : g_base_system_prompt;
             if (has_tools) {
                 sys_prompt += tools_system_prompt;
             }
@@ -9600,6 +9605,12 @@ static MultimodalPrompt apply_chat_template_multimodal(
                 continue;
             }
 
+            if (role == "assistant" && content_str.empty() &&
+                (!messages[i].contains("reasoning_content") || messages[i]["reasoning_content"].empty()) &&
+                (!messages[i].contains("tool_calls") || messages[i]["tool_calls"].empty())) {
+                continue;
+            }
+
             result.push_back(IM_START);
             auto role_enc = tok.encode(role + "\n");
             result.insert(result.end(), role_enc.begin(), role_enc.end());
@@ -9672,6 +9683,9 @@ static MultimodalPrompt apply_chat_template_multimodal(
                 bool actual_thinking = enable_thinking && out.image_b64.empty();
                 if (actual_thinking) {
                     auto think_enc = tok.encode("<think>\n");
+                    result.insert(result.end(), think_enc.begin(), think_enc.end());
+                } else {
+                    auto think_enc = tok.encode("<think>\n\n</think>\n");
                     result.insert(result.end(), think_enc.begin(), think_enc.end());
                 }
             }

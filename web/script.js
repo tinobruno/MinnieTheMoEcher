@@ -229,6 +229,52 @@ function clearChat() {
     chatInput.focus();
 }
 
+// ════════════════════════════════════════════════════════════════════════════════
+//  Global Toast Notifications
+// ════════════════════════════════════════════════════════════════════════════════
+
+function showToast(message, type = 'info', duration = 4000) {
+    if (!message || typeof document === 'undefined') return;
+    let container = document.getElementById('moecher-toast-container');
+    if (!container) {
+        container = document.createElement('div');
+        container.id = 'moecher-toast-container';
+        container.className = 'moecher-toast-container';
+        document.body.appendChild(container);
+    }
+
+    const toast = document.createElement('div');
+    toast.className = `moecher-toast toast-${type}`;
+
+    let iconName = 'info';
+    if (type === 'error') iconName = 'error';
+    else if (type === 'warn' || type === 'warning') iconName = 'warning';
+    else if (type === 'success') iconName = 'check_circle';
+
+    const safeMsg = (typeof escapeHtml === 'function') ? escapeHtml(message) : message;
+
+    toast.innerHTML = `
+        <span class="material-symbols-outlined toast-icon">${iconName}</span>
+        <span class="toast-message">${safeMsg}</span>
+        <button type="button" class="toast-close" title="Dismiss">&times;</button>
+    `;
+
+    const closeBtn = toast.querySelector('.toast-close');
+    const dismiss = () => {
+        toast.classList.remove('visible');
+        setTimeout(() => { if (toast.parentElement) toast.remove(); }, 250);
+    };
+    if (closeBtn) closeBtn.onclick = (e) => { e.stopPropagation(); dismiss(); };
+    toast.onclick = dismiss;
+
+    container.appendChild(toast);
+    requestAnimationFrame(() => {
+        toast.classList.add('visible');
+    });
+
+    setTimeout(dismiss, duration);
+}
+
 // ============================================================================
 // Resizable HTML Preview & Test Panel Implementation
 // ============================================================================
@@ -8170,16 +8216,56 @@ function toggleVoiceRecognition() {
     }
 }
 
-function startVoiceRecognition() {
+async function startVoiceRecognition() {
     if (isGenerating) return;
     const SpeechClass = getSpeechRecognitionClass();
     if (!SpeechClass) {
-        alert("Voice recognition is not supported in this browser.\nPlease use Google Chrome, Microsoft Edge, Safari, or Chromium.");
+        showToast("Voice recognition is not supported in this browser. Please use Chrome, Edge, or Safari.", "error", 5000);
         return;
     }
 
-    // Stop any ongoing speech playback so microphone doesn't hear it
+    // Stop any ongoing speech playback so microphone doesn't pick it up
     stopTtsAudio();
+
+    // Check secure context
+    if (typeof window !== 'undefined' && window.isSecureContext === false) {
+        showToast("Microphone dictation requires a secure origin (http://localhost or https://).", "error", 6000);
+        return;
+    }
+
+    // Check for connected audio input devices first if enumerateDevices is available
+    if (navigator.mediaDevices && navigator.mediaDevices.enumerateDevices) {
+        try {
+            const devices = await navigator.mediaDevices.enumerateDevices();
+            const audioInputs = devices.filter(d => d.kind === 'audioinput');
+            if (devices.length > 0 && audioInputs.length === 0) {
+                showToast("No microphone detected on this computer. Please connect a microphone, AirPods, or headset.", "error", 7000);
+                return;
+            }
+        } catch (e) {
+            // Proceed to getUserMedia check
+        }
+    }
+
+    // Explicitly prompt for mic permission via getUserMedia if available
+    if (navigator.mediaDevices && navigator.mediaDevices.getUserMedia) {
+        try {
+            const stream = await navigator.mediaDevices.getUserMedia({ audio: true });
+            stream.getTracks().forEach(track => track.stop());
+        } catch (permErr) {
+            console.warn("getUserMedia permission error:", permErr);
+            if (permErr.name === 'NotFoundError' || permErr.name === 'DevicesNotFoundError') {
+                showToast("No microphone detected on this computer. Please connect a microphone, AirPods, or headset.", "error", 7000);
+                return;
+            }
+            if (permErr.name === 'NotAllowedError' || permErr.name === 'PermissionDeniedError') {
+                showToast("Microphone permission blocked. Click the lock/tune icon in the browser address bar to allow microphone access.", "warn", 6000);
+                return;
+            }
+            showToast("Microphone access error: " + (permErr.message || permErr.name), "error", 6000);
+            return;
+        }
+    }
 
     try {
         if (speechRecognitionInstance) {
@@ -8244,10 +8330,27 @@ function startVoiceRecognition() {
         speechRecognitionInstance.onerror = (event) => {
             console.warn("Speech recognition error:", event.error);
             if (event.error === 'not-allowed') {
-                showToast("Microphone access denied. Please grant microphone permission in your browser.");
+                if (typeof window !== 'undefined' && window.isSecureContext === false) {
+                    showToast("Microphone requires a secure origin (http://localhost or https://).", "error", 6000);
+                } else {
+                    showToast("Microphone access blocked. Click the lock/tune icon in the browser address bar to allow microphone access.", "warn", 6000);
+                }
                 stopVoiceRecognition();
             } else if (event.error === 'network') {
-                showToast("Speech service network error. Check your internet connection.");
+                showToast("Speech service network error. (Note: Chromium browsers require an internet connection for built-in speech recognition).", "warn", 6000);
+                stopVoiceRecognition();
+            } else if (event.error === 'audio-capture') {
+                showToast("No microphone detected. Please check your system audio input device.", "error", 5000);
+                stopVoiceRecognition();
+            } else if (event.error === 'service-not-allowed') {
+                showToast("Speech recognition service is disabled or blocked in your browser.", "error", 5000);
+                stopVoiceRecognition();
+            } else if (event.error === 'no-speech') {
+                // Ignore silent intervals or brief pauses without spamming the user
+            } else if (event.error === 'aborted') {
+                // Handled gracefully when user or stop() cancels
+            } else {
+                showToast(`Speech error: ${event.error}`, "warn", 4000);
                 stopVoiceRecognition();
             }
         };
@@ -8264,7 +8367,7 @@ function startVoiceRecognition() {
         console.error("Failed to start speech recognition:", err);
         isVoiceRecording = false;
         updateVoiceRecordingUI(false);
-        showToast("Could not start microphone: " + (err.message || err));
+        showToast("Could not start microphone: " + (err.message || err), "error");
     }
 }
 
