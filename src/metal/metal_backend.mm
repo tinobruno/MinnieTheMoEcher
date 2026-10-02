@@ -12,6 +12,7 @@
 
 #include <iostream>
 #include <unordered_map>
+#include <unordered_set>
 #include <map>
 #include <mutex>
 #include <string>
@@ -67,7 +68,7 @@ struct MetalStreamObj {
         }
     }
 
-    void end_encoder_and_maybe_commit(int batch_limit = 16) {
+    void end_encoder_and_maybe_commit(int batch_limit = 64) {
         end_encoder();
         if (encoder_count >= batch_limit) {
             commit_async();
@@ -3378,9 +3379,10 @@ void dequant_int4_block_cuda(__nv_bfloat16* out, const uint8_t* weight, const __
 void apply_repetition_penalty_cuda(float* logits, const int32_t* history_tokens, int num_history, float penalty, cudaStream_t stream) {
     if (penalty == 1.0f || !logits || !history_tokens || num_history <= 0) return;
     metal_stream_synchronize(stream);
+    std::unordered_set<int32_t> seen;
     for (int i = 0; i < num_history; i++) {
-        int token = history_tokens[i];
-        if (token >= 0 && token < 250000) {
+        int32_t token = history_tokens[i];
+        if (token >= 0 && token < 250000 && seen.insert(token).second) {
             if (logits[token] > 0.0f) logits[token] /= penalty;
             else logits[token] *= penalty;
         }

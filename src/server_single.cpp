@@ -4677,7 +4677,7 @@ public:
         if (active_visual_embeddings_) {
             can_reuse_prefix = false;
             prefix_len = 0;
-        } else if (cfg_.architecture == ModelArch::DEEPSEEK_V4 && prefix_len < cached_tokens_.size()) {
+        } else if ((cfg_.architecture == ModelArch::DEEPSEEK_V4 || cfg_.is_qwen()) && prefix_len < cached_tokens_.size()) {
             can_reuse_prefix = false;
             prefix_len = 0;
         }
@@ -4928,7 +4928,14 @@ public:
             }
 
             std::string token_text = tokenizer_.decode({next_token});
-            if (in_think_block && (token_text.find("</think>") != std::string::npos || (token_buffer + token_text).find("</think>") != std::string::npos)) {
+            if (in_think_block && (token_text.find("</think>") != std::string::npos ||
+                                   token_text.find("</output>") != std::string::npos ||
+                                   token_text.find("</response>") != std::string::npos ||
+                                   token_text.find("</answer>") != std::string::npos ||
+                                   (token_buffer + token_text).find("</think>") != std::string::npos ||
+                                   (token_buffer + token_text).find("</output>") != std::string::npos ||
+                                   (token_buffer + token_text).find("</response>") != std::string::npos ||
+                                   (token_buffer + token_text).find("</answer>") != std::string::npos)) {
                 in_think_block = false;
                 think_block_ended = true;
             }
@@ -8317,12 +8324,12 @@ private:
     float current_rep_penalty_ = 1.0f;  // Set per-request by generate()
 
     int sample_token(float temperature, const std::vector<int>& history, int step = 0, bool is_reasoning = true,
-                     int top_k = 1024, float top_p = 0.95f, float min_p = 0.0f) {
+                     int top_k = 40, float top_p = 0.95f, float min_p = 0.05f) {
         return sample_from_logits_ptr(buf_logits_.f32(), temperature, history, step, is_reasoning, top_k, top_p, min_p);
     }
 
     int sample_from_logits_ptr(float* logits_ptr, float temperature, const std::vector<int>& history, int step = 0, bool is_reasoning = true,
-                               int top_k = 1024, float top_p = 0.95f, float min_p = 0.0f) {
+                               int top_k = 40, float top_p = 0.95f, float min_p = 0.05f) {
         int vocab = cfg_.vocab_size;
         static int32_t* h_sample_pin = nullptr;
         if (!h_sample_pin) {
@@ -9239,6 +9246,9 @@ static json g_current_active_tools = json::array();
 static const std::string g_server_instance_id = std::to_string(std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::system_clock::now().time_since_epoch()).count());
 
 static std::string update_system_prompt_with_tools(const std::string& original_content, const std::string& tools_system_prompt, bool has_tools) {
+    if (!g_enable_tools) {
+        return "You are an assistant.";
+    }
     std::string content = original_content;
     size_t tools_pos = content.find("\n\n# Tools");
     if (tools_pos == std::string::npos) tools_pos = content.find("# Tools");
@@ -9368,15 +9378,15 @@ static MultimodalPrompt apply_chat_template_multimodal(
     bool model_has_vision = false)
 {
     MultimodalPrompt out;
-    json resolved_tools = tools;
+    json resolved_tools = (!g_enable_tools) ? json::array() : tools;
     if (!resolved_tools.empty()) {
         resolved_tools = resolve_canonical_tools(resolved_tools);
     }
-    bool has_tools = (!resolved_tools.empty() && resolved_tools.is_array());
+    bool has_tools = (!resolved_tools.empty() && resolved_tools.is_array() && g_enable_tools);
     int IM_START = tok.get_token_id("<|im_start|>");
     int IM_END = tok.get_token_id("<|im_end|>");
     bool is_qwen = (IM_START >= 0 && IM_END >= 0);
-    std::string tools_system_prompt = has_tools ? build_dynamic_tools_prompt(resolved_tools, is_qwen) : "";
+    std::string tools_system_prompt = (has_tools && g_enable_tools) ? build_dynamic_tools_prompt(resolved_tools, is_qwen) : "";
     has_tools = !tools_system_prompt.empty();
 
     if (IM_START >= 0 && IM_END >= 0) {
@@ -9384,7 +9394,7 @@ static MultimodalPrompt apply_chat_template_multimodal(
         std::vector<int> result;
         bool has_system = (!messages.empty() && messages[0].value("role", "") == "system");
         if (!has_system) {
-            std::string sys_prompt = "You are a helpful assistant.";
+            std::string sys_prompt = (!g_enable_tools) ? "You are an assistant." : "You are a helpful assistant.";
             if (has_tools) {
                 sys_prompt += tools_system_prompt;
             }
@@ -9445,7 +9455,11 @@ static MultimodalPrompt apply_chat_template_multimodal(
             }
 
             if (role == "system" && i == 0) {
-                content_str = update_system_prompt_with_tools(content_str, tools_system_prompt, has_tools);
+                if (!g_enable_tools) {
+                    content_str = "You are an assistant.";
+                } else {
+                    content_str = update_system_prompt_with_tools(content_str, tools_system_prompt, has_tools);
+                }
             }
 
             if (role == "tool" || role == "function") {
@@ -10470,6 +10484,46 @@ static void rebuild_system_prefix(
     const std::string& custom_full_prompt = "")
 {
     std::lock_guard<std::mutex> lock(g_engine_mutex);
+
+    if (!g_enable_tools) {
+        g_base_system_prompt = "You are an assistant.";
+        g_current_system_prompt = "You are an assistant.";
+        g_current_active_tools = json::array();
+
+        // Invalidate conversation continuation snapshot
+        engine.turn_kv_snapshot_.valid = false;
+        s_last_conv_messages.clear();
+
+        json default_messages = json::array({
+            {{"role", "system"}, {"content", g_current_system_prompt}},
+            {{"role", "user"}, {"content", ""}}
+        });
+        std::vector<int> prompt = apply_chat_template(default_messages, engine.tokenizer_, true, "high", json::array());
+        int user_start = (engine.cfg_.architecture == ModelArch::QWEN)
+                             ? engine.tokenizer_.get_token_id("<|im_start|>")
+                             : engine.tokenizer_.get_token_id("<｜User｜>");
+        if (user_start < 0) {
+            user_start = (engine.cfg_.architecture == ModelArch::QWEN) ? 151644 : 128803;
+        }
+        size_t sys_len = prompt.size();
+        for (size_t i = 1; i < prompt.size(); i++) {
+            if (prompt[i] == user_start) {
+                sys_len = i;
+                break;
+            }
+        }
+        if (sys_len > 0) {
+            std::vector<int> sys_tokens(prompt.begin(), prompt.begin() + sys_len);
+            LOG_INFO("[NO-TOOLS] Pre-warming simple assistant prompt into System KV snapshot (%zu tokens)...", sys_tokens.size());
+            engine.reset_all_kv_caches();
+            engine.prefill_prefix(sys_tokens);
+            LOG_INFO("[NO-TOOLS] System KV snapshot pinned successfully (%zu tokens).", sys_tokens.size());
+        } else {
+            engine.reset_all_kv_caches();
+            engine.system_kv_snapshot_.valid = false;
+        }
+        return;
+    }
 
     // Invalidate conversation-level continuation snapshot so next query doesn't reuse stale prompt
     engine.turn_kv_snapshot_.valid = false;
@@ -11998,12 +12052,16 @@ static void run_server(MoecherEngine& engine, int port, int default_thinking_bud
     // ── System Prompt & Tool Configuration Endpoints ────────────────────────
     svr.Get("/api/system/prompt", [&engine](const httplib::Request&, httplib::Response& res) {
         res.set_header("Access-Control-Allow-Origin", "*");
+        std::string base = (!g_enable_tools) ? "You are an assistant." : g_base_system_prompt;
+        std::string current = (!g_enable_tools) ? "You are an assistant." : g_current_system_prompt;
+        json tools = (!g_enable_tools) ? json::array() : g_current_active_tools;
         json body = {
             {"status", "ok"},
             {"server_instance_id", g_server_instance_id},
-            {"base_prompt", g_base_system_prompt},
-            {"system_prompt", g_current_system_prompt},
-            {"active_tools", g_current_active_tools},
+            {"tools_enabled", g_enable_tools},
+            {"base_prompt", base},
+            {"system_prompt", current},
+            {"active_tools", tools},
             {"tokens_count", engine.system_kv_snapshot_.valid ? engine.system_kv_snapshot_.tokens.size() : 0}
         };
         res.set_content(body.dump(), "application/json");
@@ -12019,6 +12077,19 @@ static void run_server(MoecherEngine& engine, int port, int default_thinking_bud
     svr.Post("/api/system/configure", [&engine](const httplib::Request& req, httplib::Response& res) {
         res.set_header("Access-Control-Allow-Origin", "*");
         try {
+            if (!g_enable_tools) {
+                json body = {
+                    {"status", "ok"},
+                    {"server_instance_id", g_server_instance_id},
+                    {"tools_enabled", false},
+                    {"base_prompt", "You are an assistant."},
+                    {"system_prompt", "You are an assistant."},
+                    {"active_tools", json::array()},
+                    {"tokens_count", engine.system_kv_snapshot_.valid ? engine.system_kv_snapshot_.tokens.size() : 0}
+                };
+                res.set_content(body.dump(), "application/json");
+                return;
+            }
             json j = json::parse(req.body);
             std::string base_prompt = j.value("base_prompt", g_base_system_prompt);
             std::string custom_full_prompt = j.value("system_prompt", j.value("custom_system_prompt", ""));
@@ -12511,13 +12582,18 @@ static void run_server(MoecherEngine& engine, int port, int default_thinking_bud
             }
 
             auto& messages = request["messages"];
-            float temperature = request.value("temperature", 1.0f);
+            float temperature = request.value("temperature", 0.7f);
             float top_p = request.value("top_p", 0.95f);
-            float min_p = request.value("min_p", 0.0f);
-            int top_k = request.value("top_k", 1024);
+            float min_p = request.value("min_p", 0.05f);
+            int top_k = request.value("top_k", 40);
+            if (temperature > 0.0f) {
+                if (min_p < 0.05f) min_p = 0.05f;
+                if (top_k <= 0 || top_k > 40) top_k = 40;
+            }
             int max_tokens = request.value("max_tokens", 20000);
             bool stream = request.value("stream", false);
-            float repetition_penalty = request.value("repetition_penalty", 1.0f);
+            float repetition_penalty = request.value("repetition_penalty", 1.05f);
+            if (repetition_penalty <= 1.0f) repetition_penalty = 1.05f;
             std::string reasoning_effort = request.value("reasoning_effort", "high");
             bool enable_thinking = true;
             int max_thinking_tokens = default_thinking_budget;
@@ -14114,6 +14190,12 @@ int main(int argc, char** argv) {
     LOG_INFO("Max tool execution rounds: %d", g_max_tool_rounds);
     LOG_INFO("Server-side tool execution: %s (headless-browsing: %s)", g_server_exec ? "enabled" : "disabled", g_headless_browsing ? "enabled" : "disabled");
 
+    if (!g_enable_tools) {
+        g_base_system_prompt = "You are an assistant.";
+        g_current_system_prompt = "You are an assistant.";
+        g_current_active_tools = json::array();
+    }
+
     MoecherEngine engine;
     engine.enable_mtp_ = enable_mtp;
     engine.mtp_k_ = mtp_k;
@@ -14146,7 +14228,7 @@ int main(int argc, char** argv) {
         std::vector<int> prompt = apply_chat_template(messages, engine.tokenizer_, test_thinking, "high");
         LOG_INFO("Running test generation for prompt: '%s' (%zu prompt tokens, temp=%.2f, max_tokens=%d, thinking=%d)...",
                  prompt_str.c_str(), prompt.size(), test_temp, test_max_tokens, test_thinking ? 1 : 0);
-        std::string result = engine.generate(prompt, test_max_tokens, test_temp, nullptr, 1.0f, test_thinking, default_thinking_budget, 0.95f, 0.0f, 1024);
+        std::string result = engine.generate(prompt, test_max_tokens, test_temp, nullptr, 1.0f, test_thinking, default_thinking_budget, 0.95f, 0.05f, 40);
         printf("\n\n--- Output ---\n%s\n--------------\n", result.c_str());
         return 0;
     }
@@ -14171,13 +14253,17 @@ int main(int argc, char** argv) {
     }
 
     // Pre-warm default system prompt and tooling into KV Cache for 0ms initial prefill latency
-    if (g_enable_tools && g_prewarm) {
-        json default_tools = resolve_canonical_tools("default");
-        json mcp_tools = mcp_mgr.get_openai_tools_schema();
-        for (const auto& mt : mcp_tools) {
-            default_tools.push_back(mt);
+    if (g_prewarm) {
+        if (g_enable_tools) {
+            json default_tools = resolve_canonical_tools("default");
+            json mcp_tools = mcp_mgr.get_openai_tools_schema();
+            for (const auto& mt : mcp_tools) {
+                default_tools.push_back(mt);
+            }
+            rebuild_system_prefix(engine, g_base_system_prompt, default_tools);
+        } else {
+            rebuild_system_prefix(engine, g_base_system_prompt, json::array());
         }
-        rebuild_system_prefix(engine, g_base_system_prompt, default_tools);
     }
 
     run_server(engine, port, default_thinking_budget, proxy_port, enable_forward_proxy, enable_system_proxy);

@@ -2364,6 +2364,7 @@ function removeAuthorizedPath(idx) {
 
 // Built-in tool definitions builder (sends lightweight tool name list to backend)
 function getActiveToolsPayload() {
+    if (window.serverToolsDisabled) return [];
     const isWebRetrieval = webRetrievalEnabled ? webRetrievalEnabled.checked : true;
     const knownTools = ['web_search', 'youtube_search', 'google_search', 'fetch_url', 'create_3d_model', 'read_file', 'write_file', 'edit_file', 'execute_command'];
 
@@ -2430,6 +2431,11 @@ async function fetchBackendSystemPrompt() {
         const res = await fetch(`${getApiBase()}/api/system/prompt`);
         if (!res.ok) throw new Error(`HTTP ${res.status}`);
         const data = await res.json();
+        if (data && data.tools_enabled === false) {
+            window.serverToolsDisabled = true;
+        } else if (data && data.tools_enabled === true) {
+            window.serverToolsDisabled = false;
+        }
         if (data && data.system_prompt !== undefined) {
             if (systemPromptInput) {
                 systemPromptInput.value = data.system_prompt;
@@ -2453,6 +2459,7 @@ async function fetchBackendSystemPrompt() {
 }
 
 function syncToolSettingsWithBackend() {
+    if (window.serverToolsDisabled) return;
     setSystemPromptSyncStatus('syncing', 'Updating prefix & tools...');
     if (toolSyncDebounceTimer) {
         clearTimeout(toolSyncDebounceTimer);
@@ -2521,14 +2528,15 @@ async function initSystemPromptSync() {
     if (systemPromptInput) {
         systemPromptInput.addEventListener('input', handleSystemPromptInput);
     }
-    const activeTools = getActiveToolsPayload();
-    const allTools = ['web_search', 'youtube_search', 'google_search', 'fetch_url', 'create_3d_model', 'read_file', 'write_file', 'edit_file', 'execute_command'];
-    const hasCustomToolConfig = (activeTools.length !== allTools.length);
+    await fetchBackendSystemPrompt();
 
-    if (hasCustomToolConfig) {
-        syncToolSettingsWithBackend();
-    } else {
-        await fetchBackendSystemPrompt();
+    if (!window.serverToolsDisabled) {
+        const activeTools = getActiveToolsPayload();
+        const allTools = ['web_search', 'youtube_search', 'google_search', 'fetch_url', 'create_3d_model', 'read_file', 'write_file', 'edit_file', 'execute_command'];
+        const hasCustomToolConfig = (activeTools.length !== allTools.length);
+        if (hasCustomToolConfig) {
+            syncToolSettingsWithBackend();
+        }
     }
     window.addEventListener('focus', () => fetchBackendSystemPrompt());
     setInterval(() => fetchBackendSystemPrompt(), 30000);
@@ -2728,7 +2736,11 @@ function buildOptimizedMessagesPayload() {
     let sysPrompt = systemPromptInput ? systemPromptInput.value.trim() : '';
     const activeTools = getActiveToolsPayload();
 
-    if (sysPrompt) {
+    if (window.serverToolsDisabled) {
+        sysPrompt = "You are an assistant.";
+        if (systemPromptInput) systemPromptInput.value = sysPrompt;
+        messagesToSend.push({ role: "system", content: sysPrompt });
+    } else if (sysPrompt) {
         // Strip any stale # Tools or <tools> block if activeTools has changed or youtube_search was disabled
         if (sysPrompt.includes('# Tools') || sysPrompt.includes('<tools>')) {
             const hasYt = activeTools.includes('youtube_search');
