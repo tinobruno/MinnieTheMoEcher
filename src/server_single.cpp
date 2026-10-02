@@ -4609,7 +4609,7 @@ public:
     std::string generate(const std::vector<int>& prompt_in, int max_tokens = 20000,
                          float temperature = 1.0f,
                          std::function<bool(const std::string&,bool)> on_token = nullptr,
-                         float repetition_penalty = 1.0f,
+                         float repetition_penalty = 1.10f,
                          bool enable_thinking = true,
                          int max_thinking_tokens = 2048,
                          float top_p = 0.95f,
@@ -4868,6 +4868,11 @@ public:
         int content_tokens_generated = 0;
         int thinking_tokens_generated = 0;
 
+        std::vector<int> recent_think_tokens;
+        std::vector<int> recent_content_tokens;
+        bool think_loop_detected = false;
+        bool content_loop_detected = false;
+
         decode_step_idx_ = 0;
         int n_layers = cfg_.num_hidden_layers;
         int moe_top_k = cfg_.num_experts_per_tok;
@@ -4930,8 +4935,70 @@ public:
 
             if (in_think_block) {
                 thinking_tokens_generated++;
+                recent_think_tokens.push_back(next_token);
+                int n_recent = (int)recent_think_tokens.size();
+                if (n_recent >= 12) {
+                    for (int P = 1; P <= 32 && P * 3 <= n_recent; P++) {
+                        bool match = true;
+                        for (int i = 0; i < P; i++) {
+                            int t0 = recent_think_tokens[n_recent - 1 - i];
+                            int t1 = recent_think_tokens[n_recent - 1 - P - i];
+                            int t2 = recent_think_tokens[n_recent - 1 - 2 * P - i];
+                            if (t0 != t1 || t0 != t2) {
+                                match = false;
+                                break;
+                            }
+                        }
+                        if (match) {
+                            if (P == 1) {
+                                if (n_recent >= 5 &&
+                                    recent_think_tokens[n_recent - 1] == recent_think_tokens[n_recent - 2] &&
+                                    recent_think_tokens[n_recent - 1] == recent_think_tokens[n_recent - 3] &&
+                                    recent_think_tokens[n_recent - 1] == recent_think_tokens[n_recent - 4] &&
+                                    recent_think_tokens[n_recent - 1] == recent_think_tokens[n_recent - 5]) {
+                                    think_loop_detected = true;
+                                    break;
+                                }
+                            } else {
+                                think_loop_detected = true;
+                                break;
+                            }
+                        }
+                    }
+                }
             } else {
                 content_tokens_generated++;
+                recent_content_tokens.push_back(next_token);
+                int n_cnt = (int)recent_content_tokens.size();
+                if (n_cnt >= 16) {
+                    for (int P = 1; P <= 32 && P * 3 <= n_cnt; P++) {
+                        bool match = true;
+                        for (int i = 0; i < P; i++) {
+                            int t0 = recent_content_tokens[n_cnt - 1 - i];
+                            int t1 = recent_content_tokens[n_cnt - 1 - P - i];
+                            int t2 = recent_content_tokens[n_cnt - 1 - 2 * P - i];
+                            if (t0 != t1 || t0 != t2) {
+                                match = false;
+                                break;
+                            }
+                        }
+                        if (match) {
+                            if (P == 1) {
+                                if (n_cnt >= 5 &&
+                                    recent_content_tokens[n_cnt - 1] == recent_content_tokens[n_cnt - 2] &&
+                                    recent_content_tokens[n_cnt - 1] == recent_content_tokens[n_cnt - 3] &&
+                                    recent_content_tokens[n_cnt - 1] == recent_content_tokens[n_cnt - 4] &&
+                                    recent_content_tokens[n_cnt - 1] == recent_content_tokens[n_cnt - 5]) {
+                                    content_loop_detected = true;
+                                    break;
+                                }
+                            } else {
+                                content_loop_detected = true;
+                                break;
+                            }
+                        }
+                    }
+                }
             }
 
             std::string token_text = tokenizer_.decode({next_token});
@@ -4992,6 +5059,16 @@ public:
                 }
                 token_buffer.clear();
             }
+
+            if (!in_think_block && g_enable_tools) {
+                if (generated_text.find("</tool_call>") != std::string::npos ||
+                    generated_text.find("</tool_calls>") != std::string::npos ||
+                    generated_text.find("</function_call>") != std::string::npos) {
+                    LOG_INFO("Tool call closing tag detected. Concluding generation for tool execution.");
+                    finish_reason = "tool_calls";
+                    return false;
+                }
+            }
             return true;
         };
 
@@ -5014,8 +5091,15 @@ public:
                 break;
             }
 
-            // Graceful sentence boundary transition when thinking budget is reached
-            if (in_think_block && max_thinking_tokens > 0 && thinking_tokens_generated >= max_thinking_tokens) {
+                        if (content_loop_detected) {
+                LOG_WARN("Content repetition loop detected at step %d (%d content tokens). Terminating generation.",
+                         t, content_tokens_generated);
+                finish_reason = "stop";
+                break;
+            }
+
+            // Graceful sentence boundary transition when thinking budget is reached or thinking loop is detected
+            if (in_think_block && (think_loop_detected || (max_thinking_tokens > 0 && thinking_tokens_generated >= max_thinking_tokens))) {
                 int grace_limit = max_thinking_tokens + 255;
                 bool is_clean_boundary = false;
                 if (!last_think_token_str.empty()) {
@@ -5024,9 +5108,14 @@ public:
                         is_clean_boundary = true;
                     }
                 }
-                if (is_clean_boundary || thinking_tokens_generated >= grace_limit) {
-                    LOG_WARN("Thinking budget reached (%d/%d tokens, clean_boundary=%d). Closing </think> and starting content.",
-                             thinking_tokens_generated, max_thinking_tokens, is_clean_boundary ? 1 : 0);
+                if (think_loop_detected || is_clean_boundary || thinking_tokens_generated >= grace_limit) {
+                    if (think_loop_detected) {
+                        LOG_WARN("Thinking loop detected at step %d (%d thinking tokens). Forcing </think> and starting content.",
+                                 t, thinking_tokens_generated);
+                    } else {
+                        LOG_WARN("Thinking budget reached (%d/%d tokens, clean_boundary=%d). Closing </think> and starting content.",
+                                 thinking_tokens_generated, max_thinking_tokens, is_clean_boundary ? 1 : 0);
+                    }
 
                     // 1. Inject </think> to close thinking block
                     in_think_block = false;
@@ -5040,6 +5129,9 @@ public:
                         position++;
                         output_ids.push_back(think_end_id);
                         history.push_back(think_end_id);
+                    }
+                    if (on_token) {
+                        on_token("", false); // Signal end of reasoning to stream consumer
                     }
 
                     // 2. Inject and stream "\n\n" as the beginning of CONTENT
@@ -8355,7 +8447,7 @@ private:
 
     // ── Sample from logits ──────────────────────────────────────────────────
 
-    float current_rep_penalty_ = 1.0f;  // Set per-request by generate()
+    float current_rep_penalty_ = 1.10f;  // Set per-request by generate()
 
     int sample_token(float temperature, const std::vector<int>& history, int step = 0, bool is_reasoning = true,
                      int top_k = 1024, float top_p = 0.95f, float min_p = 0.05f) {
@@ -8372,7 +8464,7 @@ private:
 
         if (current_rep_penalty_ > 1.0f && !history.empty()) {
             static int32_t* d_rep_hist = nullptr;
-            static const int MAX_REP_HIST = 256;
+            static const int MAX_REP_HIST = 512;
             if (!d_rep_hist) {
                 CUDA_CHECK(cudaMalloc(&d_rep_hist, MAX_REP_HIST * sizeof(int32_t)));
             }
@@ -12589,7 +12681,7 @@ static void run_server(MoecherEngine& engine, int port, int default_thinking_bud
             }
             bool ignore_eos = request.value("ignore_eos", false);
             bool stream = request.value("stream", false);
-            float repetition_penalty = request.value("repetition_penalty", 1.0f);
+            float repetition_penalty = request.value("repetition_penalty", 1.10f);
             std::string reasoning_effort = request.value("reasoning_effort", default_thinking_budget > 0 ? "high" : "none");
             bool enable_thinking = (default_thinking_budget > 0);
             int max_thinking_tokens = default_thinking_budget;

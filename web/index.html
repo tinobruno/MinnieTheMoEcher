@@ -275,8 +275,31 @@
                 </div>
 
                 <div class="input-box">
+                    <!-- Live Voice Recognition Indicator Banner -->
+                    <div id="voice-indicator" class="voice-indicator hidden">
+                        <div class="voice-indicator-content">
+                            <span class="voice-pulse-dot"></span>
+                            <span id="voice-status-text" class="voice-status-text">Listening... Speak now</span>
+                            <div class="voice-wave-bars">
+                                <span></span><span></span><span></span><span></span><span></span>
+                            </div>
+                            <button type="button" class="voice-indicator-btn voice-btn-done" onclick="stopVoiceRecognition()" title="Finish dictating">
+                                <span class="material-symbols-outlined">check</span> Done
+                            </button>
+                            <button type="button" class="voice-indicator-btn voice-btn-cancel" onclick="cancelVoiceRecognition()" title="Cancel dictation">
+                                <span class="material-symbols-outlined">close</span>
+                            </button>
+                        </div>
+                    </div>
+
                     <textarea id="chat-input" placeholder="Enter a prompt here..." rows="1"></textarea>
                     <div class="input-controls">
+                        <button type="button" id="voice-mode-btn" class="voice-mode-btn" onclick="toggleVoiceMode()" title="Toggle Voice Mode (Auto read-aloud responses)">
+                            <span class="material-symbols-outlined" id="voice-mode-icon">volume_off</span>
+                        </button>
+                        <button type="button" id="mic-btn" class="mic-btn" onclick="toggleVoiceRecognition()" title="Voice input / Dictation (Click to talk)">
+                            <span class="material-symbols-outlined" id="mic-icon">mic</span>
+                        </button>
                         <button type="button" id="vision-upload-btn" class="vision-upload-btn hidden" onclick="triggerVisionUpload()" title="Attach image (PNG, JPG, WebP, BMP)">
                             <span class="material-symbols-outlined">add_photo_alternate</span>
                         </button>
@@ -797,6 +820,14 @@
                                     <span id="temp-val">0.7</span>
                                 </div>
                             </div>
+
+                            <div class="setting-item">
+                                <label>Repetition Penalty</label>
+                                <div class="slider-container">
+                                    <input type="range" id="rep-penalty-slider" min="1.0" max="1.3" step="0.02" value="1.10">
+                                    <span id="rep-penalty-val">1.10</span>
+                                </div>
+                            </div>
                             
                             <div class="setting-item">
                                 <label>Max Tokens</label>
@@ -839,6 +870,66 @@
                                     <input type="checkbox" id="sidebar-fast-media-search" checked onchange="syncFastMediaSearchToggle(this.checked)">
                                     Fast Media / YouTube (0 Cost)
                                 </label>
+                            </div>
+                        </div>
+
+                        <!-- Voice & Speech Recognition Settings Card -->
+                        <div class="agentic-card">
+                            <div class="agentic-card-header">
+                                <span class="material-symbols-outlined agentic-card-icon" style="color: #34d399;">mic</span>
+                                <div class="agentic-card-title-group">
+                                    <h4>Voice & Speech Interaction</h4>
+                                    <p class="agentic-subtitle">Dictation language, auto-send, and read-aloud TTS</p>
+                                </div>
+                            </div>
+                            
+                            <div class="setting-item" style="margin-top: 10px;">
+                                <label for="voice-lang-select">Dictation Language</label>
+                                <select id="voice-lang-select" class="select-input" onchange="onVoiceLanguageChange(this.value)">
+                                    <option value="auto">Auto-detect (Browser Language)</option>
+                                    <option value="en-US">English (United States)</option>
+                                    <option value="en-GB">English (United Kingdom)</option>
+                                    <option value="fr-FR">Français (France)</option>
+                                    <option value="es-ES">Español (España)</option>
+                                    <option value="de-DE">Deutsch (Deutschland)</option>
+                                    <option value="it-IT">Italiano (Italia)</option>
+                                    <option value="pt-BR">Português (Brasil)</option>
+                                    <option value="zh-CN">中文 (Mandarin)</option>
+                                    <option value="ja-JP">日本語 (Japanese)</option>
+                                    <option value="ko-KR">한국어 (Korean)</option>
+                                    <option value="ru-RU">Русский (Russian)</option>
+                                    <option value="ar-SA">العربية (Arabic)</option>
+                                    <option value="hi-IN">हिन्दी (Hindi)</option>
+                                </select>
+                            </div>
+
+                            <div class="setting-item">
+                                <label class="checkbox-label" title="Automatically send your message after you stop speaking for 2 seconds">
+                                    <input type="checkbox" id="voice-auto-send" onchange="onVoiceAutoSendChange(this.checked)">
+                                    Auto-send after speech pause (2s silence)
+                                </label>
+                            </div>
+
+                            <div class="setting-item">
+                                <label class="checkbox-label" title="Automatically read aloud the model's response using Text-to-Speech">
+                                    <input type="checkbox" id="voice-auto-read" onchange="onVoiceAutoReadChange(this.checked)">
+                                    Voice Mode (Read aloud model responses automatically)
+                                </label>
+                            </div>
+
+                            <div class="setting-item" id="tts-voice-setting-row">
+                                <label for="tts-voice-select">Read-Aloud Voice (TTS)</label>
+                                <select id="tts-voice-select" class="select-input" onchange="onTtsVoiceChange(this.value)">
+                                    <option value="default">Default System Voice</option>
+                                </select>
+                            </div>
+
+                            <div class="setting-item">
+                                <label>Speech Rate</label>
+                                <div class="slider-container">
+                                    <input type="range" id="tts-rate-slider" min="0.7" max="1.5" step="0.1" value="1.0" oninput="onTtsRateChange(this.value)">
+                                    <span id="tts-rate-val">1.0x</span>
+                                </div>
                             </div>
                         </div>
 
