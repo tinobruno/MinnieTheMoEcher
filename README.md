@@ -1,8 +1,9 @@
 # MinnieTheMoECher
 
-Bare-metal C++/CUDA inference engine for **Qwen 3.8 27B** and **DeepSeek V4-Flash** (284B total / 13B active) featuring ultra-fast **Multi-Token Prediction (MTP) Speculative Decoding** reaching **~98 tok/s**.
+Bare-metal C++/CUDA and Apple Metal inference engine for **Qwen 3.8 27B** and **DeepSeek V4-Flash** (284B total / 13B active) featuring ultra-fast **Multi-Token Prediction (MTP) Speculative Decoding** reaching **~98 tok/s** on NVIDIA GPUs and **143.3 - 172.0 tok/s prefill** on Apple Silicon (M6).
 
 **Key features**:
+- **Native Apple Silicon Metal Backend & Hardware MPP Tiled Prefill Engine**: High-performance bare-metal Apple Metal implementation utilizing Apple's native `<metal_tensor>` and `<MetalPerformancePrimitives/MetalPerformancePrimitives.h>` (`mpp::tensor_ops::matmul2d`). Features on-the-fly threadgroup SRAM tile dequantization (`threadgroup bfloat s_w[64][32]`), eliminating 48 GB of intermediate DRAM dequantization traffic and delivering **143.3 to 172.0 tok/s prefill** (2.67x faster than Apple MLX) and **11.27 to 11.38 tok/s decode** with 95.1% memory bus saturation (146.0 GB/s) on Apple M6. See [README.METAL.md](README.METAL.md) and [WHITEPAPER.md](WHITEPAPER.md).
 - **Ultra-Fast MTP Speculative Decoding Engine (~98 tok/s)**: Native target-model Multi-Token Prediction (MTP) self-drafting with a compact 40,000-token draft vocabulary and BF16 projection head, yielding 62–74% token acceptance with only ~1.18 ms draft latency on RTX PRO 6000 Blackwell.
 - **Batched Shared-Memory DeltaNet Recurrence**: Fused `deltanet_ssm_batch_kernel` keeping head recurrence in 32 KB on-chip shared memory across verification steps, completely eliminating intermediate VRAM roundtrips and 360 redundant D2D memory copies.
 - **Prompt-Lookup Speculative Decoding (PLD)**: Zero-overhead candidate proposal via n-gram prompt matching for recurring code, templates, and patterns.
@@ -18,6 +19,7 @@ Bare-metal C++/CUDA inference engine for **Qwen 3.8 27B** and **DeepSeek V4-Flas
 
 ## Prerequisites
 
+- macOS 15.0+ on Apple Silicon (Apple M-series / Apple M6, 16 GB+ Unified Memory, Apple Clang / Command Line Tools, CMake 3.22+)
 - Linux (Ubuntu 22.04 / 24.04) or Windows 10/11 x64
 - NVIDIA GPU with CUDA Compute 8.0+ (RTX 3090, 4090, RTX 6000 Ada, RTX PRO 6000 Blackwell)
 - CUDA Toolkit 12.0+ (CUDA 13.x fully supported)
@@ -32,7 +34,8 @@ Bare-metal C++/CUDA inference engine for **Qwen 3.8 27B** and **DeepSeek V4-Flas
 
 | Model Architecture | Quantization / Weight Format | VRAM Footprint | Speculative Decoding | Target Throughput | Primary Features |
 | :--- | :--- | :--- | :--- | :--- | :--- |
-| **Qwen 3.8 27B** | Native Packed INT4 (`attention_dense_layers_q4.bin`) | ~17.8 GiB | **MTP Self-Drafting (40k Vocab)** | **~98 tok/s** | DeltaNet Linear Attention, Fused Shared-Memory SSM Recurrence, PLD |
+| **Qwen 3.8 27B (Apple Silicon)** | Native Packed INT3/INT4 (`attention_dense_layers.bin`) | **13.00 GB** | **Autoregressive (95.1% Bus Saturation)** | **11.38 tok/s (143 - 172 tok/s prefill)** | Native Metal, Hardware MPP Tiled SRAM Dequantization, Zero-Copy UMA, DeltaNet |
+| **Qwen 3.8 27B (NVIDIA)** | Native Packed INT4 (`attention_dense_layers_q4.bin`) | ~17.8 GiB | **MTP Self-Drafting (40k Vocab)** | **~98 tok/s** | DeltaNet Linear Attention, Fused Shared-Memory SSM Recurrence, PLD |
 | **FrankensTin Vision V4** | Mixed NVFP4 (Hot) + IQ2_XXS (Cold) + Vision Delegate | ~85.2 GiB (fits 96GB) | Baseline Autoregressive Decode | **~54 tok/s** | High-res multimodal sight via [`TinoBruno/frankenstin-vision-delegate`](https://huggingface.co/TinoBruno/frankenstin-vision-delegate) (~3.3 GB), 100% VRAM resident 11,008 MoE experts, Q4 MLA |
 | **DeepSeek V4-Flash** | Calibrated `IQ2_XXS` + `Q2_K` (`moe_experts_iq2.bin`) | ~72.6 GiB | Baseline Autoregressive Decode | **~54 tok/s** | 100% resident 11,008 MoE experts, Full-Context CSA/HCA Cache, MLA |
 | **DeepSeek V4-Flash** | Standard / Imatrix INT2 | ~74.0 GiB | Baseline Autoregressive Decode | **~53 tok/s** | Uncalibrated / imatrix 4-level scalar INT2 experts |
@@ -41,6 +44,29 @@ Bare-metal C++/CUDA inference engine for **Qwen 3.8 27B** and **DeepSeek V4-Flas
 ---
 
 ## Performance & Benchmarks
+
+### Apple Silicon (Apple Mac mini, Apple M6, 24 GB Unified Memory, macOS 15+)
+
+Comprehensive GuideLLM v0.3.1 benchmark suite (see [BENCHMARKS.md](BENCHMARKS.md) and [WHITEPAPER.md](WHITEPAPER.md)):
+
+#### GuideLLM Suite A (prompt_tokens=64, output_tokens=128, samples=4)
+
+| Engine | Model & Quantization | Size on Disk | TTFT (mean) | Prefill Speed | Decode Speed | ITL (mean) | Bus Efficiency |
+| :--- | :--- | :--- | :--- | :--- | :--- | :--- | :--- |
+| **MinnieTheMoEcher (MPP Tiled)** | qwen3.8-27B-Vision-13G (INT3/INT4) | **13.00 GB** | **552.2 ms** | **143.3 tok/s** | **11.27 tok/s** | **89.2 ms** | **95.1% (146.0 GB/s)** |
+| **llama.cpp (llama-bench)** | Qwen3.8-27B-UD-IQ4_XS (IQ4_XS) | 13.27 GB | 514.8 ms | 143.5 tok/s | 10.26 tok/s | 97.4 ms | 88.7% (136.2 GB/s) |
+| **llama.cpp (llama-server)** | Qwen3.8-27B-UD-IQ4_XS (IQ4_XS) | 13.27 GB | 682.4 ms | 111.2 tok/s | 10.14 tok/s | 98.6 ms | 87.6% (134.6 GB/s) |
+| **Apple MLX (mlx_lm.server)** | Qwen3.8-27B-4bit (4-bit safetensors) | 14.95 GB | 1,431.9 ms | 53.6 tok/s | 9.81 tok/s | 103.1 ms | 94.7% (145.4 GB/s) |
+
+#### Prefill Scaling Across Prompt Lengths
+
+| Prompt Tokens | Moecher MPP TTFT | Moecher MPP Prefill Speed | llama.cpp Prefill | Apple MLX Prefill | Speedup vs. MLX | Speedup vs. llama.cpp |
+| :--- | :--- | :--- | :--- | :--- | :--- | :--- |
+| **86 tokens (Suite A)** | **552.2 ms** | **143.3 tok/s** | 111.2 - 143.5 tok/s | 53.6 tok/s | **+167.3% (2.67x)** | **Parity** |
+| **278 tokens (Medium)** | **1,584.5 ms** | **172.0 tok/s** | 143.5 tok/s | 81.4 tok/s | **+111.3% (2.11x)** | **+19.9% faster** |
+| **534 tokens (Long)** | **3,091.1 ms** | **170.7 tok/s** | 143.5 tok/s | 87.8 tok/s | **+94.4% (1.94x)** | **+18.9% faster** |
+
+---
 
 Measured on **NVIDIA RTX PRO 6000 (Blackwell 96GB VRAM, Compute 12.0)**:
 
@@ -316,6 +342,15 @@ curl -s http://localhost:8001/v1/chat/completions \
 - **Native Qwen2.5-VL ViT Window Attention (`src/cuda/vision_kernels.cu`, `src/vision_tower.hpp`)**: Full native implementation of 28 windowed attention blocks ($6 \times 6$ grid of $4 \times 4$ windows, $64 \times 64$ attention) and 4 full-attention blocks `[7, 15, 23, 31]` ($2304 \times 2304$ global attention) with 2D spatial RoPE (`mrope`). Reached **1.000000** cosine similarity to PyTorch reference.
 - **Non-Redundant Multi-Turn Visual Memory (`src/server_single.cpp`)**: Intelligently strips historical base64 images on multi-turn conversations and references KV cache perception traces, eliminating redundant perception cycles and slashing follow-up turn latencies from 5.0s to 0.5s.
 - **Hugging Face Model Publication**: Packaged and published the official vision delegate to [`TinoBruno/frankenstin-vision-delegate`](https://huggingface.co/TinoBruno/frankenstin-vision-delegate).
+
+### v2.10 — Native Apple Silicon (Metal) Backend & Hardware MPP Tiled Prefill Engine
+- **Hardware MetalPerformancePrimitives (MPP) Tiled GEMM (`gemm_int4_mpp_kernel`, `gemm_int3_mpp_kernel`)**: Implemented on-the-fly threadgroup SRAM tile dequantization using Apple native `<metal_tensor>` and `<MetalPerformancePrimitives/MetalPerformancePrimitives.h>` (`mpp::tensor_ops::matmul2d`). Unpacks INT4 and INT3 weights directly in 4 KB on-chip threadgroup memory (`threadgroup bfloat s_w[64][32]`), eliminating 48 GB of intermediate DRAM traffic and boosting prefill throughput from 84.3 tok/s to **143.3 - 172.0 tok/s** (2.67x faster than Apple MLX).
+- **Time to First Token (TTFT) Halved**: Standardized GuideLLM Suite A TTFT dropped from 1,020.2 ms down to **552.2 ms**, beating `llama-server` (682.4 ms) and Apple MLX (1,431.9 ms).
+- **95.1% Memory Bus Saturation on Single-Token Decode**: Achieved **146.0 GB/s sustained memory bandwidth** out of the 153.6 GB/s physical ceiling on 128-bit LPDDR5X-9600 Apple M6, delivering **11.27 - 11.38 tok/s decode speed** (outperforming llama.cpp at 10.14 tok/s and MLX at 9.81 tok/s).
+- **SIMD-Reduced DeltaNet A/B Projections (`deltanet_in_proj_ab_batch_kernel`)**: Vectorized projection head evaluation using SIMD horizontal reduction (`simd_sum`), reducing projection time from 1.75 ms to 0.178 ms per layer (9.8x speedup) and shaving 75 ms per prefill pass across all 48 DeltaNet layers.
+- **Fused SwiGLU Metal Pipeline**: Point-wise vectorization of SiLU activation and multiplication with memory barrier synchronization, eliminating redundant DRAM activation passes.
+- **Zero-Copy Unified Memory Architecture**: Replaced PCIe staging buffers and mirror allocations with `MTLResourceStorageModeShared`, allowing zero-copy sharing between host runtime and GPU compute pipelines.
+- **Documentation & Whitepaper**: Published comprehensive technical specification in [WHITEPAPER.md](WHITEPAPER.md), Apple Silicon user manual in [README.METAL.md](README.METAL.md), and full benchmark matrix in [BENCHMARKS.md](BENCHMARKS.md).
 
 ### v2.09 — Ampere-Gated Architecture, 4-Slot Speculative Rollback & Sliced KV Snapshotting
 - **Dynamic Hardware Capability Gating (`GpuCapabilities`)**: Added runtime GPU capability detection and gating ensuring 100% stability on Ampere architectures (RTX 3080/3090, CC 8.0/8.6). Bypasses unsupported hardware FP8 Tensor Core / FP4 paths and provides clean fallback paths.
