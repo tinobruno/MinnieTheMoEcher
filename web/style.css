@@ -1270,7 +1270,7 @@ code {
     resize: none;
     outline: none;
     max-height: 200px;
-    padding-right: 155px;
+    padding-right: 215px;
     line-height: 1.5;
 }
 
@@ -1292,7 +1292,7 @@ code {
     bottom: 8px;
     display: flex;
     align-items: center;
-    gap: 8px;
+    gap: 6px;
 }
 
 .hidden {
@@ -1337,6 +1337,257 @@ code {
 .send-btn.stop-mode:hover {
     background-color: #b3261e;
     transform: scale(1.08);
+}
+
+/* ─────────────────────────────────────────────────────────────────────────────
+   Voice & Speech Recognition & Synthesis Controls
+   ───────────────────────────────────────────────────────────────────────────── */
+
+.mic-btn,
+.voice-mode-btn {
+    background: transparent;
+    border: none;
+    color: var(--text-secondary);
+    cursor: pointer;
+    width: 36px;
+    height: 36px;
+    border-radius: 50%;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    transition: all 0.2s cubic-bezier(0.4, 0, 0.2, 1);
+    position: relative;
+    user-select: none;
+}
+
+.mic-btn:hover:not(:disabled),
+.voice-mode-btn:hover:not(:disabled) {
+    background-color: rgba(255, 255, 255, 0.08);
+    color: var(--text-primary);
+    transform: translateY(-1px);
+}
+
+.mic-btn:disabled,
+.voice-mode-btn:disabled {
+    color: var(--border);
+    cursor: not-allowed;
+    opacity: 0.5;
+}
+
+.mic-btn .material-symbols-outlined,
+.voice-mode-btn .material-symbols-outlined {
+    font-size: 20px;
+}
+
+/* Mic Active / Recording Pulse Animation */
+.mic-btn.recording {
+    background: rgba(239, 68, 68, 0.22) !important;
+    color: #f87171 !important;
+    box-shadow: 0 0 14px rgba(239, 68, 68, 0.5);
+    animation: micPulseGlow 1.4s ease-in-out infinite;
+}
+
+@keyframes micPulseGlow {
+    0% {
+        box-shadow: 0 0 0 0 rgba(239, 68, 68, 0.6), 0 0 10px rgba(239, 68, 68, 0.3);
+        transform: scale(1);
+    }
+    50% {
+        box-shadow: 0 0 0 7px rgba(239, 68, 68, 0), 0 0 18px rgba(239, 68, 68, 0.6);
+        transform: scale(1.08);
+    }
+    100% {
+        box-shadow: 0 0 0 0 rgba(239, 68, 68, 0), 0 0 10px rgba(239, 68, 68, 0.3);
+        transform: scale(1);
+    }
+}
+
+/* Voice Mode Active & Speaking States */
+.voice-mode-btn.active {
+    color: #38bdf8;
+    background: rgba(56, 189, 248, 0.15);
+}
+
+.voice-mode-btn.speaking {
+    color: #4ade80;
+    background: rgba(74, 222, 128, 0.2);
+    animation: ttsWavePulse 1.2s ease-in-out infinite;
+}
+
+@keyframes ttsWavePulse {
+    0% {
+        box-shadow: 0 0 0 0 rgba(74, 222, 128, 0.5);
+    }
+    50% {
+        box-shadow: 0 0 0 6px rgba(74, 222, 128, 0);
+        transform: scale(1.06);
+    }
+    100% {
+        box-shadow: 0 0 0 0 rgba(74, 222, 128, 0);
+    }
+}
+
+/* Live Voice Recording Floating Pill Indicator */
+.voice-indicator {
+    display: flex;
+    align-items: center;
+    margin-bottom: 8px;
+    animation: fadeInSlideDown 0.22s cubic-bezier(0.16, 1, 0.3, 1);
+}
+
+@keyframes fadeInSlideDown {
+    from { opacity: 0; transform: translateY(-6px); }
+    to { opacity: 1; transform: translateY(0); }
+}
+
+.voice-indicator-content {
+    display: inline-flex;
+    align-items: center;
+    gap: 10px;
+    padding: 6px 14px;
+    background: rgba(28, 30, 38, 0.95);
+    backdrop-filter: blur(16px);
+    -webkit-backdrop-filter: blur(16px);
+    border: 1px solid rgba(239, 68, 68, 0.35);
+    border-radius: 20px;
+    box-shadow: 0 8px 24px rgba(0, 0, 0, 0.4), 0 0 16px rgba(239, 68, 68, 0.18);
+}
+
+.voice-pulse-dot {
+    width: 8px;
+    height: 8px;
+    border-radius: 50%;
+    background-color: #ef4444;
+    box-shadow: 0 0 8px #ef4444;
+    animation: voiceDotBlink 1s infinite alternate;
+}
+
+@keyframes voiceDotBlink {
+    from { opacity: 0.4; transform: scale(0.85); }
+    to { opacity: 1; transform: scale(1.2); }
+}
+
+.voice-status-text {
+    font-size: 12px;
+    font-weight: 500;
+    color: #fca5a5;
+    letter-spacing: 0.2px;
+}
+
+/* Animated Sound Wave Equalizer Bars */
+.voice-wave-bars {
+    display: flex;
+    align-items: center;
+    gap: 3px;
+    height: 16px;
+}
+
+.voice-wave-bars span {
+    display: block;
+    width: 3px;
+    background: #f87171;
+    border-radius: 3px;
+    animation: soundWaveAnim 1.2s ease-in-out infinite;
+}
+
+.voice-wave-bars span:nth-child(1) { height: 6px; animation-delay: 0.0s; }
+.voice-wave-bars span:nth-child(2) { height: 14px; animation-delay: 0.15s; }
+.voice-wave-bars span:nth-child(3) { height: 10px; animation-delay: 0.3s; }
+.voice-wave-bars span:nth-child(4) { height: 16px; animation-delay: 0.45s; }
+.voice-wave-bars span:nth-child(5) { height: 8px; animation-delay: 0.6s; }
+
+@keyframes soundWaveAnim {
+    0%, 100% { transform: scaleY(0.4); opacity: 0.5; }
+    50% { transform: scaleY(1); opacity: 1; }
+}
+
+.voice-indicator-btn {
+    display: inline-flex;
+    align-items: center;
+    gap: 4px;
+    border: none;
+    border-radius: 12px;
+    padding: 3px 8px;
+    font-size: 11px;
+    font-weight: 600;
+    cursor: pointer;
+    transition: all 0.18s ease;
+}
+
+.voice-btn-done {
+    background: rgba(34, 197, 94, 0.2);
+    color: #4ade80;
+    border: 1px solid rgba(34, 197, 94, 0.35);
+}
+
+.voice-btn-done:hover {
+    background: rgba(34, 197, 94, 0.35);
+    color: #ffffff;
+}
+
+.voice-btn-done .material-symbols-outlined {
+    font-size: 14px;
+}
+
+.voice-btn-cancel {
+    background: transparent;
+    color: var(--text-muted);
+    padding: 3px;
+    border-radius: 50%;
+}
+
+.voice-btn-cancel:hover {
+    background: rgba(255, 255, 255, 0.1);
+    color: #f87171;
+}
+
+.voice-btn-cancel .material-symbols-outlined {
+    font-size: 15px;
+}
+
+/* Assistant Message Action Toolbar */
+.msg-footer-actions {
+    display: flex;
+    align-items: center;
+    gap: 6px;
+    margin-top: 10px;
+    padding-top: 8px;
+    border-top: 1px solid rgba(255, 255, 255, 0.05);
+}
+
+.msg-action-btn {
+    background: transparent;
+    border: 1px solid rgba(255, 255, 255, 0.08);
+    color: var(--text-secondary);
+    border-radius: 8px;
+    padding: 4px 8px;
+    font-size: 11px;
+    display: inline-flex;
+    align-items: center;
+    gap: 4px;
+    cursor: pointer;
+    transition: all 0.2s ease;
+}
+
+.msg-action-btn:hover {
+    background: rgba(255, 255, 255, 0.06);
+    color: var(--text-primary);
+    border-color: rgba(255, 255, 255, 0.15);
+}
+
+.msg-action-btn .material-symbols-outlined {
+    font-size: 15px;
+}
+
+.msg-action-btn.playing {
+    color: #4ade80;
+    border-color: rgba(74, 222, 128, 0.4);
+    background: rgba(74, 222, 128, 0.1);
+}
+
+.msg-action-btn.copied {
+    color: #60a5fa;
+    border-color: rgba(96, 165, 250, 0.4);
 }
 
 .disclaimer {

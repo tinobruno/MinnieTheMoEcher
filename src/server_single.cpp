@@ -4883,6 +4883,7 @@ public:
         int draft_streak = 0;
 
         std::string last_think_token_str;
+        int think_tokens_without_punct = 0;
 
         auto gen_start_time = std::chrono::steady_clock::now();
         int spec_cycles = 0;
@@ -5002,6 +5003,23 @@ public:
             }
 
             std::string token_text = tokenizer_.decode({next_token});
+            if (in_think_block) {
+                bool has_punct = false;
+                for (char c : token_text) {
+                    if (c == '.' || c == '?' || c == '!' || c == '\n' || c == ':' || c == ';') {
+                        has_punct = true;
+                        break;
+                    }
+                }
+                if (has_punct) {
+                    think_tokens_without_punct = 0;
+                } else {
+                    think_tokens_without_punct++;
+                    if (think_tokens_without_punct >= 40) {
+                        think_loop_detected = true;
+                    }
+                }
+            }
             if (in_think_block && (token_text.find("</think>") != std::string::npos ||
                                    token_text.find("</output>") != std::string::npos ||
                                    token_text.find("</response>") != std::string::npos ||
@@ -5098,85 +5116,8 @@ public:
                 break;
             }
 
-            // Graceful sentence boundary transition when thinking budget is reached or thinking loop is detected
-            if (in_think_block && (think_loop_detected || (max_thinking_tokens > 0 && thinking_tokens_generated >= max_thinking_tokens))) {
-                int grace_limit = max_thinking_tokens + 255;
-                bool is_clean_boundary = false;
-                if (!last_think_token_str.empty()) {
-                    char last_char = last_think_token_str.back();
-                    if (last_char == '\n' || last_char == '.' || last_char == ':') {
-                        is_clean_boundary = true;
-                    }
-                }
-                if (think_loop_detected || is_clean_boundary || thinking_tokens_generated >= grace_limit) {
-                    if (think_loop_detected) {
-                        LOG_WARN("Thinking loop detected at step %d (%d thinking tokens). Forcing </think> and starting content.",
-                                 t, thinking_tokens_generated);
-                    } else {
-                        LOG_WARN("Thinking budget reached (%d/%d tokens, clean_boundary=%d). Closing </think> and starting content.",
-                                 thinking_tokens_generated, max_thinking_tokens, is_clean_boundary ? 1 : 0);
-                    }
-
-                    // 1. Inject </think> to close thinking block
-                    in_think_block = false;
-                    think_block_ended = true;
-                    track_current_token_ = false;
-                    if (think_end_id >= 0) {
-                        forward_token(think_end_id, position);
-                        if (qwen_draft_.loaded_) {
-                            qwen_draft_.forward_token_async(think_end_id, position, main_stream_);
-                        }
-                        position++;
-                        output_ids.push_back(think_end_id);
-                        history.push_back(think_end_id);
-                    }
-                    if (on_token) {
-                        on_token("", false); // Signal end of reasoning to stream consumer
-                    }
-
-                    // 2. Inject and stream "\n\n" as the beginning of CONTENT
-                    std::vector<int> transition_tokens = tokenizer_.encode("\n\n");
-                    for (int tok_id : transition_tokens) {
-                        track_current_token_ = false; // Synthetic transition tokens not tracked
-                        forward_token(tok_id, position);
-                        if (qwen_draft_.loaded_) {
-                            qwen_draft_.forward_token_async(tok_id, position, main_stream_);
-                        }
-                        position++;
-                        output_ids.push_back(tok_id);
-                        history.push_back(tok_id);
-                        content_tokens_generated++;
-                        std::string tok_str = tokenizer_.decode({tok_id});
-                        generated_text += tok_str;
-                        if (on_token) {
-                            on_token(tok_str, false); // Streamed directly as content
-                        }
-                    }
-                    next_token = -1;
-                    continue;
-                }
-            }
-
-            // Sample from logits if next_token is not pre-set
-            if (next_token < 0) {
-                if (content_tokens_generated == 0 && had_multimodal) {
-                    float neg_inf = -1e9f;
-                    if (cfg_.eos_token_id >= 0) {
-                        CUDA_CHECK(cudaMemcpyAsync(buf_logits_.f32() + cfg_.eos_token_id, &neg_inf, sizeof(float), cudaMemcpyHostToDevice, main_stream_));
-                    }
-                    if (eos2_id >= 0) {
-                        CUDA_CHECK(cudaMemcpyAsync(buf_logits_.f32() + eos2_id, &neg_inf, sizeof(float), cudaMemcpyHostToDevice, main_stream_));
-                    }
-                    argmax_cache_valid_ = false;
-                }
-                next_token = sample_token(temperature, history, content_tokens_generated, in_think_block,
-                                          top_k, top_p, min_p);
-            }
-            
-            // If EOS is sampled while inside think block, transition to </think> and continue
-            if (in_think_block && (next_token == cfg_.eos_token_id || (eos2_id >= 0 && next_token == eos2_id))) {
-                LOG_WARN("EOS sampled during thinking at step %d (%d thinking tokens). Transitioning to </think> and starting content.",
-                         t, thinking_tokens_generated);
+            auto finish_think_block = [&]() {
+                if (!in_think_block) return;
                 in_think_block = false;
                 think_block_ended = true;
                 track_current_token_ = false;
@@ -5189,12 +5130,113 @@ public:
                     output_ids.push_back(think_end_id);
                     history.push_back(think_end_id);
                 }
+                if (on_token) {
+                    on_token("", false); // Signal end of reasoning to stream consumer
+                }
+
+                // Inject and stream "\n\n" as the beginning of CONTENT
+                std::vector<int> transition_tokens = tokenizer_.encode("\n\n");
+                for (int tok_id : transition_tokens) {
+                    track_current_token_ = false; // Synthetic transition tokens not tracked
+                    forward_token(tok_id, position);
+                    if (qwen_draft_.loaded_) {
+                        qwen_draft_.forward_token_async(tok_id, position, main_stream_);
+                    }
+                    position++;
+                    output_ids.push_back(tok_id);
+                    history.push_back(tok_id);
+                    content_tokens_generated++;
+                    std::string tok_str = tokenizer_.decode({tok_id});
+                    generated_text += tok_str;
+                    if (on_token) {
+                        on_token(tok_str, false); // Streamed directly as content
+                    }
+                }
+
+                // Mask EOS tokens in logits so model cannot immediately terminate on first content token
+                float neg_inf = -1e9f;
+                if (cfg_.eos_token_id >= 0) {
+                    CUDA_CHECK(cudaMemcpyAsync(buf_logits_.f32() + cfg_.eos_token_id, &neg_inf, sizeof(float), cudaMemcpyHostToDevice, main_stream_));
+                }
+                if (eos2_id >= 0) {
+                    CUDA_CHECK(cudaMemcpyAsync(buf_logits_.f32() + eos2_id, &neg_inf, sizeof(float), cudaMemcpyHostToDevice, main_stream_));
+                }
+                if (im_end_id >= 0) {
+                    CUDA_CHECK(cudaMemcpyAsync(buf_logits_.f32() + im_end_id, &neg_inf, sizeof(float), cudaMemcpyHostToDevice, main_stream_));
+                }
+                argmax_cache_valid_ = false;
+            };
+
+            // Graceful sentence boundary transition when thinking budget is reached or thinking loop is detected
+            if (in_think_block && (think_loop_detected || (max_thinking_tokens > 0 && thinking_tokens_generated >= max_thinking_tokens))) {
+                int grace_limit = max_thinking_tokens + 255;
+                bool is_clean_boundary = false;
+                if (!last_think_token_str.empty()) {
+                    char last_char = last_think_token_str.back();
+                    if (last_char == '\n' || last_char == '.' || last_char == ':') {
+                        is_clean_boundary = true;
+                    }
+                }
+                if (think_loop_detected || is_clean_boundary || thinking_tokens_generated >= grace_limit) {
+                    if (think_loop_detected) {
+                        LOG_WARN("Thinking loop/monologue detected at step %d (%d thinking tokens). Forcing </think> and starting content.",
+                                 t, thinking_tokens_generated);
+                    } else {
+                        LOG_WARN("Thinking budget reached (%d/%d tokens, clean_boundary=%d). Closing </think> and starting content.",
+                                 thinking_tokens_generated, max_thinking_tokens, is_clean_boundary ? 1 : 0);
+                    }
+                    finish_think_block();
+                    next_token = -1;
+                    continue;
+                }
+            }
+
+            // Sample from logits if next_token is not pre-set
+            if (next_token < 0) {
+                if (content_tokens_generated == 0 && (had_multimodal || think_block_ended)) {
+                    float neg_inf = -1e9f;
+                    if (cfg_.eos_token_id >= 0) {
+                        CUDA_CHECK(cudaMemcpyAsync(buf_logits_.f32() + cfg_.eos_token_id, &neg_inf, sizeof(float), cudaMemcpyHostToDevice, main_stream_));
+                    }
+                    if (eos2_id >= 0) {
+                        CUDA_CHECK(cudaMemcpyAsync(buf_logits_.f32() + eos2_id, &neg_inf, sizeof(float), cudaMemcpyHostToDevice, main_stream_));
+                    }
+                    if (im_end_id >= 0) {
+                        CUDA_CHECK(cudaMemcpyAsync(buf_logits_.f32() + im_end_id, &neg_inf, sizeof(float), cudaMemcpyHostToDevice, main_stream_));
+                    }
+                    argmax_cache_valid_ = false;
+                }
+                next_token = sample_token(temperature, history, content_tokens_generated, in_think_block,
+                                          top_k, top_p, min_p);
+            }
+            
+            // If EOS is sampled while inside think block, transition to </think> and continue
+            if (in_think_block && (next_token == cfg_.eos_token_id || (eos2_id >= 0 && next_token == eos2_id) || (im_end_id >= 0 && next_token == im_end_id))) {
+                LOG_WARN("EOS sampled during thinking at step %d (%d thinking tokens). Transitioning to </think> and starting content.",
+                         t, thinking_tokens_generated);
+                finish_think_block();
                 next_token = -1;
                 continue;
             }
 
             // Check all EOS and stop conditions in content mode
             if (!ignore_eos && (next_token == cfg_.eos_token_id || (eos2_id >= 0 && next_token == eos2_id) || (im_end_id >= 0 && next_token == im_end_id))) {
+                if (content_tokens_generated == 0) {
+                    LOG_WARN("EOS hit with 0 content tokens at step %d. Suppressing EOS and forcing content generation.", t);
+                    float neg_inf = -1e9f;
+                    if (cfg_.eos_token_id >= 0) {
+                        CUDA_CHECK(cudaMemcpyAsync(buf_logits_.f32() + cfg_.eos_token_id, &neg_inf, sizeof(float), cudaMemcpyHostToDevice, main_stream_));
+                    }
+                    if (eos2_id >= 0) {
+                        CUDA_CHECK(cudaMemcpyAsync(buf_logits_.f32() + eos2_id, &neg_inf, sizeof(float), cudaMemcpyHostToDevice, main_stream_));
+                    }
+                    if (im_end_id >= 0) {
+                        CUDA_CHECK(cudaMemcpyAsync(buf_logits_.f32() + im_end_id, &neg_inf, sizeof(float), cudaMemcpyHostToDevice, main_stream_));
+                    }
+                    argmax_cache_valid_ = false;
+                    next_token = -1;
+                    continue;
+                }
                 LOG_WARN("Stop token hit: token=%d (cfg_eos=%d, eos2=%d, im_end=%d) at step %d (content: %d/%d, think: %d/%d)",
                          next_token, cfg_.eos_token_id, eos2_id, im_end_id, t,
                          content_tokens_generated, max_tokens,
@@ -9631,9 +9673,6 @@ static MultimodalPrompt apply_chat_template_multimodal(
                 if (actual_thinking) {
                     auto think_enc = tok.encode("<think>\n");
                     result.insert(result.end(), think_enc.begin(), think_enc.end());
-                } else {
-                    auto think_enc = tok.encode("<think>\n\n</think>\n");
-                    result.insert(result.end(), think_enc.begin(), think_enc.end());
                 }
             }
         }
@@ -12722,25 +12761,55 @@ static void run_server(MoecherEngine& engine, int port, int default_thinking_bud
             if (reasoning_effort == "none") {
                 enable_thinking = false;
                 max_thinking_tokens = 0;
+            } else if (reasoning_effort == "low" || reasoning_effort == "medium" || reasoning_effort == "high" || reasoning_effort == "max") {
+                enable_thinking = true;
+                if (max_thinking_tokens <= 0) max_thinking_tokens = 1024;
             }
 
             if (request.contains("thinking") && request["thinking"].is_object()) {
-                if (request["thinking"].contains("type") && request["thinking"]["type"] == "disabled") {
+                if (request["thinking"].contains("type")) {
+                    std::string ttype = request["thinking"]["type"];
+                    if (ttype == "disabled") {
+                        enable_thinking = false;
+                        max_thinking_tokens = 0;
+                    } else if (ttype == "enabled") {
+                        enable_thinking = true;
+                        if (max_thinking_tokens <= 0) max_thinking_tokens = 1024;
+                    }
+                }
+                if (request["thinking"].contains("budget_tokens") && request["thinking"]["budget_tokens"].is_number_integer()) {
+                    int b = request["thinking"]["budget_tokens"].get<int>();
+                    if (b > 0) {
+                        enable_thinking = true;
+                        max_thinking_tokens = b;
+                    } else {
+                        enable_thinking = false;
+                        max_thinking_tokens = 0;
+                    }
+                }
+            }
+            if (request.contains("max_thinking_tokens") && request["max_thinking_tokens"].is_number_integer()) {
+                int b = request["max_thinking_tokens"].get<int>();
+                if (b > 0) {
+                    enable_thinking = true;
+                    max_thinking_tokens = b;
+                } else {
                     enable_thinking = false;
                     max_thinking_tokens = 0;
                 }
-                if (enable_thinking && request["thinking"].contains("budget_tokens") && request["thinking"]["budget_tokens"].is_number_integer()) {
-                    max_thinking_tokens = request["thinking"]["budget_tokens"].get<int>();
-                    if (max_thinking_tokens <= 0) enable_thinking = false;
+            }
+            if (request.contains("thinking_budget") && request["thinking_budget"].is_number_integer()) {
+                int b = request["thinking_budget"].get<int>();
+                if (b > 0) {
+                    enable_thinking = true;
+                    max_thinking_tokens = b;
+                } else {
+                    enable_thinking = false;
+                    max_thinking_tokens = 0;
                 }
             }
-            if (enable_thinking && request.contains("max_thinking_tokens") && request["max_thinking_tokens"].is_number_integer()) {
-                max_thinking_tokens = request["max_thinking_tokens"].get<int>();
-                if (max_thinking_tokens <= 0) enable_thinking = false;
-            }
-            if (enable_thinking && request.contains("thinking_budget") && request["thinking_budget"].is_number_integer()) {
-                max_thinking_tokens = request["thinking_budget"].get<int>();
-                if (max_thinking_tokens <= 0) enable_thinking = false;
+            if (enable_thinking && engine.cfg_.is_qwen() && max_thinking_tokens > 512) {
+                max_thinking_tokens = 512;
             }
             if (enable_thinking && max_tokens < 20000 && max_tokens > 0) {
                 max_thinking_tokens = std::min(max_thinking_tokens, max_tokens);
@@ -14123,6 +14192,7 @@ int main(int argc, char** argv) {
     std::string log_path = "moecher.log";
     std::string expert_dtype_override = "";
     int default_thinking_budget = 4096;
+    bool thinking_budget_explicit = false;
     std::string imatrix_dataset = "";
     std::string imatrix_out = "";
     int imatrix_max_tokens = -1;
@@ -14198,6 +14268,7 @@ int main(int argc, char** argv) {
             expert_dtype_override = argv[++i];
         } else if ((std::string(argv[i]) == "--thinking-budget" || std::string(argv[i]) == "--budget" || std::string(argv[i]) == "--max-thinking-tokens") && i + 1 < argc) {
             default_thinking_budget = std::stoi(argv[++i]);
+            thinking_budget_explicit = true;
         } else if ((std::string(argv[i]) == "--temp" || std::string(argv[i]) == "--temperature") && i + 1 < argc) {
             test_temp = std::stof(argv[++i]);
         } else if ((std::string(argv[i]) == "--max-tokens" || std::string(argv[i]) == "-n") && i + 1 < argc) {
@@ -14305,6 +14376,11 @@ int main(int argc, char** argv) {
     if (!engine.load(manifest_path, max_vram_gb, dram_cache_gb, expert_dtype_override, buffered_io, max_seq_len_override, enable_mtp)) {
         LOG_ERROR("Failed to load model");
         return 1;
+    }
+
+    if (!thinking_budget_explicit && engine.cfg_.is_qwen()) {
+        default_thinking_budget = 0;
+        LOG_INFO("Model architecture is Qwen; defaulting thinking budget to 0 (disabled).");
     }
 
     if (!imatrix_dataset.empty() && !imatrix_out.empty()) {

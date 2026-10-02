@@ -3586,7 +3586,7 @@ async function sendMessage() {
     liveIndicator.id = 'live-status-indicator';
     liveIndicator.innerHTML = `
         <span class="tool-pulse-spinner"></span>
-        <span class="status-msg-text">${isThinking ? 'Thinking and preparing response' : 'Analyzing image and preparing response'}</span>
+        <span class="status-msg-text">${isThinking ? 'Thinking and preparing response' : (attachedImg ? 'Analyzing image and preparing response' : 'Preparing response')}</span>
         <div class="elaboration-dots"><span></span><span></span><span></span></div>
     `;
     mainContent.appendChild(liveIndicator);
@@ -3599,6 +3599,7 @@ async function sendMessage() {
     let turnRetrievedDocs = [];
     let isReasoningDone = false;
     let turnMediaPreviewLoaded = false;
+    let lastRoundContent = "";
 
     // Engine performance & tool execution timing tracking
     let round1TtftMs = null;
@@ -4166,6 +4167,7 @@ async function sendMessage() {
                 loadHtmlIntoPreview(turnHtml, is3dTurn && window.lastUserPromptWas3D);
             }
 
+            lastRoundContent = roundContent;
             break;
         }
 
@@ -4213,12 +4215,12 @@ async function sendMessage() {
 
         // Attach interactive message actions (Read aloud & Copy)
         if (typeof attachAssistantMessageActions === 'function') {
-            attachAssistantMessageActions(assistantMsgDiv, roundContent);
+            attachAssistantMessageActions(assistantMsgDiv, lastRoundContent);
         }
 
         // If Voice Mode / Auto-read is enabled, speak the assistant's answer
-        if (typeof voiceSettings !== 'undefined' && voiceSettings.autoRead && roundContent) {
-            speakAssistantMessage(roundContent, assistantMsgDiv);
+        if (typeof voiceSettings !== 'undefined' && voiceSettings.autoRead && lastRoundContent) {
+            speakAssistantMessage(lastRoundContent, assistantMsgDiv);
         }
 
     } catch (err) {
