@@ -251,7 +251,7 @@ void metal_memcpy(void* dst, const void* src, size_t bytes, cudaMemcpyKind kind)
 }
 
 void metal_memcpy_async(void* dst, const void* src, size_t bytes, cudaMemcpyKind kind, cudaStream_t stream) {
-    if (kind == cudaMemcpyDeviceToHost) {
+    if (kind == cudaMemcpyDeviceToHost || kind == cudaMemcpyDeviceToDevice) {
         metal_stream_synchronize(stream);
     }
     metal_memcpy(dst, src, bytes, kind);
@@ -1427,9 +1427,23 @@ void deltanet_linear_attention_decode_batch_cuda(
     id<MTLBuffer> b_ossm = ctx.get_buffer(out_ssm_state, ossm_off);
 
     if (pso_conv && pso_ssm && b_out && b_qkv && b_z && b_a && b_b && b_cw && b_ics && b_ocs && b_al && b_dt && b_nw && b_issm && b_ossm) {
+        __nv_bfloat16* slots_conv[4] = {slot_conv_0, slot_conv_1, slot_conv_2, slot_conv_3};
+        __nv_bfloat16* slots_ssm[4] = {slot_ssm_0, slot_ssm_1, slot_ssm_2, slot_ssm_3};
+        size_t sconv_off[4] = {0, 0, 0, 0};
+        id<MTLBuffer> b_sconv[4] = {nil, nil, nil, nil};
+        size_t sssm_off[4] = {0, 0, 0, 0};
+        id<MTLBuffer> b_sssm[4] = {nil, nil, nil, nil};
+        for (int k = 0; k < 4; k++) {
+            if (slots_conv[k]) b_sconv[k] = ctx.get_buffer(slots_conv[k], sconv_off[k]);
+            if (slots_ssm[k]) b_sssm[k] = ctx.get_buffer(slots_ssm[k], sssm_off[k]);
+        }
         id<MTLComputeCommandEncoder> enc = s->get_encoder();
         for (int m = 0; m < M; m++) {
             // Conv step m
+            int has_conv_slot = (m < 4 && b_sconv[m] != nil) ? 1 : 0;
+            id<MTLBuffer> cur_sconv = has_conv_slot ? b_sconv[m] : b_ocs;
+            size_t cur_sconv_off = has_conv_slot ? sconv_off[m] : ocs_off;
+
             [enc setComputePipelineState:pso_conv];
             [enc setBuffer:b_qkv offset:qkv_off + (size_t)m * channels * 2 atIndex:0];
             [enc setBuffer:b_qkv offset:qkv_off + (size_t)m * channels * 2 atIndex:1];
@@ -1437,9 +1451,15 @@ void deltanet_linear_attention_decode_batch_cuda(
             [enc setBuffer:(m == 0 ? b_ics : b_ocs) offset:(m == 0 ? ics_off : ocs_off) atIndex:3];
             [enc setBuffer:b_ocs offset:ocs_off atIndex:4];
             [enc setBytes:&channels length:sizeof(channels) atIndex:5];
+            [enc setBuffer:cur_sconv offset:cur_sconv_off atIndex:6];
+            [enc setBytes:&has_conv_slot length:sizeof(has_conv_slot) atIndex:7];
             [enc dispatchThreadgroups:MTLSizeMake((channels + 127) / 128, 1, 1) threadsPerThreadgroup:MTLSizeMake(128, 1, 1)];
 
             // SSM step m
+            int has_ssm_slot = (m < 4 && b_sssm[m] != nil) ? 1 : 0;
+            id<MTLBuffer> cur_sssm = has_ssm_slot ? b_sssm[m] : b_ossm;
+            size_t cur_sssm_off = has_ssm_slot ? sssm_off[m] : ossm_off;
+
             [enc setComputePipelineState:pso_ssm];
             [enc setBuffer:b_out offset:o_off + (size_t)m * z_stride * 2 atIndex:0];
             [enc setBuffer:b_qkv offset:qkv_off + (size_t)m * channels * 2 atIndex:1];
@@ -1454,6 +1474,8 @@ void deltanet_linear_attention_decode_batch_cuda(
             [enc setBytes:&num_k_heads length:sizeof(num_k_heads) atIndex:10];
             [enc setBytes:&num_v_heads length:sizeof(num_v_heads) atIndex:11];
             [enc setBytes:&head_dim length:sizeof(head_dim) atIndex:12];
+            [enc setBuffer:cur_sssm offset:cur_sssm_off atIndex:13];
+            [enc setBytes:&has_ssm_slot length:sizeof(has_ssm_slot) atIndex:14];
             [enc dispatchThreadgroups:MTLSizeMake(num_v_heads, 1, 1) threadsPerThreadgroup:MTLSizeMake(128, 1, 1)];
         }
         s->end_encoder_and_maybe_commit();
@@ -1662,6 +1684,7 @@ void deltanet_linear_attention_decode_cuda(
 
         if (b_out && b_qkv && b_z && b_a && b_b && b_cw && b_ics && b_ocs && b_al && b_dt && b_nw && b_issm && b_ossm) {
             // Stage 1: Conv1D causal convolution across all channels (updates out_conv_state and overwrites b_qkv with silu_val in-place)
+            int has_conv_slot = 0;
             id<MTLComputeCommandEncoder> enc1 = s->get_encoder();
             [enc1 setComputePipelineState:pso_conv];
             [enc1 setBuffer:b_qkv offset:qkv_off atIndex:0]; // conv_out
@@ -1670,6 +1693,8 @@ void deltanet_linear_attention_decode_cuda(
             [enc1 setBuffer:b_ics offset:ics_off atIndex:3];
             [enc1 setBuffer:b_ocs offset:ocs_off atIndex:4];
             [enc1 setBytes:&channels length:sizeof(channels) atIndex:5];
+            [enc1 setBuffer:b_ocs offset:ocs_off atIndex:6];
+            [enc1 setBytes:&has_conv_slot length:sizeof(has_conv_slot) atIndex:7];
 
             NSUInteger tg = 256;
             NSUInteger groups = (channels + tg - 1) / tg;
@@ -1677,6 +1702,7 @@ void deltanet_linear_attention_decode_cuda(
             s->end_encoder_and_maybe_commit();
 
             // Stage 2: SSM recurrent step across all num_v_heads
+            int has_ssm_slot = 0;
             id<MTLComputeCommandEncoder> enc2 = s->get_encoder();
             [enc2 setComputePipelineState:pso_ssm];
             [enc2 setBuffer:b_out offset:o_off atIndex:0];
@@ -1692,6 +1718,8 @@ void deltanet_linear_attention_decode_cuda(
             [enc2 setBytes:&num_k_heads length:sizeof(num_k_heads) atIndex:10];
             [enc2 setBytes:&num_v_heads length:sizeof(num_v_heads) atIndex:11];
             [enc2 setBytes:&head_dim length:sizeof(head_dim) atIndex:12];
+            [enc2 setBuffer:b_ossm offset:ossm_off atIndex:13];
+            [enc2 setBytes:&has_ssm_slot length:sizeof(has_ssm_slot) atIndex:14];
 
             [enc2 dispatchThreadgroups:MTLSizeMake(num_v_heads, 1, 1) threadsPerThreadgroup:MTLSizeMake(128, 1, 1)];
             s->end_encoder_and_maybe_commit();
@@ -2651,7 +2679,8 @@ static void qwen_gqa_decode_gated_generic(
     const __nv_bfloat16* q_norm_w, const __nv_bfloat16* k_norm_w,
     TCache* k_cache, TCache* v_cache,
     int n_q_heads, int n_kv_heads, int head_dim, const int32_t* d_pos,
-    int pos_scalar, int M, int max_seq_len, float rope_theta, float eps, cudaStream_t stream)
+    int pos_scalar, int M, int max_seq_len, float rope_theta, float eps, cudaStream_t stream,
+    int cache_pos = -1)
 {
     metal_stream_synchronize(stream);
     int group_size = n_q_heads / n_kv_heads;
@@ -2662,7 +2691,8 @@ static void qwen_gqa_decode_gated_generic(
     // 1. Process K and V for all M tokens and store into cache
     for (int m = 0; m < M; m++) {
         int pos = d_pos ? d_pos[m] : (pos_scalar + m);
-        if (pos >= max_seq_len) pos = max_seq_len - 1;
+        int c_pos = (cache_pos >= 0) ? (cache_pos + m) : pos;
+        if (c_pos >= max_seq_len) c_pos = max_seq_len - 1;
 
         if (k && v && k_cache && v_cache) {
             for (int kv_h = 0; kv_h < n_kv_heads; kv_h++) {
@@ -2678,8 +2708,13 @@ static void qwen_gqa_decode_gated_generic(
                         sum_sq += val * val;
                     }
                     float rrms = 1.0f / sqrtf(sum_sq / (float)head_dim + eps);
+                    float k_sum = 0.0f;
+                    int check_n = std::min(head_dim, 64);
+                    for (int d = 0; d < check_n; d++) k_sum += k_norm_w[d].to_float();
+                    bool k_one_centered = (k_sum / (float)check_n < 0.5f);
                     for (int d = 0; d < head_dim; d++) {
-                        k_vec[d] = k_vec[d] * rrms * (1.0f + k_norm_w[d].to_float());
+                        float nw = k_norm_w[d].to_float();
+                        k_vec[d] = k_vec[d] * rrms * (k_one_centered ? (1.0f + nw) : nw);
                     }
                 } else {
                     for (int d = 0; d < head_dim; d++) {
@@ -2698,7 +2733,7 @@ static void qwen_gqa_decode_gated_generic(
                     k_vec[i + half_rotary] = k0 * sin_a + k1 * cos_a;
                 }
 
-                size_t cache_off = ((size_t)pos * n_kv_heads + kv_h) * head_dim;
+                size_t cache_off = ((size_t)c_pos * n_kv_heads + kv_h) * head_dim;
                 for (int d = 0; d < head_dim; d++) {
                     if constexpr (std::is_same_v<TCache, uint8_t>) {
                         k_cache[cache_off + d] = float_to_fp8_e4m3_host(k_vec[d]);
@@ -2715,7 +2750,8 @@ static void qwen_gqa_decode_gated_generic(
     // 2. Process Q and compute causal attention with Sigmoid Gate for all M tokens
     for (int m = 0; m < M; m++) {
         int pos = d_pos ? d_pos[m] : (pos_scalar + m);
-        if (pos >= max_seq_len) pos = max_seq_len - 1;
+        int c_pos = (cache_pos >= 0) ? (cache_pos + m) : pos;
+        if (c_pos >= max_seq_len) c_pos = max_seq_len - 1;
 
         dispatch_apply(n_q_heads, dispatch_get_global_queue(QOS_CLASS_USER_INTERACTIVE, 0), ^(size_t qh) {
             int kv_h = (int)qh / group_size;
@@ -2732,8 +2768,13 @@ static void qwen_gqa_decode_gated_generic(
                     sum_sq += val * val;
                 }
                 float rrms = 1.0f / sqrtf(sum_sq / (float)head_dim + eps);
+                float q_sum = 0.0f;
+                int check_n = std::min(head_dim, 64);
+                for (int d = 0; d < check_n; d++) q_sum += q_norm_w[d].to_float();
+                bool q_one_centered = (q_sum / (float)check_n < 0.5f);
                 for (int d = 0; d < head_dim; d++) {
-                    q_vec[d] = q_vec[d] * rrms * (1.0f + q_norm_w[d].to_float());
+                    float nw = q_norm_w[d].to_float();
+                    q_vec[d] = q_vec[d] * rrms * (q_one_centered ? (1.0f + nw) : nw);
                 }
             } else {
                 for (int d = 0; d < head_dim; d++) {
@@ -2752,9 +2793,9 @@ static void qwen_gqa_decode_gated_generic(
                 q_vec[i + half_rotary] = q0 * sin_a + q1 * cos_a;
             }
 
-            std::vector<float> scores(pos + 1);
+            std::vector<float> scores(c_pos + 1);
             float max_s = -1e30f;
-            for (int t = 0; t <= pos; t++) {
+            for (int t = 0; t <= c_pos; t++) {
                 const TCache* k_head = k_cache + ((size_t)t * n_kv_heads + kv_h) * head_dim;
                 float dot = 0.0f;
                 for (int d = 0; d < head_dim; d++) {
@@ -2772,7 +2813,7 @@ static void qwen_gqa_decode_gated_generic(
             }
 
             float sum_exp = 0.0f;
-            for (int t = 0; t <= pos; t++) {
+            for (int t = 0; t <= c_pos; t++) {
                 float e = expf(scores[t] - max_s);
                 scores[t] = e;
                 sum_exp += e;
@@ -2780,7 +2821,7 @@ static void qwen_gqa_decode_gated_generic(
             float inv_sum = 1.0f / (sum_exp + 1e-9f);
 
             std::vector<float> out_f(head_dim, 0.0f);
-            for (int t = 0; t <= pos; t++) {
+            for (int t = 0; t <= c_pos; t++) {
                 float w = scores[t] * inv_sum;
                 const TCache* v_head = v_cache + ((size_t)t * n_kv_heads + kv_h) * head_dim;
                 for (int d = 0; d < head_dim; d++) {
@@ -2906,11 +2947,12 @@ void qwen_gqa_decode_gated_cuda(
     const __nv_bfloat16* q_norm_w, const __nv_bfloat16* k_norm_w,
     __nv_bfloat16* k_cache, __nv_bfloat16* v_cache,
     int n_q_heads, int n_kv_heads, int head_dim, const int32_t* d_pos,
-    int pos_scalar, int max_seq_len, float rope_theta, float eps, cudaStream_t stream)
+    int pos_scalar, int max_seq_len, float rope_theta, float eps, cudaStream_t stream,
+    int cache_pos)
 {
     qwen_gqa_decode_gated_generic<__nv_bfloat16>(
         out, q_and_gate, k, v, q_norm_w, k_norm_w, k_cache, v_cache,
-        n_q_heads, n_kv_heads, head_dim, d_pos, pos_scalar, 1, max_seq_len, rope_theta, eps, stream);
+        n_q_heads, n_kv_heads, head_dim, d_pos, pos_scalar, 1, max_seq_len, rope_theta, eps, stream, cache_pos);
 }
 
 
@@ -2955,8 +2997,13 @@ void qwen2_gqa_decode_fp8_batch_cuda(
                         sum_sq += val * val;
                     }
                     float rrms = 1.0f / sqrtf(sum_sq / (float)head_dim + eps);
+                    float k_sum = 0.0f;
+                    int check_n = std::min(head_dim, 64);
+                    for (int d = 0; d < check_n; d++) k_sum += k_norm_w[d].to_float();
+                    bool k_one_centered = (k_sum / (float)check_n < 0.5f);
                     for (int d = 0; d < head_dim; d++) {
-                        k_vec[d] = k_vec[d] * rrms * (1.0f + k_norm_w[d].to_float());
+                        float nw = k_norm_w[d].to_float();
+                        k_vec[d] = k_vec[d] * rrms * (k_one_centered ? (1.0f + nw) : nw);
                     }
                 } else {
                     for (int d = 0; d < head_dim; d++) {
@@ -3018,8 +3065,13 @@ void qwen2_gqa_decode_fp8_batch_cuda(
                     sum_sq += val * val;
                 }
                 float rrms = 1.0f / sqrtf(sum_sq / (float)head_dim + eps);
+                float q_sum = 0.0f;
+                int check_n = std::min(head_dim, 64);
+                for (int d = 0; d < check_n; d++) q_sum += q_norm_w[d].to_float();
+                bool q_one_centered = (q_sum / (float)check_n < 0.5f);
                 for (int d = 0; d < head_dim; d++) {
-                    q_vec[d] = q_vec[d] * rrms * (1.0f + q_norm_w[d].to_float());
+                    float nw = q_norm_w[d].to_float();
+                    q_vec[d] = q_vec[d] * rrms * (q_one_centered ? (1.0f + nw) : nw);
                 }
             } else {
                 for (int d = 0; d < head_dim; d++) {

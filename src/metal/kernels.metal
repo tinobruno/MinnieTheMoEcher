@@ -818,6 +818,8 @@ kernel void deltanet_conv_kernel(
     device const bfloat* in_conv_state [[buffer(3)]],
     device bfloat* out_conv_state [[buffer(4)]],
     constant int& channels [[buffer(5)]],
+    device bfloat* slot_conv_state [[buffer(6)]],
+    constant int& has_slot [[buffer(7)]],
     uint c [[thread_position_in_grid]])
 {
     if (c >= uint(channels)) return;
@@ -835,6 +837,14 @@ kernel void deltanet_conv_kernel(
     out_cs[1] = bfloat(s1);
     out_cs[2] = bfloat(s2);
     out_cs[3] = bfloat(s3);
+
+    if (has_slot == 1) {
+        device bfloat* slot_cs = slot_conv_state + c * 4;
+        slot_cs[0] = bfloat(s0);
+        slot_cs[1] = bfloat(s1);
+        slot_cs[2] = bfloat(s2);
+        slot_cs[3] = bfloat(s3);
+    }
 
     float w0 = float(cw[0]);
     float w1 = float(cw[1]);
@@ -860,6 +870,8 @@ kernel void deltanet_ssm_step_kernel(
     constant int& num_k_heads [[buffer(10)]],
     constant int& num_v_heads [[buffer(11)]],
     constant int& head_dim [[buffer(12)]],
+    device bfloat* slot_ssm_state [[buffer(13)]],   // [num_v_heads, head_dim, head_dim]
+    constant int& has_slot [[buffer(14)]],
     uint h [[threadgroup_position_in_grid]],        // 0..num_v_heads-1 (48 heads)
     uint tid [[thread_position_in_threadgroup]],    // 0..127
     uint simd_lane [[thread_index_in_simdgroup]],
@@ -890,6 +902,7 @@ kernel void deltanet_ssm_step_kernel(
 
     device const bfloat* in_state_h = in_ssm_state + size_t(h) * head_dim * head_dim;
     device bfloat* out_state_h = out_ssm_state + size_t(h) * head_dim * head_dim;
+    device bfloat* slot_state_h = (has_slot == 1) ? (slot_ssm_state + size_t(h) * head_dim * head_dim) : nullptr;
 
     float a_val = float(in_a[h]);
     float b_val = float(in_b[h]);
@@ -964,6 +977,9 @@ kernel void deltanet_ssm_step_kernel(
         for (int r = 0; r < head_dim; r++) {
             float new_s = decay * col_s[r] + s_k[r] * delta_c;
             out_state_h[r * head_dim + tid] = bfloat(new_s);
+            if (has_slot == 1) {
+                slot_state_h[r * head_dim + tid] = bfloat(new_s);
+            }
             out_c += new_s * s_q[r];
         }
         s_out[tid] = out_c;

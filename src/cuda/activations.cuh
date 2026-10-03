@@ -941,7 +941,8 @@ void qwen_gqa_decode_gated_cuda(
     int max_seq_len,
     float rope_theta = 1000000.0f,
     float eps = 1e-6f,
-    cudaStream_t stream = 0);
+    cudaStream_t stream = 0,
+    int cache_pos = -1);
 
 void qwen_gqa_decode_gated_fp8_cuda(
     __nv_bfloat16* out,             // [n_q_heads * head_dim] (6144)

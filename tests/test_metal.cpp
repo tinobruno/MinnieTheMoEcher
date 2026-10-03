@@ -384,48 +384,91 @@ bool test_gemv_int3_and_dequant() {
 }
 
 bool test_deltanet_recurrence() {
-    std::cout << "[TEST] 9. DeltaNet Linear Attention recurrence..." << std::endl;
-    const int num_k_heads = 2, num_v_heads = 6, head_dim = 16;
-    const int channels = (2 * num_k_heads + num_v_heads) * head_dim; // 10 * 16 = 160
+    std::cout << "[TEST] 9. DeltaNet Linear Attention recurrence (Metal GPU + rollback slots)..." << std::endl;
+    const int num_k_heads = 4, num_v_heads = 12, head_dim = 128;
+    const int channels = (2 * num_k_heads + num_v_heads) * head_dim; // 20 * 128 = 2560
     const int M = 3;
 
-    std::vector<__nv_bfloat16> in_qkv(M * channels);
-    for (size_t i = 0; i < in_qkv.size(); i++) in_qkv[i] = __nv_bfloat16::from_float(std::sin(float(i)));
+    __nv_bfloat16 *d_qkv = nullptr, *d_z = nullptr, *d_a = nullptr, *d_b = nullptr, *d_cw = nullptr;
+    __nv_bfloat16 *d_ics = nullptr, *d_ocs = nullptr, *d_alog = nullptr, *d_dt = nullptr, *d_nw = nullptr;
+    __nv_bfloat16 *d_issm = nullptr, *d_ossm = nullptr, *d_out = nullptr;
+    __nv_bfloat16 *d_sconv[4] = {nullptr, nullptr, nullptr, nullptr};
+    __nv_bfloat16 *d_sssm[4] = {nullptr, nullptr, nullptr, nullptr};
 
-    std::vector<__nv_bfloat16> in_z(M * num_v_heads * head_dim);
-    for (size_t i = 0; i < in_z.size(); i++) in_z[i] = __nv_bfloat16::from_float(0.5f);
+    cudaMalloc((void**)&d_qkv, M * channels * sizeof(__nv_bfloat16));
+    cudaMalloc((void**)&d_z, M * num_v_heads * head_dim * sizeof(__nv_bfloat16));
+    cudaMalloc((void**)&d_a, M * num_v_heads * sizeof(__nv_bfloat16));
+    cudaMalloc((void**)&d_b, M * num_v_heads * sizeof(__nv_bfloat16));
+    cudaMalloc((void**)&d_cw, channels * 4 * sizeof(__nv_bfloat16));
+    cudaMalloc((void**)&d_ics, channels * 4 * sizeof(__nv_bfloat16));
+    cudaMalloc((void**)&d_ocs, channels * 4 * sizeof(__nv_bfloat16));
+    cudaMalloc((void**)&d_alog, num_v_heads * sizeof(__nv_bfloat16));
+    cudaMalloc((void**)&d_dt, num_v_heads * sizeof(__nv_bfloat16));
+    cudaMalloc((void**)&d_nw, head_dim * sizeof(__nv_bfloat16));
+    cudaMalloc((void**)&d_issm, num_v_heads * head_dim * head_dim * sizeof(__nv_bfloat16));
+    cudaMalloc((void**)&d_ossm, num_v_heads * head_dim * head_dim * sizeof(__nv_bfloat16));
+    cudaMalloc((void**)&d_out, M * num_v_heads * head_dim * sizeof(__nv_bfloat16));
 
-    std::vector<__nv_bfloat16> in_a(M * num_v_heads, __nv_bfloat16::from_float(-1.0f));
-    std::vector<__nv_bfloat16> in_b(M * num_v_heads, __nv_bfloat16::from_float(0.0f));
-    std::vector<__nv_bfloat16> conv1d_w(channels * 4, __nv_bfloat16::from_float(0.25f));
-    std::vector<__nv_bfloat16> in_conv_state(channels * 4, __nv_bfloat16::from_float(0.0f));
-    std::vector<__nv_bfloat16> out_conv_state(channels * 4, __nv_bfloat16::from_float(0.0f));
-    std::vector<__nv_bfloat16> A_log(num_v_heads, __nv_bfloat16::from_float(-0.5f));
-    std::vector<__nv_bfloat16> dt_bias(num_v_heads, __nv_bfloat16::from_float(0.1f));
-    std::vector<__nv_bfloat16> norm_w(head_dim, __nv_bfloat16::from_float(1.0f));
-    std::vector<__nv_bfloat16> in_ssm_state(num_v_heads * head_dim * head_dim, __nv_bfloat16::from_float(0.0f));
-    std::vector<__nv_bfloat16> out_ssm_state(num_v_heads * head_dim * head_dim, __nv_bfloat16::from_float(0.0f));
-    std::vector<__nv_bfloat16> out(M * num_v_heads * head_dim, __nv_bfloat16::from_float(0.0f));
+    for (int k = 0; k < 3; k++) {
+        cudaMalloc((void**)&d_sconv[k], channels * 4 * sizeof(__nv_bfloat16));
+        cudaMalloc((void**)&d_sssm[k], num_v_heads * head_dim * head_dim * sizeof(__nv_bfloat16));
+    }
+
+    for (int i = 0; i < M * channels; i++) d_qkv[i] = __nv_bfloat16::from_float(std::sin(float(i)));
+    for (int i = 0; i < M * num_v_heads * head_dim; i++) d_z[i] = __nv_bfloat16::from_float(0.5f);
+    for (int i = 0; i < M * num_v_heads; i++) d_a[i] = __nv_bfloat16::from_float(-1.0f);
+    for (int i = 0; i < M * num_v_heads; i++) d_b[i] = __nv_bfloat16::from_float(0.0f);
+    for (int i = 0; i < channels * 4; i++) d_cw[i] = __nv_bfloat16::from_float(0.25f);
+    for (int i = 0; i < channels * 4; i++) d_ics[i] = __nv_bfloat16::from_float(0.0f);
+    for (int i = 0; i < num_v_heads; i++) d_alog[i] = __nv_bfloat16::from_float(-0.5f);
+    for (int i = 0; i < num_v_heads; i++) d_dt[i] = __nv_bfloat16::from_float(0.1f);
+    for (int i = 0; i < head_dim; i++) d_nw[i] = __nv_bfloat16::from_float(1.0f);
+    for (int i = 0; i < num_v_heads * head_dim * head_dim; i++) d_issm[i] = __nv_bfloat16::from_float(0.0f);
 
     deltanet_linear_attention_decode_batch_cuda(
-        out.data(), in_qkv.data(), in_z.data(), in_a.data(), in_b.data(),
-        conv1d_w.data(), in_conv_state.data(), out_conv_state.data(),
-        nullptr, nullptr, nullptr, nullptr,
-        A_log.data(), dt_bias.data(), norm_w.data(),
-        in_ssm_state.data(), out_ssm_state.data(),
-        nullptr, nullptr, nullptr, nullptr,
+        d_out, d_qkv, d_z, d_a, d_b,
+        d_cw, d_ics, d_ocs,
+        d_sconv[0], d_sconv[1], d_sconv[2], nullptr,
+        d_alog, d_dt, d_nw,
+        d_issm, d_ossm,
+        d_sssm[0], d_sssm[1], d_sssm[2], nullptr,
         num_k_heads, num_v_heads, head_dim, M, 0);
+    cudaStreamSynchronize(0);
 
-    // Verify non-zero output and reasonable bounded values
+    // Verify GPU output and reasonable bounded values
     float norm_sum = 0.0f;
-    for (size_t i = 0; i < out.size(); i++) {
-        float v = out[i].to_float();
+    for (int i = 0; i < M * num_v_heads * head_dim; i++) {
+        float v = d_out[i].to_float();
         TEST_CHECK(!std::isnan(v) && !std::isinf(v), "DeltaNet output is NaN or Inf");
         norm_sum += v * v;
     }
-    std::cout << "       DeltaNet output energy norm: " << std::sqrt(norm_sum) << std::endl;
-    TEST_CHECK(norm_sum > 0.01f, "DeltaNet output is unexpectedly zero");
-    std::cout << "       PASS: DeltaNet Recurrence" << std::endl;
+    std::cout << "       DeltaNet GPU output energy norm: " << std::sqrt(norm_sum) << std::endl;
+    TEST_CHECK(norm_sum > 0.01f, "DeltaNet GPU output is unexpectedly zero");
+
+    // Verify rollback slots were written
+    float sconv0_norm = 0.0f, sssm0_norm = 0.0f;
+    for (int i = 0; i < channels * 4; i++) {
+        float v = d_sconv[0][i].to_float();
+        sconv0_norm += v * v;
+    }
+    for (int i = 0; i < num_v_heads * head_dim * head_dim; i++) {
+        float v = d_sssm[0][i].to_float();
+        sssm0_norm += v * v;
+    }
+    std::cout << "       DeltaNet slot_conv_0 energy norm: " << std::sqrt(sconv0_norm) << std::endl;
+    std::cout << "       DeltaNet slot_ssm_0 energy norm: " << std::sqrt(sssm0_norm) << std::endl;
+    TEST_CHECK(sconv0_norm > 0.01f, "DeltaNet slot_conv_0 is unexpectedly zero");
+    TEST_CHECK(sssm0_norm > 0.01f, "DeltaNet slot_ssm_0 is unexpectedly zero");
+
+    cudaFree(d_qkv); cudaFree(d_z); cudaFree(d_a); cudaFree(d_b); cudaFree(d_cw);
+    cudaFree(d_ics); cudaFree(d_ocs); cudaFree(d_alog); cudaFree(d_dt); cudaFree(d_nw);
+    cudaFree(d_issm); cudaFree(d_ossm); cudaFree(d_out);
+    for (int k = 0; k < 3; k++) {
+        cudaFree(d_sconv[k]);
+        cudaFree(d_sssm[k]);
+    }
+
+    std::cout << "       PASS: DeltaNet Recurrence & Rollback Slots on Metal GPU" << std::endl;
     return true;
 }
 

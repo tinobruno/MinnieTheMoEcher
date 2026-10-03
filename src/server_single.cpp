@@ -2726,7 +2726,7 @@ public:
     // position: current sequence position
     // Returns: draft token id (in full vocabulary space), or -1 if not in draft vocab
     int forward_one_step(const __nv_bfloat16* target_hidden, int last_token_id,
-                         int position, cudaStream_t stream) {
+                         int position, int draft_step, cudaStream_t stream) {
         if (!loaded_) return -1;
 
         auto matmul_proj = [&](GPUTensor& out, __nv_bfloat16* in_vec, GPUTensor& weight, GPUTensor& scale, int N, int K) {
@@ -2800,7 +2800,7 @@ public:
             mtp_k_cache_.bf16(), mtp_v_cache_.bf16(),
             num_heads_, num_kv_heads_, head_dim_,
             buf_mtp_input_pos_.i32(), position, max_seq_len_ > 0 ? max_seq_len_ : 32768,
-            10000000.0f, rms_eps_, stream);
+            10000000.0f, rms_eps_, stream, draft_step);
 
         // 5d. Output projection + residual
         if (mtp_layer_o_proj_w_.dtype == "int4") {
@@ -2884,6 +2884,9 @@ public:
         int best_idx = *h_draft_best_;
         if (best_idx < 0 || best_idx >= active_vocab) return -1;
         int predicted_id = use_draft_vocab_ ? draft_vocab_ids_[best_idx] : best_idx;
+
+        
+
         if (predicted_id < 0 || predicted_id >= full_vocab_size_) return -1;
         return predicted_id;
     }
@@ -2902,22 +2905,12 @@ public:
         cands.push_back(first_token);
         if (!loaded_ || K <= 0) return;
 
-        // The MTP module takes:
-        // - The target model's hidden state (after the final norm of the last layer)
-        // - The embedding of the previously predicted token
-        // And produces a draft token prediction
-
-        // For chained drafting (K > 1):
-        // Step 0: hidden = target_hidden, token = first_token → draft_1
-        // Step 1: hidden = mtp_hidden (from step 0), token = draft_1 → draft_2
-        // Step 2: hidden = mtp_hidden (from step 1), token = draft_2 → draft_3
-        // ...
-
+        reset_kv_cache(stream);
         const __nv_bfloat16* current_hidden = target_hidden;
         int current_token = first_token;
 
         for (int k = 0; k < K; k++) {
-            int draft_token = forward_one_step(current_hidden, current_token, position + 1 + k, stream);
+            int draft_token = forward_one_step(current_hidden, current_token, position + 1 + k, k, stream);
             if (draft_token < 0) break;
 
             cands.push_back(draft_token);
@@ -2985,7 +2978,7 @@ public:
     // MTP Self-Drafter (new, faster)
     MTPSelfDrafter mtp_drafter_;
 #ifdef __APPLE__
-    bool enable_mtp_ = false;
+    bool enable_mtp_ = true;
 #else
     bool enable_mtp_ = true;
 #endif
@@ -5214,17 +5207,8 @@ public:
 
             // Check all EOS and stop conditions in content mode
             if (!ignore_eos && (next_token == cfg_.eos_token_id || (eos2_id >= 0 && next_token == eos2_id) || (im_end_id >= 0 && next_token == im_end_id))) {
-                bool ends_with_punct = false;
-                if (!generated_text.empty()) {
-                    char c = generated_text.back();
-                    if (c == '.' || c == '!' || c == '?' || c == '\n' || c == '}' || c == '"' || c == '\'') {
-                        ends_with_punct = true;
-                    }
-                }
-                if (content_tokens_generated == 0 ||
-                    (content_tokens_generated < 64 && !ends_with_punct && generated_text.find("<tool_call>") == std::string::npos)) {
-                    LOG_WARN("Premature EOS hit at step %d with %d content tokens. Suppressing EOS and forcing continuation.",
-                             t, content_tokens_generated);
+                if (content_tokens_generated == 0) {
+                    LOG_WARN("EOS hit with 0 content tokens at step %d. Suppressing EOS and forcing content generation.", t);
                     float neg_inf = -1e9f;
                     if (cfg_.eos_token_id >= 0) {
                         CUDA_CHECK(cudaMemcpyAsync(buf_logits_.f32() + cfg_.eos_token_id, &neg_inf, sizeof(float), cudaMemcpyHostToDevice, main_stream_));
@@ -5331,9 +5315,7 @@ public:
                     auto tv1 = std::chrono::steady_clock::now();
                     double ver_ms = std::chrono::duration<double, std::milli>(tv1 - tv0).count();
                     total_verify_ms += ver_ms;
-                    if (spec_cycles < 5) {
-                        LOG_INFO("VERIFY TIMING: cycle=%d M=%d took %.2fms (graph=%d)", spec_cycles, M, ver_ms, (int)batch_graph_captured_[M]);
-                    }
+
 
                     int accepted = 0;
                     int bonus_token = -1;
@@ -5342,12 +5324,7 @@ public:
                         int pred_k = host_batch_preds[k];
                         int draft_cand = cand_tokens[k + 1];
 
-                        // Debug: log first 5 MTP spec cycles
-                        if (is_mtp && spec_cycles < 5) {
-                            LOG_INFO("MTP DEBUG: cycle=%d k=%d pred=%d draft=%d %s",
-                                     spec_cycles, k, pred_k, draft_cand,
-                                     pred_k == draft_cand ? "MATCH" : "MISS");
-                        }
+
 
                         if (pred_k == draft_cand &&
                             pred_k != cfg_.eos_token_id && (eos2_id < 0 || pred_k != eos2_id) &&
@@ -7140,6 +7117,11 @@ private:
             } else {
                 rms_norm_cuda(buf_hidden_.bf16(), last_hidden,
                               norm_weight_.bf16(), dim, cfg_.rms_norm_eps, main_stream_);
+            }
+
+            if (mtp_drafter_.loaded_) {
+                CUDA_CHECK(cudaMemcpyAsync(buf_hidden2_.bf16(), buf_hidden_.bf16(),
+                                           dim * sizeof(__nv_bfloat16), cudaMemcpyDeviceToDevice, main_stream_));
             }
 
             if (head_weight_.dtype == "fp4") {
@@ -14231,10 +14213,10 @@ int main(int argc, char** argv) {
     std::string imatrix_out = "";
     int imatrix_max_tokens = -1;
 #ifdef __APPLE__
-    bool enable_pld = false;
+    bool enable_pld = true;
     int pld_draft_tokens = 4;
-    bool enable_mtp = false;
-    bool enable_spec = false;
+    bool enable_mtp = true;
+    bool enable_spec = true;
 #else
     bool enable_pld = true;
     int pld_draft_tokens = 4;
