@@ -4210,6 +4210,40 @@ async function sendMessage(options = {}) {
                 continue;
             }
 
+            // If the model in synthesis generated an unfulfilled preamble promising to fetch/search details but forgot to give the answer:
+            const isUnfulfilledPreamble = (turnRetrievedDocs.length > 0 || turnExecutedSearch) &&
+                roundContent.trim().length < 140 &&
+                /(?:found it|got it|let me|i'll|i will|going to|one moment|allow me to)\s+(?:fetch|search|check|look|find|get)\b/i.test(roundContent);
+
+            if (isUnfulfilledPreamble && round < maxRounds - 1) {
+                console.log('[Agentic Auto-Continuation] Model generated incomplete preamble; prompting direct answer synthesis...');
+                chatHistory.push({
+                    role: 'assistant',
+                    content: roundContent
+                });
+                chatHistory.push({
+                    role: 'user',
+                    content: 'Please provide the answer directly based on the search results above.'
+                });
+                let procBadge = assistantMsgDiv.querySelector('#tool-proc-indicator');
+                if (!procBadge) {
+                    procBadge = document.createElement('div');
+                    procBadge.className = 'tool-activity-block active tool-processing-badge';
+                    procBadge.id = 'tool-proc-indicator';
+                    mainContent.appendChild(procBadge);
+                }
+                procBadge.innerHTML = `
+                    <span class="thinking-spinner">progress_activity</span>
+                    <span class="tool-action-label">Synthesizing full answer from results</span>
+                    <div class="elaboration-dots"><span></span><span></span><span></span></div>
+                `;
+                messagesContainer.scrollTo({
+                    top: messagesContainer.scrollHeight,
+                    behavior: 'smooth'
+                });
+                continue;
+            }
+
             chatHistory.push({
                 role: 'assistant',
                 content: roundContent,

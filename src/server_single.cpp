@@ -9672,7 +9672,11 @@ static MultimodalPrompt apply_chat_template_multimodal(
 
             if (role == "tool" || role == "function") {
                 result.push_back(IM_START);
-                auto user_role = tok.encode("user\n<tool_response>\n" + content_str + "\n</tool_response>");
+                std::string tool_body = "user\n<tool_response>\n" + content_str + "\n</tool_response>";
+                if (i == messages.size() - 1 && (!has_tools || resolved_tools.empty())) {
+                    tool_body += "\nPlease answer the user's question directly based on the search results above.";
+                }
+                auto user_role = tok.encode(tool_body);
                 result.insert(result.end(), user_role.begin(), user_role.end());
                 result.push_back(IM_END);
                 auto nl_enc = tok.encode("\n");
