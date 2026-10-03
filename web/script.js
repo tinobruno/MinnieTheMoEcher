@@ -114,8 +114,10 @@ function setGeneratingState(generating) {
     const micBtn = document.getElementById('mic-btn');
 
     if (generating) {
-        if (typeof isVoiceRecording !== 'undefined' && isVoiceRecording) {
-            stopVoiceRecognition();
+        if (typeof terminateVoiceRecognition === 'function') {
+            terminateVoiceRecognition();
+        } else if (typeof stopVoiceRecognition === 'function') {
+            stopVoiceRecognition(false);
         }
         if (typeof stopTtsAudio === 'function') {
             stopTtsAudio();
@@ -157,8 +159,10 @@ function stopGeneration() {
     if (typeof stopTtsAudio === 'function') {
         stopTtsAudio();
     }
-    if (typeof isVoiceRecording !== 'undefined' && isVoiceRecording) {
-        stopVoiceRecognition();
+    if (typeof terminateVoiceRecognition === 'function') {
+        terminateVoiceRecognition();
+    } else if (typeof stopVoiceRecognition === 'function') {
+        stopVoiceRecognition(false);
     }
     if (currentAbortController) {
         currentAbortController.abort();
@@ -2863,7 +2867,13 @@ function buildOptimizedMessagesPayload() {
                 "   - Attachments (stems, leaves, handles, spouts) must penetrate 5-10% deep into parent meshes to prevent floating seams or gaps.";
         }
         if (sysPrompt) {
-            messagesToSend.push({ role: 'system', content: sysPrompt });
+            const now = new Date();
+            const dateStr = now.toLocaleDateString('en-US', { weekday: 'long', year: 'numeric', month: 'long', day: '2-digit' });
+            let fullSys = sysPrompt;
+            if (!fullSys.includes('Current date:')) {
+                fullSys += `\nCurrent date: ${dateStr}`;
+            }
+            messagesToSend.push({ role: 'system', content: fullSys });
         }
     }
 
@@ -3569,7 +3579,10 @@ async function sendMessage(options = {}) {
     const wasVoicePrompt = (options && options.fromVoice === true) || isCurrentInputFromVoice || (typeof isVoiceRecording !== 'undefined' && isVoiceRecording);
     isCurrentInputFromVoice = false;
 
-    if (typeof isVoiceRecording !== 'undefined' && isVoiceRecording) {
+    // Immediately terminate any ongoing voice recognition and detach handlers so trailing results cannot write to input
+    if (typeof terminateVoiceRecognition === 'function') {
+        terminateVoiceRecognition();
+    } else if (typeof stopVoiceRecognition === 'function') {
         stopVoiceRecognition(false);
     }
     if (typeof stopTtsAudio === 'function') {
@@ -3585,8 +3598,12 @@ async function sendMessage(options = {}) {
     }
     currentAbortController = new AbortController();
 
+    // Clean chat input and reset all dictation buffers
     chatInput.value = '';
+    preSpeechInputValue = '';
+    speechFinalTranscript = '';
     chatInput.style.height = 'auto';
+    sendBtn.disabled = true;
     setGeneratingState(true);
     // Detect if user prompt is asking for 3D model creation
     const is3dPrompt = /(?:\b3d\b|three\.?js|\bmodel\b|\bmesh\b|\bobj\b|\bgltf\b)/i.test(text) ||
@@ -4473,6 +4490,12 @@ async function sendMessage(options = {}) {
         }
         updateChatbarPreviewButtonVisibility();
         fetchExpertProfile();
+        // Guaranteed cleanup: ensure input field never retains the sent prompt
+        if (chatInput.value.trim() === text.trim()) {
+            chatInput.value = '';
+            chatInput.style.height = 'auto';
+            sendBtn.disabled = true;
+        }
     }
 }
 
@@ -8506,6 +8529,7 @@ async function startVoiceRecognition() {
         };
 
         speechRecognitionInstance.onresult = (event) => {
+            if (!isVoiceRecording || isGenerating) return;
             let interimTranscript = '';
             for (let i = event.resultIndex; i < event.results.length; ++i) {
                 const transcript = event.results[i][0].transcript;
@@ -8515,6 +8539,8 @@ async function startVoiceRecognition() {
                     interimTranscript += transcript;
                 }
             }
+
+            if (!isVoiceRecording || isGenerating) return;
 
             const currentSpoken = (speechFinalTranscript + (interimTranscript ? ' ' + interimTranscript : '')).trim();
             const prefix = preSpeechInputValue.trim();
@@ -8566,7 +8592,7 @@ async function startVoiceRecognition() {
                     }
                     if (isVoiceRecording && chatInput.value.trim().length > 0) {
                         isCurrentInputFromVoice = true;
-                        stopVoiceRecognition(false);
+                        terminateVoiceRecognition();
                         sendMessage({ fromVoice: true });
                     }
                 }, delayMs);
@@ -8617,6 +8643,37 @@ async function startVoiceRecognition() {
     }
 }
 
+function terminateVoiceRecognition() {
+    isVoiceRecording = false;
+
+    if (speechSilenceTimer) {
+        clearTimeout(speechSilenceTimer);
+        speechSilenceTimer = null;
+    }
+    if (speechCountdownInterval) {
+        clearInterval(speechCountdownInterval);
+        speechCountdownInterval = null;
+    }
+    const countdownBadge = document.getElementById('voice-silence-countdown');
+    if (countdownBadge) countdownBadge.classList.add('hidden');
+
+    if (speechRecognitionInstance) {
+        const inst = speechRecognitionInstance;
+        speechRecognitionInstance = null;
+        inst.onresult = null;
+        inst.onerror = null;
+        inst.onend = null;
+        inst.onstart = null;
+        try {
+            inst.abort();
+        } catch (e) {}
+    }
+
+    speechFinalTranscript = '';
+    preSpeechInputValue = '';
+    updateVoiceRecordingUI(false);
+}
+
 function stopVoiceRecognition(sendNow = false) {
     if (speechSilenceTimer) {
         clearTimeout(speechSilenceTimer);
@@ -8629,11 +8686,23 @@ function stopVoiceRecognition(sendNow = false) {
     const countdownBadge = document.getElementById('voice-silence-countdown');
     if (countdownBadge) countdownBadge.classList.add('hidden');
 
-    if (speechRecognitionInstance) {
-        try { speechRecognitionInstance.stop(); } catch (e) {}
-    }
     isVoiceRecording = false;
     updateVoiceRecordingUI(false);
+
+    if (speechRecognitionInstance) {
+        const inst = speechRecognitionInstance;
+        inst.onresult = null;
+        inst.onerror = null;
+        inst.onend = null;
+        inst.onstart = null;
+        try {
+            inst.abort();
+        } catch (e) {}
+        speechRecognitionInstance = null;
+    }
+
+    speechFinalTranscript = '';
+    preSpeechInputValue = '';
     chatInput.focus();
 
     if (sendNow && chatInput.value.trim().length > 0) {
@@ -8644,22 +8713,9 @@ function stopVoiceRecognition(sendNow = false) {
 
 function cancelVoiceRecognition() {
     isCurrentInputFromVoice = false;
-    if (speechSilenceTimer) {
-        clearTimeout(speechSilenceTimer);
-        speechSilenceTimer = null;
-    }
-    if (speechCountdownInterval) {
-        clearInterval(speechCountdownInterval);
-        speechCountdownInterval = null;
-    }
-    const countdownBadge = document.getElementById('voice-silence-countdown');
-    if (countdownBadge) countdownBadge.classList.add('hidden');
-
-    if (speechRecognitionInstance) {
-        try { speechRecognitionInstance.abort(); } catch (e) {}
-    }
-    isVoiceRecording = false;
-    chatInput.value = preSpeechInputValue;
+    const restoreVal = preSpeechInputValue || '';
+    terminateVoiceRecognition();
+    chatInput.value = restoreVal;
     chatInput.style.height = 'auto';
     chatInput.style.height = Math.min(chatInput.scrollHeight, 200) + 'px';
     sendBtn.disabled = chatInput.value.trim() === '';
