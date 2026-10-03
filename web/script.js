@@ -1860,7 +1860,10 @@ function updateSearchProviderStatusBadge(configured) {
 
     let isReady = false;
     let label = 'Configured';
-    if (provider === 'searxng') {
+    if (provider === 'duckduckgo' || provider === 'ddg') {
+        isReady = true;
+        label = 'DuckDuckGo Ready (Zero-Config)';
+    } else if (provider === 'searxng') {
         isReady = !!(agenticSettings.searxngUrl && agenticSettings.searxngUrl.trim());
         label = isReady ? 'Zero-Config Ready' : 'URL Required';
     } else if (provider === 'tavily') {
@@ -1904,7 +1907,7 @@ function onSearchProviderChange(targetProvider) {
         select.value = provider;
     }
 
-    const providers = ['tavily', 'searxng', 'brave', 'serper', 'google'];
+    const providers = ['duckduckgo', 'tavily', 'searxng', 'brave', 'serper', 'google'];
     providers.forEach(p => {
         const sec = document.getElementById(`provider-section-${p}`);
         if (sec) {

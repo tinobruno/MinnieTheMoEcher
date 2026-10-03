@@ -3397,26 +3397,49 @@ inline RetrievedDocument web_search_full(
     std::string provider = !custom_provider.empty() ? custom_provider : g_search_provider;
     if (provider.empty()) provider = "tavily";
 
+    RetrievedDocument res_doc;
     if (provider == "duckduckgo" || provider == "ddg") {
-        return search_duckduckgo_lite(clean_q, num_results);
+        res_doc = search_duckduckgo_lite(clean_q, num_results);
     } else if (provider == "tavily") {
         std::string key = !custom_key.empty() ? custom_key : g_tavily_api_key;
-        return search_tavily(clean_q, num_results, key);
+        if (!key.empty()) {
+            res_doc = search_tavily(clean_q, num_results, key);
+        }
     } else if (provider == "brave") {
         std::string key = !custom_key.empty() ? custom_key : g_brave_api_key;
-        return search_brave(clean_q, num_results, key);
+        if (!key.empty()) {
+            res_doc = search_brave(clean_q, num_results, key);
+        }
     } else if (provider == "searxng" || provider == "searx") {
         std::string s_url = !custom_searx_url.empty() ? custom_searx_url : g_searxng_url;
-        return search_searxng(clean_q, num_results, s_url);
+        res_doc = search_searxng(clean_q, num_results, s_url);
     } else if (provider == "serper") {
         std::string key = !custom_key.empty() ? custom_key : g_serper_api_key;
-        return search_serper(clean_q, num_results, key);
+        if (!key.empty()) {
+            res_doc = search_serper(clean_q, num_results, key);
+        }
     } else if (provider == "google") {
-        return search_google(clean_q, num_results, custom_key, custom_cx);
+        res_doc = search_google(clean_q, num_results, custom_key, custom_cx);
     }
 
-    // Default fallback to Tavily
-    return search_tavily(clean_q, num_results, g_tavily_api_key);
+    bool has_valid_results = !res_doc.clean_text.empty() &&
+                             res_doc.clean_text.find("Search provider error") == std::string::npos &&
+                             res_doc.clean_text.find("[Tavily Error:") == std::string::npos &&
+                             res_doc.clean_text.find("[Brave Error:") == std::string::npos &&
+                             res_doc.clean_text.find("[Serper Error:") == std::string::npos &&
+                             res_doc.clean_text.find("[Google Search Error:") == std::string::npos &&
+                             res_doc.clean_text.find("Error:") == std::string::npos;
+    if (has_valid_results) {
+        return res_doc;
+    }
+
+    // Zero-config automatic fallback: DuckDuckGo Lite ensures web search always succeeds out-of-the-box
+    RetrievedDocument fallback_doc = search_duckduckgo_lite(clean_q, num_results);
+    if (!fallback_doc.clean_text.empty()) {
+        return fallback_doc;
+    }
+
+    return !res_doc.clean_text.empty() ? res_doc : fallback_doc;
 }
 
 inline std::string web_search_content(
