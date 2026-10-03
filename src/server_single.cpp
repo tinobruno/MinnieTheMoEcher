@@ -4963,31 +4963,54 @@ public:
                 content_tokens_generated++;
                 recent_content_tokens.push_back(next_token);
                 int n_cnt = (int)recent_content_tokens.size();
-                if (n_cnt >= 16) {
-                    for (int P = 1; P <= 32 && P * 3 <= n_cnt; P++) {
-                        bool match = true;
-                        for (int i = 0; i < P; i++) {
-                            int t0 = recent_content_tokens[n_cnt - 1 - i];
-                            int t1 = recent_content_tokens[n_cnt - 1 - P - i];
-                            int t2 = recent_content_tokens[n_cnt - 1 - 2 * P - i];
-                            if (t0 != t1 || t0 != t2) {
-                                match = false;
+                // Avoid false positives in the opening tokens (< 64) or while actively outputting a tool call
+                bool in_tool_call_block = (generated_text.find("<tool_call>") != std::string::npos &&
+                                           generated_text.find("</tool_call>") == std::string::npos);
+                if (content_tokens_generated >= 64 && !in_tool_call_block) {
+                    for (int P = 1; P <= 32; P++) {
+                        if (P == 1) {
+                            if (n_cnt >= 6 &&
+                                recent_content_tokens[n_cnt - 1] == recent_content_tokens[n_cnt - 2] &&
+                                recent_content_tokens[n_cnt - 1] == recent_content_tokens[n_cnt - 3] &&
+                                recent_content_tokens[n_cnt - 1] == recent_content_tokens[n_cnt - 4] &&
+                                recent_content_tokens[n_cnt - 1] == recent_content_tokens[n_cnt - 5] &&
+                                recent_content_tokens[n_cnt - 1] == recent_content_tokens[n_cnt - 6]) {
+                                content_loop_detected = true;
                                 break;
                             }
-                        }
-                        if (match) {
-                            if (P == 1) {
-                                if (n_cnt >= 5 &&
-                                    recent_content_tokens[n_cnt - 1] == recent_content_tokens[n_cnt - 2] &&
-                                    recent_content_tokens[n_cnt - 1] == recent_content_tokens[n_cnt - 3] &&
-                                    recent_content_tokens[n_cnt - 1] == recent_content_tokens[n_cnt - 4] &&
-                                    recent_content_tokens[n_cnt - 1] == recent_content_tokens[n_cnt - 5]) {
+                        } else if (P <= 4) {
+                            // Small period (2..4 tokens) requires at least 5 consecutive repetitions to avoid JSON punctuation false triggers
+                            if (P * 5 <= n_cnt) {
+                                bool match = true;
+                                for (int rep = 1; rep < 5 && match; rep++) {
+                                    for (int i = 0; i < P; i++) {
+                                        if (recent_content_tokens[n_cnt - 1 - i] != recent_content_tokens[n_cnt - 1 - rep * P - i]) {
+                                            match = false;
+                                            break;
+                                        }
+                                    }
+                                }
+                                if (match) {
                                     content_loop_detected = true;
                                     break;
                                 }
-                            } else {
-                                content_loop_detected = true;
-                                break;
+                            }
+                        } else {
+                            // Larger period (P >= 5) requires at least 3 repetitions and total repeat length >= 24
+                            if (P * 3 <= n_cnt && P * 3 >= 24) {
+                                bool match = true;
+                                for (int rep = 1; rep < 3 && match; rep++) {
+                                    for (int i = 0; i < P; i++) {
+                                        if (recent_content_tokens[n_cnt - 1 - i] != recent_content_tokens[n_cnt - 1 - rep * P - i]) {
+                                            match = false;
+                                            break;
+                                        }
+                                    }
+                                }
+                                if (match) {
+                                    content_loop_detected = true;
+                                    break;
+                                }
                             }
                         }
                     }
@@ -9356,8 +9379,9 @@ static std::string build_dynamic_tools_prompt(const json& resolved_tools, bool i
         prompt +=
             "For each function call, return a json object with function name and arguments within <tool_call></tool_call> XML tags:\n"
             "<tool_call>\n"
-            "{\"name\": \"<function-name>\", \"arguments\": <args-json-object>}\n"
-            "</tool_call>\n\n";
+            "{\"name\": \"web_search\", \"arguments\": {\"query\": \"Formula 1 pole position today\"}}\n"
+            "</tool_call>\n\n"
+            "Call only the exact function names listed in <tools> above (such as \"web_search\", \"youtube_search\", \"google_search\", \"fetch_url\", \"create_3d_model\"). Never invent function names or output placeholder tokens like <function-name> or <|reserved_0|>.\n\n";
     }
 
     prompt +=
@@ -9373,6 +9397,18 @@ static std::string build_dynamic_tools_prompt(const json& resolved_tools, bool i
         "- When continuing a previous response, immediately provide the full narrative and substantive information without meta-introductory remarks.\n";
 
     return prompt;
+}
+
+static std::string normalize_tool_name(const std::string& name) {
+    std::string s = name;
+    if (s.empty()) return "web_search";
+    if (s == "search" || s == "websearch" || s == "internet_search" ||
+        s == "bing_search" || s == "browser_search" || s == "<|reserved_0|>" ||
+        s == "<function>" || s == "function" ||
+        s == "search_web" || s == "online_search") {
+        return "web_search";
+    }
+    return s;
 }
 
 static std::string g_base_system_prompt = "You are a helpful assistant. Always provide comprehensive, thorough, and complete answers directly without asking for permission to proceed or stopping at introductory announcements. When asked to continue or keep going, immediately provide the full narrative and substantive information without meta-introductory remarks.";
@@ -11020,7 +11056,7 @@ struct ToolTagStreamFilter {
                             if (q1 != std::string::npos) {
                                 size_t q2 = tool_buffer.find('"', q1 + 1);
                                 if (q2 != std::string::npos) {
-                                    current_tool_name = tool_buffer.substr(q1 + 1, q2 - q1 - 1);
+                                    current_tool_name = normalize_tool_name(tool_buffer.substr(q1 + 1, q2 - q1 - 1));
                                     if (on_status) {
                                         if (current_tool_name == "create_3d_model" || current_tool_name == "model_3d") {
                                             on_status("Generating 3D model geometry & Three.js code...");
@@ -13013,6 +13049,7 @@ static void run_server(MoecherEngine& engine, int port, int default_thinking_bud
                         std::string final_finish_reason = "stop";
                         std::string last_completed_content;
                         std::vector<json> round_new_tool_msgs;
+                        std::set<std::pair<std::string, std::string>> previously_executed_tools;
 
                         int max_allowed_prompt = engine.cfg_.max_seq_len - max_tokens;
                         if (max_allowed_prompt < 1024) max_allowed_prompt = engine.cfg_.max_seq_len - 256;
@@ -13219,7 +13256,8 @@ static void run_server(MoecherEngine& engine, int port, int default_thinking_bud
                             bool can_execute_all = true;
                             json assistant_msg = {{"role", "assistant"}, {"content", round_content}};
                             json tc_json_arr = json::array();
-                            for (const auto& tc : round_tool_calls) {
+                            for (auto& tc : round_tool_calls) {
+                                tc.name = normalize_tool_name(tc.name);
                                 tc_json_arr.push_back({
                                     {"id", tc.id},
                                     {"type", tc.type},
@@ -13241,9 +13279,16 @@ static void run_server(MoecherEngine& engine, int port, int default_thinking_bud
                                 return false;
                             };
 
-                            for (const auto& tc : round_tool_calls) {
+                            for (auto tc : round_tool_calls) {
+                                tc.name = normalize_tool_name(tc.name);
                                 std::string exec_output;
-                                if (tc.name == "web_search" || tc.name == "google_search") {
+                                auto tool_key = std::make_pair(tc.name, tc.arguments);
+                                if (previously_executed_tools.count(tool_key)) {
+                                    LOG_WARN("Streaming Tool Exec: duplicate tool call detected [%s]. Synthesizing final answer.", tc.name.c_str());
+                                    exec_output = "Note: You have already executed this exact tool call with these arguments in this turn. Do not call this tool again. Please immediately formulate and output your final, comprehensive response to the user with the information already gathered.";
+                                } else {
+                                    previously_executed_tools.insert(tool_key);
+                                    if (tc.name == "web_search" || tc.name == "google_search" || tc.name == "youtube_search") {
                                     std::string query;
                                     int num_results = 5;
                                     std::string site = "";
@@ -13262,10 +13307,11 @@ static void run_server(MoecherEngine& engine, int port, int default_thinking_bud
                                         searx_url = args.value("searxng_url", "");
                                     } catch (...) { query = tc.arguments; }
 
+                                    std::string action_label = (tc.name == "youtube_search") ? "Searching YouTube" : "Searching Web";
                                     std::string active_card =
                                         "\n\n<div class=\"tool-activity-block active\" id=\"tool-act-" + tc.id + "\">\n"
                                         "  <span class=\"thinking-spinner\">progress_activity</span>\n"
-                                        "  <span class=\"tool-action-label\">Searching Web</span>\n"
+                                        "  <span class=\"tool-action-label\">" + action_label + "</span>\n"
                                         "  <span class=\"tool-target-subtle\">" + query + "</span>\n"
                                         "</div>\n\n";
 
@@ -13283,8 +13329,8 @@ static void run_server(MoecherEngine& engine, int port, int default_thinking_bud
                                     std::string sse_info = "data: " + info_chunk.dump(-1, ' ', false, json::error_handler_t::replace) + "\n\n";
                                     sink.write(sse_info.data(), sse_info.size());
 
-                                    LOG_INFO("Streaming Tool Exec: web_search('%s', num=%d, site='%s', provider='%s')", query.c_str(), num_results, site.c_str(), provider.c_str());
-                                    auto doc = moecher::tooling::web_search_full(query, num_results, site, provider, api_key, cx, searx_url);
+                                    LOG_INFO("Streaming Tool Exec: %s('%s', num=%d, site='%s', provider='%s')", tc.name.c_str(), query.c_str(), num_results, site.c_str(), provider.c_str());
+                                    auto doc = (tc.name == "youtube_search") ? moecher::tooling::search_youtube_direct(query, num_results) : moecher::tooling::web_search_full(query, num_results, site, provider, api_key, cx, searx_url);
                                     exec_output = doc.clean_text;
 
                                     // Stream retrieved search cards to the frontend
@@ -13756,8 +13802,9 @@ static void run_server(MoecherEngine& engine, int port, int default_thinking_bud
                                     std::string sse_comp = "data: " + comp_chunk.dump(-1, ' ', false, json::error_handler_t::replace) + "\n\n";
                                     sink.write(sse_comp.data(), sse_comp.size());
                                 } else {
-                                    can_execute_all = false;
-                                    break;
+                                    LOG_WARN("Tool '%s' not recognized by server. Feeding tool error back to assistant.", tc.name.c_str());
+                                    exec_output = "Error: Tool '" + tc.name + "' is not recognized. Available tools: web_search, youtube_search, google_search, fetch_url, create_3d_model. If you want to search online, call web_search with {\"query\": \"...\"}, or answer the user directly.";
+                                }
                                 }
 
                                 json tool_reply = {
@@ -13767,11 +13814,6 @@ static void run_server(MoecherEngine& engine, int port, int default_thinking_bud
                                 };
                                 current_messages.push_back(tool_reply);
                                 round_new_tool_msgs.push_back(tool_reply);
-                            }
-
-                            if (!can_execute_all) {
-                                final_finish_reason = "tool_calls";
-                                break;
                             }
 
                             if (round + 1 < max_tool_rounds) {
@@ -13861,6 +13903,7 @@ static void run_server(MoecherEngine& engine, int port, int default_thinking_bud
                 json current_messages = messages;
                 std::string finish_reason = "stop";
                 std::vector<json> round_new_tool_msgs;
+                std::set<std::pair<std::string, std::string>> previously_executed_tools;
 
                 int max_tool_rounds = (do_server_exec && !tools.empty() && g_enable_tools) ? req_max_tool_rounds : 1;
 
@@ -13969,9 +14012,16 @@ static void run_server(MoecherEngine& engine, int port, int default_thinking_bud
                         return false;
                     };
 
-                    for (const auto& tc : round_tool_calls) {
+                    for (auto& tc : round_tool_calls) {
+                        tc.name = normalize_tool_name(tc.name);
                         std::string exec_output;
-                        if (tc.name == "web_search" || tc.name == "google_search") {
+                        auto tool_key = std::make_pair(tc.name, tc.arguments);
+                        if (previously_executed_tools.count(tool_key)) {
+                            LOG_WARN("Non-streaming Tool Exec: duplicate tool call detected [%s]. Synthesizing final answer.", tc.name.c_str());
+                            exec_output = "Note: You have already executed this exact tool call with these arguments in this turn. Do not call this tool again. Please immediately formulate and output your final, comprehensive response to the user with the information already gathered.";
+                        } else {
+                            previously_executed_tools.insert(tool_key);
+                            if (tc.name == "web_search" || tc.name == "google_search" || tc.name == "youtube_search") {
                             std::string query;
                             int num_results = 5;
                             std::string site = "";
@@ -13989,8 +14039,13 @@ static void run_server(MoecherEngine& engine, int port, int default_thinking_bud
                                 cx = args.value("cx", "");
                                 searx_url = args.value("searxng_url", "");
                             } catch (...) { query = tc.arguments; }
-                            LOG_INFO("Executing built-in tool web_search: %s (num=%d, site=%s, provider=%s)", query.c_str(), num_results, site.c_str(), provider.c_str());
-                            exec_output = moecher::tooling::web_search_content(query, num_results, site, provider, api_key, cx, searx_url);
+                            LOG_INFO("Executing built-in tool %s: %s (num=%d, site=%s, provider=%s)", tc.name.c_str(), query.c_str(), num_results, site.c_str(), provider.c_str());
+                            if (tc.name == "youtube_search") {
+                                auto doc = moecher::tooling::search_youtube_direct(query, num_results);
+                                exec_output = doc.clean_text;
+                            } else {
+                                exec_output = moecher::tooling::web_search_content(query, num_results, site, provider, api_key, cx, searx_url);
+                            }
                         } else if (tc.name == "fetch_url") {
                             std::string url;
                             std::string mode = "text";
@@ -14071,8 +14126,9 @@ static void run_server(MoecherEngine& engine, int port, int default_thinking_bud
                             LOG_INFO("Executing MCP tool: [%s:%s]", s_id.c_str(), raw_tname.c_str());
                             exec_output = moecher::mcp::MCPManager::instance().call_tool(tc.name, parsed_args, execution_timeout_ms);
                         } else {
-                            can_execute_all = false;
-                            break;
+                            LOG_WARN("Tool '%s' not recognized by server. Feeding tool error back to assistant.", tc.name.c_str());
+                            exec_output = "Error: Tool '" + tc.name + "' is not recognized. Available tools: web_search, youtube_search, google_search, fetch_url, create_3d_model. If you want to search online, call web_search with {\"query\": \"...\"}, or answer the user directly.";
+                        }
                         }
 
                         json tool_reply = {
@@ -14082,11 +14138,6 @@ static void run_server(MoecherEngine& engine, int port, int default_thinking_bud
                         };
                         current_messages.push_back(tool_reply);
                         round_new_tool_msgs.push_back(tool_reply);
-                    }
-
-                    if (!can_execute_all) {
-                        finish_reason = "tool_calls";
-                        break;
                     }
                 }
 

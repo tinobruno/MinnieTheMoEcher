@@ -2882,6 +2882,87 @@ inline RetrievedDocument search_wikipedia(const std::string& clean_q, int num_re
     }
 }
 
+inline RetrievedDocument search_duckduckgo_lite(const std::string& clean_q, int num_results = 5) {
+    RetrievedDocument doc;
+    doc.url = "https://duckduckgo.com/?q=" + url_encode(clean_q);
+    doc.title = "Web Search: " + clean_q;
+
+    std::string post_data = "q=" + url_encode(clean_q);
+    std::string resp = http_request_native("POST", "https://lite.duckduckgo.com/lite/", post_data,
+        {"Content-Type: application/x-www-form-urlencoded",
+         "User-Agent: Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.2 Safari/605.1.15",
+         "Accept: text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+         "Accept-Language: en-US,en;q=0.9"}, 6000);
+
+    if (resp.empty()) {
+        return doc;
+    }
+
+    try {
+        std::string text_out = "[Web Search Results: \"" + clean_q + "\"]\n\n";
+        std::string html_cards = "<div style=\"font-family:-apple-system,BlinkMacSystemFont,\x27Segoe UI\x27,Roboto,Helvetica,Arial,sans-serif; color:#e2e8f0; background:#0f172a; padding:20px; border-radius:12px; max-width:860px; margin:0 auto;\">";
+        html_cards += "<h2 style=\"margin:0 0 16px 0; font-size:18px; color:#60a5fa;\">Web Search: " + clean_q + "</h2>";
+
+        std::regex link_re(R"(<a\s+[^>]*href=[\x27\"]([^\x27\"]+)[\x27\"][^>]*class=[\x27\"]result-link[\x27\"][^>]*>([\s\S]*?)<\/a>|<a\s+[^>]*class=[\x27\"]result-link[\x27\"][^>]*href=[\x27\"]([^\x27\"]+)[\x27\"][^>]*>([\s\S]*?)<\/a>)", std::regex_constants::icase);
+        std::regex snip_re(R"(<td\s+[^>]*class=[\x27\"]result-snippet[\x27\"][^>]*>([\s\S]*?)<\/td>)", std::regex_constants::icase);
+        std::regex strip_tags(R"(<[^>]+>)");
+
+        std::vector<std::pair<std::string, std::string>> links;
+        for (std::sregex_iterator it(resp.begin(), resp.end(), link_re), end; it != end; ++it) {
+            std::smatch m = *it;
+            std::string href = m[1].matched ? m[1].str() : m[3].str();
+            std::string raw_title = m[2].matched ? m[2].str() : m[4].str();
+            std::string title = std::regex_replace(raw_title, strip_tags, "");
+            size_t tf = title.find_first_not_of(" \t\r\n");
+            size_t tl = title.find_last_not_of(" \t\r\n");
+            if (tf != std::string::npos && tl != std::string::npos) title = title.substr(tf, tl - tf + 1);
+            links.push_back({href, title});
+        }
+
+        std::vector<std::string> snips;
+        for (std::sregex_iterator it(resp.begin(), resp.end(), snip_re), end; it != end; ++it) {
+            std::smatch m = *it;
+            std::string raw_snip = m[1].str();
+            std::string snip = std::regex_replace(raw_snip, strip_tags, "");
+            size_t sf = snip.find_first_not_of(" \t\r\n");
+            size_t sl = snip.find_last_not_of(" \t\r\n");
+            if (sf != std::string::npos && sl != std::string::npos) snip = snip.substr(sf, sl - sf + 1);
+            snips.push_back(snip);
+        }
+
+        int count = 0;
+        for (size_t i = 0; i < links.size() && count < num_results; ++i) {
+            count++;
+            std::string item_link = links[i].first;
+            std::string item_title = links[i].second;
+            std::string item_content = (i < snips.size()) ? snips[i] : "";
+
+            if (count == 1 && !item_link.empty()) {
+                doc.url = item_link;
+                doc.title = item_title;
+            }
+
+            text_out += std::to_string(count) + ". **" + item_title + "**\n";
+            text_out += "   URL: " + item_link + "\n";
+            text_out += "   Snippet: " + item_content + "\n\n";
+
+            html_cards += "<div style=\"background:rgba(255,255,255,0.04); border:1px solid rgba(255,255,255,0.08); border-radius:8px; padding:14px 16px; margin-bottom:12px;\">";
+            html_cards += "<a href=\"" + item_link + "\" target=\"_blank\" style=\"font-size:16px; font-weight:600; color:#93c5fd; text-decoration:none; display:inline-block; margin-bottom:6px;\">" + item_title + " &rarr;</a>";
+            html_cards += "<p style=\"font-size:13px; color:#cbd5e1; margin:0; line-height:1.5;\">" + item_content + "</p>";
+            html_cards += "</div>";
+        }
+
+        html_cards += "</div>";
+
+        if (count > 0) {
+            doc.clean_text = text_out;
+            doc.raw_html = html_cards;
+        }
+    } catch (...) {}
+
+    return doc;
+}
+
 inline RetrievedDocument search_searxng(const std::string& clean_q, int num_results, const std::string& custom_instance_url);
 
 inline RetrievedDocument search_tavily(const std::string& clean_q, int num_results, const std::string& api_key) {
@@ -2890,14 +2971,28 @@ inline RetrievedDocument search_tavily(const std::string& clean_q, int num_resul
     doc.title = "Tavily Search: " + clean_q;
 
     if (api_key.empty()) {
-        // Zero-config fallback: try SearXNG metasearch before giving up
-        RetrievedDocument sx_doc = search_searxng(clean_q, num_results, g_searxng_url);
-        if (!sx_doc.clean_text.empty() && sx_doc.clean_text.find("No public instance response") == std::string::npos && sx_doc.clean_text.find("Error parsing") == std::string::npos) {
-            return sx_doc;
+        // Zero-config fallback: try DuckDuckGo Lite first (instant, live results, no API key needed)
+        RetrievedDocument ddg_doc = search_duckduckgo_lite(clean_q, num_results);
+        if (!ddg_doc.clean_text.empty()) {
+            return ddg_doc;
+        }
+
+        // If custom SearXNG instance is configured, try it
+        if (!g_searxng_url.empty() && g_searxng_url != "https://searx.be") {
+            RetrievedDocument sx_doc = search_searxng(clean_q, num_results, g_searxng_url);
+            if (!sx_doc.clean_text.empty() && sx_doc.clean_text.find("No public instance response") == std::string::npos && sx_doc.clean_text.find("Error parsing") == std::string::npos) {
+                return sx_doc;
+            }
+        }
+
+        // Wikipedia fallback
+        RetrievedDocument wiki_doc = search_wikipedia(clean_q, num_results);
+        if (!wiki_doc.clean_text.empty()) {
+            return wiki_doc;
         }
 
         doc.clean_text = "[Web Search: \"" + clean_q + "\"]\n"
-                         "(Note: Search engine API key is not configured and public metasearch is unreachable).\n\n"
+                         "(Note: Search engine API key is not configured and public search services are currently unreachable).\n\n"
                          "Instruction for assistant: Do not call search or fetch tools again. Immediately answer the user's question directly using your internal knowledge and facts.";
         doc.raw_html = "<div style=\"padding:20px; font-family:sans-serif; color:#e2e8f0; background:#1e293b; border-radius:8px;\">"
                        "<h3>Web Search: " + clean_q + "</h3>"
@@ -3101,31 +3196,25 @@ inline RetrievedDocument search_brave(const std::string& clean_q, int num_result
 
 inline RetrievedDocument search_searxng(const std::string& clean_q, int num_results, const std::string& custom_instance_url) {
     RetrievedDocument doc;
-    std::string base_url = !custom_instance_url.empty() ? custom_instance_url : (!g_searxng_url.empty() ? g_searxng_url : "https://searx.be");
+    std::string base_url = !custom_instance_url.empty() ? custom_instance_url : (!g_searxng_url.empty() ? g_searxng_url : "");
     while (!base_url.empty() && base_url.back() == '/') base_url.pop_back();
 
-    doc.url = base_url + "/search?q=" + url_encode(clean_q);
-    doc.title = "SearXNG Search: " + clean_q;
-
-    std::vector<std::string> candidate_instances = {
-        base_url,
-        "https://sx.xo.st",
-        "https://searx.be",
-        "https://searx.tiekoetter.com"
-    };
-
     std::string resp = "";
-    for (const auto& inst : candidate_instances) {
-        if (inst.empty()) continue;
-        std::string api_url = inst + "/search?q=" + url_encode(clean_q) + "&format=json&categories=general";
-        std::string candidate_resp = http_request_native("GET", api_url, "", {"Accept: application/json", "User-Agent: Mozilla/5.0 (Windows NT 10.0; Win64; x64)"}, 5000);
+    if (!base_url.empty() && base_url != "https://searx.be") {
+        std::string api_url = base_url + "/search?q=" + url_encode(clean_q) + "&format=json&categories=general";
+        std::string candidate_resp = http_request_native("GET", api_url, "", {"Accept: application/json", "User-Agent: Mozilla/5.0 (Windows NT 10.0; Win64; x64)"}, 3000);
         if (!candidate_resp.empty() && candidate_resp.find("\"results\"") != std::string::npos) {
             resp = std::move(candidate_resp);
-            break;
+            doc.url = base_url + "/search?q=" + url_encode(clean_q);
+            doc.title = "SearXNG Search: " + clean_q;
         }
     }
 
     if (resp.empty()) {
+        RetrievedDocument ddg_doc = search_duckduckgo_lite(clean_q, num_results);
+        if (!ddg_doc.clean_text.empty()) {
+            return ddg_doc;
+        }
         RetrievedDocument wiki_doc = search_wikipedia(clean_q, num_results);
         if (!wiki_doc.clean_text.empty()) {
             return wiki_doc;
@@ -3250,9 +3339,15 @@ inline RetrievedDocument search_google(const std::string& clean_q, int num_resul
     doc.title = "Google Search: " + clean_q;
 
     if (api_key.empty() || cx.empty()) {
-        RetrievedDocument sx_doc = search_searxng(clean_q, num_results, g_searxng_url);
-        if (!sx_doc.clean_text.empty() && sx_doc.clean_text.find("No public instance response") == std::string::npos && sx_doc.clean_text.find("Error parsing") == std::string::npos) {
-            return sx_doc;
+        RetrievedDocument ddg_doc = search_duckduckgo_lite(clean_q, num_results);
+        if (!ddg_doc.clean_text.empty()) {
+            return ddg_doc;
+        }
+        if (!g_searxng_url.empty() && g_searxng_url != "https://searx.be") {
+            RetrievedDocument sx_doc = search_searxng(clean_q, num_results, g_searxng_url);
+            if (!sx_doc.clean_text.empty() && sx_doc.clean_text.find("No public instance response") == std::string::npos && sx_doc.clean_text.find("Error parsing") == std::string::npos) {
+                return sx_doc;
+            }
         }
         doc.clean_text = "[Google Search: \"" + clean_q + "\"]\n"
                          "(Note: Google Search API key is not configured and public metasearch is unreachable).\n\n"
@@ -3356,7 +3451,9 @@ inline RetrievedDocument web_search_full(
     std::string provider = !custom_provider.empty() ? custom_provider : g_search_provider;
     if (provider.empty()) provider = "tavily";
 
-    if (provider == "tavily") {
+    if (provider == "duckduckgo" || provider == "ddg") {
+        return search_duckduckgo_lite(clean_q, num_results);
+    } else if (provider == "tavily") {
         std::string key = !custom_key.empty() ? custom_key : g_tavily_api_key;
         return search_tavily(clean_q, num_results, key);
     } else if (provider == "brave") {
