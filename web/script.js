@@ -2821,33 +2821,36 @@ function buildOptimizedMessagesPayload() {
     let sysPrompt = systemPromptInput ? systemPromptInput.value.trim() : '';
     const activeTools = getActiveToolsPayload();
 
+    const now = new Date();
+    const dateStr = now.toLocaleDateString('en-US', { weekday: 'long', year: 'numeric', month: 'long', day: '2-digit' });
+
     if (window.serverToolsDisabled) {
-        sysPrompt = "You are an assistant.";
-        if (systemPromptInput) systemPromptInput.value = sysPrompt;
+        sysPrompt = `You are an assistant.\nCurrent date: ${dateStr}`;
         messagesToSend.push({ role: "system", content: sysPrompt });
-    } else if (sysPrompt) {
+    } else {
+        let baseSys = sysPrompt || "You are a helpful assistant.";
         // Strip any stale # Tools or <tools> block if activeTools has changed or youtube_search was disabled
-        if (sysPrompt.includes('# Tools') || sysPrompt.includes('<tools>')) {
+        if (baseSys.includes('# Tools') || baseSys.includes('<tools>')) {
             const hasYt = activeTools.includes('youtube_search');
-            if (activeTools.length === 0 || (!hasYt && sysPrompt.includes('youtube_search'))) {
-                let toolsIdx = sysPrompt.indexOf('\n\n# Tools');
-                if (toolsIdx === -1) toolsIdx = sysPrompt.indexOf('# Tools');
-                if (toolsIdx === -1) toolsIdx = sysPrompt.indexOf('<tools>');
+            if (activeTools.length === 0 || (!hasYt && baseSys.includes('youtube_search'))) {
+                let toolsIdx = baseSys.indexOf('\n\n# Tools');
+                if (toolsIdx === -1) toolsIdx = baseSys.indexOf('# Tools');
+                if (toolsIdx === -1) toolsIdx = baseSys.indexOf('<tools>');
                 if (toolsIdx !== -1) {
-                    sysPrompt = sysPrompt.substring(0, toolsIdx).trim();
+                    baseSys = baseSys.substring(0, toolsIdx).trim();
                 }
             }
         }
-        if (window.lastUserPromptWas3D && sysPrompt) {
+        if (window.lastUserPromptWas3D && baseSys) {
             // Strip any short/stale 3D instructions from base system prompt
-            let basicIdx = sysPrompt.indexOf('\n\n# 3D Modeling Instructions');
-            if (basicIdx === -1) basicIdx = sysPrompt.indexOf('# 3D Modeling Instructions');
-            if (basicIdx === -1) basicIdx = sysPrompt.indexOf('\n\n## 3D Modeling Instructions');
-            if (basicIdx === -1) basicIdx = sysPrompt.indexOf('## 3D Modeling Instructions');
+            let basicIdx = baseSys.indexOf('\n\n# 3D Modeling Instructions');
+            if (basicIdx === -1) basicIdx = baseSys.indexOf('# 3D Modeling Instructions');
+            if (basicIdx === -1) basicIdx = baseSys.indexOf('\n\n## 3D Modeling Instructions');
+            if (basicIdx === -1) basicIdx = baseSys.indexOf('## 3D Modeling Instructions');
             if (basicIdx !== -1) {
-                sysPrompt = sysPrompt.substring(0, basicIdx).trim();
+                baseSys = baseSys.substring(0, basicIdx).trim();
             }
-            sysPrompt += "\n\n# High-Fidelity Analytic 3D Modeling Instructions\n" +
+            baseSys += "\n\n# High-Fidelity Analytic 3D Modeling Instructions\n" +
                 "When asked to create, model, or reconstruct in 3D (or reconstruct an object from an image), always output Three.js representation code defining `function createModel(scene, THREE, inputImage, helpers) { ... }` inside a ```javascript code block (never output a full HTML file), adding all meshes to `scene`.\n\n" +
                 "CRITICAL RULES FOR ANALYTIC MODELING, PART-SPECIFIC TEXTURING & UV MAPPING:\n" +
                 "1. SEMANTIC & GEOMETRIC PART DECOMPOSITION:\n" +
@@ -2866,15 +2869,11 @@ function buildOptimizedMessagesPayload() {
                 "   - Tubes, pipes, stems, and handles must have sealed end caps (use `helpers.createCappedTube`).\n" +
                 "   - Attachments (stems, leaves, handles, spouts) must penetrate 5-10% deep into parent meshes to prevent floating seams or gaps.";
         }
-        if (sysPrompt) {
-            const now = new Date();
-            const dateStr = now.toLocaleDateString('en-US', { weekday: 'long', year: 'numeric', month: 'long', day: '2-digit' });
-            let fullSys = sysPrompt;
-            if (!fullSys.includes('Current date:')) {
-                fullSys += `\nCurrent date: ${dateStr}`;
-            }
-            messagesToSend.push({ role: 'system', content: fullSys });
+        let fullSys = baseSys;
+        if (!fullSys.includes('Current date:')) {
+            fullSys += `\nCurrent date: ${dateStr}`;
         }
+        messagesToSend.push({ role: 'system', content: fullSys });
     }
 
     // 1. Slice history according to maxTurns limit (1 turn = 1 user + 1 assistant message)

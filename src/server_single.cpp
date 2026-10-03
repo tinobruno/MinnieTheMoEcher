@@ -9453,9 +9453,17 @@ static std::string g_current_system_prompt = "";
 static json g_current_active_tools = json::array();
 static const std::string g_server_instance_id = std::to_string(std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::system_clock::now().time_since_epoch()).count());
 
+static std::string get_current_date_string() {
+    auto now = std::chrono::system_clock::now();
+    std::time_t t = std::chrono::system_clock::to_time_t(now);
+    char date_buf[128];
+    std::strftime(date_buf, sizeof(date_buf), "%A, %B %d, %Y", std::localtime(&t));
+    return std::string(date_buf);
+}
+
 static std::string update_system_prompt_with_tools(const std::string& original_content, const std::string& tools_system_prompt, bool has_tools) {
     if (!g_enable_tools) {
-        return "You are an assistant.";
+        return "You are an assistant.\nCurrent date: " + get_current_date_string();
     }
     std::string content = original_content;
     size_t tools_pos = content.find("\n\n# Tools");
@@ -9471,11 +9479,7 @@ static std::string update_system_prompt_with_tools(const std::string& original_c
         content = g_base_system_prompt;
     }
     if (content.find("Current date:") == std::string::npos) {
-        auto now = std::chrono::system_clock::now();
-        std::time_t t = std::chrono::system_clock::to_time_t(now);
-        char date_buf[128];
-        std::strftime(date_buf, sizeof(date_buf), "%A, %B %d, %Y", std::localtime(&t));
-        content += "\nCurrent date: " + std::string(date_buf);
+        content += "\nCurrent date: " + get_current_date_string();
     }
     if (has_tools) {
         content += tools_system_prompt;
@@ -9611,11 +9615,7 @@ static MultimodalPrompt apply_chat_template_multimodal(
         if (!has_system) {
             std::string sys_prompt = (!g_enable_tools) ? "You are an assistant." : g_base_system_prompt;
             if (sys_prompt.find("Current date:") == std::string::npos) {
-                auto now = std::chrono::system_clock::now();
-                std::time_t t = std::chrono::system_clock::to_time_t(now);
-                char date_buf[128];
-                std::strftime(date_buf, sizeof(date_buf), "%A, %B %d, %Y", std::localtime(&t));
-                sys_prompt += "\nCurrent date: " + std::string(date_buf);
+                sys_prompt += "\nCurrent date: " + get_current_date_string();
             }
             if (has_tools) {
                 sys_prompt += tools_system_prompt;
@@ -9817,11 +9817,12 @@ static MultimodalPrompt apply_chat_template_multimodal(
 
     bool has_system = (!messages.empty() && messages[0].value("role", "") == "system");
     if (!has_system) {
-        std::string default_sys = "";
+        std::string default_sys = (!g_enable_tools) ? "You are an assistant." : g_base_system_prompt;
+        if (default_sys.find("Current date:") == std::string::npos) {
+            default_sys += "\nCurrent date: " + get_current_date_string();
+        }
         if (has_tools) {
-            default_sys = g_base_system_prompt + tools_system_prompt;
-        } else {
-            default_sys = g_base_system_prompt;
+            default_sys += tools_system_prompt;
         }
         if (!default_sys.empty()) {
             auto enc = tok.encode(default_sys);
@@ -10722,7 +10723,7 @@ static void rebuild_system_prefix(
 
     if (!g_enable_tools) {
         g_base_system_prompt = "You are an assistant.";
-        g_current_system_prompt = "You are an assistant.";
+        g_current_system_prompt = "You are an assistant.\nCurrent date: " + get_current_date_string();
         g_current_active_tools = json::array();
 
         // Invalidate conversation continuation snapshot
@@ -10776,11 +10777,7 @@ static void rebuild_system_prefix(
         bool is_qwen = (engine.cfg_.architecture == ModelArch::QWEN);
         std::string prompt_with_date = base_prompt;
         if (prompt_with_date.find("Current date:") == std::string::npos) {
-            auto now = std::chrono::system_clock::now();
-            std::time_t t = std::chrono::system_clock::to_time_t(now);
-            char date_buf[128];
-            std::strftime(date_buf, sizeof(date_buf), "%A, %B %d, %Y", std::localtime(&t));
-            prompt_with_date += "\nCurrent date: " + std::string(date_buf);
+            prompt_with_date += "\nCurrent date: " + get_current_date_string();
         }
         full_prompt_text = prompt_with_date + build_dynamic_tools_prompt(resolved_tools, is_qwen);
     }
