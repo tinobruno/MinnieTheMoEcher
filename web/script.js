@@ -2938,32 +2938,271 @@ function buildOptimizedMessagesPayload() {
     return messagesToSend;
 }
 
+function partitionContentAndThinking(raw) {
+    if (!raw) return { thinking: '', content: '', isThinkingOpen: false };
+    
+    // Check if currently inside an unclosed <think> tag
+    const lastOpen = raw.lastIndexOf('<think>');
+    const lastClose = raw.lastIndexOf('</think>');
+    const isThinkingOpen = (lastOpen !== -1 && lastOpen > lastClose);
+
+    // Extract all thinking chunks
+    let thinking = '';
+    const thinkRegex = /<think>([\s\S]*?)(?:<\/think>|$)/gi;
+    let match;
+    while ((match = thinkRegex.exec(raw)) !== null) {
+        if (match[1]) thinking += match[1];
+    }
+
+    // Extract clean content outside all <think> blocks
+    let cleanContent = raw.replace(/<think>[\s\S]*?(?:<\/think>|$)/gi, '');
+
+    return {
+        thinking: thinking,
+        content: cleanContent,
+        isThinkingOpen: isThinkingOpen
+    };
+}
+
+function extractToolCallsFromContent(text) {
+    if (!text || typeof text !== 'string') return [];
+    const calls = [];
+    const seenCalls = new Set();
+
+    function addCall(name, args) {
+        if (!name || typeof name !== 'string') return;
+        name = name.trim();
+        if (name === '<function>' || name === 'function') name = 'web_search';
+        let argsStr = '';
+        if (typeof args === 'string') {
+            argsStr = args;
+        } else if (typeof args === 'object' && args !== null) {
+            argsStr = JSON.stringify(args);
+        } else {
+            argsStr = '{}';
+        }
+        const key = name + '::' + argsStr;
+        if (seenCalls.has(key)) return;
+        seenCalls.add(key);
+        calls.push({
+            id: 'call_client_' + Date.now() + '_' + Math.random().toString(36).substring(2, 7),
+            type: 'function',
+            name: name,
+            arguments: argsStr
+        });
+    }
+
+    // 1. XML <tool_call> tags
+    const toolCallRegex = /<\s*tool_call>([\s\S]*?)(?:<\/\s*tool_call>|$)/gi;
+    let m;
+    while ((m = toolCallRegex.exec(text)) !== null) {
+        const inner = m[1].trim();
+        if (!inner) continue;
+        try {
+            const parsed = JSON.parse(inner);
+            const name = parsed.name || (parsed.function && (typeof parsed.function === 'string' ? parsed.function : parsed.function.name));
+            const args = parsed.arguments || parsed.parameters || (parsed.function && parsed.function.arguments) || parsed;
+            if (name) addCall(name, args);
+        } catch (e) {
+            const nameMatch = inner.match(/"name"\s*:\s*"([^"]+)"/);
+            if (nameMatch) {
+                const name = nameMatch[1];
+                let args = {};
+                const queryMatch = inner.match(/"query"\s*:\s*"([^"]+)"/);
+                if (queryMatch) args.query = queryMatch[1];
+                addCall(name, args);
+            }
+        }
+    }
+
+    // 2. DeepSeek DSML / special tokens
+    const dsmlRegex = /<[｜|]?tool call begin[｜|]>(?:(?:[a-zA-Z0-9_-]+):[0-9]+\n)?([\s\S]*?)<[｜|]?tool call end[｜|]>/gi;
+    while ((m = dsmlRegex.exec(text)) !== null) {
+        const inner = m[1].trim();
+        const sepMatch = inner.split(/<[｜|]?tool sep[｜|]>/);
+        if (sepMatch.length >= 2) {
+            const fn = sepMatch[1].trim();
+            const args = sepMatch[2] ? sepMatch[2].trim() : '{}';
+            addCall(fn, args);
+        } else {
+            try {
+                const parsed = JSON.parse(inner);
+                if (parsed.name) addCall(parsed.name, parsed.arguments || parsed);
+            } catch (e) {}
+        }
+    }
+
+    // 3. Balanced JSON scan for { ... } (including inside ```json ... ``` codeblocks)
+    let i = 0;
+    const len = text.length;
+    while (i < len) {
+        if (text[i] === '{') {
+            const start = i;
+            let depth = 0;
+            let inString = false;
+            let escape = false;
+            let end = -1;
+
+            for (let j = start; j < len; j++) {
+                const c = text[j];
+                if (escape) {
+                    escape = false;
+                    continue;
+                }
+                if (c === '\\' && inString) {
+                    escape = true;
+                    continue;
+                }
+                if (c === '"') {
+                    inString = !inString;
+                    continue;
+                }
+                if (!inString) {
+                    if (c === '{') depth++;
+                    else if (c === '}') {
+                        depth--;
+                        if (depth === 0) {
+                            end = j;
+                            break;
+                        }
+                    }
+                }
+            }
+
+            if (end !== -1) {
+                const candidate = text.slice(start, end + 1);
+                try {
+                    const parsed = JSON.parse(candidate);
+                    if (parsed && typeof parsed === 'object') {
+                        let name = parsed.name || (typeof parsed.function === 'string' ? parsed.function : parsed.function?.name);
+                        let args = parsed.arguments || parsed.parameters || parsed.function?.arguments;
+                        if (!args && (parsed.query || parsed.url || parsed.path || parsed.command)) {
+                            const { name: _n, function: _f, type: _t, ...rest } = parsed;
+                            args = rest;
+                        }
+                        if (name && typeof name === 'string') {
+                            addCall(name, args || {});
+                        }
+                    }
+                } catch (e) {}
+                i = end + 1;
+                continue;
+            }
+        }
+        i++;
+    }
+
+    return calls;
+}
+
 function stripToolCallsFromText(text) {
     if (!text) return '';
     let out = text;
-    // Standard tool calls
-    out = out.replace(/<\s*tool_call>[\s\S]*?<\/\s*tool_call>/gi, '');
-    out = out.replace(/<\/?\s*tool_calls?>/gi, '');
 
-    // DeepSeek special tokens & DSML
-    out = out.replace(/<\s*[｜|]?tool call begin[｜|]>[\s\S]*?<\s*[｜|]?tool call end[｜|]>/gi, '');
-    out = out.replace(/<\s*[｜|]?DSML[｜|]?[^>]*>[\s\S]*?<\/\s*[｜|]?DSML[｜|]?[^>]*>/gi, '');
+    // 1. Remove complete & trailing unclosed <tool_call> tags
+    out = out.replace(/<\s*tool_call>[\s\S]*?(?:<\/\s*tool_call>|$)/gi, '');
+    out = out.replace(/<\/?\s*tool_calls?>/gi, '');
+    out = out.replace(/<\s*function_call>[\s\S]*?(?:<\/\s*function_call>|$)/gi, '');
+
+    // 2. Remove DeepSeek tokens
+    out = out.replace(/<\s*[｜|]?tool call begin[｜|]>[\s\S]*?(?:<\s*[｜|]?tool call end[｜|]>|$)/gi, '');
+    out = out.replace(/<\s*[｜|]?DSML[｜|]?[^>]*>[\s\S]*?(?:<\/\s*[｜|]?DSML[｜|]?[^>]*>|$)/gi, '');
     out = out.replace(/<\/?\s*[｜|]?DSML[｜|]?[^>]*>/gi, '');
     out = out.replace(/<\s*[｜|]?tool (?:call begin|call end|sep|outputs begin|outputs end)[｜|]?>/gi, '');
 
-    // Raw function call JSON
-    out = out.replace(/\{"name":\s*"[^"]+"[\s\S]*?\}/g, '');
-    out = out.replace(/\{"function":\s*"[^"]+"[\s\S]*?\}/g, '');
+    // 3. Remove markdown blocks wrapping tool call JSON: ```(?:json)?\s*\{[\s\S]*?\}\s*```
+    out = out.replace(/```(?:json)?\s*\{[\s\S]*?(?:"name"|"function")[\s\S]*?\}\s*```/gi, '');
+    out = out.replace(/```(?:json)?\s*\{[\s\S]*?(?:"name"|"function")[\s\S]*$/gi, '');
+
+    // 4. Remove balanced JSON objects that represent tool calls
+    let result = '';
+    let i = 0;
+    const len = out.length;
+    while (i < len) {
+        if (out[i] === '{') {
+            const start = i;
+            let depth = 0;
+            let inString = false;
+            let escape = false;
+            let end = -1;
+
+            for (let j = start; j < len; j++) {
+                const c = out[j];
+                if (escape) {
+                    escape = false;
+                    continue;
+                }
+                if (c === '\\' && inString) {
+                    escape = true;
+                    continue;
+                }
+                if (c === '"') {
+                    inString = !inString;
+                    continue;
+                }
+                if (!inString) {
+                    if (c === '{') depth++;
+                    else if (c === '}') {
+                        depth--;
+                        if (depth === 0) {
+                            end = j;
+                            break;
+                        }
+                    }
+                }
+            }
+
+            if (end !== -1) {
+                const candidate = out.slice(start, end + 1);
+                let isTool = false;
+                try {
+                    const parsed = JSON.parse(candidate);
+                    if (parsed && typeof parsed === 'object') {
+                        if (parsed.name || (parsed.function && (typeof parsed.function === 'string' || parsed.function.name))) {
+                            isTool = true;
+                        }
+                    }
+                } catch (e) {
+                    if (/"name"\s*:\s*"[^"]+"/.test(candidate) || /"function"\s*:\s*"[^"]+"/.test(candidate)) {
+                        isTool = true;
+                    }
+                }
+
+                if (isTool) {
+                    i = end + 1;
+                    continue;
+                }
+            } else {
+                const trailing = out.slice(start);
+                if (/"name"\s*:\s*"[^"]+"/.test(trailing) || /"function"\s*:\s*"[^"]+"/.test(trailing)) {
+                    break;
+                }
+            }
+        }
+        result += out[i];
+        i++;
+    }
+
+    out = result;
+    out = out.replace(/```(?:json)?\s*```/g, '');
     return out.trim();
 }
 
 function isRawToolCallString(text) {
     if (!text) return false;
     const trimmed = text.trim();
-    if (trimmed.startsWith('<tool_call>') || trimmed.startsWith('<｜tool call begin｜>') || trimmed.startsWith('<|tool call begin|>')) return true;
-    if (trimmed.startsWith('<｜DSML') || trimmed.startsWith('<|DSML') || trimmed.startsWith('<DSML') || trimmed.startsWith('< DSML') || trimmed.startsWith('< tool')) return true;
-    if (trimmed.startsWith('{"name"') || trimmed.startsWith('{"function"') || trimmed.startsWith('{"name":') || trimmed.startsWith('{"function":')) return true;
-    return false;
+    if (trimmed.startsWith('<tool_call') || trimmed.startsWith('<function_call') ||
+        trimmed.startsWith('<｜tool call begin') || trimmed.startsWith('<|tool call begin') ||
+        trimmed.startsWith('<｜DSML') || trimmed.startsWith('<|DSML') || trimmed.startsWith('<DSML')) {
+        return true;
+    }
+    if (trimmed.startsWith('```json') || trimmed.startsWith('```')) {
+        if (trimmed.includes('"name"') || trimmed.includes('"function"')) return true;
+    }
+    if (trimmed.startsWith('{')) {
+        if (trimmed.includes('"name"') || trimmed.includes('"function"')) return true;
+    }
+    return stripToolCallsFromText(text).length === 0;
 }
 
 
@@ -3728,6 +3967,9 @@ async function sendMessage(options = {}) {
 
         while (round < maxRounds) {
             round++;
+            if (typeof streamingTtsState !== 'undefined') {
+                streamingTtsState.processedCursor = 0;
+            }
             const roundStartTime = performance.now();
             let roundFirstTokenTime = null;
             const messagesToSend = buildOptimizedMessagesPayload();
@@ -3768,6 +4010,7 @@ async function sendMessage(options = {}) {
 
             let roundReasoning = "";
             let roundContent = "";
+            let rawRoundContent = "";
             let roundToolCalls = [];
             let roundFinishReason = "stop";
 
@@ -3980,25 +4223,60 @@ async function sendMessage(options = {}) {
                                     }
 
                                     if (!replaced) {
-                                        if (reasoningBlock && !isReasoningDone) {
+                                        rawRoundContent += delta.content;
+
+                                        // Partition incoming stream to detect reasoning blocks vs true response content
+                                        const partition = partitionContentAndThinking(rawRoundContent);
+
+                                        if (partition.thinking) {
+                                            if (!reasoningBlock) {
+                                                reasoningBlock = document.createElement('details');
+                                                reasoningBlock.className = 'reasoning-block';
+                                                reasoningBlock.open = true;
+                                                const summary = document.createElement('summary');
+                                                summary.innerHTML = '<span class="thinking-spinner">progress_activity</span> Thinking...';
+                                                reasoningContent = document.createElement('div');
+                                                reasoningContent.className = 'reasoning-content';
+                                                reasoningBlock.appendChild(summary);
+                                                reasoningBlock.appendChild(reasoningContent);
+                                                assistantMsgDiv.querySelector('.msg-content').insertBefore(reasoningBlock, mainContent);
+                                            }
+                                            if (partition.isThinkingOpen) {
+                                                reasoningBlock.open = true;
+                                                isReasoningDone = false;
+                                                const summary = reasoningBlock.querySelector('summary');
+                                                if (summary && !summary.querySelector('.thinking-spinner')) {
+                                                    summary.innerHTML = '<span class="thinking-spinner">progress_activity</span> Thinking...';
+                                                }
+                                            } else if (!isReasoningDone) {
+                                                isReasoningDone = true;
+                                                reasoningBlock.open = false;
+                                                const summary = reasoningBlock.querySelector('summary');
+                                                if (summary) summary.innerHTML = 'Thought process';
+                                            }
+                                            roundReasoning = partition.thinking;
+                                            reasoningContent.innerHTML = marked.parse(stripToolCallsFromText(roundReasoning));
+                                        } else if (reasoningBlock && !isReasoningDone) {
                                             isReasoningDone = true;
                                             reasoningBlock.open = false;
                                             const summary = reasoningBlock.querySelector('summary');
                                             if (summary) summary.innerHTML = 'Thought process';
                                         }
-                                        roundContent += delta.content;
+
+                                        roundContent = partition.content;
                                         lastRoundContent = roundContent;
 
                                         // Filter out raw tool call JSON so it never pollutes the chat UI
                                         const displayContent = stripToolCallsFromText(roundContent);
                                         if (displayContent.length > 0) {
                                             renderMarkdownContent(displayContent, mainContent);
-                                        } else if (isRawToolCallString(roundContent)) {
+                                        } else if (isRawToolCallString(roundContent) || isRawToolCallString(rawRoundContent)) {
                                             mainContent.innerHTML = '';
                                         }
 
                                         // Real-time streaming text-to-speech (speaks sentences as tokens arrive)
-                                        if (typeof voiceSettings !== 'undefined' && voiceSettings.autoRead && voiceSettings.streamingTts) {
+                                        // ONLY speak when not inside an active thinking block
+                                        if (typeof voiceSettings !== 'undefined' && voiceSettings.autoRead && voiceSettings.streamingTts && !partition.isThinkingOpen) {
                                             processStreamingTtsChunk(displayContent, assistantMsgDiv);
                                         }
                                     }
@@ -4025,6 +4303,29 @@ async function sendMessage(options = {}) {
 
             let validToolCalls = roundToolCalls.filter(tc => tc && tc.name);
 
+            // Extract tool calls from roundContent, rawRoundContent, or roundReasoning if not already received from SSE delta
+            if (validToolCalls.length === 0) {
+                const fromContent = extractToolCallsFromContent(roundContent);
+                if (fromContent.length > 0) {
+                    validToolCalls = fromContent;
+                    roundContent = stripToolCallsFromText(roundContent);
+                    console.log("[Client Tool Extractor] Extracted tool calls from content:", validToolCalls);
+                } else if (typeof rawRoundContent !== 'undefined' && rawRoundContent) {
+                    const fromRaw = extractToolCallsFromContent(rawRoundContent);
+                    if (fromRaw.length > 0) {
+                        validToolCalls = fromRaw;
+                        roundContent = stripToolCallsFromText(rawRoundContent);
+                        console.log("[Client Tool Extractor] Extracted tool calls from raw content:", validToolCalls);
+                    }
+                } else if (roundReasoning) {
+                    const fromReasoning = extractToolCallsFromContent(roundReasoning);
+                    if (fromReasoning.length > 0) {
+                        validToolCalls = fromReasoning;
+                        console.log("[Client Tool Extractor] Extracted tool calls from reasoning:", validToolCalls);
+                    }
+                }
+            }
+
             // If the model did not emit a formal <tool_call> tag but announced an intent to search:
             if (validToolCalls.length === 0 && (roundFinishReason === 'stop' || roundFinishReason === 'tool_calls') && activeTools.includes('web_search')) {
                 const searchIntentMatch = roundContent.match(/(?:i['’]ll|i will|let me|allow me to|i can|i am going to|i['’]m going to|i need to|need to|should|must|have to|going to)\s+search\s+(?:the\s+web\s+)?(?:for|to\s+find)?\s*["'’]?([^.\n!?:;]+)/i);
@@ -4045,11 +4346,14 @@ async function sendMessage(options = {}) {
                             arguments: JSON.stringify({ query: extractedQuery })
                         });
                     }
-                } else if (isRealTimeRefusal && round === 1) {
+                } else if (round === 1) {
                     const lastUserMsg = chatHistory.filter(m => m.role === "user").slice(-1)[0]?.content || "";
                     let cleanUserQuery = lastUserMsg.replace(/^(?:hello|hi|hey|please|can you|could you|tell me|do you know)\s+/i, "").trim();
-                    if (cleanUserQuery.length >= 3) {
-                        console.log("[Agentic Auto-Tool] Model gave real-time refusal but web_search is enabled; triggering search for:", cleanUserQuery);
+                    const asksForDateOrEvent = /(?:which|what)\s+(?:date|race|circuit|event)\b|(?:specify|clarify|tell me)\s+(?:the\s+)?date/i.test(roundContent);
+                    const userAskedTemporal = /(?:this morning|today|tonight|yesterday|this weekend|pole position|who won|latest|current)/i.test(lastUserMsg);
+
+                    if ((isRealTimeRefusal || (asksForDateOrEvent && userAskedTemporal)) && cleanUserQuery.length >= 3) {
+                        console.log("[Agentic Auto-Tool] Model gave refusal or asked for date/race specification; triggering web_search for:", cleanUserQuery);
                         validToolCalls.push({
                             id: "call_fallback_" + Date.now(),
                             type: "function",
@@ -4061,6 +4365,7 @@ async function sendMessage(options = {}) {
             }
 
             if (validToolCalls.length > 0 && (roundFinishReason === 'tool_calls' || roundFinishReason === 'stop')) {
+                stopTtsAudio(); // Cancel any speech immediately since this round is executing tools!
                 const toolExecStartTime = performance.now();
                 turnToolCallsCount += validToolCalls.length;
                 const cleanRoundContent = stripToolCallsFromText(roundContent);
@@ -8769,11 +9074,18 @@ function cleanTextForSpeech(raw) {
     if (!raw) return '';
     let text = raw;
 
-    // Remove tool activity markup if present
+    // Never speak thinking blocks or unclosed think tags
+    text = text.replace(/<think>[\s\S]*?(?:<\/think>|$)/gi, '');
+
+    // Never speak tool activity markup
     text = text.replace(/<div class="tool-activity-block[\s\S]*?<\/div>/gi, '');
     
+    // Never speak raw tool calls, DSML, or JSON tool signatures
+    text = stripToolCallsFromText(text);
+
     // Replace full code blocks with a brief spoken placeholder
     text = text.replace(/```[\s\S]*?```/g, ' [code snippet omitted] ');
+    text = text.replace(/```[\s\S]*$/g, '');
     
     // Remove inline code ticks
     text = text.replace(/`([^`]+)`/g, '$1');
@@ -8900,6 +9212,11 @@ function findSentenceCut(text) {
 function processStreamingTtsChunk(currentFullText, assistantMsgDiv) {
     if (!voiceSettings.autoRead || !voiceSettings.streamingTts) return;
     if (typeof window === 'undefined' || !('speechSynthesis' in window)) return;
+
+    // Never process or speak while inside an open think block
+    if (currentFullText.lastIndexOf('<think>') > currentFullText.lastIndexOf('</think>')) {
+        return;
+    }
 
     // Check if currently inside an open code block (odd number of ```)
     const tripleTicks = (currentFullText.match(/```/g) || []).length;

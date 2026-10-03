@@ -4829,8 +4829,10 @@ public:
         // Think token IDs
         int think_start_id = tokenizer_.get_token_id("<think>");
         int think_end_id = tokenizer_.get_token_id("</think>");
-        if (think_start_id < 0) think_start_id = 128821;
-        if (think_end_id < 0) think_end_id = 128822;
+        if (!cfg_.is_qwen()) {
+            if (think_start_id < 0) think_start_id = 128821;
+            if (think_end_id < 0) think_end_id = 128822;
+        }
 
         int tool_call_start_id = tokenizer_.get_token_id("<tool_call>");
 
@@ -5030,16 +5032,38 @@ public:
 
             std::string token_text = tokenizer_.decode({next_token});
 
-            if (in_think_block && (token_text.find("</think>") != std::string::npos ||
-                                   token_text.find("</output>") != std::string::npos ||
-                                   token_text.find("</response>") != std::string::npos ||
-                                   token_text.find("</answer>") != std::string::npos ||
-                                   (token_buffer + token_text).find("</think>") != std::string::npos ||
-                                   (token_buffer + token_text).find("</output>") != std::string::npos ||
-                                   (token_buffer + token_text).find("</response>") != std::string::npos ||
-                                   (token_buffer + token_text).find("</answer>") != std::string::npos)) {
+            if (!in_think_block && (token_text.find("<think>") != std::string::npos ||
+                                    (token_buffer + token_text).find("<think>") != std::string::npos)) {
+                in_think_block = true;
+                think_block_ended = false;
+                std::string combined = token_buffer + token_text;
+                size_t pos = combined.find("<think>");
+                if (pos != std::string::npos) {
+                    token_buffer = combined.substr(0, pos);
+                    token_text = combined.substr(pos + 7);
+                }
+            } else if (in_think_block && (token_text.find("</think>") != std::string::npos ||
+                                          token_text.find("</output>") != std::string::npos ||
+                                          token_text.find("</response>") != std::string::npos ||
+                                          token_text.find("</answer>") != std::string::npos ||
+                                          (token_buffer + token_text).find("</think>") != std::string::npos ||
+                                          (token_buffer + token_text).find("</output>") != std::string::npos ||
+                                          (token_buffer + token_text).find("</response>") != std::string::npos ||
+                                          (token_buffer + token_text).find("</answer>") != std::string::npos)) {
                 in_think_block = false;
                 think_block_ended = true;
+                std::string combined = token_buffer + token_text;
+                for (const char* tag : {"</think>", "</output>", "</response>", "</answer>"}) {
+                    size_t pos = combined.find(tag);
+                    if (pos != std::string::npos) {
+                        combined.erase(pos, strlen(tag));
+                    }
+                }
+                token_buffer = combined;
+                token_text.clear();
+                if (on_token) {
+                    on_token("", false); // Signal end of reasoning block
+                }
             }
             if (in_think_block) {
                 last_think_token_str = token_text;
@@ -9419,18 +9443,17 @@ static std::string build_dynamic_tools_prompt(const json& resolved_tools, bool i
     }
     prompt += "</tools>\n\n";
 
-    if (is_qwen) {
-        prompt +=
-            "For each function call, return a json object with function name and arguments within <tool_call></tool_call> XML tags:\n"
-            "<tool_call>\n"
-            "{\"name\": \"<function-name>\", \"arguments\": <args-json-object>}\n"
-            "</tool_call>\n\n";
-    }
+    prompt +=
+        "For each function call, return a json object with function name and arguments within <tool_call></tool_call> XML tags:\n"
+        "<tool_call>\n"
+        "{\"name\": \"<function-name>\", \"arguments\": <args-json-object>}\n"
+        "</tool_call>\n\n";
 
     if (has_yt || has_web) {
         prompt += "## Tool Usage Instructions:\n";
         if (has_web) {
             prompt += "- When current information, real-time events, sports results, news, or web search is needed, invoke `web_search` directly with an informative query.\n";
+            prompt += "- Always invoke `web_search` for queries referencing \"today\", \"this morning\", \"tonight\", or recent events rather than asking the user to specify dates.\n";
         }
         if (has_yt) {
             prompt += "- When the user asks to play music, a song, or a video, invoke `youtube_search` directly. The video will automatically load and play in the user's preview panel with autoplay.\n";
@@ -10739,11 +10762,11 @@ static void rebuild_system_prefix(
             {{"role", "user"}, {"content", ""}}
         });
         std::vector<int> prompt = apply_chat_template(default_messages, engine.tokenizer_, true, "high", json::array());
-        int user_start = (engine.cfg_.architecture == ModelArch::QWEN)
+        int user_start = (engine.cfg_.is_qwen())
                              ? engine.tokenizer_.get_token_id("<|im_start|>")
                              : engine.tokenizer_.get_token_id("<｜User｜>");
         if (user_start < 0) {
-            user_start = (engine.cfg_.architecture == ModelArch::QWEN) ? 151644 : 128803;
+            user_start = (engine.cfg_.is_qwen()) ? 151644 : 128803;
         }
         size_t sys_len = prompt.size();
         for (size_t i = 1; i < prompt.size(); i++) {
@@ -10778,7 +10801,7 @@ static void rebuild_system_prefix(
     if (!custom_full_prompt.empty()) {
         full_prompt_text = custom_full_prompt;
     } else {
-        bool is_qwen = (engine.cfg_.architecture == ModelArch::QWEN);
+        bool is_qwen = engine.cfg_.is_qwen();
         std::string prompt_with_date = base_prompt;
         if (prompt_with_date.find("Current date:") == std::string::npos) {
             prompt_with_date += "\nCurrent date: " + get_current_date_string();
@@ -10797,11 +10820,11 @@ static void rebuild_system_prefix(
 
     std::vector<int> prompt = apply_chat_template(default_messages, engine.tokenizer_, true, "high", resolved_tools);
 
-    int user_start = (engine.cfg_.architecture == ModelArch::QWEN)
+    int user_start = (engine.cfg_.is_qwen())
                          ? engine.tokenizer_.get_token_id("<|im_start|>")
                          : engine.tokenizer_.get_token_id("<｜User｜>");
     if (user_start < 0) {
-        user_start = (engine.cfg_.architecture == ModelArch::QWEN) ? 151644 : 128803;
+        user_start = (engine.cfg_.is_qwen()) ? 151644 : 128803;
     }
     size_t sys_len = prompt.size();
     for (size_t i = 1; i < prompt.size(); i++) {
@@ -10834,7 +10857,7 @@ static std::vector<int> build_continuation_prompt(
     const auto& tok = engine.tokenizer_;
     std::vector<int> result = engine.turn_kv_snapshot_.tokens;
 
-    if (engine.cfg_.architecture == ModelArch::QWEN) {
+    if (engine.cfg_.is_qwen()) {
         int IM_START = tok.get_token_id("<|im_start|>");
         int IM_END = tok.get_token_id("<|im_end|>");
         auto nl = tok.encode("\n");
@@ -10845,7 +10868,7 @@ static std::vector<int> build_continuation_prompt(
             std::string content = get_message_content_string(msg);
             result.push_back(IM_START);
             if (role == "tool" || role == "function") {
-                auto u_enc = tok.encode("user\n<tool_response>\n" + content + "\n</tool_response>\nPlease answer the user's question directly, accurately, and comprehensively based on the information above. If the event name or location is unusual or newly scheduled (for example, a title-sponsored event like 'Bahrain Grand Prix in Malaysia' held at Sepang), clearly mention and explain the venue and title context so the user understands.");
+                auto u_enc = tok.encode("user\n<tool_response>\n" + content + "\n</tool_response>\nPlease answer the user's question directly, accurately, and concisely based on the information above.");
                 result.insert(result.end(), u_enc.begin(), u_enc.end());
             } else {
                 auto u_enc = tok.encode("user\n" + content);
@@ -12468,7 +12491,7 @@ static void run_server(MoecherEngine& engine, int port, int default_thinking_bud
     svr.Get("/v1/models", [&engine, get_system_resource_telemetry](const httplib::Request&, httplib::Response& res) {
         std::string model_id = engine.get_model_id();
         std::string display_name = engine.get_model_display_name();
-        std::string arch_desc = (engine.cfg_.architecture == ModelArch::QWEN)
+        std::string arch_desc = (engine.cfg_.is_qwen())
             ? "DeltaNet Linear Attention + MTP Speculative Decoding"
             : (model_id.find("coder") != std::string::npos
                 ? "MoE Coder (64 Experts)"
@@ -12498,7 +12521,7 @@ static void run_server(MoecherEngine& engine, int port, int default_thinking_bud
     svr.Get("/api/model", [&engine, get_system_resource_telemetry](const httplib::Request&, httplib::Response& res) {
         std::string model_id = engine.get_model_id();
         std::string display_name = engine.get_model_display_name();
-        std::string arch_desc = (engine.cfg_.architecture == ModelArch::QWEN)
+        std::string arch_desc = (engine.cfg_.is_qwen())
             ? "DeltaNet Linear Attention + MTP Speculative Decoding"
             : (model_id.find("coder") != std::string::npos
                 ? "MoE Coder (64 Experts)"
@@ -13241,13 +13264,12 @@ static void run_server(MoecherEngine& engine, int port, int default_thinking_bud
                                 round_reasoning = clean_reasoning;
                             }
 
-                            if (round_tool_calls.empty() && round == 0 && g_enable_tools && !tools.empty()) {
+                            if (round_tool_calls.empty() && round == 0 && g_enable_tools && !tools.empty() && do_server_exec) {
                                 std::string lower = round_content;
                                 for (char& c : lower) c = (char)std::tolower((unsigned char)c);
                                 bool has_search_intent = (lower.find("need to search") != std::string::npos ||
                                                          lower.find("search the web") != std::string::npos ||
                                                          lower.find("search for the latest") != std::string::npos ||
-                                                         lower.find("look up") != std::string::npos ||
                                                          lower.find("don't have access to real-time") != std::string::npos ||
                                                          lower.find("do not have access to real-time") != std::string::npos ||
                                                          lower.find("cannot browse the web") != std::string::npos);
@@ -14112,13 +14134,12 @@ static void run_server(MoecherEngine& engine, int port, int default_thinking_bud
                     std::vector<moecher::tooling::ToolCall> round_tool_calls;
                     moecher::tooling::extract_tool_calls(response_text, clean_content, round_tool_calls);
 
-                    if (round_tool_calls.empty() && round == 0 && g_enable_tools && !tools.empty()) {
+                    if (round_tool_calls.empty() && round == 0 && g_enable_tools && !tools.empty() && do_server_exec) {
                         std::string lower = response_text;
                         for (char& c : lower) c = (char)std::tolower((unsigned char)c);
                         bool has_search_intent = (lower.find("need to search") != std::string::npos ||
                                                  lower.find("search the web") != std::string::npos ||
                                                  lower.find("search for the latest") != std::string::npos ||
-                                                 lower.find("look up") != std::string::npos ||
                                                  lower.find("don't have access to real-time") != std::string::npos ||
                                                  lower.find("do not have access to real-time") != std::string::npos ||
                                                  lower.find("cannot browse the web") != std::string::npos);
