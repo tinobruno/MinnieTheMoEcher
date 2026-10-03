@@ -2971,32 +2971,10 @@ inline RetrievedDocument search_tavily(const std::string& clean_q, int num_resul
     doc.title = "Tavily Search: " + clean_q;
 
     if (api_key.empty()) {
-        // Zero-config fallback: try DuckDuckGo Lite first (instant, live results, no API key needed)
-        RetrievedDocument ddg_doc = search_duckduckgo_lite(clean_q, num_results);
-        if (!ddg_doc.clean_text.empty()) {
-            return ddg_doc;
-        }
-
-        // If custom SearXNG instance is configured, try it
-        if (!g_searxng_url.empty() && g_searxng_url != "https://searx.be") {
-            RetrievedDocument sx_doc = search_searxng(clean_q, num_results, g_searxng_url);
-            if (!sx_doc.clean_text.empty() && sx_doc.clean_text.find("No public instance response") == std::string::npos && sx_doc.clean_text.find("Error parsing") == std::string::npos) {
-                return sx_doc;
-            }
-        }
-
-        // Wikipedia fallback
-        RetrievedDocument wiki_doc = search_wikipedia(clean_q, num_results);
-        if (!wiki_doc.clean_text.empty()) {
-            return wiki_doc;
-        }
-
-        doc.clean_text = "[Web Search: \"" + clean_q + "\"]\n"
-                         "(Note: Search engine API key is not configured and public search services are currently unreachable).\n\n"
-                         "Instruction for assistant: Do not call search or fetch tools again. Immediately answer the user's question directly using your internal knowledge and facts.";
+        doc.clean_text = "Search provider error: Tavily API key is not configured. Please configure your Tavily API key in settings or select another search provider.";
         doc.raw_html = "<div style=\"padding:20px; font-family:sans-serif; color:#e2e8f0; background:#1e293b; border-radius:8px;\">"
                        "<h3>Web Search: " + clean_q + "</h3>"
-                       "<p>Search provider unconfigured. Answered using internal knowledge.</p>"
+                       "<p>Tavily API key is not configured.</p>"
                        "</div>";
         return doc;
     }
@@ -3136,13 +3114,7 @@ inline RetrievedDocument search_brave(const std::string& clean_q, int num_result
     doc.title = "Brave Search: " + clean_q;
 
     if (api_key.empty()) {
-        RetrievedDocument sx_doc = search_searxng(clean_q, num_results, g_searxng_url);
-        if (!sx_doc.clean_text.empty() && sx_doc.clean_text.find("No public instance response") == std::string::npos && sx_doc.clean_text.find("Error parsing") == std::string::npos) {
-            return sx_doc;
-        }
-        doc.clean_text = "[Brave Search: \"" + clean_q + "\"]\n"
-                         "(Note: Search engine API key is not configured and metasearch is unreachable).\n\n"
-                         "Instruction for assistant: Do not call search or fetch tools again. Immediately answer the user's question directly using your internal knowledge and facts.";
+        doc.clean_text = "Search provider error: Brave API key is not configured. Please configure your Brave API key in settings or select another search provider.";
         return doc;
     }
 
@@ -3211,15 +3183,7 @@ inline RetrievedDocument search_searxng(const std::string& clean_q, int num_resu
     }
 
     if (resp.empty()) {
-        RetrievedDocument ddg_doc = search_duckduckgo_lite(clean_q, num_results);
-        if (!ddg_doc.clean_text.empty()) {
-            return ddg_doc;
-        }
-        RetrievedDocument wiki_doc = search_wikipedia(clean_q, num_results);
-        if (!wiki_doc.clean_text.empty()) {
-            return wiki_doc;
-        }
-        doc.clean_text = "[SearXNG Search: No public instance response received. Please configure a custom instance (e.g. local Docker http://localhost:8080) or switch to Tavily AI (1,000 free queries/mo) in Settings.]";
+        doc.clean_text = "Search provider error: Unable to connect to SearXNG instance (" + (base_url.empty() ? "unconfigured" : base_url) + "). Please configure a valid instance URL or select another search provider in settings.";
         return doc;
     }
 
@@ -3269,13 +3233,7 @@ inline RetrievedDocument search_serper(const std::string& clean_q, int num_resul
     doc.title = "Serper (Google Search): " + clean_q;
 
     if (api_key.empty()) {
-        RetrievedDocument sx_doc = search_searxng(clean_q, num_results, g_searxng_url);
-        if (!sx_doc.clean_text.empty() && sx_doc.clean_text.find("No public instance response") == std::string::npos && sx_doc.clean_text.find("Error parsing") == std::string::npos) {
-            return sx_doc;
-        }
-        doc.clean_text = "[Serper Search: \"" + clean_q + "\"]\n"
-                         "(Note: Search engine API key is not configured and metasearch is unreachable).\n\n"
-                         "Instruction for assistant: Do not call search or fetch tools again. Immediately answer the user's question directly using your internal knowledge and facts.";
+        doc.clean_text = "Search provider error: Serper API key is not configured. Please configure your Serper API key in settings or select another search provider.";
         return doc;
     }
 
@@ -3339,22 +3297,10 @@ inline RetrievedDocument search_google(const std::string& clean_q, int num_resul
     doc.title = "Google Search: " + clean_q;
 
     if (api_key.empty() || cx.empty()) {
-        RetrievedDocument ddg_doc = search_duckduckgo_lite(clean_q, num_results);
-        if (!ddg_doc.clean_text.empty()) {
-            return ddg_doc;
-        }
-        if (!g_searxng_url.empty() && g_searxng_url != "https://searx.be") {
-            RetrievedDocument sx_doc = search_searxng(clean_q, num_results, g_searxng_url);
-            if (!sx_doc.clean_text.empty() && sx_doc.clean_text.find("No public instance response") == std::string::npos && sx_doc.clean_text.find("Error parsing") == std::string::npos) {
-                return sx_doc;
-            }
-        }
-        doc.clean_text = "[Google Search: \"" + clean_q + "\"]\n"
-                         "(Note: Google Search API key is not configured and public metasearch is unreachable).\n\n"
-                         "Instruction for assistant: Do not call search or fetch tools again. Immediately answer the user's question directly using your internal knowledge and facts.";
+        doc.clean_text = "Search provider error: Google Search API key or Search Engine ID (CX) is not configured. Please configure them in settings or select another search provider.";
         doc.raw_html = "<div style=\"padding:20px; font-family:sans-serif; color:#e2e8f0; background:#1e293b; border-radius:8px;\">"
                        "<h3>Google Search: " + clean_q + "</h3>"
-                       "<p>Google Search API not configured. Answered using internal knowledge.</p>"
+                       "<p>Google Search API key or Search Engine ID (CX) is not configured.</p>"
                        "</div>";
         return doc;
     }

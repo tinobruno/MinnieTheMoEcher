@@ -1559,6 +1559,21 @@ code {
     font-size: 15px;
 }
 
+.voice-prompt-pill {
+    display: inline-flex;
+    align-items: center;
+    gap: 4px;
+    font-size: 11px;
+    font-weight: 500;
+    color: #93c5fd;
+    background: rgba(59, 130, 246, 0.15);
+    border: 1px solid rgba(59, 130, 246, 0.3);
+    padding: 2px 7px;
+    border-radius: 10px;
+    margin-bottom: 6px;
+    user-select: none;
+}
+
 /* Assistant Message Action Toolbar */
 .msg-footer-actions {
     display: flex;

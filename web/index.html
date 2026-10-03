@@ -284,7 +284,7 @@
                                 <span></span><span></span><span></span><span></span><span></span>
                             </div>
                             <span id="voice-silence-countdown" class="voice-countdown-badge hidden">2.0s</span>
-                            <button type="button" class="voice-indicator-btn voice-btn-done" onclick="stopVoiceRecognition()" title="Finish dictating">
+                            <button type="button" class="voice-indicator-btn voice-btn-done" onclick="stopVoiceRecognition(true)" title="Finish dictating and send immediately">
                                 <span class="material-symbols-outlined">check</span> Done
                             </button>
                             <button type="button" class="voice-indicator-btn voice-btn-cancel" onclick="cancelVoiceRecognition()" title="Cancel dictation">
@@ -934,6 +934,16 @@
                                     <input type="checkbox" id="voice-streaming-tts" checked onchange="onVoiceStreamingTtsChange(this.checked)">
                                     Low-Latency Streaming TTS (Speak while generating)
                                 </label>
+                            </div>
+
+                            <div class="setting-item">
+                                <label class="checkbox-label" title="Disables reasoning/thinking tokens on the fly when dictating with microphone to deliver instant conversational responses">
+                                    <input type="checkbox" id="voice-disable-thinking" checked onchange="onVoiceDisableThinkingChange(this.checked)">
+                                    Disable Thinking for Voice Prompts (Fast Response)
+                                </label>
+                                <small style="color: var(--text-secondary); font-size: 11px; display: block; margin-top: 2px;">
+                                    Bypasses thinking on the fly when prompting with the mic to eliminate latency and reply immediately.
+                                </small>
                             </div>
 
                             <div class="setting-item" id="tts-voice-setting-row">

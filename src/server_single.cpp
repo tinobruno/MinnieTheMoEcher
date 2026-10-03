@@ -4611,7 +4611,8 @@ public:
                          const __nv_bfloat16* visual_embeddings = nullptr,
                          int visual_start_pos = -1,
                          int visual_num_tokens = 0,
-                         bool ignore_eos = false) {
+                         bool ignore_eos = false,
+                         bool allow_tool_calls = true) {
         // Ensure prompt fits within max_seq_len (defense-in-depth safety clamp)
         std::vector<int> prompt = prompt_in;
         if (prompt.size() > (size_t)cfg_.max_seq_len) {
@@ -4831,6 +4832,8 @@ public:
         if (think_start_id < 0) think_start_id = 128821;
         if (think_end_id < 0) think_end_id = 128822;
 
+        int tool_call_start_id = tokenizer_.get_token_id("<tool_call>");
+
         int eos2_id = tokenizer_.get_token_id("<|end_of_sentence|>");
         if (eos2_id < 0) eos2_id = tokenizer_.get_token_id("<｜end of sentence｜>");
         int im_end_id = tokenizer_.get_token_id("<|im_end|>");
@@ -4963,10 +4966,18 @@ public:
                 content_tokens_generated++;
                 recent_content_tokens.push_back(next_token);
                 int n_cnt = (int)recent_content_tokens.size();
-                // Avoid false positives in the opening tokens (< 64) or while actively outputting a tool call
-                bool in_tool_call_block = (generated_text.find("<tool_call>") != std::string::npos &&
+                bool in_tool_call_block = (allow_tool_calls &&
+                                           generated_text.find("<tool_call>") != std::string::npos &&
                                            generated_text.find("</tool_call>") == std::string::npos);
-                if (content_tokens_generated >= 64 && !in_tool_call_block) {
+                if (in_tool_call_block && allow_tool_calls) {
+                    size_t tc_pos = generated_text.rfind("<tool_call>");
+                    if (tc_pos != std::string::npos && (generated_text.size() - tc_pos) > 2048) {
+                        LOG_WARN("Tool call block exceeded size limit without closing tag. Concluding tool call generation.");
+                        finish_reason = "tool_calls";
+                        return false;
+                    }
+                }
+                if (content_tokens_generated >= 32) {
                     for (int P = 1; P <= 32; P++) {
                         if (P == 1) {
                             if (n_cnt >= 6 &&
@@ -5077,7 +5088,7 @@ public:
                 token_buffer.clear();
             }
 
-            if (!in_think_block && g_enable_tools) {
+            if (!in_think_block && g_enable_tools && allow_tool_calls) {
                 if (generated_text.find("</tool_call>") != std::string::npos ||
                     generated_text.find("</tool_calls>") != std::string::npos ||
                     generated_text.find("</function_call>") != std::string::npos) {
@@ -5215,6 +5226,13 @@ public:
                     }
                     argmax_cache_valid_ = false;
                 }
+                if (!allow_tool_calls) {
+                    float neg_inf = -1e9f;
+                    if (tool_call_start_id >= 0) {
+                        CUDA_CHECK(cudaMemcpyAsync(buf_logits_.f32() + tool_call_start_id, &neg_inf, sizeof(float), cudaMemcpyHostToDevice, main_stream_));
+                    }
+                    argmax_cache_valid_ = false;
+                }
                 next_token = sample_token(temperature, output_ids, content_tokens_generated, in_think_block,
                                           top_k, top_p, min_p);
             }
@@ -5268,7 +5286,11 @@ public:
 
             if (allow_draft) {
                 if (!emit_token_cpu(next_token, t)) {
-                    if (finish_reason != "tool_calls") finish_reason = "stop";
+                    if (allow_tool_calls && finish_reason == "tool_calls") {
+                    // keep
+                } else {
+                    finish_reason = "stop";
+                }
                     break;
                 }
 
@@ -5351,19 +5373,27 @@ public:
 
                         if (pred_k == draft_cand &&
                             pred_k != cfg_.eos_token_id && (eos2_id < 0 || pred_k != eos2_id) &&
-                            (enable_thinking || (pred_k != think_start_id && pred_k != think_end_id))) {
+                            (enable_thinking || (pred_k != think_start_id && pred_k != think_end_id)) &&
+                            (allow_tool_calls || (tool_call_start_id < 0 || pred_k != tool_call_start_id))) {
                             accepted++;
                             if (!emit_token_cpu(draft_cand, t)) {
-                                finish_reason = "stop";
+                                if (allow_tool_calls && finish_reason == "tool_calls") {
+                                    // keep
+                                } else {
+                                    finish_reason = "stop";
+                                }
                                 break;
                             }
                         } else {
                             bonus_token = pred_k;
+                            if (!allow_tool_calls && tool_call_start_id >= 0 && bonus_token == tool_call_start_id) {
+                                bonus_token = -1;
+                            }
                             break;
                         }
                     }
 
-                    if (finish_reason == "stop") break;
+                    if (finish_reason == "stop" || (allow_tool_calls && finish_reason == "tool_calls")) break;
 
                     spec_cycles++;
                     spec_drafted += num_verify;
@@ -9322,7 +9352,7 @@ static json resolve_canonical_tools(const json& tools_input) {
         std::string s = tools_input.get<std::string>();
         if (s == "default" || s == "all") {
             json arr = json::array();
-            static const std::vector<std::string> default_order = {"web_search", "youtube_search", "google_search", "fetch_url", "create_3d_model", "read_file", "write_file", "edit_file", "execute_command"};
+            static const std::vector<std::string> default_order = {"web_search", "youtube_search", "fetch_url", "create_3d_model", "read_file", "write_file", "edit_file", "execute_command"};
             for (const auto& name : default_order) {
                 if (CANONICAL_TOOLS.count(name)) arr.push_back(CANONICAL_TOOLS.at(name));
             }
@@ -9336,13 +9366,21 @@ static json resolve_canonical_tools(const json& tools_input) {
 
     if (tools_input.is_array()) {
         json arr = json::array();
+        bool has_web = false;
+        for (const auto& item : tools_input) {
+            std::string name = item.is_string() ? item.get<std::string>() : (item.is_object() && item.contains("function") ? item["function"].value("name", "") : "");
+            if (name == "web_search") has_web = true;
+        }
         for (const auto& item : tools_input) {
             if (item.is_string()) {
                 std::string name = item.get<std::string>();
+                if (name == "google_search" && has_web) continue;
                 if (CANONICAL_TOOLS.count(name)) {
                     arr.push_back(CANONICAL_TOOLS.at(name));
                 }
             } else if (item.is_object()) {
+                std::string name = item.contains("function") ? item["function"].value("name", "") : "";
+                if (name == "google_search" && has_web) continue;
                 arr.push_back(item);
             }
         }
@@ -9379,22 +9417,15 @@ static std::string build_dynamic_tools_prompt(const json& resolved_tools, bool i
         prompt +=
             "For each function call, return a json object with function name and arguments within <tool_call></tool_call> XML tags:\n"
             "<tool_call>\n"
-            "{\"name\": \"web_search\", \"arguments\": {\"query\": \"Formula 1 pole position today\"}}\n"
-            "</tool_call>\n\n"
-            "Call only the exact function names listed in <tools> above (such as \"web_search\", \"youtube_search\", \"google_search\", \"fetch_url\", \"create_3d_model\"). Never invent function names or output placeholder tokens like <function-name> or <|reserved_0|>.\n\n";
+            "{\"name\": \"<function-name>\", \"arguments\": <args-json-object>}\n"
+            "</tool_call>\n\n";
     }
 
-    prompt +=
-        "## Tool Usage Instructions:\n";
     if (has_yt) {
         prompt +=
+            "## Tool Usage Instructions:\n"
             "- When the user asks to play music, a song, or a video, invoke `youtube_search` directly. The video will automatically load and play in the user's preview panel with autoplay.\n";
     }
-    prompt +=
-        "- For factual, general knowledge, or common schedule questions that you know accurately, answer directly without invoking tools.\n"
-        "- If a search tool returns no results, fails, or indicates an unconfigured API key, do not retry or repeat tool calls; immediately answer the user's question directly with your own knowledge.\n"
-        "- Always provide comprehensive, thorough, and complete answers directly in full detail.\n"
-        "- When continuing a previous response, immediately provide the full narrative and substantive information without meta-introductory remarks.\n";
 
     return prompt;
 }
@@ -9411,7 +9442,7 @@ static std::string normalize_tool_name(const std::string& name) {
     return s;
 }
 
-static std::string g_base_system_prompt = "You are a helpful assistant. Always provide comprehensive, thorough, and complete answers directly without asking for permission to proceed or stopping at introductory announcements. When asked to continue or keep going, immediately provide the full narrative and substantive information without meta-introductory remarks.";
+static std::string g_base_system_prompt = "You are a helpful assistant.";
 static std::string g_current_system_prompt = "";
 static json g_current_active_tools = json::array();
 static const std::string g_server_instance_id = std::to_string(std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::system_clock::now().time_since_epoch()).count());
@@ -13112,13 +13143,14 @@ static void run_server(MoecherEngine& engine, int port, int default_thinking_bud
                             bool req_thinking = enable_thinking && !conv_has_image;
                             int req_thinking_tokens = req_thinking ? max_thinking_tokens : 0;
 
+                            bool req_has_tools = (g_enable_tools && !tools.empty());
                             engine.generate(prompt, max_tokens, temperature, [&](const std::string& text, bool is_reasoning) -> bool {
                                 if (g_stop_requested.load()) return false;
                                 if (text.empty()) return true;
 
                                 if (is_reasoning) {
                                     round_reasoning += text;
-                                    if (g_enable_tools && !tools.empty()) {
+                                    if (req_has_tools) {
                                         return reasoning_filter.feed(text, [&](const std::string& safe_text) -> bool {
                                             return send_sse_delta(sink, req_id, model_id, created_time_str, "reasoning_content", safe_text);
                                         });
@@ -13127,7 +13159,7 @@ static void run_server(MoecherEngine& engine, int port, int default_thinking_bud
                                     }
                                 } else {
                                     round_content += text;
-                                    if (g_enable_tools && !tools.empty()) {
+                                    if (req_has_tools) {
                                         return content_filter.feed(text, [&](const std::string& safe_text) -> bool {
                                             return send_sse_delta(sink, req_id, model_id, created_time_str, "content", safe_text);
                                         });
@@ -13136,7 +13168,7 @@ static void run_server(MoecherEngine& engine, int port, int default_thinking_bud
                                     }
                                 }
                             }, repetition_penalty, req_thinking, req_thinking_tokens, top_p, min_p, top_k,
-                               d_vis_out, mm_prompt.visual_start_pos, mm_prompt.visual_num_tokens, ignore_eos);
+                               d_vis_out, mm_prompt.visual_start_pos, mm_prompt.visual_num_tokens, ignore_eos, req_has_tools);
 
                             final_finish_reason = engine.last_finish_reason_.empty() ? "stop" : engine.last_finish_reason_;
 
@@ -13816,6 +13848,25 @@ static void run_server(MoecherEngine& engine, int port, int default_thinking_bud
                                 round_new_tool_msgs.push_back(tool_reply);
                             }
 
+                            bool stream_should_synthesize = false;
+                            for (const auto& tc : round_tool_calls) {
+                                if (tc.name == "web_search" || tc.name == "google_search" || tc.name == "youtube_search") {
+                                    stream_should_synthesize = true;
+                                }
+                            }
+                            for (const auto& tm : round_new_tool_msgs) {
+                                std::string c = tm.value("content", "");
+                                if (c.find("Search provider error:") != std::string::npos ||
+                                    c.find("not configured") != std::string::npos ||
+                                    c.find("No search results found") != std::string::npos) {
+                                    stream_should_synthesize = true;
+                                }
+                            }
+                            if (stream_should_synthesize) {
+                                LOG_INFO("Tool execution complete for turn. Proceeding directly to response synthesis.");
+                                break;
+                            }
+
                             if (round + 1 < max_tool_rounds) {
                                 json proc_chunk = {
                                     {"id", req_id},
@@ -13851,6 +13902,19 @@ static void run_server(MoecherEngine& engine, int port, int default_thinking_bud
                                 std::string sse_warn = "data: " + warn_chunk.dump(-1, ' ', false, json::error_handler_t::replace) + "\n\n";
                                 sink.write(sse_warn.data(), sse_warn.size());
                             }
+                        }
+
+                        if (do_server_exec && last_completed_content.empty() && !round_new_tool_msgs.empty()) {
+                            LOG_INFO("Running final synthesis pass to formulate answer for user...");
+                            std::vector<int> prompt = build_continuation_prompt(engine, round_new_tool_msgs, enable_thinking, reasoning_effort);
+                            round_new_tool_msgs.clear();
+                            engine.generate(prompt, max_tokens, temperature, [&](const std::string& text, bool is_reasoning) -> bool {
+                                if (g_stop_requested.load()) return false;
+                                if (text.empty()) return true;
+                                last_completed_content += text;
+                                return send_sse_delta(sink, req_id, model_id, created_time_str, "content", text);
+                            }, repetition_penalty, false, 0, top_p, min_p, top_k, nullptr, -1, 0, false, /*allow_tool_calls=*/false);
+                            final_finish_reason = "stop";
                         }
 
                         // Final finish chunk
@@ -13961,8 +14025,9 @@ static void run_server(MoecherEngine& engine, int port, int default_thinking_bud
                         }
                         bool req_thinking = enable_thinking && !conv_has_image;
                         int req_thinking_tokens = req_thinking ? max_thinking_tokens : 0;
+                        bool req_has_tools = (g_enable_tools && !tools.empty());
                         response_text = engine.generate(prompt, max_tokens, temperature, nullptr, repetition_penalty, req_thinking, req_thinking_tokens, top_p, min_p, top_k,
-                                                        d_vis_out, mm_prompt.visual_start_pos, mm_prompt.visual_num_tokens, ignore_eos);
+                                                        d_vis_out, mm_prompt.visual_start_pos, mm_prompt.visual_num_tokens, ignore_eos, req_has_tools);
                         finish_reason = engine.last_finish_reason_;
                     }
 
@@ -14139,11 +14204,33 @@ static void run_server(MoecherEngine& engine, int port, int default_thinking_bud
                         current_messages.push_back(tool_reply);
                         round_new_tool_msgs.push_back(tool_reply);
                     }
+
+                    bool nonstream_should_synthesize = false;
+                    for (const auto& tc : round_tool_calls) {
+                        if (tc.name == "web_search" || tc.name == "google_search" || tc.name == "youtube_search") {
+                            nonstream_should_synthesize = true;
+                        }
+                    }
+                    for (const auto& tm : round_new_tool_msgs) {
+                        std::string c = tm.value("content", "");
+                        if (c.find("Search provider error:") != std::string::npos ||
+                            c.find("not configured") != std::string::npos ||
+                            c.find("No search results found") != std::string::npos) {
+                            nonstream_should_synthesize = true;
+                        }
+                    }
+                    if (nonstream_should_synthesize) {
+                        LOG_INFO("Tool execution complete for turn. Proceeding directly to response synthesis.");
+                        break;
+                    }
                 }
 
-                if (do_server_exec && !emitted_tool_calls.empty() && finish_reason != "tool_calls") {
-                    LOG_WARN("Tool execution reached max rounds limit (%d).", req_max_tool_rounds);
-                    final_response_text += "\n\n> ⚠️ **Maximum tool execution rounds reached (" + std::to_string(req_max_tool_rounds) + "/" + std::to_string(req_max_tool_rounds) + ").** Execution stopped.";
+                if (do_server_exec && final_response_text.empty() && !round_new_tool_msgs.empty()) {
+                    LOG_INFO("Running final non-streaming synthesis pass to formulate answer for user...");
+                    std::vector<int> prompt = build_continuation_prompt(engine, round_new_tool_msgs, enable_thinking, reasoning_effort);
+                    round_new_tool_msgs.clear();
+                    final_response_text = engine.generate(prompt, max_tokens, temperature, nullptr, repetition_penalty, false, 0, top_p, min_p, top_k, nullptr, -1, 0, false, /*allow_tool_calls=*/false);
+                    finish_reason = "stop";
                 }
 
                 json choice = {

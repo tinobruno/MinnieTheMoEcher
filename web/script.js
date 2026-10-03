@@ -186,6 +186,9 @@ chatInput.addEventListener('input', () => {
     if (!isGenerating) {
         sendBtn.disabled = chatInput.value.trim() === '';
     }
+    if (chatInput.value.trim() === '') {
+        isCurrentInputFromVoice = false;
+    }
 });
 
 chatInput.addEventListener('keydown', (e) => {
@@ -2447,6 +2450,12 @@ function getActiveToolsPayload() {
         return agenticSettings.tools[name] !== false;
     });
 
+    // If web_search is active, avoid sending duplicate google_search tool to prevent tool bouncing
+    if (activeList.includes('web_search')) {
+        const gIdx = activeList.indexOf('google_search');
+        if (gIdx !== -1) activeList.splice(gIdx, 1);
+    }
+
     return activeList;
 }
 
@@ -3550,12 +3559,15 @@ async function executeClientToolCall(tc, turnRetrievedDocs = null) {
     }
 }
 
-async function sendMessage() {
+async function sendMessage(options = {}) {
     const text = chatInput.value.trim();
     if (!text || isGenerating) return;
 
+    const wasVoicePrompt = (options && options.fromVoice === true) || isCurrentInputFromVoice || (typeof isVoiceRecording !== 'undefined' && isVoiceRecording);
+    isCurrentInputFromVoice = false;
+
     if (typeof isVoiceRecording !== 'undefined' && isVoiceRecording) {
-        stopVoiceRecognition();
+        stopVoiceRecognition(false);
     }
     if (typeof stopTtsAudio === 'function') {
         stopTtsAudio();
@@ -3611,7 +3623,7 @@ async function sendMessage() {
             ThreeStudio.updatePhotoTextureButtons();
         }
     }
-    appendMessage('user', text || "Describe this image", attachedImg);
+    appendMessage('user', text || "Describe this image", attachedImg, wasVoicePrompt);
     chatHistory.push({ role: 'user', content: userMsgContent });
 
     // Create assistant message container
@@ -3627,7 +3639,10 @@ async function sendMessage() {
     let mainContent = document.createElement('div');
     assistantMsgDiv.querySelector('.msg-content').appendChild(mainContent);
 
-    const isThinking = attachedImg ? false : (thinkingEnabled ? thinkingEnabled.checked : true);
+    const baseThinking = attachedImg ? false : (thinkingEnabled ? thinkingEnabled.checked : true);
+    // Voice prompt speed optimization: disable thinking on the fly for fast conversational responses
+    const isVoiceBypassThinking = wasVoicePrompt && (typeof voiceSettings === 'undefined' || voiceSettings.disableThinkingForVoice !== false);
+    const isThinking = isVoiceBypassThinking ? false : baseThinking;
 
     // Initial visual feedback while engine starts thinking/elaborating
     const liveIndicator = document.createElement('div');
@@ -3635,7 +3650,11 @@ async function sendMessage() {
     liveIndicator.id = 'live-status-indicator';
     liveIndicator.innerHTML = `
         <span class="tool-pulse-spinner"></span>
-        <span class="status-msg-text">${isThinking ? 'Thinking and preparing response' : (attachedImg ? 'Analyzing image and preparing response' : 'Preparing response')}</span>
+        <span class="status-msg-text">${
+            isVoiceBypassThinking
+                ? '⚡ Fast voice response (thinking bypassed)'
+                : (isThinking ? 'Thinking and preparing response' : (attachedImg ? 'Analyzing image and preparing response' : 'Preparing response'))
+        }</span>
         <div class="elaboration-dots"><span></span><span></span><span></span></div>
     `;
     mainContent.appendChild(liveIndicator);
@@ -3659,6 +3678,9 @@ async function sendMessage() {
 
     const maxRounds = agenticSettings.maxToolRounds || 10;
     let round = 0;
+    const turnExecutedToolKeys = new Set();
+    let turnExecutedSearch = false;
+    let turnEncounteredToolIssue = false;
 
     try {
         const apiUrl = `${getApiBase()}/v1/chat/completions`;
@@ -3698,6 +3720,7 @@ async function sendMessage() {
                 temperature: parseFloat(tempSlider.value),
                 repetition_penalty: parseFloat(repPenaltySlider ? repPenaltySlider.value : 1.00),
                 stream: true,
+                enable_thinking: isThinking,
                 thinking: {
                     type: isThinking ? "enabled" : "disabled",
                     budget_tokens: budgetVal
@@ -3720,7 +3743,9 @@ async function sendMessage() {
                 }
             };
 
-            payload.tools = activeTools;
+            // Disable tools once search has executed in this turn, or if a tool returned an issue/error, or if round >= maxRounds,
+            // forcing the assistant to formulate and stream its complete conversational answer directly to the user.
+            payload.tools = (round >= maxRounds || turnExecutedSearch || turnEncounteredToolIssue) ? [] : activeTools;
 
             let roundReasoning = "";
             let roundContent = "";
@@ -4009,6 +4034,10 @@ async function sendMessage() {
                     let doneIcon = 'done';
                     let completedLabel = 'Completed';
 
+                    const toolKey = (tc.name || '') + '::' + (typeof tc.arguments === 'string' ? tc.arguments : JSON.stringify(tc.arguments || {}));
+                    const isDuplicate = turnExecutedToolKeys.has(toolKey);
+                    turnExecutedToolKeys.add(toolKey);
+
                     try {
                         const parsedArgs = typeof tc.arguments === 'string' ? JSON.parse(tc.arguments) : (tc.arguments || {});
                         const queryStr = parsedArgs.query || parsedArgs.q || '';
@@ -4093,7 +4122,26 @@ async function sendMessage() {
                     const toolTargetContainer = (reasoningContent && !isReasoningDone) ? reasoningContent : mainContent;
                     toolTargetContainer.insertAdjacentHTML('beforeend', activeCardHtml);
 
-                    const toolOutput = await executeClientToolCall(tc, turnRetrievedDocs);
+                    let toolOutput = "";
+                    if (isDuplicate) {
+                        console.warn('[Tool Execution Guard] Duplicate tool call in same turn detected:', toolKey);
+                        toolOutput = "Note: You have already executed this exact tool with these parameters in this turn. Please formulate and output your final response directly to the user.";
+                        turnEncounteredToolIssue = true;
+                    } else {
+                        toolOutput = await executeClientToolCall(tc, turnRetrievedDocs);
+                    }
+
+                    if (tc.name === 'web_search' || tc.name === 'google_search' || tc.name === 'youtube_search') {
+                        turnExecutedSearch = true;
+                    }
+                    if (typeof toolOutput === 'string' &&
+                        (toolOutput.includes('Search provider error:') ||
+                         toolOutput.includes('Error:') ||
+                         toolOutput.includes('not configured') ||
+                         toolOutput.includes('No search results found') ||
+                         toolOutput.includes('Failed to execute'))) {
+                        turnEncounteredToolIssue = true;
+                    }
 
                     const activeCardEl = document.getElementById(`tool-act-${tc.id}`);
                     if (activeCardEl) {
@@ -4227,6 +4275,61 @@ async function sendMessage() {
             break;
         }
 
+        if ((!lastRoundContent || lastRoundContent.trim().length === 0) && turnToolCallsCount > 0) {
+            console.log('[Turn Synthesis Guard] Formulating final answer for user...');
+            try {
+                const finalMessages = buildOptimizedMessagesPayload();
+                const finalPayload = {
+                    model: currentModelId || "deepseek-v4-flash",
+                    messages: finalMessages,
+                    max_tokens: parseInt(tokensInput ? tokensInput.value : 20000, 10) || 20000,
+                    temperature: parseFloat(tempSlider.value),
+                    stream: true,
+                    enable_thinking: false,
+                    tools: [],
+                    client_tool_execution: true
+                };
+                const synthRes = await fetch(apiUrl, {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/json', 'Accept': 'text/event-stream' },
+                    body: pythonJsonDumps(finalPayload)
+                });
+                if (synthRes.ok) {
+                    const synthReader = synthRes.body.getReader();
+                    const synthDecoder = new TextDecoder('utf-8');
+                    let synthBuf = '';
+                    while (true) {
+                        const { done, value } = await synthReader.read();
+                        if (done) break;
+                        synthBuf += synthDecoder.decode(value, { stream: true });
+                        const sLines = synthBuf.split('\n');
+                        synthBuf = sLines.pop();
+                        for (const sl of sLines) {
+                            if (sl.startsWith('data: ')) {
+                                const dStr = sl.slice(6);
+                                if (dStr === '[DONE]') break;
+                                try {
+                                    const dJson = JSON.parse(dStr);
+                                    if (dJson.choices && dJson.choices.length > 0) {
+                                        const cDelta = dJson.choices[0].delta || {};
+                                        if (cDelta.content) {
+                                            lastRoundContent += cDelta.content;
+                                            renderMarkdownContent(lastRoundContent, mainContent);
+                                        }
+                                    }
+                                } catch (_) {}
+                            }
+                        }
+                    }
+                    if (lastRoundContent) {
+                        chatHistory.push({ role: 'assistant', content: lastRoundContent });
+                    }
+                }
+            } catch (synthErr) {
+                console.warn('[Turn Synthesis Guard] Synthesis request failed:', synthErr);
+            }
+        }
+
         const ttftMs = (round1TtftMs !== null ? round1TtftMs : totalPrefillMs);
         const ttftSec = ttftMs / 1000.0;
         const prefillSec = totalPrefillMs / 1000.0;
@@ -4325,11 +4428,17 @@ function createMessageContainer(role) {
     return div;
 }
 
-function appendMessage(role, text, attachedImg = null) {
+function appendMessage(role, text, attachedImg = null, isVoice = false) {
     const div = createMessageContainer(role);
     if (role === 'user') {
         const contentEl = div.querySelector('.msg-content');
         contentEl.textContent = '';
+        if (isVoice) {
+            const voiceBadge = document.createElement('div');
+            voiceBadge.className = 'voice-prompt-pill';
+            voiceBadge.innerHTML = `<span class="material-symbols-outlined" style="font-size: 13px;">mic</span> Spoken prompt`;
+            contentEl.appendChild(voiceBadge);
+        }
         if (attachedImg && attachedImg.dataUrl) {
             const thumbCard = document.createElement('div');
             thumbCard.className = 'attachment-thumb-card user-msg-attachment';
@@ -8117,12 +8226,14 @@ let voiceSettings = {
     silenceDelay: parseFloat(localStorage.getItem('moecher_voice_silence_delay') || '2.0'),
     autoRead: localStorage.getItem('moecher_voice_auto_read') === 'true',
     streamingTts: localStorage.getItem('moecher_voice_streaming_tts') !== 'false',
+    disableThinkingForVoice: localStorage.getItem('moecher_voice_disable_thinking') !== 'false',
     ttsVoice: localStorage.getItem('moecher_tts_voice') || 'default',
     ttsRate: parseFloat(localStorage.getItem('moecher_tts_rate') || '1.0')
 };
 
 let speechRecognitionInstance = null;
 let isVoiceRecording = false;
+let isCurrentInputFromVoice = false;
 let preSpeechInputValue = '';
 let speechFinalTranscript = '';
 let speechSilenceTimer = null;
@@ -8147,6 +8258,7 @@ function initVoiceRecognitionUI() {
     const silenceSlider = document.getElementById('voice-silence-delay-slider');
     const silenceVal = document.getElementById('voice-silence-delay-val');
     const streamingCheck = document.getElementById('voice-streaming-tts');
+    const disableThinkingCheck = document.getElementById('voice-disable-thinking');
     const rateSlider = document.getElementById('tts-rate-slider');
     const rateVal = document.getElementById('tts-rate-val');
 
@@ -8156,6 +8268,7 @@ function initVoiceRecognitionUI() {
     if (silenceSlider) silenceSlider.value = voiceSettings.silenceDelay;
     if (silenceVal) silenceVal.textContent = `${voiceSettings.silenceDelay.toFixed(2).replace(/\.?0+$/, '')}s`;
     if (streamingCheck) streamingCheck.checked = voiceSettings.streamingTts !== false;
+    if (disableThinkingCheck) disableThinkingCheck.checked = voiceSettings.disableThinkingForVoice !== false;
     if (rateSlider) rateSlider.value = voiceSettings.ttsRate;
     if (rateVal) rateVal.textContent = `${voiceSettings.ttsRate.toFixed(1)}x`;
 
@@ -8230,6 +8343,12 @@ function onVoiceStreamingTtsChange(checked) {
     voiceSettings.streamingTts = checked;
     localStorage.setItem('moecher_voice_streaming_tts', checked);
     showToast(checked ? "Low-Latency Streaming TTS enabled (speaks while generating)." : "Streaming speech disabled (speaks at end).");
+}
+
+function onVoiceDisableThinkingChange(checked) {
+    voiceSettings.disableThinkingForVoice = checked;
+    localStorage.setItem('moecher_voice_disable_thinking', checked);
+    showToast(checked ? "Fast Voice Mode: Thinking disabled on the fly for voice prompts." : "Thinking enabled for voice prompts.");
 }
 
 function onTtsVoiceChange(val) {
@@ -8346,6 +8465,9 @@ async function startVoiceRecognition() {
             } else {
                 chatInput.value = currentSpoken || prefix;
             }
+            if (currentSpoken) {
+                isCurrentInputFromVoice = true;
+            }
 
             chatInput.style.height = 'auto';
             chatInput.style.height = Math.min(chatInput.scrollHeight, 200) + 'px';
@@ -8384,8 +8506,9 @@ async function startVoiceRecognition() {
                         speechCountdownInterval = null;
                     }
                     if (isVoiceRecording && chatInput.value.trim().length > 0) {
-                        stopVoiceRecognition();
-                        sendMessage();
+                        isCurrentInputFromVoice = true;
+                        stopVoiceRecognition(false);
+                        sendMessage({ fromVoice: true });
                     }
                 }, delayMs);
             }
@@ -8435,7 +8558,7 @@ async function startVoiceRecognition() {
     }
 }
 
-function stopVoiceRecognition() {
+function stopVoiceRecognition(sendNow = false) {
     if (speechSilenceTimer) {
         clearTimeout(speechSilenceTimer);
         speechSilenceTimer = null;
@@ -8453,9 +8576,15 @@ function stopVoiceRecognition() {
     isVoiceRecording = false;
     updateVoiceRecordingUI(false);
     chatInput.focus();
+
+    if (sendNow && chatInput.value.trim().length > 0) {
+        isCurrentInputFromVoice = true;
+        sendMessage({ fromVoice: true });
+    }
 }
 
 function cancelVoiceRecognition() {
+    isCurrentInputFromVoice = false;
     if (speechSilenceTimer) {
         clearTimeout(speechSilenceTimer);
         speechSilenceTimer = null;
