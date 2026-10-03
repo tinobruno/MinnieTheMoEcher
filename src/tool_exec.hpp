@@ -4020,6 +4020,26 @@ inline void extract_tool_calls(
         } else {
             out_clean_content.clear();
         }
+    } else {
+        // Fallback: Check if the model explicitly announced an intent to search
+        static const std::regex s_intent_re(R"((?:i'll|i’ll|i will|let me|allow me to|i can|i am going to|i'm going to|i’m going to)\s+search\s+(?:the\s+web\s+)?(?:for|to\s+find)?\s*["'’]?([^.\n!?:;]+))", std::regex::icase);
+        std::smatch m;
+        if (std::regex_search(response_text, m, s_intent_re) && m.size() > 1) {
+            std::string q = m[1].str();
+            size_t fb = q.find_first_not_of(" \t\r\n\"'");
+            size_t lb = q.find_last_not_of(" \t\r\n\"'");
+            if (fb != std::string::npos && lb != std::string::npos) q = q.substr(fb, lb - fb + 1);
+            if (q.size() >= 3) {
+                ToolCall tc;
+                tc.id = "call_intent_" + std::to_string(std::chrono::steady_clock::now().time_since_epoch().count() % 1000000);
+                tc.type = "function";
+                tc.name = "web_search";
+                json args = json::object();
+                args["query"] = q;
+                tc.arguments = args.dump();
+                out_tool_calls.push_back(tc);
+            }
+        }
     }
     out_clean_content = scrub_dsml_and_tool_tags(out_clean_content);
 }

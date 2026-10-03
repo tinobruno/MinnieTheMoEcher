@@ -9396,10 +9396,12 @@ static std::string build_dynamic_tools_prompt(const json& resolved_tools, bool i
     }
 
     bool has_yt = false;
+    bool has_web = false;
     for (const auto& item : resolved_tools) {
-        if (item.contains("function") && item["function"].value("name", "") == "youtube_search") {
-            has_yt = true;
-            break;
+        if (item.contains("function")) {
+            std::string fn = item["function"].value("name", "");
+            if (fn == "youtube_search") has_yt = true;
+            if (fn == "web_search" || fn == "google_search") has_web = true;
         }
     }
 
@@ -9421,10 +9423,14 @@ static std::string build_dynamic_tools_prompt(const json& resolved_tools, bool i
             "</tool_call>\n\n";
     }
 
-    if (has_yt) {
-        prompt +=
-            "## Tool Usage Instructions:\n"
-            "- When the user asks to play music, a song, or a video, invoke `youtube_search` directly. The video will automatically load and play in the user's preview panel with autoplay.\n";
+    if (has_yt || has_web) {
+        prompt += "## Tool Usage Instructions:\n";
+        if (has_web) {
+            prompt += "- When current information, real-time events, or web search is needed, invoke `web_search` directly.\n";
+        }
+        if (has_yt) {
+            prompt += "- When the user asks to play music, a song, or a video, invoke `youtube_search` directly. The video will automatically load and play in the user's preview panel with autoplay.\n";
+        }
     }
 
     return prompt;

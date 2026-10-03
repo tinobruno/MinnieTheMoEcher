@@ -4004,7 +4004,29 @@ async function sendMessage(options = {}) {
             totalPrefillMs += roundPrefillMs;
             totalDecodeMs += roundDecodeMs;
 
-            const validToolCalls = roundToolCalls.filter(tc => tc && tc.name);
+            let validToolCalls = roundToolCalls.filter(tc => tc && tc.name);
+
+            // If the model did not emit a formal <tool_call> tag but announced an intent to search:
+            if (validToolCalls.length === 0 && (roundFinishReason === 'stop' || roundFinishReason === 'tool_calls') && activeTools.includes('web_search')) {
+                const searchIntentMatch = roundContent.match(/(?:i['’]ll|i will|let me|allow me to|i can|i am going to|i['’]m going to)\s+search\s+(?:the\s+web\s+)?(?:for|to\s+find)?\s*["'’]?([^.\n!?:;]+)/i);
+                if (searchIntentMatch && searchIntentMatch[1]) {
+                    let extractedQuery = searchIntentMatch[1].trim();
+                    extractedQuery = extractedQuery.replace(/^(?:out\s+)?(?:who\s+secured\s+|the\s+latest\s+|the\s+most\s+recent\s+)?/i, '').trim();
+                    if (/^(?:that|this|it|the\s+answer|information|more)$/i.test(extractedQuery)) {
+                        const lastUserMsg = chatHistory.filter(m => m.role === 'user').slice(-1)[0]?.content || '';
+                        extractedQuery = lastUserMsg.trim();
+                    }
+                    if (extractedQuery.length >= 3) {
+                        console.log('[Agentic Auto-Tool] Triggering web_search from announced intent:', extractedQuery);
+                        validToolCalls.push({
+                            id: 'call_intent_' + Date.now(),
+                            type: 'function',
+                            name: 'web_search',
+                            arguments: JSON.stringify({ query: extractedQuery })
+                        });
+                    }
+                }
+            }
 
             if (validToolCalls.length > 0 && (roundFinishReason === 'tool_calls' || roundFinishReason === 'stop')) {
                 const toolExecStartTime = performance.now();
