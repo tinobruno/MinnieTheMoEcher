@@ -5089,9 +5089,13 @@ public:
             }
 
             if (!in_think_block && g_enable_tools && allow_tool_calls) {
-                if (generated_text.find("</tool_call>") != std::string::npos ||
-                    generated_text.find("</tool_calls>") != std::string::npos ||
-                    generated_text.find("</function_call>") != std::string::npos) {
+                bool has_opening = (generated_text.find("<tool_call>") != std::string::npos ||
+                                    generated_text.find("<tool_calls>") != std::string::npos ||
+                                    generated_text.find("<function_call>") != std::string::npos);
+                bool has_closing = (generated_text.find("</tool_call>") != std::string::npos ||
+                                    generated_text.find("</tool_calls>") != std::string::npos ||
+                                    generated_text.find("</function_call>") != std::string::npos);
+                if (has_opening && has_closing) {
                     LOG_INFO("Tool call closing tag detected. Concluding generation for tool execution.");
                     finish_reason = "tool_calls";
                     return false;
@@ -9426,7 +9430,7 @@ static std::string build_dynamic_tools_prompt(const json& resolved_tools, bool i
     if (has_yt || has_web) {
         prompt += "## Tool Usage Instructions:\n";
         if (has_web) {
-            prompt += "- When current information, real-time events, or web search is needed, invoke `web_search` directly.\n";
+            prompt += "- When current information, real-time events, sports results, news, or web search is needed, invoke `web_search` directly with an informative query.\n";
         }
         if (has_yt) {
             prompt += "- When the user asks to play music, a song, or a video, invoke `youtube_search` directly. The video will automatically load and play in the user's preview panel with autoplay.\n";
@@ -10841,7 +10845,7 @@ static std::vector<int> build_continuation_prompt(
             std::string content = get_message_content_string(msg);
             result.push_back(IM_START);
             if (role == "tool" || role == "function") {
-                auto u_enc = tok.encode("user\n<tool_response>\n" + content + "\n</tool_response>");
+                auto u_enc = tok.encode("user\n<tool_response>\n" + content + "\n</tool_response>\nPlease answer the user's question directly, accurately, and comprehensively based on the information above. If the event name or location is unusual or newly scheduled (for example, a title-sponsored event like 'Bahrain Grand Prix in Malaysia' held at Sepang), clearly mention and explain the venue and title context so the user understands.");
                 result.insert(result.end(), u_enc.begin(), u_enc.end());
             } else {
                 auto u_enc = tok.encode("user\n" + content);
@@ -12833,7 +12837,7 @@ static void run_server(MoecherEngine& engine, int port, int default_thinking_bud
             bool ignore_eos = request.value("ignore_eos", false);
             bool stream = request.value("stream", false);
             float repetition_penalty = request.value("repetition_penalty", 1.0f);
-            std::string reasoning_effort = request.value("reasoning_effort", default_thinking_budget > 0 ? "high" : "none");
+            std::string reasoning_effort = request.value("reasoning_effort", "");
             bool enable_thinking = (default_thinking_budget > 0);
             int max_thinking_tokens = default_thinking_budget;
 
@@ -12870,10 +12874,18 @@ static void run_server(MoecherEngine& engine, int port, int default_thinking_bud
                 enable_thinking = request["enable_thinking"].get<bool>();
             }
 
-            if (reasoning_effort == "none") {
-                enable_thinking = false;
-                max_thinking_tokens = 0;
-            } else if (reasoning_effort == "low" || reasoning_effort == "medium" || reasoning_effort == "high" || reasoning_effort == "max") {
+            if (!reasoning_effort.empty()) {
+                if (reasoning_effort == "none") {
+                    enable_thinking = false;
+                    max_thinking_tokens = 0;
+                } else if (reasoning_effort == "low" || reasoning_effort == "medium" || reasoning_effort == "high" || reasoning_effort == "max") {
+                    enable_thinking = true;
+                    if (max_thinking_tokens <= 0) max_thinking_tokens = 1024;
+                }
+            } else {
+                reasoning_effort = enable_thinking ? "high" : "none";
+            }
+            if (reasoning_effort != "none" && enable_thinking) {
                 enable_thinking = true;
                 if (max_thinking_tokens <= 0) max_thinking_tokens = 1024;
             }
@@ -13227,6 +13239,37 @@ static void run_server(MoecherEngine& engine, int port, int default_thinking_bud
                                     round_tool_calls = reasoning_calls;
                                 }
                                 round_reasoning = clean_reasoning;
+                            }
+
+                            if (round_tool_calls.empty() && round == 0 && g_enable_tools && !tools.empty()) {
+                                std::string lower = round_content;
+                                for (char& c : lower) c = (char)std::tolower((unsigned char)c);
+                                bool has_search_intent = (lower.find("need to search") != std::string::npos ||
+                                                         lower.find("search the web") != std::string::npos ||
+                                                         lower.find("search for the latest") != std::string::npos ||
+                                                         lower.find("look up") != std::string::npos ||
+                                                         lower.find("don't have access to real-time") != std::string::npos ||
+                                                         lower.find("do not have access to real-time") != std::string::npos ||
+                                                         lower.find("cannot browse the web") != std::string::npos);
+                                if (has_search_intent) {
+                                    std::string user_q = "";
+                                    for (int m = (int)current_messages.size() - 1; m >= 0; m--) {
+                                        if (current_messages[m].value("role", "") == "user") {
+                                            user_q = get_message_content_string(current_messages[m]);
+                                            break;
+                                        }
+                                    }
+                                    if (!user_q.empty()) {
+                                        LOG_INFO("Auto-triggering web_search fallback in streaming for: '%s'", user_q.c_str());
+                                        moecher::tooling::ToolCall tc;
+                                        tc.id = "call_auto_" + std::to_string(std::chrono::system_clock::now().time_since_epoch().count());
+                                        tc.name = "web_search";
+                                        tc.type = "function";
+                                        json args = {{"query", user_q}};
+                                        tc.arguments = args.dump();
+                                        round_tool_calls.push_back(tc);
+                                    }
+                                }
                             }
 
                             if (round_tool_calls.empty()) {
@@ -14068,6 +14111,37 @@ static void run_server(MoecherEngine& engine, int port, int default_thinking_bud
                     std::string clean_content;
                     std::vector<moecher::tooling::ToolCall> round_tool_calls;
                     moecher::tooling::extract_tool_calls(response_text, clean_content, round_tool_calls);
+
+                    if (round_tool_calls.empty() && round == 0 && g_enable_tools && !tools.empty()) {
+                        std::string lower = response_text;
+                        for (char& c : lower) c = (char)std::tolower((unsigned char)c);
+                        bool has_search_intent = (lower.find("need to search") != std::string::npos ||
+                                                 lower.find("search the web") != std::string::npos ||
+                                                 lower.find("search for the latest") != std::string::npos ||
+                                                 lower.find("look up") != std::string::npos ||
+                                                 lower.find("don't have access to real-time") != std::string::npos ||
+                                                 lower.find("do not have access to real-time") != std::string::npos ||
+                                                 lower.find("cannot browse the web") != std::string::npos);
+                        if (has_search_intent) {
+                            std::string user_q = "";
+                            for (int m = (int)current_messages.size() - 1; m >= 0; m--) {
+                                if (current_messages[m].value("role", "") == "user") {
+                                    user_q = get_message_content_string(current_messages[m]);
+                                    break;
+                                }
+                            }
+                            if (!user_q.empty()) {
+                                LOG_INFO("Auto-triggering web_search fallback in non-streaming for: '%s'", user_q.c_str());
+                                moecher::tooling::ToolCall tc;
+                                tc.id = "call_auto_" + std::to_string(std::chrono::system_clock::now().time_since_epoch().count());
+                                tc.name = "web_search";
+                                tc.type = "function";
+                                json args = {{"query", user_q}};
+                                tc.arguments = args.dump();
+                                round_tool_calls.push_back(tc);
+                            }
+                        }
+                    }
 
                     if (round_tool_calls.empty()) {
                         final_response_text = clean_content;

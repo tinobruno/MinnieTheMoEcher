@@ -4027,21 +4027,34 @@ async function sendMessage(options = {}) {
 
             // If the model did not emit a formal <tool_call> tag but announced an intent to search:
             if (validToolCalls.length === 0 && (roundFinishReason === 'stop' || roundFinishReason === 'tool_calls') && activeTools.includes('web_search')) {
-                const searchIntentMatch = roundContent.match(/(?:i['’]ll|i will|let me|allow me to|i can|i am going to|i['’]m going to)\s+search\s+(?:the\s+web\s+)?(?:for|to\s+find)?\s*["'’]?([^.\n!?:;]+)/i);
+                const searchIntentMatch = roundContent.match(/(?:i['’]ll|i will|let me|allow me to|i can|i am going to|i['’]m going to|i need to|need to|should|must|have to|going to)\s+search\s+(?:the\s+web\s+)?(?:for|to\s+find)?\s*["'’]?([^.\n!?:;]+)/i);
+                const isRealTimeRefusal = /(?:don['’]t have|do not have|no)\s+(?:access to\s+)?(?:real-time|current|live|up-to-date)\s+(?:information|data|news|updates)|(?:cannot|can['’]t)\s+(?:browse|access)\s+(?:the\s+)?web/i.test(roundContent);
                 if (searchIntentMatch && searchIntentMatch[1]) {
                     let extractedQuery = searchIntentMatch[1].trim();
-                    extractedQuery = extractedQuery.replace(/^(?:out\s+)?(?:who\s+secured\s+|the\s+latest\s+|the\s+most\s+recent\s+)?/i, '').trim();
+                    extractedQuery = extractedQuery.replace(/^(?:out\s+)?(?:who\s+secured\s+|the\s+latest\s+|the\s+most\s+recent\s+)?/i, "").trim();
                     if (/^(?:that|this|it|the\s+answer|information|more)$/i.test(extractedQuery)) {
-                        const lastUserMsg = chatHistory.filter(m => m.role === 'user').slice(-1)[0]?.content || '';
+                        const lastUserMsg = chatHistory.filter(m => m.role === "user").slice(-1)[0]?.content || "";
                         extractedQuery = lastUserMsg.trim();
                     }
                     if (extractedQuery.length >= 3) {
-                        console.log('[Agentic Auto-Tool] Triggering web_search from announced intent:', extractedQuery);
+                        console.log("[Agentic Auto-Tool] Triggering web_search from announced intent:", extractedQuery);
                         validToolCalls.push({
-                            id: 'call_intent_' + Date.now(),
-                            type: 'function',
-                            name: 'web_search',
+                            id: "call_intent_" + Date.now(),
+                            type: "function",
+                            name: "web_search",
                             arguments: JSON.stringify({ query: extractedQuery })
+                        });
+                    }
+                } else if (isRealTimeRefusal && round === 1) {
+                    const lastUserMsg = chatHistory.filter(m => m.role === "user").slice(-1)[0]?.content || "";
+                    let cleanUserQuery = lastUserMsg.replace(/^(?:hello|hi|hey|please|can you|could you|tell me|do you know)\s+/i, "").trim();
+                    if (cleanUserQuery.length >= 3) {
+                        console.log("[Agentic Auto-Tool] Model gave real-time refusal but web_search is enabled; triggering search for:", cleanUserQuery);
+                        validToolCalls.push({
+                            id: "call_fallback_" + Date.now(),
+                            type: "function",
+                            name: "web_search",
+                            arguments: JSON.stringify({ query: cleanUserQuery })
                         });
                     }
                 }
@@ -4226,20 +4239,24 @@ async function sendMessage(options = {}) {
                 continue;
             }
 
-            // If the model in synthesis generated an unfulfilled preamble promising to fetch/search details but forgot to give the answer:
-            const isUnfulfilledPreamble = (turnRetrievedDocs.length > 0 || turnExecutedSearch) &&
+            // If the model in synthesis generated an unfulfilled preamble or truncated header but forgot to give the answer:
+            const isUnfulfilledPreamble = ((turnRetrievedDocs.length > 0 || turnExecutedSearch) &&
                 roundContent.trim().length < 140 &&
-                /(?:found it|got it|let me|i'll|i will|going to|one moment|allow me to)\s+(?:fetch|search|check|look|find|get)\b/i.test(roundContent);
+                /(?:found it|got it|let me|i'll|i will|going to|one moment|allow me to)\s+(?:fetch|search|check|look|find|get)\b/i.test(roundContent)) ||
+                (round === 1 && roundContent.trim().length > 0 && roundContent.trim().length < 60 && !/[.!?]$/.test(roundContent.trim()) && !validToolCalls.length);
 
             if (isUnfulfilledPreamble && round < maxRounds - 1) {
-                console.log('[Agentic Auto-Continuation] Model generated incomplete preamble; prompting direct answer synthesis...');
+                console.log('[Agentic Auto-Continuation] Model generated incomplete preamble or truncated header; prompting completion...');
                 chatHistory.push({
                     role: 'assistant',
                     content: roundContent
                 });
+                const continuationPrompt = (turnRetrievedDocs.length > 0 || turnExecutedSearch)
+                    ? 'Please provide the answer directly based on the search results above.'
+                    : 'Please provide the complete answer to my question.';
                 chatHistory.push({
                     role: 'user',
-                    content: 'Please provide the answer directly based on the search results above.'
+                    content: continuationPrompt
                 });
                 let procBadge = assistantMsgDiv.querySelector('#tool-proc-indicator');
                 if (!procBadge) {
