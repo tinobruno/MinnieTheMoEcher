@@ -1716,6 +1716,16 @@ let agenticSettings = {
 
 let currentPendingAuth = null;
 
+function getUserMessageText(m) {
+    if (!m) return '';
+    if (typeof m.content === 'string') return m.content;
+    if (Array.isArray(m.content)) {
+        const textPart = m.content.find(p => p && p.type === 'text' && typeof p.text === 'string');
+        return textPart ? textPart.text : '';
+    }
+    return '';
+}
+
 function isMediaSearchQuery(query) {
     if (!query) return false;
     const q = query.toLowerCase();
@@ -1731,15 +1741,15 @@ function isMediaSearchQuery(query) {
     ];
     if (kw.some(k => q.includes(k))) return true;
 
-    // Check if the user's latest prompt in the active turn was requesting media playback
+    // Check if user requested media playback in chat history
     if (Array.isArray(chatHistory) && chatHistory.length > 0) {
         for (let i = chatHistory.length - 1; i >= 0; i--) {
             const msg = chatHistory[i];
             if (msg.role === 'user') {
-                const uContent = (msg.content || '').toLowerCase();
+                const uContent = getUserMessageText(msg).toLowerCase();
                 const mediaTriggers = [
                     "play", "suona", "canzone", "song", "music", "musica", "listen", "ascolta",
-                    "fammi sentire", "fammi ascoltare", "metti la canzone", "metti il pezzo", "video", "youtube"
+                    "fammi sentire", "fammi ascoltare", "metti la canzone", "metti il pezzo", "video", "youtube", "metti"
                 ];
                 if (mediaTriggers.some(t => uContent.includes(t))) {
                     return true;
@@ -1750,6 +1760,97 @@ function isMediaSearchQuery(query) {
     }
 
     return false;
+}
+
+function detectYouTubeSearchIntent(roundContent, round, lastUserMsg, chatHistory) {
+    if (agenticSettings.tools['youtube_search'] === false || agenticSettings.fastMediaSearch === false) {
+        return null;
+    }
+
+    const cleanRound = (roundContent || '').trim();
+    const cleanUser = (lastUserMsg || '').trim();
+
+    // 1. Direct model quotation of a song/track to search on YouTube:
+    // e.g. "If you’d like, I can search YouTube right now for “Vampires of Time and Memories.” Just say the word..."
+    // e.g. "Let me search YouTube for "song title"..."
+    const ytQuoteMatch = cleanRound.match(/(?:search\s+youtube|look\s+up\s+on\s+youtube|cerca\s+su\s+youtube|cercare\s+su\s+youtube)(?:\s+right\s+now)?\s+(?:for\s+)?["'“‘]([^"'”’\n]+)["'”’]/i);
+    if (ytQuoteMatch && ytQuoteMatch[1].trim().length >= 2) {
+        return ytQuoteMatch[1].trim().replace(/[.,!?:;]+$/, '').trim();
+    }
+
+    // 2. Model refusal stating it doesn't know / isn't familiar with a song called "..."
+    // e.g. "I'm sorry, but I'm not familiar with a song called "Vampire of Diamond Memories." Could you clarify...?"
+    const unknownSongMatch = cleanRound.match(/(?:not\s+familiar\s+with|don['’]t\s+know|never\s+heard\s+of|cannot\s+find|non\s+conosco)\s+(?:a\s+)?(?:song|track|piece|music|canzone|brano)\s+(?:called|named|titled|intitolat[ao])?\s*["'“‘]([^"'”’\n.!?]+)["'”’]/i);
+    if (unknownSongMatch && unknownSongMatch[1].trim().length >= 2) {
+        return unknownSongMatch[1].trim().replace(/[.,!?:;]+$/, '').trim();
+    }
+
+    // 3. Model announced it is searching or loading the track now (without emitting tool_call):
+    // e.g. "Searching for that now", "Great choice! Loading that now... 🎵", "Let me actually search for that track now", "Searching now..."
+    const announcedMediaSearch = /(?:searching|looking|loading|caricando|cercando)\s+(?:for\s+)?(?:that|it|the\s+track|the\s+song|the\s+video|il\s+brano|la\s+canzone|il\s+video)\s+now/i.test(cleanRound) ||
+        /(?:loading\s+that\s+now|searching\s+for\s+that\s+now|great\s+choice!\s+loading\s+that\s+now)/i.test(cleanRound) ||
+        /(?:let\s+me|allow\s+me\s+to|i['’]ll|i\s+will|i\s+am\s+going\s+to|i['’]m\s+going\s+to)\s+(?:actually\s+)?(?:search|look\s+up|find)\s+(?:for\s+)?(?:that\s+track|that\s+song|that\s+music|youtube|the\s+video|the\s+track|the\s+song)/i.test(cleanRound) ||
+        /(?:didn['’]t\s+actually\s+invoke\s+the\s+search\s+tool|mistakenly\s+claimed\s+i\s+was\s+searching|never\s+actually\s+called\s+the\s+search\s+tool)/i.test(cleanRound);
+
+    if (announcedMediaSearch) {
+        // First check if quotes in roundContent have a track name
+        const anyQuote = cleanRound.match(/["'“‘]([^"'”’\n]{3,60})["'”’]/);
+        if (anyQuote && anyQuote[1] && !/(?:youtube|tool|function|search|loading)/i.test(anyQuote[1])) {
+            return anyQuote[1].trim();
+        }
+        // Next check if current user message is a valid query
+        if (cleanUser && cleanUser.length >= 2 && !/^(?:did\s+you|why|do\s+it|yes|ok|sure|please|what)/i.test(cleanUser)) {
+            return cleanUser.replace(/^(?:now\s+)?(?:play|listen(?:\s+to)?|put\s+on|suona|metti)\s+/i, '').trim();
+        }
+        // Check prior user messages in chatHistory
+        if (Array.isArray(chatHistory)) {
+            for (let i = chatHistory.length - 1; i >= 0; i--) {
+                const m = chatHistory[i];
+                if (m.role === 'user') {
+                    let prev = getUserMessageText(m).trim();
+                    if (prev.length >= 3 && !/^(?:did\s+you|why|do\s+it|yes|ok|sure|please|hello|hi)/i.test(prev)) {
+                        return prev.replace(/^(?:now\s+)?(?:play|listen(?:\s+to)?|put\s+on|suona|metti)\s+/i, '').trim();
+                    }
+                }
+            }
+        }
+    }
+
+    // 4. User explicitly commanded playback in Round 1 and model did not call youtube_search:
+    // e.g. "Now play Vampire of diamond memories", "play no one knows of Queens of Destiny", "metti i coldplay", "can you play ..."
+    if (round === 1 && cleanUser) {
+        const playCommandMatch = cleanUser.match(/^(?:now\s+)?(?:please\s+)?(?:can\s+you\s+|could\s+you\s+)?(?:per\s+favore\s+)?(?:puoi\s+)?(?:play|listen(?:\s+to)?|put\s+on|suona|metti|riproduci|fammi\s+sentire|fammi\s+ascoltare|cerca\s+su\s+youtube|search\s+youtube\s+for)\s+(.+)/i);
+        if (playCommandMatch && playCommandMatch[1]) {
+            let extracted = playCommandMatch[1].trim();
+            extracted = extracted.replace(/^["'“‘]|["'”’]$/g, '').trim();
+            if (extracted.length >= 2) {
+                return extracted;
+            }
+        }
+        const wantToListenMatch = cleanUser.match(/(?:i\s+want\s+to\s+(?:listen\s+to|hear)|vorrei\s+(?:ascoltare|sentire))\s+(.+)/i);
+        if (wantToListenMatch && wantToListenMatch[1]) {
+            let extracted = wantToListenMatch[1].trim();
+            extracted = extracted.replace(/^["'“‘]|["'”’]$/g, '').trim();
+            if (extracted.length >= 2) {
+                return extracted;
+            }
+        }
+    }
+
+    // 5. Follow-up song title when previous assistant message was discussing music/playback:
+    if (round === 1 && cleanUser && cleanUser.split(/\s+/).length <= 8 && !/^(?:why|how|what|who|where|when|can|could|is|are|perché|cosa|chi|come)\b/i.test(cleanUser)) {
+        if (Array.isArray(chatHistory) && chatHistory.length >= 2) {
+            const prevAsst = chatHistory.slice(-1)[0];
+            if (prevAsst && prevAsst.role === 'assistant') {
+                const prevText = typeof prevAsst.content === 'string' ? prevAsst.content : '';
+                if (/(?:song|track|music|artist|album|youtube|preview|vampire|vampyre|canzone|brano|suonare|ascoltare)/i.test(prevText)) {
+                    return cleanUser;
+                }
+            }
+        }
+    }
+
+    return null;
 }
 
 function loadAgenticSettings() {
@@ -3074,11 +3175,18 @@ function extractToolCallsFromContent(text) {
                 try {
                     const parsed = JSON.parse(candidate);
                     if (parsed && typeof parsed === 'object') {
-                        let name = parsed.name || (typeof parsed.function === 'string' ? parsed.function : parsed.function?.name);
-                        let args = parsed.arguments || parsed.parameters || parsed.function?.arguments;
+                        let name = parsed.name || parsed.tool || parsed.action || parsed.tool_name || parsed.function_name || (typeof parsed.function === 'string' ? parsed.function : parsed.function?.name);
+                        let args = parsed.arguments || parsed.parameters || parsed.args || parsed.function?.arguments;
                         if (!args && (parsed.query || parsed.url || parsed.path || parsed.command)) {
-                            const { name: _n, function: _f, type: _t, ...rest } = parsed;
+                            const { name: _n, function: _f, type: _t, tool: _tool, action: _act, tool_name: _tn, function_name: _fn, ...rest } = parsed;
                             args = rest;
+                        }
+                        if (!name) {
+                            if (parsed.query && typeof parsed.query === 'string' && parsed.query.length >= 2) {
+                                name = (agenticSettings.tools['youtube_search'] && isMediaSearchQuery(parsed.query)) ? 'youtube_search' : 'web_search';
+                            } else if (parsed.url && typeof parsed.url === 'string') {
+                                name = 'fetch_url';
+                            }
                         }
                         if (name && typeof name === 'string') {
                             addCall(name, args || {});
@@ -3111,8 +3219,8 @@ function stripToolCallsFromText(text) {
     out = out.replace(/<\s*[｜|]?tool (?:call begin|call end|sep|outputs begin|outputs end)[｜|]?>/gi, '');
 
     // 3. Remove markdown blocks wrapping tool call JSON: ```(?:json)?\s*\{[\s\S]*?\}\s*```
-    out = out.replace(/```(?:json)?\s*\{[\s\S]*?(?:"name"|"function")[\s\S]*?\}\s*```/gi, '');
-    out = out.replace(/```(?:json)?\s*\{[\s\S]*?(?:"name"|"function")[\s\S]*$/gi, '');
+    out = out.replace(/```(?:json)?\s*\{[\s\S]*?(?:"name"|"function"|"tool"|"query"|"action")[\s\S]*?\}\s*```/gi, '');
+    out = out.replace(/```(?:json)?\s*\{[\s\S]*?(?:"name"|"function"|"tool"|"query"|"action")[\s\S]*$/gi, '');
 
     // 4. Remove balanced JSON objects that represent tool calls
     let result = '';
@@ -3158,12 +3266,14 @@ function stripToolCallsFromText(text) {
                 try {
                     const parsed = JSON.parse(candidate);
                     if (parsed && typeof parsed === 'object') {
-                        if (parsed.name || (parsed.function && (typeof parsed.function === 'string' || parsed.function.name))) {
+                        if (parsed.name || parsed.tool || parsed.action || parsed.tool_name || parsed.function_name ||
+                            (parsed.function && (typeof parsed.function === 'string' || parsed.function.name)) ||
+                            (parsed.query && typeof parsed.query === 'string')) {
                             isTool = true;
                         }
                     }
                 } catch (e) {
-                    if (/"name"\s*:\s*"[^"]+"/.test(candidate) || /"function"\s*:\s*"[^"]+"/.test(candidate)) {
+                    if (/"(?:name|function|tool|query|action)"\s*:\s*"[^"]+"/.test(candidate)) {
                         isTool = true;
                     }
                 }
@@ -3174,7 +3284,7 @@ function stripToolCallsFromText(text) {
                 }
             } else {
                 const trailing = out.slice(start);
-                if (/"name"\s*:\s*"[^"]+"/.test(trailing) || /"function"\s*:\s*"[^"]+"/.test(trailing)) {
+                if (/"(?:name|function|tool|query|action)"\s*:\s*"[^"]+"/.test(trailing)) {
                     break;
                 }
             }
@@ -3678,7 +3788,7 @@ async function executeClientToolCall(tc, turnRetrievedDocs = null) {
 
         // Disambiguate accidental youtube_search calls for general search requests (e.g. "search Tino Bruno", "who is ...")
         if (tc.name === 'youtube_search' && !isMediaSearchQuery(query)) {
-            const latestUserMsg = (chatHistory.filter(m => m.role === 'user').slice(-1)[0]?.content || '').trim().toLowerCase();
+            const latestUserMsg = getUserMessageText(chatHistory.filter(m => m.role === 'user').slice(-1)[0]).trim().toLowerCase();
             const hasMediaKeywords = isMediaSearchQuery(latestUserMsg);
             if (!hasMediaKeywords && (latestUserMsg.startsWith('search') || latestUserMsg.startsWith('cerca') || latestUserMsg.startsWith('who is') || latestUserMsg.startsWith('chi è') || latestUserMsg.startsWith('find'))) {
                 console.log('[Tool Dispatcher] Overriding accidental youtube_search -> web_search for general search query:', query);
@@ -4326,40 +4436,69 @@ async function sendMessage(options = {}) {
                 }
             }
 
-            // If the model did not emit a formal <tool_call> tag but announced an intent to search:
-            if (validToolCalls.length === 0 && (roundFinishReason === 'stop' || roundFinishReason === 'tool_calls') && activeTools.includes('web_search')) {
-                const searchIntentMatch = roundContent.match(/(?:i['’]ll|i will|let me|allow me to|i can|i am going to|i['’]m going to|i need to|need to|should|must|have to|going to)\s+search\s+(?:the\s+web\s+)?(?:for|to\s+find)?\s*["'’]?([^.\n!?:;]+)/i);
-                const isRealTimeRefusal = /(?:don['’]t have|do not have|no)\s+(?:access to\s+)?(?:real-time|current|live|up-to-date)\s+(?:information|data|news|updates)|(?:cannot|can['’]t)\s+(?:browse|access)\s+(?:the\s+)?web/i.test(roundContent);
-                if (searchIntentMatch && searchIntentMatch[1]) {
-                    let extractedQuery = searchIntentMatch[1].trim();
-                    extractedQuery = extractedQuery.replace(/^(?:out\s+)?(?:who\s+secured\s+|the\s+latest\s+|the\s+most\s+recent\s+)?/i, "").trim();
-                    if (/^(?:that|this|it|the\s+answer|information|more)$/i.test(extractedQuery)) {
-                        const lastUserMsg = chatHistory.filter(m => m.role === "user").slice(-1)[0]?.content || "";
-                        extractedQuery = lastUserMsg.trim();
-                    }
-                    if (extractedQuery.length >= 3) {
-                        console.log("[Agentic Auto-Tool] Triggering web_search from announced intent:", extractedQuery);
-                        validToolCalls.push({
-                            id: "call_intent_" + Date.now(),
-                            type: "function",
-                            name: "web_search",
-                            arguments: JSON.stringify({ query: extractedQuery })
-                        });
-                    }
-                } else if (round === 1) {
-                    const lastUserMsg = chatHistory.filter(m => m.role === "user").slice(-1)[0]?.content || "";
-                    let cleanUserQuery = lastUserMsg.replace(/^(?:hello|hi|hey|please|can you|could you|tell me|do you know)\s+/i, "").trim();
-                    const asksForDateOrEvent = /(?:which|what)\s+(?:date|race|circuit|event)\b|(?:specify|clarify|tell me)\s+(?:the\s+)?date/i.test(roundContent);
-                    const userAskedTemporal = /(?:this morning|today|tonight|yesterday|this weekend|pole position|who won|latest|current)/i.test(lastUserMsg);
+            // If the model did not emit a formal <tool_call> tag but announced an intent to search or user requested media/search:
+            if (validToolCalls.length === 0 && (roundFinishReason === 'stop' || roundFinishReason === 'tool_calls')) {
+                const lastUserMsg = (function() {
+                    const userMsgs = chatHistory.filter(m => m.role === 'user');
+                    if (userMsgs.length === 0) return '';
+                    return getUserMessageText(userMsgs[userMsgs.length - 1]);
+                })();
 
-                    if ((isRealTimeRefusal || (asksForDateOrEvent && userAskedTemporal)) && cleanUserQuery.length >= 3) {
-                        console.log("[Agentic Auto-Tool] Model gave refusal or asked for date/race specification; triggering web_search for:", cleanUserQuery);
+                // A. YouTube Search Intent & Playback Auto-Trigger
+                if (activeTools.includes('youtube_search')) {
+                    const ytQuery = detectYouTubeSearchIntent(roundContent, round, lastUserMsg, chatHistory);
+                    if (ytQuery && ytQuery.length >= 2) {
+                        console.log("[Agentic Auto-Tool] Auto-triggering youtube_search for:", ytQuery);
+                        // Clean out any conversational refusal or filler so it does not persist in the UI
+                        roundContent = "";
+                        rawRoundContent = "";
                         validToolCalls.push({
-                            id: "call_fallback_" + Date.now(),
+                            id: "call_yt_auto_" + Date.now(),
                             type: "function",
-                            name: "web_search",
-                            arguments: JSON.stringify({ query: cleanUserQuery })
+                            name: "youtube_search",
+                            arguments: JSON.stringify({ query: ytQuery })
                         });
+                    }
+                }
+
+                // B. Web Search Intent & Fallback Auto-Trigger
+                if (validToolCalls.length === 0 && activeTools.includes('web_search')) {
+                    const searchIntentMatch = roundContent.match(/(?:i['’]ll|i will|let me|allow me to|i can|i am going to|i['’]m going to|i need to|need to|should|must|have to|going to)\s+search\s+(?:the\s+web\s+|online\s+)?(?:for|to\s+find)?\s*["'’]?([^.\n!?:;]+)/i);
+                    const isRealTimeRefusal = /(?:don['’]t have|do not have|no)\s+(?:access to\s+)?(?:real-time|current|live|up-to-date)\s+(?:information|data|news|updates)|(?:cannot|can['’]t)\s+(?:browse|access)\s+(?:the\s+)?web/i.test(roundContent);
+                    if (searchIntentMatch && searchIntentMatch[1]) {
+                        let extractedQuery = searchIntentMatch[1].trim();
+                        extractedQuery = extractedQuery.replace(/^(?:out\s+)?(?:who\s+secured\s+|the\s+latest\s+|the\s+most\s+recent\s+)?/i, "").trim();
+                        if (/^(?:that|this|it|the\s+answer|information|more)$/i.test(extractedQuery)) {
+                            extractedQuery = lastUserMsg.trim();
+                        }
+                        if (extractedQuery.length >= 3) {
+                            console.log("[Agentic Auto-Tool] Triggering web_search from announced intent:", extractedQuery);
+                            roundContent = "";
+                            rawRoundContent = "";
+                            validToolCalls.push({
+                                id: "call_intent_" + Date.now(),
+                                type: "function",
+                                name: "web_search",
+                                arguments: JSON.stringify({ query: extractedQuery })
+                            });
+                        }
+                    } else if (round === 1) {
+                        let cleanUserQuery = lastUserMsg.replace(/^(?:hello|hi|hey|please|can you|could you|tell me|do you know|cerca(?:\s+su\s+google|\s+online)?|search(?:\s+the\s+web|\s+online)?)\s+/i, "").trim();
+                        const asksForDateOrEvent = /(?:which|what)\s+(?:date|race|circuit|event)\b|(?:specify|clarify|tell me)\s+(?:the\s+)?date/i.test(roundContent);
+                        const userAskedTemporal = /(?:this morning|today|tonight|yesterday|this weekend|pole position|who won|latest|current)/i.test(lastUserMsg);
+                        const userExplicitSearch = /^(?:cerca\b|search\b|find\b|look up\b)/i.test(lastUserMsg);
+
+                        if ((isRealTimeRefusal || userExplicitSearch || (asksForDateOrEvent && userAskedTemporal)) && cleanUserQuery.length >= 3) {
+                            console.log("[Agentic Auto-Tool] Triggering web_search for explicit query or temporal inquiry:", cleanUserQuery);
+                            roundContent = "";
+                            rawRoundContent = "";
+                            validToolCalls.push({
+                                id: "call_fallback_" + Date.now(),
+                                type: "function",
+                                name: "web_search",
+                                arguments: JSON.stringify({ query: cleanUserQuery })
+                            });
+                        }
                     }
                 }
             }
@@ -4403,7 +4542,7 @@ async function sendMessage(options = {}) {
                         let isDirectMedia = (tc.name === 'youtube_search' && activeTools.includes('youtube_search') && agenticSettings.fastMediaSearch !== false) ||
                             ((tc.name === 'web_search' || tc.name === 'google_search') && activeTools.includes(tc.name) && (agenticSettings.fastMediaSearch !== false) && isMediaSearchQuery(queryStr));
                         if (tc.name === 'youtube_search' && !isMediaSearchQuery(queryStr)) {
-                            const latestUserMsg = (chatHistory.filter(m => m.role === 'user').slice(-1)[0]?.content || '').trim().toLowerCase();
+                            const latestUserMsg = getUserMessageText(chatHistory.filter(m => m.role === 'user').slice(-1)[0]).trim().toLowerCase();
                             const hasMediaKeywords = isMediaSearchQuery(latestUserMsg);
                             if (!hasMediaKeywords && (latestUserMsg.startsWith('search') || latestUserMsg.startsWith('cerca') || latestUserMsg.startsWith('who is') || latestUserMsg.startsWith('chi è') || latestUserMsg.startsWith('find'))) {
                                 isDirectMedia = false;
@@ -4418,7 +4557,8 @@ async function sendMessage(options = {}) {
                             toolTarget = queryStr;
                             const prov = agenticSettings.searchProvider || 'web';
                             let provName = 'Web';
-                            if (prov === 'tavily') provName = 'Tavily';
+                            if (prov === 'duckduckgo' || prov === 'ddg') provName = 'DuckDuckGo';
+                            else if (prov === 'tavily') provName = 'Tavily';
                             else if (prov === 'searxng') provName = 'SearXNG';
                             else if (prov === 'brave') provName = 'Brave';
                             else if (prov === 'serper') provName = 'Serper';
