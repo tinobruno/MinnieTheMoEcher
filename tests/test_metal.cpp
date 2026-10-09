@@ -683,6 +683,542 @@ bool test_gqa_attention() {
     return true;
 }
 
+bool test_hc_and_sinkhorn() {
+    std::cout << "[TEST] 13. Hyper-Connections (HC) Pre-Norm, Sinkhorn, and Update..." << std::endl;
+    const int hc = 4;
+    const int mix_size = 4;
+    const int hc_dim = 256;
+    const float eps = 1e-6f;
+
+    float* d_mixes;
+    __nv_bfloat16* d_hc_state;
+    float* d_hc_fn;
+    cudaMalloc((void**)&d_mixes, mix_size * sizeof(float));
+    cudaMalloc((void**)&d_hc_state, hc * hc_dim * sizeof(__nv_bfloat16));
+    cudaMalloc((void**)&d_hc_fn, mix_size * hc_dim * sizeof(float));
+
+    for (int i = 0; i < hc * hc_dim; i++) {
+        d_hc_state[i] = __nv_bfloat16::from_float(0.1f * ((i % 11) - 5));
+    }
+    for (int i = 0; i < mix_size * hc_dim; i++) {
+        d_hc_fn[i] = 0.05f * ((i % 7) - 3);
+    }
+
+    gemv_hc_pre_norm_cuda(d_mixes, d_hc_state, d_hc_fn, mix_size, hc_dim, eps, nullptr);
+    metal_stream_synchronize(nullptr);
+
+    for (int i = 0; i < mix_size; i++) {
+        float m = d_mixes[i];
+        TEST_CHECK(!std::isnan(m) && !std::isinf(m), "HC pre-norm produced NaN or Inf");
+    }
+
+    // Split Sinkhorn
+    const int mix_total = (2 + hc) * hc; // 24
+    float *d_sink_mixes, *d_pre, *d_post, *d_comb, *d_scale, *d_base;
+    cudaMalloc((void**)&d_sink_mixes, mix_total * sizeof(float));
+    cudaMalloc((void**)&d_pre, hc * sizeof(float));
+    cudaMalloc((void**)&d_post, hc * sizeof(float));
+    cudaMalloc((void**)&d_comb, hc * hc * sizeof(float));
+    cudaMalloc((void**)&d_scale, 3 * sizeof(float));
+    cudaMalloc((void**)&d_base, mix_total * sizeof(float));
+    for (int i = 0; i < mix_total; i++) {
+        d_sink_mixes[i] = 0.1f * ((i % 5) - 2);
+        d_base[i] = 0.0f;
+    }
+    d_scale[0] = 1.0f; d_scale[1] = 1.0f; d_scale[2] = 1.0f;
+
+    hc_split_sinkhorn_cuda(d_pre, d_post, d_comb, d_sink_mixes, d_scale, d_base, hc, 20, eps, nullptr);
+    metal_stream_synchronize(nullptr);
+
+    for (int i = 0; i < hc; i++) {
+        TEST_CHECK(!std::isnan(d_pre[i]) && !std::isinf(d_pre[i]), "Sinkhorn pre NaN/Inf");
+        TEST_CHECK(!std::isnan(d_post[i]) && !std::isinf(d_post[i]), "Sinkhorn post NaN/Inf");
+        TEST_CHECK(d_pre[i] > 0.0f && d_pre[i] < 1.0f + eps, "Sinkhorn pre weights out of sigmoid range");
+    }
+
+    // Verify comb row sums = 1.0 (doubly stochastic)
+    for (int r = 0; r < hc; r++) {
+        float r_sum = 0.0f;
+        for (int c = 0; c < hc; c++) r_sum += d_comb[r * hc + c];
+        TEST_CHECK(std::fabs(r_sum - 1.0f) < 0.05f, "Sinkhorn comb row sum must be ~1.0");
+    }
+    std::cout << "       Sinkhorn comb matrix is doubly-stochastic (row sum ~ 1.0)" << std::endl;
+
+    // Pre-weighted add + norm
+    __nv_bfloat16 *d_out, *d_norm_w;
+    cudaMalloc((void**)&d_out, hc_dim * sizeof(__nv_bfloat16));
+    cudaMalloc((void**)&d_norm_w, hc_dim * sizeof(__nv_bfloat16));
+    for (int i = 0; i < hc_dim; i++) d_norm_w[i] = __nv_bfloat16::from_float(1.0f);
+
+    hc_pre_weighted_add_norm_cuda(d_out, d_hc_state, d_pre, d_norm_w, hc_dim, hc, eps, nullptr);
+    metal_stream_synchronize(nullptr);
+
+    float norm_sq = 0.0f;
+    for (int i = 0; i < hc_dim; i++) {
+        float val = d_out[i].to_float();
+        TEST_CHECK(!std::isnan(val) && !std::isinf(val), "HC norm produced NaN or Inf");
+        norm_sq += val * val;
+    }
+    float rms = std::sqrt(norm_sq / float(hc_dim));
+    std::cout << "       HC pre-weighted add RMS: " << rms << std::endl;
+    TEST_CHECK(std::fabs(rms - 1.0f) < 0.15f, "RMSNorm of HC output should be close to 1.0");
+    std::cout << "       PASS: Hyper-Connections (HC) Pre-Norm & Sinkhorn" << std::endl;
+
+    cudaFree(d_mixes); cudaFree(d_sink_mixes); cudaFree(d_hc_state); cudaFree(d_hc_fn);
+    cudaFree(d_pre); cudaFree(d_post); cudaFree(d_comb); cudaFree(d_scale); cudaFree(d_base);
+    cudaFree(d_out); cudaFree(d_norm_w);
+    return true;
+}
+
+bool test_mla_attention_fused() {
+    std::cout << "[TEST] 14. MLA Attention Fused (64 heads, 512 head_dim)..." << std::endl;
+    const int n_heads = 64;
+    const int head_dim = 512;
+    const int rope_dim = 64;
+    const int window = 128;
+    const int max_comp = 64;
+    const int max_cache_len = window + max_comp; // 192
+
+    __nv_bfloat16 *d_q, *d_raw_kv, *d_comp_kv, *d_out;
+    float *d_sink, *d_freqs;
+    int32_t *d_pos, *d_comp_cnt;
+    cudaMalloc((void**)&d_q, n_heads * head_dim * sizeof(__nv_bfloat16));
+    cudaMalloc((void**)&d_raw_kv, window * head_dim * sizeof(__nv_bfloat16));
+    cudaMalloc((void**)&d_comp_kv, max_comp * head_dim * sizeof(__nv_bfloat16));
+    cudaMalloc((void**)&d_sink, n_heads * sizeof(float));
+    cudaMalloc((void**)&d_out, n_heads * head_dim * sizeof(__nv_bfloat16));
+    cudaMalloc((void**)&d_pos, sizeof(int32_t));
+    cudaMalloc((void**)&d_comp_cnt, sizeof(int32_t));
+    cudaMalloc((void**)&d_freqs, 65536 * (rope_dim / 2) * 2 * sizeof(float));
+
+    *d_pos = 10;
+    *d_comp_cnt = 0;
+
+    for (int i = 0; i < n_heads * head_dim; i++) {
+        d_q[i] = __nv_bfloat16::from_float(0.01f * ((i % 13) - 6));
+    }
+    for (int i = 0; i < window * head_dim; i++) {
+        d_raw_kv[i] = __nv_bfloat16::from_float(0.02f * ((i % 17) - 8));
+    }
+    for (int i = 0; i < max_comp * head_dim; i++) {
+        d_comp_kv[i] = __nv_bfloat16::from_float(0.0f);
+    }
+    for (int i = 0; i < n_heads; i++) {
+        d_sink[i] = -10.0f;
+    }
+    // Simple identity RoPE freqs (cos=1, sin=0)
+    for (int i = 0; i < 65536 * (rope_dim / 2) * 2; i += 2) {
+        d_freqs[i] = 1.0f;
+        d_freqs[i + 1] = 0.0f;
+    }
+
+    float scale = 1.0f / std::sqrt((float)head_dim);
+    mla_attention_fused_cuda(
+        d_q, d_raw_kv, d_comp_kv, d_sink, d_out,
+        d_pos, d_comp_cnt, d_freqs, max_cache_len,
+        head_dim, rope_dim, scale, 1e-6f,
+        nullptr, window, nullptr);
+    metal_stream_synchronize(nullptr);
+
+    float norm = 0.0f;
+    for (int i = 0; i < n_heads * head_dim; i++) {
+        float v = d_out[i].to_float();
+        TEST_CHECK(!std::isnan(v) && !std::isinf(v), "MLA attention produced NaN or Inf");
+        norm += v * v;
+    }
+    std::cout << "       MLA Attention output norm: " << std::sqrt(norm) << std::endl;
+    TEST_CHECK(norm > 0.01f, "MLA attention output norm unexpectedly zero");
+    std::cout << "       PASS: MLA Attention Fused Kernel" << std::endl;
+
+    cudaFree(d_q); cudaFree(d_raw_kv); cudaFree(d_comp_kv); cudaFree(d_sink);
+    cudaFree(d_out); cudaFree(d_pos); cudaFree(d_comp_cnt); cudaFree(d_freqs);
+    return true;
+}
+
+bool test_gemv_iq2_xxs_and_swiglu() {
+    std::cout << "[TEST] 15. IQ2_XXS SwiGLU Fused GEMV..." << std::endl;
+    const int N = 64;
+    const int K = 256;
+    const int n_blocks = K / 256;
+
+    __nv_bfloat16 *d_out, *d_vec;
+    block_iq2_xxs *d_w1, *d_w3;
+    cudaMalloc((void**)&d_out, N * sizeof(__nv_bfloat16));
+    cudaMalloc((void**)&d_vec, K * sizeof(__nv_bfloat16));
+    cudaMalloc((void**)&d_w1, N * n_blocks * sizeof(block_iq2_xxs));
+    cudaMalloc((void**)&d_w3, N * n_blocks * sizeof(block_iq2_xxs));
+
+    for (int i = 0; i < K; i++) {
+        d_vec[i] = __nv_bfloat16::from_float(0.1f * ((i % 5) - 2));
+    }
+    for (int r = 0; r < N; r++) {
+        d_w1[r].d = half::from_float(0.25f);
+        d_w3[r].d = half::from_float(0.25f);
+        for (int q = 0; q < 32; q++) {
+            d_w1[r].qs[q] = (uint16_t)((r * 31 + q * 17) & 0xFFFF);
+            d_w3[r].qs[q] = (uint16_t)((r * 43 + q * 23) & 0xFFFF);
+        }
+    }
+
+    gemv_iq2_xxs_swiglu_fused_cuda(d_out, d_vec, d_w1, d_w3, N, K, 0.0f, nullptr);
+    metal_stream_synchronize(nullptr);
+
+    float norm = 0.0f;
+    for (int i = 0; i < N; i++) {
+        float v = d_out[i].to_float();
+        TEST_CHECK(!std::isnan(v) && !std::isinf(v), "IQ2_XXS SwiGLU produced NaN or Inf");
+        norm += v * v;
+    }
+    std::cout << "       IQ2_XXS SwiGLU output energy: " << std::sqrt(norm) << std::endl;
+    TEST_CHECK(norm > 0.001f, "IQ2_XXS SwiGLU output unexpectedly zero");
+    std::cout << "       PASS: IQ2_XXS SwiGLU Fused Kernel" << std::endl;
+
+    cudaFree(d_out); cudaFree(d_vec); cudaFree(d_w1); cudaFree(d_w3);
+    return true;
+}
+
+bool test_gemv_q2_k() {
+    std::cout << "[TEST] 16. Q2_K GEMV Down-Projection..." << std::endl;
+    const int N = 64;
+    const int K = 256;
+    const int n_blocks = K / 256;
+
+    __nv_bfloat16 *d_out, *d_vec;
+    block_q2_K *d_weight;
+    cudaMalloc((void**)&d_out, N * sizeof(__nv_bfloat16));
+    cudaMalloc((void**)&d_vec, K * sizeof(__nv_bfloat16));
+    cudaMalloc((void**)&d_weight, N * n_blocks * sizeof(block_q2_K));
+
+    for (int i = 0; i < K; i++) {
+        d_vec[i] = __nv_bfloat16::from_float(0.1f * ((i % 7) - 3));
+    }
+    for (int r = 0; r < N; r++) {
+        d_weight[r].d = half::from_float(0.5f);
+        d_weight[r].dmin = half::from_float(0.1f);
+        for (int s = 0; s < 16; s++) d_weight[r].scales[s] = 0x22;
+        for (int q = 0; q < 64; q++) d_weight[r].qs[q] = (uint8_t)((r * 19 + q) & 0xFF);
+    }
+
+    gemv_q2_k_cuda(d_out, d_vec, d_weight, N, K, nullptr);
+    metal_stream_synchronize(nullptr);
+
+    // Compute CPU reference GEMV
+    float max_err = 0.0f;
+    for (int r = 0; r < N; r++) {
+        float ref_sum = 0.0f;
+        for (int b = 0; b < n_blocks; b++) {
+            const block_q2_K& blk = d_weight[r * n_blocks + b];
+            float d = blk.d.to_float();
+            float min = blk.dmin.to_float();
+            for (int group = 0; group < 16; group++) {
+                uint8_t sc = blk.scales[group];
+                float dl = d * (float)(sc & 0x0F);
+                float ml = min * (float)(sc >> 4);
+                int q_base = 32 * (group / 8) + 16 * (group & 1);
+                int shift = ((group / 2) & 3) * 2;
+                for (int l = 0; l < 16; l++) {
+                    uint8_t q = (blk.qs[q_base + l] >> shift) & 0x03;
+                    float w = dl * (float)q - ml;
+                    int col = b * 256 + group * 16 + l;
+                    ref_sum += w * d_vec[col].to_float();
+                }
+            }
+        }
+        float gpu_val = d_out[r].to_float();
+        float err = std::abs(gpu_val - ref_sum);
+        if (err > max_err) max_err = err;
+    }
+    std::cout << "       Max Q2_K GEMV vs CPU error: " << max_err << std::endl;
+    TEST_CHECK(max_err < 0.1f, "Q2_K GEMV Metal kernel produced excessive error vs reference");
+    std::cout << "       PASS: Q2_K GEMV Metal Kernel" << std::endl;
+
+    cudaFree(d_out); cudaFree(d_vec); cudaFree(d_weight);
+    return true;
+}
+
+bool test_fp8_dequant_and_gemv() {
+    std::cout << "[TEST] 17. FP8 GEMV & Dequantization..." << std::endl;
+    const int rows = 64;
+    const int cols = 128;
+    const int block_size = 128;
+
+    __nv_bfloat16 *d_dequant, *d_out, *d_vec;
+    uint8_t *d_weight, *d_scale;
+    cudaMalloc((void**)&d_dequant, rows * cols * sizeof(__nv_bfloat16));
+    cudaMalloc((void**)&d_out, rows * sizeof(__nv_bfloat16));
+    cudaMalloc((void**)&d_vec, cols * sizeof(__nv_bfloat16));
+    cudaMalloc((void**)&d_weight, rows * cols);
+    cudaMalloc((void**)&d_scale, rows * (cols / block_size));
+
+    for (int i = 0; i < cols; i++) d_vec[i] = __nv_bfloat16::from_float(0.1f * ((i % 5) - 2));
+    for (int i = 0; i < rows * cols; i++) d_weight[i] = (uint8_t)(0x38 + (i % 8)); // Valid non-zero FP8 E4M3 values
+    for (int i = 0; i < rows; i++) d_scale[i] = 0x7F; // 2^0 = 1.0f in E8M0
+
+    fp8_dequant_cuda(d_dequant, d_weight, d_scale, rows, cols, block_size, nullptr);
+    gemv_fp8_cuda(d_out, d_vec, d_weight, d_scale, rows, cols, block_size, nullptr);
+    metal_stream_synchronize(nullptr);
+
+    float dequant_norm = 0.0f;
+    for (int i = 0; i < rows * cols; i++) {
+        float v = d_dequant[i].to_float();
+        TEST_CHECK(!std::isnan(v) && !std::isinf(v), "FP8 dequant produced NaN or Inf");
+        dequant_norm += v * v;
+    }
+    std::cout << "       FP8 Dequant matrix norm: " << std::sqrt(dequant_norm) << std::endl;
+    TEST_CHECK(dequant_norm > 0.01f, "FP8 dequant norm unexpectedly zero");
+
+    float gemv_norm = 0.0f;
+    for (int i = 0; i < rows; i++) {
+        float v = d_out[i].to_float();
+        TEST_CHECK(!std::isnan(v) && !std::isinf(v), "FP8 GEMV produced NaN or Inf");
+        gemv_norm += v * v;
+    }
+    std::cout << "       FP8 GEMV vector norm: " << std::sqrt(gemv_norm) << std::endl;
+    TEST_CHECK(gemv_norm > 0.01f, "FP8 GEMV norm unexpectedly zero");
+
+    // Microbenchmark with DeepSeek-V4 realistic dimensions: 2048 x 4096
+    const int b_rows = 2048, b_cols = 4096;
+    __nv_bfloat16 *b_out, *b_vec;
+    uint8_t *b_weight, *b_scale;
+    cudaMalloc((void**)&b_out, b_rows * sizeof(__nv_bfloat16));
+    cudaMalloc((void**)&b_vec, b_cols * sizeof(__nv_bfloat16));
+    cudaMalloc((void**)&b_weight, b_rows * b_cols);
+    cudaMalloc((void**)&b_scale, (b_rows / block_size) * (b_cols / block_size));
+    for (int i = 0; i < 5; i++) {
+        gemv_fp8_cuda(b_out, b_vec, b_weight, b_scale, b_rows, b_cols, block_size, nullptr);
+    }
+    metal_stream_synchronize(nullptr);
+    auto t0 = std::chrono::high_resolution_clock::now();
+    for (int i = 0; i < 50; i++) {
+        gemv_fp8_cuda(b_out, b_vec, b_weight, b_scale, b_rows, b_cols, block_size, nullptr);
+    }
+    metal_stream_synchronize(nullptr);
+    // Benchmark wq_b dimensions: 32768 x 1536
+    const int wq_rows = 32768, wq_cols = 1536;
+    __nv_bfloat16 *wq_out, *wq_vec;
+    uint8_t *wq_weight, *wq_scale;
+    cudaMalloc((void**)&wq_out, wq_rows * sizeof(__nv_bfloat16));
+    cudaMalloc((void**)&wq_vec, wq_cols * sizeof(__nv_bfloat16));
+    cudaMalloc((void**)&wq_weight, wq_rows * wq_cols);
+    cudaMalloc((void**)&wq_scale, (wq_rows / block_size) * (wq_cols / block_size));
+    metal_stream_synchronize(nullptr);
+    auto t_wq0 = std::chrono::high_resolution_clock::now();
+    for (int i = 0; i < 10; i++) {
+        gemv_fp8_cuda(wq_out, wq_vec, wq_weight, wq_scale, wq_rows, wq_cols, block_size, nullptr);
+    }
+    metal_stream_synchronize(nullptr);
+    auto t_wq1 = std::chrono::high_resolution_clock::now();
+    double wq_ms = std::chrono::duration<double, std::milli>(t_wq1 - t_wq0).count() / 10.0;
+    std::cout << "       FP8 GEMV wq_b (32768x1536) benchmark: " << wq_ms << " ms" << std::endl;
+    cudaFree(wq_out); cudaFree(wq_vec); cudaFree(wq_weight); cudaFree(wq_scale);
+
+    // Benchmark wo_b dimensions: 4096 x 8192
+    const int wob_rows = 4096, wob_cols = 8192;
+    __nv_bfloat16 *wob_out, *wob_vec;
+    uint8_t *wob_weight, *wob_scale;
+    cudaMalloc((void**)&wob_out, wob_rows * sizeof(__nv_bfloat16));
+    cudaMalloc((void**)&wob_vec, wob_cols * sizeof(__nv_bfloat16));
+    cudaMalloc((void**)&wob_weight, wob_rows * wob_cols);
+    cudaMalloc((void**)&wob_scale, (wob_rows / block_size) * (wob_cols / block_size));
+    metal_stream_synchronize(nullptr);
+    auto t_wob0 = std::chrono::high_resolution_clock::now();
+    for (int i = 0; i < 10; i++) {
+        gemv_fp8_cuda(wob_out, wob_vec, wob_weight, wob_scale, wob_rows, wob_cols, block_size, nullptr);
+    }
+    metal_stream_synchronize(nullptr);
+    auto t_wob1 = std::chrono::high_resolution_clock::now();
+    double wob_ms = std::chrono::duration<double, std::milli>(t_wob1 - t_wob0).count() / 10.0;
+    std::cout << "       FP8 GEMV wo_b (4096x8192) benchmark: " << wob_ms << " ms" << std::endl;
+    cudaFree(wob_out); cudaFree(wob_vec); cudaFree(wob_weight); cudaFree(wob_scale);
+    std::cout << "       PASS: FP8 Dequant & GEMV Metal Kernels" << std::endl;
+
+    cudaFree(d_dequant); cudaFree(d_out); cudaFree(d_vec); cudaFree(d_weight); cudaFree(d_scale);
+    return true;
+}
+
+bool test_fused_moe_accum() {
+    std::cout << "[TEST] 18. Fused 6-way MoE Dynamic Accumulation..." << std::endl;
+    const int dim = 4096;
+    __nv_bfloat16 *d_accum, *d_down_buf, *d_shared_down;
+    float *d_topk_weights;
+    cudaMalloc((void**)&d_accum, dim * sizeof(__nv_bfloat16));
+    cudaMalloc((void**)&d_down_buf, 6 * dim * sizeof(__nv_bfloat16));
+    cudaMalloc((void**)&d_shared_down, dim * sizeof(__nv_bfloat16));
+    cudaMalloc((void**)&d_topk_weights, 6 * sizeof(float));
+
+    float weights[6] = {0.25f, 0.20f, 0.15f, 0.15f, 0.15f, 0.10f};
+    for (int k = 0; k < 6; k++) d_topk_weights[k] = weights[k];
+    for (int i = 0; i < dim; i++) {
+        d_shared_down[i] = __nv_bfloat16::from_float(0.05f * ((i % 5) - 2));
+        for (int k = 0; k < 6; k++) {
+            d_down_buf[k * dim + i] = __nv_bfloat16::from_float(0.1f * ((i + k) % 7 - 3));
+        }
+    }
+
+    fused_moe_accum_dynamic_cuda(d_accum, d_down_buf, d_topk_weights, d_shared_down, dim, nullptr);
+    metal_stream_synchronize(nullptr);
+
+    float max_err = 0.0f;
+    for (int i = 0; i < dim; i++) {
+        float ref = d_shared_down[i].to_float();
+        for (int k = 0; k < 6; k++) {
+            ref += d_down_buf[k * dim + i].to_float() * weights[k];
+        }
+        float gpu_val = d_accum[i].to_float();
+        float err = std::abs(gpu_val - ref);
+        if (err > max_err) max_err = err;
+    }
+    std::cout << "       Max MoE Accumulation vs CPU error: " << max_err << std::endl;
+    TEST_CHECK(max_err < 0.05f, "Fused MoE accumulation error exceeds tolerance");
+    std::cout << "       PASS: Fused MoE Dynamic Accumulation Metal Kernel" << std::endl;
+
+    cudaFree(d_accum); cudaFree(d_down_buf); cudaFree(d_shared_down); cudaFree(d_topk_weights);
+    return true;
+}
+
+bool test_moe_top6_routing() {
+    std::cout << "[TEST] 19. GPU-Accelerated MoE Top-6 Routing Kernel..." << std::endl;
+    const int M = 8;
+    const int n_experts = 256;
+    const int top_k = 6;
+    const float routed_scaling = 2.5f;
+
+    __nv_bfloat16* d_scores;
+    float* d_bias;
+    int32_t* d_topk_ids;
+    float* d_topk_weights;
+
+    cudaMalloc((void**)&d_scores, M * n_experts * sizeof(__nv_bfloat16));
+    cudaMalloc((void**)&d_bias, n_experts * sizeof(float));
+    cudaMalloc((void**)&d_topk_ids, M * top_k * sizeof(int32_t));
+    cudaMalloc((void**)&d_topk_weights, M * top_k * sizeof(float));
+
+    std::vector<__nv_bfloat16> h_scores(M * n_experts);
+    std::vector<float> h_bias(n_experts);
+    for (int i = 0; i < n_experts; i++) {
+        h_bias[i] = 0.05f * std::sin((float)i * 0.1f);
+    }
+    for (int m = 0; m < M; m++) {
+        for (int i = 0; i < n_experts; i++) {
+            float val = std::cos((float)(m * 256 + i) * 0.07f) * 4.0f;
+            h_scores[m * n_experts + i] = __nv_bfloat16::from_float(val);
+        }
+    }
+
+    cudaMemcpy(d_scores, h_scores.data(), M * n_experts * sizeof(__nv_bfloat16), cudaMemcpyHostToDevice);
+    cudaMemcpy(d_bias, h_bias.data(), n_experts * sizeof(float), cudaMemcpyHostToDevice);
+
+    // Test 1: Single token routing
+    moe_route_top6_from_bf16_cuda(d_topk_ids, d_topk_weights, d_scores, d_bias, n_experts, top_k, routed_scaling, nullptr);
+    metal_stream_synchronize(nullptr);
+
+    // CPU reference for token 0
+    std::vector<std::pair<float, int>> ref_exp_scores(n_experts);
+    std::vector<float> ref_exp_probs(n_experts);
+    for (int i = 0; i < n_experts; i++) {
+        float raw = h_scores[i].to_float();
+        float sp = (raw > 20.0f) ? raw : ((raw < -20.0f) ? expf(raw) : log1pf(expf(raw)));
+        float prob = sqrtf(sp);
+        ref_exp_probs[i] = prob;
+        ref_exp_scores[i] = {prob + h_bias[i], i};
+    }
+    std::partial_sort(ref_exp_scores.begin(), ref_exp_scores.begin() + top_k, ref_exp_scores.end(),
+                      [](const auto& a, const auto& b) { return a.first > b.first; });
+    float ref_sum_p = 0.0f;
+    for (int k = 0; k < top_k; k++) ref_sum_p += ref_exp_probs[ref_exp_scores[k].second];
+    if (ref_sum_p < 1e-6f) ref_sum_p = 1e-6f;
+
+    std::vector<int32_t> out_ids(M * top_k);
+    std::vector<float> out_weights(M * top_k);
+    cudaMemcpy(out_ids.data(), d_topk_ids, top_k * sizeof(int32_t), cudaMemcpyDeviceToHost);
+    cudaMemcpy(out_weights.data(), d_topk_weights, top_k * sizeof(float), cudaMemcpyDeviceToHost);
+
+    for (int k = 0; k < top_k; k++) {
+        int expected_id = ref_exp_scores[k].second;
+        float expected_w = (ref_exp_probs[expected_id] / ref_sum_p) * routed_scaling;
+        TEST_CHECK(out_ids[k] == expected_id, "Single-token routing ID mismatch");
+        TEST_CHECK(std::abs(out_weights[k] - expected_w) < 1e-4f, "Single-token routing weight mismatch");
+    }
+
+    // Test 2: Batched routing for M tokens
+    moe_route_top6_from_bf16_batch_cuda(d_topk_ids, d_topk_weights, d_scores, d_bias, M, n_experts, top_k, routed_scaling, nullptr);
+    metal_stream_synchronize(nullptr);
+    cudaMemcpy(out_ids.data(), d_topk_ids, M * top_k * sizeof(int32_t), cudaMemcpyDeviceToHost);
+    cudaMemcpy(out_weights.data(), d_topk_weights, M * top_k * sizeof(float), cudaMemcpyDeviceToHost);
+
+    for (int m = 0; m < M; m++) {
+        for (int i = 0; i < n_experts; i++) {
+            float raw = h_scores[m * n_experts + i].to_float();
+            float sp = (raw > 20.0f) ? raw : ((raw < -20.0f) ? expf(raw) : log1pf(expf(raw)));
+            float prob = sqrtf(sp);
+            ref_exp_probs[i] = prob;
+            ref_exp_scores[i] = {prob + h_bias[i], i};
+        }
+        std::partial_sort(ref_exp_scores.begin(), ref_exp_scores.begin() + top_k, ref_exp_scores.end(),
+                          [](const auto& a, const auto& b) { return a.first > b.first; });
+        float m_sum_p = 0.0f;
+        for (int k = 0; k < top_k; k++) m_sum_p += ref_exp_probs[ref_exp_scores[k].second];
+        if (m_sum_p < 1e-6f) m_sum_p = 1e-6f;
+
+        for (int k = 0; k < top_k; k++) {
+            int expected_id = ref_exp_scores[k].second;
+            float expected_w = (ref_exp_probs[expected_id] / m_sum_p) * routed_scaling;
+            TEST_CHECK(out_ids[m * top_k + k] == expected_id, "Batched routing ID mismatch");
+            TEST_CHECK(std::abs(out_weights[m * top_k + k] - expected_w) < 1e-4f, "Batched routing weight mismatch");
+        }
+    }
+
+    std::cout << "       PASS: GPU MoE Top-6 Routing (Single & Batched M=" << M << ")" << std::endl;
+    cudaFree(d_scores); cudaFree(d_bias); cudaFree(d_topk_ids); cudaFree(d_topk_weights);
+    return true;
+}
+
+bool test_markov_head_predict() {
+    std::cout << "[TEST] 20. DeepSeek V4 MTP Markov Head Predict Kernel..." << std::endl;
+    const int vocab_size = 1024;
+    const int hidden_dim = 256;
+    const int input_token = 42;
+    const int expected_target = 314;
+
+    __nv_bfloat16* d_w1;
+    __nv_bfloat16* d_w2;
+    int32_t* d_pred;
+    float* d_temp_vals;
+    int32_t* d_temp_idx;
+
+    cudaMalloc((void**)&d_w1, (size_t)vocab_size * hidden_dim * sizeof(__nv_bfloat16));
+    cudaMalloc((void**)&d_w2, (size_t)vocab_size * hidden_dim * sizeof(__nv_bfloat16));
+    cudaMalloc((void**)&d_pred, sizeof(int32_t));
+    cudaMalloc((void**)&d_temp_vals, 256 * sizeof(float));
+    cudaMalloc((void**)&d_temp_idx, 256 * sizeof(int32_t));
+
+    std::vector<__nv_bfloat16> h_w1((size_t)vocab_size * hidden_dim, __nv_bfloat16::from_float(0.01f));
+    std::vector<__nv_bfloat16> h_w2((size_t)vocab_size * hidden_dim, __nv_bfloat16::from_float(0.01f));
+
+    // Make input_token vector distinctive
+    for (int d = 0; d < hidden_dim; d++) {
+        h_w1[(size_t)input_token * hidden_dim + d] = __nv_bfloat16::from_float(0.1f * (d % 5 + 1));
+        // Make expected_target have the highest dot product
+        h_w2[(size_t)expected_target * hidden_dim + d] = __nv_bfloat16::from_float(0.5f * (d % 5 + 1));
+    }
+
+    cudaMemcpy(d_w1, h_w1.data(), h_w1.size() * sizeof(__nv_bfloat16), cudaMemcpyHostToDevice);
+    cudaMemcpy(d_w2, h_w2.data(), h_w2.size() * sizeof(__nv_bfloat16), cudaMemcpyHostToDevice);
+
+    markov_head_predict_cuda(d_pred, d_temp_vals, d_temp_idx, d_w1, d_w2, input_token, vocab_size, hidden_dim, nullptr);
+    metal_stream_synchronize(nullptr);
+
+    int32_t pred_result = -1;
+    cudaMemcpy(&pred_result, d_pred, sizeof(int32_t), cudaMemcpyDeviceToHost);
+
+    std::cout << "       Predicted next token: " << pred_result << " (expected: " << expected_target << ")" << std::endl;
+    TEST_CHECK(pred_result == expected_target, "Markov head predicted token does not match expected target");
+    std::cout << "       PASS: DeepSeek V4 MTP Markov Head Predict Kernel" << std::endl;
+
+    cudaFree(d_w1); cudaFree(d_w2); cudaFree(d_pred); cudaFree(d_temp_vals); cudaFree(d_temp_idx);
+    return true;
+}
+
 int main() {
     std::cout << "==========================================================" << std::endl;
     std::cout << "  MinnieTheMoEcher — Metal Backend Test Suite (Apple M6)  " << std::endl;
@@ -700,9 +1236,18 @@ int main() {
     if (!test_gemv_int4_gpu()) return 1;
     if (!test_gemv_int3_gpu()) return 1;
     if (!test_gqa_attention()) return 1;
+    if (!test_hc_and_sinkhorn()) return 1;
+    if (!test_mla_attention_fused()) return 1;
+    if (!test_gemv_iq2_xxs_and_swiglu()) return 1;
+    if (!test_gemv_q2_k()) return 1;
+    if (!test_fp8_dequant_and_gemv()) return 1;
+    if (!test_fused_moe_accum()) return 1;
+    if (!test_moe_top6_routing()) return 1;
+    if (!test_markov_head_predict()) return 1;
 
     std::cout << "==========================================================" << std::endl;
-    std::cout << "  ALL TESTS PASSED ON APPLE SILICON METAL GPU!            " << std::endl;
+    std::cout << "  ALL 20 TESTS PASSED ON APPLE SILICON METAL GPU!         " << std::endl;
     std::cout << "==========================================================" << std::endl;
     return 0;
 }
+

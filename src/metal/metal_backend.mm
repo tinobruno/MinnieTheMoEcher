@@ -34,20 +34,20 @@ struct MetalStreamObj {
     id<MTLCommandBuffer> current_cmd_buf;
     id<MTLComputeCommandEncoder> current_encoder;
     id<MTLCommandBuffer> last_submitted_cmd_buf;
-    int encoder_count;
+    int dispatch_count;
 
     MetalStreamObj(id<MTLCommandQueue> q)
-        : queue(q), current_cmd_buf(nil), current_encoder(nil), last_submitted_cmd_buf(nil), encoder_count(0) {}
+        : queue(q), current_cmd_buf(nil), current_encoder(nil), last_submitted_cmd_buf(nil), dispatch_count(0) {}
 
     id<MTLComputeCommandEncoder> get_encoder() {
         if (!current_cmd_buf) {
             current_cmd_buf = [queue commandBuffer];
-            encoder_count = 0;
+            dispatch_count = 0;
         }
         if (!current_encoder) {
             current_encoder = [current_cmd_buf computeCommandEncoder];
-            encoder_count++;
         }
+        dispatch_count++;
         return current_encoder;
     }
 
@@ -64,13 +64,12 @@ struct MetalStreamObj {
             [current_cmd_buf commit];
             last_submitted_cmd_buf = current_cmd_buf;
             current_cmd_buf = nil;
-            encoder_count = 0;
+            dispatch_count = 0;
         }
     }
 
     void end_encoder_and_maybe_commit(int batch_limit = 64) {
-        end_encoder();
-        if (encoder_count >= batch_limit) {
+        if (dispatch_count >= batch_limit) {
             commit_async();
         }
     }
@@ -78,7 +77,7 @@ struct MetalStreamObj {
     id<MTLCommandBuffer> get_command_buffer() {
         if (!current_cmd_buf) {
             current_cmd_buf = [queue commandBuffer];
-            encoder_count = 0;
+            dispatch_count = 0;
         }
         end_encoder();
         return current_cmd_buf;
@@ -268,10 +267,12 @@ void metal_memset_async(void* ptr, int value, size_t bytes, cudaStream_t stream)
     metal_memset(ptr, value, bytes);
 }
 
+static inline MetalStreamObj* get_stream(cudaStream_t s) {
+    return s ? (MetalStreamObj*)s : MetalContext::instance().default_stream;
+}
+
 cudaStream_t metal_stream_create() {
-    auto& ctx = MetalContext::instance();
-    id<MTLCommandQueue> q = [ctx.device newCommandQueue];
-    return (cudaStream_t)new MetalStreamObj(q);
+    return (cudaStream_t)MetalContext::instance().default_stream;
 }
 
 void metal_stream_destroy(cudaStream_t stream) {
@@ -287,11 +288,41 @@ void metal_stream_synchronize(cudaStream_t stream) {
     }
 }
 
-cudaEvent_t metal_event_create() { return (cudaEvent_t)0x1; }
-void metal_event_destroy(cudaEvent_t event) { (void)event; }
-void metal_event_record(cudaEvent_t event, cudaStream_t stream) { (void)event; (void)stream; }
-void metal_event_synchronize(cudaEvent_t event) { (void)event; }
-void metal_stream_wait_event(cudaStream_t stream, cudaEvent_t event, unsigned int flags) { (void)stream; (void)event; (void)flags; }
+struct MetalEventObj {
+    id<MTLCommandBuffer> recorded_cmd_buf;
+    MetalEventObj() : recorded_cmd_buf(nil) {}
+};
+
+cudaEvent_t metal_event_create() {
+    return (cudaEvent_t)(new MetalEventObj());
+}
+void metal_event_destroy(cudaEvent_t event) {
+    if (event && event != (cudaEvent_t)0x1) {
+        delete (MetalEventObj*)event;
+    }
+}
+void metal_event_record(cudaEvent_t event, cudaStream_t stream) {
+    MetalStreamObj* s = get_stream(stream);
+    if (s && event && event != (cudaEvent_t)0x1) {
+        s->commit_async();
+        ((MetalEventObj*)event)->recorded_cmd_buf = s->last_submitted_cmd_buf;
+    }
+}
+void metal_event_synchronize(cudaEvent_t event) {
+    if (event && event != (cudaEvent_t)0x1) {
+        MetalEventObj* e = (MetalEventObj*)event;
+        if (e->recorded_cmd_buf) {
+            id<MTLCommandBuffer> cb = e->recorded_cmd_buf;
+            e->recorded_cmd_buf = nil;
+            [cb waitUntilCompleted];
+            return;
+        }
+    }
+    MetalContext::instance().default_stream->commit_and_wait();
+}
+void metal_stream_wait_event(cudaStream_t stream, cudaEvent_t event, unsigned int flags) {
+    (void)stream; (void)event; (void)flags;
+}
 
 void metal_get_device_properties(cudaDeviceProp* prop, int device) {
     (void)device;
@@ -349,6 +380,8 @@ cublasStatus_t metal_gemm_ex(
 
     CBLAS_TRANSPOSE opA = (transa == CUBLAS_OP_T ? CblasTrans : CblasNoTrans);
     CBLAS_TRANSPOSE opB = (transb == CUBLAS_OP_T ? CblasTrans : CblasNoTrans);
+
+    metal_stream_synchronize(0);
 
     if (Atype == CUDA_R_32F && Btype == CUDA_R_32F && Ctype == CUDA_R_32F) {
         cblas_sgemm(CblasColMajor, opA, opB,
@@ -448,9 +481,6 @@ cublasStatus_t metal_gemm_strided_batched_ex(
 //  Kernel Dispatch Implementations
 // ════════════════════════════════════════════════════════════════════════════════
 
-static inline MetalStreamObj* get_stream(cudaStream_t s) {
-    return s ? (MetalStreamObj*)s : MetalContext::instance().default_stream;
-}
 
 void rms_norm_cuda(
     __nv_bfloat16* out, const __nv_bfloat16* x, const __nv_bfloat16* weight,
@@ -1215,7 +1245,7 @@ void gemv_bf16_cuda(float* out, const __nv_bfloat16* W, const __nv_bfloat16* x, 
     [enc setBytes:&N length:sizeof(N) atIndex:3];
     [enc setBytes:&K length:sizeof(K) atIndex:4];
 
-    [enc dispatchThreadgroups:MTLSizeMake(N, 1, 1) threadsPerThreadgroup:MTLSizeMake(64, 1, 1)];
+    [enc dispatchThreadgroups:MTLSizeMake(N, 1, 1) threadsPerThreadgroup:MTLSizeMake(32, 1, 1)];
     s->end_encoder_and_maybe_commit();
 }
 
@@ -1261,14 +1291,44 @@ void gemv_bf16_out_bf16_cuda(__nv_bfloat16* out, const __nv_bfloat16* W, const _
     [enc setBytes:&N length:sizeof(N) atIndex:3];
     [enc setBytes:&K length:sizeof(K) atIndex:4];
 
-    [enc dispatchThreadgroups:MTLSizeMake(N, 1, 1) threadsPerThreadgroup:MTLSizeMake(64, 1, 1)];
+    [enc dispatchThreadgroups:MTLSizeMake(N, 1, 1) threadsPerThreadgroup:MTLSizeMake(32, 1, 1)];
     s->end_encoder_and_maybe_commit();
 }
 
 void gemv_bf16_batch_cuda(float* out, const __nv_bfloat16* W, const __nv_bfloat16* X, int N, int K, int M, cudaStream_t stream) {
-    for (int m = 0; m < M; m++) {
-        gemv_bf16_cuda(out + m * N, W, X + m * K, N, K, stream);
+    if (M <= 0) return;
+    if (M == 1) {
+        gemv_bf16_cuda(out, W, X, N, K, stream);
+        return;
     }
+    auto& ctx = MetalContext::instance();
+    MetalStreamObj* s = get_stream(stream);
+    id<MTLComputePipelineState> pso = ctx.get_pipeline("gemv_bf16_f32_batch_kernel");
+    if (!pso || M > 4) {
+        for (int m = 0; m < M; m++) {
+            gemv_bf16_cuda(out + (size_t)m * N, W, X + (size_t)m * K, N, K, stream);
+        }
+        return;
+    }
+    size_t out_off, w_off, x_off;
+    id<MTLBuffer> b_out = ctx.get_buffer(out, out_off);
+    id<MTLBuffer> b_w = ctx.get_buffer(W, w_off);
+    id<MTLBuffer> b_x = ctx.get_buffer(X, x_off);
+    if (!b_out || !b_w || !b_x) return;
+
+    id<MTLComputeCommandEncoder> enc = s->get_encoder();
+    [enc setComputePipelineState:pso];
+    [enc setBuffer:b_out offset:out_off atIndex:0];
+    [enc setBuffer:b_w offset:w_off atIndex:1];
+    [enc setBuffer:b_x offset:x_off atIndex:2];
+    [enc setBytes:&N length:sizeof(N) atIndex:3];
+    [enc setBytes:&K length:sizeof(K) atIndex:4];
+    [enc setBytes:&M length:sizeof(M) atIndex:5];
+
+    int threads_per_group = 32;
+    [enc dispatchThreadgroups:MTLSizeMake(N, 1, 1)
+        threadsPerThreadgroup:MTLSizeMake(threads_per_group, 1, 1)];
+    s->end_encoder_and_maybe_commit();
 }
 
 
@@ -1923,13 +1983,34 @@ void precompute_freqs_cuda(
     float* freqs, int max_seq_len, int rope_dim, float base, float factor,
     int original_seq_len, int beta_fast, int beta_slow, cudaStream_t stream)
 {
-    (void)factor; (void)original_seq_len; (void)beta_fast; (void)beta_slow; (void)stream;
+    (void)stream;
+    int half_dim = rope_dim / 2;
+    float denom = 2.0f * logf(base);
+    float corr0 = 0.0f;
+    float corr1 = (float)(rope_dim - 1);
+    if (original_seq_len > 0) {
+        corr0 = floorf((float)rope_dim * logf((float)original_seq_len / ((float)beta_fast * 2.0f * 3.141592653589793f)) / denom);
+        corr1 = ceilf((float)rope_dim * logf((float)original_seq_len / ((float)beta_slow * 2.0f * 3.141592653589793f)) / denom);
+        corr0 = fmaxf(0.0f, corr0);
+        corr1 = fminf((float)(rope_dim - 1), corr1);
+    }
+    float freq_scale = (factor > 0.0f) ? (1.0f / factor) : 1.0f;
+
     for (int pos = 0; pos < max_seq_len; pos++) {
-        for (int d = 0; d < rope_dim / 2; d++) {
-            float freq = 1.0f / powf(base, float(d * 2) / float(rope_dim));
-            float angle = float(pos) * freq;
-            freqs[pos * rope_dim + d * 2] = cosf(angle);
-            freqs[pos * rope_dim + d * 2 + 1] = sinf(angle);
+        for (int pair = 0; pair < half_dim; pair++) {
+            int i = pair * 2;
+            float theta_extrap = (float)pos * powf(base, -((float)i) / (float)rope_dim);
+            float theta = freq_scale * theta_extrap;
+
+            if (original_seq_len > 0) {
+                float y = ((float)pair - corr0) / fmaxf(0.001f, corr1 - corr0);
+                float ramp_mix = 1.0f - fminf(1.0f, fmaxf(0.0f, y));
+                theta = (freq_scale * theta_extrap) * (1.0f - ramp_mix) + theta_extrap * ramp_mix;
+            }
+
+            int out_idx = pos * half_dim * 2 + pair * 2;
+            freqs[out_idx]     = cosf(theta);
+            freqs[out_idx + 1] = sinf(theta);
         }
     }
 }
@@ -2248,50 +2329,85 @@ void unpermute_merged_tokens_bf16_cuda(
 
 // ── MoE Top-6 Routing ───────────────────────────────────────────────────────
 
-void moe_route_top6_from_bf16_cuda(
-    int32_t* topk_ids, float* topk_weights, const __nv_bfloat16* scores_bf16,
-    const float* gate_bias, int n_experts, int top_k, float routed_scaling_factor, cudaStream_t stream)
-{
-    (void)stream;
-    std::vector<std::pair<float, int>> exp_scores(n_experts);
-    std::vector<float> exp_probs(n_experts);
-
-    for (int i = 0; i < n_experts; i++) {
-        float raw = scores_bf16[i].to_float();
-        float sp = (raw > 20.0f) ? raw : ((raw < -20.0f) ? expf(raw) : log1pf(expf(raw)));
-        float prob = sqrtf(sp);
-        exp_probs[i] = prob;
-        exp_scores[i] = {prob + (gate_bias ? gate_bias[i] : 0.0f), i};
-    }
-
-    std::partial_sort(exp_scores.begin(), exp_scores.begin() + top_k, exp_scores.end(),
-                      [](const auto& a, const auto& b) { return a.first > b.first; });
-
-    float sum_p = 0.0f;
-    for (int k = 0; k < top_k; k++) {
-        int idx = exp_scores[k].second;
-        sum_p += exp_probs[idx];
-    }
-    if (sum_p < 1e-6f) sum_p = 1e-6f;
-
-    for (int k = 0; k < top_k; k++) {
-        int idx = exp_scores[k].second;
-        topk_ids[k] = idx;
-        topk_weights[k] = (exp_probs[idx] / sum_p) * routed_scaling_factor;
-    }
-}
-
 void moe_route_top6_from_bf16_batch_cuda(
     int32_t* topk_ids, float* topk_weights, const __nv_bfloat16* scores_bf16,
     const float* gate_bias, int M, int n_experts, int top_k, float routed_scaling_factor, cudaStream_t stream)
 {
-    for (int m = 0; m < M; m++) {
-        moe_route_top6_from_bf16_cuda(
-            topk_ids + m * top_k,
-            topk_weights + m * top_k,
-            scores_bf16 + m * n_experts,
-            gate_bias, n_experts, top_k, routed_scaling_factor, stream);
+    if (M <= 0) return;
+    auto& ctx = MetalContext::instance();
+    MetalStreamObj* s = get_stream(stream);
+    id<MTLComputePipelineState> pso = ctx.get_pipeline("moe_route_top6_kernel");
+    if (pso && n_experts <= 512 && top_k <= 8) {
+        size_t id_off = 0, w_off = 0, sc_off = 0, gb_off = 0;
+        id<MTLBuffer> b_ids = ctx.get_buffer(topk_ids, id_off);
+        id<MTLBuffer> b_w   = ctx.get_buffer(topk_weights, w_off);
+        id<MTLBuffer> b_sc  = ctx.get_buffer(scores_bf16, sc_off);
+        id<MTLBuffer> b_gb  = gate_bias ? ctx.get_buffer(gate_bias, gb_off) : nil;
+        if (b_ids && b_w && b_sc) {
+            int has_bias = (gate_bias != nullptr && b_gb != nil) ? 1 : 0;
+            id<MTLComputeCommandEncoder> enc = s->get_encoder();
+            [enc setComputePipelineState:pso];
+            [enc setBuffer:b_ids offset:id_off atIndex:0];
+            [enc setBuffer:b_w   offset:w_off  atIndex:1];
+            [enc setBuffer:b_sc  offset:sc_off atIndex:2];
+            if (b_gb) {
+                [enc setBuffer:b_gb offset:gb_off atIndex:3];
+            } else {
+                [enc setBuffer:b_sc offset:sc_off atIndex:3];
+            }
+            [enc setBytes:&n_experts length:sizeof(n_experts) atIndex:4];
+            [enc setBytes:&top_k length:sizeof(top_k) atIndex:5];
+            [enc setBytes:&routed_scaling_factor length:sizeof(routed_scaling_factor) atIndex:6];
+            [enc setBytes:&has_bias length:sizeof(has_bias) atIndex:7];
+
+            NSUInteger tpg = (n_experts <= 256) ? 256 : 512;
+            [enc dispatchThreadgroups:MTLSizeMake(M, 1, 1) threadsPerThreadgroup:MTLSizeMake(tpg, 1, 1)];
+            s->end_encoder_and_maybe_commit();
+            return;
+        }
     }
+
+    // CPU fallback (synchronized ONCE before the loop, not M times!)
+    metal_stream_synchronize(stream);
+    std::pair<float, int> exp_scores[512];
+    float exp_probs[512];
+    for (int m = 0; m < M; m++) {
+        const __nv_bfloat16* cur_scores = scores_bf16 + m * n_experts;
+        int32_t* cur_topk_ids = topk_ids + m * top_k;
+        float* cur_topk_weights = topk_weights + m * top_k;
+
+        for (int i = 0; i < n_experts; i++) {
+            float raw = cur_scores[i].to_float();
+            float sp = (raw > 20.0f) ? raw : ((raw < -20.0f) ? expf(raw) : log1pf(expf(raw)));
+            float prob = sqrtf(sp);
+            exp_probs[i] = prob;
+            exp_scores[i] = {prob + (gate_bias ? gate_bias[i] : 0.0f), i};
+        }
+
+        std::partial_sort(exp_scores, exp_scores + top_k, exp_scores + n_experts,
+                          [](const auto& a, const auto& b) { return a.first > b.first; });
+
+        float sum_p = 0.0f;
+        for (int k = 0; k < top_k; k++) {
+            int idx = exp_scores[k].second;
+            sum_p += exp_probs[idx];
+        }
+        if (sum_p < 1e-6f) sum_p = 1e-6f;
+
+        for (int k = 0; k < top_k; k++) {
+            int idx = exp_scores[k].second;
+            cur_topk_ids[k] = idx;
+            cur_topk_weights[k] = (exp_probs[idx] / sum_p) * routed_scaling_factor;
+        }
+    }
+}
+
+void moe_route_top6_from_bf16_cuda(
+    int32_t* topk_ids, float* topk_weights, const __nv_bfloat16* scores_bf16,
+    const float* gate_bias, int n_experts, int top_k, float routed_scaling_factor, cudaStream_t stream)
+{
+    moe_route_top6_from_bf16_batch_cuda(
+        topk_ids, topk_weights, scores_bf16, gate_bias, 1, n_experts, top_k, routed_scaling_factor, stream);
 }
 
 void moe_route_top6_cuda(
@@ -2344,14 +2460,47 @@ void fused_moe_accum_dynamic_cuda(
     __nv_bfloat16* accum, const __nv_bfloat16* down_buf, const float* topk_weights,
     const __nv_bfloat16* shared_down, int dim, cudaStream_t stream)
 {
-    (void)stream;
-    for (int i = 0; i < dim; i++) {
-        float sum = shared_down ? shared_down[i].to_float() : 0.0f;
-        for (int k = 0; k < 6; k++) {
-            sum += down_buf[k * dim + i].to_float() * topk_weights[k];
+    if (dim <= 0) return;
+    auto& ctx = MetalContext::instance();
+    MetalStreamObj* s = get_stream(stream);
+    id<MTLComputePipelineState> pso = ctx.get_pipeline("fused_moe_accum_dynamic_kernel");
+    if (!pso) {
+        metal_stream_synchronize(stream);
+        for (int i = 0; i < dim; i++) {
+            float sum = shared_down ? shared_down[i].to_float() : 0.0f;
+            for (int k = 0; k < 6; k++) {
+                sum += down_buf[k * dim + i].to_float() * topk_weights[k];
+            }
+            accum[i] = __nv_bfloat16::from_float(sum);
         }
-        accum[i] = __nv_bfloat16::from_float(sum);
+        return;
     }
+
+    size_t a_off, d_off, w_off, sd_off = 0;
+    id<MTLBuffer> b_accum = ctx.get_buffer(accum, a_off);
+    id<MTLBuffer> b_down  = ctx.get_buffer(down_buf, d_off);
+    id<MTLBuffer> b_topk  = ctx.get_buffer(topk_weights, w_off);
+    id<MTLBuffer> b_sd    = shared_down ? ctx.get_buffer(shared_down, sd_off) : nil;
+    if (!b_accum || !b_down || !b_topk) return;
+
+    int has_shared = (shared_down != nullptr && b_sd != nil) ? 1 : 0;
+    id<MTLComputeCommandEncoder> enc = s->get_encoder();
+    [enc setComputePipelineState:pso];
+    [enc setBuffer:b_accum offset:a_off atIndex:0];
+    [enc setBuffer:b_down  offset:d_off atIndex:1];
+    [enc setBuffer:b_topk  offset:w_off atIndex:2];
+    if (b_sd) {
+        [enc setBuffer:b_sd offset:sd_off atIndex:3];
+    } else {
+        [enc setBuffer:b_accum offset:a_off atIndex:3];
+    }
+    [enc setBytes:&dim length:sizeof(dim) atIndex:4];
+    [enc setBytes:&has_shared length:sizeof(has_shared) atIndex:5];
+
+    NSUInteger tpg = 256;
+    NSUInteger tg = (dim + tpg - 1) / tpg;
+    [enc dispatchThreadgroups:MTLSizeMake(tg, 1, 1) threadsPerThreadgroup:MTLSizeMake(tpg, 1, 1)];
+    s->end_encoder_and_maybe_commit();
 }
 
 void fused_moe_accum_dynamic_batch_cuda(
@@ -2399,24 +2548,29 @@ void iq2_xxs_dequant_cuda(__nv_bfloat16* out, const block_iq2_xxs* weight, int r
 }
 
 void gemv_iq2_xxs_cuda(__nv_bfloat16* out, const __nv_bfloat16* vec, const block_iq2_xxs* weight, int rows, int cols, cudaStream_t stream) {
-    (void)stream;
-    int blocks_per_row = cols / 256;
-    for (int r = 0; r < rows; r++) {
-        float sum = 0.0f;
-        for (int b = 0; b < blocks_per_row; b++) {
-            const block_iq2_xxs& blk = weight[r * blocks_per_row + b];
-            float d = blk.d.to_float();
-            int in_idx = b * 256;
-            for (int i = 0; i < 256; i++) {
-                int q_idx = i / 8;
-                int shift = (i % 8) * 2;
-                int q = (blk.qs[q_idx] >> shift) & 3;
-                float w = (float(q) - 1.5f) * d;
-                sum += w * vec[in_idx + i].to_float();
-            }
-        }
-        out[r] = __nv_bfloat16::from_float(sum);
-    }
+    if (rows <= 0 || cols <= 0) return;
+    auto& ctx = MetalContext::instance();
+    MetalStreamObj* s = get_stream(stream);
+    id<MTLComputePipelineState> pso = ctx.get_pipeline("gemv_iq2_xxs_kernel");
+    if (!pso) return;
+
+    size_t o_off, v_off, w_off;
+    id<MTLBuffer> b_out = ctx.get_buffer(out, o_off);
+    id<MTLBuffer> b_vec = ctx.get_buffer(vec, v_off);
+    id<MTLBuffer> b_w = ctx.get_buffer(weight, w_off);
+    if (!b_out || !b_vec || !b_w) return;
+
+    id<MTLComputeCommandEncoder> enc = s->get_encoder();
+    [enc setComputePipelineState:pso];
+    [enc setBuffer:b_out offset:o_off atIndex:0];
+    [enc setBuffer:b_vec offset:v_off atIndex:1];
+    [enc setBuffer:b_w offset:w_off atIndex:2];
+    [enc setBytes:&rows length:sizeof(rows) atIndex:3];
+    [enc setBytes:&cols length:sizeof(cols) atIndex:4];
+
+    NSUInteger tg = (rows + 7) / 8;
+    [enc dispatchThreadgroups:MTLSizeMake(tg, 1, 1) threadsPerThreadgroup:MTLSizeMake(256, 1, 1)];
+    s->end_encoder_and_maybe_commit();
 }
 
 void gemv_iq2_xxs_swiglu_fused_cuda(
@@ -2424,12 +2578,32 @@ void gemv_iq2_xxs_swiglu_fused_cuda(
     const block_iq2_xxs* w1, const block_iq2_xxs* w3,
     int N, int K, float swiglu_limit, cudaStream_t stream)
 {
-    (void)stream;
-    std::vector<__nv_bfloat16> g(N);
-    std::vector<__nv_bfloat16> u(N);
-    gemv_iq2_xxs_cuda(g.data(), vec, w1, N, K, stream);
-    gemv_iq2_xxs_cuda(u.data(), vec, w3, N, K, stream);
-    silu_mul_cuda(out, g.data(), u.data(), N, swiglu_limit, stream);
+    if (N <= 0 || K <= 0) return;
+    auto& ctx = MetalContext::instance();
+    MetalStreamObj* s = get_stream(stream);
+    id<MTLComputePipelineState> pso = ctx.get_pipeline("gemv_iq2_xxs_swiglu_fused_kernel");
+    if (!pso) return;
+
+    size_t o_off, v_off, w1_off, w3_off;
+    id<MTLBuffer> b_out = ctx.get_buffer(out, o_off);
+    id<MTLBuffer> b_vec = ctx.get_buffer(vec, v_off);
+    id<MTLBuffer> b_w1 = ctx.get_buffer(w1, w1_off);
+    id<MTLBuffer> b_w3 = ctx.get_buffer(w3, w3_off);
+    if (!b_out || !b_vec || !b_w1 || !b_w3) return;
+
+    id<MTLComputeCommandEncoder> enc = s->get_encoder();
+    [enc setComputePipelineState:pso];
+    [enc setBuffer:b_out offset:o_off atIndex:0];
+    [enc setBuffer:b_vec offset:v_off atIndex:1];
+    [enc setBuffer:b_w1 offset:w1_off atIndex:2];
+    [enc setBuffer:b_w3 offset:w3_off atIndex:3];
+    [enc setBytes:&N length:sizeof(N) atIndex:4];
+    [enc setBytes:&K length:sizeof(K) atIndex:5];
+    [enc setBytes:&swiglu_limit length:sizeof(swiglu_limit) atIndex:6];
+
+    NSUInteger tg = (N + 7) / 8;
+    [enc dispatchThreadgroups:MTLSizeMake(tg, 1, 1) threadsPerThreadgroup:MTLSizeMake(256, 1, 1)];
+    s->end_encoder_and_maybe_commit();
 }
 
 void gemv_iq2_xxs_moe_swiglu_fused_cuda(
@@ -2439,8 +2613,10 @@ void gemv_iq2_xxs_moe_swiglu_fused_cuda(
     const void* const* flat_expert_ptrs, int layer_id, int n_experts, cudaStream_t stream)
 {
     (void)topk_ids; (void)flat_expert_ptrs; (void)layer_id; (void)n_experts;
+    if (!active_expert_ptrs) return;
     for (int k = 0; k < 6; k++) {
         const char* exp_base = (const char*)active_expert_ptrs[k];
+        if (!exp_base) continue;
         const block_iq2_xxs* w1 = (const block_iq2_xxs*)(exp_base + w1_offset);
         const block_iq2_xxs* w3 = (const block_iq2_xxs*)(exp_base + w3_offset);
         gemv_iq2_xxs_swiglu_fused_cuda(gate_buf + k * N, vec, w1, w3, N, K, swiglu_limit, stream);
@@ -2474,37 +2650,48 @@ void q2_k_dequant_cuda(__nv_bfloat16* out, const block_q2_K* weight, int rows, i
         for (int b = 0; b < blocks_per_row; b++) {
             const block_q2_K& blk = weight[r * blocks_per_row + b];
             float d = blk.d.to_float();
-            float dmin = blk.dmin.to_float();
-            int out_idx = r * cols + b * 256;
-            for (int i = 0; i < 256; i++) {
-                int q_byte = blk.qs[i / 4];
-                int q = (q_byte >> ((i % 4) * 2)) & 3;
-                float val = d * float(q) - dmin;
-                out[out_idx + i] = __nv_bfloat16::from_float(val);
+            float min = blk.dmin.to_float();
+            __nv_bfloat16* out_row = out + r * cols + b * 256;
+            for (int group = 0; group < 16; group++) {
+                uint8_t sc = blk.scales[group];
+                float dl = d * (float)(sc & 0x0F);
+                float ml = min * (float)(sc >> 4);
+                int q_base = 32 * (group / 8) + 16 * (group & 1);
+                int shift = ((group / 2) & 3) * 2;
+                for (int l = 0; l < 16; l++) {
+                    uint8_t q = (blk.qs[q_base + l] >> shift) & 0x03;
+                    float w = dl * (float)q - ml;
+                    out_row[group * 16 + l] = __nv_bfloat16::from_float(w);
+                }
             }
         }
     }
 }
 
 void gemv_q2_k_cuda(__nv_bfloat16* out, const __nv_bfloat16* vec, const block_q2_K* weight, int rows, int cols, cudaStream_t stream) {
-    (void)stream;
-    int blocks_per_row = cols / 256;
-    for (int r = 0; r < rows; r++) {
-        float sum = 0.0f;
-        for (int b = 0; b < blocks_per_row; b++) {
-            const block_q2_K& blk = weight[r * blocks_per_row + b];
-            float d = blk.d.to_float();
-            float dmin = blk.dmin.to_float();
-            int in_idx = b * 256;
-            for (int i = 0; i < 256; i++) {
-                int q_byte = blk.qs[i / 4];
-                int q = (q_byte >> ((i % 4) * 2)) & 3;
-                float w = d * float(q) - dmin;
-                sum += w * vec[in_idx + i].to_float();
-            }
-        }
-        out[r] = __nv_bfloat16::from_float(sum);
-    }
+    if (rows <= 0 || cols <= 0) return;
+    auto& ctx = MetalContext::instance();
+    MetalStreamObj* s = get_stream(stream);
+    id<MTLComputePipelineState> pso = ctx.get_pipeline("gemv_q2_k_kernel");
+    if (!pso) return;
+
+    size_t o_off, v_off, w_off;
+    id<MTLBuffer> b_out = ctx.get_buffer(out, o_off);
+    id<MTLBuffer> b_vec = ctx.get_buffer(vec, v_off);
+    id<MTLBuffer> b_w = ctx.get_buffer(weight, w_off);
+    if (!b_out || !b_vec || !b_w) return;
+
+    id<MTLComputeCommandEncoder> enc = s->get_encoder();
+    [enc setComputePipelineState:pso];
+    [enc setBuffer:b_out offset:o_off atIndex:0];
+    [enc setBuffer:b_vec offset:v_off atIndex:1];
+    [enc setBuffer:b_w offset:w_off atIndex:2];
+    [enc setBytes:&rows length:sizeof(rows) atIndex:3];
+    [enc setBytes:&cols length:sizeof(cols) atIndex:4];
+
+    NSUInteger tg = (rows + 7) / 8;
+    [enc dispatchThreadgroups:MTLSizeMake(tg, 1, 1) threadsPerThreadgroup:MTLSizeMake(256, 1, 1)];
+    s->end_encoder_and_maybe_commit();
 }
 
 void gemv_q2_k_moe_cuda(
@@ -2513,8 +2700,10 @@ void gemv_q2_k_moe_cuda(
     const int32_t* topk_ids, const void* const* flat_expert_ptrs, int layer_id, int n_experts, cudaStream_t stream)
 {
     (void)topk_ids; (void)flat_expert_ptrs; (void)layer_id; (void)n_experts;
+    if (!active_expert_ptrs) return;
     for (int k = 0; k < 6; k++) {
         const char* exp_base = (const char*)active_expert_ptrs[k];
+        if (!exp_base) continue;
         const block_q2_K* w2 = (const block_q2_K*)(exp_base + w2_offset);
         gemv_q2_k_cuda(down_buf + k * N, gate_buf + k * K, w2, N, K, stream);
     }
@@ -3203,10 +3392,36 @@ void store_kv_device_pos_cuda(
     __nv_bfloat16* kv_cache, const __nv_bfloat16* kv_val,
     const int32_t* d_position, int window, int head_dim, cudaStream_t stream)
 {
-    (void)stream;
-    int pos = d_position ? *d_position : 0;
-    int slot = pos % window;
-    std::memcpy(kv_cache + slot * head_dim, kv_val, head_dim * sizeof(__nv_bfloat16));
+    if (head_dim <= 0) return;
+    auto& ctx = MetalContext::instance();
+    MetalStreamObj* s = get_stream(stream);
+    id<MTLComputePipelineState> pso = ctx.get_pipeline("store_kv_device_pos_kernel");
+    if (!pso) {
+        metal_stream_synchronize(stream);
+        int pos = d_position ? *d_position : 0;
+        int slot = pos % window;
+        std::memcpy(kv_cache + slot * head_dim, kv_val, head_dim * sizeof(__nv_bfloat16));
+        return;
+    }
+
+    size_t c_off, v_off, p_off;
+    id<MTLBuffer> b_c = ctx.get_buffer(kv_cache, c_off);
+    id<MTLBuffer> b_v = ctx.get_buffer(kv_val, v_off);
+    id<MTLBuffer> b_p = ctx.get_buffer(d_position, p_off);
+    if (!b_c || !b_v || !b_p) return;
+
+    id<MTLComputeCommandEncoder> enc = s->get_encoder();
+    [enc setComputePipelineState:pso];
+    [enc setBuffer:b_c offset:c_off atIndex:0];
+    [enc setBuffer:b_v offset:v_off atIndex:1];
+    [enc setBuffer:b_p offset:p_off atIndex:2];
+    [enc setBytes:&window length:sizeof(window) atIndex:3];
+    [enc setBytes:&head_dim length:sizeof(head_dim) atIndex:4];
+
+    NSUInteger tpg = 256;
+    NSUInteger tg = (head_dim + tpg - 1) / tpg;
+    [enc dispatchThreadgroups:MTLSizeMake(tg, 1, 1) threadsPerThreadgroup:MTLSizeMake(tpg, 1, 1)];
+    s->end_encoder_and_maybe_commit();
 }
 
 void mla_attention_fused_cuda(
@@ -3216,9 +3431,65 @@ void mla_attention_fused_cuda(
     int head_dim, int rope_dim, float scale, float q_norm_eps,
     const uint8_t* comp_mask, int window, cudaStream_t stream)
 {
-    (void)raw_q; (void)raw_kv; (void)comp_kv; (void)attn_sink; (void)out; (void)d_position;
-    (void)d_comp_count; (void)freq_table; (void)max_cache_len; (void)head_dim; (void)rope_dim;
-    (void)scale; (void)q_norm_eps; (void)comp_mask; (void)window; (void)stream;
+    if (head_dim <= 0 || max_cache_len <= 0) return;
+    auto& ctx = MetalContext::instance();
+    MetalStreamObj* s = get_stream(stream);
+    id<MTLComputePipelineState> pso = ctx.get_pipeline("mla_attention_fused_kernel");
+    if (!pso) return;
+
+    NSUInteger max_allowed = ctx.device.maxThreadgroupMemoryLength;
+    NSUInteger max_dynamic = (pso.staticThreadgroupMemoryLength < max_allowed) ?
+                             (max_allowed - pso.staticThreadgroupMemoryLength) : 0;
+    int max_cache_floats = (int)(max_dynamic / sizeof(float));
+    if (max_cache_len > max_cache_floats) max_cache_len = max_cache_floats;
+
+    size_t q_off, r_off, c_off = 0, s_off = 0, o_off, pos_off, cnt_off, freq_off, m_off = 0;
+    id<MTLBuffer> b_q = ctx.get_buffer(raw_q, q_off);
+    id<MTLBuffer> b_r = ctx.get_buffer(raw_kv, r_off);
+    id<MTLBuffer> b_c = comp_kv ? ctx.get_buffer(comp_kv, c_off) : nil;
+    id<MTLBuffer> b_s = attn_sink ? ctx.get_buffer(attn_sink, s_off) : nil;
+    id<MTLBuffer> b_out = ctx.get_buffer(out, o_off);
+    id<MTLBuffer> b_pos = ctx.get_buffer(d_position, pos_off);
+    id<MTLBuffer> b_cnt = ctx.get_buffer(d_comp_count, cnt_off);
+    id<MTLBuffer> b_freq = ctx.get_buffer(freq_table, freq_off);
+    id<MTLBuffer> b_mask = comp_mask ? ctx.get_buffer(comp_mask, m_off) : nil;
+
+    if (!b_q || !b_r || !b_out || !b_pos || !b_cnt || !b_freq) return;
+    if (!b_c) {
+        b_c = b_r; // dummy buffer for layers with ratio=0 (never read in shader since n_comp=0)
+        c_off = 0;
+    }
+    if (!b_s) {
+        b_s = b_out;
+        s_off = 0;
+    }
+
+    id<MTLComputeCommandEncoder> enc = s->get_encoder();
+    [enc setComputePipelineState:pso];
+    [enc setBuffer:b_q offset:q_off atIndex:0];
+    [enc setBuffer:b_r offset:r_off atIndex:1];
+    [enc setBuffer:b_c offset:c_off atIndex:2];
+    [enc setBuffer:b_s offset:s_off atIndex:3];
+    [enc setBuffer:b_out offset:o_off atIndex:4];
+    [enc setBuffer:b_pos offset:pos_off atIndex:5];
+    [enc setBuffer:b_cnt offset:cnt_off atIndex:6];
+    [enc setBuffer:b_freq offset:freq_off atIndex:7];
+    [enc setBytes:&max_cache_len length:sizeof(max_cache_len) atIndex:8];
+    [enc setBytes:&head_dim length:sizeof(head_dim) atIndex:9];
+    [enc setBytes:&rope_dim length:sizeof(rope_dim) atIndex:10];
+    [enc setBytes:&scale length:sizeof(scale) atIndex:11];
+    [enc setBytes:&q_norm_eps length:sizeof(q_norm_eps) atIndex:12];
+    [enc setBuffer:b_mask offset:m_off atIndex:13];
+    [enc setBytes:&window length:sizeof(window) atIndex:14];
+
+    NSUInteger smem_bytes = max_cache_len * sizeof(float);
+    if (smem_bytes > max_dynamic) smem_bytes = max_dynamic;
+    [enc setThreadgroupMemoryLength:smem_bytes atIndex:0];
+
+    int n_heads = 64;
+    int n_threads = 256;
+    [enc dispatchThreadgroups:MTLSizeMake(n_heads, 1, 1) threadsPerThreadgroup:MTLSizeMake(n_threads, 1, 1)];
+    s->end_encoder_and_maybe_commit();
 }
 
 void compressor_device_step_cuda(
@@ -3230,11 +3501,61 @@ void compressor_device_step_cuda(
     float* idx_kv_state, float* idx_score_state, const float* idx_ape,
     const __nv_bfloat16* idx_norm, __nv_bfloat16* idx_comp_kv_cache, int max_comp, cudaStream_t stream)
 {
-    (void)d_position; (void)d_comp_count; (void)proj_kv; (void)proj_gate; (void)comp_kv_state;
-    (void)comp_score_state; (void)comp_ape; (void)comp_norm; (void)comp_kv_cache;
-    (void)rope_freqs_compressed; (void)ratio; (void)head_dim; (void)rope_dim; (void)rms_norm_eps;
-    (void)idx_proj_kv; (void)idx_proj_gate; (void)idx_kv_state; (void)idx_score_state;
-    (void)idx_ape; (void)idx_norm; (void)idx_comp_kv_cache; (void)max_comp; (void)stream;
+    auto& ctx = MetalContext::instance();
+    MetalStreamObj* s = get_stream(stream);
+    id<MTLComputePipelineState> pso = ctx.get_pipeline("compressor_device_step_kernel");
+    if (!pso) return;
+
+    size_t pos_off, cnt_off, pkv_off, pg_off, kvs_off, scs_off, ape_off, n_off, kvc_off, rfc_off;
+    id<MTLBuffer> b_pos = ctx.get_buffer(d_position, pos_off);
+    id<MTLBuffer> b_cnt = ctx.get_buffer(d_comp_count, cnt_off);
+    id<MTLBuffer> b_pkv = ctx.get_buffer(proj_kv, pkv_off);
+    id<MTLBuffer> b_pg  = ctx.get_buffer(proj_gate, pg_off);
+    id<MTLBuffer> b_kvs = ctx.get_buffer(comp_kv_state, kvs_off);
+    id<MTLBuffer> b_scs = ctx.get_buffer(comp_score_state, scs_off);
+    id<MTLBuffer> b_ape = ctx.get_buffer(comp_ape, ape_off);
+    id<MTLBuffer> b_n   = ctx.get_buffer(comp_norm, n_off);
+    id<MTLBuffer> b_kvc = ctx.get_buffer(comp_kv_cache, kvc_off);
+    id<MTLBuffer> b_rfc = ctx.get_buffer(rope_freqs_compressed, rfc_off);
+
+    if (!b_pos || !b_cnt || !b_pkv || !b_pg || !b_kvs || !b_scs || !b_ape || !b_n || !b_kvc || !b_rfc) return;
+
+    size_t ipkv_off = 0, ipg_off = 0, ikvs_off = 0, iscs_off = 0, iape_off = 0, in_off = 0, ikvc_off = 0;
+    id<MTLBuffer> b_ipkv = idx_proj_kv ? ctx.get_buffer(idx_proj_kv, ipkv_off) : nil;
+    id<MTLBuffer> b_ipg  = idx_proj_gate ? ctx.get_buffer(idx_proj_gate, ipg_off) : nil;
+    id<MTLBuffer> b_ikvs = idx_kv_state ? ctx.get_buffer(idx_kv_state, ikvs_off) : nil;
+    id<MTLBuffer> b_iscs = idx_score_state ? ctx.get_buffer(idx_score_state, iscs_off) : nil;
+    id<MTLBuffer> b_iape = idx_ape ? ctx.get_buffer(idx_ape, iape_off) : nil;
+    id<MTLBuffer> b_in   = idx_norm ? ctx.get_buffer(idx_norm, in_off) : nil;
+    id<MTLBuffer> b_ikvc = idx_comp_kv_cache ? ctx.get_buffer(idx_comp_kv_cache, ikvc_off) : nil;
+
+    id<MTLComputeCommandEncoder> enc = s->get_encoder();
+    [enc setComputePipelineState:pso];
+    [enc setBuffer:b_pos offset:pos_off atIndex:0];
+    [enc setBuffer:b_cnt offset:cnt_off atIndex:1];
+    [enc setBuffer:b_pkv offset:pkv_off atIndex:2];
+    [enc setBuffer:b_pg offset:pg_off atIndex:3];
+    [enc setBuffer:b_kvs offset:kvs_off atIndex:4];
+    [enc setBuffer:b_scs offset:scs_off atIndex:5];
+    [enc setBuffer:b_ape offset:ape_off atIndex:6];
+    [enc setBuffer:b_n offset:n_off atIndex:7];
+    [enc setBuffer:b_kvc offset:kvc_off atIndex:8];
+    [enc setBuffer:b_rfc offset:rfc_off atIndex:9];
+    [enc setBytes:&ratio length:sizeof(ratio) atIndex:10];
+    [enc setBytes:&head_dim length:sizeof(head_dim) atIndex:11];
+    [enc setBytes:&rope_dim length:sizeof(rope_dim) atIndex:12];
+    [enc setBytes:&rms_norm_eps length:sizeof(rms_norm_eps) atIndex:13];
+    [enc setBuffer:b_ipkv offset:ipkv_off atIndex:14];
+    [enc setBuffer:b_ipg offset:ipg_off atIndex:15];
+    [enc setBuffer:b_ikvs offset:ikvs_off atIndex:16];
+    [enc setBuffer:b_iscs offset:iscs_off atIndex:17];
+    [enc setBuffer:b_iape offset:iape_off atIndex:18];
+    [enc setBuffer:b_in offset:in_off atIndex:19];
+    [enc setBuffer:b_ikvc offset:ikvc_off atIndex:20];
+    [enc setBytes:&max_comp length:sizeof(max_comp) atIndex:21];
+
+    [enc dispatchThreadgroups:MTLSizeMake(1, 1, 1) threadsPerThreadgroup:MTLSizeMake(256, 1, 1)];
+    s->end_encoder_and_maybe_commit();
 }
 
 void rope_device_pos_cuda(
@@ -3255,7 +3576,7 @@ void embedding_broadcast_device_id_cuda(
 
 void embedding_broadcast_batch_cuda(
     __nv_bfloat16* hidden, __nv_bfloat16* hc_state, const __nv_bfloat16* table,
-    const int32_t* d_token_ids, int dim, int hc, int M, cudaStream_t stream)
+    const int32_t* d_token_ids, int M, int dim, int hc, cudaStream_t stream)
 {
     for (int m = 0; m < M; m++) {
         embedding_broadcast_cuda(hidden + m * dim, hc_state + m * hc * dim, table, d_token_ids[m], dim, hc, stream);
@@ -3357,22 +3678,125 @@ void embedding_fp4_cuda(
 // ── Stub Fallbacks for Quantization / Advanced Blackwell Routines ───────────
 
 void fp8_dequant_cuda(__nv_bfloat16* out, const uint8_t* weight, const uint8_t* scale, int rows, int cols, int block_size, cudaStream_t stream) {
-    (void)out; (void)weight; (void)scale; (void)rows; (void)cols; (void)block_size; (void)stream;
+    if (rows <= 0 || cols <= 0) return;
+    auto& ctx = MetalContext::instance();
+    MetalStreamObj* s = get_stream(stream);
+    id<MTLComputePipelineState> pso = ctx.get_pipeline("fp8_dequant_kernel");
+    if (!pso) return;
+
+    size_t o_off, w_off, s_off;
+    id<MTLBuffer> b_out = ctx.get_buffer(out, o_off);
+    id<MTLBuffer> b_w = ctx.get_buffer(weight, w_off);
+    id<MTLBuffer> b_s = ctx.get_buffer(scale, s_off);
+    if (!b_out || !b_w || !b_s) return;
+
+    id<MTLComputeCommandEncoder> enc = s->get_encoder();
+    [enc setComputePipelineState:pso];
+    [enc setBuffer:b_out offset:o_off atIndex:0];
+    [enc setBuffer:b_w offset:w_off atIndex:1];
+    [enc setBuffer:b_s offset:s_off atIndex:2];
+    [enc setBytes:&rows length:sizeof(rows) atIndex:3];
+    [enc setBytes:&cols length:sizeof(cols) atIndex:4];
+    [enc setBytes:&block_size length:sizeof(block_size) atIndex:5];
+
+    MTLSize tg_size = MTLSizeMake(16, 16, 1);
+    MTLSize grid_size = MTLSizeMake((cols + 15) / 16, (rows + 15) / 16, 1);
+    [enc dispatchThreadgroups:grid_size threadsPerThreadgroup:tg_size];
+    s->end_encoder_and_maybe_commit();
 }
+
 void gemv_fp8_cuda(__nv_bfloat16* out, const __nv_bfloat16* vec, const uint8_t* weight, const uint8_t* scale, int rows, int cols, int block_size, cudaStream_t stream) {
-    (void)out; (void)vec; (void)weight; (void)scale; (void)rows; (void)cols; (void)block_size; (void)stream;
+    if (rows <= 0 || cols <= 0) return;
+    auto& ctx = MetalContext::instance();
+    MetalStreamObj* s = get_stream(stream);
+    id<MTLComputePipelineState> pso = ctx.get_pipeline("gemv_fp8_kernel");
+    if (!pso) return;
+
+    size_t o_off, v_off, w_off, s_off;
+    id<MTLBuffer> b_out = ctx.get_buffer(out, o_off);
+    id<MTLBuffer> b_vec = ctx.get_buffer(vec, v_off);
+    id<MTLBuffer> b_w = ctx.get_buffer(weight, w_off);
+    id<MTLBuffer> b_s = ctx.get_buffer(scale, s_off);
+    if (!b_out || !b_vec || !b_w || !b_s) return;
+
+    id<MTLComputeCommandEncoder> enc = s->get_encoder();
+    [enc setComputePipelineState:pso];
+    [enc setBuffer:b_out offset:o_off atIndex:0];
+    [enc setBuffer:b_vec offset:v_off atIndex:1];
+    [enc setBuffer:b_w offset:w_off atIndex:2];
+    [enc setBuffer:b_s offset:s_off atIndex:3];
+    [enc setBytes:&rows length:sizeof(rows) atIndex:4];
+    [enc setBytes:&cols length:sizeof(cols) atIndex:5];
+    [enc setBytes:&block_size length:sizeof(block_size) atIndex:6];
+
+    [enc dispatchThreadgroups:MTLSizeMake(rows, 1, 1) threadsPerThreadgroup:MTLSizeMake(32, 1, 1)];
+    s->end_encoder_and_maybe_commit();
 }
+
 void gemv_fp8_grouped_cuda(__nv_bfloat16* out, const __nv_bfloat16* vec, const uint8_t* weight, const uint8_t* scale, int rows, int cols, int groups, int block_size, cudaStream_t stream) {
-    (void)out; (void)vec; (void)weight; (void)scale; (void)rows; (void)cols; (void)groups; (void)block_size; (void)stream;
+    if (rows <= 0 || cols <= 0 || groups <= 0) return;
+    auto& ctx = MetalContext::instance();
+    MetalStreamObj* s = get_stream(stream);
+    id<MTLComputePipelineState> pso = ctx.get_pipeline("gemv_fp8_grouped_kernel");
+    if (!pso) return;
+
+    size_t o_off, v_off, w_off, s_off;
+    id<MTLBuffer> b_out = ctx.get_buffer(out, o_off);
+    id<MTLBuffer> b_vec = ctx.get_buffer(vec, v_off);
+    id<MTLBuffer> b_w = ctx.get_buffer(weight, w_off);
+    id<MTLBuffer> b_s = ctx.get_buffer(scale, s_off);
+    if (!b_out || !b_vec || !b_w || !b_s) return;
+
+    id<MTLComputeCommandEncoder> enc = s->get_encoder();
+    [enc setComputePipelineState:pso];
+    [enc setBuffer:b_out offset:o_off atIndex:0];
+    [enc setBuffer:b_vec offset:v_off atIndex:1];
+    [enc setBuffer:b_w offset:w_off atIndex:2];
+    [enc setBuffer:b_s offset:s_off atIndex:3];
+    [enc setBytes:&rows length:sizeof(rows) atIndex:4];
+    [enc setBytes:&cols length:sizeof(cols) atIndex:5];
+    [enc setBytes:&groups length:sizeof(groups) atIndex:6];
+    [enc setBytes:&block_size length:sizeof(block_size) atIndex:7];
+
+    [enc dispatchThreadgroups:MTLSizeMake(rows, groups, 1) threadsPerThreadgroup:MTLSizeMake(32, 1, 1)];
+    s->end_encoder_and_maybe_commit();
 }
-void gemv_fp8_grouped_batch_cuda(__nv_bfloat16* out, const __nv_bfloat16* vec, const uint8_t* weight, const uint8_t* scale, int rows, int cols, int groups, int block_size, int M, cudaStream_t stream) {
-    (void)out; (void)vec; (void)weight; (void)scale; (void)rows; (void)cols; (void)groups; (void)block_size; (void)M; (void)stream;
+
+void gemv_fp8_grouped_batch_cuda(__nv_bfloat16* out, const __nv_bfloat16* vec, const uint8_t* weight, const uint8_t* scale, int M, int rows, int cols, int groups, int block_size, cudaStream_t stream) {
+    for (int m = 0; m < M; m++) {
+        gemv_fp8_grouped_cuda(out + (size_t)m * groups * rows, vec + (size_t)m * groups * cols, weight, scale, rows, cols, groups, block_size, stream);
+    }
 }
+
 void gemv_hc_pre_norm_cuda(float* mixes, const __nv_bfloat16* hc_state, const float* hc_fn, int mix_size, int hc_dim, float eps, cudaStream_t stream) {
-    (void)mixes; (void)hc_state; (void)hc_fn; (void)mix_size; (void)hc_dim; (void)eps; (void)stream;
+    if (mix_size <= 0 || hc_dim <= 0) return;
+    auto& ctx = MetalContext::instance();
+    MetalStreamObj* s = get_stream(stream);
+    id<MTLComputePipelineState> pso = ctx.get_pipeline("gemv_hc_pre_norm_kernel");
+    if (!pso) return;
+
+    size_t m_off, h_off, fn_off;
+    id<MTLBuffer> b_mixes = ctx.get_buffer(mixes, m_off);
+    id<MTLBuffer> b_hc = ctx.get_buffer(hc_state, h_off);
+    id<MTLBuffer> b_fn = ctx.get_buffer(hc_fn, fn_off);
+    if (!b_mixes || !b_hc || !b_fn) return;
+
+    id<MTLComputeCommandEncoder> enc = s->get_encoder();
+    [enc setComputePipelineState:pso];
+    [enc setBuffer:b_mixes offset:m_off atIndex:0];
+    [enc setBuffer:b_hc offset:h_off atIndex:1];
+    [enc setBuffer:b_fn offset:fn_off atIndex:2];
+    [enc setBytes:&mix_size length:sizeof(mix_size) atIndex:3];
+    [enc setBytes:&hc_dim length:sizeof(hc_dim) atIndex:4];
+    [enc setBytes:&eps length:sizeof(eps) atIndex:5];
+    [enc dispatchThreadgroups:MTLSizeMake(mix_size, 1, 1) threadsPerThreadgroup:MTLSizeMake(256, 1, 1)];
+    s->end_encoder_and_maybe_commit();
 }
+
 void gemv_hc_pre_norm_batch_cuda(float* mixes, const __nv_bfloat16* hc_state, const float* hc_fn, int M, int mix_size, int hc_dim, float eps, cudaStream_t stream) {
-    (void)mixes; (void)hc_state; (void)hc_fn; (void)M; (void)mix_size; (void)hc_dim; (void)eps; (void)stream;
+    for (int m = 0; m < M; m++) {
+        gemv_hc_pre_norm_cuda(mixes + m * mix_size, hc_state + m * hc_dim, hc_fn, mix_size, hc_dim, eps, stream);
+    }
 }
 void fp4_dequant_cuda(__nv_bfloat16* out, const uint8_t* weight, const uint8_t* scale, int rows, int cols_packed, int scale_cols, cudaStream_t stream) {
     (void)out; (void)weight; (void)scale; (void)rows; (void)cols_packed; (void)scale_cols; (void)stream;
@@ -3386,8 +3810,10 @@ void gemv_int2_cuda(__nv_bfloat16* out, const __nv_bfloat16* vec, const uint8_t*
 void gemm_int2_cuda(__nv_bfloat16* out, const __nv_bfloat16* A, const uint8_t* weight, const __nv_bfloat16* scale_min, int M, int N, int K_packed, int block_size, cudaStream_t stream) {
     (void)out; (void)A; (void)weight; (void)scale_min; (void)M; (void)N; (void)K_packed; (void)block_size; (void)stream;
 }
-void gemv_int4_grouped_batch_cuda(__nv_bfloat16* out, const __nv_bfloat16* A, const uint8_t* weight, const __nv_bfloat16* scale, int N, int K, int num_heads, int M, cudaStream_t stream) {
-    gemm_int4_batch_cuda(out, A, weight, scale, N, K, M, stream);
+void gemv_int4_grouped_batch_cuda(__nv_bfloat16* out, const __nv_bfloat16* A, const uint8_t* weight, const __nv_bfloat16* scale, int M, int N, int K, int groups, cudaStream_t stream) {
+    for (int m = 0; m < M; m++) {
+        gemm_int4_batch_cuda(out + (size_t)m * groups * N, A + (size_t)m * groups * K, weight, scale, N, K, groups, stream);
+    }
 }
 void gemv_sparse_nvfp4_cuda(
     __nv_bfloat16* out, const __nv_bfloat16* vec, const uint8_t* weight,
@@ -3938,31 +4364,208 @@ void apply_repetition_penalty_cuda(float* logits, const int32_t* history_tokens,
     }
 }
 void hc_split_sinkhorn_cuda(float* pre, float* post, float* comb, const float* mixes, const float* scale, const float* base, int hc_mult, int sinkhorn_iters, float eps, cudaStream_t stream) {
-    (void)pre; (void)post; (void)comb; (void)mixes; (void)scale; (void)base; (void)hc_mult; (void)sinkhorn_iters; (void)eps; (void)stream;
+    auto& ctx = MetalContext::instance();
+    MetalStreamObj* s = get_stream(stream);
+    id<MTLComputePipelineState> pso = ctx.get_pipeline("hc_split_sinkhorn_kernel");
+    if (!pso) return;
+
+    size_t pre_off, post_off, comb_off, mix_off, sc_off, b_off;
+    id<MTLBuffer> b_pre = ctx.get_buffer(pre, pre_off);
+    id<MTLBuffer> b_post = ctx.get_buffer(post, post_off);
+    id<MTLBuffer> b_comb = ctx.get_buffer(comb, comb_off);
+    id<MTLBuffer> b_mix = ctx.get_buffer(mixes, mix_off);
+    id<MTLBuffer> b_sc = ctx.get_buffer(scale, sc_off);
+    id<MTLBuffer> b_base = ctx.get_buffer(base, b_off);
+    if (!b_pre || !b_post || !b_comb || !b_mix || !b_sc || !b_base) return;
+
+    id<MTLComputeCommandEncoder> enc = s->get_encoder();
+    [enc setComputePipelineState:pso];
+    [enc setBuffer:b_pre offset:pre_off atIndex:0];
+    [enc setBuffer:b_post offset:post_off atIndex:1];
+    [enc setBuffer:b_comb offset:comb_off atIndex:2];
+    [enc setBuffer:b_mix offset:mix_off atIndex:3];
+    [enc setBuffer:b_sc offset:sc_off atIndex:4];
+    [enc setBuffer:b_base offset:b_off atIndex:5];
+    [enc setBytes:&hc_mult length:sizeof(hc_mult) atIndex:6];
+    [enc setBytes:&sinkhorn_iters length:sizeof(sinkhorn_iters) atIndex:7];
+    [enc setBytes:&eps length:sizeof(eps) atIndex:8];
+    [enc dispatchThreadgroups:MTLSizeMake(1, 1, 1) threadsPerThreadgroup:MTLSizeMake(32, 1, 1)];
+    s->end_encoder_and_maybe_commit();
 }
+
 void hc_split_sinkhorn_batch_cuda(float* pre, float* post, float* comb, const float* mixes, const float* scale, const float* base, int M, int hc_mult, int sinkhorn_iters, float eps, cudaStream_t stream) {
-    (void)pre; (void)post; (void)comb; (void)mixes; (void)scale; (void)base; (void)M; (void)hc_mult; (void)sinkhorn_iters; (void)eps; (void)stream;
+    int mix_size = (2 + hc_mult) * hc_mult;
+    for (int m = 0; m < M; m++) {
+        hc_split_sinkhorn_cuda(pre + m * hc_mult, post + m * hc_mult, comb + m * hc_mult * hc_mult, mixes + m * mix_size, scale, base, hc_mult, sinkhorn_iters, eps, stream);
+    }
 }
+
 void hc_pre_weighted_add_cuda(__nv_bfloat16* hidden, const __nv_bfloat16* hc_state, const float* pre_weights, int dim, int hc, cudaStream_t stream) {
-    (void)hidden; (void)hc_state; (void)pre_weights; (void)dim; (void)hc; (void)stream;
+    if (dim <= 0 || hc <= 0) return;
+    auto& ctx = MetalContext::instance();
+    MetalStreamObj* s = get_stream(stream);
+    id<MTLComputePipelineState> pso = ctx.get_pipeline("hc_pre_weighted_add_kernel");
+    if (!pso) return;
+
+    size_t h_off, st_off, p_off;
+    id<MTLBuffer> b_h = ctx.get_buffer(hidden, h_off);
+    id<MTLBuffer> b_st = ctx.get_buffer(hc_state, st_off);
+    id<MTLBuffer> b_p = ctx.get_buffer(pre_weights, p_off);
+    if (!b_h || !b_st || !b_p) return;
+
+    id<MTLComputeCommandEncoder> enc = s->get_encoder();
+    [enc setComputePipelineState:pso];
+    [enc setBuffer:b_h offset:h_off atIndex:0];
+    [enc setBuffer:b_st offset:st_off atIndex:1];
+    [enc setBuffer:b_p offset:p_off atIndex:2];
+    [enc setBytes:&dim length:sizeof(dim) atIndex:3];
+    [enc setBytes:&hc length:sizeof(hc) atIndex:4];
+
+    int threads = 256;
+    int blocks = (dim + threads - 1) / threads;
+    [enc dispatchThreadgroups:MTLSizeMake(blocks, 1, 1) threadsPerThreadgroup:MTLSizeMake(threads, 1, 1)];
+    s->end_encoder_and_maybe_commit();
 }
+
 void hc_pre_weighted_add_norm_cuda(__nv_bfloat16* out, const __nv_bfloat16* hc_state, const float* pre_weights, const __nv_bfloat16* norm_weight, int dim, int hc, float eps, cudaStream_t stream) {
-    (void)out; (void)hc_state; (void)pre_weights; (void)norm_weight; (void)dim; (void)hc; (void)eps; (void)stream;
+    if (dim <= 0 || hc <= 0) return;
+    auto& ctx = MetalContext::instance();
+    MetalStreamObj* s = get_stream(stream);
+    id<MTLComputePipelineState> pso = ctx.get_pipeline("hc_pre_weighted_add_norm_kernel");
+    if (!pso) return;
+
+    size_t o_off, h_off, p_off, n_off;
+    id<MTLBuffer> b_out = ctx.get_buffer(out, o_off);
+    id<MTLBuffer> b_hc = ctx.get_buffer(hc_state, h_off);
+    id<MTLBuffer> b_p = ctx.get_buffer(pre_weights, p_off);
+    id<MTLBuffer> b_n = ctx.get_buffer(norm_weight, n_off);
+    if (!b_out || !b_hc || !b_p || !b_n) return;
+
+    id<MTLComputeCommandEncoder> enc = s->get_encoder();
+    [enc setComputePipelineState:pso];
+    [enc setBuffer:b_out offset:o_off atIndex:0];
+    [enc setBuffer:b_hc offset:h_off atIndex:1];
+    [enc setBuffer:b_p offset:p_off atIndex:2];
+    [enc setBuffer:b_n offset:n_off atIndex:3];
+    [enc setBytes:&dim length:sizeof(dim) atIndex:4];
+    [enc setBytes:&hc length:sizeof(hc) atIndex:5];
+    [enc setBytes:&eps length:sizeof(eps) atIndex:6];
+    int threads = std::min(1024, ((dim + 31) / 32) * 32);
+    [enc dispatchThreadgroups:MTLSizeMake(1, 1, 1) threadsPerThreadgroup:MTLSizeMake(threads, 1, 1)];
+    s->end_encoder_and_maybe_commit();
 }
+
 void hc_pre_weighted_add_norm_batch_cuda(__nv_bfloat16* out, const __nv_bfloat16* hc_state, const float* pre_weights, const __nv_bfloat16* norm_weight, int M, int dim, int hc, float eps, cudaStream_t stream) {
-    (void)out; (void)hc_state; (void)pre_weights; (void)norm_weight; (void)M; (void)dim; (void)hc; (void)eps; (void)stream;
+    for (int m = 0; m < M; m++) {
+        hc_pre_weighted_add_norm_cuda(out + m * dim, hc_state + m * hc * dim, pre_weights + m * hc, norm_weight, dim, hc, eps, stream);
+    }
 }
+
 void hc_post_update_cuda(__nv_bfloat16* hc_state, const __nv_bfloat16* hidden, const __nv_bfloat16* hc_residual, const float* post_weights, const float* comb_weights, int dim, int hc, cudaStream_t stream) {
-    (void)hc_state; (void)hidden; (void)hc_residual; (void)post_weights; (void)comb_weights; (void)dim; (void)hc; (void)stream;
+    if (dim <= 0 || hc <= 0) return;
+    auto& ctx = MetalContext::instance();
+    MetalStreamObj* s = get_stream(stream);
+    id<MTLComputePipelineState> pso = ctx.get_pipeline("hc_post_update_kernel");
+    if (!pso) return;
+
+    size_t st_off, h_off, r_off, p_off, c_off;
+    id<MTLBuffer> b_st = ctx.get_buffer(hc_state, st_off);
+    id<MTLBuffer> b_h = ctx.get_buffer(hidden, h_off);
+    id<MTLBuffer> b_r = ctx.get_buffer(hc_residual, r_off);
+    id<MTLBuffer> b_p = ctx.get_buffer(post_weights, p_off);
+    id<MTLBuffer> b_c = ctx.get_buffer(comb_weights, c_off);
+    if (!b_st || !b_h || !b_r || !b_p || !b_c) return;
+
+    id<MTLComputeCommandEncoder> enc = s->get_encoder();
+    [enc setComputePipelineState:pso];
+    [enc setBuffer:b_st offset:st_off atIndex:0];
+    [enc setBuffer:b_h offset:h_off atIndex:1];
+    [enc setBuffer:b_r offset:r_off atIndex:2];
+    [enc setBuffer:b_p offset:p_off atIndex:3];
+    [enc setBuffer:b_c offset:c_off atIndex:4];
+    [enc setBytes:&dim length:sizeof(dim) atIndex:5];
+    [enc setBytes:&hc length:sizeof(hc) atIndex:6];
+
+    int threads = 256;
+    int blocks = (dim + threads - 1) / threads;
+    [enc dispatchThreadgroups:MTLSizeMake(blocks, 1, 1) threadsPerThreadgroup:MTLSizeMake(threads, 1, 1)];
+    s->end_encoder_and_maybe_commit();
 }
-void hc_post_update_batch_cuda(__nv_bfloat16* hc_state, const __nv_bfloat16* hidden, const __nv_bfloat16* hc_residual, const float* post_weights, const float* comb_weights, int dim, int hc, int M, cudaStream_t stream) {
-    (void)hc_state; (void)hidden; (void)hc_residual; (void)post_weights; (void)comb_weights; (void)dim; (void)hc; (void)M; (void)stream;
+
+void hc_post_update_batch_cuda(__nv_bfloat16* hc_state, const __nv_bfloat16* hidden, const __nv_bfloat16* hc_residual, const float* post_weights, const float* comb_weights, int M, int dim, int hc, cudaStream_t stream) {
+    for (int m = 0; m < M; m++) {
+        hc_post_update_cuda(hc_state + m * hc * dim, hidden + m * dim, hc_residual + m * hc * dim, post_weights + m * hc, comb_weights + m * hc * hc, dim, hc, stream);
+    }
 }
+
 void hc_head_reduce_cuda(__nv_bfloat16* hidden, const __nv_bfloat16* hc_state, const float* mixes, const float* scale, const float* base, int dim, int hc, cudaStream_t stream) {
-    (void)hidden; (void)hc_state; (void)mixes; (void)scale; (void)base; (void)dim; (void)hc; (void)stream;
+    if (dim <= 0 || hc <= 0) return;
+    auto& ctx = MetalContext::instance();
+    MetalStreamObj* s = get_stream(stream);
+    id<MTLComputePipelineState> pso = ctx.get_pipeline("hc_head_reduce_kernel");
+    if (!pso) return;
+
+    size_t h_off, st_off, m_off, sc_off, b_off;
+    id<MTLBuffer> b_h = ctx.get_buffer(hidden, h_off);
+    id<MTLBuffer> b_st = ctx.get_buffer(hc_state, st_off);
+    id<MTLBuffer> b_m = ctx.get_buffer(mixes, m_off);
+    id<MTLBuffer> b_sc = ctx.get_buffer(scale, sc_off);
+    id<MTLBuffer> b_b = ctx.get_buffer(base, b_off);
+    if (!b_h || !b_st || !b_m || !b_sc || !b_b) return;
+
+    id<MTLComputeCommandEncoder> enc = s->get_encoder();
+    [enc setComputePipelineState:pso];
+    [enc setBuffer:b_h offset:h_off atIndex:0];
+    [enc setBuffer:b_st offset:st_off atIndex:1];
+    [enc setBuffer:b_m offset:m_off atIndex:2];
+    [enc setBuffer:b_sc offset:sc_off atIndex:3];
+    [enc setBuffer:b_b offset:b_off atIndex:4];
+    [enc setBytes:&dim length:sizeof(dim) atIndex:5];
+    [enc setBytes:&hc length:sizeof(hc) atIndex:6];
+
+    int threads = 256;
+    int blocks = (dim + threads - 1) / threads;
+    [enc dispatchThreadgroups:MTLSizeMake(blocks, 1, 1) threadsPerThreadgroup:MTLSizeMake(threads, 1, 1)];
+    s->end_encoder_and_maybe_commit();
 }
+
 void indexer_score_and_mask_cuda(uint8_t* out_mask, float* out_scores, const __nv_bfloat16* index_comp, const __nv_bfloat16* q, const float* weights, const int32_t* d_comp_count, int max_comp_entries, int top_k, cudaStream_t stream) {
-    (void)out_mask; (void)out_scores; (void)index_comp; (void)q; (void)weights; (void)d_comp_count; (void)max_comp_entries; (void)top_k; (void)stream;
+    if (max_comp_entries <= 0) return;
+    auto& ctx = MetalContext::instance();
+    MetalStreamObj* s = get_stream(stream);
+    id<MTLComputePipelineState> pso_score = ctx.get_pipeline("indexer_score_kernel");
+    id<MTLComputePipelineState> pso_mask = ctx.get_pipeline("indexer_mask_topk_kernel");
+    if (!pso_score || !pso_mask) return;
+
+    size_t m_off, sc_off, c_off, q_off, w_off, cnt_off;
+    id<MTLBuffer> b_mask = ctx.get_buffer(out_mask, m_off);
+    id<MTLBuffer> b_scores = ctx.get_buffer(out_scores, sc_off);
+    id<MTLBuffer> b_comp = ctx.get_buffer(index_comp, c_off);
+    id<MTLBuffer> b_q = ctx.get_buffer(q, q_off);
+    id<MTLBuffer> b_w = ctx.get_buffer(weights, w_off);
+    id<MTLBuffer> b_cnt = ctx.get_buffer(d_comp_count, cnt_off);
+    if (!b_mask || !b_scores || !b_comp || !b_q || !b_w || !b_cnt) return;
+
+    id<MTLComputeCommandEncoder> enc = s->get_encoder();
+    // 1. Scoring step
+    [enc setComputePipelineState:pso_score];
+    [enc setBuffer:b_scores offset:sc_off atIndex:0];
+    [enc setBuffer:b_comp offset:c_off atIndex:1];
+    [enc setBuffer:b_q offset:q_off atIndex:2];
+    [enc setBuffer:b_w offset:w_off atIndex:3];
+    [enc setBuffer:b_cnt offset:cnt_off atIndex:4];
+    [enc setBytes:&max_comp_entries length:sizeof(max_comp_entries) atIndex:5];
+    [enc dispatchThreadgroups:MTLSizeMake(max_comp_entries, 1, 1) threadsPerThreadgroup:MTLSizeMake(128, 1, 1)];
+
+    // 2. Top-K Masking step
+    [enc setComputePipelineState:pso_mask];
+    [enc setBuffer:b_mask offset:m_off atIndex:0];
+    [enc setBuffer:b_scores offset:sc_off atIndex:1];
+    [enc setBuffer:b_cnt offset:cnt_off atIndex:2];
+    [enc setBytes:&max_comp_entries length:sizeof(max_comp_entries) atIndex:3];
+    [enc setBytes:&top_k length:sizeof(top_k) atIndex:4];
+    [enc dispatchThreadgroups:MTLSizeMake(1, 1, 1) threadsPerThreadgroup:MTLSizeMake(256, 1, 1)];
+    s->end_encoder_and_maybe_commit();
 }
 
 
@@ -4037,3 +4640,54 @@ void quantize_bf16_to_int4_symmetric_cuda(
 {
     (void)out_packed; (void)out_scale; (void)in_bf16; (void)N; (void)K; (void)stream;
 }
+
+void markov_head_predict_cuda(
+    int32_t* d_out_pred,
+    float* d_temp_vals,
+    int32_t* d_temp_idx,
+    const __nv_bfloat16* w1,
+    const __nv_bfloat16* w2,
+    int32_t input_token,
+    int vocab_size,
+    int hidden_dim,
+    cudaStream_t stream)
+{
+    if (vocab_size <= 0 || hidden_dim <= 0) return;
+    auto& ctx = MetalContext::instance();
+    MetalStreamObj* s = get_stream(stream);
+    id<MTLComputePipelineState> pso_block = ctx.get_pipeline("markov_head_block_kernel");
+    id<MTLComputePipelineState> pso_reduce = ctx.get_pipeline("markov_head_reduce_kernel");
+    if (!pso_block || !pso_reduce) return;
+
+    size_t pred_off, v_off, i_off, w1_off, w2_off;
+    id<MTLBuffer> b_pred = ctx.get_buffer(d_out_pred, pred_off);
+    id<MTLBuffer> b_vals = ctx.get_buffer(d_temp_vals, v_off);
+    id<MTLBuffer> b_idx  = ctx.get_buffer(d_temp_idx, i_off);
+    id<MTLBuffer> b_w1   = ctx.get_buffer(w1, w1_off);
+    id<MTLBuffer> b_w2   = ctx.get_buffer(w2, w2_off);
+    if (!b_pred || !b_vals || !b_idx || !b_w1 || !b_w2) return;
+
+    int num_blocks = 256;
+    int threads_per_block = 256;
+
+    id<MTLComputeCommandEncoder> enc = s->get_encoder();
+    [enc setComputePipelineState:pso_block];
+    [enc setBuffer:b_vals offset:v_off atIndex:0];
+    [enc setBuffer:b_idx  offset:i_off atIndex:1];
+    [enc setBuffer:b_w1   offset:w1_off atIndex:2];
+    [enc setBuffer:b_w2   offset:w2_off atIndex:3];
+    [enc setBytes:&input_token length:sizeof(input_token) atIndex:4];
+    [enc setBytes:&vocab_size length:sizeof(vocab_size) atIndex:5];
+    [enc setBytes:&hidden_dim length:sizeof(hidden_dim) atIndex:6];
+    [enc dispatchThreadgroups:MTLSizeMake(num_blocks, 1, 1) threadsPerThreadgroup:MTLSizeMake(threads_per_block, 1, 1)];
+
+    [enc setComputePipelineState:pso_reduce];
+    [enc setBuffer:b_pred offset:pred_off atIndex:0];
+    [enc setBuffer:b_vals offset:v_off atIndex:1];
+    [enc setBuffer:b_idx  offset:i_off atIndex:2];
+    [enc setBytes:&num_blocks length:sizeof(num_blocks) atIndex:3];
+    [enc dispatchThreadgroups:MTLSizeMake(1, 1, 1) threadsPerThreadgroup:MTLSizeMake(threads_per_block, 1, 1)];
+
+    s->end_encoder_and_maybe_commit();
+}
+

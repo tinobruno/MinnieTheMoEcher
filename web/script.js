@@ -2930,11 +2930,13 @@ function buildOptimizedMessagesPayload() {
         messagesToSend.push({ role: "system", content: sysPrompt });
     } else {
         let baseSys = sysPrompt || "You are a helpful assistant.";
-        // Strip any stale # Tools or <tools> block if activeTools has changed or youtube_search was disabled
-        if (baseSys.includes('# Tools') || baseSys.includes('<tools>')) {
+        // Strip any stale ## Tools, # Tools, or <tools> block if activeTools has changed or youtube_search was disabled
+        if (baseSys.includes('## Tools') || baseSys.includes('# Tools') || baseSys.includes('<tools>')) {
             const hasYt = activeTools.includes('youtube_search');
             if (activeTools.length === 0 || (!hasYt && baseSys.includes('youtube_search'))) {
-                let toolsIdx = baseSys.indexOf('\n\n# Tools');
+                let toolsIdx = baseSys.indexOf('\n\n## Tools');
+                if (toolsIdx === -1) toolsIdx = baseSys.indexOf('## Tools');
+                if (toolsIdx === -1) toolsIdx = baseSys.indexOf('\n\n# Tools');
                 if (toolsIdx === -1) toolsIdx = baseSys.indexOf('# Tools');
                 if (toolsIdx === -1) toolsIdx = baseSys.indexOf('<tools>');
                 if (toolsIdx !== -1) {
@@ -4007,7 +4009,7 @@ async function sendMessage(options = {}) {
     let mainContent = document.createElement('div');
     assistantMsgDiv.querySelector('.msg-content').appendChild(mainContent);
 
-    const baseThinking = attachedImg ? false : (thinkingEnabled ? thinkingEnabled.checked : true);
+    const baseThinking = attachedImg ? false : (thinkingEnabled ? thinkingEnabled.checked : false);
     // Voice prompt speed optimization: disable thinking on the fly for fast conversational responses
     const isVoiceBypassThinking = wasVoicePrompt && (typeof voiceSettings === 'undefined' || voiceSettings.disableThinkingForVoice !== false);
     const isThinking = isVoiceBypassThinking ? false : baseThinking;

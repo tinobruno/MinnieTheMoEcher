@@ -311,28 +311,42 @@ kernel void rope_kernel(
     device const float* freq_table [[buffer(5)]],
     constant bool& inverse [[buffer(6)]],
     uint vec_idx [[threadgroup_position_in_grid]],
-    uint tid [[thread_position_in_threadgroup]])
+    uint pair_id [[thread_position_in_threadgroup]])
 {
     if (vec_idx >= uint(n_vectors)) return;
     int half_rope = rope_dim / 2;
-    if (tid >= uint(half_rope)) return;
+    if (pair_id >= uint(half_rope)) return;
 
-    device bfloat* head = x + vec_idx * head_dim;
-    int rope_start = head_dim - rope_dim;
+    int base_idx = vec_idx * head_dim + (head_dim - rope_dim) + 2 * pair_id;
 
-    float cos_th = freq_table[position * rope_dim + tid * 2];
-    float sin_th = freq_table[position * rope_dim + tid * 2 + 1];
-    if (inverse) sin_th = -sin_th;
+    float x0 = float(x[base_idx]);
+    float x1 = float(x[base_idx + 1]);
 
-    int i0 = rope_start + tid;
-    int i1 = rope_start + half_rope + tid;
+    float cos_val = freq_table[position * half_rope * 2 + pair_id * 2];
+    float sin_val = freq_table[position * half_rope * 2 + pair_id * 2 + 1];
+    if (inverse) sin_val = -sin_val;
 
-    float x0 = float(head[i0]);
-    float x1 = float(head[i1]);
+    float y0 = x0 * cos_val - x1 * sin_val;
+    float y1 = x0 * sin_val + x1 * cos_val;
 
-    head[i0] = bfloat(x0 * cos_th - x1 * sin_th);
-    head[i1] = bfloat(x0 * sin_th + x1 * cos_th);
+    x[base_idx]     = bfloat(y0);
+    x[base_idx + 1] = bfloat(y1);
 }
+
+kernel void store_kv_device_pos_kernel(
+    device bfloat* kv_cache [[buffer(0)]],
+    device const bfloat* kv_val [[buffer(1)]],
+    device const int32_t* d_position [[buffer(2)]],
+    constant int& window [[buffer(3)]],
+    constant int& head_dim [[buffer(4)]],
+    uint d [[thread_position_in_grid]])
+{
+    if (d >= uint(head_dim)) return;
+    int position = d_position ? *d_position : 0;
+    int cache_pos = position % window;
+    kv_cache[(size_t)cache_pos * head_dim + d] = kv_val[d];
+}
+
 
 kernel void rope_standard_kernel(
     device bfloat* q [[buffer(0)]],
@@ -1025,8 +1039,43 @@ kernel void gemv_bf16_out_bf16_kernel(
     uint simd_id [[simdgroup_index_in_threadgroup]])
 {
     if (row >= uint(N)) return;
-    device const bfloat* row_w = W + size_t(row) * size_t(K);
 
+    if ((K & 3) == 0) {
+        int K4 = K >> 2;
+        device const bfloat4* row_w4 = (device const bfloat4*)(W + size_t(row) * size_t(K));
+        device const bfloat4* x4 = (device const bfloat4*)x;
+
+        float sum = 0.0f;
+        for (int c = tid; c < K4; c += threads_per_group) {
+            float4 wf = float4(row_w4[c]);
+            float4 xf = float4(x4[c]);
+            sum += dot(wf, xf);
+        }
+
+        if (threads_per_group <= 32) {
+            float total = simd_sum(sum);
+            if (simd_lane == 0) {
+                out[row] = bfloat(total);
+            }
+            return;
+        }
+
+        threadgroup float sdata[32];
+        sum = simd_sum(sum);
+        if (simd_lane == 0) sdata[simd_id] = sum;
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+
+        if (simd_id == 0) {
+            float total = (simd_lane < (threads_per_group >> 5)) ? sdata[simd_lane] : 0.0f;
+            total = simd_sum(total);
+            if (simd_lane == 0) {
+                out[row] = bfloat(total);
+            }
+        }
+        return;
+    }
+
+    device const bfloat* row_w = W + size_t(row) * size_t(K);
     float sum = 0.0f;
     for (int c = tid; c < K; c += threads_per_group) {
         sum += float(row_w[c]) * float(x[c]);
@@ -1034,9 +1083,7 @@ kernel void gemv_bf16_out_bf16_kernel(
 
     sum = simd_sum(sum);
     threadgroup float sdata[32];
-    if (simd_lane == 0) {
-        sdata[simd_id] = sum;
-    }
+    if (simd_lane == 0) sdata[simd_id] = sum;
     threadgroup_barrier(mem_flags::mem_threadgroup);
 
     if (simd_id == 0) {
@@ -1061,8 +1108,81 @@ kernel void gemv_bf16_f32_kernel(
     uint simd_id [[simdgroup_index_in_threadgroup]])
 {
     if (row >= uint(N)) return;
-    device const bfloat* row_w = W + size_t(row) * size_t(K);
 
+    if ((K & 7) == 0) {
+        int K8 = K >> 3;
+        device const bfloat4* row_w4 = (device const bfloat4*)(W + size_t(row) * size_t(K));
+        device const bfloat4* x4 = (device const bfloat4*)x;
+
+        float sum = 0.0f;
+        for (int c = tid; c < K8; c += threads_per_group) {
+            int idx = c << 1;
+            float4 wf0 = float4(row_w4[idx]);
+            float4 xf0 = float4(x4[idx]);
+            float4 wf1 = float4(row_w4[idx + 1]);
+            float4 xf1 = float4(x4[idx + 1]);
+            sum += dot(wf0, xf0) + dot(wf1, xf1);
+        }
+
+        if (threads_per_group <= 32) {
+            float total = simd_sum(sum);
+            if (simd_lane == 0) {
+                out[row] = total;
+            }
+            return;
+        }
+
+        threadgroup float sdata[32];
+        sum = simd_sum(sum);
+        if (simd_lane == 0) sdata[simd_id] = sum;
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+
+        if (simd_id == 0) {
+            float total = (simd_lane < (threads_per_group >> 5)) ? sdata[simd_lane] : 0.0f;
+            total = simd_sum(total);
+            if (simd_lane == 0) {
+                out[row] = total;
+            }
+        }
+        return;
+    }
+
+    if ((K & 3) == 0) {
+        int K4 = K >> 2;
+        device const bfloat4* row_w4 = (device const bfloat4*)(W + size_t(row) * size_t(K));
+        device const bfloat4* x4 = (device const bfloat4*)x;
+
+        float sum = 0.0f;
+        for (int c = tid; c < K4; c += threads_per_group) {
+            float4 wf = float4(row_w4[c]);
+            float4 xf = float4(x4[c]);
+            sum += dot(wf, xf);
+        }
+
+        if (threads_per_group <= 32) {
+            float total = simd_sum(sum);
+            if (simd_lane == 0) {
+                out[row] = total;
+            }
+            return;
+        }
+
+        threadgroup float sdata[32];
+        sum = simd_sum(sum);
+        if (simd_lane == 0) sdata[simd_id] = sum;
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+
+        if (simd_id == 0) {
+            float total = (simd_lane < (threads_per_group >> 5)) ? sdata[simd_lane] : 0.0f;
+            total = simd_sum(total);
+            if (simd_lane == 0) {
+                out[row] = total;
+            }
+        }
+        return;
+    }
+
+    device const bfloat* row_w = W + size_t(row) * size_t(K);
     float sum = 0.0f;
     for (int c = tid; c < K; c += threads_per_group) {
         sum += float(row_w[c]) * float(x[c]);
@@ -1070,9 +1190,7 @@ kernel void gemv_bf16_f32_kernel(
 
     sum = simd_sum(sum);
     threadgroup float sdata[32];
-    if (simd_lane == 0) {
-        sdata[simd_id] = sum;
-    }
+    if (simd_lane == 0) sdata[simd_id] = sum;
     threadgroup_barrier(mem_flags::mem_threadgroup);
 
     if (simd_id == 0) {
@@ -1081,6 +1199,94 @@ kernel void gemv_bf16_f32_kernel(
         if (simd_lane == 0) {
             out[row] = total;
         }
+    }
+}
+
+kernel void gemv_bf16_f32_batch_kernel(
+    device float* out [[buffer(0)]],
+    device const bfloat* W [[buffer(1)]],
+    device const bfloat* X [[buffer(2)]],
+    constant int& N [[buffer(3)]],
+    constant int& K [[buffer(4)]],
+    constant int& M [[buffer(5)]],
+    uint row [[threadgroup_position_in_grid]],
+    uint tid [[thread_position_in_threadgroup]],
+    uint threads_per_group [[threads_per_threadgroup]],
+    uint simd_lane [[thread_index_in_simdgroup]],
+    uint simd_id [[simdgroup_index_in_threadgroup]])
+{
+    if (row >= uint(N)) return;
+
+    if ((K & 7) == 0) {
+        int K8 = K >> 3;
+        device const bfloat4* row_w4 = (device const bfloat4*)(W + size_t(row) * size_t(K));
+        device const bfloat4* x4_0 = (device const bfloat4*)X;
+        device const bfloat4* x4_1 = (device const bfloat4*)(X + (size_t)1 * K);
+        device const bfloat4* x4_2 = (device const bfloat4*)(X + (size_t)2 * K);
+        device const bfloat4* x4_3 = (device const bfloat4*)(X + (size_t)3 * K);
+
+        float sum0 = 0.0f, sum1 = 0.0f, sum2 = 0.0f, sum3 = 0.0f;
+        for (int c = tid; c < K8; c += threads_per_group) {
+            int idx = c << 1;
+            float4 wf0 = float4(row_w4[idx]);
+            float4 wf1 = float4(row_w4[idx + 1]);
+
+            sum0 += dot(wf0, float4(x4_0[idx])) + dot(wf1, float4(x4_0[idx + 1]));
+            if (M > 1) sum1 += dot(wf0, float4(x4_1[idx])) + dot(wf1, float4(x4_1[idx + 1]));
+            if (M > 2) sum2 += dot(wf0, float4(x4_2[idx])) + dot(wf1, float4(x4_2[idx + 1]));
+            if (M > 3) sum3 += dot(wf0, float4(x4_3[idx])) + dot(wf1, float4(x4_3[idx + 1]));
+        }
+
+        if (threads_per_group <= 32) {
+            float tot0 = simd_sum(sum0);
+            if (simd_lane == 0) out[row] = tot0;
+            if (M > 1) {
+                float tot1 = simd_sum(sum1);
+                if (simd_lane == 0) out[(size_t)1 * N + row] = tot1;
+            }
+            if (M > 2) {
+                float tot2 = simd_sum(sum2);
+                if (simd_lane == 0) out[(size_t)2 * N + row] = tot2;
+            }
+            if (M > 3) {
+                float tot3 = simd_sum(sum3);
+                if (simd_lane == 0) out[(size_t)3 * N + row] = tot3;
+            }
+            return;
+        }
+
+        threadgroup float sdata0[32];
+        threadgroup float sdata1[32];
+        sum0 = simd_sum(sum0);
+        if (simd_lane == 0) sdata0[simd_id] = sum0;
+        if (M > 1) {
+            sum1 = simd_sum(sum1);
+            if (simd_lane == 0) sdata1[simd_id] = sum1;
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+
+        if (simd_id == 0) {
+            float total0 = (simd_lane < (threads_per_group >> 5)) ? sdata0[simd_lane] : 0.0f;
+            total0 = simd_sum(total0);
+            if (simd_lane == 0) out[row] = total0;
+            if (M > 1) {
+                float total1 = (simd_lane < (threads_per_group >> 5)) ? sdata1[simd_lane] : 0.0f;
+                total1 = simd_sum(total1);
+                if (simd_lane == 0) out[(size_t)1 * N + row] = total1;
+            }
+        }
+        return;
+    }
+
+    device const bfloat* row_w = W + size_t(row) * size_t(K);
+    for (int m = 0; m < M; m++) {
+        device const bfloat* xm = X + (size_t)m * K;
+        float sum = 0.0f;
+        for (int c = tid; c < K; c += threads_per_group) {
+            sum += float(row_w[c]) * float(xm[c]);
+        }
+        sum = simd_sum(sum);
+        if (simd_lane == 0) out[(size_t)m * N + row] = sum;
     }
 }
 
@@ -2442,3 +2648,1587 @@ kernel void deltanet_in_proj_ab_batch_kernel(
         out_b[(size_t)m * N + n] = bfloat(sum_b);
     }
 }
+
+// ════════════════════════════════════════════════════════════════════════════════
+//  DeepSeek V4 MLA, Hyper-Connections & IQ2_XXS / Q2_K Kernels
+// ════════════════════════════════════════════════════════════════════════════════
+
+// ── FP8 Conversions ─────────────────────────────────────────────────────────
+
+inline float fp8_e4m3_to_float_v2(uint8_t val) {
+    if (val == 0) return 0.0f;
+    uint32_t sign = (uint32_t)(val & 0x80) << 24;
+    uint32_t body = ((uint32_t)(val & 0x7F) << 20) + 0x3C000000U;
+    return as_type<float>(sign | body);
+}
+
+inline float e8m0_to_float_v2(uint8_t val) {
+    return as_type<float>((uint32_t)val << 23);
+}
+
+inline float4 fp8_e4m3_to_float4(uchar4 val) {
+    return float4(
+        fp8_e4m3_to_float_v2(val.x),
+        fp8_e4m3_to_float_v2(val.y),
+        fp8_e4m3_to_float_v2(val.z),
+        fp8_e4m3_to_float_v2(val.w)
+    );
+}
+
+kernel void fp8_dequant_kernel(
+    device bfloat* out [[buffer(0)]],
+    device const uint8_t* weight [[buffer(1)]],
+    device const uint8_t* scale [[buffer(2)]],
+    constant int& rows [[buffer(3)]],
+    constant int& cols [[buffer(4)]],
+    constant int& block_size [[buffer(5)]],
+    uint2 gid [[thread_position_in_grid]])
+{
+    int r = gid.y;
+    int c = gid.x;
+    if (r >= rows || c >= cols) return;
+
+    int scale_cols = (cols + block_size - 1) / block_size;
+    int br = r / block_size;
+    int bc = c / block_size;
+
+    float s_val = e8m0_to_float_v2(scale[br * scale_cols + bc]);
+    float w_val = fp8_e4m3_to_float_v2(weight[r * cols + c]) * s_val;
+    out[r * cols + c] = bfloat(w_val);
+}
+
+kernel void gemv_fp8_kernel(
+    device bfloat* out [[buffer(0)]],
+    device const bfloat* vec [[buffer(1)]],
+    device const uint8_t* weight [[buffer(2)]],
+    device const uint8_t* scale [[buffer(3)]],
+    constant int& N [[buffer(4)]],
+    constant int& K [[buffer(5)]],
+    constant int& block_size [[buffer(6)]],
+    uint row [[threadgroup_position_in_grid]],
+    uint tid [[thread_position_in_threadgroup]],
+    uint threads_per_group [[threads_per_threadgroup]],
+    uint simd_lane [[thread_index_in_simdgroup]],
+    uint simd_id [[simdgroup_index_in_threadgroup]])
+{
+    if (row >= (uint)N) return;
+
+    if (block_size == 128 && (K & 127) == 0) {
+        int num_blocks = K >> 7;
+        int scale_cols = num_blocks;
+        int br = row >> 7;
+        int scale_row_offset = br * scale_cols;
+        device const uchar4* weight_u4 = (device const uchar4*)(weight + (size_t)row * K);
+        device const bfloat4* vec_bf4 = (device const bfloat4*)vec;
+
+        float local_sum = 0.0f;
+        for (int b = 0; b < num_blocks; b++) {
+            float s_val = e8m0_to_float_v2(scale[scale_row_offset + b]);
+            float block_acc = 0.0f;
+            int base_u4 = b * 32;
+            for (int i = tid; i < 32; i += threads_per_group) {
+                uchar4 w4 = weight_u4[base_u4 + i];
+                bfloat4 v4 = vec_bf4[base_u4 + i];
+                float4 wf = fp8_e4m3_to_float4(w4);
+                float4 vf = float4(v4);
+                block_acc += dot(wf, vf);
+            }
+            local_sum += block_acc * s_val;
+        }
+
+        if (threads_per_group <= 32) {
+            float sum = simd_sum(local_sum);
+            if (simd_lane == 0) {
+                out[row] = bfloat(sum);
+            }
+            return;
+        }
+
+        threadgroup float s_red[32];
+        float warp_sum = simd_sum(local_sum);
+        if (simd_lane == 0) s_red[simd_id] = warp_sum;
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+
+        if (simd_id == 0) {
+            float b_sum = (simd_lane < (threads_per_group >> 5)) ? s_red[simd_lane] : 0.0f;
+            b_sum = simd_sum(b_sum);
+            if (simd_lane == 0) {
+                out[row] = bfloat(b_sum);
+            }
+        }
+        return;
+    }
+
+    threadgroup float s_red[32];
+    int scale_cols = (K + block_size - 1) / block_size;
+    int br = row / block_size;
+
+    float local_sum = 0.0f;
+    for (int k = tid; k < K; k += threads_per_group) {
+        int bc = k / block_size;
+        float s_val = e8m0_to_float_v2(scale[br * scale_cols + bc]);
+        float w_val = fp8_e4m3_to_float_v2(weight[row * K + k]) * s_val;
+        local_sum += w_val * float(vec[k]);
+    }
+
+    float warp_sum = simd_sum(local_sum);
+    if (simd_lane == 0) s_red[simd_id] = warp_sum;
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    if (simd_id == 0) {
+        float b_sum = (simd_lane < (threads_per_group >> 5)) ? s_red[simd_lane] : 0.0f;
+        b_sum = simd_sum(b_sum);
+        if (simd_lane == 0) {
+            out[row] = bfloat(b_sum);
+        }
+    }
+}
+
+kernel void gemv_fp8_grouped_kernel(
+    device bfloat* out [[buffer(0)]],
+    device const bfloat* vec [[buffer(1)]],
+    device const uint8_t* weight [[buffer(2)]],
+    device const uint8_t* scale [[buffer(3)]],
+    constant int& N [[buffer(4)]],
+    constant int& K [[buffer(5)]],
+    constant int& groups [[buffer(6)]],
+    constant int& block_size [[buffer(7)]],
+    uint2 tg_pos [[threadgroup_position_in_grid]],
+    uint2 thread_pos [[thread_position_in_threadgroup]],
+    uint2 tpg [[threads_per_threadgroup]],
+    uint simd_lane [[thread_index_in_simdgroup]],
+    uint simd_id [[simdgroup_index_in_threadgroup]])
+{
+    uint tid = thread_pos.x;
+    uint threads_per_group = tpg.x;
+    uint row = tg_pos.x;
+    uint group = tg_pos.y;
+    if (row >= (uint)N || group >= (uint)groups) return;
+
+    if (block_size == 128 && (K & 127) == 0) {
+        int num_blocks = K >> 7;
+        int scale_cols = num_blocks;
+        int scale_rows_per_group = (N + 127) >> 7;
+        int br = row >> 7;
+
+        device const uchar4* g_weight_u4 = (device const uchar4*)(weight + (size_t)group * N * K + (size_t)row * K);
+        device const uint8_t* g_scale = scale + (size_t)group * scale_rows_per_group * scale_cols;
+        device const bfloat4* g_vec_bf4 = (device const bfloat4*)(vec + (size_t)group * K);
+        device bfloat* g_out = out + (size_t)group * N;
+
+        int scale_row_offset = br * scale_cols;
+        float local_sum = 0.0f;
+        for (int b = 0; b < num_blocks; b++) {
+            float s_val = e8m0_to_float_v2(g_scale[scale_row_offset + b]);
+            float block_acc = 0.0f;
+            int base_u4 = b * 32;
+            for (int i = tid; i < 32; i += threads_per_group) {
+                uchar4 w4 = g_weight_u4[base_u4 + i];
+                bfloat4 v4 = g_vec_bf4[base_u4 + i];
+                float4 wf = fp8_e4m3_to_float4(w4);
+                float4 vf = float4(v4);
+                block_acc += dot(wf, vf);
+            }
+            local_sum += block_acc * s_val;
+        }
+
+        if (threads_per_group <= 32) {
+            float sum = simd_sum(local_sum);
+            if (simd_lane == 0) {
+                g_out[row] = bfloat(sum);
+            }
+            return;
+        }
+
+        threadgroup float s_red[32];
+        float warp_sum = simd_sum(local_sum);
+        if (simd_lane == 0) s_red[simd_id] = warp_sum;
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+
+        if (simd_id == 0) {
+            float b_sum = (simd_lane < (threads_per_group >> 5)) ? s_red[simd_lane] : 0.0f;
+            b_sum = simd_sum(b_sum);
+            if (simd_lane == 0) {
+                g_out[row] = bfloat(b_sum);
+            }
+        }
+        return;
+    }
+
+    threadgroup float s_red[32];
+    int scale_cols = (K + block_size - 1) / block_size;
+    int scale_rows_per_group = (N + block_size - 1) / block_size;
+    int br = row / block_size;
+
+    device const uint8_t* g_weight = weight + (size_t)group * N * K;
+    device const uint8_t* g_scale = scale + (size_t)group * scale_rows_per_group * scale_cols;
+    device const bfloat* g_vec = vec + (size_t)group * K;
+    device bfloat* g_out = out + (size_t)group * N;
+
+    float local_sum = 0.0f;
+    for (int k = tid; k < K; k += threads_per_group) {
+        int bc = k / block_size;
+        float s_val = e8m0_to_float_v2(g_scale[br * scale_cols + bc]);
+        float w_val = fp8_e4m3_to_float_v2(g_weight[row * K + k]) * s_val;
+        local_sum += w_val * float(g_vec[k]);
+    }
+
+    float warp_sum = simd_sum(local_sum);
+    if (simd_lane == 0) s_red[simd_id] = warp_sum;
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    if (simd_id == 0) {
+        float b_sum = (simd_lane < (threads_per_group >> 5)) ? s_red[simd_lane] : 0.0f;
+        b_sum = simd_sum(b_sum);
+        if (simd_lane == 0) {
+            g_out[row] = bfloat(b_sum);
+        }
+    }
+}
+
+// ── Hyper-Connections (HC) Metal Kernels ────────────────────────────────────
+
+kernel void gemv_hc_pre_norm_kernel(
+    device float* mixes [[buffer(0)]],
+    device const bfloat* hc_state [[buffer(1)]],
+    device const float* hc_fn [[buffer(2)]],
+    constant int& mix_size [[buffer(3)]],
+    constant int& hc_dim [[buffer(4)]],
+    constant float& eps [[buffer(5)]],
+    uint row [[threadgroup_position_in_grid]],
+    uint tid [[thread_position_in_threadgroup]],
+    uint threads_per_group [[threads_per_threadgroup]],
+    uint simd_lane [[thread_index_in_simdgroup]],
+    uint simd_id [[simdgroup_index_in_threadgroup]])
+{
+    if (row >= (uint)mix_size) return;
+    threadgroup float s_red[32];
+
+    // Step 1: Compute sum of squares across hc_state in parallel
+    float local_sq = 0.0f;
+    for (int i = tid; i < hc_dim; i += threads_per_group) {
+        float v = float(hc_state[i]);
+        local_sq += v * v;
+    }
+    float warp_sq = simd_sum(local_sq);
+    if (simd_lane == 0) s_red[simd_id] = warp_sq;
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    if (simd_id == 0) {
+        float b_sq = (simd_lane < (threads_per_group >> 5)) ? s_red[simd_lane] : 0.0f;
+        b_sq = simd_sum(b_sq);
+        if (simd_lane == 0) s_red[0] = rsqrt(b_sq / float(hc_dim) + eps);
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    float rsqrt_val = s_red[0];
+
+    // Step 2: Compute dot product with row of hc_fn
+    device const float* fn_row = hc_fn + (size_t)row * hc_dim;
+    float local_dot = 0.0f;
+    for (int i = tid; i < hc_dim; i += threads_per_group) {
+        local_dot += fn_row[i] * (float(hc_state[i]) * rsqrt_val);
+    }
+    float warp_dot = simd_sum(local_dot);
+    if (simd_lane == 0) s_red[simd_id] = warp_dot;
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    if (simd_id == 0) {
+        float b_dot = (simd_lane < (threads_per_group >> 5)) ? s_red[simd_lane] : 0.0f;
+        b_dot = simd_sum(b_dot);
+        if (simd_lane == 0) mixes[row] = b_dot;
+    }
+}
+
+kernel void hc_split_sinkhorn_kernel(
+    device float* pre [[buffer(0)]],
+    device float* post [[buffer(1)]],
+    device float* comb [[buffer(2)]],
+    device const float* mixes [[buffer(3)]],
+    device const float* scale [[buffer(4)]],
+    device const float* base [[buffer(5)]],
+    constant int& hc_mult [[buffer(6)]],
+    constant int& sinkhorn_iters [[buffer(7)]],
+    constant float& eps [[buffer(8)]],
+    uint tid [[thread_position_in_threadgroup]])
+{
+    int hc = hc_mult;
+
+    // Pre
+    if (tid < (uint)hc) {
+        float v = mixes[tid] * scale[0] + base[tid];
+        pre[tid] = 1.0f / (1.0f + exp(-v)) + eps;
+    }
+    // Post
+    if (tid >= (uint)hc && tid < (uint)(2 * hc)) {
+        int i = tid - hc;
+        float v = mixes[hc + i] * scale[1] + base[hc + i];
+        post[i] = 2.0f / (1.0f + exp(-v));
+    }
+
+    threadgroup float s_comb[64];
+    threadgroup float s_row_sum[8];
+    threadgroup float s_col_sum[8];
+
+    // Comb logits
+    if (tid < (uint)(hc * hc)) {
+        int r = tid / hc;
+        int c = tid % hc;
+        float v = mixes[2 * hc + r * hc + c] * scale[2] + base[2 * hc + r * hc + c];
+        s_comb[r * hc + c] = v;
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    // Row max & softmax
+    if (tid < (uint)hc) {
+        int r = tid;
+        float max_val = -1e38f;
+        for (int c = 0; c < hc; c++) {
+            max_val = max(max_val, s_comb[r * hc + c]);
+        }
+        float row_sum = 0.0f;
+        for (int c = 0; c < hc; c++) {
+            float e = exp(s_comb[r * hc + c] - max_val);
+            s_comb[r * hc + c] = e;
+            row_sum += e;
+        }
+        for (int c = 0; c < hc; c++) {
+            s_comb[r * hc + c] = (s_comb[r * hc + c] / row_sum) + eps;
+        }
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    // Col normalize
+    if (tid < (uint)hc) {
+        int c = tid;
+        float col_sum = 0.0f;
+        for (int r = 0; r < hc; r++) {
+            col_sum += s_comb[r * hc + c];
+        }
+        float inv = 1.0f / (col_sum + eps);
+        for (int r = 0; r < hc; r++) {
+            s_comb[r * hc + c] *= inv;
+        }
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    // Sinkhorn loop
+    for (int iter = 0; iter < sinkhorn_iters - 1; iter++) {
+        // Row norm
+        if (tid < (uint)hc) {
+            int r = tid;
+            float row_sum = 0.0f;
+            for (int c = 0; c < hc; c++) {
+                row_sum += s_comb[r * hc + c];
+            }
+            s_row_sum[r] = 1.0f / (row_sum + eps);
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+
+        if (tid < (uint)(hc * hc)) {
+            int r = tid / hc;
+            s_comb[tid] *= s_row_sum[r];
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+
+        // Col norm
+        if (tid < (uint)hc) {
+            int c = tid;
+            float col_sum = 0.0f;
+            for (int r = 0; r < hc; r++) {
+                col_sum += s_comb[r * hc + c];
+            }
+            s_col_sum[c] = 1.0f / (col_sum + eps);
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+
+        if (tid < (uint)(hc * hc)) {
+            int c = tid % hc;
+            s_comb[tid] *= s_col_sum[c];
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+    }
+
+    if (tid < (uint)(hc * hc)) {
+        comb[tid] = s_comb[tid];
+    }
+}
+
+kernel void hc_pre_weighted_add_kernel(
+    device bfloat* hidden [[buffer(0)]],
+    device const bfloat* hc_state [[buffer(1)]],
+    device const float* pre_weights [[buffer(2)]],
+    constant int& dim [[buffer(3)]],
+    constant int& hc [[buffer(4)]],
+    uint gid [[thread_position_in_grid]])
+{
+    if (gid >= (uint)dim) return;
+    float sum = 0.0f;
+    for (int h = 0; h < hc; h++) {
+        sum += pre_weights[h] * float(hc_state[(size_t)h * dim + gid]);
+    }
+    hidden[gid] = bfloat(sum);
+}
+
+kernel void hc_pre_weighted_add_norm_kernel(
+    device bfloat* out [[buffer(0)]],
+    device const bfloat* hc_state [[buffer(1)]],
+    device const float* pre_weights [[buffer(2)]],
+    device const bfloat* norm_weight [[buffer(3)]],
+    constant int& dim [[buffer(4)]],
+    constant int& hc [[buffer(5)]],
+    constant float& eps [[buffer(6)]],
+    uint tid [[thread_position_in_threadgroup]],
+    uint threads_per_group [[threads_per_threadgroup]],
+    uint simd_lane [[thread_index_in_simdgroup]],
+    uint simd_id [[simdgroup_index_in_threadgroup]])
+{
+    threadgroup float s_red[32];
+
+    float w0 = pre_weights[0];
+    float w1 = pre_weights[1];
+    float w2 = pre_weights[2];
+    float w3 = pre_weights[3];
+
+    device const bfloat* s0 = hc_state + 0 * dim;
+    device const bfloat* s1 = hc_state + 1 * dim;
+    device const bfloat* s2 = hc_state + 2 * dim;
+    device const bfloat* s3 = hc_state + 3 * dim;
+
+    float local_sq = 0.0f;
+    for (int i = tid; i < dim; i += threads_per_group) {
+        float f0 = float(s0[i]);
+        float f1 = float(s1[i]);
+        float f2 = float(s2[i]);
+        float f3 = float(s3[i]);
+        float y = w0 * f0 + w1 * f1 + w2 * f2 + w3 * f3;
+        local_sq += y * y;
+    }
+
+    float warp_sq = simd_sum(local_sq);
+    if (simd_lane == 0) s_red[simd_id] = warp_sq;
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    if (simd_id == 0) {
+        float b_sq = (simd_lane < (threads_per_group >> 5)) ? s_red[simd_lane] : 0.0f;
+        b_sq = simd_sum(b_sq);
+        if (simd_lane == 0) s_red[0] = rsqrt(b_sq / float(dim) + eps);
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    float rsqrt_val = s_red[0];
+
+    for (int i = tid; i < dim; i += threads_per_group) {
+        float f0 = float(s0[i]);
+        float f1 = float(s1[i]);
+        float f2 = float(s2[i]);
+        float f3 = float(s3[i]);
+        float y = w0 * f0 + w1 * f1 + w2 * f2 + w3 * f3;
+        float nw = float(norm_weight[i]);
+        out[i] = bfloat(y * rsqrt_val * nw);
+    }
+}
+
+kernel void hc_post_update_kernel(
+    device bfloat* hc_state [[buffer(0)]],
+    device const bfloat* hidden [[buffer(1)]],
+    device const bfloat* hc_residual [[buffer(2)]],
+    device const float* post_weights [[buffer(3)]],
+    device const float* comb_weights [[buffer(4)]],
+    constant int& dim [[buffer(5)]],
+    constant int& hc [[buffer(6)]],
+    uint idx [[thread_position_in_grid]])
+{
+    if (idx >= (uint)dim) return;
+
+    float p0 = post_weights[0], p1 = post_weights[1], p2 = post_weights[2], p3 = post_weights[3];
+    float c00 = comb_weights[0], c01 = comb_weights[1], c02 = comb_weights[2], c03 = comb_weights[3];
+    float c10 = comb_weights[4], c11 = comb_weights[5], c12 = comb_weights[6], c13 = comb_weights[7];
+    float c20 = comb_weights[8], c21 = comb_weights[9], c22 = comb_weights[10], c23 = comb_weights[11];
+    float c30 = comb_weights[12], c31 = comb_weights[13], c32 = comb_weights[14], c33 = comb_weights[15];
+
+    float h_val = float(hidden[idx]);
+    float r0 = float(hc_residual[0 * dim + idx]);
+    float r1 = float(hc_residual[1 * dim + idx]);
+    float r2 = float(hc_residual[2 * dim + idx]);
+    float r3 = float(hc_residual[3 * dim + idx]);
+
+    hc_state[0 * dim + idx] = bfloat(p0 * h_val + c00 * r0 + c10 * r1 + c20 * r2 + c30 * r3);
+    hc_state[1 * dim + idx] = bfloat(p1 * h_val + c01 * r0 + c11 * r1 + c21 * r2 + c31 * r3);
+    hc_state[2 * dim + idx] = bfloat(p2 * h_val + c02 * r0 + c12 * r1 + c22 * r2 + c32 * r3);
+    hc_state[3 * dim + idx] = bfloat(p3 * h_val + c03 * r0 + c13 * r1 + c23 * r2 + c33 * r3);
+}
+
+kernel void hc_head_reduce_kernel(
+    device bfloat* hidden [[buffer(0)]],
+    device const bfloat* hc_state [[buffer(1)]],
+    device const float* mixes [[buffer(2)]],
+    device const float* scale [[buffer(3)]],
+    device const float* base [[buffer(4)]],
+    constant int& dim [[buffer(5)]],
+    constant int& hc [[buffer(6)]],
+    uint idx [[thread_position_in_grid]])
+{
+    if (idx >= (uint)dim) return;
+
+    float s = scale[0];
+    float sum = 0.0f;
+    for (int h = 0; h < hc; h++) {
+        float mix = mixes[h];
+        float b = base[h];
+        float arg = mix * s + b;
+        float w = 1.0f / (1.0f + exp(-arg)) + 1e-6f;
+        sum += w * float(hc_state[h * dim + idx]);
+    }
+    hidden[idx] = bfloat(sum);
+}
+
+// ── Multi-Head Latent Attention (MLA) Fused Metal Kernel ────────────────────
+
+kernel void mla_attention_fused_kernel(
+    device const bfloat* raw_q [[buffer(0)]],
+    device const bfloat* raw_kv [[buffer(1)]],
+    device const bfloat* comp_kv [[buffer(2)]],
+    device const float* attn_sink [[buffer(3)]],
+    device bfloat* out [[buffer(4)]],
+    device const int32_t* d_position [[buffer(5)]],
+    device const int32_t* d_comp_count [[buffer(6)]],
+    device const float* freq_table [[buffer(7)]],
+    constant int& max_cache_len [[buffer(8)]],
+    constant int& head_dim [[buffer(9)]],
+    constant int& rope_dim [[buffer(10)]],
+    constant float& scale [[buffer(11)]],
+    constant float& q_norm_eps [[buffer(12)]],
+    device const uint8_t* comp_mask [[buffer(13)]],
+    constant int& window [[buffer(14)]],
+    threadgroup float* s_scores [[threadgroup(0)]],
+    uint h [[threadgroup_position_in_grid]],
+    uint tid [[thread_position_in_threadgroup]],
+    uint threads_per_group [[threads_per_threadgroup]],
+    uint simd_lane [[thread_index_in_simdgroup]],
+    uint simd_id [[simdgroup_index_in_threadgroup]])
+{
+    threadgroup float s_q[512];
+    threadgroup float s_out[512];
+    threadgroup float s_red[32];
+
+    // Step 1: Load raw Q & compute unweighted RMSNorm in shared memory
+    float local_sum_sq = 0.0f;
+    for (int d = tid; d < head_dim; d += threads_per_group) {
+        float val = float(raw_q[h * head_dim + d]);
+        s_q[d] = val;
+        local_sum_sq += val * val;
+    }
+    float warp_sum_sq = simd_sum(local_sum_sq);
+    if (simd_lane == 0) s_red[simd_id] = warp_sum_sq;
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    if (simd_id == 0) {
+        float b_sq = (simd_lane < (threads_per_group >> 5)) ? s_red[simd_lane] : 0.0f;
+        b_sq = simd_sum(b_sq);
+        if (simd_lane == 0) s_red[0] = rsqrt(b_sq / float(head_dim) + q_norm_eps);
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    float rsqrt_val = s_red[0];
+
+    for (int d = tid; d < head_dim; d += threads_per_group) {
+        s_q[d] *= rsqrt_val;
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    // Step 2: Forward RoPE rotation on Q
+    int pos = d_position ? *d_position : 0;
+    int half_rope = rope_dim / 2;
+    if (tid < (uint)half_rope) {
+        int pair_id = tid;
+        int base_idx = (head_dim - rope_dim) + 2 * pair_id;
+        float x0 = s_q[base_idx];
+        float x1 = s_q[base_idx + 1];
+
+        float cos_val = freq_table[pos * half_rope * 2 + pair_id * 2];
+        float sin_val = freq_table[pos * half_rope * 2 + pair_id * 2 + 1];
+
+        s_q[base_idx]     = x0 * cos_val - x1 * sin_val;
+        s_q[base_idx + 1] = x0 * sin_val + x1 * cos_val;
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    // Step 3: Compute attention dot products
+    int n_raw = (pos + 1 < window) ? (pos + 1) : window;
+    int n_comp = (pos + 1 > window && d_comp_count != nullptr && comp_kv != nullptr) ? *d_comp_count : 0;
+    int cache_len = n_raw + n_comp;
+    if (cache_len > max_cache_len) cache_len = max_cache_len;
+    if (cache_len < 1) cache_len = 1;
+
+    int raw_start = (pos + 1 > window) ? ((pos + 1) % window) : 0;
+
+    for (int t = tid; t < cache_len; t += threads_per_group) {
+        device const bfloat* kv_t = nullptr;
+        if (t < n_raw) {
+            int raw_slot = (raw_start + t) % window;
+            kv_t = raw_kv + (size_t)raw_slot * head_dim;
+        } else {
+            int comp_slot = t - n_raw;
+            if (comp_mask != nullptr && comp_mask[comp_slot] == 0) {
+                s_scores[t] = -1e38f;
+                continue;
+            }
+            kv_t = comp_kv + (size_t)comp_slot * head_dim;
+        }
+
+        float dot = 0.0f;
+        for (int d = 0; d < head_dim; d++) {
+            dot += s_q[d] * float(kv_t[d]);
+        }
+        s_scores[t] = dot * scale;
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    // Step 4: Softmax Max + Exp + Sum
+    float local_max = -1e38f;
+    for (int t = tid; t < cache_len; t += threads_per_group) {
+        local_max = max(local_max, s_scores[t]);
+    }
+    if (attn_sink != nullptr) {
+        local_max = max(local_max, attn_sink[h]);
+    }
+    #pragma unroll
+    for (int offset = 16; offset > 0; offset /= 2) {
+        local_max = max(local_max, simd_shuffle_down(local_max, offset));
+    }
+    if (simd_lane == 0) s_red[simd_id] = local_max;
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    if (simd_id == 0) {
+        float b_max = (simd_lane < (threads_per_group >> 5)) ? s_red[simd_lane] : -1e38f;
+        for (int offset = 16; offset > 0; offset /= 2) {
+            b_max = max(b_max, simd_shuffle_down(b_max, offset));
+        }
+        if (simd_lane == 0) s_red[0] = b_max;
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    float block_max = s_red[0];
+
+    float local_sum = 0.0f;
+    for (int t = tid; t < cache_len; t += threads_per_group) {
+        float e = exp(s_scores[t] - block_max);
+        s_scores[t] = e;
+        local_sum += e;
+    }
+    if (tid == 0 && attn_sink != nullptr) {
+        local_sum += exp(attn_sink[h] - block_max);
+    }
+
+    float warp_sum = simd_sum(local_sum);
+    if (simd_lane == 0) s_red[simd_id] = warp_sum;
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    if (simd_id == 0) {
+        float b_sum = (simd_lane < (threads_per_group >> 5)) ? s_red[simd_lane] : 0.0f;
+        b_sum = simd_sum(b_sum);
+        if (simd_lane == 0) s_red[0] = 1.0f / b_sum;
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    float inv_sum = s_red[0];
+
+    for (int t = tid; t < cache_len; t += threads_per_group) {
+        s_scores[t] *= inv_sum;
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    // Step 5: Weighted Value Reduction (scores @ KV)
+    float sum0 = 0.0f;
+    float sum1 = 0.0f;
+    int d0 = tid * 2;
+    int d1 = tid * 2 + 1;
+
+    for (int t = 0; t < n_raw; t++) {
+        int raw_slot = (raw_start + t) % window;
+        float sc = s_scores[t];
+        sum0 += sc * float(raw_kv[(size_t)raw_slot * head_dim + d0]);
+        sum1 += sc * float(raw_kv[(size_t)raw_slot * head_dim + d1]);
+    }
+    int safe_comp = n_comp;
+    if (n_raw + safe_comp > max_cache_len) safe_comp = max_cache_len - n_raw;
+    if (safe_comp < 0) safe_comp = 0;
+    for (int t = 0; t < safe_comp; t++) {
+        float sc = s_scores[n_raw + t];
+        sum0 += sc * float(comp_kv[(size_t)t * head_dim + d0]);
+        sum1 += sc * float(comp_kv[(size_t)t * head_dim + d1]);
+    }
+    s_out[d0] = sum0;
+    s_out[d1] = sum1;
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    // Step 6: Inverse RoPE Rotation & Store
+    if (tid < (uint)half_rope) {
+        int pair_id = tid;
+        int base_idx = (head_dim - rope_dim) + 2 * pair_id;
+        float y0 = s_out[base_idx];
+        float y1 = s_out[base_idx + 1];
+
+        float cos_val = freq_table[pos * half_rope * 2 + pair_id * 2];
+        float sin_val = -freq_table[pos * half_rope * 2 + pair_id * 2 + 1];
+
+        s_out[base_idx]     = y0 * cos_val - y1 * sin_val;
+        s_out[base_idx + 1] = y0 * sin_val + y1 * cos_val;
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    out[h * head_dim + d0] = bfloat(s_out[d0]);
+    out[h * head_dim + d1] = bfloat(s_out[d1]);
+}
+
+// ── KV Compressor Step Metal Kernel ─────────────────────────────────────────
+
+kernel void compressor_device_step_kernel(
+    device const int32_t* d_position [[buffer(0)]],
+    device int32_t* d_comp_count [[buffer(1)]],
+    device const float* proj_kv [[buffer(2)]],
+    device const float* proj_gate [[buffer(3)]],
+    device float* comp_kv_state [[buffer(4)]],
+    device float* comp_score_state [[buffer(5)]],
+    device const float* comp_ape [[buffer(6)]],
+    device const bfloat* comp_norm [[buffer(7)]],
+    device bfloat* comp_kv_cache [[buffer(8)]],
+    device const float* rope_freqs_compressed [[buffer(9)]],
+    constant int& ratio [[buffer(10)]],
+    constant int& head_dim [[buffer(11)]],
+    constant int& rope_dim [[buffer(12)]],
+    constant float& rms_norm_eps [[buffer(13)]],
+    device const float* idx_proj_kv [[buffer(14)]],
+    device const float* idx_proj_gate [[buffer(15)]],
+    device float* idx_kv_state [[buffer(16)]],
+    device float* idx_score_state [[buffer(17)]],
+    device const float* idx_ape [[buffer(18)]],
+    device const bfloat* idx_norm [[buffer(19)]],
+    device bfloat* idx_comp_kv_cache [[buffer(20)]],
+    constant int& max_comp [[buffer(21)]],
+    uint tid [[thread_position_in_threadgroup]],
+    uint threads_per_group [[threads_per_threadgroup]],
+    uint simd_lane [[thread_index_in_simdgroup]],
+    uint simd_id [[simdgroup_index_in_threadgroup]])
+{
+    int pos = *d_position;
+    int pos_mod = pos % ratio;
+    bool overlap = (ratio == 4);
+    int coff = overlap ? 2 : 1;
+    int proj_dim = coff * head_dim;
+    int state_idx = overlap ? (ratio + pos_mod) : pos_mod;
+
+    // 1. Copy projection to state & add APE bias
+    for (int i = tid; i < proj_dim; i += threads_per_group) {
+        comp_kv_state[(size_t)state_idx * proj_dim + i] = proj_kv[i];
+        comp_score_state[(size_t)state_idx * proj_dim + i] = proj_gate[i] + comp_ape[(size_t)pos_mod * proj_dim + i];
+    }
+    if (idx_proj_kv != nullptr) {
+        int idx_proj_dim = 256;
+        for (int i = tid; i < idx_proj_dim; i += threads_per_group) {
+            idx_kv_state[(size_t)state_idx * idx_proj_dim + i] = idx_proj_kv[i];
+            idx_score_state[(size_t)state_idx * idx_proj_dim + i] = idx_proj_gate[i] + idx_ape[(size_t)pos_mod * idx_proj_dim + i];
+        }
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    // 2. Check boundary
+    if ((pos + 1) % ratio != 0) return;
+
+    threadgroup float s_pooled[512];
+    threadgroup float s_normed[512];
+    threadgroup float s_warp_sq[32];
+    threadgroup float s_sq_sum;
+
+    // 3. Softmax-gated pooling
+    for (int j = tid; j < head_dim; j += threads_per_group) {
+        float max_score = -1e38f;
+        if (overlap) {
+            for (int r = 0; r < ratio; r++) {
+                float sp = comp_score_state[(size_t)r * proj_dim + j];
+                float sc = comp_score_state[(size_t)(ratio + r) * proj_dim + head_dim + j];
+                max_score = max(max_score, max(sp, sc));
+            }
+            float denom = 0.0f;
+            float sum = 0.0f;
+            for (int r = 0; r < ratio; r++) {
+                float wp = exp(comp_score_state[(size_t)r * proj_dim + j] - max_score);
+                float wc = exp(comp_score_state[(size_t)(ratio + r) * proj_dim + head_dim + j] - max_score);
+                denom += wp + wc;
+                sum += wp * comp_kv_state[(size_t)r * proj_dim + j] + wc * comp_kv_state[(size_t)(ratio + r) * proj_dim + head_dim + j];
+            }
+            s_pooled[j] = denom > 0.0f ? (sum / denom) : 0.0f;
+        } else {
+            for (int r = 0; r < ratio; r++) {
+                max_score = max(max_score, comp_score_state[(size_t)r * proj_dim + j]);
+            }
+            float denom = 0.0f;
+            float sum = 0.0f;
+            for (int r = 0; r < ratio; r++) {
+                float w = exp(comp_score_state[(size_t)r * proj_dim + j] - max_score);
+                denom += w;
+                sum += w * comp_kv_state[(size_t)r * proj_dim + j];
+            }
+            s_pooled[j] = denom > 0.0f ? (sum / denom) : 0.0f;
+        }
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    // 4. RMSNorm
+    float thread_sq = 0.0f;
+    for (int j = tid; j < head_dim; j += threads_per_group) {
+        thread_sq += s_pooled[j] * s_pooled[j];
+    }
+    float warp_sq = simd_sum(thread_sq);
+    if (simd_lane == 0) s_warp_sq[simd_id] = warp_sq;
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    if (simd_id == 0) {
+        float b_sq = (simd_lane < (threads_per_group >> 5)) ? s_warp_sq[simd_lane] : 0.0f;
+        b_sq = simd_sum(b_sq);
+        if (simd_lane == 0) s_sq_sum = b_sq;
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    float rms_scale = rsqrt(s_sq_sum / float(head_dim) + rms_norm_eps);
+    for (int j = tid; j < head_dim; j += threads_per_group) {
+        s_normed[j] = s_pooled[j] * rms_scale * float(comp_norm[j]);
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    // 5. RoPE on compressed entry
+    int comp_pos = pos + 1 - ratio;
+    if (comp_pos >= 65536) comp_pos = 65535;
+    if (comp_pos < 0) comp_pos = 0;
+    int half_rope = rope_dim / 2;
+    if (tid < (uint)half_rope) {
+        int pair_id = tid;
+        int base_idx = (head_dim - rope_dim) + 2 * pair_id;
+        float x0 = s_normed[base_idx];
+        float x1 = s_normed[base_idx + 1];
+        float cos_val = rope_freqs_compressed[comp_pos * half_rope * 2 + pair_id * 2];
+        float sin_val = rope_freqs_compressed[comp_pos * half_rope * 2 + pair_id * 2 + 1];
+        s_normed[base_idx]     = x0 * cos_val - x1 * sin_val;
+        s_normed[base_idx + 1] = x0 * sin_val + x1 * cos_val;
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    // 6. Store to cache & shift state
+    int comp_idx = *d_comp_count;
+    if (max_comp <= 0 || comp_idx < max_comp) {
+        for (int j = tid; j < head_dim; j += threads_per_group) {
+            comp_kv_cache[(size_t)comp_idx * head_dim + j] = bfloat(s_normed[j]);
+        }
+    }
+    if (overlap) {
+        int half_elements = ratio * proj_dim;
+        for (int i = tid; i < half_elements; i += threads_per_group) {
+            comp_kv_state[i] = comp_kv_state[half_elements + i];
+            comp_score_state[i] = comp_score_state[half_elements + i];
+        }
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    // 7. If ratio == 4, Indexer Compressor
+    if (idx_proj_kv != nullptr) {
+        int idx_head_dim = 128;
+        int idx_proj_dim = 256;
+        threadgroup float s_idx_pooled[128];
+        threadgroup float s_idx_normed[128];
+        threadgroup float s_idx_sq_sum;
+
+        if (tid < (uint)idx_head_dim) {
+            int j = tid;
+            float max_score = -1e38f;
+            for (int r = 0; r < ratio; r++) {
+                float sp = idx_score_state[(size_t)r * idx_proj_dim + j];
+                float sc = idx_score_state[(size_t)(ratio + r) * idx_proj_dim + idx_head_dim + j];
+                max_score = max(max_score, max(sp, sc));
+            }
+            float denom = 0.0f;
+            float sum = 0.0f;
+            for (int r = 0; r < ratio; r++) {
+                float wp = exp(idx_score_state[(size_t)r * idx_proj_dim + j] - max_score);
+                float wc = exp(idx_score_state[(size_t)(ratio + r) * idx_proj_dim + idx_head_dim + j] - max_score);
+                denom += wp + wc;
+                sum += wp * idx_kv_state[(size_t)r * idx_proj_dim + j] + wc * idx_kv_state[(size_t)(ratio + r) * idx_proj_dim + idx_head_dim + j];
+            }
+            s_idx_pooled[j] = denom > 0.0f ? (sum / denom) : 0.0f;
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+
+        float idx_thread_sq = (tid < (uint)idx_head_dim) ? (s_idx_pooled[tid] * s_idx_pooled[tid]) : 0.0f;
+        float idx_warp_sq = simd_sum(idx_thread_sq);
+        if (simd_lane == 0) s_warp_sq[simd_id] = idx_warp_sq;
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+
+        if (simd_id == 0) {
+            float b_sq = (simd_lane < (threads_per_group >> 5)) ? s_warp_sq[simd_lane] : 0.0f;
+            b_sq = simd_sum(b_sq);
+            if (simd_lane == 0) s_idx_sq_sum = b_sq;
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+
+        float idx_rms_scale = rsqrt(s_idx_sq_sum / float(idx_head_dim) + rms_norm_eps);
+        if (tid < (uint)idx_head_dim) {
+            s_idx_normed[tid] = s_idx_pooled[tid] * idx_rms_scale * float(idx_norm[tid]);
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+
+        if (tid < (uint)half_rope) {
+            int pair_id = tid;
+            int base_idx = (idx_head_dim - rope_dim) + 2 * pair_id;
+            float x0 = s_idx_normed[base_idx];
+            float x1 = s_idx_normed[base_idx + 1];
+            float cos_val = rope_freqs_compressed[comp_pos * half_rope * 2 + pair_id * 2];
+            float sin_val = rope_freqs_compressed[comp_pos * half_rope * 2 + pair_id * 2 + 1];
+            s_idx_normed[base_idx]     = x0 * cos_val - x1 * sin_val;
+            s_idx_normed[base_idx + 1] = x0 * sin_val + x1 * cos_val;
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+
+        if (tid < (uint)idx_head_dim) {
+            if (max_comp <= 0 || comp_idx < max_comp) {
+                idx_comp_kv_cache[(size_t)comp_idx * idx_head_dim + tid] = bfloat(s_idx_normed[tid]);
+            }
+        }
+        int idx_half_elements = ratio * idx_proj_dim;
+        for (int i = tid; i < idx_half_elements; i += threads_per_group) {
+            idx_kv_state[i] = idx_kv_state[idx_half_elements + i];
+            idx_score_state[i] = idx_score_state[idx_half_elements + i];
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+    }
+
+    if (tid == 0) {
+        if (max_comp <= 0 || *d_comp_count < max_comp) {
+            *d_comp_count += 1;
+        }
+    }
+}
+
+// ── Indexer Scoring & Top-K Masking Metal Kernels ───────────────────────────
+
+kernel void indexer_score_kernel(
+    device float* out_scores [[buffer(0)]],
+    device const bfloat* index_comp [[buffer(1)]],
+    device const bfloat* q [[buffer(2)]],
+    device const float* weights [[buffer(3)]],
+    device const int32_t* d_comp_count [[buffer(4)]],
+    constant int& max_comp [[buffer(5)]],
+    uint c [[threadgroup_position_in_grid]],
+    uint tid [[thread_position_in_threadgroup]],
+    uint threads_per_group [[threads_per_threadgroup]],
+    uint simd_lane [[thread_index_in_simdgroup]],
+    uint simd_id [[simdgroup_index_in_threadgroup]])
+{
+    int n_comp = *d_comp_count;
+    if (c >= (uint)n_comp || c >= (uint)max_comp) return;
+
+    device const bfloat* kv_c = index_comp + (size_t)c * 128;
+    threadgroup float s_kv[128];
+    threadgroup float s_warp_scores[32];
+
+    if (tid < 128) {
+        s_kv[tid] = float(kv_c[tid]);
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    float local_total = 0.0f;
+    for (int h = tid; h < 64; h += threads_per_group) {
+        device const bfloat* q_h = q + (size_t)h * 128;
+        float dot = 0.0f;
+        for (int d = 0; d < 128; d++) {
+            dot += s_kv[d] * float(q_h[d]);
+        }
+        if (dot > 0.0f) {
+            local_total += dot * weights[h];
+        }
+    }
+
+    float warp_total = simd_sum(local_total);
+    if (simd_lane == 0) s_warp_scores[simd_id] = warp_total;
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    if (simd_id == 0) {
+        float b_total = (simd_lane < (threads_per_group >> 5)) ? s_warp_scores[simd_lane] : 0.0f;
+        b_total = simd_sum(b_total);
+        if (simd_lane == 0) out_scores[c] = b_total;
+    }
+}
+
+kernel void indexer_mask_topk_kernel(
+    device uint8_t* out_mask [[buffer(0)]],
+    device const float* scores [[buffer(1)]],
+    device const int32_t* d_comp_count [[buffer(2)]],
+    constant int& max_comp [[buffer(3)]],
+    constant int& top_k [[buffer(4)]],
+    uint tid [[thread_position_in_threadgroup]],
+    uint threads_per_group [[threads_per_threadgroup]],
+    uint simd_lane [[thread_index_in_simdgroup]],
+    uint simd_id [[simdgroup_index_in_threadgroup]])
+{
+    int n_comp = *d_comp_count;
+    if (n_comp <= 0) return;
+    if (n_comp > max_comp) n_comp = max_comp;
+
+    // Fast path: all fit
+    if (n_comp <= top_k) {
+        for (int i = tid; i < n_comp; i += threads_per_group) {
+            out_mask[i] = 1;
+        }
+        return;
+    }
+
+    threadgroup float s_min[32];
+    threadgroup float s_max[32];
+
+    float local_min = 1e38f;
+    float local_max = -1e38f;
+    for (int i = tid; i < n_comp; i += threads_per_group) {
+        float v = scores[i];
+        local_min = min(local_min, v);
+        local_max = max(local_max, v);
+    }
+
+    #pragma unroll
+    for (int offset = 16; offset > 0; offset /= 2) {
+        local_min = min(local_min, simd_shuffle_down(local_min, offset));
+        local_max = max(local_max, simd_shuffle_down(local_max, offset));
+    }
+
+    if (simd_lane == 0) {
+        s_min[simd_id] = local_min;
+        s_max[simd_id] = local_max;
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    if (simd_id == 0) {
+        float b_min = (simd_lane < (threads_per_group >> 5)) ? s_min[simd_lane] : 1e38f;
+        float b_max = (simd_lane < (threads_per_group >> 5)) ? s_max[simd_lane] : -1e38f;
+        for (int offset = 16; offset > 0; offset /= 2) {
+            b_min = min(b_min, simd_shuffle_down(b_min, offset));
+            b_max = max(b_max, simd_shuffle_down(b_max, offset));
+        }
+        if (simd_lane == 0) {
+            s_min[0] = b_min;
+            s_max[0] = b_max;
+        }
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    float global_min = s_min[0];
+    float global_max = s_max[0];
+    float low = global_min;
+    float high = global_max;
+    threadgroup int s_count;
+
+    for (int iter = 0; iter < 16; iter++) {
+        float mid = 0.5f * (low + high);
+        int local_cnt = 0;
+        for (int i = tid; i < n_comp; i += threads_per_group) {
+            if (scores[i] >= mid) local_cnt++;
+        }
+        int warp_cnt = simd_sum(local_cnt);
+        if (simd_lane == 0) s_min[simd_id] = float(warp_cnt);
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+
+        if (simd_id == 0) {
+            float b_cnt = (simd_lane < (threads_per_group >> 5)) ? s_min[simd_lane] : 0.0f;
+            b_cnt = simd_sum(b_cnt);
+            if (simd_lane == 0) s_count = int(b_cnt);
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+
+        if (s_count >= top_k) {
+            low = mid;
+        } else {
+            high = mid;
+        }
+    }
+
+    float thresh = low;
+    for (int i = tid; i < n_comp; i += threads_per_group) {
+        out_mask[i] = (scores[i] >= thresh) ? 1 : 0;
+    }
+}
+
+// ── IQ2_XXS & Q2_K Quantization MSL Compute Shaders ─────────────────────────
+
+constant uint8_t c_ksigns_iq2xs[128] = {
+      0, 129, 130,   3, 132,   5,   6, 135, 136,   9,  10, 139,  12, 141, 142,  15,
+    144,  17,  18, 147,  20, 149, 150,  23,  24, 153, 154,  27, 156,  29,  30, 159,
+    160,  33,  34, 163,  36, 165, 166,  39,  40, 169, 170,  43, 172,  45,  46, 175,
+     48, 177, 178,  51, 180,  53,  54, 183, 184,  57,  58, 187,  60, 189, 190,  63,
+    192,  65,  66, 195,  68, 197, 198,  71,  72, 201, 202,  75, 204,  77,  78, 207,
+     80, 209, 210,  83, 212,  85,  86, 215, 216,  89,  90, 219,  92, 221, 222,  95,
+     96, 225, 226,  99, 228, 101, 102, 231, 232, 105, 106, 235, 108, 237, 238, 111,
+    240, 113, 114, 243, 116, 245, 246, 119, 120, 249, 250, 123, 252, 125, 126, 255,
+};
+
+constant uint64_t c_iq2xxs_grid[256] = {
+    0x0808080808080808ULL, 0x080808080808082bULL, 0x0808080808081919ULL, 0x0808080808082b08ULL,
+    0x0808080808082b2bULL, 0x0808080808190819ULL, 0x0808080808191908ULL, 0x08080808082b0808ULL,
+    0x08080808082b082bULL, 0x08080808082b2b08ULL, 0x08080808082b2b2bULL, 0x0808080819080819ULL,
+    0x0808080819081908ULL, 0x0808080819190808ULL, 0x0808080819192b08ULL, 0x08080808192b0819ULL,
+    0x08080808192b1908ULL, 0x080808082b080808ULL, 0x080808082b08082bULL, 0x080808082b082b2bULL,
+    0x080808082b2b082bULL, 0x0808081908080819ULL, 0x0808081908081908ULL, 0x0808081908190808ULL,
+    0x0808081908191919ULL, 0x0808081919080808ULL, 0x080808192b081908ULL, 0x080808192b192b08ULL,
+    0x0808082b08080808ULL, 0x0808082b0808082bULL, 0x0808082b082b082bULL, 0x0808082b2b08082bULL,
+    0x0808190808080819ULL, 0x0808190808081908ULL, 0x0808190808190808ULL, 0x08081908082b0819ULL,
+    0x08081908082b1908ULL, 0x0808190819080808ULL, 0x080819081908082bULL, 0x0808190819082b08ULL,
+    0x08081908192b0808ULL, 0x080819082b080819ULL, 0x080819082b081908ULL, 0x080819082b190808ULL,
+    0x080819082b2b1908ULL, 0x0808191908080808ULL, 0x080819190808082bULL, 0x0808191908082b08ULL,
+    0x08081919082b0808ULL, 0x080819191908192bULL, 0x08081919192b2b19ULL, 0x080819192b080808ULL,
+    0x080819192b190819ULL, 0x0808192b08082b19ULL, 0x0808192b08190808ULL, 0x0808192b19080808ULL,
+    0x0808192b2b081908ULL, 0x0808192b2b2b1908ULL, 0x08082b0808080808ULL, 0x08082b0808081919ULL,
+    0x08082b0808082b08ULL, 0x08082b0808191908ULL, 0x08082b08082b2b08ULL, 0x08082b0819080819ULL,
+    0x08082b0819081908ULL, 0x08082b0819190808ULL, 0x08082b081919082bULL, 0x08082b082b082b08ULL,
+    0x08082b1908081908ULL, 0x08082b1919080808ULL, 0x08082b2b0808082bULL, 0x08082b2b08191908ULL,
+    0x0819080808080819ULL, 0x0819080808081908ULL, 0x0819080808190808ULL, 0x08190808082b0819ULL,
+    0x0819080819080808ULL, 0x08190808192b0808ULL, 0x081908082b081908ULL, 0x081908082b190808ULL,
+    0x081908082b191919ULL, 0x0819081908080808ULL, 0x0819081908082b08ULL, 0x08190819082b0808ULL,
+    0x0819081919190808ULL, 0x0819081919192b2bULL, 0x081908192b080808ULL, 0x0819082b082b1908ULL,
+    0x0819082b19081919ULL, 0x0819190808080808ULL, 0x0819190808082b08ULL, 0x08191908082b0808ULL,
+    0x08191908082b1919ULL, 0x0819190819082b19ULL, 0x081919082b080808ULL, 0x0819191908192b08ULL,
+    0x08191919192b082bULL, 0x0819192b08080808ULL, 0x0819192b0819192bULL, 0x08192b0808080819ULL,
+    0x08192b0808081908ULL, 0x08192b0808190808ULL, 0x08192b0819080808ULL, 0x08192b082b080819ULL,
+    0x08192b1908080808ULL, 0x08192b1908081919ULL, 0x08192b192b2b0808ULL, 0x08192b2b19190819ULL,
+    0x082b080808080808ULL, 0x082b08080808082bULL, 0x082b080808082b2bULL, 0x082b080819081908ULL,
+    0x082b0808192b0819ULL, 0x082b08082b080808ULL, 0x082b08082b08082bULL, 0x082b0819082b2b19ULL,
+    0x082b081919082b08ULL, 0x082b082b08080808ULL, 0x082b082b0808082bULL, 0x082b190808080819ULL,
+    0x082b190808081908ULL, 0x082b190808190808ULL, 0x082b190819080808ULL, 0x082b19081919192bULL,
+    0x082b191908080808ULL, 0x082b191919080819ULL, 0x082b1919192b1908ULL, 0x082b192b2b190808ULL,
+    0x082b2b0808082b08ULL, 0x082b2b08082b0808ULL, 0x082b2b082b191908ULL, 0x082b2b2b19081908ULL,
+    0x1908080808080819ULL, 0x1908080808081908ULL, 0x1908080808190808ULL, 0x1908080808192b08ULL,
+    0x19080808082b0819ULL, 0x19080808082b1908ULL, 0x1908080819080808ULL, 0x1908080819082b08ULL,
+    0x190808081919192bULL, 0x19080808192b0808ULL, 0x190808082b080819ULL, 0x190808082b081908ULL,
+    0x190808082b190808ULL, 0x1908081908080808ULL, 0x19080819082b0808ULL, 0x19080819192b0819ULL,
+    0x190808192b080808ULL, 0x190808192b081919ULL, 0x1908082b08080819ULL, 0x1908082b08190808ULL,
+    0x1908082b19082b08ULL, 0x1908082b1919192bULL, 0x1908082b192b2b08ULL, 0x1908190808080808ULL,
+    0x1908190808082b08ULL, 0x19081908082b0808ULL, 0x190819082b080808ULL, 0x190819082b192b19ULL,
+    0x190819190819082bULL, 0x19081919082b1908ULL, 0x1908192b08080808ULL, 0x19082b0808080819ULL,
+    0x19082b0808081908ULL, 0x19082b0808190808ULL, 0x19082b0819080808ULL, 0x19082b0819081919ULL,
+    0x19082b1908080808ULL, 0x19082b1919192b08ULL, 0x19082b19192b0819ULL, 0x19082b192b08082bULL,
+    0x19082b2b19081919ULL, 0x19082b2b2b190808ULL, 0x1919080808080808ULL, 0x1919080808082b08ULL,
+    0x1919080808190819ULL, 0x1919080808192b19ULL, 0x19190808082b0808ULL, 0x191908082b080808ULL,
+    0x191908082b082b08ULL, 0x1919081908081908ULL, 0x191908191908082bULL, 0x191908192b2b1908ULL,
+    0x1919082b2b190819ULL, 0x191919082b190808ULL, 0x191919082b19082bULL, 0x1919191908082b2bULL,
+    0x1919192b08080819ULL, 0x1919192b19191908ULL, 0x19192b0808080808ULL, 0x19192b0808190819ULL,
+    0x19192b0808192b19ULL, 0x19192b08192b1908ULL, 0x19192b1919080808ULL, 0x19192b2b08082b08ULL,
+    0x192b080808081908ULL, 0x192b080808190808ULL, 0x192b080819080808ULL, 0x192b0808192b2b08ULL,
+    0x192b081908080808ULL, 0x192b081919191919ULL, 0x192b082b08192b08ULL, 0x192b082b192b0808ULL,
+    0x192b190808080808ULL, 0x192b190808081919ULL, 0x192b191908190808ULL, 0x192b19190819082bULL,
+    0x192b19192b081908ULL, 0x192b2b081908082bULL, 0x2b08080808080808ULL, 0x2b0808080808082bULL,
+    0x2b08080808082b2bULL, 0x2b08080819080819ULL, 0x2b0808082b08082bULL, 0x2b08081908081908ULL,
+    0x2b08081908192b08ULL, 0x2b08081919080808ULL, 0x2b08082b08190819ULL, 0x2b08190808080819ULL,
+    0x2b08190808081908ULL, 0x2b08190808190808ULL, 0x2b08190808191919ULL, 0x2b08190819080808ULL,
+    0x2b081908192b0808ULL, 0x2b08191908080808ULL, 0x2b0819191908192bULL, 0x2b0819192b191908ULL,
+    0x2b08192b08082b19ULL, 0x2b08192b19080808ULL, 0x2b08192b192b0808ULL, 0x2b082b080808082bULL,
+    0x2b082b1908081908ULL, 0x2b082b2b08190819ULL, 0x2b19080808081908ULL, 0x2b19080808190808ULL,
+    0x2b190808082b1908ULL, 0x2b19080819080808ULL, 0x2b1908082b2b0819ULL, 0x2b1908190819192bULL,
+    0x2b1908192b080808ULL, 0x2b19082b19081919ULL, 0x2b19190808080808ULL, 0x2b191908082b082bULL,
+    0x2b19190819081908ULL, 0x2b19191919190819ULL, 0x2b192b082b080819ULL, 0x2b192b19082b0808ULL,
+    0x2b2b08080808082bULL, 0x2b2b080819190808ULL, 0x2b2b08082b081919ULL, 0x2b2b081908082b19ULL,
+    0x2b2b082b08080808ULL, 0x2b2b190808192b08ULL, 0x2b2b2b0819190808ULL, 0x2b2b2b1908081908ULL,
+};
+
+struct block_iq2_xxs {
+    half d;
+    uint16_t qs[32];
+};
+
+struct block_q2_K {
+    uint8_t scales[16];
+    uint8_t qs[64];
+    half d;
+    half dmin;
+};
+
+kernel void gemv_iq2_xxs_swiglu_fused_kernel(
+    device bfloat* out [[buffer(0)]],
+    device const bfloat* vec [[buffer(1)]],
+    device const block_iq2_xxs* w1 [[buffer(2)]],
+    device const block_iq2_xxs* w3 [[buffer(3)]],
+    constant int& N [[buffer(4)]],
+    constant int& K [[buffer(5)]],
+    constant float& swiglu_limit [[buffer(6)]],
+    uint tg_x [[threadgroup_position_in_grid]],
+    uint simd_id [[simdgroup_index_in_threadgroup]],
+    uint simd_lane [[thread_index_in_simdgroup]])
+{
+    uint row = tg_x * 8 + simd_id;
+    if (row >= (uint)N) return;
+
+    int n_blocks = K / 256;
+    device const block_iq2_xxs* row_w1 = w1 + row * n_blocks;
+    device const block_iq2_xxs* row_w3 = w3 + row * n_blocks;
+
+    int l = simd_lane / 8;
+    int j = simd_lane % 8;
+    uint8_t kmask = 1 << j;
+
+    float sum1 = 0.0f;
+    float sum3 = 0.0f;
+
+    for (int b = 0; b < n_blocks; b++) {
+        device const block_iq2_xxs& blk1 = row_w1[b];
+        device const block_iq2_xxs& blk3 = row_w3[b];
+
+        float d1 = float(blk1.d);
+        float d3 = float(blk3.d);
+
+        #pragma unroll
+        for (int ib32 = 0; ib32 < 8; ib32++) {
+            uint32_t aux0_1 = uint32_t(blk1.qs[ib32 * 4 + 0]) | (uint32_t(blk1.qs[ib32 * 4 + 1]) << 16);
+            uint32_t aux1_1 = uint32_t(blk1.qs[ib32 * 4 + 2]) | (uint32_t(blk1.qs[ib32 * 4 + 3]) << 16);
+            float db1 = d1 * (0.5f + float(aux1_1 >> 28)) * 0.25f;
+
+            uint8_t g_idx1 = (aux0_1 >> (8 * l)) & 0xFF;
+            uint8_t s_idx1 = (aux1_1 >> (7 * l)) & 0x7F;
+            uint64_t g_val1 = c_iq2xxs_grid[g_idx1];
+            uint8_t s_val1 = c_ksigns_iq2xs[s_idx1];
+            uint8_t byte1 = (g_val1 >> (8 * j)) & 0xFF;
+            float sign1 = (s_val1 & kmask) ? -1.0f : 1.0f;
+            float weight1 = db1 * float(byte1) * sign1;
+
+            uint32_t aux0_3 = uint32_t(blk3.qs[ib32 * 4 + 0]) | (uint32_t(blk3.qs[ib32 * 4 + 1]) << 16);
+            uint32_t aux1_3 = uint32_t(blk3.qs[ib32 * 4 + 2]) | (uint32_t(blk3.qs[ib32 * 4 + 3]) << 16);
+            float db3 = d3 * (0.5f + float(aux1_3 >> 28)) * 0.25f;
+
+            uint8_t g_idx3 = (aux0_3 >> (8 * l)) & 0xFF;
+            uint8_t s_idx3 = (aux1_3 >> (7 * l)) & 0x7F;
+            uint64_t g_val3 = c_iq2xxs_grid[g_idx3];
+            uint8_t s_val3 = c_ksigns_iq2xs[s_idx3];
+            uint8_t byte3 = (g_val3 >> (8 * j)) & 0xFF;
+            float sign3 = (s_val3 & kmask) ? -1.0f : 1.0f;
+            float weight3 = db3 * float(byte3) * sign3;
+
+            int col = b * 256 + (ib32 << 5) + simd_lane;
+            float a = float(vec[col]);
+            sum1 += weight1 * a;
+            sum3 += weight3 * a;
+        }
+    }
+
+    sum1 = simd_sum(sum1);
+    sum3 = simd_sum(sum3);
+
+    if (simd_lane == 0) {
+        float g = sum1;
+        float u = sum3;
+        if (swiglu_limit > 0.0f) {
+            g = min(g, swiglu_limit);
+            u = min(max(u, -swiglu_limit), swiglu_limit);
+        }
+        float silu_g = g / (1.0f + exp(-g));
+        out[row] = bfloat(silu_g * u);
+    }
+}
+
+kernel void gemv_iq2_xxs_kernel(
+    device bfloat* out [[buffer(0)]],
+    device const bfloat* vec [[buffer(1)]],
+    device const block_iq2_xxs* weight [[buffer(2)]],
+    constant int& N [[buffer(3)]],
+    constant int& K [[buffer(4)]],
+    uint tg_x [[threadgroup_position_in_grid]],
+    uint simd_id [[simdgroup_index_in_threadgroup]],
+    uint simd_lane [[thread_index_in_simdgroup]])
+{
+    uint row = tg_x * 8 + simd_id;
+    if (row >= (uint)N) return;
+
+    int n_blocks = K / 256;
+    device const block_iq2_xxs* row_w = weight + row * n_blocks;
+
+    int l = simd_lane / 8;
+    int j = simd_lane % 8;
+    uint8_t kmask = 1 << j;
+
+    float sum = 0.0f;
+
+    for (int b = 0; b < n_blocks; b++) {
+        device const block_iq2_xxs& blk = row_w[b];
+        float d = float(blk.d);
+
+        #pragma unroll
+        for (int ib32 = 0; ib32 < 8; ib32++) {
+            uint32_t aux0 = uint32_t(blk.qs[ib32 * 4 + 0]) | (uint32_t(blk.qs[ib32 * 4 + 1]) << 16);
+            uint32_t aux1 = uint32_t(blk.qs[ib32 * 4 + 2]) | (uint32_t(blk.qs[ib32 * 4 + 3]) << 16);
+            float db = d * (0.5f + float(aux1 >> 28)) * 0.25f;
+
+            uint8_t g_idx = (aux0 >> (8 * l)) & 0xFF;
+            uint8_t s_idx = (aux1 >> (7 * l)) & 0x7F;
+            uint64_t g_val = c_iq2xxs_grid[g_idx];
+            uint8_t s_val = c_ksigns_iq2xs[s_idx];
+            uint8_t byte_val = (g_val >> (8 * j)) & 0xFF;
+            float sign_val = (s_val & kmask) ? -1.0f : 1.0f;
+            float weight_val = db * float(byte_val) * sign_val;
+
+            int col = b * 256 + (ib32 << 5) + simd_lane;
+            sum += weight_val * float(vec[col]);
+        }
+    }
+
+    sum = simd_sum(sum);
+    if (simd_lane == 0) {
+        out[row] = bfloat(sum);
+    }
+}
+
+kernel void gemv_q2_k_kernel(
+    device bfloat* out [[buffer(0)]],
+    device const bfloat* vec [[buffer(1)]],
+    device const block_q2_K* weight [[buffer(2)]],
+    constant int& N [[buffer(3)]],
+    constant int& K [[buffer(4)]],
+    uint tg_x [[threadgroup_position_in_grid]],
+    uint simd_id [[simdgroup_index_in_threadgroup]],
+    uint simd_lane [[thread_index_in_simdgroup]])
+{
+    uint row = tg_x * 8 + simd_id;
+    if (row >= (uint)N) return;
+
+    int n_blocks = K / 256;
+    device const block_q2_K* row_w2 = weight + row * n_blocks;
+
+    float sum = 0.0f;
+    for (int b = 0; b < n_blocks; b++) {
+        device const block_q2_K& blk = row_w2[b];
+        float d = float(blk.d);
+        float min = float(blk.dmin);
+
+        #pragma unroll 4
+        for (int iter = 0; iter < 8; iter++) {
+            int idx = (iter << 5) + simd_lane; // 0..255
+            int group = idx >> 4;
+            int l = idx & 15;
+            int q_base = ((group >> 3) << 5) + ((group & 1) << 4);
+            int shift = ((group >> 1) & 3) << 1;
+            uint8_t q = (blk.qs[q_base + l] >> shift) & 0x03;
+            uint8_t sc = blk.scales[group];
+            float dl = d * float(sc & 0x0F);
+            float ml = min * float(sc >> 4);
+            float w = dl * float(q) - ml;
+
+            int col_idx = (b << 8) + idx;
+            float a = float(vec[col_idx]);
+            sum += w * a;
+        }
+    }
+
+    sum = simd_sum(sum);
+    if (simd_lane == 0) {
+        out[row] = bfloat(sum);
+    }
+}
+
+kernel void fused_moe_accum_dynamic_kernel(
+    device bfloat* accum [[buffer(0)]],
+    device const bfloat* down_buf [[buffer(1)]],
+    device const float* topk_weights [[buffer(2)]],
+    device const bfloat* shared_down [[buffer(3)]],
+    constant int& dim [[buffer(4)]],
+    constant int& has_shared [[buffer(5)]],
+    uint idx [[thread_position_in_grid]])
+{
+    if (idx >= (uint)dim) return;
+
+    float sum = (has_shared != 0) ? float(shared_down[idx]) : 0.0f;
+    #pragma unroll
+    for (int k = 0; k < 6; k++) {
+        float w = topk_weights[k];
+        sum += float(down_buf[k * dim + idx]) * w;
+    }
+    accum[idx] = bfloat(sum);
+}
+
+kernel void moe_route_top6_kernel(
+    device int32_t* topk_ids [[buffer(0)]],
+    device float* topk_weights [[buffer(1)]],
+    device const bfloat* scores_bf16 [[buffer(2)]],
+    device const float* gate_bias [[buffer(3)]],
+    constant int& n_experts [[buffer(4)]],
+    constant int& top_k [[buffer(5)]],
+    constant float& routed_scaling_factor [[buffer(6)]],
+    constant int& has_bias [[buffer(7)]],
+    uint m [[threadgroup_position_in_grid]],
+    uint tid [[thread_position_in_threadgroup]])
+{
+    threadgroup float tg_scores[512];
+    threadgroup float tg_probs[512];
+
+    if (tid < (uint)n_experts && tid < 512) {
+        float raw = float(scores_bf16[m * n_experts + tid]);
+        float sp = (raw > 20.0f) ? raw : ((raw < -20.0f) ? exp(raw) : log(1.0f + exp(raw)));
+        float prob = sqrt(sp);
+        tg_probs[tid] = prob;
+        float b = (has_bias != 0) ? gate_bias[tid] : 0.0f;
+        tg_scores[tid] = prob + b;
+    } else if (tid < 512) {
+        tg_scores[tid] = -1e30f;
+        tg_probs[tid] = 0.0f;
+    }
+
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    if (tid == 0) {
+        int best_idx[8];
+        float best_prob[8];
+        float sum_p = 0.0f;
+        int k_max = (top_k <= 8) ? top_k : 8;
+
+        for (int k = 0; k < k_max; k++) {
+            float max_s = -1e30f;
+            int max_i = 0;
+            for (int i = 0; i < n_experts; i++) {
+                float s = tg_scores[i];
+                if (s > max_s) {
+                    max_s = s;
+                    max_i = i;
+                }
+            }
+            best_idx[k] = max_i;
+            best_prob[k] = tg_probs[max_i];
+            sum_p += best_prob[k];
+            tg_scores[max_i] = -1e30f;
+        }
+
+        if (sum_p < 1e-6f) sum_p = 1e-6f;
+
+        for (int k = 0; k < k_max; k++) {
+            topk_ids[m * top_k + k] = best_idx[k];
+            topk_weights[m * top_k + k] = (best_prob[k] / sum_p) * routed_scaling_factor;
+        }
+    }
+}
+
+// ── DeepSeek V4 MTP Markov Head Predict Kernels ──────────────────────────────
+
+kernel void markov_head_block_kernel(
+    device float* block_max_vals [[buffer(0)]],
+    device int32_t* block_max_indices [[buffer(1)]],
+    device const bfloat* w1 [[buffer(2)]],
+    device const bfloat* w2 [[buffer(3)]],
+    constant int32_t& input_token [[buffer(4)]],
+    constant int32_t& vocab_size [[buffer(5)]],
+    constant int32_t& hidden_dim [[buffer(6)]],
+    uint tid [[thread_position_in_threadgroup]],
+    uint bid [[threadgroup_position_in_grid]],
+    uint num_blocks [[threadgroups_per_grid]],
+    uint simd_lane [[thread_index_in_simdgroup]],
+    uint simd_id [[simdgroup_index_in_threadgroup]])
+{
+    threadgroup float4 s_u4[64];
+    threadgroup float s_max[8];
+    threadgroup int32_t s_idx[8];
+
+    // Load 256-element input embedding (64 bfloat4 vectors) into shared memory
+    if (tid < 64) {
+        if (input_token >= 0 && input_token < vocab_size) {
+            device const bfloat4* u_b4 = (device const bfloat4*)(w1 + (size_t)input_token * 256);
+            s_u4[tid] = float4(u_b4[tid]);
+        } else {
+            s_u4[tid] = float4(0.0f);
+        }
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    int total_simdgroups = num_blocks * 8;
+    int global_simd_id = bid * 8 + simd_id;
+
+    float best_val = -1e30f;
+    int32_t best_idx = -1;
+
+    for (int y = global_simd_id; y < vocab_size; y += total_simdgroups) {
+        if (y == input_token) continue;
+        device const bfloat4* row2_b4 = (device const bfloat4*)(w2 + (size_t)y * 256);
+        float acc = dot(float4(row2_b4[simd_lane]), s_u4[simd_lane]) +
+                    dot(float4(row2_b4[simd_lane + 32]), s_u4[simd_lane + 32]);
+        float row_dot = simd_sum(acc);
+
+        if (simd_lane == 0) {
+            if (row_dot > best_val) {
+                best_val = row_dot;
+                best_idx = y;
+            }
+        }
+    }
+
+    if (simd_lane == 0) {
+        s_max[simd_id] = best_val;
+        s_idx[simd_id] = best_idx;
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    if (simd_id == 0) {
+        float m = (simd_lane < 8) ? s_max[simd_lane] : -1e30f;
+        int32_t idx = (simd_lane < 8) ? s_idx[simd_lane] : -1;
+        for (int offset = 4; offset > 0; offset >>= 1) {
+            float om = simd_shuffle_down(m, offset);
+            int32_t oi = simd_shuffle_down(idx, offset);
+            if (om > m) {
+                m = om;
+                idx = oi;
+            }
+        }
+        if (simd_lane == 0) {
+            block_max_vals[bid] = m;
+            block_max_indices[bid] = idx;
+        }
+    }
+}
+
+kernel void markov_head_reduce_kernel(
+    device int32_t* d_out_pred [[buffer(0)]],
+    device const float* block_max_vals [[buffer(1)]],
+    device const int32_t* block_max_indices [[buffer(2)]],
+    constant int32_t& num_blocks [[buffer(3)]],
+    uint tid [[thread_position_in_threadgroup]],
+    uint simd_lane [[thread_index_in_simdgroup]],
+    uint simd_id [[simdgroup_index_in_threadgroup]])
+{
+    threadgroup float s_max[8];
+    threadgroup int32_t s_idx[8];
+
+    float local_max = -1e30f;
+    int32_t local_idx = -1;
+
+    for (int i = tid; i < num_blocks; i += 256) {
+        float v = block_max_vals[i];
+        if (v > local_max) {
+            local_max = v;
+            local_idx = block_max_indices[i];
+        }
+    }
+
+    for (int offset = 16; offset > 0; offset >>= 1) {
+        float om = simd_shuffle_down(local_max, offset);
+        int32_t oi = simd_shuffle_down(local_idx, offset);
+        if (om > local_max) {
+            local_max = om;
+            local_idx = oi;
+        }
+    }
+
+    if (simd_lane == 0) {
+        s_max[simd_id] = local_max;
+        s_idx[simd_id] = local_idx;
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    if (simd_id == 0) {
+        float m = (simd_lane < 8) ? s_max[simd_lane] : -1e30f;
+        int32_t idx = (simd_lane < 8) ? s_idx[simd_lane] : -1;
+        for (int offset = 4; offset > 0; offset >>= 1) {
+            float om = simd_shuffle_down(m, offset);
+            int32_t oi = simd_shuffle_down(idx, offset);
+            if (om > m) {
+                m = om;
+                idx = oi;
+            }
+        }
+        if (simd_lane == 0) {
+            d_out_pred[0] = idx;
+        }
+    }
+}
+
+

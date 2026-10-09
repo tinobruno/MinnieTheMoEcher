@@ -435,11 +435,43 @@ public:
                 token_to_id_[content] = id;
                 id_to_token_[id] = content;
                 special_tokens_.push_back({content, id});
+
+                // Also register normalized aliases with regular space ' ' if content has \xe2\x96\x81 (U+2581)
+                std::string with_spaces = content;
+                std::string u2581 = "\xe2\x96\x81";
+                size_t p = 0;
+                while ((p = with_spaces.find(u2581, p)) != std::string::npos) {
+                    with_spaces.replace(p, u2581.length(), " ");
+                    p += 1;
+                }
+                if (with_spaces != content) {
+                    token_to_id_[with_spaces] = id;
+                    special_tokens_.push_back({with_spaces, id});
+                }
+
+                // Also register ASCII pipe '|' version if it has fullwidth '｜' (\xef\xbd\x9c)
+                std::string with_ascii_pipe = with_spaces;
+                std::string fullwidth_pipe = "\xef\xbd\x9c";
+                p = 0;
+                while ((p = with_ascii_pipe.find(fullwidth_pipe, p)) != std::string::npos) {
+                    with_ascii_pipe.replace(p, fullwidth_pipe.length(), "|");
+                    p += 1;
+                }
+                if (with_ascii_pipe != with_spaces) {
+                    token_to_id_[with_ascii_pipe] = id;
+                    special_tokens_.push_back({with_ascii_pipe, id});
+                }
             }
         }
 
         std::sort(special_tokens_.begin(), special_tokens_.end(),
-                  [](const auto& a, const auto& b) { return a.first.size() > b.first.size(); });
+                  [](const auto& a, const auto& b) {
+                      if (a.first.size() != b.first.size()) return a.first.size() > b.first.size();
+                      return a.first < b.first;
+                  });
+        special_tokens_.erase(std::unique(special_tokens_.begin(), special_tokens_.end(),
+                                          [](const auto& a, const auto& b) { return a.first == b.first; }),
+                              special_tokens_.end());
 
         build_byte_mapping();
 
@@ -1521,6 +1553,164 @@ public:
         return n_uncached;
     }
 
+    // Ensure all requested expert_ids for layer_id are present in L1 cache during batched prefill.
+    // Loads missing experts in parallel using ThreadPool.
+    // Protects already-selected experts in the batch from eviction.
+    void ensure_layer_experts(int layer_id, const int32_t* requested_eids, int count, ThreadPool* pool) {
+        if (count <= 0 || !pool) return;
+
+        // 1. Deduplicate requested expert IDs for this layer
+        std::vector<int> unique_eids;
+        unique_eids.reserve(count);
+        std::unordered_set<int> seen;
+        for (int i = 0; i < count; i++) {
+            int eid = requested_eids[i];
+            if (eid >= 0 && eid < n_experts_ && seen.insert(eid).second) {
+                unique_eids.push_back(eid);
+            }
+        }
+        if (unique_eids.empty()) return;
+
+        struct LoadItem {
+            int eid;
+            int64_t key;
+            int l1_slot;
+            void* gpu_dst;
+            int64_t file_offset;
+        };
+        std::vector<LoadItem> to_load;
+
+        {
+            std::unique_lock<std::mutex> lock(cache_mutex_);
+            access_counter_++;
+
+            // Set of slots that hold experts for the current batch (MUST NOT be evicted)
+            std::vector<uint8_t> batch_slots(cache_capacity_, 0);
+
+            // First pass: protect already-cached experts in L1 and update last_used
+            std::vector<int> missing_eids;
+            for (int eid : unique_eids) {
+                int64_t key = (int64_t)layer_id * n_experts_ + eid;
+                auto it = key_to_slot_.find(key);
+                if (it != key_to_slot_.end()) {
+                    int slot_idx = it->second;
+                    auto& slot = cache_slots_[slot_idx];
+                    slot.last_used = access_counter_;
+                    batch_slots[slot_idx] = 1;
+                    flat_vram_ptrs_[key] = slot.gpu_data;
+                } else {
+                    missing_eids.push_back(eid);
+                }
+            }
+
+            // Second pass: for missing experts, find eviction candidates NOT in batch_slots
+            int search_start = 0;
+            for (int eid : missing_eids) {
+                int64_t key = (int64_t)layer_id * n_experts_ + eid;
+                int evict_slot = -1;
+                int64_t oldest_time = INT64_MAX;
+
+                // First check for unallocated slots
+                for (int i = search_start; i < cache_capacity_; i++) {
+                    if (!batch_slots[i] && cache_slots_[i].layer_id < 0) {
+                        evict_slot = i;
+                        search_start = i + 1;
+                        break;
+                    }
+                }
+
+                // If no empty slot, find true LRU among non-batch slots
+                if (evict_slot < 0) {
+                    for (int i = 0; i < cache_capacity_; i++) {
+                        if (batch_slots[i]) continue;
+                        if (cache_slots_[i].last_used < oldest_time) {
+                            oldest_time = cache_slots_[i].last_used;
+                            evict_slot = i;
+                        }
+                    }
+                }
+
+                if (evict_slot < 0) {
+                    LOG_ERROR("ensure_layer_experts: No eviction slot available (capacity=%d, requested=%zu)",
+                              cache_capacity_, unique_eids.size());
+                    break;
+                }
+
+                auto& slot = cache_slots_[evict_slot];
+                if (slot.layer_id >= 0) {
+                    int64_t old_key = (int64_t)slot.layer_id * n_experts_ + slot.expert_id;
+                    key_to_slot_.erase(old_key);
+                    flat_vram_ptrs_[old_key] = nullptr;
+                    if (flat_vram_ptrs_gpu_.data) {
+#if defined(__APPLE__)
+                        ((void**)flat_vram_ptrs_gpu_.data)[old_key] = nullptr;
+#else
+                        void* null_ptr = nullptr;
+                        CUDA_CHECK(cudaMemcpy((char*)flat_vram_ptrs_gpu_.data + old_key * sizeof(void*),
+                                              &null_ptr, sizeof(void*), cudaMemcpyHostToDevice));
+#endif
+                    }
+                }
+
+                slot.layer_id = layer_id;
+                slot.expert_id = eid;
+                slot.last_used = access_counter_;
+                key_to_slot_[key] = evict_slot;
+                flat_vram_ptrs_[key] = slot.gpu_data;
+                batch_slots[evict_slot] = 1;
+
+                LoadItem item;
+                item.eid = eid;
+                item.key = key;
+                item.l1_slot = evict_slot;
+                item.gpu_dst = slot.gpu_data;
+                item.file_offset = key * expert_block_size_;
+                to_load.push_back(item);
+            }
+        } // lock released
+
+        if (!to_load.empty()) {
+            std::vector<std::future<bool>> futures;
+            futures.reserve(to_load.size());
+
+            for (size_t i = 0; i < to_load.size(); i++) {
+                futures.push_back(pool->enqueue([this, item = to_load[i]]() -> bool {
+#if defined(__APPLE__)
+                    int64_t bytes = expert_file_.pread_exact(item.gpu_dst, expert_block_size_, item.file_offset);
+                    return (bytes == expert_block_size_);
+#else
+                    void* stage = malloc(expert_block_size_);
+                    int64_t bytes = expert_file_.pread_exact(stage, expert_block_size_, item.file_offset);
+                    if (bytes == expert_block_size_) {
+                        CUDA_CHECK(cudaMemcpy(item.gpu_dst, stage, expert_block_size_, cudaMemcpyHostToDevice));
+                    }
+                    free(stage);
+                    return (bytes == expert_block_size_);
+#endif
+                }));
+            }
+
+            for (size_t i = 0; i < futures.size(); i++) {
+                if (!futures[i].get()) {
+                    LOG_ERROR("Failed to pread expert L%d E%d in batched prefill", layer_id, to_load[i].eid);
+                }
+            }
+        }
+
+        if (flat_vram_ptrs_gpu_.data) {
+            size_t layer_offset = (size_t)layer_id * n_experts_ * sizeof(void*);
+#if defined(__APPLE__)
+            std::memcpy((char*)flat_vram_ptrs_gpu_.data + layer_offset,
+                        (const char*)flat_vram_ptrs_.data() + layer_offset,
+                        n_experts_ * sizeof(void*));
+#else
+            CUDA_CHECK(cudaMemcpy((char*)flat_vram_ptrs_gpu_.data + layer_offset,
+                                  (const char*)flat_vram_ptrs_.data() + layer_offset,
+                                  n_experts_ * sizeof(void*), cudaMemcpyHostToDevice));
+#endif
+        }
+    }
+
     bool preload_all(int n_threads = 16, const std::vector<uint32_t>& freq_counts = {}) {
         int total = n_layers_ * n_experts_;
         int to_load = std::min(total, cache_capacity_);
@@ -1528,6 +1718,70 @@ public:
         
         auto start = std::chrono::steady_clock::now();
         std::atomic<int> loaded{0};
+
+        struct ExpertTarget {
+            int layer_id;
+            int expert_id;
+            int64_t key;
+            int64_t file_offset;
+        };
+        std::vector<ExpertTarget> targets;
+        targets.reserve(to_load);
+
+        bool has_real_freq = false;
+        if (!freq_counts.empty() && (int)freq_counts.size() == total) {
+            for (uint32_t c : freq_counts) {
+                if (c > 0) { has_real_freq = true; break; }
+            }
+        }
+
+        if (has_real_freq) {
+            struct Candidate {
+                int layer_id;
+                int expert_id;
+                uint32_t count;
+            };
+            std::vector<Candidate> candidates;
+            candidates.reserve(total);
+            for (int l = 0; l < n_layers_; l++) {
+                for (int e = 0; e < n_experts_; e++) {
+                    candidates.push_back({l, e, freq_counts[(size_t)l * n_experts_ + e]});
+                }
+            }
+            std::sort(candidates.begin(), candidates.end(), [](const Candidate& a, const Candidate& b) {
+                if (a.count != b.count) return a.count > b.count;
+                if (a.layer_id != b.layer_id) return a.layer_id < b.layer_id;
+                return a.expert_id < b.expert_id;
+            });
+            for (int i = 0; i < to_load; i++) {
+                int l = candidates[i].layer_id;
+                int e = candidates[i].expert_id;
+                int64_t key = (int64_t)l * n_experts_ + e;
+                targets.push_back({l, e, key, key * expert_block_size_});
+            }
+        } else {
+            // Distribute preload slots evenly across all MoE layers (starting at layer 3 for DeepSeek)
+            int moe_start = (n_layers_ > 3) ? 3 : 0;
+            int num_moe_layers = std::max(1, n_layers_ - moe_start);
+            int slots_per_layer = to_load / num_moe_layers;
+            int rem = to_load % num_moe_layers;
+
+            for (int l = moe_start; l < n_layers_; l++) {
+                int n_for_this_layer = slots_per_layer + (l - moe_start < rem ? 1 : 0);
+                for (int e = 0; e < std::min(n_experts_, n_for_this_layer); e++) {
+                    if ((int)targets.size() >= to_load) break;
+                    int64_t key = (int64_t)l * n_experts_ + e;
+                    targets.push_back({l, e, key, key * expert_block_size_});
+                }
+            }
+            // Fill any remaining slots if needed
+            for (int l = 0; l < moe_start && (int)targets.size() < to_load; l++) {
+                for (int e = 0; e < n_experts_ && (int)targets.size() < to_load; e++) {
+                    int64_t key = (int64_t)l * n_experts_ + e;
+                    targets.push_back({l, e, key, key * expert_block_size_});
+                }
+            }
+        }
 
         std::vector<std::thread> workers;
         int chunk_size = (to_load + n_threads - 1) / n_threads;
@@ -1537,29 +1791,26 @@ public:
             int end_idx = std::min(start_idx + chunk_size, to_load);
             if (start_idx >= end_idx) continue;
 
-            workers.emplace_back([this, start_idx, end_idx, &loaded, to_load]() {
+            workers.emplace_back([this, start_idx, end_idx, &targets, &loaded, to_load]() {
                 void* stage_ptr = nullptr;
                 cudaStream_t stream = nullptr;
                 CUDA_CHECK(cudaMallocHost(&stage_ptr, expert_block_size_));
                 CUDA_CHECK(cudaStreamCreate(&stream));
 
                 for (int i = start_idx; i < end_idx; i++) {
-                    int l = i / n_experts_;
-                    int e = i % n_experts_;
-                    int64_t file_offset = (int64_t)i * expert_block_size_;
-
-                    int64_t bytes_read = expert_file_.pread_exact(stage_ptr, expert_block_size_, file_offset);
+                    auto& tgt = targets[i];
+                    int64_t bytes_read = expert_file_.pread_exact(stage_ptr, expert_block_size_, tgt.file_offset);
                     if (bytes_read == expert_block_size_) {
                         void* dst = cache_slots_[i].gpu_data;
-                        cache_slots_[i].layer_id = l;
-                        cache_slots_[i].expert_id = e;
+                        cache_slots_[i].layer_id = tgt.layer_id;
+                        cache_slots_[i].expert_id = tgt.expert_id;
                         cache_slots_[i].last_used = 1;
-                        flat_vram_ptrs_[i] = dst;
+                        flat_vram_ptrs_[tgt.key] = dst;
                         CUDA_CHECK(cudaMemcpyAsync(dst, stage_ptr, expert_block_size_, cudaMemcpyHostToDevice, stream));
                         CUDA_CHECK(cudaStreamSynchronize(stream));
                     }
                     int done = ++loaded;
-                    if (done % 1000 == 0 || done == to_load) {
+                    if (done % 500 == 0 || done == to_load) {
                         LOG_INFO("  Preloaded %d/%d experts into VRAM...", done, to_load);
                     }
                 }
@@ -2920,6 +3171,109 @@ public:
     }
 };
 
+// ════════════════════════════════════════════════════════════════════════════════
+//  DeepSeek V4 Markov MTP Head Drafter (mtp.2.markov_head)
+// ════════════════════════════════════════════════════════════════════════════════
+
+class DeepSeekMarkovDrafter {
+public:
+    bool loaded_ = false;
+    int vocab_size_ = 129280;
+    int hidden_dim_ = 256;
+
+    GPUTensor w1_;              // [vocab_size, hidden_dim] BF16 (66 MB)
+    GPUTensor w2_;              // [vocab_size, hidden_dim] BF16 (66 MB)
+    GPUTensor d_pred_;          // [1] I32 on GPU
+    GPUTensor d_temp_vals_;     // [256] F32 on GPU
+    GPUTensor d_temp_idx_;      // [256] I32 on GPU
+    int32_t* h_pred_ = nullptr; // Pinned host memory for fast D2H
+
+    ~DeepSeekMarkovDrafter() {
+        if (h_pred_) {
+            cudaFreeHost(h_pred_);
+            h_pred_ = nullptr;
+        }
+    }
+
+    bool load(const std::string& dense_path, const json& tensor_map) {
+        if (!tensor_map.contains("mtp.2.markov_head.markov_w1.weight") ||
+            !tensor_map.contains("mtp.2.markov_head.markov_w2.weight")) {
+            LOG_INFO("DeepSeek Markov Head weights not present in manifest");
+            return false;
+        }
+
+        LOG_INFO("Loading DeepSeek V4 Native Markov Head from %s...", dense_path.c_str());
+        moecher::platform::MemoryMappedFile dense_mmap;
+        if (!dense_mmap.open_read(dense_path)) {
+            LOG_ERROR("Cannot open dense file for Markov Head: %s", dense_path.c_str());
+            return false;
+        }
+        void* mapped = dense_mmap.data();
+
+        auto load_bf16_tensor = [&](GPUTensor& gpu, const std::string& name) -> bool {
+            auto& info = tensor_map[name];
+            int64_t offset = info["offset"].get<int64_t>();
+            int64_t nbytes = info["nbytes"].get<int64_t>();
+            gpu.dtype = "bfloat16";
+            gpu.shape.clear();
+            for (auto& s : info["shape"]) gpu.shape.push_back(s.get<int>());
+            gpu.alloc(nbytes);
+            CUDA_CHECK(cudaMemcpy(gpu.data, (char*)mapped + offset, nbytes, cudaMemcpyHostToDevice));
+            return true;
+        };
+
+        if (!load_bf16_tensor(w1_, "mtp.2.markov_head.markov_w1.weight") ||
+            !load_bf16_tensor(w2_, "mtp.2.markov_head.markov_w2.weight")) {
+            LOG_ERROR("Failed to load Markov Head tensors");
+            return false;
+        }
+
+        d_pred_.dtype = "int32";
+        d_pred_.alloc(sizeof(int32_t));
+        d_temp_vals_.dtype = "float32";
+        d_temp_vals_.alloc(256 * sizeof(float));
+        d_temp_idx_.dtype = "int32";
+        d_temp_idx_.alloc(256 * sizeof(int32_t));
+
+        CUDA_CHECK(cudaMallocHost(&h_pred_, sizeof(int32_t)));
+
+        loaded_ = true;
+        LOG_INFO("DeepSeek V4 Native Markov Head loaded successfully (w1=%zu MB, w2=%zu MB, inner_dim=%d)",
+                 w1_.size_bytes / (1024 * 1024), w2_.size_bytes / (1024 * 1024), hidden_dim_);
+        return true;
+    }
+
+    int draft_one(int input_token, cudaStream_t stream) {
+        if (!loaded_ || input_token < 0 || input_token >= vocab_size_) return -1;
+        markov_head_predict_cuda(d_pred_.i32(), d_temp_vals_.f32(), d_temp_idx_.i32(),
+                                 w1_.bf16(), w2_.bf16(), input_token, vocab_size_, hidden_dim_, stream);
+#ifdef __APPLE__
+        metal_stream_synchronize(stream);
+        int pred = d_pred_.i32()[0];
+#else
+        CUDA_CHECK(cudaMemcpyAsync(h_pred_, d_pred_.i32(), sizeof(int32_t), cudaMemcpyDeviceToHost, stream));
+        CUDA_CHECK(cudaStreamSynchronize(stream));
+        int pred = h_pred_[0];
+#endif
+        if (pred < 0 || pred >= vocab_size_ || pred == input_token) return -1;
+        return pred;
+    }
+
+    void draft_k_tokens(int first_token, int K, std::vector<int>& cands, cudaStream_t stream) {
+        cands.clear();
+        cands.push_back(first_token);
+        if (!loaded_ || K <= 0) return;
+
+        int curr = first_token;
+        for (int k = 0; k < K; k++) {
+            int nxt = draft_one(curr, stream);
+            if (nxt < 0 || nxt == curr) break;
+            cands.push_back(nxt);
+            curr = nxt;
+        }
+    }
+};
+
 
 // ════════════════════════════════════════════════════════════════════════════════
 //  Model Engine
@@ -2983,6 +3337,7 @@ public:
     bool enable_mtp_ = true;
 #endif
     int mtp_k_ = 0; // 0 = auto (1 for 16GB GPUs, 4 for >= 24GB GPUs)
+    DeepSeekMarkovDrafter deepseek_markov_;
 
     // Qwen Vision Tower (Multimodal)
     bool has_vision_ = false;
@@ -3280,6 +3635,19 @@ public:
     GPUTensor buf_linear_b_batch_;     // [8, 48] BF16
     GPUTensor buf_logits_batch_;       // [8, vocab_size] F32
     GPUTensor buf_argmax_out_batch_;   // [8] I32
+    GPUTensor buf_down_batch_;          // [8, max_inter] BF16
+    GPUTensor buf_kv_batch_;            // [8, head_dim] BF16
+    GPUTensor buf_lora_batch_;          // [8, lora_dim] BF16
+    GPUTensor buf_scores_bf16_batch_;   // [8, n_routed_experts] BF16
+    GPUTensor buf_topk_idx_batch_;      // [8, top_k] I32
+    GPUTensor buf_topk_vals_batch_;     // [8, top_k] F32
+    GPUTensor buf_hc_state_batch_;      // [8, hc_mult * hidden_size] BF16
+    GPUTensor buf_hc_after_attn_batch_; // [8, hc_mult * hidden_size] BF16
+    GPUTensor buf_hc_pre_batch_;        // [8, hc_mult] F32
+    GPUTensor buf_hc_post_batch_;       // [8, hc_mult] F32
+    GPUTensor buf_hc_comb_batch_;       // [8, hc_mult * hc_mult] F32
+    GPUTensor buf_hc_mixes_batch_;      // [8, (2 + hc) * hc] F32
+
 
     GPUTensor target_ssm_pool_;
     GPUTensor target_ssm_slots_[8];
@@ -3508,7 +3876,7 @@ public:
 
     bool load(const std::string& manifest_path, float max_vram_gb = 0.0f, float dram_cache_gb = 0.0f,
               const std::string& expert_dtype_override = "", bool buffered_io = false,
-              int max_seq_len_override = 0, bool enable_mtp = true) {
+              int max_seq_len_override = 0, bool enable_mtp = true, int sliding_window_override = 0) {
         enable_mtp_ = enable_mtp;
         manifest_path_ = manifest_path;
         LOG_INFO("Loading manifest: %s", manifest_path.c_str());
@@ -3520,6 +3888,10 @@ public:
 
         // Parse config
         cfg_.from_json(manifest["model_config"]);
+        if (sliding_window_override > 0) {
+            cfg_.sliding_window = sliding_window_override;
+            cfg_.window_size = sliding_window_override;
+        }
         if (max_seq_len_override > 0) {
             cfg_.max_seq_len = max_seq_len_override;
             cfg_.max_compressed_entries = 0;
@@ -3690,7 +4062,11 @@ public:
         size_t vram_free_after_dense;
         CUDA_CHECK(cudaMemGetInfo(&vram_free_after_dense, &vram_total));
         size_t total_experts_bytes = (size_t)expert_n_layers * expert_n_experts * expert_block_size;
+#ifdef __APPLE__
+        size_t vram_reserve = 1024ULL * 1024 * 1024; // 1.0GB is ample for Metal activations & KV cache on Apple Silicon
+#else
         size_t vram_reserve = 4ULL * 1024 * 1024 * 1024; // reserve 4GB for KV cache snapshots, activations and CUDA graphs
+#endif
         size_t cache_budget = vram_free_after_dense > vram_reserve ? (vram_free_after_dense - vram_reserve) : vram_free_after_dense;
         
         if (max_vram_gb > 0.0f) {
@@ -3704,14 +4080,33 @@ public:
             }
         }
 
+#ifdef __APPLE__
+        // On Apple Silicon (24GB Unified Memory), avoid exceeding physical RAM headroom.
+        // Cap the L1 expert cache to 450 slots (~1.0 GB) so that the entire active footprint
+        // (5.5 GB dense + 1.0 GB buffers + 1.0 GB experts = ~7.5 GB) fits 100% in physical RAM
+        // without triggering macOS memory compressor or SSD swap thrashing!
+        size_t target_apple_l1_budget = 450ULL * (expert_block_size > 0 ? expert_block_size : 2359296);
+        if (cache_budget > target_apple_l1_budget) {
+            cache_budget = target_apple_l1_budget;
+        }
+#endif
+
         // Cap cache budget to the exact size of all routed experts if it fits
         if (cache_budget > total_experts_bytes) {
             cache_budget = total_experts_bytes;
         }
         
         size_t dram_cache_budget = (size_t)(dram_cache_gb * 1024.0 * 1024.0 * 1024.0);
-        LOG_INFO("Expert L1 (VRAM) cache budget: %.1f GB", cache_budget / (1024.0 * 1024.0 * 1024.0));
+#ifdef __APPLE__
+        if (dram_cache_budget > 0) {
+            LOG_INFO("Apple Silicon Unified Memory (UMA) detected: bypassing redundant L2 DRAM cache to prevent duplicate allocations and maximize zero-copy streaming.");
+            dram_cache_budget = 0;
+        }
+#endif
+        LOG_INFO("Expert L1 (Unified Memory) cache budget: %.1f GB", cache_budget / (1024.0 * 1024.0 * 1024.0));
+#ifndef __APPLE__
         LOG_INFO("Expert L2 (DRAM) cache budget: %.1f GB", dram_cache_budget / (1024.0 * 1024.0 * 1024.0));
+#endif
         
         if (cfg_.n_routed_experts > 0 && cfg_.expert_dtype == "mixed_nvfp4_iq2") {
             std::string cold_path = "";
@@ -4096,13 +4491,21 @@ public:
         // Tier 1: Check all-resident MoE topology
         bool all_res = expert_loader_.all_resident(cfg_.num_hidden_layers);
         if (!all_res) {
-            if (batched_prefill_mode_ == "on") {
-                LOG_WARN("[Prefill] Warning: --batched-prefill on requested but experts are not all resident in VRAM. Forcing safe sequential prefill to prevent cache thrashing.");
-            } else {
-                LOG_INFO("[Prefill] Constrained VRAM detected (experts are offloaded). Batched prefill disabled (using safe sequential prefill).");
+            if (batched_prefill_mode_ == "off") {
+                LOG_INFO("[Prefill] Batched prefill explicitly disabled (--batched-prefill off).");
+                enable_batched_prefill_ = false;
+                return;
             }
-            enable_batched_prefill_ = false;
-            return;
+            int top_k = cfg_.num_experts_per_tok > 0 ? cfg_.num_experts_per_tok : 6;
+            int max_safe_chunk = 128;
+            if (expert_loader_.cache_capacity_ < cfg_.n_routed_experts + 16) {
+                max_safe_chunk = std::max(1, (expert_loader_.cache_capacity_ - 16) / top_k);
+            }
+            if (prefill_chunk_size_ > max_safe_chunk) {
+                prefill_chunk_size_ = max_safe_chunk;
+            }
+            LOG_INFO("[Prefill] Offloaded MoE topology detected: enabled chunked batched prefill (chunk_size=%d, expert reuse enabled).",
+                     prefill_chunk_size_);
         }
 
         // Tier 2: Check available VRAM headroom
@@ -4209,13 +4612,16 @@ public:
 
     void forward_token_eager(int token_id, int position, bool compute_logits_flag = true) {
         int track_flag = (track_expert_freq_ && track_current_token_) ? 1 : 0;
+#ifdef __APPLE__
+        *buf_track_flag_.i32() = track_flag;
+        *buf_input_token_.i32() = token_id;
+        *buf_input_pos_.i32() = position;
+#else
         CUDA_CHECK(cudaMemcpy(buf_track_flag_.i32(), &track_flag, sizeof(int32_t), cudaMemcpyHostToDevice));
         CUDA_CHECK(cudaMemcpy(buf_input_token_.i32(), &token_id, sizeof(int32_t), cudaMemcpyHostToDevice));
         CUDA_CHECK(cudaMemcpy(buf_input_pos_.i32(), &position, sizeof(int32_t), cudaMemcpyHostToDevice));
-        forward_token_device_body(token_id, position, compute_logits_flag);
-#ifdef __APPLE__
-        CUDA_CHECK(cudaStreamSynchronize(main_stream_));
 #endif
+        forward_token_device_body(token_id, position, compute_logits_flag);
         if (track_expert_freq_ && step_topk_host_ && d_step_topk_.data) {
             int slot = decode_step_idx_ % 2;
             int n_layers = cfg_.num_hidden_layers;
@@ -4357,6 +4763,7 @@ public:
 
     KVSnapshot system_kv_snapshot_;
     KVSnapshot turn_kv_snapshot_;
+    KVSnapshot prompt_kv_snapshot_;
 
     void snapshot_kv(KVSnapshot& snap, const std::vector<int>& tokens) {
         if (tokens.empty()) return;
@@ -4570,7 +4977,7 @@ public:
             }
         } else {
             // ModelArch::DEEPSEEK_V4
-            if (enable_batched_prefill_ && prefix_tokens.size() > 1) {
+            if (enable_batched_prefill_ && prefix_tokens.size() >= 2) {
                 prefill_prompt_batched_deepseek(prefix_tokens);
             } else {
                 for (size_t i = 0; i < prefix_tokens.size(); i++) {
@@ -4699,7 +5106,28 @@ public:
             }
         }
 
-        // If turn snapshot matching failed, check if prompt starts with the pinned System KV snapshot!
+        // If turn snapshot matching failed, check if prompt starts with the previous Prompt KV snapshot!
+        if (!active_visual_embeddings_ && !can_reuse_prefix && prompt_kv_snapshot_.valid && !prompt_kv_snapshot_.tokens.empty()) {
+            size_t p_len = prompt_kv_snapshot_.tokens.size();
+            if (prompt.size() >= p_len) {
+                bool p_matches = true;
+                for (size_t i = 0; i < p_len; i++) {
+                    if (prompt[i] != prompt_kv_snapshot_.tokens[i]) {
+                        p_matches = false;
+                        break;
+                    }
+                }
+                if (p_matches) {
+                    restore_kv(prompt_kv_snapshot_);
+                    prefix_len = p_len;
+                    can_reuse_prefix = true;
+                    LOG_INFO("Restored Prompt KV Cache snapshot of %zu tokens (<0.1ms). Skipping prefill 0..%zu, evaluating %zu..%zu",
+                             p_len, p_len > 0 ? p_len - 1 : 0, p_len, prompt.size() - 1);
+                }
+            }
+        }
+
+        // If turn and prompt snapshots failed, check if prompt starts with the pinned System KV snapshot!
         if (!active_visual_embeddings_ && !can_reuse_prefix && system_kv_snapshot_.valid && !system_kv_snapshot_.tokens.empty()) {
             size_t sys_len = system_kv_snapshot_.tokens.size();
             if (prompt.size() >= sys_len) {
@@ -4784,7 +5212,7 @@ public:
             } else {
                 // ModelArch::DEEPSEEK_V4
                 size_t remaining = (prompt.size() > prefix_len) ? (prompt.size() - prefix_len) : 0;
-                if (enable_batched_prefill_ && remaining > 1) {
+                if (enable_batched_prefill_ && remaining >= 2) {
                     prefill_prompt_batched_deepseek(prompt, (int)prefix_len);
                 } else {
                     for (size_t i = prefix_len; i < prompt.size(); i++) {
@@ -4818,6 +5246,10 @@ public:
                  evaluated_tokens, prefill_sec, prefill_tps,
                  prefix_len, prompt.size(),
                  prompt.empty() ? 0.0 : (100.0 * prefix_len / prompt.size()));
+
+        if (!active_visual_embeddings_ && prompt.size() > 1) {
+            snapshot_kv(prompt_kv_snapshot_, prompt);
+        }
 
         // Token generation loop
         std::vector<int> output_ids;
@@ -4969,10 +5401,19 @@ public:
                 recent_content_tokens.push_back(next_token);
                 int n_cnt = (int)recent_content_tokens.size();
                 bool in_tool_call_block = (allow_tool_calls &&
-                                           generated_text.find("<tool_call>") != std::string::npos &&
-                                           generated_text.find("</tool_call>") == std::string::npos);
+                                           (generated_text.find("<tool_call>") != std::string::npos ||
+                                            generated_text.find("<｜DSML｜tool_calls>") != std::string::npos ||
+                                            generated_text.find("<|DSML|tool_calls>") != std::string::npos ||
+                                            generated_text.find("<｜tool call begin｜>") != std::string::npos) &&
+                                           (generated_text.find("</tool_call>") == std::string::npos &&
+                                            generated_text.find("</｜DSML｜tool_calls>") == std::string::npos &&
+                                            generated_text.find("</|DSML|tool_calls>") == std::string::npos &&
+                                            generated_text.find("<｜tool call end｜>") == std::string::npos));
                 if (in_tool_call_block && allow_tool_calls) {
                     size_t tc_pos = generated_text.rfind("<tool_call>");
+                    if (tc_pos == std::string::npos) tc_pos = generated_text.rfind("<｜DSML｜tool_calls>");
+                    if (tc_pos == std::string::npos) tc_pos = generated_text.rfind("<|DSML|tool_calls>");
+                    if (tc_pos == std::string::npos) tc_pos = generated_text.rfind("<｜tool call begin｜>");
                     if (tc_pos != std::string::npos && (generated_text.size() - tc_pos) > 2048) {
                         LOG_WARN("Tool call block exceeded size limit without closing tag. Concluding tool call generation.");
                         finish_reason = "tool_calls";
@@ -5115,10 +5556,18 @@ public:
             if (!in_think_block && g_enable_tools && allow_tool_calls) {
                 bool has_opening = (generated_text.find("<tool_call>") != std::string::npos ||
                                     generated_text.find("<tool_calls>") != std::string::npos ||
-                                    generated_text.find("<function_call>") != std::string::npos);
+                                    generated_text.find("<function_call>") != std::string::npos ||
+                                    generated_text.find("<｜DSML｜tool_calls>") != std::string::npos ||
+                                    generated_text.find("<|DSML|tool_calls>") != std::string::npos ||
+                                    generated_text.find("<｜tool call begin｜>") != std::string::npos ||
+                                    generated_text.find("<|tool call begin|>") != std::string::npos);
                 bool has_closing = (generated_text.find("</tool_call>") != std::string::npos ||
                                     generated_text.find("</tool_calls>") != std::string::npos ||
-                                    generated_text.find("</function_call>") != std::string::npos);
+                                    generated_text.find("</function_call>") != std::string::npos ||
+                                    generated_text.find("</｜DSML｜tool_calls>") != std::string::npos ||
+                                    generated_text.find("</|DSML|tool_calls>") != std::string::npos ||
+                                    generated_text.find("<｜tool call end｜>") != std::string::npos ||
+                                    generated_text.find("<|tool call end|>") != std::string::npos);
                 if (has_opening && has_closing) {
                     LOG_INFO("Tool call closing tag detected. Concluding generation for tool execution.");
                     finish_reason = "tool_calls";
@@ -5308,8 +5757,8 @@ public:
                 continue;
             }
 
-            // 2. Speculative Decoding Verification Loop (MTP Self-Drafter + PLD + 2B Neural Drafter fallback)
-            bool allow_draft = enable_spec_ && (draft_streak >= 0) && !in_think_block &&
+            // 2. Speculative Decoding Verification Loop (MTP Self-Drafter + DeepSeek Markov + PLD)
+            bool allow_draft = enable_spec_ && (draft_streak >= 0) &&
                                (content_tokens_generated + 4 < max_tokens) && !g_stop_requested.load();
 
             if (allow_draft) {
@@ -5329,7 +5778,7 @@ public:
                 bool is_pld = false;
                 bool is_mtp = false;
 
-                // Priority 1: MTP Self-Drafter (trained neural speculative drafter for Qwen)
+                // Priority 1: Qwen MTP Self-Drafter
                 if (cfg_.architecture == ModelArch::QWEN && enable_mtp_ && mtp_drafter_.loaded_) {
                     bool in_tool_call = false;
                     size_t last_tc_open = generated_text.rfind("<tool_call>");
@@ -5339,9 +5788,6 @@ public:
                             in_tool_call = true;
                         }
                     }
-                    // Adaptive MTP draft depth:
-                    // On VRAM/compute-constrained 16GB cards (36 SMs), cap to K=1 so verification is always M=2,
-                    // avoiding the severe compute latency spike of M=5 verification on missed draft tokens.
                     int max_k = (mtp_k_ > 0) ? mtp_k_ : (gpu_caps_.is_vram_constrained ? 1 : 4);
                     int K = in_tool_call ? 4 : ((draft_streak >= 1) ? 3 : 2);
                     if (K > max_k) K = max_k;
@@ -5352,7 +5798,28 @@ public:
                     is_mtp = (cand_tokens.size() > 1);
                 }
 
-                // Priority 2: Prompt-Lookup Drafting (only as fallback when MTP is not loaded / disabled)
+                // Priority 1 (DeepSeek V4): Speculative Drafting via PLD and/or Native Markov MTP Head
+                if (cfg_.architecture == ModelArch::DEEPSEEK_V4) {
+                    if (enable_pld_ && !history.empty()) {
+                        int max_pld = std::min(pld_draft_tokens_, 3);
+                        std::vector<int> pld_cands = PromptLookupDrafter::draft(history, max_pld, 5, 3);
+                        if (!pld_cands.empty()) {
+                            for (int tok : pld_cands) {
+                                cand_tokens.push_back(tok);
+                            }
+                            is_pld = true;
+                        }
+                    }
+                    if (!is_pld && deepseek_markov_.loaded_ && draft_streak >= 1) {
+                        int pred1 = deepseek_markov_.draft_one(next_token, main_stream_);
+                        if (pred1 > 0 && pred1 != next_token) {
+                            cand_tokens.push_back(pred1);
+                            is_mtp = true;
+                        }
+                    }
+                }
+
+                // Priority 2: Qwen Prompt-Lookup Drafting (only as fallback when MTP is not loaded / disabled)
                 if (cfg_.architecture == ModelArch::QWEN && !is_mtp && (!enable_mtp_ || !mtp_drafter_.loaded_) && enable_pld_ && !history.empty()) {
                     int max_pld = std::min(pld_draft_tokens_, 2);
                     std::vector<int> pld_cands = PromptLookupDrafter::draft(history, max_pld, 6, 6);
@@ -5371,20 +5838,29 @@ public:
                 }
 
                 int M = (int)cand_tokens.size();
-                if (cfg_.architecture == ModelArch::QWEN && M >= 2) {
+                if ((cfg_.architecture == ModelArch::QWEN || cfg_.architecture == ModelArch::DEEPSEEK_V4) && M >= 2) {
                     auto tv0 = std::chrono::steady_clock::now();
-                    forward_token_batch_qwen(cand_tokens.data(), position, M);
+                    if (cfg_.architecture == ModelArch::QWEN) {
+                        forward_token_batch_qwen(cand_tokens.data(), position, M);
+                    } else {
+                        forward_token_batch_deepseek(cand_tokens.data(), position, M);
+                    }
 
                     int num_verify = M - 1;
                     // Verify candidate positions simultaneously in ONE GPU pass (computing all M predictions)
                     argmax_f32_batch_cuda(buf_argmax_out_batch_.i32(), buf_logits_batch_.f32(), cfg_.vocab_size, M, main_stream_);
 
+#ifdef __APPLE__
+                    metal_stream_synchronize(main_stream_);
+                    const int32_t* host_batch_preds = buf_argmax_out_batch_.i32();
+#else
                     static int32_t* host_batch_preds = nullptr;
                     if (!host_batch_preds) {
                         CUDA_CHECK(cudaMallocHost(&host_batch_preds, 16 * sizeof(int32_t)));
                     }
                     CUDA_CHECK(cudaMemcpyAsync(host_batch_preds, buf_argmax_out_batch_.i32(), M * sizeof(int32_t), cudaMemcpyDeviceToHost, main_stream_));
                     CUDA_CHECK(cudaStreamSynchronize(main_stream_));
+#endif
                     auto tv1 = std::chrono::steady_clock::now();
                     double ver_ms = std::chrono::duration<double, std::milli>(tv1 - tv0).count();
                     total_verify_ms += ver_ms;
@@ -5396,8 +5872,6 @@ public:
                     for (int k = 0; k < num_verify; k++) {
                         int pred_k = host_batch_preds[k];
                         int draft_cand = cand_tokens[k + 1];
-
-
 
                         if (pred_k == draft_cand &&
                             pred_k != cfg_.eos_token_id && (eos2_id < 0 || pred_k != eos2_id) &&
@@ -5429,6 +5903,18 @@ public:
 
                     if (accepted == num_verify) {
                         // All draft tokens accepted!
+                        if (cfg_.architecture == ModelArch::DEEPSEEK_V4) {
+                            CUDA_CHECK(cudaMemcpyAsync(buf_hc_state_.bf16(),
+                                                       buf_hc_state_batch_.bf16() + (size_t)(M - 1) * (cfg_.hc_mult * cfg_.hidden_size),
+                                                       cfg_.hc_mult * cfg_.hidden_size * sizeof(__nv_bfloat16),
+                                                       cudaMemcpyDeviceToDevice, main_stream_));
+                            CUDA_CHECK(cudaMemcpyAsync(buf_logits_.f32(),
+                                                       buf_logits_batch_.f32() + (size_t)(M - 1) * cfg_.vocab_size,
+                                                       cfg_.vocab_size * sizeof(float),
+                                                       cudaMemcpyDeviceToDevice, main_stream_));
+                            CUDA_CHECK(cudaStreamSynchronize(main_stream_));
+                        }
+
                         // For MTP: no drafter state management needed (it reads hidden state each time)
                         // For 2B drafter: need to keep it in sync
                         if (!is_mtp && qwen_draft_.loaded_) {
@@ -5468,6 +5954,18 @@ public:
                     } else {
                         // Mismatch at index 'accepted' (0 <= accepted < num_verify)
                         // Valid candidate sequence: cand_tokens[0 .. accepted]
+                        if (cfg_.architecture == ModelArch::DEEPSEEK_V4) {
+                            CUDA_CHECK(cudaMemcpyAsync(buf_hc_state_.bf16(),
+                                                       buf_hc_state_batch_.bf16() + (size_t)accepted * (cfg_.hc_mult * cfg_.hidden_size),
+                                                       cfg_.hc_mult * cfg_.hidden_size * sizeof(__nv_bfloat16),
+                                                       cudaMemcpyDeviceToDevice, main_stream_));
+                            CUDA_CHECK(cudaMemcpyAsync(buf_logits_.f32(),
+                                                       buf_logits_batch_.f32() + (size_t)accepted * cfg_.vocab_size,
+                                                       cfg_.vocab_size * sizeof(float),
+                                                       cudaMemcpyDeviceToDevice, main_stream_));
+                            CUDA_CHECK(cudaStreamSynchronize(main_stream_));
+                        }
+
                         // 1. Commit Target model state to slot 'accepted' (0-overhead D2D copy)
                         commit_target_state_slot(accepted);
                         // Save post-norm hidden state from accepted batch slot for MTP drafter
@@ -5489,14 +5987,26 @@ public:
                             }
                         }
 
-                        // 3. bonus_token becomes next_token for next cycle
-                        next_token = bonus_token;
+                        // 3. bonus_token becomes next_token for next cycle (with temperature sampling if active)
+                        if (temperature <= 0.0f) {
+                            next_token = bonus_token;
+                        } else {
+                            argmax_cache_valid_ = false;
+                            next_token = sample_token(temperature, output_ids, content_tokens_generated, in_think_block,
+                                                      top_k, top_p, min_p);
+                        }
+
+                        LOG_INFO("[SPEC CYCLE] M=%d cand[0]=%d ('%s') cand[1]=%d ('%s') -> pred[0]=%d ('%s') accepted=%d next=%d ('%s')",
+                                 M, cand_tokens[0], tokenizer_.decode({cand_tokens[0]}).c_str(),
+                                 num_verify > 0 ? cand_tokens[1] : -1, num_verify > 0 ? tokenizer_.decode({cand_tokens[1]}).c_str() : "",
+                                 host_batch_preds[0], tokenizer_.decode({host_batch_preds[0]}).c_str(),
+                                 accepted, next_token, tokenizer_.decode({next_token}).c_str());
 
                         position += (accepted + 1);
                         decode_step_idx_ += (accepted + 1);
 
                         if (accepted == 0) {
-                            draft_streak = is_mtp ? 0 : -8;
+                            draft_streak = -2;
                         } else {
                             draft_streak = std::min(draft_streak + accepted, 6);
                         }
@@ -5511,7 +6021,7 @@ public:
                     position++;
                     decode_step_idx_++;
                     next_token = -1;
-                    draft_streak = -2;
+                    draft_streak = 0;
                     continue;
                 }
             }
@@ -5684,6 +6194,8 @@ public:
         reset_all_kv_caches();
         turn_kv_snapshot_.valid = false;
         turn_kv_snapshot_.tokens.clear();
+        prompt_kv_snapshot_.valid = false;
+        prompt_kv_snapshot_.tokens.clear();
 
         std::string perception = generate(
             prompt,
@@ -6166,6 +6678,11 @@ private:
             LOG_INFO("MTP: Self-drafter explicitly disabled via --no-mtp flag");
         }
 
+        // Load DeepSeek V4 Native Markov MTP Head if present
+        if (enable_mtp_ && cfg_.architecture == ModelArch::DEEPSEEK_V4) {
+            deepseek_markov_.load(dense_path, tensor_map);
+        }
+
         dense_mmap.close();
         LOG_INFO("Dense tensors loaded");
         return true;
@@ -6234,7 +6751,7 @@ private:
         buf_hc_comb_.alloc(hc * hc * sizeof(float));
         buf_hc_mixes_.alloc((2 + hc) * hc * sizeof(float));
         buf_hc_input_.alloc((size_t)hc * dim * sizeof(float));
-        buf_active_expert_ptrs_.alloc(32 * sizeof(void*));
+        buf_active_expert_ptrs_.alloc(128 * sizeof(void*));
 
         // Speculative decoding & Batched Prefill buffers (M=512 capacity)
         int max_batch_m = 512;
@@ -6254,6 +6771,25 @@ private:
         buf_linear_b_batch_.alloc(max_batch_m * 64 * sizeof(__nv_bfloat16));
         buf_logits_batch_.alloc((size_t)16 * cfg_.vocab_size * sizeof(float));
         buf_argmax_out_batch_.alloc(16 * sizeof(int32_t));
+
+        // DeepSeek Batched Speculative buffers
+        buf_down_batch_.alloc(max_batch_m * max_down * sizeof(__nv_bfloat16));
+        buf_kv_batch_.alloc(max_batch_m * head_dim_val * sizeof(__nv_bfloat16));
+        buf_lora_batch_.alloc(max_batch_m * std::max({
+            (size_t)cfg_.q_lora_rank,
+            (size_t)cfg_.o_lora_rank * cfg_.o_groups,
+            (size_t)n_heads * head_dim_val
+        }) * sizeof(__nv_bfloat16));
+        buf_scores_bf16_batch_.alloc(max_batch_m * std::max(cfg_.n_routed_experts, 64) * sizeof(__nv_bfloat16));
+        buf_topk_idx_batch_.alloc(max_batch_m * std::max(cfg_.num_experts_per_tok, 64) * sizeof(int32_t));
+        buf_topk_vals_batch_.alloc(max_batch_m * std::max(cfg_.num_experts_per_tok, 64) * sizeof(float));
+        buf_hc_state_batch_.alloc((size_t)max_batch_m * hc * dim * sizeof(__nv_bfloat16));
+        buf_hc_after_attn_batch_.alloc((size_t)max_batch_m * hc * dim * sizeof(__nv_bfloat16));
+        buf_hc_pre_batch_.alloc(max_batch_m * hc * sizeof(float));
+        buf_hc_post_batch_.alloc(max_batch_m * hc * sizeof(float));
+        buf_hc_comb_batch_.alloc(max_batch_m * hc * hc * sizeof(float));
+        buf_hc_mixes_batch_.alloc(max_batch_m * (2 + hc) * hc * sizeof(float));
+
 
         // Compressor working buffers
         // Max projection output size: coff=2 for ratio=4, head_dim=512 -> 1024
@@ -6307,6 +6843,14 @@ private:
             gemv_bf16_out_bf16_cuda(C, B, A, N, K, main_stream_);
             return;
         }
+#ifdef __APPLE__
+        if (M <= 8) {
+            for (int m = 0; m < M; m++) {
+                gemv_bf16_out_bf16_cuda(C + (size_t)m * N, B, A + (size_t)m * K, N, K, main_stream_);
+            }
+            return;
+        }
+#endif
         // In column-major: A_col = K x M, B_col = K x N
         // cuBLAS: C_col = B_col.T @ A_col = N x K @ K x M = N x M
         // Which is C_row = M x N ✓
@@ -6334,6 +6878,14 @@ private:
             gemv_bf16_cuda(C, B, A, N, K, main_stream_);
             return;
         }
+#ifdef __APPLE__
+        if (M <= 8) {
+            for (int m = 0; m < M; m++) {
+                gemv_bf16_cuda(C + (size_t)m * N, B, A + (size_t)m * K, N, K, main_stream_);
+            }
+            return;
+        }
+#endif
         CUBLAS_CHECK(cublasGemmEx(
             cublas_handle_,
             CUBLAS_OP_T,    // B transposed (K x N -> N x K)
@@ -6362,7 +6914,15 @@ private:
         if (M == 1) {
             // Fused gemv for decoding
             gemv_fp8_cuda(C, A, weight, scale, N, K, block_size, stream);
-        } else {
+        }
+#ifdef __APPLE__
+        else if (M <= 32) {
+            for (int m = 0; m < M; m++) {
+                gemv_fp8_cuda(C + (size_t)m * N, A + (size_t)m * K, weight, scale, N, K, block_size, stream);
+            }
+        }
+#endif
+        else {
             // Dequantize weight to BF16 in buf_dequant_
             fp8_dequant_cuda(buf_dequant_.bf16(), weight, scale, N, K, block_size, stream);
             // GEMM with dequantized weight
@@ -6383,7 +6943,15 @@ private:
         if (!stream) stream = main_stream_;
         if (M == 1) {
             gemv_int4_cuda(C, A, weight, scale, N, K, stream);
-        } else if (M <= 8) {
+        }
+#ifdef __APPLE__
+        else if (M <= 32) {
+            for (int m = 0; m < M; m++) {
+                gemv_int4_cuda(C + (size_t)m * N, A + (size_t)m * K, weight, scale, N, K, stream);
+            }
+        }
+#endif
+        else if (M <= 8) {
             gemm_int4_batch_cuda(C, A, weight, scale, N, K, M, stream);
         } else {
             dequant_int4_block_cuda(buf_dequant_.bf16(), weight, scale, N, K, block_size, stream);
@@ -7349,6 +7917,400 @@ private:
         }
     }
 
+    // ── DeepSeek V4 Batched Speculative Forward Pass ─────────────────────────
+
+    void hc_pre_norm_batch(int m, const __nv_bfloat16* in_hc, GPUTensor& hc_fn, GPUTensor& hc_scale, GPUTensor& hc_base,
+                           const __nv_bfloat16* norm_weight) {
+        int dim = cfg_.hidden_size;
+        int hc = cfg_.hc_mult;
+        int mix_size = (2 + hc) * hc;
+        int hc_dim = hc * dim;
+
+        gemv_hc_pre_norm_cuda(buf_hc_mixes_batch_.f32() + (size_t)m * mix_size, in_hc, hc_fn.f32(),
+                              mix_size, hc_dim, cfg_.hc_eps, main_stream_);
+
+        hc_split_sinkhorn_cuda(
+            buf_hc_pre_batch_.f32() + (size_t)m * hc,
+            buf_hc_post_batch_.f32() + (size_t)m * hc,
+            buf_hc_comb_batch_.f32() + (size_t)m * (hc * hc),
+            buf_hc_mixes_batch_.f32() + (size_t)m * mix_size,
+            hc_scale.f32(), hc_base.f32(),
+            hc, cfg_.hc_sinkhorn_iters, cfg_.hc_eps, main_stream_);
+
+        hc_pre_weighted_add_norm_cuda(buf_hidden_batch_.bf16() + (size_t)m * dim, in_hc,
+                                      buf_hc_pre_batch_.f32() + (size_t)m * hc, norm_weight,
+                                      dim, hc, cfg_.rms_norm_eps, main_stream_);
+    }
+
+    void hc_post_batch(int m, __nv_bfloat16* out_hc, const __nv_bfloat16* in_hc) {
+        int dim = cfg_.hidden_size;
+        int hc = cfg_.hc_mult;
+
+        hc_post_update_cuda(out_hc, buf_hidden_batch_.bf16() + (size_t)m * dim, in_hc,
+                            buf_hc_post_batch_.f32() + (size_t)m * hc,
+                            buf_hc_comb_batch_.f32() + (size_t)m * (hc * hc),
+                            dim, hc, main_stream_);
+    }
+
+    void hc_head_reduce_batch(int m, const __nv_bfloat16* in_hc) {
+        int dim = cfg_.hidden_size;
+        int hc = cfg_.hc_mult;
+        int hc_dim = hc * dim;
+
+        gemv_hc_pre_norm_cuda(buf_hc_mixes_batch_.f32() + (size_t)m * hc, in_hc,
+                              hc_head_fn_.f32(), hc, hc_dim, cfg_.rms_norm_eps, main_stream_);
+
+        hc_head_reduce_cuda(buf_hidden_batch_.bf16() + (size_t)m * dim, in_hc,
+                            buf_hc_mixes_batch_.f32() + (size_t)m * hc,
+                            hc_head_scale_.f32(), hc_head_base_.f32(),
+                            dim, hc, main_stream_);
+    }
+
+    void compute_logits_deepseek_batch(int M) {
+        int dim = cfg_.hidden_size;
+        int vocab = cfg_.vocab_size;
+
+        if (head_weight_.dtype == "int4") {
+            for (int m = 0; m < M; m++) {
+                float* dst_logits = buf_logits_batch_.f32() + (size_t)m * vocab;
+                const __nv_bfloat16* src_hid = buf_hidden_batch_.bf16() + (size_t)m * dim;
+                gemv_int4_f32_cuda(dst_logits, src_hid,
+                                   (const uint8_t*)head_weight_.data, head_weight_scale_.bf16(),
+                                   vocab, dim, main_stream_);
+            }
+        } else {
+            gemv_bf16_batch_cuda(buf_logits_batch_.f32(), head_weight_.bf16(),
+                                 buf_hidden_batch_.bf16(), vocab, dim, M, main_stream_);
+        }
+    }
+
+    void forward_layer_deepseek_batch(int layer_id, int position, int M) {
+        auto& lw = layers_[layer_id];
+        int dim = cfg_.hidden_size;
+        int n_heads = cfg_.num_attention_heads;
+        int head_dim_val = cfg_.head_dim;
+        int rope_dim = cfg_.qk_rope_head_dim;
+        int q_lora = cfg_.q_lora_rank;
+        int o_lora = cfg_.o_lora_rank;
+        int o_groups = cfg_.o_groups;
+        int window = cfg_.sliding_window;
+        int hc = cfg_.hc_mult;
+        int top_k = cfg_.num_experts_per_tok;
+        int moe_inter = cfg_.moe_intermediate_size;
+        int n_experts = cfg_.n_routed_experts;
+        size_t max_inter = std::max({
+            (size_t)(top_k + 1) * moe_inter,
+            (size_t)cfg_.intermediate_size,
+            (size_t)17408
+        });
+
+        bool is_compressed = (layer_id < (int)cfg_.compress_ratios.size() &&
+                             cfg_.compress_ratios[layer_id] > 0);
+        float* layer_rope_freqs = is_compressed ? rope_freqs_compressed_.f32()
+                                                : rope_freqs_.f32();
+
+        // 1. HC Pre-Norm for Attention: [M, hc, dim] -> [M, dim]
+        for (int m = 0; m < M; m++) {
+            hc_pre_norm_batch(m, buf_hc_state_batch_.bf16() + (size_t)m * (hc * dim),
+                              lw.hc_attn_fn, lw.hc_attn_scale, lw.hc_attn_base,
+                              lw.attn_norm_w.bf16());
+        }
+
+        // 2. KV Projection & Store into Cache for all M tokens
+        for (int m = 0; m < M; m++) {
+            __nv_bfloat16* kv_m = buf_kv_batch_.bf16() + (size_t)m * head_dim_val;
+            const __nv_bfloat16* hid_m = buf_hidden_batch_.bf16() + (size_t)m * dim;
+            if (lw.wkv_w.dtype == "int4") {
+                gemv_int4_cuda(kv_m, hid_m, (const uint8_t*)lw.wkv_w.data, lw.wkv_s.bf16(), head_dim_val, dim, main_stream_);
+            } else {
+                gemm_fp8_dequant(kv_m, 1, head_dim_val, dim, hid_m, lw.wkv_w.u8(), lw.wkv_s.u8(), 128, main_stream_);
+            }
+            rms_norm_cuda(kv_m, kv_m, lw.kv_norm_w.bf16(), head_dim_val, cfg_.rms_norm_eps, main_stream_);
+            rope_device_pos_cuda(kv_m, 1, head_dim_val, rope_dim,
+                                 buf_input_pos_batch_.i32() + m, layer_rope_freqs, false, main_stream_);
+            store_kv_device_pos_cuda(lw.kv_cache.bf16(), kv_m,
+                                     buf_input_pos_batch_.i32() + m, window, head_dim_val, main_stream_);
+        }
+
+        // 3. Q Projection for all M tokens
+        for (int m = 0; m < M; m++) {
+            const __nv_bfloat16* hid_m = buf_hidden_batch_.bf16() + (size_t)m * dim;
+            __nv_bfloat16* lora_m = buf_lora_batch_.bf16() + (size_t)m * q_lora;
+            if (lw.wq_a_w.dtype == "int4") {
+                gemv_int4_cuda(lora_m, hid_m, (const uint8_t*)lw.wq_a_w.data, lw.wq_a_s.bf16(), q_lora, dim, main_stream_);
+            } else {
+                gemm_fp8_dequant(lora_m, 1, q_lora, dim, hid_m, lw.wq_a_w.u8(), lw.wq_a_s.u8(), 128, main_stream_);
+            }
+            rms_norm_cuda(lora_m, lora_m, lw.q_norm_w.bf16(), q_lora, cfg_.rms_norm_eps, main_stream_);
+
+            __nv_bfloat16* q_m = buf_q_batch_.bf16() + (size_t)m * (n_heads * head_dim_val);
+            if (lw.wq_b_w.dtype == "int4") {
+                gemv_int4_cuda(q_m, lora_m, (const uint8_t*)lw.wq_b_w.data, lw.wq_b_s.bf16(), n_heads * head_dim_val, q_lora, main_stream_);
+            } else {
+                gemm_fp8_dequant(q_m, 1, n_heads * head_dim_val, q_lora, lora_m, lw.wq_b_w.u8(), lw.wq_b_s.u8(), 128, main_stream_);
+            }
+        }
+
+        // 4. Attention for all M tokens
+        float scale = 1.0f / sqrtf((float)head_dim_val);
+        int max_combined = window + cfg_.max_compressed_entries;
+
+        for (int m = 0; m < M; m++) {
+            mla_attention_fused_cuda(
+                buf_q_batch_.bf16() + (size_t)m * (n_heads * head_dim_val),
+                lw.kv_cache.bf16(), lw.comp_kv_cache.bf16(), lw.attn_sink.f32(),
+                buf_attn_out_batch_.bf16() + (size_t)m * (n_heads * head_dim_val),
+                buf_input_pos_batch_.i32() + m, lw.d_comp_kv_count.i32(),
+                layer_rope_freqs, max_combined, head_dim_val, rope_dim, scale,
+                cfg_.rms_norm_eps, nullptr, window, main_stream_);
+        }
+
+        // 5. Output projection (wo_a and wo_b) for all M tokens
+        int heads_per_group = n_heads / o_groups;  // 64 / 8 = 8
+        int hpg_dim = heads_per_group * head_dim_val;  // 8 * 512 = 4096
+
+        for (int m = 0; m < M; m++) {
+            const __nv_bfloat16* a_m = buf_attn_out_batch_.bf16() + (size_t)m * (n_heads * head_dim_val);
+            __nv_bfloat16* lora_m = buf_lora_batch_.bf16() + (size_t)m * (o_groups * o_lora);
+            __nv_bfloat16* hid_m = buf_hidden_batch_.bf16() + (size_t)m * dim;
+
+            if (lw.wo_a_w.dtype == "int4") {
+                for (int g = 0; g < o_groups; g++) {
+                    const uint8_t* w_g = (const uint8_t*)lw.wo_a_w.data + (size_t)g * o_lora * (hpg_dim / 2);
+                    const __nv_bfloat16* s_g = lw.wo_a_s.bf16() + (size_t)g * o_lora * (hpg_dim / 32);
+                    const __nv_bfloat16* a_g = a_m + (size_t)g * hpg_dim;
+                    __nv_bfloat16* out_g = lora_m + (size_t)g * o_lora;
+                    gemv_int4_cuda(out_g, a_g, w_g, s_g, o_lora, hpg_dim, main_stream_);
+                }
+            } else {
+                gemv_fp8_grouped_cuda(lora_m, a_m, lw.wo_a_w.u8(), lw.wo_a_s.u8(),
+                                      o_lora, hpg_dim, o_groups, 128, main_stream_);
+            }
+
+            if (lw.wo_b_w.dtype == "int4") {
+                gemv_int4_cuda(hid_m, lora_m, (const uint8_t*)lw.wo_b_w.data, lw.wo_b_s.bf16(), dim, o_groups * o_lora, main_stream_);
+            } else {
+                gemm_fp8_dequant(hid_m, 1, dim, o_groups * o_lora, lora_m, lw.wo_b_w.u8(), lw.wo_b_s.u8(), 128, main_stream_);
+            }
+        }
+
+        // 6. HC Post for Attention
+        for (int m = 0; m < M; m++) {
+            hc_post_batch(m, buf_hc_after_attn_batch_.bf16() + (size_t)m * (hc * dim),
+                          buf_hc_state_batch_.bf16() + (size_t)m * (hc * dim));
+        }
+
+        // 7. HC Pre-Norm for FFN
+        for (int m = 0; m < M; m++) {
+            hc_pre_norm_batch(m, buf_hc_after_attn_batch_.bf16() + (size_t)m * (hc * dim),
+                              lw.hc_ffn_fn, lw.hc_ffn_scale, lw.hc_ffn_base,
+                              lw.ffn_norm_w.bf16());
+        }
+
+        // 8. MoE FFN for all M tokens
+        // Routing:
+        if (layer_id < cfg_.n_hash_layers) {
+            moe_route_hash_device_id_batch_cuda(
+                buf_topk_idx_batch_.i32(), buf_topk_vals_batch_.f32(),
+                lw.tid2eid.i64(), buf_input_tokens_batch_.i32(),
+                M, top_k, cfg_.routed_scaling_factor, main_stream_);
+        } else {
+            for (int m = 0; m < M; m++) {
+                gemm_bf16(buf_scores_bf16_batch_.bf16() + (size_t)m * n_experts, 1, n_experts, dim,
+                          buf_hidden_batch_.bf16() + (size_t)m * dim, lw.gate_w.bf16());
+            }
+            moe_route_top6_from_bf16_batch_cuda(
+                buf_topk_idx_batch_.i32(), buf_topk_vals_batch_.f32(),
+                buf_scores_bf16_batch_.bf16(), lw.gate_bias.f32(),
+                M, n_experts, top_k, cfg_.routed_scaling_factor, main_stream_);
+        }
+
+        // Synchronize routing before resolving experts on host
+        CUDA_CHECK(cudaStreamSynchronize(main_stream_));
+
+        auto& w1_info = expert_parts_["w1.weight"];
+        auto& w3_info = expert_parts_["w3.weight"];
+        auto& w2_info = expert_parts_["w2.weight"];
+
+        // ── Resolve all unique routed experts across all M tokens in parallel ──
+        struct BatchExpertReq {
+            int eid;
+            int64_t key;
+            void* gpu_dst;
+        };
+        std::vector<BatchExpertReq> batch_reqs;
+        std::unordered_map<int, void*> resolved_ptrs;
+
+        {
+            std::unique_lock<std::mutex> lock(expert_loader_.cache_mutex_);
+            expert_loader_.access_counter_++;
+
+            for (int m = 0; m < M; m++) {
+                for (int k = 0; k < top_k; k++) {
+                    int eid = buf_topk_idx_batch_.i32()[m * top_k + k];
+                    if (eid < 0 || eid >= n_experts || resolved_ptrs.count(eid)) continue;
+
+                    int64_t key = (int64_t)layer_id * expert_loader_.n_experts_ + eid;
+                    auto it = expert_loader_.key_to_slot_.find(key);
+                    if (it != expert_loader_.key_to_slot_.end()) {
+                        auto& slot = expert_loader_.cache_slots_[it->second];
+                        slot.last_used = expert_loader_.access_counter_;
+                        resolved_ptrs[eid] = slot.gpu_data;
+                        continue;
+                    }
+
+                    // Evict oldest slot
+                    int evict_slot = -1;
+                    int64_t oldest = INT64_MAX;
+                    for (int i = 0; i < expert_loader_.cache_capacity_; i++) {
+                        if (expert_loader_.cache_slots_[i].layer_id < 0) { evict_slot = i; break; }
+                        if (expert_loader_.cache_slots_[i].last_used < oldest) {
+                            oldest = expert_loader_.cache_slots_[i].last_used;
+                            evict_slot = i;
+                        }
+                    }
+                    auto& slot = expert_loader_.cache_slots_[evict_slot];
+                    if (slot.layer_id >= 0) {
+                        int64_t old_key = (int64_t)slot.layer_id * expert_loader_.n_experts_ + slot.expert_id;
+                        expert_loader_.key_to_slot_.erase(old_key);
+                        expert_loader_.flat_vram_ptrs_[old_key] = nullptr;
+                    }
+                    slot.layer_id = layer_id;
+                    slot.expert_id = eid;
+                    slot.last_used = expert_loader_.access_counter_;
+                    expert_loader_.key_to_slot_[key] = evict_slot;
+                    expert_loader_.flat_vram_ptrs_[key] = slot.gpu_data;
+
+                    resolved_ptrs[eid] = slot.gpu_data;
+                    batch_reqs.push_back({eid, key, slot.gpu_data});
+                }
+            }
+        }
+
+        // Parallel SSD reads for all missing experts
+        if (!batch_reqs.empty() && expert_pool_) {
+            std::vector<std::future<bool>> futures(batch_reqs.size());
+            for (size_t i = 0; i < batch_reqs.size(); i++) {
+                futures[i] = expert_pool_->enqueue([this, r = batch_reqs[i]]() -> bool {
+                    int64_t bytes = expert_loader_.expert_file_.pread_exact(
+                        r.gpu_dst, expert_loader_.expert_block_size_, r.key * expert_loader_.expert_block_size_);
+                    return (bytes == expert_loader_.expert_block_size_);
+                });
+            }
+            for (auto& f : futures) {
+                f.get();
+            }
+        }
+
+        for (int m = 0; m < M; m++) {
+            __nv_bfloat16* shared_gate = buf_gate_batch_.bf16() + (size_t)m * max_inter + top_k * moe_inter;
+            __nv_bfloat16* shared_up   = buf_up_batch_.bf16()   + (size_t)m * max_inter + top_k * moe_inter;
+            __nv_bfloat16* shared_down = buf_down_batch_.bf16() + (size_t)m * max_inter + top_k * dim;
+            __nv_bfloat16* hid_m       = buf_hidden_batch_.bf16() + (size_t)m * dim;
+
+            if (lw.shared_w1_w.dtype == "int4") {
+                gemv_int4_cuda(shared_gate, hid_m, (const uint8_t*)lw.shared_w1_w.data, lw.shared_w1_s.bf16(), moe_inter, dim, main_stream_);
+                gemv_int4_cuda(shared_up, hid_m, (const uint8_t*)lw.shared_w3_w.data, lw.shared_w3_s.bf16(), moe_inter, dim, main_stream_);
+                silu_mul_cuda(shared_gate, shared_gate, shared_up, moe_inter, cfg_.swiglu_limit, main_stream_);
+                gemv_int4_cuda(shared_down, shared_gate, (const uint8_t*)lw.shared_w2_w.data, lw.shared_w2_s.bf16(), dim, moe_inter, main_stream_);
+            } else {
+                gemm_fp8_dequant(shared_gate, 1, moe_inter, dim, hid_m, lw.shared_w1_w.u8(), lw.shared_w1_s.u8(), 128, main_stream_);
+                gemm_fp8_dequant(shared_up, 1, moe_inter, dim, hid_m, lw.shared_w3_w.u8(), lw.shared_w3_s.u8(), 128, main_stream_);
+                silu_mul_cuda(shared_gate, shared_gate, shared_up, moe_inter, cfg_.swiglu_limit, main_stream_);
+                gemm_fp8_dequant(shared_down, 1, dim, moe_inter, shared_gate, lw.shared_w2_w.u8(), lw.shared_w2_s.u8(), 128, main_stream_);
+            }
+
+            // Routed experts for token m (each token in batch has its own 8-pointer slot to avoid race condition):
+            void* active_ptrs_m[8] = {nullptr};
+            for (int k = 0; k < top_k; k++) {
+                int eid = buf_topk_idx_batch_.i32()[m * top_k + k];
+                if (eid >= 0 && eid < n_experts && resolved_ptrs.count(eid)) {
+                    active_ptrs_m[k] = resolved_ptrs[eid];
+                }
+            }
+            void** m_expert_ptrs = (void**)buf_active_expert_ptrs_.data + (size_t)m * 8;
+            std::memcpy(m_expert_ptrs, active_ptrs_m, top_k * sizeof(void*));
+
+            if (cfg_.expert_dtype == "iq2_xxs") {
+                gemv_iq2_xxs_moe_swiglu_fused_cuda(
+                    buf_gate_batch_.bf16() + (size_t)m * max_inter,
+                    hid_m,
+                    (const void* const*)m_expert_ptrs,
+                    w1_info.offset_in_block, w3_info.offset_in_block,
+                    moe_inter, dim, cfg_.swiglu_limit,
+                    nullptr, nullptr, 0, 0, main_stream_);
+
+                gemv_q2_k_moe_cuda(
+                    buf_down_batch_.bf16() + (size_t)m * max_inter,
+                    buf_gate_batch_.bf16() + (size_t)m * max_inter,
+                    (const void* const*)m_expert_ptrs,
+                    w2_info.offset_in_block,
+                    dim, moe_inter,
+                    nullptr, nullptr, 0, 0, main_stream_);
+            }
+
+            fused_moe_accum_dynamic_cuda(
+                hid_m,
+                buf_down_batch_.bf16() + (size_t)m * max_inter,
+                buf_topk_vals_batch_.f32() + (size_t)m * top_k,
+                shared_down, dim, main_stream_);
+        }
+
+        // 9. HC Post for FFN
+        for (int m = 0; m < M; m++) {
+            hc_post_batch(m, buf_hc_state_batch_.bf16() + (size_t)m * (hc * dim),
+                          buf_hc_after_attn_batch_.bf16() + (size_t)m * (hc * dim));
+        }
+    }
+
+    void forward_token_batch_deepseek_device_body(int position, int M) {
+        int dim = cfg_.hidden_size;
+        int hc = cfg_.hc_mult;
+
+        // 1. Embedding lookup and broadcast to HC copies for each token m in batch:
+        for (int m = 0; m < M; m++) {
+            embedding_broadcast_device_id_cuda(
+                buf_hidden_batch_.bf16() + (size_t)m * dim,
+                buf_hc_state_batch_.bf16() + (size_t)m * (hc * dim),
+                embed_weight_.bf16(), buf_input_tokens_batch_.i32() + m, dim, hc, main_stream_);
+        }
+
+        // 2. Process each layer
+        for (int layer = 0; layer < cfg_.num_hidden_layers; layer++) {
+            forward_layer_deepseek_batch(layer, position, M);
+        }
+
+        // 3. Head HC reduction for each token m:
+        for (int m = 0; m < M; m++) {
+            hc_head_reduce_batch(m, buf_hc_state_batch_.bf16() + (size_t)m * (hc * dim));
+        }
+
+        // 4. Final norm for each token m:
+        for (int m = 0; m < M; m++) {
+            rms_norm_cuda(buf_hidden_batch_.bf16() + (size_t)m * dim,
+                          buf_hidden_batch_.bf16() + (size_t)m * dim,
+                          norm_weight_.bf16(), dim, cfg_.rms_norm_eps, main_stream_);
+        }
+
+        // 5. Compute logits for each token m:
+        compute_logits_deepseek_batch(M);
+    }
+
+    void forward_token_batch_deepseek(const int* tokens_host, int position, int M) {
+        if (!h_target_batch_tok_) {
+            CUDA_CHECK(cudaMallocHost(&h_target_batch_tok_, 16 * sizeof(int32_t)));
+            CUDA_CHECK(cudaMallocHost(&h_target_batch_pos_, 16 * sizeof(int32_t)));
+        }
+        for (int m = 0; m < M; m++) {
+            h_target_batch_pos_[m] = position + m;
+            h_target_batch_tok_[m] = tokens_host[m];
+        }
+        CUDA_CHECK(cudaMemcpyAsync(buf_input_pos_batch_.i32(), h_target_batch_pos_, M * sizeof(int32_t), cudaMemcpyHostToDevice, main_stream_));
+        CUDA_CHECK(cudaMemcpyAsync(buf_input_tokens_batch_.i32(), h_target_batch_tok_, M * sizeof(int32_t), cudaMemcpyHostToDevice, main_stream_));
+
+        forward_token_batch_deepseek_device_body(position, M);
+    }
+
     // ── Forward one layer ───────────────────────────────────────────────────
 
     void forward_layer(int layer_id, int token_id, int position) {
@@ -7363,7 +8325,9 @@ private:
         // ── HC pre for attention + Attention norm (fused into 1 pass) ──
         hc_pre_norm(buf_hc_state_, lw.hc_attn_fn, lw.hc_attn_scale, lw.hc_attn_base,
                     lw.attn_norm_w.bf16());
+#ifndef __APPLE__
         CUDA_CHECK(cudaEventRecord(main_event_, main_stream_));
+#endif
 
         // ── Attention ──
         forward_attention(layer_id, position);
@@ -7374,7 +8338,9 @@ private:
         // ── HC pre for FFN + FFN norm (fused into 1 pass) ──
         hc_pre_norm(buf_hc_after_attn_, lw.hc_ffn_fn, lw.hc_ffn_scale, lw.hc_ffn_base,
                     lw.ffn_norm_w.bf16());
+#ifndef __APPLE__
         CUDA_CHECK(cudaEventRecord(main_event_, main_stream_));
+#endif
 
         // ── MoE FFN ──
         forward_moe(layer_id, token_id);
@@ -7496,7 +8462,9 @@ private:
                              buf_input_pos_.i32(), layer_rope_freqs, false, side_stream_);
         store_kv_device_pos_cuda(lw.kv_cache.bf16(), buf_kv_.bf16(),
                                  buf_input_pos_.i32(), window, head_dim_val, side_stream_);
+#ifndef __APPLE__
         CUDA_CHECK(cudaEventRecord(side_event_, side_stream_));
+#endif
 
         // Q projection on main_stream_
         // q_raw = wq_a(x) -> [q_lora_rank]
@@ -7579,6 +8547,7 @@ private:
         // ── Attention computation ───────────────────────────────────────────
         float scale = 1.0f / sqrtf((float)head_dim_val);
         int max_combined = window + cfg_.max_compressed_entries;
+        if (max_combined > 8192) max_combined = 8192;
 
         // Fused Direct-Addressing Flash-MLA: Q-Norm + Forward RoPE + Attention Dot Products + Softmax + Value Reduction + Inverse RoPE
         mla_attention_fused_cuda(
@@ -7679,6 +8648,7 @@ private:
         } else {
             // ── TIMING INSTRUMENTATION for offloading path ──
             static thread_local int64_t t_token_count = 0;
+            static thread_local double t_gpu_wait_us = 0;
             static thread_local double t_cache_resolve_us = 0;
             static thread_local double t_io_submit_us = 0;
             static thread_local double t_io_wait_us = 0;
@@ -7687,14 +8657,20 @@ private:
             static thread_local int t_l2_hits = 0;
             static thread_local int t_ssd_reads = 0;
             if (layer_id == 3) {  // Reset per-token at first MoE layer
-                t_cache_resolve_us = 0; t_io_submit_us = 0; t_io_wait_us = 0; t_compute_us = 0;
+                t_gpu_wait_us = 0; t_cache_resolve_us = 0; t_io_submit_us = 0; t_io_wait_us = 0; t_compute_us = 0;
                 t_l1_hits = 0; t_l2_hits = 0; t_ssd_reads = 0;
             }
             auto _tp0 = std::chrono::high_resolution_clock::now();
             // Async copy top-k IDs to host with event-based sync (no full pipeline flush)
+#ifdef __APPLE__
+            // On Apple Silicon, buf_topk_idx_ resides in unified memory (MTLResourceStorageModeShared).
+            // Recording dma_event_ commits the router kernel asynchronously without blocking the CPU.
+            CUDA_CHECK(cudaEventRecord(dma_event_, main_stream_));
+#else
             CUDA_CHECK(cudaMemcpyAsync(topk_ids_host_, buf_topk_idx_.i32(),
                                        top_k * sizeof(int32_t), cudaMemcpyDeviceToHost, main_stream_));
             CUDA_CHECK(cudaEventRecord(dma_event_, main_stream_));
+#endif
 
             // ── Launch shared expert FIRST on side_stream_ while we wait for top-k IDs ──
             // This overlaps shared expert GPU compute with the CPU-side expert loading below.
@@ -7723,10 +8699,23 @@ private:
                                  shared_gate,
                                  lw.shared_w2_w.u8(), lw.shared_w2_s.u8(), 128, side_stream_);
             }
+#ifndef __APPLE__
             CUDA_CHECK(cudaEventRecord(side_event_, side_stream_));
+#endif
 
-            // ── Now wait only for the D→H copy to complete (NOT full pipeline flush) ──
             CUDA_CHECK(cudaEventSynchronize(dma_event_));
+            auto _tp_sync = std::chrono::high_resolution_clock::now();
+            double layer_gpu_wait_us = std::chrono::duration<double, std::micro>(_tp_sync - _tp0).count();
+            t_gpu_wait_us += layer_gpu_wait_us;
+            if (layer_gpu_wait_us > 50000.0) {
+                LOG_INFO("[LAYER TIMING] Layer %d gpu_wait: %.1f ms", layer_id, layer_gpu_wait_us / 1000.0);
+            }
+
+#ifdef __APPLE__
+            const int32_t* active_topk_ids = buf_topk_idx_.i32();
+#else
+            const int32_t* active_topk_ids = topk_ids_host_;
+#endif
 
             // ── Resolve all 6 experts' cache in a single lock (no I/O blocking) ──
             void* batch_ptrs[32] = {nullptr};
@@ -7744,12 +8733,13 @@ private:
                 bool l1_hit;
             } reqs[32];
 
+            auto _tp_cache0 = std::chrono::high_resolution_clock::now();
             {
                 std::unique_lock<std::mutex> lock(expert_loader_.cache_mutex_);
                 expert_loader_.access_counter_++;
 
                 for (int k = 0; k < top_k; k++) {
-                    int eid = topk_ids_host_[k];
+                    int eid = active_topk_ids[k];
                     reqs[k].l1_hit = false;
                     reqs[k].stage_idx = -1;
                     reqs[k].needs_disk = false;
@@ -7828,7 +8818,7 @@ private:
             // ── Mutex released ──
 
             auto _tp1 = std::chrono::high_resolution_clock::now();
-            t_cache_resolve_us += std::chrono::duration<double, std::micro>(_tp1 - _tp0).count();
+            t_cache_resolve_us += std::chrono::duration<double, std::micro>(_tp1 - _tp_cache0).count();
 
             // Count hits/misses
             for (int k = 0; k < top_k; k++) {
@@ -7845,6 +8835,13 @@ private:
                     auto& r = reqs[k];
                     void* host_ptr = r.host_src;
                     if (r.stage_idx >= 0) {
+#ifdef __APPLE__
+                        // On Apple Silicon unified memory, r.gpu_dst is directly accessible in CPU host address space!
+                        // Direct read from SSD straight into the destination buffer (zero-copy SSD->Unified Memory).
+                        int64_t bytes = expert_loader_.expert_file_.pread_exact(
+                            r.gpu_dst, expert_loader_.expert_block_size_, r.key * expert_loader_.expert_block_size_);
+                        if (bytes != expert_loader_.expert_block_size_) return false;
+#else
                         // SSD path: 2.5ms SSD read provides enough time for writeback (0.27ms) to complete
                         auto& stage = expert_loader_.staging_ring_[r.stage_idx];
                         CUDA_CHECK(cudaEventSynchronize(stage.event));
@@ -7855,6 +8852,7 @@ private:
                         CUDA_CHECK(cudaMemcpyAsync(r.gpu_dst, host_ptr, expert_loader_.expert_block_size_,
                                                     cudaMemcpyHostToDevice, expert_streams_[k]));
                         CUDA_CHECK(cudaEventRecord(stage.event, expert_streams_[k]));
+#endif
                     } else {
                         // L2 hit path: DMA is immediate, must wait for writeback to complete first
                         expert_loader_.wait_for_writeback(expert_streams_[k]);
@@ -7902,13 +8900,19 @@ private:
             // Make main_stream_ wait for ALL expert DMA streams to complete
             for (int k = 0; k < top_k; k++) {
                 if (reqs[k].l1_hit || !active_expert_ptrs_host_[k]) continue;
+#ifndef __APPLE__
                 CUDA_CHECK(cudaEventRecord(expert_events_[k], expert_streams_[k]));
                 CUDA_CHECK(cudaStreamWaitEvent(main_stream_, expert_events_[k], 0));
+#endif
             }
 
             // Copy expert pointers to GPU for fused kernel
+#ifdef __APPLE__
+            std::memcpy(buf_active_expert_ptrs_.data, active_expert_ptrs_host_, top_k * sizeof(void*));
+#else
             CUDA_CHECK(cudaMemcpyAsync(buf_active_expert_ptrs_.data, active_expert_ptrs_host_,
                                        top_k * sizeof(void*), cudaMemcpyHostToDevice, main_stream_));
+#endif
 
             // Launch fused kernel: processes all 6 experts in 2 kernel calls instead of 12-24
             auto& w1_info = expert_parts_["w1.weight"];
@@ -7944,8 +8948,8 @@ private:
             if (layer_id == cfg_.num_hidden_layers - 1) {
                 t_token_count++;
                 if (t_token_count % 10 == 1) {
-                    LOG_INFO("[MoE Perf] Token #%lld: cache_resolve=%.1fms io_submit=%.1fms io_wait+compute=%.1fms | L1=%d L2=%d SSD=%d",
-                             t_token_count, t_cache_resolve_us/1000.0, t_io_submit_us/1000.0,
+                    LOG_INFO("[MoE Perf] Token #%lld: gpu_wait=%.1fms cache_resolve=%.1fms io_submit=%.1fms io_wait+compute=%.1fms | L1=%d L2=%d SSD=%d",
+                             t_token_count, t_gpu_wait_us/1000.0, t_cache_resolve_us/1000.0, t_io_submit_us/1000.0,
                              t_io_wait_us/1000.0, t_l1_hits, t_l2_hits, t_ssd_reads);
                 }
             }
@@ -7977,7 +8981,9 @@ private:
                                  shared_gate,
                                  lw.shared_w2_w.u8(), lw.shared_w2_s.u8(), 128, side_stream_);
             }
+#ifndef __APPLE__
             CUDA_CHECK(cudaEventRecord(side_event_, side_stream_));
+#endif
         }
 
         // 6. Launch 6 routed experts (all-resident path uses fused kernel)
@@ -8148,7 +9154,7 @@ private:
         if (prompt.empty()) return;
         int remaining_tokens = (int)prompt.size() - start_offset;
         if (remaining_tokens <= 0) return;
-        if (remaining_tokens <= 1) {
+        if (remaining_tokens <= 16) {
             for (size_t i = (size_t)start_offset; i < prompt.size(); i++) {
                 forward_token(prompt[i], (int)i);
             }
@@ -8178,6 +9184,7 @@ private:
         int top_k = cfg_.num_experts_per_tok;
         float scale = 1.0f / sqrtf((float)head_dim_val);
         int max_combined = window + cfg_.max_compressed_entries;
+        if (max_combined > 8192) max_combined = 8192;
 
         for (int start = start_offset; start < total_tokens; start += chunk_size) {
             int M = std::min(chunk_size, total_tokens - start);
@@ -8185,6 +9192,12 @@ private:
             bool is_last_chunk = (start + M == total_tokens);
 
             // 1. Copy tokens and positions to pinned host buffers, then async DMA to device
+#ifdef __APPLE__
+            for (int m = 0; m < M; m++) {
+                prefill_bufs_.buf_tokens.i32()[m] = prompt[start + m];
+                prefill_bufs_.buf_pos.i32()[m] = position + m;
+            }
+#else
             for (int m = 0; m < M; m++) {
                 h_prefill_tok_[m] = prompt[start + m];
                 h_prefill_pos_[m] = position + m;
@@ -8193,6 +9206,7 @@ private:
                                        M * sizeof(int32_t), cudaMemcpyHostToDevice, main_stream_));
             CUDA_CHECK(cudaMemcpyAsync(prefill_bufs_.buf_pos.i32(), h_prefill_pos_,
                                        M * sizeof(int32_t), cudaMemcpyHostToDevice, main_stream_));
+#endif
 
             // 2. Embedding lookup and broadcast to HC copies: [M, dim] and [M, hc * dim]
             embedding_broadcast_batch_cuda(
@@ -8466,7 +9480,19 @@ private:
                                      lw.shared_w2_w.u8(), lw.shared_w2_s.u8(), 128, main_stream_);
                 }
 
-                // ── Routed Experts (Resident MoE) ──
+                // ── Routed Experts (Resident & Offloaded MoE) ──
+                if (!expert_loader_.all_resident(cfg_.num_hidden_layers)) {
+#ifdef __APPLE__
+                    metal_stream_synchronize(main_stream_);
+                    expert_loader_.ensure_layer_experts(layer_id, prefill_bufs_.buf_topk_idx.i32(), M * top_k, expert_pool_.get());
+#else
+                    std::vector<int32_t> h_topk(M * top_k);
+                    CUDA_CHECK(cudaMemcpy(h_topk.data(), prefill_bufs_.buf_topk_idx.i32(),
+                                          M * top_k * sizeof(int32_t), cudaMemcpyDeviceToHost));
+                    expert_loader_.ensure_layer_experts(layer_id, h_topk.data(), M * top_k, expert_pool_.get());
+#endif
+                }
+
                 const void* const* flat_ptrs = expert_loader_.flat_vram_ptrs_gpu();
                 auto& w1_info = expert_parts_["w1.weight"];
                 auto& w3_info = expert_parts_["w3.weight"];
@@ -8605,17 +9631,27 @@ private:
                 argmax_f32_cuda(buf_argmax_out_.i32(), logits_ptr, vocab, main_stream_);
             }
             argmax_cache_valid_ = false;
+#ifdef __APPLE__
+            metal_stream_synchronize(main_stream_);
+            return buf_argmax_out_.i32()[0];
+#else
             CUDA_CHECK(cudaMemcpyAsync(h_sample_pin, buf_argmax_out_.i32(), sizeof(int32_t), cudaMemcpyDeviceToHost, main_stream_));
             CUDA_CHECK(cudaStreamSynchronize(main_stream_));
             return *h_sample_pin;
+#endif
         }
 
         std::uniform_real_distribution<float> dist(0.0f, 1.0f);
         float r = dist(rng_);
         sample_multinomial_f32_cuda(buf_argmax_out_.i32(), logits_ptr, vocab, temperature, r, min_p, main_stream_, top_k, top_p);
+#ifdef __APPLE__
+        metal_stream_synchronize(main_stream_);
+        return buf_argmax_out_.i32()[0];
+#else
         CUDA_CHECK(cudaMemcpyAsync(h_sample_pin, buf_argmax_out_.i32(), sizeof(int32_t), cudaMemcpyDeviceToHost, main_stream_));
         CUDA_CHECK(cudaStreamSynchronize(main_stream_));
         return *h_sample_pin;
+#endif
     }
 
 public:
@@ -9433,24 +10469,69 @@ static std::string build_dynamic_tools_prompt(const json& resolved_tools, bool i
         }
     }
 
-    std::string prompt =
-        "\n\n# Tools\n\n"
-        "You may call one or more functions to assist with the user query.\n"
-        "You are provided with function signatures within <tools></tools> XML tags:\n"
-        "<tools>\n";
-    for (const auto& item : resolved_tools) {
-        prompt += item.dump() + "\n";
-    }
-    prompt += "</tools>\n\n";
+    if (is_qwen) {
+        std::string prompt =
+            "\n\n# Tools\n\n"
+            "You may call one or more functions to assist with the user query.\n"
+            "You are provided with function signatures within <tools></tools> XML tags:\n"
+            "<tools>\n";
+        for (const auto& item : resolved_tools) {
+            prompt += item.dump() + "\n";
+        }
+        prompt += "</tools>\n\n";
 
-    prompt +=
-        "For each function call, return a json object with function name and arguments within <tool_call></tool_call> XML tags:\n"
-        "<tool_call>\n"
-        "{\"name\": \"<function-name>\", \"arguments\": <args-json-object>}\n"
-        "</tool_call>\n\n";
+        prompt +=
+            "For each function call, return a json object with function name and arguments within <tool_call></tool_call> XML tags:\n"
+            "<tool_call>\n"
+            "{\"name\": \"<function-name>\", \"arguments\": <args-json-object>}\n"
+            "</tool_call>\n\n";
+
+        if (has_yt || has_web) {
+            prompt += "## Tool Usage Instructions:\n";
+            if (has_web) {
+                prompt += "- When current information, real-time events, sports results, news, or web search is needed, invoke `web_search` directly with an informative query.\n";
+                prompt += "- Always invoke `web_search` for queries referencing \"today\", \"this morning\", \"tonight\", or recent events rather than asking the user to specify dates.\n";
+            }
+            if (has_yt) {
+                prompt += "- When the user asks to play music, a song, or a video, invoke `youtube_search` directly. The video will automatically load and play in the user's preview panel with autoplay.\n";
+            }
+        }
+        return prompt;
+    }
+
+    // Official DeepSeek-V4 DSML tool prompt template
+    std::string prompt =
+        "\n\n## Tools\n\n"
+        "You have access to a set of tools to help answer the user's question. You can invoke tools by writing a \"<｜DSML｜tool_calls>\" block like the following:\n\n"
+        "<｜DSML｜tool_calls>\n"
+        "<｜DSML｜invoke name=\"$TOOL_NAME\">\n"
+        "<｜DSML｜parameter name=\"$PARAMETER_NAME\" string=\"true|false\">$PARAMETER_VALUE</｜DSML｜parameter>\n"
+        "...\n"
+        "</｜DSML｜invoke>\n"
+        "<｜DSML｜invoke name=\"$TOOL_NAME2\">\n"
+        "...\n"
+        "</｜DSML｜invoke>\n"
+        "</｜DSML｜tool_calls>\n\n"
+        "String parameters should be specified as is and set `string=\"true\"`. For all other types (numbers, booleans, arrays, objects), pass the value in JSON format and set `string=\"false\"`.\n\n"
+        "If thinking_mode is enabled (triggered by <think>), you MUST output your complete reasoning inside <think>...</think> BEFORE any tool calls or final response.\n\n"
+        "Otherwise, output directly after </think> with tool calls or final response.\n\n";
+
+    prompt += "```json\n[\n";
+    for (size_t i = 0; i < resolved_tools.size(); i++) {
+        const auto& item = resolved_tools[i];
+        if (item.contains("function")) {
+            prompt += "  " + item["function"].dump();
+        } else {
+            prompt += "  " + item.dump();
+        }
+        if (i + 1 < resolved_tools.size()) prompt += ",";
+        prompt += "\n";
+    }
+    prompt += "]\n```\n";
+    prompt += "\nYou MUST strictly follow the above defined tool name and parameter schemas to invoke tool calls.\n";
 
     if (has_yt || has_web) {
-        prompt += "## Tool Usage Instructions:\n";
+        prompt += "\n## Tool Usage Instructions:\n";
         if (has_web) {
             prompt += "- When current information, real-time events, sports results, news, or web search is needed, invoke `web_search` directly with an informative query.\n";
             prompt += "- Always invoke `web_search` for queries referencing \"today\", \"this morning\", \"tonight\", or recent events rather than asking the user to specify dates.\n";
@@ -9493,7 +10574,9 @@ static std::string update_system_prompt_with_tools(const std::string& original_c
         return "You are an assistant.\nCurrent date: " + get_current_date_string();
     }
     std::string content = original_content;
-    size_t tools_pos = content.find("\n\n# Tools");
+    size_t tools_pos = content.find("\n\n## Tools");
+    if (tools_pos == std::string::npos) tools_pos = content.find("## Tools");
+    if (tools_pos == std::string::npos) tools_pos = content.find("\n\n# Tools");
     if (tools_pos == std::string::npos) tools_pos = content.find("# Tools");
     if (tools_pos == std::string::npos) tools_pos = content.find("<tools>");
     if (tools_pos != std::string::npos) {
@@ -9834,6 +10917,33 @@ static MultimodalPrompt apply_chat_template_multimodal(
     int THINK_END = tok.get_token_id("</think>");
     if (THINK_END < 0) THINK_END = 128822;
 
+    int TOOL_CALLS_BEGIN = tok.get_token_id("<｜tool calls begin｜>");
+    if (TOOL_CALLS_BEGIN < 0) TOOL_CALLS_BEGIN = 128806;
+
+    int TOOL_CALLS_END = tok.get_token_id("<｜tool calls end｜>");
+    if (TOOL_CALLS_END < 0) TOOL_CALLS_END = 128807;
+
+    int TOOL_CALL_BEGIN = tok.get_token_id("<｜tool call begin｜>");
+    if (TOOL_CALL_BEGIN < 0) TOOL_CALL_BEGIN = 128808;
+
+    int TOOL_CALL_END = tok.get_token_id("<｜tool call end｜>");
+    if (TOOL_CALL_END < 0) TOOL_CALL_END = 128809;
+
+    int TOOL_OUTPUTS_BEGIN = tok.get_token_id("<｜tool outputs begin｜>");
+    if (TOOL_OUTPUTS_BEGIN < 0) TOOL_OUTPUTS_BEGIN = 128810;
+
+    int TOOL_OUTPUTS_END = tok.get_token_id("<｜tool outputs end｜>");
+    if (TOOL_OUTPUTS_END < 0) TOOL_OUTPUTS_END = 128811;
+
+    int TOOL_OUTPUT_BEGIN = tok.get_token_id("<｜tool output begin｜>");
+    if (TOOL_OUTPUT_BEGIN < 0) TOOL_OUTPUT_BEGIN = 128812;
+
+    int TOOL_OUTPUT_END = tok.get_token_id("<｜tool output end｜>");
+    if (TOOL_OUTPUT_END < 0) TOOL_OUTPUT_END = 128813;
+
+    int TOOL_SEP = tok.get_token_id("<｜tool sep｜>");
+    if (TOOL_SEP < 0) TOOL_SEP = 128814;
+
     std::vector<int> result;
     result.push_back(BOS);
 
@@ -9955,7 +11065,8 @@ static MultimodalPrompt apply_chat_template_multimodal(
             result.insert(result.end(), enc.begin(), enc.end());
         } else if (role == "tool" || role == "function") {
             result.push_back(USER);
-            auto enc = tok.encode("<tool_response>\n" + content + "\n</tool_response>");
+            std::string tool_body = "<tool_result>" + content + "</tool_result>";
+            auto enc = tok.encode(tool_body);
             result.insert(result.end(), enc.begin(), enc.end());
         } else if (role == "assistant") {
             result.push_back(ASSISTANT);
@@ -9973,18 +11084,38 @@ static MultimodalPrompt apply_chat_template_multimodal(
                 result.push_back(THINK_END);
             }
             std::string body = content;
-            if (messages[i].contains("tool_calls") && messages[i]["tool_calls"].is_array()) {
+            if (messages[i].contains("tool_calls") && messages[i]["tool_calls"].is_array() && !messages[i]["tool_calls"].empty()) {
+                if (!body.empty()) {
+                    auto b_enc = tok.encode(body);
+                    result.insert(result.end(), b_enc.begin(), b_enc.end());
+                }
+                std::string tc_block = "\n\n<｜DSML｜tool_calls>\n";
                 for (const auto& tc : messages[i]["tool_calls"]) {
                     std::string fn_name = tc.value("function", json::object()).value("name", "");
                     json fn_args = tc.value("function", json::object()).value("arguments", json::object());
-                    std::string args_str = fn_args.is_string() ? fn_args.get<std::string>() : fn_args.dump();
-                    if (!body.empty() && body.back() != '\n') body += "\n";
-                    body += "<tool_call>\n{\"name\": \"" + fn_name + "\", \"arguments\": " + args_str + "}\n</tool_call>\n";
+                    if (fn_args.is_string()) {
+                        try { fn_args = json::parse(fn_args.get<std::string>()); } catch (...) { fn_args = json::object(); }
+                    }
+                    tc_block += "<｜DSML｜invoke name=\"" + fn_name + "\">\n";
+                    if (fn_args.is_object()) {
+                        for (auto it = fn_args.begin(); it != fn_args.end(); ++it) {
+                            std::string k = it.key();
+                            bool is_str = it.value().is_string();
+                            std::string val = is_str ? it.value().get<std::string>() : it.value().dump();
+                            tc_block += "<｜DSML｜parameter name=\"" + k + "\" string=\"" + (is_str ? "true" : "false") + "\">" + val + "</｜DSML｜parameter>\n";
+                        }
+                    }
+                    tc_block += "</｜DSML｜invoke>\n";
                 }
+                tc_block += "</｜DSML｜tool_calls>";
+                auto tc_enc = tok.encode(tc_block);
+                result.insert(result.end(), tc_enc.begin(), tc_enc.end());
+                result.push_back(EOS);
+            } else {
+                auto enc = tok.encode(body);
+                result.insert(result.end(), enc.begin(), enc.end());
+                result.push_back(EOS); // <｜end▁of▁sentence｜>
             }
-            auto enc = tok.encode(body);
-            result.insert(result.end(), enc.begin(), enc.end());
-            result.push_back(EOS); // <｜end▁of▁sentence｜>
         }
     }
 
@@ -9996,11 +11127,10 @@ static MultimodalPrompt apply_chat_template_multimodal(
             bool actual_thinking = enable_thinking && out.image_b64.empty();
             if (actual_thinking) {
                 result.push_back(THINK_BEGIN);
-            } else {
-                result.push_back(THINK_BEGIN);
-                result.push_back(THINK_END);
                 auto nl = tok.encode("\n");
                 result.insert(result.end(), nl.begin(), nl.end());
+            } else {
+                result.push_back(THINK_END);
             }
         }
     }
@@ -10628,6 +11758,9 @@ static bool start_forward_proxy(int proxy_port) {
 
     int opt = 1;
     setsockopt(g_proxy_listen_sock, SOL_SOCKET, SO_REUSEADDR, (const char*)&opt, sizeof(opt));
+#ifdef SO_REUSEPORT
+    setsockopt(g_proxy_listen_sock, SOL_SOCKET, SO_REUSEPORT, (const char*)&opt, sizeof(opt));
+#endif
 
     sockaddr_in saddr{};
     saddr.sin_family = AF_INET;
@@ -10635,10 +11768,13 @@ static bool start_forward_proxy(int proxy_port) {
     saddr.sin_port = htons((u_short)proxy_port);
 
     if (bind(g_proxy_listen_sock, (sockaddr*)&saddr, sizeof(saddr)) == SOCKET_ERROR) {
-        LOG_ERROR("[Proxy] Failed to bind forward proxy to 0.0.0.0:%d", proxy_port);
-        closesocket(g_proxy_listen_sock);
-        g_proxy_listen_sock = INVALID_SOCKET;
-        return false;
+        saddr.sin_addr.s_addr = inet_addr("127.0.0.1");
+        if (bind(g_proxy_listen_sock, (sockaddr*)&saddr, sizeof(saddr)) == SOCKET_ERROR) {
+            LOG_ERROR("[Proxy] Failed to bind forward proxy to 0.0.0.0:%d and 127.0.0.1:%d", proxy_port, proxy_port);
+            closesocket(g_proxy_listen_sock);
+            g_proxy_listen_sock = INVALID_SOCKET;
+            return false;
+        }
     }
 
     if (listen(g_proxy_listen_sock, 128) == SOCKET_ERROR) {
@@ -10748,6 +11884,14 @@ static void rebuild_system_prefix(
 {
     std::lock_guard<std::mutex> lock(g_engine_mutex);
 
+    if (engine.system_kv_snapshot_.valid &&
+        base_prompt == g_base_system_prompt &&
+        active_tools == g_current_active_tools &&
+        (custom_full_prompt.empty() || custom_full_prompt == g_current_system_prompt)) {
+        LOG_INFO("System KV snapshot already valid (%zu tokens), skipping rebuild.", engine.system_kv_snapshot_.tokens.size());
+        return;
+    }
+
     if (!g_enable_tools) {
         g_base_system_prompt = "You are an assistant.";
         g_current_system_prompt = "You are an assistant.\nCurrent date: " + get_current_date_string();
@@ -10755,6 +11899,7 @@ static void rebuild_system_prefix(
 
         // Invalidate conversation continuation snapshot
         engine.turn_kv_snapshot_.valid = false;
+        engine.prompt_kv_snapshot_.valid = false;
         s_last_conv_messages.clear();
 
         json default_messages = json::array({
@@ -10790,6 +11935,7 @@ static void rebuild_system_prefix(
 
     // Invalidate conversation-level continuation snapshot so next query doesn't reuse stale prompt
     engine.turn_kv_snapshot_.valid = false;
+    engine.prompt_kv_snapshot_.valid = false;
     s_last_conv_messages.clear();
 
     json resolved_tools = active_tools;
@@ -11133,26 +12279,43 @@ struct ToolTagStreamFilter {
             } else if (state == State::BUFFERING_TOOL) {
                 tool_buffer.push_back(c);
 
-                // Early detection of tool name inside JSON arguments
-                if (current_tool_name.empty() && tool_buffer.size() > 15) {
-                    size_t npos = tool_buffer.find("\"name\"");
-                    if (npos != std::string::npos) {
-                        size_t colon = tool_buffer.find(':', npos);
-                        if (colon != std::string::npos) {
-                            size_t q1 = tool_buffer.find('"', colon);
-                            if (q1 != std::string::npos) {
-                                size_t q2 = tool_buffer.find('"', q1 + 1);
-                                if (q2 != std::string::npos) {
-                                    current_tool_name = normalize_tool_name(tool_buffer.substr(q1 + 1, q2 - q1 - 1));
-                                    if (on_status) {
-                                        if (current_tool_name == "create_3d_model" || current_tool_name == "model_3d") {
-                                            on_status("Generating 3D model geometry & Three.js code...");
-                                        } else {
-                                            on_status("Generating tool call: " + current_tool_name + "...");
-                                        }
+                // Early detection of tool name inside JSON arguments or DeepSeek sep
+                if (current_tool_name.empty() && tool_buffer.size() > 10) {
+                    // 1. DeepSeek format: <｜tool sep｜>function_name
+                    size_t sep_pos = tool_buffer.find("\xef\xbd\x9ctool sep\xef\xbd\x9c");
+                    if (sep_pos == std::string::npos) sep_pos = tool_buffer.find("|tool sep|");
+                    if (sep_pos != std::string::npos) {
+                        size_t after = tool_buffer.find('>', sep_pos);
+                        if (after != std::string::npos && after + 1 < tool_buffer.size()) {
+                            std::string rem = tool_buffer.substr(after + 1);
+                            while (!rem.empty() && (rem.front() == ' ' || rem.front() == '\t')) rem.erase(rem.begin());
+                            size_t fn_end = rem.find_first_of(" \t\n\r`");
+                            if (fn_end != std::string::npos && fn_end > 0) {
+                                current_tool_name = normalize_tool_name(rem.substr(0, fn_end));
+                            }
+                        }
+                    }
+                    // 2. JSON format: "name": "..."
+                    if (current_tool_name.empty()) {
+                        size_t npos = tool_buffer.find("\"name\"");
+                        if (npos != std::string::npos) {
+                            size_t colon = tool_buffer.find(':', npos);
+                            if (colon != std::string::npos) {
+                                size_t q1 = tool_buffer.find('"', colon);
+                                if (q1 != std::string::npos) {
+                                    size_t q2 = tool_buffer.find('"', q1 + 1);
+                                    if (q2 != std::string::npos) {
+                                        current_tool_name = normalize_tool_name(tool_buffer.substr(q1 + 1, q2 - q1 - 1));
                                     }
                                 }
                             }
+                        }
+                    }
+                    if (!current_tool_name.empty() && on_status) {
+                        if (current_tool_name == "create_3d_model" || current_tool_name == "model_3d") {
+                            on_status("Generating 3D model geometry & Three.js code...");
+                        } else {
+                            on_status("Generating tool call: " + current_tool_name + "...");
                         }
                     }
                 }
@@ -11244,11 +12407,15 @@ private:
             "tool",
             "function_call",
             "call",
+            "\xef\xbd\x9ctool calls begin\xef\xbd\x9c",
+            "\xef\xbd\x9ctool calls end\xef\xbd\x9c",
             "\xef\xbd\x9ctool call begin\xef\xbd\x9c",
             "\xef\xbd\x9ctool call end\xef\xbd\x9c",
             "\xef\xbd\x9ctool sep\xef\xbd\x9c",
             "\xef\xbd\x9ctool outputs begin\xef\xbd\x9c",
             "\xef\xbd\x9ctool outputs end\xef\xbd\x9c",
+            "|tool calls begin|",
+            "|tool calls end|",
             "|tool call begin|",
             "|tool call end|",
             "|tool sep|",
@@ -11293,7 +12460,8 @@ private:
         if (lower.find("tool_call") != std::string::npos) return true;
         if (lower.find("tool_calls") != std::string::npos) return true;
         if (lower.find("tools") != std::string::npos) return true;
-        if (lower.find("tool call begin") != std::string::npos) return true;
+        if (lower.find("tool call") != std::string::npos) return true;
+        if (lower.find("tool calls") != std::string::npos) return true;
         if (lower.find("dsml") != std::string::npos) return true;
         if (lower.find("function_call") != std::string::npos) return true;
         if (lower.find("<call") != std::string::npos) return true;
@@ -11305,6 +12473,7 @@ private:
     static bool is_container_tool_tag(const std::string& s) {
         std::string lower = to_lower_ascii(s);
         if (lower.find("tool_calls") != std::string::npos) return true;
+        if (lower.find("tool calls") != std::string::npos) return true;
         if (lower.find("<tools>") != std::string::npos || lower.find("<tools ") != std::string::npos) return true;
         return false;
     }
@@ -11331,6 +12500,8 @@ private:
         static const std::vector<std::string> closings = {
             "</tool_calls>",
             "</tools>",
+            "<\xef\xbd\x9ctool calls end\xef\xbd\x9c>",
+            "<|tool calls end|>",
             "</\xef\xbd\x9c" "dsml\xef\xbd\x9c" "tool_calls>",
             "</|dsml|tool_calls>",
             "</dsml:tool_calls>",
@@ -11355,6 +12526,8 @@ private:
             "</call>",
             "<\xef\xbd\x9ctool call end\xef\xbd\x9c>",
             "<|tool call end|>",
+            "<\xef\xbd\x9ctool calls end\xef\xbd\x9c>",
+            "<|tool calls end|>",
             "<\xef\xbd\x9ctool outputs end\xef\xbd\x9c>",
             "<|tool outputs end|>",
             "</\xef\xbd\x9c" "dsml\xef\xbd\x9c" "tool_calls>",
@@ -11385,6 +12558,9 @@ static void run_server(MoecherEngine& engine, int port, int default_thinking_bud
         setsockopt(sock, SOL_SOCKET, SO_REUSEADDR, reinterpret_cast<const char*>(&opt), sizeof(opt));
 #else
         setsockopt(sock, SOL_SOCKET, SO_REUSEADDR, reinterpret_cast<const void*>(&opt), sizeof(opt));
+#ifdef SO_REUSEPORT
+        setsockopt(sock, SOL_SOCKET, SO_REUSEPORT, reinterpret_cast<const void*>(&opt), sizeof(opt));
+#endif
 #endif
     });
 
@@ -12270,6 +13446,7 @@ static void run_server(MoecherEngine& engine, int port, int default_thinking_bud
             s_last_conv_messages.clear();
         }
         engine.turn_kv_snapshot_.valid = false;
+        engine.prompt_kv_snapshot_.valid = false;
         if (engine.system_kv_snapshot_.valid) {
             engine.restore_system_kv();
             LOG_INFO("[KV RESET] Restored pinned System KV snapshot of %zu tokens (ready for fresh conversation with 0ms prefill).",
@@ -12295,6 +13472,7 @@ static void run_server(MoecherEngine& engine, int port, int default_thinking_bud
             s_last_conv_messages.clear();
         }
         engine.turn_kv_snapshot_.valid = false;
+        engine.prompt_kv_snapshot_.valid = false;
         if (engine.system_kv_snapshot_.valid) {
             engine.restore_system_kv();
         } else {
@@ -12962,6 +14140,13 @@ static void run_server(MoecherEngine& engine, int port, int default_thinking_bud
                 max_thinking_tokens = std::min(max_thinking_tokens, max_tokens);
             }
 
+            bool req_speculative = engine.enable_spec_;
+            if (request.contains("speculative") && request["speculative"].is_boolean()) {
+                req_speculative = request["speculative"].get<bool>();
+            } else if (request.contains("enable_speculative") && request["enable_speculative"].is_boolean()) {
+                req_speculative = request["enable_speculative"].get<bool>();
+            }
+
             bool req_has_image = false;
             if (messages.is_array()) {
                 for (const auto& msg : messages) {
@@ -13116,7 +14301,7 @@ static void run_server(MoecherEngine& engine, int port, int default_thinking_bud
                 // SSE streaming
                 res.set_chunked_content_provider(
                     "text/event-stream",
-                    [&engine, messages, tools, max_tokens, temperature, req_id, repetition_penalty, enable_thinking, max_thinking_tokens, top_p, min_p, top_k, reasoning_effort, model_id, execution_timeout_ms, require_external_authorization, workspace_boundary_enforced, authorized_paths, do_server_exec, req_max_tool_rounds, busy_guard, send_sse_delta, ignore_eos](size_t offset, httplib::DataSink &sink) {
+                    [&engine, messages, tools, max_tokens, temperature, req_id, repetition_penalty, enable_thinking, max_thinking_tokens, top_p, min_p, top_k, reasoning_effort, model_id, execution_timeout_ms, require_external_authorization, workspace_boundary_enforced, authorized_paths, do_server_exec, req_max_tool_rounds, busy_guard, send_sse_delta, ignore_eos, req_speculative](size_t offset, httplib::DataSink &sink) {
                         if (offset > 0) return false;
                         std::lock_guard<std::mutex> lock(g_engine_mutex);
 
@@ -13208,6 +14393,8 @@ static void run_server(MoecherEngine& engine, int port, int default_thinking_bud
                             int req_thinking_tokens = req_thinking ? max_thinking_tokens : 0;
 
                             bool req_has_tools = (g_enable_tools && !tools.empty());
+                            bool orig_spec = engine.enable_spec_;
+                            engine.enable_spec_ = req_speculative;
                             engine.generate(prompt, max_tokens, temperature, [&](const std::string& text, bool is_reasoning) -> bool {
                                 if (g_stop_requested.load()) return false;
                                 if (text.empty()) return true;
@@ -13233,6 +14420,7 @@ static void run_server(MoecherEngine& engine, int port, int default_thinking_bud
                                 }
                             }, repetition_penalty, req_thinking, req_thinking_tokens, top_p, min_p, top_k,
                                d_vis_out, mm_prompt.visual_start_pos, mm_prompt.visual_num_tokens, ignore_eos, req_has_tools);
+                            engine.enable_spec_ = orig_spec;
 
                             final_finish_reason = engine.last_finish_reason_.empty() ? "stop" : engine.last_finish_reason_;
 
@@ -14002,12 +15190,15 @@ static void run_server(MoecherEngine& engine, int port, int default_thinking_bud
                             LOG_INFO("Running final synthesis pass to formulate answer for user...");
                             std::vector<int> prompt = build_continuation_prompt(engine, round_new_tool_msgs, enable_thinking, reasoning_effort);
                             round_new_tool_msgs.clear();
+                            bool orig_spec = engine.enable_spec_;
+                            engine.enable_spec_ = req_speculative;
                             engine.generate(prompt, max_tokens, temperature, [&](const std::string& text, bool is_reasoning) -> bool {
                                 if (g_stop_requested.load()) return false;
                                 if (text.empty()) return true;
                                 last_completed_content += text;
                                 return send_sse_delta(sink, req_id, model_id, created_time_str, "content", text);
                             }, repetition_penalty, false, 0, top_p, min_p, top_k, nullptr, -1, 0, false, /*allow_tool_calls=*/false);
+                            engine.enable_spec_ = orig_spec;
                             final_finish_reason = "stop";
                         }
 
@@ -14120,8 +15311,11 @@ static void run_server(MoecherEngine& engine, int port, int default_thinking_bud
                         bool req_thinking = enable_thinking && !conv_has_image;
                         int req_thinking_tokens = req_thinking ? max_thinking_tokens : 0;
                         bool req_has_tools = (g_enable_tools && !tools.empty());
+                        bool orig_spec = engine.enable_spec_;
+                        engine.enable_spec_ = req_speculative;
                         response_text = engine.generate(prompt, max_tokens, temperature, nullptr, repetition_penalty, req_thinking, req_thinking_tokens, top_p, min_p, top_k,
                                                         d_vis_out, mm_prompt.visual_start_pos, mm_prompt.visual_num_tokens, ignore_eos, req_has_tools);
+                        engine.enable_spec_ = orig_spec;
                         finish_reason = engine.last_finish_reason_;
                     }
 
@@ -14433,11 +15627,14 @@ static void run_server(MoecherEngine& engine, int port, int default_thinking_bud
         res.set_content(body.dump(), "application/json");
     });
 
-    LOG_INFO("Binding to 0.0.0.0:%d...", port);
-    if (!svr.bind_to_port("0.0.0.0", port)) {
-        LOG_ERROR("Failed to bind to 0.0.0.0:%d: %s (errno=%d)", port, strerror(errno), errno);
-        moecher::mcp::MCPManager::instance().stop_all();
-        return;
+    LOG_INFO("Binding to 127.0.0.1:%d...", port);
+    if (!svr.bind_to_port("127.0.0.1", port)) {
+        LOG_WARN("Failed to bind to 127.0.0.1:%d (%s). Retrying on 0.0.0.0:%d...", port, strerror(errno), port);
+        if (!svr.bind_to_port("0.0.0.0", port)) {
+            LOG_ERROR("Failed to bind to port %d: %s (errno=%d)", port, strerror(errno), errno);
+            moecher::mcp::MCPManager::instance().stop_all();
+            return;
+        }
     }
     LOG_INFO("Server listening on port %d", port);
     LOG_INFO("version %s", MOECHER_VERSION);
@@ -14496,6 +15693,7 @@ int main(int argc, char** argv) {
     std::string batched_prefill_mode = "auto";
     int prefill_chunk_size = 512;
     int max_seq_len_override = 0;
+    int sliding_window_override = 0;
     int mtp_k = 0;
 
     for (int i = 1; i < argc; i++) {
@@ -14508,6 +15706,7 @@ int main(int argc, char** argv) {
             printf("  --dram-cache-gb <gb>        DRAM cache budget in GB\n");
             printf("  --ctx, -c <tokens>          Max context length in tokens (default: 65536)\n");
             printf("  --max-seq-len <tokens>      Alias for --ctx\n");
+            printf("  --sliding-window, -w <tok>  Sliding window / raw KV window size in tokens (default: 2048)\n");
             printf("  --no-mtp, --disable-mtp     Disable MTP self-speculative decoding\n");
             printf("  --mtp-k <n>                 Max MTP draft depth (default: 1 on 16GB GPUs, 4 on >=24GB GPUs)\n");
             printf("  --budget <tokens>           Default thinking budget tokens\n");
@@ -14617,6 +15816,8 @@ int main(int argc, char** argv) {
             prefill_chunk_size = std::stoi(argv[++i]);
         } else if ((std::string(argv[i]) == "--ctx" || std::string(argv[i]) == "--max-seq-len" || std::string(argv[i]) == "-c") && i + 1 < argc) {
             max_seq_len_override = std::stoi(argv[++i]);
+        } else if ((std::string(argv[i]) == "--sliding-window" || std::string(argv[i]) == "-w" || std::string(argv[i]) == "--window-size") && i + 1 < argc) {
+            sliding_window_override = std::stoi(argv[++i]);
         } else if ((std::string(argv[i]) == "--max-tool-rounds" || std::string(argv[i]) == "--max-rounds") && i + 1 < argc) {
             g_max_tool_rounds = std::max(1, std::stoi(argv[++i]));
         }
@@ -14651,7 +15852,7 @@ int main(int argc, char** argv) {
              enable_pld ? "enabled" : "disabled",
              enable_mtp ? "enabled" : "disabled");
 
-    if (!engine.load(manifest_path, max_vram_gb, dram_cache_gb, expert_dtype_override, buffered_io, max_seq_len_override, enable_mtp)) {
+    if (!engine.load(manifest_path, max_vram_gb, dram_cache_gb, expert_dtype_override, buffered_io, max_seq_len_override, enable_mtp, sliding_window_override)) {
         LOG_ERROR("Failed to load model");
         return 1;
     }
@@ -14698,18 +15899,9 @@ int main(int argc, char** argv) {
         mcp_mgr.start_all_enabled();
     }
 
-    // Pre-warm default system prompt and tooling into KV Cache for 0ms initial prefill latency
+    // Pre-warm default system prompt into KV Cache for 0ms initial prefill latency
     if (g_prewarm) {
-        if (g_enable_tools) {
-            json default_tools = resolve_canonical_tools("default");
-            json mcp_tools = mcp_mgr.get_openai_tools_schema();
-            for (const auto& mt : mcp_tools) {
-                default_tools.push_back(mt);
-            }
-            rebuild_system_prefix(engine, g_base_system_prompt, default_tools);
-        } else {
-            rebuild_system_prefix(engine, g_base_system_prompt, json::array());
-        }
+        rebuild_system_prefix(engine, g_base_system_prompt, json::array());
     }
 
     run_server(engine, port, default_thinking_budget, proxy_port, enable_forward_proxy, enable_system_proxy);

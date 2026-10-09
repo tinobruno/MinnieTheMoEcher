@@ -58,7 +58,7 @@ cmake --build build -j
 ```
 This builds two primary executables:
 - `build/moecher`: The high-performance inference engine and server.
-- `build/test_metal`: The comprehensive 12-stage Metal kernel unit test suite.
+- `build/test_metal`: The comprehensive 17-stage Metal kernel unit test suite.
 
 ### 3. Verify Metal Hardware Tests
 Run the Metal test suite to verify kernel numerical accuracy and device detection:
@@ -82,6 +82,11 @@ Expected output:
 [TEST] 10. INT4 GEMV Metal GPU kernel (gemv_int4_cuda)... PASS
 [TEST] 11. INT3 GEMV Metal GPU kernel (gemv_int3_cuda)... PASS
 [TEST] 12. GQA Attention Metal compute kernel... PASS
+[TEST] 13. Hyper-Connections (HC) Pre-Norm, Sinkhorn, and Update... PASS
+[TEST] 14. MLA Attention Fused (64 heads, 512 head_dim)... PASS
+[TEST] 15. IQ2_XXS SwiGLU Fused GEMV... PASS
+[TEST] 16. Q2_K GEMV Down-Projection... PASS
+[TEST] 17. FP8 GEMV & Dequantization... PASS
 ==========================================================
   ALL TESTS PASSED ON APPLE SILICON METAL GPU!            
 ==========================================================
@@ -91,29 +96,59 @@ Expected output:
 
 ## Running the Inference Server
 
-### 1. Launch the Server Daemon
+### 1. Qwen 3.8 27B Vision (Fully Resident)
 ```bash
 ./build/moecher -m models/qwen3_8_27b_vision_13g/moecher_manifest.json -p 8001 --no-tools --no-think
 ```
 
-Key CLI Flags:
+### 2. DeepSeek-V4-Flash MoE (Dynamic SSD Streaming on Unified Memory)
+On Apple Silicon, CPU and GPU share the same physical Unified Memory Architecture (UMA). Because there is no separate discrete VRAM, the L2 host DRAM cache is redundant (`--dram-cache-gb 0`, which is the default). 
+
+You only need to specify `--max-vram` (or omit it to let the engine automatically detect free unified memory and reserve 4 GB for macOS):
+
+```bash
+# Recommended on a 24 GB Mac: Budget 18-20 GB total for dense layers + L1 expert cache
+./build/moecher -m models/deepseek_v4_flash_iq2/moecher_manifest.json \
+  --max-vram 19 \
+  -p 8001
+```
+
+Or simply let MinnieTheMoEcher auto-budget:
+```bash
+./build/moecher -m models/deepseek_v4_flash_iq2/moecher_manifest.json -p 8001
+```
+
+How memory is budgeted on a 24 GB Mac:
+- **Dense Layers (`attention_dense_layers.bin`)**: ~8.8 GB in unified memory.
+- **Working Buffers & KV Cache**: ~2.0 GB.
+- **L1 Expert Cache (`cache_pool_gpu_`)**: ~8-9 GB in unified memory (holds frequently activated experts).
+- **NVMe SSD Streaming**: Remaining experts stream on-demand directly into zero-copy double-buffered `MTLResourceStorageModeShared` slots via POSIX `pread` (`F_NOCACHE`), completely eliminating PCIe transfer overhead.
+
+Key CLI Flags for DeepSeek-V4-Flash:
 - `-m, --manifest <path>`: Path to the model manifest JSON file.
 - `-p, --port <port>`: Port to bind the HTTP server to (default: `8001`).
+- `--max-vram, -V <gb>`: Maximum total unified memory budget for dense weights and active L1 expert cache (e.g. `19` on a 24 GB Mac).
 - `--no-tools`: Disable system tooling schemas for maximum raw prompt performance.
 - `--no-think`: Direct answering mode without extended deliberation blocks.
 - `--no-mtp`: Disable speculative drafting (runs pure autoregressive decode).
 
-### 2. Querying the OpenAI-Compatible API
+### 3. DeepSeek-V4 Apple Silicon Architecture Highlights
+- **Zero-Copy Streaming**: Direct POSIX `pread` into `MTLResourceStorageModeShared` allocations with `F_NOCACHE` bypassing kernel page caches. Unified memory eliminates PCIe serialization entirely.
+- **Hardware Sinkhorn Hyper-Connections**: Fused doubly-stochastic Sinkhorn reduction running directly on the Apple M-series GPU for residual routing.
+- **Fused MLA (Multi-Head Latent Attention)**: RMSNorm + RoPE + compressed KV cache scoring and inverse RoPE projection executed in dynamic threadgroup SRAM.
+- **IQ2_XXS & Q2_K Quantization Shaders**: Direct SIMD vector lookups (`c_iq2xxs_grid` & `c_ksigns_iq2xs`) with fused SwiGLU activation.
+
+### 4. Querying the OpenAI-Compatible API
 ```bash
 curl -s http://localhost:8001/v1/chat/completions \
   -H "Content-Type: application/json" \
   -d '{
-    "model": "qwen3.8-27B-Vision-13G",
+    "model": "deepseek-v4-flash",
     "messages": [
       {"role": "system", "content": "You are a helpful AI assistant."},
-      {"role": "user", "content": "Explain briefly what is Metal Performance Primitives on Apple Silicon."}
+      {"role": "user", "content": "Explain the architecture of DeepSeek-V4-Flash MoE."}
     ],
-    "max_tokens": 64,
+    "max_tokens": 128,
     "temperature": 0.0,
     "stream": false
   }'

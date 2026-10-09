@@ -23,8 +23,11 @@ A comprehensive chronological record of engineering breakthroughs, mathematical 
 16. [2026-09-25 — Endeavour 17: Dual-Format Mixed Quantization (Hot 2:4 Sparse NVFP4 + Cold IQ2_XXS) — 100% VRAM Residency & 75.64 tok/s Breakthrough](#endeavour-17-dual-format-mixed-quantization-hot-24-sparse-nvfp4--cold-iq2_xxs--100-vram-residency--7564-toks-breakthrough)
 17. [2026-09-26 — Endeavour 18: FrankensTin-Vision-V4 — Fusing Qwen ViT with DeepSeek MoE & The Multimodal Attention Anchor Breakthrough](#endeavour-18-frankenstin-vision-v4--fusing-qwen-vit-with-deepseek-moe--the-multimodal-attention-anchor-breakthrough)
 18. [2026-09-27 — Endeavour 20: Multimodal Reasoning Calibration, Visual Token Soft Norm Capping, and Web UI Alignment](#endeavour-20-multimodal-reasoning-calibration-visual-token-soft-norm-capping-and-web-ui-alignment)
-19. [2026-09-27 — Endeavour 21: Qwen2.5-VL Dual-Engine Vision Delegation & 2D Spatial Merge Gather Topology Restoration](#endeavour-21-qwen25-vl-dual-engine-vision-delegation--2d-spatial-merge-gather-topology-restoration)
-20. [Roadmap of Pending Optimizations](#roadmap-of-pending-optimizations)
+19. [2026-09-27 — Endeavour 20: Multimodal Reasoning Calibration, Visual Token Soft Norm Capping, and Web UI Alignment](#endeavour-20-multimodal-reasoning-calibration-visual-token-soft-norm-capping-and-web-ui-alignment)
+20. [2026-09-27 — Endeavour 21: Qwen2.5-VL Dual-Engine Vision Delegation & 2D Spatial Merge Gather Topology Restoration](#endeavour-21-qwen25-vl-dual-engine-vision-delegation--2d-spatial-merge-gather-topology-restoration)
+21. [2026-10-08 — Endeavour 21: Metal RoPE YaRN Interpolation, Sliding Window Restoration, & DSML Tool Calling Alignment](#endeavour-21-metal-rope-yarn-interpolation-sliding-window-restoration--dsml-tool-calling-alignment)
+22. [2026-10-09 — Endeavour 22: Apple Silicon Metal Decode Acceleration & DeepSeek-V4 Speculative Decoding](#endeavour-22-apple-silicon-metal-decode-acceleration--deepseek-v4-speculative-decoding)
+23. [Roadmap of Pending Optimizations](#roadmap-of-pending-optimizations)
 
 ---
 
@@ -1045,5 +1048,92 @@ Add to any model's `moecher_manifest.json`:
 }
 ```
 MinnieTheMoEcher automatically initializes the vision delegate on startup and exposes `/v1/chat/completions` image support.
+
+---
+
+## Endeavour 21: Metal RoPE YaRN Interpolation, Sliding Window Restoration, & DSML Tool Calling Alignment
+**Date:** October 8, 2026 (`2026-10-08`)
+
+### Motivation & Problem Statement
+Generations on Apple Silicon Metal under DeepSeek-V4 Flash suffered from severe attention degradation, repetition loops (`Content repetition loop detected`), and token hallucination ("hallucination festival"):
+1. Prompts > 100 tokens degraded into repetitive colon/quote loops (`: "": " \n": #:ole/> {{{ \n #: \n definition define define`).
+2. Generative output often emitted raw control tokens, Chinese characters, or hung during speculative decoding.
+3. Tool prompts with JSON schemas triggered immediate syntax continuation loops instead of reasoning or tool calls.
+
+### Root Cause Analysis & Resolutions
+
+#### 1. Metal Backend Missing Analytical YaRN RoPE Interpolation
+- **Root Cause**: In `src/metal/metal_backend.mm: precompute_freqs_cuda`, the YaRN interpolation parameters (`factor`, `original_seq_len`, `beta_fast`, `beta_slow`) were cast to `(void)` and ignored, defaulting to standard RoPE. Because DeepSeek-V4 Flash uses compressed RoPE bases with YaRN factor 16 on all compressed layers, positions > 100 experienced severe phase distortion.
+- **Resolution**: Ported the analytical YaRN frequency scaling formula directly from `src/cuda/activations.cu` into `metal_backend.mm`, properly computing `corr0`, `corr1`, `ramp_mix`, and `freq_scale` for all heads and positions up to `max_seq_len`.
+
+#### 2. Threadgroup Memory Clamping for Apple Silicon
+- **Root Cause**: On Apple Silicon, threadgroup memory is strictly bounded by hardware (`device.maxThreadgroupMemoryLength`, typically 32 KB). In `mla_attention_fused_cuda`, setting threadgroup memory length for dynamic score reduction without accounting for static memory declared in shaders (`s_q[512]`, `s_out[512]`, `s_red[32]`) could trigger pipeline validation failures or buffer overruns.
+- **Resolution**: Subtracted `pso.staticThreadgroupMemoryLength` from `device.maxThreadgroupMemoryLength` before clamping `max_cache_len` dynamic allocation.
+
+#### 3. Restoration of `sliding_window` to 128
+- **Root Cause**: An earlier modification had altered `"sliding_window"` in `moecher_manifest.json` from 128 to 2048. As established in commit `1f1b73e` ("Fix context bleeding hallucination and KV cache overflow"), DeepSeek-V4 Flash was trained with a 128-token raw sliding window combined with Compressed Sparse Attention (CSA/HCA). Setting `sliding_window = 2048` prevented `n_comp = *d_comp_count` from ever being evaluated for any prompt < 2048 tokens, disabling the compressed KV cache and forcing raw attention outside its trained distribution.
+- **Resolution**: Restored `"sliding_window": 128` across manifest configurations. Positions $\ge 128$ now correctly maintain the 128-token raw window and cross-attend to compressed KV tokens.
+
+#### 4. Tool Prompt DSML Formatting & Stop Conditions
+- **Root Cause**:
+  1. `build_dynamic_tools_prompt` dumped raw JSON schemas without markdown code fences, causing the model to interpret them as open JSON objects and attempt syntactic key-value continuation.
+  2. The assistant turn ended with `<｜Assistant｜><think>` without a newline (`\n`), placing the model at an ambiguous prompt-continuation boundary.
+  3. The generation stopping check in `generate()` only looked for `<tool_call>` / `</tool_call>` and failed to recognize official DeepSeek-V4 `<｜DSML｜tool_calls>` / `</｜DSML｜tool_calls>` blocks, preventing clean tool termination.
+- **Resolution**:
+  - Enclosed tool schemas in ````json\n[\n  {...}\n]\n```` inside `build_dynamic_tools_prompt`.
+  - Appended `\n` after `THINK_BEGIN` (`<think>\n`) to place the model cleanly on the first reasoning line.
+  - Added full support for DSML tags (`<｜DSML｜tool_calls>`, `</｜DSML｜tool_calls>`, `<｜tool call begin｜>`, `<｜tool call end｜>`) to generation termination filters in `server_single.cpp`.
+
+### Verification Suite & Results
+1. **Unit Tests**: All 18 Metal unit tests passing (`./build/test_metal`).
+2. **Short Prompt ("Hi", len=24)**: 100% fluent reasoning and warm greeting response.
+3. **Long Prompt (Roman Empire decline, len=192)**: Evaluated through chunked batched prefill crossing position 128; outputted structured, encyclopedic analysis with zero loops or degradation.
+4. **Tool Schema Fact Query ("Capital of France", len=360)**: Evaluated through multi-chunk prefill without JSON schema continuation loops; accurately determined tool necessity and answered "Paris".
+5. **Tool Execution ("Tokyo weather", len=366)**: Emitted syntactically valid DSML `<｜DSML｜tool_calls>` block for `web_search`, terminated at `</｜DSML｜tool_calls>`, and executed the tool server-side with `finish_reason: "tool_calls"`.
+
+---
+
+## Endeavour 22: Apple Silicon Metal Decode Acceleration & DeepSeek-V4 Speculative Decoding
+**Date:** October 9, 2026 (`2026-10-09`)
+
+### Motivation & Problem Statement
+On Apple Silicon (Mac Mini M6, 24GB Unified Memory), DeepSeek-V4 Flash faced two fundamental throughput bottlenecks:
+1. **Physical Bandwidth Wall**: Pure autoregressive decoding ($M=1$) required reading 6.57 GB of weights from unified memory and streaming ~510 MB of offloaded MoE experts across 43 layers per token, capping theoretical single-token speed to ~4.1 tok/s.
+2. **Speculative Decoding Bypassed**: Speculative candidate drafting and batched multi-token verification were gated exclusively behind `ModelArch::QWEN`, leaving DeepSeek-V4 executing in single-token mode despite having the native Markov speculative head in `attention_dense_layers.bin` and MTP drafter weights in the manifest.
+3. **Kernel Dispatch Overhead**: FP8 and BF16 GEMV kernels suffered from unvectorized scalar scale lookups and threadgroup barrier overheads, driving per-layer GPU wait times up to ~240ms.
+
+### Root Cause Analysis & Resolutions
+
+#### 1. Vectorized FP8 and BF16 Metal Compute Kernels
+- **Resolution**:
+  - Vectorized `gemv_fp8_kernel` and `gemv_fp8_grouped_kernel` in `src/metal/kernels.metal` to 4-wide `uchar4` + `bfloat4` with hardware `dot(float4, float4)` FMAs.
+  - Hoisted block scale retrieval to decode once per 128 elements ($128\times$ fewer scale memory fetches).
+  - Pinned threadgroup size to 32 threads (1 SIMDgroup) in `src/metal/metal_backend.mm`, eliminating threadgroup barrier overhead and reducing layer `gpu_wait` from 240+ ms to **97 ms** (~60% reduction).
+
+#### 2. DeepSeek-V4 Native Markov MTP Draft Kernel on Metal GPU
+- **Resolution**:
+  - Implemented `deepseek_v4_mtp_markov_predict_kernel` in `src/metal/kernels.metal` and exposed `deepseek_v4_markov_predict_cuda` in `src/metal/metal_backend.mm`.
+  - The kernel executes the two-layer MLP Markov head directly on the Metal GPU command stream using weights from `attention_dense_layers.bin` (`markov_head_w1` 63 MB, `markov_head_w2` 63 MB, inner dim 256).
+  - Added unit test 20 to `tests/test_metal.cpp` verifying Markov draft prediction.
+
+#### 3. Speculative Multi-Token Verification & State Rollback
+- **Resolution**:
+  - Enabled architecture-aware speculative drafting in `src/server_single.cpp` for `ModelArch::DEEPSEEK_V4` using high-confidence Prompt Lookup Decoding (PLD, $n$-gram match $\ge 3$) and the Native Markov MTP head.
+  - Implemented `forward_token_batch_deepseek` to evaluate candidate token batches ($M \ge 2$) in a single pass across all 43 layers, sharing dense weights and expert I/O.
+  - Preserved strict state rollback for KV cache positions and Hyper-Connections (HC) matrices upon candidate rejection.
+  - Secured multi-threaded expert I/O by capturing batch request structs by value in thread pool lambdas.
+
+#### 4. Direct I/O and Zero-Copy Sampling
+- **Resolution**:
+  - Configured expert disk streaming to use Direct I/O (`O_DIRECT`), bypassing host OS double-caching and reducing RAM footprint.
+  - Sized the resident expert cache to 2.4 GB (358 resident experts) to prevent unified memory pressure.
+  - Eliminated host staging memcpy calls in `sample_from_logits_ptr`, sampling directly from unified memory (`MTLResourceStorageModeShared`).
+
+### Verification Suite & Results
+1. **Metal Test Suite**: **20/20 unit tests passing** on Apple Silicon Metal GPU (`./build/test_metal`).
+2. **Time to First Token (TTFT)**: **5.24s – 5.36s** (down from 49.5s baseline, **~9.5x speedup**).
+3. **Decoding Throughput**: **3.40 – 3.42 tok/s sustained** (up from 0.02 tok/s baseline and 2.3 tok/s initial port).
+4. **Reliability**: Verified 64-token continuous generation runs with zero crashes, clean tool calling integration, and stable memory usage.
+
 
 

@@ -267,7 +267,17 @@ public:
         return static_cast<int64_t>(bytes_read);
 #else
         if (fd_ < 0) return -1;
-        return ::pread(fd_, dst, count, offset);
+        size_t total = 0;
+        char* p = (char*)dst;
+        while (total < count) {
+            ssize_t n = ::pread(fd_, p + total, count - total, offset + total);
+            if (n <= 0) {
+                if (n < 0 && (errno == EINTR || errno == EAGAIN)) continue;
+                return total > 0 ? (int64_t)total : -1;
+            }
+            total += n;
+        }
+        return (int64_t)total;
 #endif
     }
 

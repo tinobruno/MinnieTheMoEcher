@@ -2,23 +2,47 @@
 import os
 import sys
 import time
+import argparse
 import urllib.request
 import urllib.error
 
-REPO = "TinoBruno/moecher-qwen-3.8-27b-vision-13g"
-DEST_DIR = os.path.abspath(os.path.join(os.path.dirname(__file__), "..", "models", "qwen3_8_27b_vision_13g"))
-
-FILES = [
-    "moecher_manifest.json",
-    "tokenizer.json",
-    "draft_vocab_ids.bin",
-    "draft_vocab_ids.json",
-    "draft_vocab_ids_mapping.json",
-    "draft_vocab_ids_reverse.bin",
-    "draft_lm_head_int8.bin",
-    "draft_lm_head_int8_bf16.bin",
-    "attention_dense_layers.bin",
-]
+MODELS = {
+    "qwen": {
+        "repo": "TinoBruno/moecher-qwen-3.8-27b-vision-13g",
+        "dir": "qwen3_8_27b_vision_13g",
+        "files": [
+            "moecher_manifest.json",
+            "tokenizer.json",
+            "draft_vocab_ids.bin",
+            "draft_vocab_ids.json",
+            "draft_vocab_ids_mapping.json",
+            "draft_vocab_ids_reverse.bin",
+            "draft_lm_head_int8.bin",
+            "draft_lm_head_int8_bf16.bin",
+            "attention_dense_layers.bin",
+        ]
+    },
+    "deepseek": {
+        "repo": "TinoBruno/moecher-deepseek-v4-flash-iq2",
+        "dir": "deepseek_v4_flash_iq2",
+        "files": [
+            "moecher_manifest.json",
+            "tokenizer.json",
+            "attention_dense_layers.bin",
+            "moe_experts_iq2.bin",
+        ]
+    },
+    "deepseek_q4": {
+        "repo": "TinoBruno/moecher-deepseek-v4-flash-q4",
+        "dir": "deepseek_v4_flash_q4",
+        "files": [
+            "moecher_manifest.json",
+            "tokenizer.json",
+            "attention_dense_layers_q4.bin",
+            "moe_experts_iq2.bin",
+        ]
+    }
+}
 
 def format_bytes(n):
     if n >= 1024 * 1024 * 1024:
@@ -29,10 +53,10 @@ def format_bytes(n):
         return f"{n / 1024:.1f} KB"
     return f"{n} B"
 
-def download_file(filename, target_dir):
+def download_file(repo, filename, target_dir):
     os.makedirs(target_dir, exist_ok=True)
     out_path = os.path.join(target_dir, filename)
-    url = f"https://huggingface.co/{REPO}/resolve/main/{filename}"
+    url = f"https://huggingface.co/{repo}/resolve/main/{filename}"
 
     # Get remote size
     req = urllib.request.Request(url, method="HEAD", headers={"User-Agent": "MoecherDownloader/1.0"})
@@ -92,18 +116,32 @@ def download_file(filename, target_dir):
     return True
 
 def main():
+    parser = argparse.ArgumentParser(description="Download model weights for MinnieTheMoEcher")
+    parser.add_argument("--model", "-m", choices=["qwen", "deepseek", "deepseek_q4"], default="deepseek",
+                        help="Model to download (default: deepseek)")
+    parser.add_argument("--manifest-only", action="store_true",
+                        help="Only download manifest and tokenizer (for config testing)")
+    args = parser.parse_args()
+
+    cfg = MODELS[args.model]
+    dest_dir = os.path.abspath(os.path.join(os.path.dirname(__file__), "..", "models", cfg["dir"]))
+
+    files = cfg["files"]
+    if args.manifest_only:
+        files = [f for f in files if f.endswith(".json")]
+
     print("=================================================================")
-    print(f"  Downloading Model: {REPO}")
-    print(f"  Target Directory:  {DEST_DIR}")
+    print(f"  Downloading Model: {cfg['repo']}")
+    print(f"  Target Directory:  {dest_dir}")
     print("=================================================================\n")
 
-    for f in FILES:
-        if not download_file(f, DEST_DIR):
+    for f in files:
+        if not download_file(cfg["repo"], f, dest_dir):
             print(f"\nFailed on {f}")
             sys.exit(1)
 
     print("\n=================================================================")
-    print("  ALL MODEL FILES DOWNLOADED AND READY!")
+    print("  ALL REQUESTED FILES DOWNLOADED AND READY!")
     print("=================================================================")
 
 if __name__ == "__main__":

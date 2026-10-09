@@ -3737,6 +3737,8 @@ inline std::string scrub_dsml_and_tool_tags(const std::string& text) {
         {"<dsml>", "</dsml>"},
         {"<tool_call>", "</tool_call>"},
         {"<tool_calls>", "</tool_calls>"},
+        {"<\xef\xbd\x9c" "tool calls begin\xef\xbd\x9c>", "<\xef\xbd\x9c" "tool calls end\xef\xbd\x9c>"},
+        {"<|tool calls begin|>", "<|tool calls end|>"},
         {"<\xef\xbd\x9c" "tool call begin\xef\xbd\x9c>", "<\xef\xbd\x9c" "tool call end\xef\xbd\x9c>"},
         {"<|tool call begin|>", "<|tool call end|>"}
     };
@@ -3926,40 +3928,73 @@ inline void extract_tool_calls(
         if (!out_tool_calls.empty()) return;
     }
 
-    // 2. Check DeepSeek DSML tokens: <｜tool call begin｜> ... <｜tool call end｜> (or ASCII pipes)
-    std::string dsml_start = "<｜tool call begin｜>";
-    std::string dsml_end = "<｜tool call end｜>";
-    size_t dsml_pos = response_text.find(dsml_start);
-    if (dsml_pos == std::string::npos) {
-        dsml_start = "<|tool call begin|>";
-        dsml_end = "<|tool call end|>";
-        dsml_pos = response_text.find(dsml_start);
-    }
-    if (dsml_pos != std::string::npos) {
-        size_t dsml_pos_end = response_text.find(dsml_end, dsml_pos);
-        if (dsml_pos_end != std::string::npos) {
-            std::string dsml_block = response_text.substr(dsml_pos + dsml_start.size(), dsml_pos_end - (dsml_pos + dsml_start.size()));
-            std::string sep = "<｜tool sep｜>";
-            size_t sep1 = dsml_block.find(sep);
-            if (sep1 == std::string::npos) {
-                sep = "<|tool sep|>";
-                sep1 = dsml_block.find(sep);
-            }
-            if (sep1 != std::string::npos) {
-                size_t sep2 = dsml_block.find(sep, sep1 + sep.size());
-                if (sep2 != std::string::npos) {
-                    std::string fn_name = dsml_block.substr(sep1 + sep.size(), sep2 - (sep1 + sep.size()));
-                    std::string fn_args = dsml_block.substr(sep2 + sep.size());
+    // 2. Check DeepSeek native tool tokens: <｜tool call begin｜> ... <｜tool call end｜> (or ASCII pipes)
+    static const std::vector<std::pair<std::string, std::string>> dsml_delims = {
+        {"<\xef\xbd\x9ctool call begin\xef\xbd\x9c>", "<\xef\xbd\x9ctool call end\xef\xbd\x9c>"},
+        {"<|tool call begin|>", "<|tool call end|>"}
+    };
+
+    for (const auto& delim : dsml_delims) {
+        size_t search_pos = 0;
+        while (true) {
+            size_t start = response_text.find(delim.first, search_pos);
+            if (start == std::string::npos) break;
+            size_t end = response_text.find(delim.second, start + delim.first.size());
+            if (end == std::string::npos) end = response_text.size();
+
+            std::string dsml_block = response_text.substr(start + delim.first.size(), end - (start + delim.first.size()));
+            size_t sep_pos = dsml_block.find("<\xef\xbd\x9ctool sep\xef\xbd\x9c>");
+            if (sep_pos == std::string::npos) sep_pos = dsml_block.find("<|tool sep|>");
+
+            if (sep_pos != std::string::npos) {
+                size_t sep_end = dsml_block.find('>', sep_pos);
+                if (sep_end != std::string::npos) {
+                    std::string after_sep = dsml_block.substr(sep_end + 1);
+                    while (!after_sep.empty() && (after_sep.front() == ' ' || after_sep.front() == '\t')) after_sep.erase(after_sep.begin());
+                    size_t ws_pos = after_sep.find_first_of(" \t\n\r");
+                    std::string fn_name;
+                    std::string fn_args;
+                    if (ws_pos != std::string::npos) {
+                        fn_name = after_sep.substr(0, ws_pos);
+                        fn_args = after_sep.substr(ws_pos);
+                    } else {
+                        fn_name = after_sep;
+                    }
+
+                    // Strip ```json and ``` markdown formatting from arguments
+                    size_t json_tag = fn_args.find("```json");
+                    if (json_tag != std::string::npos) {
+                        fn_args = fn_args.substr(json_tag + 7);
+                        size_t json_end = fn_args.rfind("```");
+                        if (json_end != std::string::npos) {
+                            fn_args = fn_args.substr(0, json_end);
+                        }
+                    } else {
+                        size_t code_tag = fn_args.find("```");
+                        if (code_tag != std::string::npos) {
+                            fn_args = fn_args.substr(code_tag + 3);
+                            size_t json_end = fn_args.rfind("```");
+                            if (json_end != std::string::npos) {
+                                fn_args = fn_args.substr(0, json_end);
+                            }
+                        }
+                    }
+                    while (!fn_args.empty() && (fn_args.front() == ' ' || fn_args.front() == '\n' || fn_args.front() == '\r' || fn_args.front() == '\t')) fn_args.erase(fn_args.begin());
+                    while (!fn_args.empty() && (fn_args.back() == ' ' || fn_args.back() == '\n' || fn_args.back() == '\r' || fn_args.back() == '\t')) fn_args.pop_back();
+
                     ToolCall tc;
-                    tc.id = "call_1_" + std::to_string(std::chrono::steady_clock::now().time_since_epoch().count() % 1000000);
+                    tc.id = "call_" + std::to_string(++call_idx) + "_" + std::to_string(std::chrono::steady_clock::now().time_since_epoch().count() % 1000000);
                     tc.type = "function";
                     tc.name = fn_name;
                     tc.arguments = fn_args;
                     out_tool_calls.push_back(tc);
-                    out_clean_content = scrub_dsml_and_tool_tags(response_text.substr(0, dsml_pos));
-                    return;
                 }
             }
+            search_pos = (end < response_text.size()) ? (end + delim.second.size()) : response_text.size();
+        }
+        if (!out_tool_calls.empty()) {
+            out_clean_content = scrub_dsml_and_tool_tags(response_text);
+            return;
         }
     }
 
