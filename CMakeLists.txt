@@ -124,6 +124,7 @@ if(APPLE)
 elseif(WIN32)
     target_link_libraries(moecher PRIVATE
         CUDA::cublas
+        CUDA::cublasLt
         CUDA::cudart
         httplib::httplib
         nlohmann_json::nlohmann_json
@@ -136,6 +137,7 @@ elseif(WIN32)
 else()
     target_link_libraries(moecher PRIVATE
         CUDA::cublas
+        CUDA::cublasLt
         CUDA::cudart
         httplib::httplib
         nlohmann_json::nlohmann_json

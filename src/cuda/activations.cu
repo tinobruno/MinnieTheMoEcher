@@ -7,6 +7,7 @@
 #include <cuda_bf16.h>
 #include <cuda_bf16.hpp>
 #include <cuda_fp16.h>
+#include <cuda_fp8.h>
 #include <cmath>
 #include <cfloat>
 #include <cstdio>
@@ -1351,8 +1352,12 @@ void gemv_bf16_batch_cuda(
     dim3 blocks((N + 7) / 8);
     if (M <= 4) {
         gemv_bf16_batch_generic_kernel<float, 4><<<blocks, threads, 0, stream>>>(out, W, X, N, K, M);
-    } else {
+    } else if (M <= 8) {
         gemv_bf16_batch_generic_kernel<float, 8><<<blocks, threads, 0, stream>>>(out, W, X, N, K, M);
+    } else if (M <= 16) {
+        gemv_bf16_batch_generic_kernel<float, 16><<<blocks, threads, 0, stream>>>(out, W, X, N, K, M);
+    } else {
+        gemv_bf16_batch_generic_kernel<float, 32><<<blocks, threads, 0, stream>>>(out, W, X, N, K, M);
     }
 }
 
@@ -1367,8 +1372,12 @@ void gemv_bf16_out_bf16_batch_cuda(
     dim3 blocks((N + 7) / 8);
     if (M <= 4) {
         gemv_bf16_batch_generic_kernel<__nv_bfloat16, 4><<<blocks, threads, 0, stream>>>(out, W, X, N, K, M);
-    } else {
+    } else if (M <= 8) {
         gemv_bf16_batch_generic_kernel<__nv_bfloat16, 8><<<blocks, threads, 0, stream>>>(out, W, X, N, K, M);
+    } else if (M <= 16) {
+        gemv_bf16_batch_generic_kernel<__nv_bfloat16, 16><<<blocks, threads, 0, stream>>>(out, W, X, N, K, M);
+    } else {
+        gemv_bf16_batch_generic_kernel<__nv_bfloat16, 32><<<blocks, threads, 0, stream>>>(out, W, X, N, K, M);
     }
 }
 
@@ -2039,42 +2048,78 @@ __global__ void dequant_int3_block_kernel(
     const __nv_bfloat16* __restrict__ scale, // [N, K/32] BF16
     int total_blocks)
 {
-    int block_idx = blockIdx.x * blockDim.x + threadIdx.x;
-    if (block_idx >= total_blocks) return;
+    int warp_id = (blockIdx.x * (blockDim.x / 32)) + (threadIdx.x / 32);
+    int lane = threadIdx.x & 31;
+    int warp_start_block = warp_id * 8;
+    if (warp_start_block >= total_blocks) return;
 
-    float s = __bfloat162float(scale[block_idx]);
-    const uint8_t* b_ptr = weight + (size_t)block_idx * 12;
-    __nv_bfloat162 res[16];
+    int cur_blocks = min(8, total_blocks - warp_start_block);
 
-    #pragma unroll
-    for (int i = 0; i < 4; i++) {
-        uint32_t b0 = b_ptr[i * 3 + 0];
-        uint32_t b1 = b_ptr[i * 3 + 1];
-        uint32_t b2 = b_ptr[i * 3 + 2];
-
-        float w0 = ((float)(b0 & 0x07) - 4.0f) * s;
-        float w1 = ((float)((b0 >> 3) & 0x07) - 4.0f) * s;
-        float w2 = ((float)(((b0 >> 6) & 0x03) | ((b1 & 0x01) << 2)) - 4.0f) * s;
-        float w3 = ((float)((b1 >> 1) & 0x07) - 4.0f) * s;
-        float w4 = ((float)((b1 >> 4) & 0x07) - 4.0f) * s;
-        float w5 = ((float)(((b1 >> 7) & 0x01) | ((b2 & 0x03) << 1)) - 4.0f) * s;
-        float w6 = ((float)((b2 >> 2) & 0x07) - 4.0f) * s;
-        float w7 = ((float)((b2 >> 5) & 0x07) - 4.0f) * s;
-
-        res[i * 4 + 0].x = __float2bfloat16(w0);
-        res[i * 4 + 0].y = __float2bfloat16(w1);
-        res[i * 4 + 1].x = __float2bfloat16(w2);
-        res[i * 4 + 1].y = __float2bfloat16(w3);
-        res[i * 4 + 2].x = __float2bfloat16(w4);
-        res[i * 4 + 2].y = __float2bfloat16(w5);
-        res[i * 4 + 3].x = __float2bfloat16(w6);
-        res[i * 4 + 3].y = __float2bfloat16(w7);
+    // Threads 0..23 in warp load 24 uint32_t words = 96 bytes (8 blocks * 12 bytes)
+    // 96-byte aligned, perfectly coalesced memory load
+    uint32_t p = 0;
+    if (lane < cur_blocks * 3) {
+        const uint32_t* p32_ptr = reinterpret_cast<const uint32_t*>(weight + (size_t)warp_start_block * 12);
+        p = p32_ptr[lane];
     }
 
-    uint4* out_u4 = reinterpret_cast<uint4*>(out + (size_t)block_idx * 32);
-    #pragma unroll
-    for (int j = 0; j < 4; j++) {
-        out_u4[j] = *reinterpret_cast<const uint4*>(&res[j * 4]);
+    // Threads 0..7 in warp load 8 scale values (16 bytes, 16-byte aligned)
+    float s = 0.0f;
+    if (lane < cur_blocks) {
+        s = __bfloat162float(scale[warp_start_block + lane]);
+    }
+
+    int b = lane >> 2; // block 0..7
+    int i = lane & 3;  // sub-block 0..3 (8 weights)
+
+    // 1-cycle register warp shuffles to broadcast block b's packed integers and scale
+    uint32_t p0 = __shfl_sync(0xFFFFFFFF, p, b * 3 + 0);
+    uint32_t p1 = __shfl_sync(0xFFFFFFFF, p, b * 3 + 1);
+    uint32_t p2 = __shfl_sync(0xFFFFFFFF, p, b * 3 + 2);
+    float s_val = __shfl_sync(0xFFFFFFFF, s, b);
+
+    uint32_t b0, b1, b2;
+    if (i == 0) {
+        b0 = p0 & 0xFF;
+        b1 = (p0 >> 8) & 0xFF;
+        b2 = (p0 >> 16) & 0xFF;
+    } else if (i == 1) {
+        b0 = (p0 >> 24) & 0xFF;
+        b1 = p1 & 0xFF;
+        b2 = (p1 >> 8) & 0xFF;
+    } else if (i == 2) {
+        b0 = (p1 >> 16) & 0xFF;
+        b1 = (p1 >> 24) & 0xFF;
+        b2 = p2 & 0xFF;
+    } else {
+        b0 = (p2 >> 8) & 0xFF;
+        b1 = (p2 >> 16) & 0xFF;
+        b2 = (p2 >> 24) & 0xFF;
+    }
+
+    float w0 = ((float)(b0 & 0x07) - 4.0f) * s_val;
+    float w1 = ((float)((b0 >> 3) & 0x07) - 4.0f) * s_val;
+    float w2 = ((float)(((b0 >> 6) & 0x03) | ((b1 & 0x01) << 2)) - 4.0f) * s_val;
+    float w3 = ((float)((b1 >> 1) & 0x07) - 4.0f) * s_val;
+    float w4 = ((float)((b1 >> 4) & 0x07) - 4.0f) * s_val;
+    float w5 = ((float)(((b1 >> 7) & 0x01) | ((b2 & 0x03) << 1)) - 4.0f) * s_val;
+    float w6 = ((float)((b2 >> 2) & 0x07) - 4.0f) * s_val;
+    float w7 = ((float)((b2 >> 5) & 0x07) - 4.0f) * s_val;
+
+    __nv_bfloat162 res[4];
+    res[0].x = __float2bfloat16(w0);
+    res[0].y = __float2bfloat16(w1);
+    res[1].x = __float2bfloat16(w2);
+    res[1].y = __float2bfloat16(w3);
+    res[2].x = __float2bfloat16(w4);
+    res[2].y = __float2bfloat16(w5);
+    res[3].x = __float2bfloat16(w6);
+    res[3].y = __float2bfloat16(w7);
+
+    // 100% coalesced 16-byte write per thread -> contiguous 512 bytes per warp
+    if (b < cur_blocks) {
+        uint4* out_u4 = reinterpret_cast<uint4*>(out + (size_t)warp_start_block * 32);
+        out_u4[lane] = *reinterpret_cast<const uint4*>(&res[0]);
     }
 }
 
@@ -2089,7 +2134,8 @@ void dequant_int3_block_cuda(
     int blocks_per_row = K / 32;
     int total_blocks = N * blocks_per_row;
     int threads = 256;
-    int blocks = (total_blocks + threads - 1) / threads;
+    int total_warps = (total_blocks + 7) / 8;
+    int blocks = (total_warps + (threads / 32) - 1) / (threads / 32);
     dequant_int3_block_kernel<<<blocks, threads, 0, stream>>>(out, weight, scale, total_blocks);
 }
 
@@ -2425,8 +2471,12 @@ void gemm_int3_batch_cuda(
     dim3 blocks((N + 1) / 2);
     if (M <= 4) {
         gemm_int3_batch_kernel<__nv_bfloat16, 4><<<blocks, threads, 0, stream>>>(out, A, weight, scale, N, K, M);
-    } else {
+    } else if (M <= 8) {
         gemm_int3_batch_kernel<__nv_bfloat16, 8><<<blocks, threads, 0, stream>>>(out, A, weight, scale, N, K, M);
+    } else if (M <= 16) {
+        gemm_int3_batch_kernel<__nv_bfloat16, 16><<<blocks, threads, 0, stream>>>(out, A, weight, scale, N, K, M);
+    } else {
+        gemm_int3_batch_kernel<__nv_bfloat16, 32><<<blocks, threads, 0, stream>>>(out, A, weight, scale, N, K, M);
     }
 }
 
@@ -2637,8 +2687,14 @@ void gemm_int3_swiglu_fused_batch_cuda(
     if (M <= 4) {
         gemm_int3_swiglu_fused_batch_kernel<4><<<blocks, threads, 0, stream>>>(
             out, A, gate_weight, gate_scale, up_weight, up_scale, N, K, M, swiglu_limit);
-    } else {
+    } else if (M <= 8) {
         gemm_int3_swiglu_fused_batch_kernel<8><<<blocks, threads, 0, stream>>>(
+            out, A, gate_weight, gate_scale, up_weight, up_scale, N, K, M, swiglu_limit);
+    } else if (M <= 16) {
+        gemm_int3_swiglu_fused_batch_kernel<16><<<blocks, threads, 0, stream>>>(
+            out, A, gate_weight, gate_scale, up_weight, up_scale, N, K, M, swiglu_limit);
+    } else {
+        gemm_int3_swiglu_fused_batch_kernel<32><<<blocks, threads, 0, stream>>>(
             out, A, gate_weight, gate_scale, up_weight, up_scale, N, K, M, swiglu_limit);
     }
 }
@@ -2904,8 +2960,12 @@ void gemm_int4_batch_cuda(
     dim3 blocks((N + 1) / 2);
     if (M <= 4) {
         gemm_int4_batch_kernel<__nv_bfloat16, 4><<<blocks, threads, 0, stream>>>(out, A, weight, scale, N, K, M);
-    } else {
+    } else if (M <= 8) {
         gemm_int4_batch_kernel<__nv_bfloat16, 8><<<blocks, threads, 0, stream>>>(out, A, weight, scale, N, K, M);
+    } else if (M <= 16) {
+        gemm_int4_batch_kernel<__nv_bfloat16, 16><<<blocks, threads, 0, stream>>>(out, A, weight, scale, N, K, M);
+    } else {
+        gemm_int4_batch_kernel<__nv_bfloat16, 32><<<blocks, threads, 0, stream>>>(out, A, weight, scale, N, K, M);
     }
 }
 
@@ -2934,8 +2994,12 @@ void gemm_int4_f32_batch_cuda(
     dim3 blocks((N + 1) / 2);
     if (M <= 4) {
         gemm_int4_batch_kernel<float, 4><<<blocks, threads, 0, stream>>>(out, A, weight, scale, N, K, M);
-    } else {
+    } else if (M <= 8) {
         gemm_int4_batch_kernel<float, 8><<<blocks, threads, 0, stream>>>(out, A, weight, scale, N, K, M);
+    } else if (M <= 16) {
+        gemm_int4_batch_kernel<float, 16><<<blocks, threads, 0, stream>>>(out, A, weight, scale, N, K, M);
+    } else {
+        gemm_int4_batch_kernel<float, 32><<<blocks, threads, 0, stream>>>(out, A, weight, scale, N, K, M);
     }
 }
 
@@ -3083,7 +3147,7 @@ void gemv_fp4_f32_cuda(
 //  Batched FP4 GEMM Kernel for M tokens (M <= 8, Block Size = 32, 128-bit)
 // ════════════════════════════════════════════════════════════════════════════════
 template <typename TOut = __nv_bfloat16, bool ACCUM_RESIDUAL = false, int MAX_M = 4>
-__global__ void __launch_bounds__(256, 3) gemm_fp4_batch_kernel(
+__global__ void __launch_bounds__(256, 1) gemm_fp4_batch_kernel(
     TOut* __restrict__ out,              // [M, N]
     const __nv_bfloat16* __restrict__ A, // [M, K]
     const uint8_t* __restrict__ weight,  // [N, K/2]
@@ -3217,8 +3281,12 @@ void gemm_fp4_batch_cuda(
         gemm_fp4_batch_kernel<__nv_bfloat16, false, 5><<<blocks, threads, 0, stream>>>(out, A, weight, scale, N, K, M);
     } else if (M == 6) {
         gemm_fp4_batch_kernel<__nv_bfloat16, false, 6><<<blocks, threads, 0, stream>>>(out, A, weight, scale, N, K, M);
-    } else {
+    } else if (M <= 8) {
         gemm_fp4_batch_kernel<__nv_bfloat16, false, 8><<<blocks, threads, 0, stream>>>(out, A, weight, scale, N, K, M);
+    } else if (M <= 16) {
+        gemm_fp4_batch_kernel<__nv_bfloat16, false, 16><<<blocks, threads, 0, stream>>>(out, A, weight, scale, N, K, M);
+    } else {
+        gemm_fp4_batch_kernel<__nv_bfloat16, false, 32><<<blocks, threads, 0, stream>>>(out, A, weight, scale, N, K, M);
     }
 }
 
@@ -3242,8 +3310,12 @@ void gemm_fp4_residual_batch_cuda(
         gemm_fp4_batch_kernel<__nv_bfloat16, true, 5><<<blocks, threads, 0, stream>>>(inout, A, weight, scale, N, K, M);
     } else if (M == 6) {
         gemm_fp4_batch_kernel<__nv_bfloat16, true, 6><<<blocks, threads, 0, stream>>>(inout, A, weight, scale, N, K, M);
-    } else {
+    } else if (M <= 8) {
         gemm_fp4_batch_kernel<__nv_bfloat16, true, 8><<<blocks, threads, 0, stream>>>(inout, A, weight, scale, N, K, M);
+    } else if (M <= 16) {
+        gemm_fp4_batch_kernel<__nv_bfloat16, true, 16><<<blocks, threads, 0, stream>>>(inout, A, weight, scale, N, K, M);
+    } else {
+        gemm_fp4_batch_kernel<__nv_bfloat16, true, 32><<<blocks, threads, 0, stream>>>(inout, A, weight, scale, N, K, M);
     }
 }
 
@@ -3267,8 +3339,12 @@ void gemm_fp4_f32_batch_cuda(
         gemm_fp4_batch_kernel<float, false, 5><<<blocks, threads, 0, stream>>>(out, A, weight, scale, N, K, M);
     } else if (M == 6) {
         gemm_fp4_batch_kernel<float, false, 6><<<blocks, threads, 0, stream>>>(out, A, weight, scale, N, K, M);
-    } else {
+    } else if (M <= 8) {
         gemm_fp4_batch_kernel<float, false, 8><<<blocks, threads, 0, stream>>>(out, A, weight, scale, N, K, M);
+    } else if (M <= 16) {
+        gemm_fp4_batch_kernel<float, false, 16><<<blocks, threads, 0, stream>>>(out, A, weight, scale, N, K, M);
+    } else {
+        gemm_fp4_batch_kernel<float, false, 32><<<blocks, threads, 0, stream>>>(out, A, weight, scale, N, K, M);
     }
 }
 
@@ -3281,47 +3357,62 @@ __global__ void dequant_int4_block_kernel(
     const __nv_bfloat16* __restrict__ scale, // [N, K/32] BF16
     int total_blocks)
 {
-    int block_idx = blockIdx.x * blockDim.x + threadIdx.x;
-    if (block_idx >= total_blocks) return;
+    int warp_id = (blockIdx.x * (blockDim.x / 32)) + (threadIdx.x / 32);
+    int lane = threadIdx.x & 31;
+    int warp_start_block = warp_id * 8;
+    if (warp_start_block >= total_blocks) return;
 
-    // Each block represents 32 INT4 weights (16 bytes packed) with 1 BF16 scale
-    float s = __bfloat162float(scale[block_idx]);
-    uint4 w_val = reinterpret_cast<const uint4*>(weight)[block_idx];
+    int cur_blocks = min(8, total_blocks - warp_start_block);
 
-    uint32_t w_arr[4] = {w_val.x, w_val.y, w_val.z, w_val.w};
-    __nv_bfloat162 res[16];
-
-    #pragma unroll
-    for (int i = 0; i < 4; i++) {
-        uint32_t chunk = w_arr[i];
-        uint32_t b0 = chunk & 0xFF;
-        uint32_t b1 = (chunk >> 8) & 0xFF;
-        uint32_t b2 = (chunk >> 16) & 0xFF;
-        uint32_t b3 = (chunk >> 24) & 0xFF;
-
-        float w0 = ((float)(b0 & 0x0F) - 8.0f) * s;
-        float w1 = ((float)(b0 >> 4) - 8.0f) * s;
-        float w2 = ((float)(b1 & 0x0F) - 8.0f) * s;
-        float w3 = ((float)(b1 >> 4) - 8.0f) * s;
-        float w4 = ((float)(b2 & 0x0F) - 8.0f) * s;
-        float w5 = ((float)(b2 >> 4) - 8.0f) * s;
-        float w6 = ((float)(b3 & 0x0F) - 8.0f) * s;
-        float w7 = ((float)(b3 >> 4) - 8.0f) * s;
-
-        res[i * 4 + 0].x = __float2bfloat16(w0);
-        res[i * 4 + 0].y = __float2bfloat16(w1);
-        res[i * 4 + 1].x = __float2bfloat16(w2);
-        res[i * 4 + 1].y = __float2bfloat16(w3);
-        res[i * 4 + 2].x = __float2bfloat16(w4);
-        res[i * 4 + 2].y = __float2bfloat16(w5);
-        res[i * 4 + 3].x = __float2bfloat16(w6);
-        res[i * 4 + 3].y = __float2bfloat16(w7);
+    // Threads 0..31 in warp load 32 uint32_t words = 128 bytes (8 blocks * 16 bytes)
+    // 100% coalesced 128-byte load across all 32 lanes
+    uint32_t w = 0;
+    if (lane < cur_blocks * 4) {
+        const uint32_t* w32_ptr = reinterpret_cast<const uint32_t*>(weight + (size_t)warp_start_block * 16);
+        w = w32_ptr[lane];
     }
 
-    uint4* out_u4 = reinterpret_cast<uint4*>(out + (size_t)block_idx * 32);
-    #pragma unroll
-    for (int j = 0; j < 4; j++) {
-        out_u4[j] = *reinterpret_cast<const uint4*>(&res[j * 4]);
+    // Threads 0..7 in warp load 8 scale values (16 bytes, 16-byte aligned)
+    float s = 0.0f;
+    if (lane < cur_blocks) {
+        s = __bfloat162float(scale[warp_start_block + lane]);
+    }
+
+    int b = lane >> 2; // block 0..7
+    int i = lane & 3;  // sub-block 0..3 (8 weights)
+
+    // 1-cycle register warp shuffles to broadcast block b's chunk and scale
+    uint32_t chunk = __shfl_sync(0xFFFFFFFF, w, b * 4 + i);
+    float s_val = __shfl_sync(0xFFFFFFFF, s, b);
+
+    uint32_t b0 = chunk & 0xFF;
+    uint32_t b1 = (chunk >> 8) & 0xFF;
+    uint32_t b2 = (chunk >> 16) & 0xFF;
+    uint32_t b3 = (chunk >> 24) & 0xFF;
+
+    float w0 = ((float)(b0 & 0x0F) - 8.0f) * s_val;
+    float w1 = ((float)(b0 >> 4) - 8.0f) * s_val;
+    float w2 = ((float)(b1 & 0x0F) - 8.0f) * s_val;
+    float w3 = ((float)(b1 >> 4) - 8.0f) * s_val;
+    float w4 = ((float)(b2 & 0x0F) - 8.0f) * s_val;
+    float w5 = ((float)(b2 >> 4) - 8.0f) * s_val;
+    float w6 = ((float)(b3 & 0x0F) - 8.0f) * s_val;
+    float w7 = ((float)(b3 >> 4) - 8.0f) * s_val;
+
+    __nv_bfloat162 res[4];
+    res[0].x = __float2bfloat16(w0);
+    res[0].y = __float2bfloat16(w1);
+    res[1].x = __float2bfloat16(w2);
+    res[1].y = __float2bfloat16(w3);
+    res[2].x = __float2bfloat16(w4);
+    res[2].y = __float2bfloat16(w5);
+    res[3].x = __float2bfloat16(w6);
+    res[3].y = __float2bfloat16(w7);
+
+    // 100% coalesced 16-byte write per thread -> contiguous 512 bytes per warp
+    if (b < cur_blocks) {
+        uint4* out_u4 = reinterpret_cast<uint4*>(out + (size_t)warp_start_block * 32);
+        out_u4[lane] = *reinterpret_cast<const uint4*>(&res[0]);
     }
 }
 
@@ -3336,7 +3427,8 @@ void dequant_int4_block_cuda(
     int blocks_per_row = K / 32;
     int total_blocks = N * blocks_per_row;
     int threads = 256;
-    int blocks = (total_blocks + threads - 1) / threads;
+    int total_warps = (total_blocks + 7) / 8;
+    int blocks = (total_warps + (threads / 32) - 1) / (threads / 32);
     dequant_int4_block_kernel<<<blocks, threads, 0, stream>>>(out, weight, scale, total_blocks);
 }
 
@@ -4032,8 +4124,14 @@ void gemm_int4_swiglu_fused_batch_cuda(
     if (M <= 4) {
         gemm_int4_swiglu_fused_batch_kernel<4><<<blocks, threads, 0, stream>>>(
             out, A, gate_weight, gate_scale, up_weight, up_scale, N, K, M, swiglu_limit);
-    } else {
+    } else if (M <= 8) {
         gemm_int4_swiglu_fused_batch_kernel<8><<<blocks, threads, 0, stream>>>(
+            out, A, gate_weight, gate_scale, up_weight, up_scale, N, K, M, swiglu_limit);
+    } else if (M <= 16) {
+        gemm_int4_swiglu_fused_batch_kernel<16><<<blocks, threads, 0, stream>>>(
+            out, A, gate_weight, gate_scale, up_weight, up_scale, N, K, M, swiglu_limit);
+    } else {
+        gemm_int4_swiglu_fused_batch_kernel<32><<<blocks, threads, 0, stream>>>(
             out, A, gate_weight, gate_scale, up_weight, up_scale, N, K, M, swiglu_limit);
     }
 }
@@ -4188,7 +4286,7 @@ void gemv_fp4_swiglu_fused_cuda(
 }
 
 template <int MAX_M = 4>
-__global__ void __launch_bounds__(256, 3) gemm_fp4_swiglu_fused_batch_kernel(
+__global__ void __launch_bounds__(256, 1) gemm_fp4_swiglu_fused_batch_kernel(
     __nv_bfloat16* __restrict__ out,              // [M, N]
     const __nv_bfloat16* __restrict__ A,          // [M, K]
     const uint8_t* __restrict__ gate_weight,
@@ -4358,8 +4456,14 @@ void gemm_fp4_swiglu_fused_batch_cuda(
     } else if (M == 6) {
         gemm_fp4_swiglu_fused_batch_kernel<6><<<blocks, threads, 0, stream>>>(
             out, A, gate_weight, gate_scale, up_weight, up_scale, N, K, M, swiglu_limit);
-    } else {
+    } else if (M <= 8) {
         gemm_fp4_swiglu_fused_batch_kernel<8><<<blocks, threads, 0, stream>>>(
+            out, A, gate_weight, gate_scale, up_weight, up_scale, N, K, M, swiglu_limit);
+    } else if (M <= 16) {
+        gemm_fp4_swiglu_fused_batch_kernel<16><<<blocks, threads, 0, stream>>>(
+            out, A, gate_weight, gate_scale, up_weight, up_scale, N, K, M, swiglu_limit);
+    } else {
+        gemm_fp4_swiglu_fused_batch_kernel<32><<<blocks, threads, 0, stream>>>(
             out, A, gate_weight, gate_scale, up_weight, up_scale, N, K, M, swiglu_limit);
     }
 }
@@ -9046,11 +9150,11 @@ __global__ void deltanet_ssm_batch_kernel(
     __shared__ float s_k[128];
     __shared__ float s_v[128];
     __shared__ float s_z[128];
-    __shared__ float s_kv_mem[128];
-    __shared__ float s_out[128];
-    __shared__ float s_q_norm_sq;
-    __shared__ float s_k_norm_sq;
-    __shared__ float s_out_norm_sq;
+    __shared__ float s_warp_q[4];
+    __shared__ float s_warp_k[4];
+    __shared__ float s_warp_out[4];
+    __shared__ float s_beta;
+    __shared__ float s_decay;
 
     const __nv_bfloat16* in_state_h = in_ssm_state + (size_t)h * head_dim * head_dim;
 
@@ -9077,75 +9181,66 @@ __global__ void deltanet_ssm_batch_kernel(
         const __nv_bfloat16* m_a = in_a + (size_t)m * num_v_heads;
         const __nv_bfloat16* m_b = in_b + (size_t)m * num_v_heads;
 
-        float a_val = __bfloat162float(m_a[h]);
-        float b_val = __bfloat162float(m_b[h]);
-        float beta = 1.0f / (1.0f + __expf(-b_val));
-        float val_a = a_val + dt_val;
-        float softplus_a = (val_a > 20.0f) ? val_a : log1pf(__expf(val_a));
-        float g = -__expf(a_log_val) * softplus_a;
-        float decay = __expf(g);
-
-        if (tid < head_dim) {
-            s_q[tid] = __bfloat162float(m_conv[q_offset + tid]);
-            s_k[tid] = __bfloat162float(m_conv[k_offset + tid]);
-            s_v[tid] = __bfloat162float(m_conv[v_offset + tid]);
-            s_z[tid] = __bfloat162float(m_z[h * head_dim + tid]);
-        }
         if (tid == 0) {
-            s_q_norm_sq = 0.0f;
-            s_k_norm_sq = 0.0f;
-            s_out_norm_sq = 0.0f;
+            float a_val = __bfloat162float(m_a[h]);
+            float b_val = __bfloat162float(m_b[h]);
+            s_beta = 1.0f / (1.0f + __expf(-b_val));
+            float val_a = a_val + dt_val;
+            float softplus_a = (val_a > 20.0f) ? val_a : log1pf(__expf(val_a));
+            float g = -__expf(a_log_val) * softplus_a;
+            s_decay = __expf(g);
         }
-        __syncthreads();
 
-        // 1. L2 Normalize Q and K
-        float q_sq = (tid < head_dim) ? (s_q[tid] * s_q[tid]) : 0.0f;
-        float k_sq = (tid < head_dim) ? (s_k[tid] * s_k[tid]) : 0.0f;
+        // Direct register load and norm calculation (0 intermediate shared memory, eliminates 2 barriers)
+        float q_val = (tid < head_dim) ? __bfloat162float(m_conv[q_offset + tid]) : 0.0f;
+        float k_val = (tid < head_dim) ? __bfloat162float(m_conv[k_offset + tid]) : 0.0f;
+        float v_val = (tid < head_dim) ? __bfloat162float(m_conv[v_offset + tid]) : 0.0f;
+        float z_val = (tid < head_dim) ? __bfloat162float(m_z[h * head_dim + tid]) : 0.0f;
+
+        float q_sq = q_val * q_val;
+        float k_sq = k_val * k_val;
         for (int offset = 16; offset > 0; offset /= 2) {
             q_sq += __shfl_down_sync(0xFFFFFFFF, q_sq, offset);
             k_sq += __shfl_down_sync(0xFFFFFFFF, k_sq, offset);
         }
-        if (tid % 32 == 0) {
-            atomicAdd(&s_q_norm_sq, q_sq);
-            atomicAdd(&s_k_norm_sq, k_sq);
+        if ((tid & 31) == 0) {
+            s_warp_q[tid >> 5] = q_sq;
+            s_warp_k[tid >> 5] = k_sq;
         }
         __syncthreads();
 
         if (tid < head_dim) {
-            float r_q = rsqrtf(s_q_norm_sq + 1e-6f) * (1.0f / sqrtf((float)head_dim));
-            float r_k = rsqrtf(s_k_norm_sq + 1e-6f);
-            s_q[tid] *= r_q;
-            s_k[tid] *= r_k;
+            float q_norm_sq = s_warp_q[0] + s_warp_q[1] + s_warp_q[2] + s_warp_q[3];
+            float k_norm_sq = s_warp_k[0] + s_warp_k[1] + s_warp_k[2] + s_warp_k[3];
+            float r_q = rsqrtf(q_norm_sq + 1e-6f) * (1.0f / sqrtf((float)head_dim));
+            float r_k = rsqrtf(k_norm_sq + 1e-6f);
+            s_q[tid] = q_val * r_q;
+            s_k[tid] = k_val * r_k;
+            s_v[tid] = v_val;
+            s_z[tid] = z_val;
         }
         __syncthreads();
 
-        // 2. Compute kv_mem[col] from shared memory state (cached in registers)
-        float col_s[128];
+        // 2 & 3. Factored decay and fused state update directly producing out_c in register
+        float decay = s_decay;
+        float beta = s_beta;
+        float out_c = 0.0f;
         if (tid < head_dim) {
-            float mem = 0.0f;
-            #pragma unroll 4
+            float dot_k = 0.0f;
+            #pragma unroll 16
+            for (int r = 0; r < head_dim; r++) {
+                dot_k = fmaf(__bfloat162float(s_state[r][tid]), s_k[r], dot_k);
+            }
+            float mem = dot_k * decay;
+            float delta_c = (s_v[tid] - mem) * beta;
+            #pragma unroll 16
             for (int r = 0; r < head_dim; r++) {
                 float s_val = __bfloat162float(s_state[r][tid]);
-                col_s[r] = s_val;
-                mem += (decay * s_val) * s_k[r];
-            }
-            s_kv_mem[tid] = mem;
-        }
-        __syncthreads();
-
-        // 3. State delta update in shared memory
-        if (tid < head_dim) {
-            float delta_c = (s_v[tid] - s_kv_mem[tid]) * beta;
-            float out_c = 0.0f;
-            #pragma unroll 4
-            for (int r = 0; r < head_dim; r++) {
-                float new_s = decay * col_s[r] + s_k[r] * delta_c;
+                float new_s = fmaf(s_k[r], delta_c, decay * s_val);
                 s_state[r][tid] = __float2bfloat16(new_s);
-                out_c += new_s * s_q[r];
+                out_c = fmaf(new_s, s_q[r], out_c);
             }
-            s_out[tid] = out_c;
         }
-        __syncthreads();
 
         // Save intermediate state slot if needed for rollback
         if (m == 0 && slot_ssm_0) {
@@ -9174,17 +9269,20 @@ __global__ void deltanet_ssm_batch_kernel(
             }
         }
 
-        // 4. Output RMSNorm + Z-gating
-        float out_sq = (tid < head_dim) ? (s_out[tid] * s_out[tid]) : 0.0f;
+        // 4. Output RMSNorm + Z-gating from register out_c (zero s_out shared memory, eliminates 1 barrier)
+        float out_sq = (tid < head_dim) ? (out_c * out_c) : 0.0f;
         for (int offset = 16; offset > 0; offset /= 2) {
             out_sq += __shfl_down_sync(0xFFFFFFFF, out_sq, offset);
         }
-        if (tid % 32 == 0) atomicAdd(&s_out_norm_sq, out_sq);
+        if ((tid & 31) == 0) {
+            s_warp_out[tid >> 5] = out_sq;
+        }
         __syncthreads();
 
-        float r_out = rsqrtf(s_out_norm_sq / (float)head_dim + 1e-6f);
         if (tid < head_dim) {
-            float normed = s_out[tid] * r_out * nw_val;
+            float out_norm_sq = s_warp_out[0] + s_warp_out[1] + s_warp_out[2] + s_warp_out[3];
+            float r_out = rsqrtf(out_norm_sq / (float)head_dim + 1e-6f);
+            float normed = out_c * r_out * nw_val;
             float z = s_z[tid];
             float silu_z = z / (1.0f + __expf(-z));
             out[(size_t)m * z_stride + h * head_dim + tid] = __float2bfloat16(normed * silu_z);
@@ -11179,6 +11277,219 @@ void gemv_mixed_moe_down_batch_cuda(
     gemv_mixed_moe_down_batch_kernel<<<blocks, threads, 0, stream>>>(
         down_buf, gate_buf, topk_ids, flat_expert_ptrs, expert_type_map,
         layer_id, n_experts, w2_cold_offset, N, K);
+}
+
+// ════════════════════════════════════════════════════════════════════════════════
+//  Blackwell sm_120a Native FP8 Tensor Core Accelerators
+// ════════════════════════════════════════════════════════════════════════════════
+
+__global__ void quantize_bf16_to_fp8_e4m3_kernel(
+    uint8_t* __restrict__ out,
+    const __nv_bfloat16* __restrict__ in,
+    int total_elements)
+{
+    int idx = (blockIdx.x * blockDim.x + threadIdx.x) * 8;
+    if (idx >= total_elements) return;
+
+    int remaining = total_elements - idx;
+    if (remaining >= 8) {
+        const uint4* in_u4 = reinterpret_cast<const uint4*>(in + idx);
+        uint4 raw = *in_u4;
+        const __nv_bfloat16* bf = reinterpret_cast<const __nv_bfloat16*>(&raw);
+
+        __nv_fp8_e4m3 fp8_vals[8];
+        #pragma unroll
+        for (int i = 0; i < 8; i++) {
+            fp8_vals[i] = __nv_fp8_e4m3(bf[i]);
+        }
+
+        uint64_t* out_u64 = reinterpret_cast<uint64_t*>(out + idx);
+        *out_u64 = *reinterpret_cast<const uint64_t*>(&fp8_vals[0]);
+    } else {
+        for (int i = 0; i < remaining; i++) {
+            out[idx + i] = (uint8_t)__nv_fp8_e4m3(in[idx + i]);
+        }
+    }
+}
+
+void quantize_bf16_to_fp8_e4m3_cuda(
+    uint8_t* out,
+    const __nv_bfloat16* in,
+    int total_elements,
+    cudaStream_t stream)
+{
+    int threads = 256;
+    int blocks = (total_elements / 8 + threads - 1) / threads;
+    if (blocks == 0 && total_elements > 0) blocks = 1;
+    quantize_bf16_to_fp8_e4m3_kernel<<<blocks, threads, 0, stream>>>(out, in, total_elements);
+}
+
+__global__ void dequant_int4_to_fp8_block_kernel(
+    uint8_t* __restrict__ out,               // [N, K] FP8
+    const uint8_t* __restrict__ weight,      // [N, K/2] packed INT4
+    const __nv_bfloat16* __restrict__ scale, // [N, K/32] BF16
+    int total_blocks)
+{
+    int warp_id = (blockIdx.x * (blockDim.x / 32)) + (threadIdx.x / 32);
+    int lane = threadIdx.x & 31;
+    int warp_start_block = warp_id * 8;
+    if (warp_start_block >= total_blocks) return;
+
+    int cur_blocks = min(8, total_blocks - warp_start_block);
+
+    uint32_t w = 0;
+    if (lane < cur_blocks * 4) {
+        const uint32_t* w32_ptr = reinterpret_cast<const uint32_t*>(weight + (size_t)warp_start_block * 16);
+        w = w32_ptr[lane];
+    }
+
+    float s = 0.0f;
+    if (lane < cur_blocks) {
+        s = __bfloat162float(scale[warp_start_block + lane]);
+    }
+
+    int b = lane >> 2; // block 0..7
+    int i = lane & 3;  // sub-block 0..3 (8 weights)
+
+    uint32_t chunk = __shfl_sync(0xFFFFFFFF, w, b * 4 + i);
+    float s_val = __shfl_sync(0xFFFFFFFF, s, b);
+
+    uint32_t b0 = chunk & 0xFF;
+    uint32_t b1 = (chunk >> 8) & 0xFF;
+    uint32_t b2 = (chunk >> 16) & 0xFF;
+    uint32_t b3 = (chunk >> 24) & 0xFF;
+
+    float w0 = ((float)(b0 & 0x0F) - 8.0f) * s_val;
+    float w1 = ((float)(b0 >> 4) - 8.0f) * s_val;
+    float w2 = ((float)(b1 & 0x0F) - 8.0f) * s_val;
+    float w3 = ((float)(b1 >> 4) - 8.0f) * s_val;
+    float w4 = ((float)(b2 & 0x0F) - 8.0f) * s_val;
+    float w5 = ((float)(b2 >> 4) - 8.0f) * s_val;
+    float w6 = ((float)(b3 & 0x0F) - 8.0f) * s_val;
+    float w7 = ((float)(b3 >> 4) - 8.0f) * s_val;
+
+    __nv_fp8_e4m3 fp8_vals[8];
+    fp8_vals[0] = __nv_fp8_e4m3(w0);
+    fp8_vals[1] = __nv_fp8_e4m3(w1);
+    fp8_vals[2] = __nv_fp8_e4m3(w2);
+    fp8_vals[3] = __nv_fp8_e4m3(w3);
+    fp8_vals[4] = __nv_fp8_e4m3(w4);
+    fp8_vals[5] = __nv_fp8_e4m3(w5);
+    fp8_vals[6] = __nv_fp8_e4m3(w6);
+    fp8_vals[7] = __nv_fp8_e4m3(w7);
+
+    if (b < cur_blocks) {
+        uint64_t* out_u64 = reinterpret_cast<uint64_t*>(out + (size_t)warp_start_block * 32);
+        out_u64[lane] = *reinterpret_cast<const uint64_t*>(&fp8_vals[0]);
+    }
+}
+
+void dequant_int4_to_fp8_block_cuda(
+    uint8_t* out,
+    const uint8_t* weight,
+    const __nv_bfloat16* scale,
+    int N, int K,
+    int block_size,
+    cudaStream_t stream)
+{
+    int blocks_per_row = K / 32;
+    int total_blocks = N * blocks_per_row;
+    int threads = 256;
+    int total_warps = (total_blocks + 7) / 8;
+    int blocks = (total_warps + (threads / 32) - 1) / (threads / 32);
+    dequant_int4_to_fp8_block_kernel<<<blocks, threads, 0, stream>>>(out, weight, scale, total_blocks);
+}
+
+__global__ void dequant_int3_to_fp8_block_kernel(
+    uint8_t* __restrict__ out,               // [N, K] FP8
+    const uint8_t* __restrict__ weight,      // packed INT3 (12 bytes per block)
+    const __nv_bfloat16* __restrict__ scale, // [N, K/32] BF16
+    int total_blocks)
+{
+    int warp_id = (blockIdx.x * (blockDim.x / 32)) + (threadIdx.x / 32);
+    int lane = threadIdx.x & 31;
+    int warp_start_block = warp_id * 8;
+    if (warp_start_block >= total_blocks) return;
+
+    int cur_blocks = min(8, total_blocks - warp_start_block);
+
+    uint32_t p = 0;
+    if (lane < cur_blocks * 3) {
+        const uint32_t* p32_ptr = reinterpret_cast<const uint32_t*>(weight + (size_t)warp_start_block * 12);
+        p = p32_ptr[lane];
+    }
+
+    float s = 0.0f;
+    if (lane < cur_blocks) {
+        s = __bfloat162float(scale[warp_start_block + lane]);
+    }
+
+    int b = lane >> 2;
+    int i = lane & 3;
+
+    uint32_t p0 = __shfl_sync(0xFFFFFFFF, p, b * 3 + 0);
+    uint32_t p1 = __shfl_sync(0xFFFFFFFF, p, b * 3 + 1);
+    uint32_t p2 = __shfl_sync(0xFFFFFFFF, p, b * 3 + 2);
+    float s_val = __shfl_sync(0xFFFFFFFF, s, b);
+
+    uint32_t b0, b1, b2;
+    if (i == 0) {
+        b0 = p0 & 0xFF;
+        b1 = (p0 >> 8) & 0xFF;
+        b2 = (p0 >> 16) & 0xFF;
+    } else if (i == 1) {
+        b0 = (p0 >> 24) & 0xFF;
+        b1 = p1 & 0xFF;
+        b2 = (p1 >> 8) & 0xFF;
+    } else if (i == 2) {
+        b0 = (p1 >> 16) & 0xFF;
+        b1 = (p1 >> 24) & 0xFF;
+        b2 = p2 & 0xFF;
+    } else {
+        b0 = (p2 >> 8) & 0xFF;
+        b1 = (p2 >> 16) & 0xFF;
+        b2 = (p2 >> 24) & 0xFF;
+    }
+
+    float w0 = ((float)(b0 & 0x07) - 4.0f) * s_val;
+    float w1 = ((float)((b0 >> 3) & 0x07) - 4.0f) * s_val;
+    float w2 = ((float)(((b0 >> 6) & 0x03) | ((b1 & 0x01) << 2)) - 4.0f) * s_val;
+    float w3 = ((float)((b1 >> 1) & 0x07) - 4.0f) * s_val;
+    float w4 = ((float)((b1 >> 4) & 0x07) - 4.0f) * s_val;
+    float w5 = ((float)(((b1 >> 7) & 0x01) | ((b2 & 0x03) << 1)) - 4.0f) * s_val;
+    float w6 = ((float)((b2 >> 2) & 0x07) - 4.0f) * s_val;
+    float w7 = ((float)((b2 >> 5) & 0x07) - 4.0f) * s_val;
+
+    __nv_fp8_e4m3 fp8_vals[8];
+    fp8_vals[0] = __nv_fp8_e4m3(w0);
+    fp8_vals[1] = __nv_fp8_e4m3(w1);
+    fp8_vals[2] = __nv_fp8_e4m3(w2);
+    fp8_vals[3] = __nv_fp8_e4m3(w3);
+    fp8_vals[4] = __nv_fp8_e4m3(w4);
+    fp8_vals[5] = __nv_fp8_e4m3(w5);
+    fp8_vals[6] = __nv_fp8_e4m3(w6);
+    fp8_vals[7] = __nv_fp8_e4m3(w7);
+
+    if (b < cur_blocks) {
+        uint64_t* out_u64 = reinterpret_cast<uint64_t*>(out + (size_t)warp_start_block * 32);
+        out_u64[lane] = *reinterpret_cast<const uint64_t*>(&fp8_vals[0]);
+    }
+}
+
+void dequant_int3_to_fp8_block_cuda(
+    uint8_t* out,
+    const uint8_t* weight,
+    const __nv_bfloat16* scale,
+    int N, int K,
+    int block_size,
+    cudaStream_t stream)
+{
+    int blocks_per_row = K / 32;
+    int total_blocks = N * blocks_per_row;
+    int threads = 256;
+    int total_warps = (total_blocks + 7) / 8;
+    int blocks = (total_warps + (threads / 32) - 1) / (threads / 32);
+    dequant_int3_to_fp8_block_kernel<<<blocks, threads, 0, stream>>>(out, weight, scale, total_blocks);
 }
 
 

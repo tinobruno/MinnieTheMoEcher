@@ -207,6 +207,16 @@ body {
     color: var(--text-primary);
     font-family: var(--font-primary);
 }
+.stat-sub {
+    font-size: 0.65rem;
+    color: var(--text-tertiary, #888);
+    white-space: nowrap;
+    overflow: hidden;
+    text-overflow: ellipsis;
+    line-height: 1.1;
+    display: block;
+    margin-top: 1px;
+}
 
 .setting-item {
     display: flex;

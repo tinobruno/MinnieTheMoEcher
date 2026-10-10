@@ -281,8 +281,8 @@ public:
             }
         }
 
-        // 5. Allocate Reusable Working Scratch Buffers
-        if (!alloc_scratch_buffers()) {
+        // 5. Allocate Persistent Working Buffers (RoPE tables, window indices, output buffer)
+        if (!init_persistent_buffers()) {
             return false;
         }
 
@@ -296,6 +296,12 @@ public:
         if (!is_loaded_) return nullptr;
         cudaStream_t active_stream = stream ? stream : stream_;
         cublasSetStream(cublas_handle_, active_stream);
+
+        // Allocate transient scratch buffers (~265 MB) on-demand for the ViT forward pass
+        if (!alloc_scratch_buffers()) {
+            std::cerr << "[Vision] Error: Failed to allocate on-demand ViT scratch buffers!" << std::endl;
+            return nullptr;
+        }
 
         // 1. Copy host normalized image to GPU
         size_t img_bytes = img.data.size() * sizeof(float);
@@ -564,6 +570,10 @@ public:
         add_bias_bf16_cuda(
             d_visual_out_, merger_.fc2_b, merged_patches_, output_dim_, active_stream);
 
+        // Synchronize active stream and immediately reclaim ~265 MB scratch buffers for LLM decode
+        cudaStreamSynchronize(active_stream);
+        free_scratch_buffers();
+
         return d_visual_out_;
     }
 
@@ -586,16 +596,47 @@ private:
             CUBLAS_GEMM_DEFAULT);
     }
 
-    bool alloc_scratch_buffers() {
-        size_t img_bytes = (size_t)temporal_size_ * 3 * image_size_ * image_size_ * sizeof(float);
-        if (cudaMalloc(&d_img_norm_, img_bytes) != cudaSuccess) return false;
-        allocated_ptrs_.push_back(d_img_norm_);
+    bool init_persistent_buffers() {
+        if (cudaMalloc(&d_visual_out_, (size_t)merged_patches_ * output_dim_ * sizeof(__nv_bfloat16)) != cudaSuccess) return false;
+        allocated_ptrs_.push_back(d_visual_out_);
 
-        auto alloc_bf16 = [&](__nv_bfloat16*& ptr, size_t elements) -> bool {
-            if (cudaMalloc(&ptr, elements * sizeof(__nv_bfloat16)) != cudaSuccess) return false;
-            allocated_ptrs_.push_back(ptr);
+        if (is_qwen25_) {
+            if (cudaMalloc(&d_window_index_, (size_t)merged_patches_ * sizeof(int)) != cudaSuccess) return false;
+            allocated_ptrs_.push_back(d_window_index_);
+            if (cudaMalloc(&d_reverse_indices_, (size_t)merged_patches_ * sizeof(int)) != cudaSuccess) return false;
+            allocated_ptrs_.push_back(d_reverse_indices_);
+        }
+
+        if (!init_rotary_tables()) {
+            return false;
+        }
+
+        size_t col_mean_bytes = (size_t)(output_dim_ + 256) * sizeof(float);
+        if (cudaMalloc(&d_col_mean_scratch_, col_mean_bytes) != cudaSuccess) return false;
+        allocated_ptrs_.push_back(d_col_mean_scratch_);
+
+        return true;
+    }
+
+    bool alloc_scratch_buffers() {
+        if (!scratch_ptrs_.empty()) return true;
+
+        auto alloc_raw = [&](void*& ptr, size_t bytes) -> bool {
+            if (cudaMalloc(&ptr, bytes) != cudaSuccess) return false;
+            scratch_ptrs_.push_back(ptr);
             return true;
         };
+        auto alloc_bf16 = [&](__nv_bfloat16*& ptr, size_t elements) -> bool {
+            void* raw = nullptr;
+            if (!alloc_raw(raw, elements * sizeof(__nv_bfloat16))) return false;
+            ptr = static_cast<__nv_bfloat16*>(raw);
+            return true;
+        };
+
+        size_t img_bytes = (size_t)temporal_size_ * 3 * image_size_ * image_size_ * sizeof(float);
+        void* raw_img = nullptr;
+        if (!alloc_raw(raw_img, img_bytes)) return false;
+        d_img_norm_ = static_cast<float*>(raw_img);
 
         size_t patch_filter_elems = (size_t)3 * temporal_size_ * patch_size_ * patch_size_;
         if (!alloc_bf16(d_im2col_, (size_t)num_patches_ * patch_filter_elems) ||
@@ -609,8 +650,8 @@ private:
             !alloc_bf16(d_attn_ctx_, (size_t)num_heads_ * num_patches_ * head_dim_) ||
             !alloc_bf16(d_attn_merged_, (size_t)num_patches_ * embed_dim_) ||
             !alloc_bf16(d_attn_proj_, (size_t)num_patches_ * embed_dim_) ||
-            !alloc_bf16(d_merge_in_, (size_t)merged_patches_ * merger_in_dim_) ||
-            !alloc_bf16(d_visual_out_, (size_t)merged_patches_ * output_dim_)) {
+            !alloc_bf16(d_merge_in_, (size_t)merged_patches_ * merger_in_dim_)) {
+            free_scratch_buffers();
             return false;
         }
 
@@ -622,29 +663,49 @@ private:
                 !alloc_bf16(d_mlp0_, (size_t)merged_patches_ * merger_in_dim_) ||
                 !alloc_bf16(d_patches_win_, (size_t)num_patches_ * embed_dim_) ||
                 !alloc_bf16(d_mlp2_out_, (size_t)merged_patches_ * output_dim_)) {
+                free_scratch_buffers();
                 return false;
             }
-            if (cudaMalloc(&d_window_index_, (size_t)merged_patches_ * sizeof(int)) != cudaSuccess) return false;
-            allocated_ptrs_.push_back(d_window_index_);
-            if (cudaMalloc(&d_reverse_indices_, (size_t)merged_patches_ * sizeof(int)) != cudaSuccess) return false;
-            allocated_ptrs_.push_back(d_reverse_indices_);
         } else {
             if (!alloc_bf16(d_mlp_fc1_, (size_t)num_patches_ * mlp_intermediate_) ||
                 !alloc_bf16(d_mlp_fc2_, (size_t)num_patches_ * embed_dim_) ||
                 !alloc_bf16(d_merge_fc1_, (size_t)merged_patches_ * merger_in_dim_)) {
+                free_scratch_buffers();
                 return false;
             }
         }
 
-        if (!init_rotary_tables()) {
-            return false;
-        }
-
-        size_t col_mean_bytes = (size_t)(output_dim_ + 256) * sizeof(float);
-        if (cudaMalloc(&d_col_mean_scratch_, col_mean_bytes) != cudaSuccess) return false;
-        allocated_ptrs_.push_back(d_col_mean_scratch_);
-
         return true;
+    }
+
+    void free_scratch_buffers() {
+        for (void* p : scratch_ptrs_) {
+            if (p) cudaFree(p);
+        }
+        scratch_ptrs_.clear();
+        d_img_norm_ = nullptr;
+        d_im2col_ = nullptr;
+        d_patches_ = nullptr;
+        d_norm_out_ = nullptr;
+        d_qkv_ = nullptr;
+        d_Q_ = nullptr;
+        d_K_ = nullptr;
+        d_V_ = nullptr;
+        d_scores_ = nullptr;
+        d_attn_ctx_ = nullptr;
+        d_attn_merged_ = nullptr;
+        d_attn_proj_ = nullptr;
+        d_merge_in_ = nullptr;
+        d_gate_buf_ = nullptr;
+        d_up_buf_ = nullptr;
+        d_down_buf_ = nullptr;
+        d_ln_q_ = nullptr;
+        d_mlp0_ = nullptr;
+        d_patches_win_ = nullptr;
+        d_mlp2_out_ = nullptr;
+        d_mlp_fc1_ = nullptr;
+        d_mlp_fc2_ = nullptr;
+        d_merge_fc1_ = nullptr;
     }
 
     bool init_rotary_tables() {
@@ -753,6 +814,7 @@ private:
 
 
     void free_all() {
+        free_scratch_buffers();
         for (void* p : allocated_ptrs_) {
             if (p) cudaFree(p);
         }
@@ -764,6 +826,7 @@ private:
     cublasHandle_t cublas_handle_ = nullptr;
     cudaStream_t stream_ = 0;
     std::vector<void*> allocated_ptrs_;
+    std::vector<void*> scratch_ptrs_;
 
     // Weights
     __nv_bfloat16* patch_embed_w_ = nullptr;

@@ -47,9 +47,10 @@
                             <span class="stat-label">TTFT</span>
                             <span class="stat-value" id="stat-last-ttft">-</span>
                         </div>
-                        <div class="stat-card">
+                        <div class="stat-card" id="card-last-prefill" title="Actual evaluated token throughput">
                             <span class="stat-label">Prefill Speed</span>
                             <span class="stat-value" id="stat-last-prefill">-</span>
+                            <span class="stat-sub" id="stat-last-prefill-sub"></span>
                         </div>
                         <div class="stat-card">
                             <span class="stat-label">Decode Speed</span>
@@ -80,9 +81,10 @@
                             <span class="stat-label">Avg TTFT</span>
                             <span class="stat-value" id="stat-avg-ttft">-</span>
                         </div>
-                        <div class="stat-card">
+                        <div class="stat-card" id="card-avg-prefill" title="Session average hardware prefill speed">
                             <span class="stat-label">Avg Prefill</span>
                             <span class="stat-value" id="stat-avg-prefill">-</span>
+                            <span class="stat-sub" id="stat-avg-prefill-sub"></span>
                         </div>
                         <div class="stat-card">
                             <span class="stat-label">Avg Decode</span>
@@ -1003,6 +1005,13 @@
                                     <input type="checkbox" id="agentic-omit-reasoning" class="agentic-toggle">
                                 </label>
                                 <input type="checkbox" id="sidebar-omit-reasoning" style="display:none;">
+                                <label class="agentic-switch-row">
+                                    <div class="agentic-switch-info">
+                                        <span class="agentic-switch-label">Bypass KV Cache (Benchmark Cold Prefill)</span>
+                                        <span class="agentic-switch-sub">Force GPU to evaluate the entire prompt from scratch to test raw prefill tok/s</span>
+                                    </div>
+                                    <input type="checkbox" id="agentic-bypass-kv-cache" class="agentic-toggle">
+                                </label>
                             </div>
                         </div>
                     </div>

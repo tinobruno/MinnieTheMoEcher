@@ -37,6 +37,8 @@ let sessionStats = {
 function updateStatsUI(lastStats) {
     const elLastTtft = document.getElementById('stat-last-ttft');
     const elLastPrefill = document.getElementById('stat-last-prefill');
+    const elLastPrefillSub = document.getElementById('stat-last-prefill-sub');
+    const cardLastPrefill = document.getElementById('card-last-prefill');
     const elLastDecode = document.getElementById('stat-last-decode');
     const elLastTokens = document.getElementById('stat-last-tokens');
     const elLastToolTime = document.getElementById('stat-last-tool-time');
@@ -44,6 +46,8 @@ function updateStatsUI(lastStats) {
 
     const elAvgTtft = document.getElementById('stat-avg-ttft');
     const elAvgPrefill = document.getElementById('stat-avg-prefill');
+    const elAvgPrefillSub = document.getElementById('stat-avg-prefill-sub');
+    const cardAvgPrefill = document.getElementById('card-avg-prefill');
     const elAvgDecode = document.getElementById('stat-avg-decode');
     const elTotalTokens = document.getElementById('stat-total-tokens');
     const elAvgToolTime = document.getElementById('stat-avg-tool-time');
@@ -51,7 +55,25 @@ function updateStatsUI(lastStats) {
 
     if (lastStats) {
         if (elLastTtft) elLastTtft.textContent = `${lastStats.ttftSec.toFixed(2)}s`;
-        if (elLastPrefill) elLastPrefill.textContent = lastStats.prefillTps > 0 ? `${lastStats.prefillTps.toFixed(1)} t/s` : '-';
+        if (elLastPrefill) {
+            elLastPrefill.textContent = lastStats.prefillTps > 0 ? `${lastStats.prefillTps.toFixed(1)} t/s` : '-';
+            const evalTok = lastStats.evaluatedTokens !== undefined ? lastStats.evaluatedTokens : lastStats.promptTokens;
+            const cachedTok = lastStats.cachedTokens || 0;
+            const promptTok = lastStats.promptTokens || evalTok;
+            if (elLastPrefillSub) {
+                if (cachedTok > 0 && promptTok > 0) {
+                    const pct = Math.round((cachedTok / promptTok) * 100);
+                    elLastPrefillSub.textContent = `${evalTok} eval (${pct}% cached)`;
+                } else if (evalTok > 0) {
+                    elLastPrefillSub.textContent = `${evalTok} eval (cold)`;
+                } else {
+                    elLastPrefillSub.textContent = '';
+                }
+            }
+            if (cardLastPrefill) {
+                cardLastPrefill.title = `Evaluated: ${evalTok} tokens in ${(lastStats.prefillSec || 0).toFixed(3)}s (${(lastStats.prefillTps || 0).toFixed(1)} tok/s)\nCached prefix: ${cachedTok} tokens\nTotal prompt: ${promptTok} tokens`;
+            }
+        }
         if (elLastDecode) elLastDecode.textContent = lastStats.decodeTps > 0 ? `${lastStats.decodeTps.toFixed(1)} t/s` : '-';
         if (elLastTokens) elLastTokens.textContent = `${lastStats.completionTokens} tok`;
         if (elLastToolTime) {
@@ -63,6 +85,7 @@ function updateStatsUI(lastStats) {
     } else {
         if (elLastTtft) elLastTtft.textContent = '-';
         if (elLastPrefill) elLastPrefill.textContent = '-';
+        if (elLastPrefillSub) elLastPrefillSub.textContent = '';
         if (elLastDecode) elLastDecode.textContent = '-';
         if (elLastTokens) elLastTokens.textContent = '-';
         if (elLastToolTime) elLastToolTime.textContent = '-';
@@ -71,20 +94,34 @@ function updateStatsUI(lastStats) {
 
     if (sessionStats.totalTurns > 0) {
         const avgTtftSec = (sessionStats.totalTtftMs / sessionStats.totalTurns) / 1000.0;
-        const totalPrefillSec = (sessionStats.totalPrefillMs || sessionStats.totalTtftMs) / 1000.0;
+        const totalPrefillSec = sessionStats.totalPrefillHardwareSec > 0
+            ? sessionStats.totalPrefillHardwareSec
+            : ((sessionStats.totalPrefillMs || sessionStats.totalTtftMs) / 1000.0);
         const totalDecodeSec = sessionStats.totalDecodeTimeMs / 1000.0;
         const totalToolSec = (sessionStats.totalToolTimeMs || 0) / 1000.0;
         const avgToolSecPerTurn = totalToolSec / sessionStats.totalTurns;
 
-        const avgPrefillTps = (totalPrefillSec > 0 && sessionStats.totalPromptTokens > 0)
-            ? (sessionStats.totalPromptTokens / totalPrefillSec)
+        const evaluatedPromptTokens = sessionStats.totalEvaluatedPromptTokens > 0
+            ? sessionStats.totalEvaluatedPromptTokens
+            : sessionStats.totalPromptTokens;
+
+        const avgPrefillTps = (totalPrefillSec > 0 && evaluatedPromptTokens > 0)
+            ? (evaluatedPromptTokens / totalPrefillSec)
             : 0;
         const avgDecodeTps = (totalDecodeSec > 0 && sessionStats.totalCompletionTokens > 0)
             ? (sessionStats.totalCompletionTokens / totalDecodeSec)
             : 0;
 
         if (elAvgTtft) elAvgTtft.textContent = `${avgTtftSec.toFixed(2)}s`;
-        if (elAvgPrefill) elAvgPrefill.textContent = avgPrefillTps > 0 ? `${avgPrefillTps.toFixed(1)} t/s` : '-';
+        if (elAvgPrefill) {
+            elAvgPrefill.textContent = avgPrefillTps > 0 ? `${avgPrefillTps.toFixed(1)} t/s` : '-';
+            if (elAvgPrefillSub) {
+                elAvgPrefillSub.textContent = `${evaluatedPromptTokens} eval / ${sessionStats.totalTurns}t`;
+            }
+            if (cardAvgPrefill) {
+                cardAvgPrefill.title = `Average evaluated hardware speed: ${avgPrefillTps.toFixed(1)} tok/s\nTotal evaluated: ${evaluatedPromptTokens} tokens across ${totalPrefillSec.toFixed(3)}s compute\nCached reuse: ${sessionStats.totalCachedPromptTokens || 0} tokens`;
+            }
+        }
         if (elAvgDecode) elAvgDecode.textContent = avgDecodeTps > 0 ? `${avgDecodeTps.toFixed(1)} t/s` : '-';
         if (elTotalTokens) elTotalTokens.textContent = `${sessionStats.totalCompletionTokens} tok (${sessionStats.totalTurns} turn${sessionStats.totalTurns === 1 ? '' : 's'})`;
         if (elAvgToolTime) {
@@ -98,6 +135,7 @@ function updateStatsUI(lastStats) {
     } else {
         if (elAvgTtft) elAvgTtft.textContent = '-';
         if (elAvgPrefill) elAvgPrefill.textContent = '-';
+        if (elAvgPrefillSub) elAvgPrefillSub.textContent = '';
         if (elAvgDecode) elAvgDecode.textContent = '-';
         if (elTotalTokens) elTotalTokens.textContent = '-';
         if (elAvgToolTime) elAvgToolTime.textContent = '-';
@@ -2334,6 +2372,16 @@ function initAgenticSettingsUI() {
         sideOmitReasoningToggle.addEventListener('change', (e) => updateOmitReasoningUI(e.target.checked));
     }
 
+    // Bypass KV Cache Toggle (for benchmarking cold prefill speed)
+    const bypassKvToggle = document.getElementById('agentic-bypass-kv-cache');
+    if (bypassKvToggle) {
+        bypassKvToggle.checked = !!agenticSettings.bypassKvCache;
+        bypassKvToggle.addEventListener('change', (e) => {
+            agenticSettings.bypassKvCache = e.target.checked;
+            saveAgenticSettings();
+        });
+    }
+
     // Boundary & Auth Toggles
     const boundaryToggle = document.getElementById('agentic-boundary-enforced');
     if (boundaryToggle) {
@@ -4044,6 +4092,12 @@ async function sendMessage(options = {}) {
     let turnToolTimeMs = 0;
     let turnToolCallsCount = 0;
 
+    let lastTurnUsage = null;
+    let turnEvaluatedTokens = 0;
+    let turnCachedTokens = 0;
+    let turnPrefillTps = 0;
+    let turnPrefillSec = 0;
+
     const maxRounds = agenticSettings.maxToolRounds || 10;
     let round = 0;
     const turnExecutedToolKeys = new Set();
@@ -4114,6 +4168,12 @@ async function sendMessage(options = {}) {
                 }
             };
 
+            const bypassKvCache = !!(agenticSettings.bypassKvCache || document.getElementById('agentic-bypass-kv-cache')?.checked);
+            if (bypassKvCache) {
+                payload.no_cache = true;
+                payload.bypass_cache = true;
+            }
+
             // Disable tools once search has executed in this turn, or if a tool returned an issue/error, or if round >= maxRounds,
             // forcing the assistant to formulate and stream its complete conversational answer directly to the user.
             payload.tools = (round >= maxRounds || turnExecutedSearch || turnEncounteredToolIssue) ? [] : activeTools;
@@ -4163,8 +4223,15 @@ async function sendMessage(options = {}) {
                             const data = JSON.parse(dataStr);
 
                             if (data.usage) {
-                                if (data.usage.prompt_tokens !== undefined) totalPromptTokens += data.usage.prompt_tokens;
-                                if (data.usage.completion_tokens !== undefined) totalCompletionTokens += data.usage.completion_tokens;
+                                lastTurnUsage = data.usage;
+                                if (data.usage.prompt_tokens !== undefined) totalPromptTokens = data.usage.prompt_tokens;
+                                if (data.usage.completion_tokens !== undefined) totalCompletionTokens = data.usage.completion_tokens;
+                                if (data.usage.evaluated_prompt_tokens !== undefined) turnEvaluatedTokens = data.usage.evaluated_prompt_tokens;
+                                if (data.usage.prefill_tps !== undefined) turnPrefillTps = data.usage.prefill_tps;
+                                if (data.usage.prefill_sec !== undefined) turnPrefillSec = data.usage.prefill_sec;
+                                if (data.usage.prompt_tokens_details && data.usage.prompt_tokens_details.cached_tokens !== undefined) {
+                                    turnCachedTokens = data.usage.prompt_tokens_details.cached_tokens;
+                                }
                             }
 
                             if (data.choices && data.choices.length > 0) {
@@ -4869,12 +4936,19 @@ async function sendMessage(options = {}) {
 
         const ttftMs = (round1TtftMs !== null ? round1TtftMs : totalPrefillMs);
         const ttftSec = ttftMs / 1000.0;
-        const prefillSec = totalPrefillMs / 1000.0;
+        const prefillSec = (turnPrefillSec > 0) ? turnPrefillSec : (totalPrefillMs / 1000.0);
         const decodeSec = totalDecodeMs / 1000.0;
         const toolTimeSec = turnToolTimeMs / 1000.0;
 
+        const evaluatedTokens = (turnEvaluatedTokens > 0)
+            ? turnEvaluatedTokens
+            : (totalPromptTokens > turnCachedTokens ? (totalPromptTokens - turnCachedTokens) : totalPromptTokens);
+        const cachedTokens = turnCachedTokens;
+
         const actualCompletionTokens = totalCompletionTokens > 0 ? totalCompletionTokens : 1;
-        const prefillTps = (prefillSec > 0 && totalPromptTokens > 0) ? (totalPromptTokens / prefillSec) : 0.0;
+        const prefillTps = (turnPrefillTps > 0)
+            ? turnPrefillTps
+            : ((prefillSec > 0 && evaluatedTokens > 0) ? (evaluatedTokens / prefillSec) : 0.0);
         const decodeTps = (decodeSec > 0 && actualCompletionTokens > 1) 
             ? ((actualCompletionTokens - 1) / decodeSec) 
             : (decodeSec > 0 ? (actualCompletionTokens / decodeSec) : 0.0);
@@ -4885,6 +4959,8 @@ async function sendMessage(options = {}) {
             decodeSec,
             promptTokens: totalPromptTokens,
             completionTokens: actualCompletionTokens,
+            evaluatedTokens,
+            cachedTokens,
             prefillTps,
             decodeTps,
             toolTimeSec,
@@ -4894,6 +4970,9 @@ async function sendMessage(options = {}) {
         sessionStats.totalTurns++;
         sessionStats.totalPromptTokens += totalPromptTokens;
         sessionStats.totalCompletionTokens += actualCompletionTokens;
+        sessionStats.totalEvaluatedPromptTokens = (sessionStats.totalEvaluatedPromptTokens || 0) + evaluatedTokens;
+        sessionStats.totalCachedPromptTokens = (sessionStats.totalCachedPromptTokens || 0) + cachedTokens;
+        sessionStats.totalPrefillHardwareSec = (sessionStats.totalPrefillHardwareSec || 0) + prefillSec;
         sessionStats.totalTtftMs += ttftMs;
         sessionStats.totalPrefillMs += totalPrefillMs;
         sessionStats.totalDecodeTimeMs += totalDecodeMs;

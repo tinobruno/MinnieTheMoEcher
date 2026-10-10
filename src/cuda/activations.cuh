@@ -574,6 +574,7 @@ void argmax_f32_batch_cuda(
     int n, int M,
     cudaStream_t stream = 0);
 
+#if defined(__APPLE__)
 void sample_multinomial_f32_cuda(
     int32_t* out,
     float* logits,
@@ -584,6 +585,16 @@ void sample_multinomial_f32_cuda(
     cudaStream_t stream = 0,
     int top_k = 50,
     float top_p = 0.95f);
+#else
+void sample_multinomial_f32_cuda(
+    int32_t* out,
+    float* logits,
+    int n,
+    float temperature,
+    float rand_val,
+    float min_p = 0.05f,
+    cudaStream_t stream = 0);
+#endif
 
 // ── sqrt(softplus(x)) scoring ──────────────────────────────────────────────────
 void sqrtsoftplus_cuda(
@@ -661,6 +672,7 @@ void gemv_bf16_batch_cuda(
     int N, int K, int M,
     cudaStream_t stream = 0);
 
+#if defined(__APPLE__)
 void deltanet_in_proj_ab_batch_cuda(
     __nv_bfloat16* out_a,
     __nv_bfloat16* out_b,
@@ -669,6 +681,7 @@ void deltanet_in_proj_ab_batch_cuda(
     const __nv_bfloat16* X,
     int N, int K, int M,
     cudaStream_t stream = 0);
+#endif
 
 void gemv_bf16_out_bf16_batch_cuda(
     __nv_bfloat16* out,            // [M, N] BF16 output
@@ -924,6 +937,7 @@ void gqa_attention_decode_cuda(
     cudaStream_t stream = 0);
 
 // ── Qwen 3.8 Gated GQA Attention Decode (with QK Norm + Gate) ────────────────
+#if defined(__APPLE__)
 void qwen_gqa_decode_gated_cuda(
     __nv_bfloat16* out,             // [n_q_heads * head_dim] (6144)
     const __nv_bfloat16* q_and_gate,// [2 * n_q_heads * head_dim] (12288)
@@ -943,6 +957,26 @@ void qwen_gqa_decode_gated_cuda(
     float eps = 1e-6f,
     cudaStream_t stream = 0,
     int cache_pos = -1);
+#else
+void qwen_gqa_decode_gated_cuda(
+    __nv_bfloat16* out,             // [n_q_heads * head_dim] (6144)
+    const __nv_bfloat16* q_and_gate,// [2 * n_q_heads * head_dim] (12288)
+    __nv_bfloat16* k,               // [n_kv_heads * head_dim]
+    const __nv_bfloat16* v,         // [n_kv_heads * head_dim]
+    const __nv_bfloat16* q_norm_w,  // [head_dim]
+    const __nv_bfloat16* k_norm_w,  // [head_dim]
+    __nv_bfloat16* k_cache,
+    __nv_bfloat16* v_cache,
+    int n_q_heads,
+    int n_kv_heads,
+    int head_dim,
+    const int32_t* d_pos,
+    int pos_scalar,
+    int max_seq_len,
+    float rope_theta = 1000000.0f,
+    float eps = 1e-6f,
+    cudaStream_t stream = 0);
+#endif
 
 void qwen_gqa_decode_gated_fp8_cuda(
     __nv_bfloat16* out,             // [n_q_heads * head_dim] (6144)
@@ -1219,4 +1253,27 @@ void gemv_mixed_moe_down_batch_cuda(
     const uint8_t* expert_type_map,
     int layer_id, int n_experts,
     int w2_cold_offset, int N, int K, int M,
+    cudaStream_t stream = 0);
+
+// ── Blackwell FP8 (sm_120a) Accelerators ──────────────────────────────────────
+void quantize_bf16_to_fp8_e4m3_cuda(
+    uint8_t* out,
+    const __nv_bfloat16* in,
+    int total_elements,
+    cudaStream_t stream = 0);
+
+void dequant_int4_to_fp8_block_cuda(
+    uint8_t* out,
+    const uint8_t* weight,
+    const __nv_bfloat16* scale,
+    int N, int K,
+    int block_size = 32,
+    cudaStream_t stream = 0);
+
+void dequant_int3_to_fp8_block_cuda(
+    uint8_t* out,
+    const uint8_t* weight,
+    const __nv_bfloat16* scale,
+    int N, int K,
+    int block_size = 32,
     cudaStream_t stream = 0);
