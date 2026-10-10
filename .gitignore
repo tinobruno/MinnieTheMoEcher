@@ -61,3 +61,4 @@ tmp/
 mcp_servers.json
 node_modules/
 calcolatrice/
+.vscode/
