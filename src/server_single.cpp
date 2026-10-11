@@ -811,6 +811,8 @@ struct GPUTensor {
     const int32_t* i32() const { return (const int32_t*)data; }
     int64_t* i64() { return (int64_t*)data; }
     const int64_t* i64() const { return (const int64_t*)data; }
+    uint64_t* u64() { return (uint64_t*)data; }
+    const uint64_t* u64() const { return (const uint64_t*)data; }
 };
 
 // ════════════════════════════════════════════════════════════════════════════════
@@ -2490,10 +2492,16 @@ public:
     GPUTensor buf_mtp_argmax_;      // [1] INT32
     GPUTensor buf_mtp_input_pos_;   // [1] INT32
     GPUTensor buf_draft_k_tokens_;  // [16] INT32 — output candidate tokens
+    GPUTensor buf_mtp_top2_idx_;    // [2] INT32
+    GPUTensor buf_mtp_top2_val_;    // [2] FLOAT
+    GPUTensor buf_mtp_hidden_saved_;   // [5120] BF16
+    GPUTensor buf_mtp_hidden_saved_2_; // [5120] BF16
 
     int32_t* h_draft_best_ = nullptr;
     int32_t* h_draft_k_cands_ = nullptr;
     int32_t* h_draft_pos_ = nullptr;
+    int32_t* h_draft_top2_ = nullptr;
+
 
     // Reference to target model's embedding table (shared, not owned)
     __nv_bfloat16* target_embed_w_ = nullptr;
@@ -2654,10 +2662,16 @@ public:
         buf_mtp_argmax_.alloc(sizeof(int32_t));
         buf_mtp_input_pos_.alloc(sizeof(int32_t));
         buf_draft_k_tokens_.alloc(16 * sizeof(int32_t));
+        buf_mtp_top2_idx_.alloc(2 * sizeof(int32_t));
+        buf_mtp_top2_val_.alloc(2 * sizeof(float));
+        buf_mtp_hidden_saved_.alloc(hidden_size_ * sizeof(__nv_bfloat16));
+        buf_mtp_hidden_saved_2_.alloc(hidden_size_ * sizeof(__nv_bfloat16));
 
         CUDA_CHECK(cudaMallocHost(&h_draft_best_, sizeof(int32_t)));
         CUDA_CHECK(cudaMallocHost(&h_draft_k_cands_, 16 * sizeof(int32_t)));
         CUDA_CHECK(cudaMallocHost(&h_draft_pos_, sizeof(int32_t)));
+        CUDA_CHECK(cudaMallocHost(&h_draft_top2_, 2 * sizeof(int32_t)));
+
 
         CUDA_CHECK(cudaStreamSynchronize(stream));
 
@@ -2884,7 +2898,289 @@ public:
             current_token = draft_token;
         }
     }
+
+    // Forward one step returning top-2 candidate tokens
+    std::pair<int, int> forward_one_step_top2(const __nv_bfloat16* target_hidden, int last_token_id,
+                                              int position, cudaStream_t stream) {
+        if (!loaded_) return {-1, -1};
+
+        auto matmul_proj = [&](GPUTensor& out, __nv_bfloat16* in_vec, GPUTensor& weight, GPUTensor& scale, int N, int K) {
+            if (weight.dtype == "int4") {
+                gemv_int4_cuda(out.bf16(), in_vec, (const uint8_t*)weight.data, scale.bf16(), N, K, stream);
+            } else if (weight.dtype == "fp4") {
+                gemv_fp4_cuda(out.bf16(), in_vec, (const uint8_t*)weight.data, (const uint8_t*)scale.data, N, K, stream);
+            } else {
+                gemv_bf16_out_bf16_cuda(out.bf16(), weight.bf16(), in_vec, N, K, stream);
+            }
+        };
+
+        // 1. Norm the target hidden state
+        rms_norm_one_centered_cuda(buf_mtp_hidden_.bf16(), target_hidden,
+                                   mtp_pre_fc_norm_hidden_w_.bf16(), hidden_size_, rms_eps_, stream);
+
+        // 2. Embed the last token and norm it
+        int32_t tok = last_token_id;
+        CUDA_CHECK(cudaMemcpyAsync(buf_mtp_argmax_.i32(), &tok, sizeof(int32_t), cudaMemcpyHostToDevice, stream));
+        if (is_embed_fp4_) {
+            embedding_fp4_cuda(buf_mtp_embed_.bf16(), target_embed_w_fp4_, target_embed_s_fp4_, buf_mtp_argmax_.i32(), 1, hidden_size_, stream);
+        } else if (is_embed_int4_) {
+            embedding_int4_cuda(buf_mtp_embed_.bf16(), target_embed_w_int4_, target_embed_s_, buf_mtp_argmax_.i32(), 1, hidden_size_, stream);
+        } else {
+            embedding_cuda(buf_mtp_embed_.bf16(), target_embed_w_, buf_mtp_argmax_.i32(), 1, hidden_size_, stream);
+        }
+        rms_norm_one_centered_cuda(buf_mtp_embed_.bf16(), buf_mtp_embed_.bf16(),
+                                   mtp_pre_fc_norm_embed_w_.bf16(), hidden_size_, rms_eps_, stream);
+
+        // 3. Concatenate: [normed_embed, normed_hidden] -> [10240]
+        CUDA_CHECK(cudaMemcpyAsync(buf_mtp_concat_.bf16(), buf_mtp_embed_.bf16(),
+                                   hidden_size_ * sizeof(__nv_bfloat16), cudaMemcpyDeviceToDevice, stream));
+        CUDA_CHECK(cudaMemcpyAsync(buf_mtp_concat_.bf16() + hidden_size_, buf_mtp_hidden_.bf16(),
+                                   hidden_size_ * sizeof(__nv_bfloat16), cudaMemcpyDeviceToDevice, stream));
+
+        // 4. FC projection
+        if (mtp_fc_w_.dtype == "int4") {
+            gemv_int4_cuda(buf_mtp_hidden_.bf16(), buf_mtp_concat_.bf16(),
+                           (const uint8_t*)mtp_fc_w_.data, mtp_fc_s_.bf16(),
+                           hidden_size_, 2 * hidden_size_, stream);
+        } else if (mtp_fc_w_.dtype == "fp4") {
+            gemv_fp4_cuda(buf_mtp_hidden_.bf16(), buf_mtp_concat_.bf16(),
+                          (const uint8_t*)mtp_fc_w_.data, (const uint8_t*)mtp_fc_s_.data,
+                          hidden_size_, 2 * hidden_size_, stream);
+        } else {
+            gemv_bf16_out_bf16_cuda(buf_mtp_hidden_.bf16(), mtp_fc_w_.bf16(), buf_mtp_concat_.bf16(),
+                                    hidden_size_, 2 * hidden_size_, stream);
+        }
+
+        // 5. MTP Transformer layer
+        rms_norm_one_centered_cuda(buf_mtp_hidden2_.bf16(), buf_mtp_hidden_.bf16(),
+                                   mtp_layer_attn_norm_w_.bf16(), hidden_size_, rms_eps_, stream);
+
+        matmul_proj(buf_mtp_q_, buf_mtp_hidden2_.bf16(), mtp_layer_q_proj_w_, mtp_layer_q_proj_s_,
+                    2 * num_heads_ * head_dim_, hidden_size_);
+        matmul_proj(buf_mtp_k_, buf_mtp_hidden2_.bf16(), mtp_layer_k_proj_w_, mtp_layer_k_proj_s_,
+                    num_kv_heads_ * head_dim_, hidden_size_);
+        matmul_proj(buf_mtp_v_, buf_mtp_hidden2_.bf16(), mtp_layer_v_proj_w_, mtp_layer_v_proj_s_,
+                    num_kv_heads_ * head_dim_, hidden_size_);
+
+        *h_draft_pos_ = position;
+        CUDA_CHECK(cudaMemcpyAsync(buf_mtp_input_pos_.i32(), h_draft_pos_, sizeof(int32_t),
+                                   cudaMemcpyHostToDevice, stream));
+#if defined(__APPLE__)
+        qwen_gqa_decode_gated_cuda(
+            buf_mtp_attn_out_.bf16(), buf_mtp_q_.bf16(), buf_mtp_k_.bf16(), buf_mtp_v_.bf16(),
+            mtp_layer_q_norm_w_.bf16(), mtp_layer_k_norm_w_.bf16(),
+            mtp_k_cache_.bf16(), mtp_v_cache_.bf16(),
+            num_heads_, num_kv_heads_, head_dim_,
+            buf_mtp_input_pos_.i32(), position, max_seq_len_ > 0 ? max_seq_len_ : 32768,
+            10000000.0f, rms_eps_, stream, /*cache_pos=*/-1);
+#else
+        qwen_gqa_decode_gated_cuda(
+            buf_mtp_attn_out_.bf16(), buf_mtp_q_.bf16(), buf_mtp_k_.bf16(), buf_mtp_v_.bf16(),
+            mtp_layer_q_norm_w_.bf16(), mtp_layer_k_norm_w_.bf16(),
+            mtp_k_cache_.bf16(), mtp_v_cache_.bf16(),
+            num_heads_, num_kv_heads_, head_dim_,
+            buf_mtp_input_pos_.i32(), position, max_seq_len_ > 0 ? max_seq_len_ : 32768,
+            10000000.0f, rms_eps_, stream);
+#endif
+
+        if (mtp_layer_o_proj_w_.dtype == "int4") {
+            gemv_int4_residual_cuda(buf_mtp_hidden_.bf16(), buf_mtp_attn_out_.bf16(),
+                                    (const uint8_t*)mtp_layer_o_proj_w_.data, mtp_layer_o_proj_s_.bf16(),
+                                    hidden_size_, num_heads_ * head_dim_, stream);
+        } else if (mtp_layer_o_proj_w_.dtype == "fp4") {
+            gemv_fp4_residual_cuda(buf_mtp_hidden_.bf16(), buf_mtp_attn_out_.bf16(),
+                                   (const uint8_t*)mtp_layer_o_proj_w_.data, (const uint8_t*)mtp_layer_o_proj_s_.data,
+                                   hidden_size_, num_heads_ * head_dim_, stream);
+        } else {
+            gemv_bf16_out_bf16_cuda(buf_mtp_hidden2_.bf16(), mtp_layer_o_proj_w_.bf16(),
+                                    buf_mtp_attn_out_.bf16(), hidden_size_, num_heads_ * head_dim_, stream);
+            vector_add_bf16_cuda(buf_mtp_hidden_.bf16(), buf_mtp_hidden2_.bf16(), hidden_size_, stream);
+        }
+
+        rms_norm_one_centered_cuda(buf_mtp_hidden2_.bf16(), buf_mtp_hidden_.bf16(),
+                                   mtp_layer_post_attn_norm_w_.bf16(), hidden_size_, rms_eps_, stream);
+
+        if (mtp_layer_gate_w_.dtype == "int4") {
+            gemv_int4_swiglu_fused_cuda(buf_mtp_gate_.bf16(), buf_mtp_hidden2_.bf16(),
+                                        (const uint8_t*)mtp_layer_gate_w_.data, mtp_layer_gate_s_.bf16(),
+                                        (const uint8_t*)mtp_layer_up_w_.data, mtp_layer_up_s_.bf16(),
+                                        intermediate_size_, hidden_size_, 0.0f, stream);
+        } else if (mtp_layer_gate_w_.dtype == "fp4") {
+            gemv_fp4_swiglu_fused_cuda(buf_mtp_gate_.bf16(), buf_mtp_hidden2_.bf16(),
+                                        (const uint8_t*)mtp_layer_gate_w_.data, (const uint8_t*)mtp_layer_gate_s_.data,
+                                        (const uint8_t*)mtp_layer_up_w_.data, (const uint8_t*)mtp_layer_up_s_.data,
+                                        intermediate_size_, hidden_size_, 0.0f, stream);
+        } else {
+            gemv_bf16_out_bf16_cuda(buf_mtp_gate_.bf16(), mtp_layer_gate_w_.bf16(),
+                                    buf_mtp_hidden2_.bf16(), intermediate_size_, hidden_size_, stream);
+            gemv_bf16_out_bf16_cuda(buf_mtp_up_.bf16(), mtp_layer_up_w_.bf16(),
+                                    buf_mtp_hidden2_.bf16(), intermediate_size_, hidden_size_, stream);
+            silu_mul_cuda(buf_mtp_gate_.bf16(), buf_mtp_gate_.bf16(), buf_mtp_up_.bf16(), intermediate_size_, 0.0f, stream);
+        }
+
+        if (mtp_layer_down_w_.dtype == "int4") {
+            gemv_int4_residual_cuda(buf_mtp_hidden_.bf16(), buf_mtp_gate_.bf16(),
+                                    (const uint8_t*)mtp_layer_down_w_.data, mtp_layer_down_s_.bf16(),
+                                    hidden_size_, intermediate_size_, stream);
+        } else if (mtp_layer_down_w_.dtype == "fp4") {
+            gemv_fp4_residual_cuda(buf_mtp_hidden_.bf16(), buf_mtp_gate_.bf16(),
+                                   (const uint8_t*)mtp_layer_down_w_.data, (const uint8_t*)mtp_layer_down_s_.data,
+                                   hidden_size_, intermediate_size_, stream);
+        } else {
+            gemv_bf16_out_bf16_cuda(buf_mtp_hidden2_.bf16(), mtp_layer_down_w_.bf16(),
+                                    buf_mtp_gate_.bf16(), hidden_size_, intermediate_size_, stream);
+            vector_add_bf16_cuda(buf_mtp_hidden_.bf16(), buf_mtp_hidden2_.bf16(), hidden_size_, stream);
+        }
+
+        // 6. Final norm
+        rms_norm_one_centered_cuda(buf_mtp_hidden_.bf16(), buf_mtp_hidden_.bf16(),
+                                   mtp_norm_w_.bf16(), hidden_size_, rms_eps_, stream);
+
+        int active_vocab = use_draft_vocab_ ? draft_vocab_size_ : full_vocab_size_;
+        const __nv_bfloat16* active_head = use_draft_vocab_ ? draft_lm_head_w_.bf16() : full_lm_head_w_;
+
+        // 7. lm_head
+        gemv_bf16_cuda(buf_mtp_logits_.f32(), active_head, buf_mtp_hidden_.bf16(),
+                       active_vocab, hidden_size_, stream);
+
+        // 8. Top-2 over active vocab
+        top2_f32_cuda(buf_mtp_top2_idx_.i32(), buf_mtp_top2_val_.f32(), buf_mtp_logits_.f32(), active_vocab, stream);
+
+        // 9. Copy top-2 to host
+        CUDA_CHECK(cudaMemcpyAsync(h_draft_top2_, buf_mtp_top2_idx_.i32(), 2 * sizeof(int32_t),
+                                   cudaMemcpyDeviceToHost, stream));
+        CUDA_CHECK(cudaStreamSynchronize(stream));
+
+        int idx1 = h_draft_top2_[0];
+        int idx2 = h_draft_top2_[1];
+
+        int tok1 = (idx1 >= 0 && idx1 < active_vocab) ? (use_draft_vocab_ ? draft_vocab_ids_[idx1] : idx1) : -1;
+        int tok2 = (idx2 >= 0 && idx2 < active_vocab) ? (use_draft_vocab_ ? draft_vocab_ids_[idx2] : idx2) : -1;
+
+        return {tok1, tok2};
+    }
+
+    // Forward tree drafting for candidate nodes (configurable: 1, 2, or 3 candidate nodes)
+    bool draft_tree_tokens(const __nv_bfloat16* target_hidden, int first_token,
+                           int position, struct TreeTopology& tree, cudaStream_t stream, int tree_nodes = 2);
 };
+
+// ════════════════════════════════════════════════════════════════════════════════
+//  Speculative Decoding Tree Topology & Longest Path Resolver
+// ════════════════════════════════════════════════════════════════════════════════
+
+struct TreeTopology {
+    int num_nodes = 0;                  // Total candidate nodes (e.g. 3 or 4)
+    int depth[16] = {0};                // Depth in tree (0 = root)
+    int parent[16] = {-1};              // Parent index in candidate array (-1 for root)
+    uint64_t ancestor_mask[16] = {0};   // Bit j is 1 if candidate j is an ancestor of candidate i
+    int tokens[16] = {0};               // Predicted candidate token IDs
+};
+
+struct TreeVerificationResult {
+    int accepted_count = 0;             // Number of speculative tokens accepted (0..3)
+    std::vector<int> accepted_tokens;   // The accepted tokens
+    std::vector<int> winning_slots;     // Slot indices of the winning path (for KV compaction)
+    int bonus_token = -1;               // The next token predicted by the base model
+    int last_accepted_node = 0;         // Node index of deepest accepted node (for SSM state commit)
+};
+
+inline bool MTPSelfDrafter::draft_tree_tokens(const __nv_bfloat16* target_hidden, int first_token,
+                                              int position, TreeTopology& tree, cudaStream_t stream, int tree_nodes) {
+    if (!loaded_) return false;
+
+    // Node 0: Root (already accepted first_token)
+    tree.depth[0] = 0;
+    tree.parent[0] = -1;
+    tree.ancestor_mask[0] = (1ULL << 0);
+    tree.tokens[0] = first_token;
+
+    if (tree_nodes <= 1) {
+        int t1 = forward_one_step(target_hidden, first_token, position + 1, stream);
+        if (t1 < 0) return false;
+        tree.num_nodes = 2;
+        tree.depth[1] = 1; tree.parent[1] = 0; tree.ancestor_mask[1] = (1ULL << 0) | (1ULL << 1); tree.tokens[1] = t1;
+        return true;
+    }
+
+    // Step 1: from root (target_hidden, first_token) -> top-2 (Node 1, Node 2)
+    auto pair1 = forward_one_step_top2(target_hidden, first_token, position + 1, stream);
+    if (pair1.first < 0) return false;
+    int t1 = pair1.first;
+    int t2 = (pair1.second >= 0 && pair1.second != t1) ? pair1.second : pair1.first;
+
+    tree.depth[1] = 1; tree.parent[1] = 0; tree.ancestor_mask[1] = (1ULL << 0) | (1ULL << 1); tree.tokens[1] = t1;
+    tree.depth[2] = 1; tree.parent[2] = 0; tree.ancestor_mask[2] = (1ULL << 0) | (1ULL << 2); tree.tokens[2] = t2;
+
+    if (tree_nodes == 2) {
+        // 2 alternative branches: Top-1 and Top-2 (no depth-2 continuation)
+        tree.num_nodes = 3;
+        return true;
+    }
+
+    // Step 2: from Node 1 (buf_mtp_hidden_, t1) -> top-1 (Node 3)
+    int t3 = forward_one_step(buf_mtp_hidden_.bf16(), t1, position + 2, stream);
+    if (t3 < 0) t3 = t1;
+
+    tree.num_nodes = 4;
+    tree.depth[3] = 2; tree.parent[3] = 1; tree.ancestor_mask[3] = (1ULL << 0) | (1ULL << 1) | (1ULL << 3); tree.tokens[3] = t3;
+
+    return true;
+}
+
+static inline TreeVerificationResult resolve_tree_longest_path(
+    const TreeTopology& tree,
+    const int32_t* host_batch_preds,
+    int eos_id,
+    int eos2_id,
+    int think_start_id,
+    int think_end_id,
+    bool enable_thinking)
+{
+    TreeVerificationResult res;
+    int p0 = host_batch_preds[0];
+
+    auto is_valid_token = [&](int tok) {
+        if (tok < 0) return false;
+        if (tok == eos_id || (eos2_id >= 0 && tok == eos2_id)) return false;
+        if (!enable_thinking && (tok == think_start_id || tok == think_end_id)) return false;
+        return true;
+    };
+
+    if (p0 == tree.tokens[1] && is_valid_token(tree.tokens[1])) {
+        // Path A: Node 1 accepted
+        res.accepted_count = 1;
+        res.accepted_tokens.push_back(tree.tokens[1]);
+        res.winning_slots.push_back(1);
+        res.last_accepted_node = 1;
+        res.bonus_token = host_batch_preds[1];
+
+        int p1 = host_batch_preds[1];
+        if (tree.num_nodes >= 4 && p1 == tree.tokens[3] && is_valid_token(tree.tokens[3])) {
+            // Path A extended: Node 3 accepted
+            res.accepted_count = 2;
+            res.accepted_tokens.push_back(tree.tokens[3]);
+            res.winning_slots.push_back(3);
+            res.last_accepted_node = 3;
+            res.bonus_token = host_batch_preds[3];
+        }
+    } else if (tree.num_nodes > 2 && p0 == tree.tokens[2] && is_valid_token(tree.tokens[2])) {
+        // Path B: Node 2 accepted
+        res.accepted_count = 1;
+        res.accepted_tokens.push_back(tree.tokens[2]);
+        res.winning_slots.push_back(2);
+        res.last_accepted_node = 2;
+        res.bonus_token = host_batch_preds[2];
+    } else {
+        // Fallback: accept root only
+        res.accepted_count = 0;
+        res.bonus_token = p0;
+        res.last_accepted_node = 0;
+    }
+
+    return res;
+}
+
 
 
 // ════════════════════════════════════════════════════════════════════════════════
@@ -2952,19 +3248,75 @@ public:
     int visual_embed_start_pos_ = -1;
     int visual_embed_num_tokens_ = 0;
 
+    // On-demand Vision Tower loader state (zero VRAM consumption during text chat)
+    struct VisionTowerConfig {
+        bool available = false;
+        std::string dense_path;
+        json tensor_map;
+        std::string vision_bin;
+        std::string bridge_bin;
+        std::string embed_mean_bin;
+        int output_dim = 0;
+    } vision_tower_cfg_;
+
+    bool ensure_vision_loaded() {
+        if (vision_tower_ && vision_tower_->is_loaded()) return true;
+        if (!vision_tower_cfg_.available) return false;
+        LOG_INFO("[Vision] Multimodal image detected. Loading Vision Tower on-demand (~990 MB)...");
+        vision_tower_ = std::make_unique<moecher::vision::QwenVisionTower>();
+        if (vision_tower_->load_from_manifest(
+                vision_tower_cfg_.dense_path,
+                vision_tower_cfg_.tensor_map,
+                cublas_handle_,
+                main_stream_,
+                vision_tower_cfg_.output_dim,
+                vision_tower_cfg_.vision_bin,
+                vision_tower_cfg_.bridge_bin,
+                vision_tower_cfg_.embed_mean_bin)) {
+            LOG_INFO("[Vision] Vision Tower successfully loaded on-demand! (num_blocks=%d, 576 tokens output x %d dim)",
+                     vision_tower_->num_blocks_, vision_tower_cfg_.output_dim);
+            return true;
+        } else {
+            LOG_WARN("[Vision] Failed to load Vision Tower weights on-demand.");
+            vision_tower_.reset();
+            return false;
+        }
+    }
+
+    void unload_vision_tower() {
+        if (vision_tower_) {
+            LOG_INFO("[Vision] Unloading Vision Tower from VRAM to preserve full headroom for LLM decode...");
+            vision_tower_.reset();
+        }
+    }
+
     // In-process Vision Delegate Engine (Multimodal Delegation)
     std::unique_ptr<MoecherEngine> vision_delegate_engine_;
     bool has_vision_delegate() const { return vision_delegate_engine_ != nullptr; }
 
-    bool has_vision() const { return has_vision_ && (vision_tower_ != nullptr); }
+    bool has_vision() const { return has_vision_; }
+    bool is_vision_loaded() const { return vision_tower_ != nullptr; }
     bool supports_vision() const { return has_vision() || has_vision_delegate(); }
 
     // Prompt-Lookup Drafting (PLD) Speculative Decoding
     bool enable_pld_ = true;
     int pld_draft_tokens_ = 4;
     bool enable_mtp_ = true;
+    bool default_enable_mtp_ = true;
+#if defined(__APPLE__)
+    bool enable_tree_mtp_ = false;
+    bool default_enable_tree_mtp_ = false;
+#else
+    bool enable_tree_mtp_ = true;
+    bool default_enable_tree_mtp_ = true;
+#endif
+    int tree_nodes_ = 2; // 2 = 2 alternative branches (Top-1 and Top-2, M=3 total nodes)
+    int default_tree_nodes_ = 2;
+    int tree_graph_M_ = 3;
     int mtp_k_ = 0; // 0 = auto (1 for 16GB GPUs, 4 for >= 24GB GPUs)
+    int default_mtp_k_ = 0;
     bool enable_spec_ = true;
+    bool default_enable_spec_ = true;
     
     // Prompt Prefix KV Cache Tracking
     std::vector<int> cached_tokens_;
@@ -3257,6 +3609,12 @@ public:
     GPUTensor buf_linear_b_batch_;     // [8, 48] BF16
     GPUTensor buf_logits_batch_;       // [8, vocab_size] F32
     GPUTensor buf_argmax_out_batch_;   // [8] I32
+    GPUTensor buf_tree_ancestor_mask_;  // [8] uint64_t
+    GPUTensor buf_tree_parent_indices_; // [8] int32_t
+    GPUTensor buf_tree_winning_slots_;  // [8] int32_t
+    cudaGraph_t tree_graph_ = nullptr;
+    cudaGraphExec_t tree_graph_exec_ = nullptr;
+    bool tree_graph_captured_ = false;
 
     GPUTensor target_ssm_pool_;
     GPUTensor target_ssm_slots_[8];
@@ -3264,6 +3622,8 @@ public:
     GPUTensor target_conv_slots_[8];
     int32_t* h_target_batch_tok_ = nullptr;
     int32_t* h_target_batch_pos_ = nullptr;
+    uint64_t* h_tree_ancestor_mask_ = nullptr;
+    int32_t* h_tree_parent_ = nullptr;
     int32_t* h_single_tok_ = nullptr;
     int32_t* h_single_pos_ = nullptr;
     int32_t* h_single_flag_ = nullptr;
@@ -3422,6 +3782,18 @@ public:
             cudaFreeHost(h_target_batch_pos_);
             h_target_batch_pos_ = nullptr;
         }
+        if (h_target_batch_tok_) {
+            cudaFreeHost(h_target_batch_tok_);
+            h_target_batch_tok_ = nullptr;
+        }
+        if (h_tree_ancestor_mask_) {
+            cudaFreeHost(h_tree_ancestor_mask_);
+            h_tree_ancestor_mask_ = nullptr;
+        }
+        if (h_tree_parent_) {
+            cudaFreeHost(h_tree_parent_);
+            h_tree_parent_ = nullptr;
+        }
         for (int m = 0; m <= 8; m++) {
             if (batch_graph_exec_[m]) {
                 cudaGraphExecDestroy(batch_graph_exec_[m]);
@@ -3431,6 +3803,14 @@ public:
                 cudaGraphDestroy(batch_graph_[m]);
                 batch_graph_[m] = nullptr;
             }
+        }
+        if (tree_graph_exec_) {
+            cudaGraphExecDestroy(tree_graph_exec_);
+            tree_graph_exec_ = nullptr;
+        }
+        if (tree_graph_) {
+            cudaGraphDestroy(tree_graph_);
+            tree_graph_ = nullptr;
         }
         if (step_topk_host_) {
             cudaFreeHost(step_topk_host_);
@@ -3909,8 +4289,9 @@ public:
             }
         }
 
-        // Auto-load Direct Vision Tower if available in manifest and no delegate is configured
+        // Auto-configure Direct Vision Tower if available in manifest and no delegate is configured
         has_vision_ = false;
+        vision_tower_cfg_.available = false;
         bool vision_flag = (manifest.contains("model_config") && manifest["model_config"].value("has_vision", false)) ||
                            manifest.contains("visual_config") ||
                            manifest.contains("vision_bin") ||
@@ -3942,15 +4323,18 @@ public:
                 }
 
                 int output_dim = cfg_.hidden_size; // 4096 for DeepSeek, 5120 for Qwen, 2048 for Qwen2.5-VL
-                LOG_INFO("[Vision] Vision configuration detected in manifest. Loading Vision Tower (output_dim=%d)...", output_dim);
-                vision_tower_ = std::make_unique<moecher::vision::QwenVisionTower>();
-                if (vision_tower_->load_from_manifest(dense_full, manifest["dense_tensors"], cublas_handle_, main_stream_, output_dim, vision_full, bridge_full, embed_mean_full)) {
-                    has_vision_ = true;
-                    LOG_INFO("[Vision] Vision Tower successfully loaded and operational! (num_blocks=%d, 576 tokens output x %d dim)", vision_tower_->num_blocks_, output_dim);
-                } else {
-                    LOG_WARN("[Vision] Failed to load Vision Tower weights. Disabling vision capabilities.");
-                    vision_tower_.reset();
-                }
+                
+                // Save configuration for on-demand lazy loading (zero VRAM overhead during text chat)
+                vision_tower_cfg_.available = true;
+                vision_tower_cfg_.dense_path = dense_full;
+                vision_tower_cfg_.tensor_map = manifest["dense_tensors"];
+                vision_tower_cfg_.vision_bin = vision_full;
+                vision_tower_cfg_.bridge_bin = bridge_full;
+                vision_tower_cfg_.embed_mean_bin = embed_mean_full;
+                vision_tower_cfg_.output_dim = output_dim;
+                has_vision_ = true;
+
+                LOG_INFO("[Vision] Vision configuration detected in manifest. Enabled on-demand Vision Tower (zero VRAM at startup; loads ~990 MB only when an image is processed).");
             }
         } else if (!enable_vision_ && vision_flag) {
             LOG_INFO("[Vision] Vision Tower explicitly disabled via --no-vision flag (saves ~990 MB VRAM).");
@@ -5210,8 +5594,107 @@ public:
 
                 bool is_pld = false;
                 bool is_mtp = false;
+                bool is_tree = false;
+                TreeTopology tree_top;
 
-                // Priority 1: MTP Self-Drafter (trained neural speculative drafter for Qwen)
+                // Priority 1: MTP Tree Attention Self-Drafter (candidate tree: tree_nodes_ branches)
+                if (cfg_.architecture == ModelArch::QWEN && enable_mtp_ && enable_tree_mtp_ && mtp_drafter_.loaded_) {
+                    auto t0 = std::chrono::steady_clock::now();
+                    is_tree = mtp_drafter_.draft_tree_tokens(buf_hidden2_.bf16(), next_token, position, tree_top, main_stream_, tree_nodes_);
+                    auto t1 = std::chrono::steady_clock::now();
+                    total_draft_ms += std::chrono::duration<double, std::milli>(t1 - t0).count();
+                }
+
+                // If Tree drafting was successful, verify candidate tree on Target model
+                int tree_M = tree_top.num_nodes;
+                if (is_tree && tree_M >= 2) {
+                    auto tv0 = std::chrono::steady_clock::now();
+                    forward_token_tree_qwen(tree_top, position);
+
+                    // Compute argmax across all tree nodes
+                    argmax_f32_batch_cuda(buf_argmax_out_batch_.i32(), buf_logits_batch_.f32(), cfg_.vocab_size, tree_M, main_stream_);
+
+                    static int32_t* host_tree_preds = nullptr;
+                    if (!host_tree_preds) {
+                        CUDA_CHECK(cudaMallocHost(&host_tree_preds, 16 * sizeof(int32_t)));
+                    }
+                    CUDA_CHECK(cudaMemcpyAsync(host_tree_preds, buf_argmax_out_batch_.i32(), tree_M * sizeof(int32_t), cudaMemcpyDeviceToHost, main_stream_));
+                    CUDA_CHECK(cudaStreamSynchronize(main_stream_));
+                    auto tv1 = std::chrono::steady_clock::now();
+                    double ver_ms = std::chrono::duration<double, std::milli>(tv1 - tv0).count();
+                    total_verify_ms += ver_ms;
+                    if (spec_cycles < 5) {
+                        LOG_INFO("TREE VERIFY TIMING: cycle=%d nodes=%d took %.2fms (graph=%d)",
+                                 spec_cycles, tree_M, ver_ms, (int)tree_graph_captured_);
+                    }
+
+                    // Resolve longest verified path
+                    TreeVerificationResult vres = resolve_tree_longest_path(
+                        tree_top, host_tree_preds,
+                        cfg_.eos_token_id, eos2_id,
+                        think_start_id, think_end_id, enable_thinking);
+
+                    if (spec_cycles < 5) {
+                        LOG_INFO("TREE DEBUG: cycle=%d accepted=%d last_node=%d bonus=%d winning_slots=%zu",
+                                 spec_cycles, vres.accepted_count, vres.last_accepted_node,
+                                 vres.bonus_token, vres.winning_slots.size());
+                    }
+
+                    // Emit accepted draft tokens to user output
+                    for (int k = 0; k < vres.accepted_count; k++) {
+                        if (!emit_token_cpu(vres.accepted_tokens[k], t)) {
+                            finish_reason = "stop";
+                            break;
+                        }
+                    }
+
+                    if (finish_reason == "stop") break;
+
+                    spec_cycles++;
+                    spec_drafted += (tree_M - 1);
+                    spec_accepted += vres.accepted_count;
+
+                    // 1. KV cache compaction for GQA layers (moves winning path KV entries to contiguous slots)
+                    if (!vres.winning_slots.empty()) {
+                        compact_tree_kv_all_gqa_layers(vres.winning_slots.data(), position, (int)vres.winning_slots.size());
+                    }
+
+                    // 2. Commit DeltaNet SSM state of winning path
+                    commit_target_state_slot(vres.last_accepted_node);
+
+                    // 3. Save post-norm hidden state from last accepted node for next MTP draft cycle
+                    CUDA_CHECK(cudaMemcpyAsync(buf_hidden2_.bf16(),
+                                               buf_hidden_batch_.bf16() + (size_t)vres.last_accepted_node * cfg_.hidden_size,
+                                               cfg_.hidden_size * sizeof(__nv_bfloat16),
+                                               cudaMemcpyDeviceToDevice, main_stream_));
+
+                    // 4. Bonus token becomes next_token for next cycle (or sample if temperature > 0 and at root)
+                    if (vres.bonus_token >= 0 && (temperature <= 0.0f || vres.accepted_count > 0)) {
+                        next_token = vres.bonus_token;
+                    } else {
+                        CUDA_CHECK(cudaMemcpyAsync(buf_logits_.f32(),
+                                                   buf_logits_batch_.f32() + (size_t)vres.last_accepted_node * cfg_.vocab_size,
+                                                   cfg_.vocab_size * sizeof(float),
+                                                   cudaMemcpyDeviceToDevice, main_stream_));
+                        CUDA_CHECK(cudaStreamSynchronize(main_stream_));
+                        argmax_cache_valid_ = false;
+                        next_token = sample_token(temperature, history, content_tokens_generated, in_think_block,
+                                                  top_k, top_p, min_p);
+                    }
+
+                    int advanced = 1 + vres.accepted_count;
+                    position += advanced;
+                    decode_step_idx_ += advanced;
+
+                    if (vres.accepted_count == 0) {
+                        draft_streak = 0;
+                    } else {
+                        draft_streak = std::min(draft_streak + vres.accepted_count, 6);
+                    }
+                    continue;
+                }
+
+                // Priority 1b: Linear MTP Self-Drafter (fallback if tree drafting disabled/unloaded)
                 if (cfg_.architecture == ModelArch::QWEN && enable_mtp_ && mtp_drafter_.loaded_) {
                     bool in_tool_call = false;
                     size_t last_tc_open = generated_text.rfind("<tool_call>");
@@ -5509,8 +5992,8 @@ public:
         if (has_vision_delegate()) {
             return vision_delegate_engine_->describe_image(image_b64, user_query);
         }
-        if (!has_vision_ || !vision_tower_) {
-            LOG_WARN("[Vision Delegate] describe_image called but vision tower is not active!");
+        if (!has_vision_ || !ensure_vision_loaded()) {
+            LOG_WARN("[Vision Delegate] describe_image called but vision tower could not be loaded!");
             return "";
         }
 
@@ -5588,6 +6071,10 @@ public:
             visual_start_pos,
             visual_num_tokens
         );
+
+        if (gpu_caps_.is_vram_constrained) {
+            unload_vision_tower();
+        }
 
         while (!perception.empty() && (perception.front() == ' ' || perception.front() == '\n' || perception.front() == '\r')) {
             perception.erase(perception.begin());
@@ -6000,7 +6487,9 @@ private:
                 CUDA_CHECK(cudaMemset(target_conv_pool_.data, 0, target_conv_pool_.size_bytes));
 
                 int num_slots;
-                if (mtp_k_ == 1 || (mtp_k_ == 0 && gpu_caps_.is_vram_constrained)) {
+                if (enable_tree_mtp_ && enable_mtp_) {
+                    num_slots = gpu_caps_.is_vram_constrained ? std::min(8, tree_nodes_ + 1) : 8;
+                } else if (mtp_k_ == 1 || (mtp_k_ == 0 && gpu_caps_.is_vram_constrained)) {
                     num_slots = 1;
                 } else if (mtp_k_ > 1) {
                     num_slots = std::min(8, mtp_k_);
@@ -6171,6 +6660,9 @@ private:
         buf_linear_b_batch_.alloc(max_batch_m * 64 * sizeof(__nv_bfloat16));
         buf_logits_batch_.alloc((size_t)std::min(max_batch_m, 8) * cfg_.vocab_size * sizeof(float));
         buf_argmax_out_batch_.alloc(max_batch_m * sizeof(int32_t));
+        buf_tree_ancestor_mask_.alloc(8 * sizeof(uint64_t));
+        buf_tree_parent_indices_.alloc(8 * sizeof(int32_t));
+        buf_tree_winning_slots_.alloc(8 * sizeof(int32_t));
 
         // Compressor working buffers
         // Max projection output size: coff=2 for ratio=4, head_dim=512 -> 1024
@@ -7103,7 +7595,7 @@ private:
         }
     }
 
-    void forward_layer_qwen_batch(int layer_id, int position, int M) {
+    void forward_layer_qwen_batch(int layer_id, int position, int M, bool is_tree = false) {
         auto& lw = layers_[layer_id];
         int dim = cfg_.hidden_size;
         int n_q_heads = cfg_.num_attention_heads;
@@ -7227,30 +7719,65 @@ private:
                 t2 = std::chrono::high_resolution_clock::now();
             }
 
-            // DeltaNet SSM recurrence across M tokens (fully batched, zero intermediate VRAM roundtrips)
-            deltanet_linear_attention_decode_batch_cuda(
-                buf_attn_out_batch_.bf16(),
-                buf_q_batch_.bf16(),
-                buf_up_batch_.bf16(),
-                buf_linear_a_batch_.bf16(),
-                buf_linear_b_batch_.bf16(),
-                lw.conv1d_w.bf16(),
-                lw.conv_state.bf16(),
-                lw.conv_state.bf16(),
-                (M > 1 && M <= 4) ? lw.conv_state_slots[0].bf16() : nullptr,
-                (M > 2 && M <= 4) ? lw.conv_state_slots[1].bf16() : nullptr,
-                (M > 3 && M <= 4) ? lw.conv_state_slots[2].bf16() : nullptr,
-                (M > 4 && M <= 4) ? lw.conv_state_slots[3].bf16() : nullptr,
-                lw.A_log.bf16(),
-                lw.dt_bias.bf16(),
-                lw.linear_norm_w.bf16(),
-                lw.ssm_state.bf16(),
-                lw.ssm_state.bf16(),
-                (M > 1 && M <= 4) ? lw.ssm_state_slots[0].bf16() : nullptr,
-                (M > 2 && M <= 4) ? lw.ssm_state_slots[1].bf16() : nullptr,
-                (M > 3 && M <= 4) ? lw.ssm_state_slots[2].bf16() : nullptr,
-                (M > 4 && M <= 4) ? lw.ssm_state_slots[3].bf16() : nullptr,
-                16, 48, 128, M, main_stream_);
+            if (is_tree) {
+                deltanet_linear_attention_tree_cuda(
+                    buf_attn_out_batch_.bf16(),
+                    buf_q_batch_.bf16(),
+                    buf_up_batch_.bf16(),
+                    buf_linear_a_batch_.bf16(),
+                    buf_linear_b_batch_.bf16(),
+                    lw.conv1d_w.bf16(),
+                    lw.conv_state.bf16(),
+                    lw.conv_state.bf16(),
+                    lw.conv_state_slots[0].bf16(),
+                    lw.conv_state_slots[1].bf16(),
+                    lw.conv_state_slots[2].bf16(),
+                    lw.conv_state_slots[3].bf16(),
+                    lw.conv_state_slots[4].bf16(),
+                    lw.conv_state_slots[5].bf16(),
+                    lw.conv_state_slots[6].bf16(),
+                    lw.conv_state_slots[7].bf16(),
+                    lw.A_log.bf16(),
+                    lw.dt_bias.bf16(),
+                    lw.linear_norm_w.bf16(),
+                    lw.ssm_state.bf16(),
+                    lw.ssm_state.bf16(),
+                    lw.ssm_state_slots[0].bf16(),
+                    lw.ssm_state_slots[1].bf16(),
+                    lw.ssm_state_slots[2].bf16(),
+                    lw.ssm_state_slots[3].bf16(),
+                    lw.ssm_state_slots[4].bf16(),
+                    lw.ssm_state_slots[5].bf16(),
+                    lw.ssm_state_slots[6].bf16(),
+                    lw.ssm_state_slots[7].bf16(),
+                    buf_tree_parent_indices_.i32(),
+                    16, 48, 128, M, main_stream_);
+            } else {
+                // DeltaNet SSM recurrence across M tokens (fully batched, zero intermediate VRAM roundtrips)
+                deltanet_linear_attention_decode_batch_cuda(
+                    buf_attn_out_batch_.bf16(),
+                    buf_q_batch_.bf16(),
+                    buf_up_batch_.bf16(),
+                    buf_linear_a_batch_.bf16(),
+                    buf_linear_b_batch_.bf16(),
+                    lw.conv1d_w.bf16(),
+                    lw.conv_state.bf16(),
+                    lw.conv_state.bf16(),
+                    (M > 1 && M <= 4) ? lw.conv_state_slots[0].bf16() : nullptr,
+                    (M > 2 && M <= 4) ? lw.conv_state_slots[1].bf16() : nullptr,
+                    (M > 3 && M <= 4) ? lw.conv_state_slots[2].bf16() : nullptr,
+                    (M > 4 && M <= 4) ? lw.conv_state_slots[3].bf16() : nullptr,
+                    lw.A_log.bf16(),
+                    lw.dt_bias.bf16(),
+                    lw.linear_norm_w.bf16(),
+                    lw.ssm_state.bf16(),
+                    lw.ssm_state.bf16(),
+                    (M > 1 && M <= 4) ? lw.ssm_state_slots[0].bf16() : nullptr,
+                    (M > 2 && M <= 4) ? lw.ssm_state_slots[1].bf16() : nullptr,
+                    (M > 3 && M <= 4) ? lw.ssm_state_slots[2].bf16() : nullptr,
+                    (M > 4 && M <= 4) ? lw.ssm_state_slots[3].bf16() : nullptr,
+                    16, 48, 128, M, main_stream_);
+            }
 
             if (prof) {
                 cudaStreamSynchronize(main_stream_);
@@ -7465,21 +7992,40 @@ private:
                 t2 = std::chrono::high_resolution_clock::now();
             }
 
-            qwen_gqa_decode_gated_fp8_batch_cuda(
-                buf_attn_out_batch_.bf16(),
-                buf_q_batch_.bf16(),
-                buf_gate_batch_.bf16(),
-                buf_up_batch_.bf16(),
-                lw.gqa_q_norm_w.bf16(),
-                lw.gqa_k_norm_w.bf16(),
-                lw.k_cache_gqa.u8(),
-                lw.v_cache_gqa.u8(),
-                n_q_heads, n_kv_heads, head_dim,
-                buf_input_pos_batch_.data ? buf_input_pos_batch_.i32() : nullptr,
-                position,
-                M,
-                cfg_.max_seq_len,
-                cfg_.rope_theta, cfg_.rms_norm_eps, main_stream_);
+            if (is_tree) {
+                qwen_gqa_decode_tree_fp8_batch_cuda(
+                    buf_attn_out_batch_.bf16(),
+                    buf_q_batch_.bf16(),
+                    buf_gate_batch_.bf16(),
+                    buf_up_batch_.bf16(),
+                    lw.gqa_q_norm_w.bf16(),
+                    lw.gqa_k_norm_w.bf16(),
+                    lw.k_cache_gqa.u8(),
+                    lw.v_cache_gqa.u8(),
+                    n_q_heads, n_kv_heads, head_dim,
+                    buf_input_pos_batch_.data ? buf_input_pos_batch_.i32() : nullptr,
+                    buf_tree_ancestor_mask_.u64(),
+                    position,
+                    M,
+                    cfg_.max_seq_len,
+                    cfg_.rope_theta, cfg_.rms_norm_eps, main_stream_);
+            } else {
+                qwen_gqa_decode_gated_fp8_batch_cuda(
+                    buf_attn_out_batch_.bf16(),
+                    buf_q_batch_.bf16(),
+                    buf_gate_batch_.bf16(),
+                    buf_up_batch_.bf16(),
+                    lw.gqa_q_norm_w.bf16(),
+                    lw.gqa_k_norm_w.bf16(),
+                    lw.k_cache_gqa.u8(),
+                    lw.v_cache_gqa.u8(),
+                    n_q_heads, n_kv_heads, head_dim,
+                    buf_input_pos_batch_.data ? buf_input_pos_batch_.i32() : nullptr,
+                    position,
+                    M,
+                    cfg_.max_seq_len,
+                    cfg_.rope_theta, cfg_.rms_norm_eps, main_stream_);
+            }
 
             if (prof) {
                 cudaStreamSynchronize(main_stream_);
@@ -7649,7 +8195,7 @@ private:
     cudaGraph_t batch_graph_[9] = {nullptr};
     cudaGraphExec_t batch_graph_exec_[9] = {nullptr};
 
-    void forward_token_batch_qwen_device_body(int position, int M, bool compute_logits = true) {
+    void forward_token_batch_qwen_device_body(int position, int M, bool compute_logits = true, bool is_tree = false) {
         int dim = cfg_.hidden_size;
         // 1. Embedding lookup for M tokens
         if (embed_weight_.dtype == "fp4") {
@@ -7686,7 +8232,7 @@ private:
             int n_gqa = 0;
             for (int layer = 0; layer < cfg_.num_hidden_layers; layer++) {
                 auto tl0 = std::chrono::high_resolution_clock::now();
-                forward_layer_qwen_batch(layer, position, M);
+                forward_layer_qwen_batch(layer, position, M, is_tree);
                 cudaStreamSynchronize(main_stream_);
                 auto tl1 = std::chrono::high_resolution_clock::now();
                 float ms = std::chrono::duration<float, std::milli>(tl1 - tl0).count();
@@ -7704,7 +8250,7 @@ private:
                      M, total_ms, M / (total_ms / 1000.0f), n_delta_net, t_delta_net / std::max(1, n_delta_net), t_delta_net, n_gqa, t_gqa / std::max(1, n_gqa), t_gqa);
         } else {
             for (int layer = 0; layer < cfg_.num_hidden_layers; layer++) {
-                forward_layer_qwen_batch(layer, position, M);
+                forward_layer_qwen_batch(layer, position, M, is_tree);
             }
         }
 
@@ -7758,6 +8304,33 @@ private:
             CUDA_CHECK(cudaGraphLaunch(batch_graph_exec_[M], main_stream_));
         } else {
             forward_token_batch_qwen_device_body(position, M);
+        }
+    }
+
+
+    void forward_token_tree_qwen(const TreeTopology& tree, int position) {
+        int M = tree.num_nodes;
+        if (!h_target_batch_tok_) {
+            CUDA_CHECK(cudaMallocHost(&h_target_batch_tok_, 64 * sizeof(int32_t)));
+            CUDA_CHECK(cudaMallocHost(&h_target_batch_pos_, 64 * sizeof(int32_t)));
+            CUDA_CHECK(cudaMallocHost(&h_tree_ancestor_mask_, 64 * sizeof(uint64_t)));
+            CUDA_CHECK(cudaMallocHost(&h_tree_parent_, 64 * sizeof(int32_t)));
+        }
+        for (int m = 0; m < M; m++) {
+            h_target_batch_pos_[m] = position + tree.depth[m];
+            h_target_batch_tok_[m] = tree.tokens[m];
+            h_tree_ancestor_mask_[m] = tree.ancestor_mask[m];
+            h_tree_parent_[m] = tree.parent[m];
+        }
+        CUDA_CHECK(cudaMemcpyAsync(buf_input_pos_batch_.i32(), h_target_batch_pos_, M * sizeof(int32_t), cudaMemcpyHostToDevice, main_stream_));
+        CUDA_CHECK(cudaMemcpyAsync(buf_input_tokens_batch_.i32(), h_target_batch_tok_, M * sizeof(int32_t), cudaMemcpyHostToDevice, main_stream_));
+        CUDA_CHECK(cudaMemcpyAsync(buf_tree_ancestor_mask_.u64(), h_tree_ancestor_mask_, M * sizeof(uint64_t), cudaMemcpyHostToDevice, main_stream_));
+        CUDA_CHECK(cudaMemcpyAsync(buf_tree_parent_indices_.i32(), h_tree_parent_, M * sizeof(int32_t), cudaMemcpyHostToDevice, main_stream_));
+
+        if (M == tree_graph_M_ && tree_graph_captured_) {
+            CUDA_CHECK(cudaGraphLaunch(tree_graph_exec_, main_stream_));
+        } else {
+            forward_token_batch_qwen_device_body(position, M, /*compute_logits=*/true, /*is_tree=*/true);
         }
     }
 
@@ -7818,6 +8391,58 @@ private:
             batch_graph_captured_[M] = true;
             LOG_INFO("Batched Target CUDA Graph (M=%d) instantiated successfully!", M);
         }
+
+        if (enable_tree_mtp_) {
+            int M = std::max(2, std::min(4, tree_nodes_ + 1));
+            tree_graph_M_ = M;
+            LOG_INFO("Warming up and capturing Tree Attention CUDA Graph (nodes=%d, M=%d)...", tree_nodes_, M);
+            std::vector<int32_t> dummy_toks(M, 0);
+            std::vector<int32_t> dummy_pos(M, 0);
+            std::vector<uint64_t> dummy_ancestors(M, 0ULL);
+            std::vector<int32_t> dummy_parents(M, 0);
+
+            for (int m = 0; m < M; m++) {
+                dummy_parents[m] = (m == 0) ? -1 : (m == 3 ? 1 : 0);
+                if (m == 0) dummy_ancestors[m] = 1ULL << 0;
+                else if (m == 1) dummy_ancestors[m] = (1ULL << 0) | (1ULL << 1);
+                else if (m == 2) dummy_ancestors[m] = (1ULL << 0) | (1ULL << 2);
+                else if (m == 3) dummy_ancestors[m] = (1ULL << 0) | (1ULL << 1) | (1ULL << 3);
+            }
+
+            CUDA_CHECK(cudaMemcpy(buf_input_tokens_batch_.i32(), dummy_toks.data(), M * sizeof(int32_t), cudaMemcpyHostToDevice));
+            CUDA_CHECK(cudaMemcpy(buf_input_pos_batch_.i32(), dummy_pos.data(), M * sizeof(int32_t), cudaMemcpyHostToDevice));
+            CUDA_CHECK(cudaMemcpy(buf_tree_ancestor_mask_.u64(), dummy_ancestors.data(), M * sizeof(uint64_t), cudaMemcpyHostToDevice));
+            CUDA_CHECK(cudaMemcpy(buf_tree_parent_indices_.i32(), dummy_parents.data(), M * sizeof(int32_t), cudaMemcpyHostToDevice));
+
+            // Warmup
+            for (int i = 0; i < 3; i++) {
+                forward_token_batch_qwen_device_body(0, M, /*compute_logits=*/true, /*is_tree=*/true);
+            }
+            CUDA_CHECK(cudaStreamSynchronize(main_stream_));
+
+            cudaError_t cap_err = cudaStreamBeginCapture(main_stream_, cudaStreamCaptureModeGlobal);
+            if (cap_err != cudaSuccess) {
+                tree_graph_captured_ = false;
+                LOG_WARN("cudaStreamBeginCapture failed for tree graph: %s", cudaGetErrorString(cap_err));
+            } else {
+                forward_token_batch_qwen_device_body(0, M, /*compute_logits=*/true, /*is_tree=*/true);
+
+                cudaError_t end_err = cudaStreamEndCapture(main_stream_, &tree_graph_);
+                if (end_err != cudaSuccess) {
+                    tree_graph_captured_ = false;
+                    LOG_WARN("cudaStreamEndCapture failed for tree graph: %s", cudaGetErrorString(end_err));
+                } else {
+                    cudaError_t inst_err = cudaGraphInstantiate(&tree_graph_exec_, tree_graph_, nullptr, nullptr, 0);
+                    if (inst_err != cudaSuccess) {
+                        tree_graph_captured_ = false;
+                        LOG_WARN("cudaGraphInstantiate failed for tree graph: %s", cudaGetErrorString(inst_err));
+                    } else {
+                        tree_graph_captured_ = true;
+                        LOG_INFO("Tree Attention CUDA Graph (nodes=%d, M=%d) instantiated successfully!", tree_nodes_, M);
+                    }
+                }
+            }
+        }
     }
 
     inline void checkpoint_target_state() {
@@ -7836,11 +8461,40 @@ private:
 
     inline void commit_target_state_slot(int slot_idx) {
         if (slot_idx < 0 || slot_idx >= 8) return;
-        // DeltaNet SSM batch kernel maintains intermediate rollback slots 0, 1, 2, and 3. Slots >= 4 are not populated.
-        if (slot_idx >= 4) return;
+        if (!enable_tree_mtp_ && slot_idx >= 4) return;
         if (target_ssm_pool_.data && target_ssm_slots_[slot_idx].data) {
             CUDA_CHECK(cudaMemcpyAsync(target_ssm_pool_.data, target_ssm_slots_[slot_idx].data, target_ssm_pool_.size_bytes, cudaMemcpyDeviceToDevice, main_stream_));
             CUDA_CHECK(cudaMemcpyAsync(target_conv_pool_.data, target_conv_slots_[slot_idx].data, target_conv_pool_.size_bytes, cudaMemcpyDeviceToDevice, main_stream_));
+        }
+    }
+
+    inline void compact_tree_kv_all_gqa_layers(const int* winning_slots, int pos_base, int L) {
+        if (L <= 0 || !winning_slots) return;
+        bool needs_compact = false;
+        for (int k = 0; k < L; k++) {
+            if (winning_slots[k] != (k + 1)) {
+                needs_compact = true;
+                break;
+            }
+        }
+        if (!needs_compact) return;
+
+        CUDA_CHECK(cudaMemcpyAsync(buf_tree_winning_slots_.i32(), winning_slots, L * sizeof(int32_t), cudaMemcpyHostToDevice, main_stream_));
+        int n_kv_heads = cfg_.num_key_value_heads;
+        int head_dim = cfg_.head_dim;
+        for (int layer = 0; layer < cfg_.num_hidden_layers; layer++) {
+            auto& lw = layers_[layer];
+            if (!lw.is_linear_attn) {
+                compact_tree_kv_cache_cuda(
+                    lw.k_cache_gqa.u8(),
+                    lw.v_cache_gqa.u8(),
+                    buf_tree_winning_slots_.i32(),
+                    pos_base,
+                    L,
+                    n_kv_heads,
+                    head_dim,
+                    main_stream_);
+            }
         }
     }
 
@@ -13292,6 +13946,33 @@ static void run_server(MoecherEngine& engine, int port, int default_thinking_bud
                 enable_thinking = request["enable_thinking"].get<bool>();
             }
 
+            engine.enable_tree_mtp_ = engine.default_enable_tree_mtp_;
+            engine.tree_nodes_ = engine.default_tree_nodes_;
+            engine.enable_mtp_ = engine.default_enable_mtp_;
+            engine.mtp_k_ = engine.default_mtp_k_;
+            engine.enable_spec_ = engine.default_enable_spec_;
+            if (request.contains("enable_spec") && request["enable_spec"].is_boolean()) {
+                engine.enable_spec_ = request["enable_spec"].get<bool>();
+            }
+            if (request.contains("enable_mtp") && request["enable_mtp"].is_boolean()) {
+                engine.enable_mtp_ = request["enable_mtp"].get<bool>();
+            } else if (request.contains("mtp") && request["mtp"].is_boolean()) {
+                engine.enable_mtp_ = request["mtp"].get<bool>();
+            }
+            if (request.contains("mtp_k") && request["mtp_k"].is_number_integer()) {
+                engine.mtp_k_ = std::clamp(request["mtp_k"].get<int>(), 0, 8);
+            }
+            if (request.contains("tree_mtp") && request["tree_mtp"].is_boolean()) {
+                engine.enable_tree_mtp_ = request["tree_mtp"].get<bool>();
+            } else if (request.contains("enable_tree_mtp") && request["enable_tree_mtp"].is_boolean()) {
+                engine.enable_tree_mtp_ = request["enable_tree_mtp"].get<bool>();
+            }
+            if (request.contains("tree_nodes") && request["tree_nodes"].is_number_integer()) {
+                engine.tree_nodes_ = std::clamp(request["tree_nodes"].get<int>(), 1, 4);
+            } else if (request.contains("tree_branches") && request["tree_branches"].is_number_integer()) {
+                engine.tree_nodes_ = std::clamp(request["tree_branches"].get<int>(), 1, 4);
+            }
+
             if (reasoning_effort == "none") {
                 enable_thinking = false;
                 max_thinking_tokens = 0;
@@ -13508,13 +14189,17 @@ static void run_server(MoecherEngine& engine, int port, int default_thinking_bud
                                 mm_prompt = apply_chat_template_multimodal(current_messages, engine.tokenizer_, enable_thinking, reasoning_effort, tools, engine.has_vision());
                                 prompt = mm_prompt.prompt;
                                 if (engine.has_vision() && !mm_prompt.image_b64.empty() && mm_prompt.visual_start_pos >= 0) {
-                                    moecher::vision::ProcessedImage proc_img;
-                                    LOG_INFO("[Vision] Preprocessing image attachment for multimodal inference (%zu bytes b64)...", mm_prompt.image_b64.size());
-                                    if (moecher::vision::preprocess_image_from_base64(mm_prompt.image_b64, proc_img, 768)) {
-                                        d_vis_out = engine.vision_tower_->forward(proc_img, engine.main_stream_);
-                                        LOG_INFO("[Vision] Vision Tower forward pass complete: 576 visual tokens projected to hidden size %d.", engine.cfg_.hidden_size);
-                                    } else {
-                                        LOG_WARN("[Vision] Failed to decode/preprocess image attachment!");
+                                    if (engine.ensure_vision_loaded()) {
+                                        moecher::vision::ProcessedImage proc_img;
+                                        int img_target_sz = engine.vision_tower_->image_size_;
+                                        LOG_INFO("[Vision] Preprocessing image attachment for multimodal inference (%zu bytes b64, target_size=%d)...",
+                                                 mm_prompt.image_b64.size(), img_target_sz);
+                                        if (moecher::vision::preprocess_image_from_base64(mm_prompt.image_b64, proc_img, img_target_sz)) {
+                                            d_vis_out = engine.vision_tower_->forward(proc_img, engine.main_stream_);
+                                            LOG_INFO("[Vision] Vision Tower forward pass complete: 576 visual tokens projected to hidden size %d.", engine.cfg_.hidden_size);
+                                        } else {
+                                            LOG_WARN("[Vision] Failed to decode/preprocess image attachment!");
+                                        }
                                     }
                                 }
                             }
@@ -13564,6 +14249,10 @@ static void run_server(MoecherEngine& engine, int port, int default_thinking_bud
                                 }
                             }, repetition_penalty, req_thinking, req_thinking_tokens, top_p, min_p, top_k,
                                d_vis_out, mm_prompt.visual_start_pos, mm_prompt.visual_num_tokens, bypass_prefix_cache);
+
+                            if (d_vis_out != nullptr && engine.gpu_caps_.is_vram_constrained) {
+                                engine.unload_vision_tower();
+                            }
 
                             final_finish_reason = engine.last_finish_reason_.empty() ? "stop" : engine.last_finish_reason_;
 
@@ -14368,13 +15057,17 @@ static void run_server(MoecherEngine& engine, int port, int default_thinking_bud
                         mm_prompt = apply_chat_template_multimodal(current_messages, engine.tokenizer_, enable_thinking, reasoning_effort, tools, engine.has_vision());
                         prompt = mm_prompt.prompt;
                         if (engine.has_vision() && !mm_prompt.image_b64.empty() && mm_prompt.visual_start_pos >= 0) {
-                            moecher::vision::ProcessedImage proc_img;
-                            LOG_INFO("[Vision] Preprocessing image attachment for multimodal inference (%zu bytes b64)...", mm_prompt.image_b64.size());
-                            if (moecher::vision::preprocess_image_from_base64(mm_prompt.image_b64, proc_img, 768)) {
-                                d_vis_out = engine.vision_tower_->forward(proc_img, engine.main_stream_);
-                                LOG_INFO("[Vision] Vision Tower forward pass complete: 576 visual tokens projected to hidden size %d.", engine.cfg_.hidden_size);
-                            } else {
-                                LOG_WARN("[Vision] Failed to decode/preprocess image attachment!");
+                            if (engine.ensure_vision_loaded()) {
+                                moecher::vision::ProcessedImage proc_img;
+                                int img_target_sz = engine.vision_tower_->image_size_;
+                                LOG_INFO("[Vision] Preprocessing image attachment for multimodal inference (%zu bytes b64, target_size=%d)...",
+                                         mm_prompt.image_b64.size(), img_target_sz);
+                                if (moecher::vision::preprocess_image_from_base64(mm_prompt.image_b64, proc_img, img_target_sz)) {
+                                    d_vis_out = engine.vision_tower_->forward(proc_img, engine.main_stream_);
+                                    LOG_INFO("[Vision] Vision Tower forward pass complete: 576 visual tokens projected to hidden size %d.", engine.cfg_.hidden_size);
+                                } else {
+                                    LOG_WARN("[Vision] Failed to decode/preprocess image attachment!");
+                                }
                             }
                         }
                     }
@@ -14393,6 +15086,10 @@ static void run_server(MoecherEngine& engine, int port, int default_thinking_bud
                         response_text = engine.generate(prompt, max_tokens, temperature, nullptr, repetition_penalty, req_thinking, req_thinking_tokens, top_p, min_p, top_k,
                                                         d_vis_out, mm_prompt.visual_start_pos, mm_prompt.visual_num_tokens, bypass_prefix_cache);
                         finish_reason = engine.last_finish_reason_;
+
+                        if (d_vis_out != nullptr && engine.gpu_caps_.is_vram_constrained) {
+                            engine.unload_vision_tower();
+                        }
                     }
 
                     if (!g_enable_tools || tools.empty()) {
@@ -14695,11 +15392,15 @@ int main(int argc, char** argv) {
     bool enable_pld = true;
     int pld_draft_tokens = 4;
     bool enable_mtp = true;
+    bool enable_tree_mtp = false;
+    int tree_nodes = 2; // Default 2 alternative branches (Top-1 and Top-2, M=3 total nodes)
     bool enable_spec = true;
 #else
     bool enable_pld = true;
     int pld_draft_tokens = 4;
     bool enable_mtp = true;
+    bool enable_tree_mtp = true;
+    int tree_nodes = 2;
     bool enable_spec = true;
 #endif
     std::string test_prompt = "";
@@ -14727,6 +15428,9 @@ int main(int argc, char** argv) {
             printf("  --ctx, -c <tokens>          Max context length in tokens (default: 65536)\n");
             printf("  --max-seq-len <tokens>      Alias for --ctx\n");
             printf("  --no-mtp, --disable-mtp     Disable MTP self-speculative decoding\n");
+            printf("  --no-tree-mtp               Disable Tree Attention on MTP speculative decoding\n");
+            printf("  --tree-mtp                  Enable Tree Attention on MTP speculative decoding\n");
+            printf("  --tree-nodes <n>            Number of alternative branches for Tree MTP (default: 2, range: 1..4)\n");
             printf("  --mtp-k <n>                 Max MTP draft depth (default: 1 on 16GB GPUs, 4 on >=24GB GPUs)\n");
             printf("  --no-vision                 Disable Vision Tower (saves ~990 MB VRAM on 16GB GPUs)\n");
             printf("  --budget <tokens>           Default thinking budget tokens\n");
@@ -14773,6 +15477,12 @@ int main(int argc, char** argv) {
             enable_pld = false;
         } else if (std::string(argv[i]) == "--no-mtp" || std::string(argv[i]) == "--disable-mtp") {
             enable_mtp = false;
+        } else if (std::string(argv[i]) == "--no-tree-mtp" || std::string(argv[i]) == "--disable-tree-mtp") {
+            enable_tree_mtp = false;
+        } else if (std::string(argv[i]) == "--tree-mtp" || std::string(argv[i]) == "--enable-tree-mtp") {
+            enable_tree_mtp = true;
+        } else if ((std::string(argv[i]) == "--tree-nodes" || std::string(argv[i]) == "--tree-branches") && i + 1 < argc) {
+            tree_nodes = std::clamp(std::stoi(argv[++i]), 1, 4);
         } else if ((std::string(argv[i]) == "--mtp-k" || std::string(argv[i]) == "--mtp-depth") && i + 1 < argc) {
             mtp_k = std::stoi(argv[++i]);
         } else if (std::string(argv[i]) == "--no-vision" || std::string(argv[i]) == "--disable-vision") {
@@ -14844,13 +15554,22 @@ int main(int argc, char** argv) {
     engine.enable_pld_ = enable_pld;
     engine.pld_draft_tokens_ = pld_draft_tokens;
     engine.enable_mtp_ = enable_mtp;
+    engine.default_enable_mtp_ = enable_mtp;
+    engine.enable_tree_mtp_ = enable_tree_mtp;
+    engine.tree_nodes_ = tree_nodes;
     engine.mtp_k_ = mtp_k;
+    engine.default_mtp_k_ = mtp_k;
     engine.enable_spec_ = enable_spec;
+    engine.default_enable_tree_mtp_ = enable_tree_mtp;
+    engine.default_tree_nodes_ = tree_nodes;
+    engine.default_enable_spec_ = enable_spec;
     engine.enable_vision_ = enable_vision;
-    LOG_INFO("Speculative decoding: %s (PLD: %s, MTP: %s, mtp_k=%d)",
+    LOG_INFO("Speculative decoding: %s (PLD: %s, MTP: %s, Tree MTP: %s, tree_nodes=%d, mtp_k=%d)",
              enable_spec ? "enabled" : "disabled",
              enable_pld ? "enabled" : "disabled",
              enable_mtp ? "enabled" : "disabled",
+             enable_tree_mtp ? "enabled" : "disabled",
+             tree_nodes,
              mtp_k);
 
     if (!engine.load(manifest_path, max_vram_gb, dram_cache_gb, expert_dtype_override, buffered_io, max_seq_len_override)) {

@@ -1752,6 +1752,127 @@ let agenticSettings = {
     workspaceDir: ''
 };
 
+// ============================================================================
+// Speculative Decoding (MTP & Tree Attention) Settings
+// ============================================================================
+
+let speculativeSettings = {
+    enableMtp: true,
+    mtpK: 0,
+    enableTreeMtp: true,
+    treeNodes: 2
+};
+
+function loadSpeculativeSettings() {
+    try {
+        const savedMtp = localStorage.getItem('moecher_enable_mtp');
+        if (savedMtp !== null) speculativeSettings.enableMtp = savedMtp === 'true';
+
+        const savedMtpK = localStorage.getItem('moecher_mtp_k');
+        if (savedMtpK !== null) speculativeSettings.mtpK = parseInt(savedMtpK, 10) || 0;
+
+        const savedTreeMtp = localStorage.getItem('moecher_enable_tree_mtp');
+        if (savedTreeMtp !== null) speculativeSettings.enableTreeMtp = savedTreeMtp === 'true';
+
+        const savedTreeNodes = localStorage.getItem('moecher_tree_nodes');
+        if (savedTreeNodes !== null) speculativeSettings.treeNodes = parseInt(savedTreeNodes, 10) || 2;
+
+        const elMtp = document.getElementById('mtp-enabled');
+        if (elMtp) elMtp.checked = speculativeSettings.enableMtp;
+
+        const elMtpK = document.getElementById('mtp-k-select');
+        if (elMtpK) elMtpK.value = String(speculativeSettings.mtpK);
+
+        const elTreeMtp = document.getElementById('tree-mtp-enabled');
+        if (elTreeMtp) elTreeMtp.checked = speculativeSettings.enableTreeMtp;
+
+        const elTreeNodes = document.getElementById('tree-nodes-select');
+        if (elTreeNodes) elTreeNodes.value = String(speculativeSettings.treeNodes);
+
+        updateSpeculativeControls();
+    } catch (e) {
+        console.warn('Could not load speculative settings from localStorage', e);
+    }
+}
+
+function saveSpeculativeSettings() {
+    try {
+        const elMtp = document.getElementById('mtp-enabled');
+        if (elMtp) speculativeSettings.enableMtp = elMtp.checked;
+
+        const elMtpK = document.getElementById('mtp-k-select');
+        if (elMtpK) speculativeSettings.mtpK = parseInt(elMtpK.value, 10) || 0;
+
+        const elTreeMtp = document.getElementById('tree-mtp-enabled');
+        if (elTreeMtp) speculativeSettings.enableTreeMtp = elTreeMtp.checked;
+
+        const elTreeNodes = document.getElementById('tree-nodes-select');
+        if (elTreeNodes) speculativeSettings.treeNodes = parseInt(elTreeNodes.value, 10) || 2;
+
+        localStorage.setItem('moecher_enable_mtp', speculativeSettings.enableMtp);
+        localStorage.setItem('moecher_mtp_k', speculativeSettings.mtpK);
+        localStorage.setItem('moecher_enable_tree_mtp', speculativeSettings.enableTreeMtp);
+        localStorage.setItem('moecher_tree_nodes', speculativeSettings.treeNodes);
+
+        updateSpeculativeControls();
+    } catch (e) {
+        console.warn('Could not save speculative settings to localStorage', e);
+    }
+}
+
+function updateSpeculativeControls() {
+    const elMtp = document.getElementById('mtp-enabled');
+    const elMtpK = document.getElementById('mtp-k-select');
+    const elTreeMtp = document.getElementById('tree-mtp-enabled');
+    const elTreeNodes = document.getElementById('tree-nodes-select');
+
+    const mtpActive = elMtp ? elMtp.checked : true;
+    if (elMtpK) elMtpK.disabled = !mtpActive;
+    if (elTreeMtp) elTreeMtp.disabled = !mtpActive;
+
+    const treeActive = mtpActive && (elTreeMtp ? elTreeMtp.checked : true);
+    if (elTreeNodes) elTreeNodes.disabled = !treeActive;
+
+    const mtpKCont = document.getElementById('mtp-k-container');
+    const treeMtpCont = document.getElementById('tree-mtp-container');
+    const treeNodesCont = document.getElementById('tree-nodes-container');
+
+    if (mtpKCont) {
+        mtpKCont.style.opacity = mtpActive ? '1' : '0.45';
+        mtpKCont.style.pointerEvents = mtpActive ? 'auto' : 'none';
+    }
+    if (treeMtpCont) {
+        treeMtpCont.style.opacity = mtpActive ? '1' : '0.45';
+        treeMtpCont.style.pointerEvents = mtpActive ? 'auto' : 'none';
+    }
+    if (treeNodesCont) {
+        treeNodesCont.style.opacity = treeActive ? '1' : '0.45';
+        treeNodesCont.style.pointerEvents = treeActive ? 'auto' : 'none';
+    }
+
+    const badge = document.getElementById('speculative-mode-badge');
+    if (badge) {
+        if (!mtpActive) {
+            badge.textContent = 'MTP Off';
+            badge.style.color = 'var(--text-secondary, #94a3b8)';
+            badge.style.borderColor = 'rgba(148, 163, 184, 0.3)';
+            badge.style.background = 'rgba(148, 163, 184, 0.1)';
+        } else if (!treeActive) {
+            const kStr = elMtpK && elMtpK.value !== '0' ? `K=${elMtpK.value}` : 'Auto';
+            badge.textContent = `MTP (${kStr})`;
+            badge.style.color = '#a78bfa';
+            badge.style.borderColor = 'rgba(167, 139, 250, 0.35)';
+            badge.style.background = 'rgba(167, 139, 250, 0.15)';
+        } else {
+            const branches = elTreeNodes ? elTreeNodes.value : '2';
+            badge.textContent = `Tree (${branches}B)`;
+            badge.style.color = '#38bdf8';
+            badge.style.borderColor = 'rgba(56, 189, 248, 0.35)';
+            badge.style.background = 'rgba(56, 189, 248, 0.15)';
+        }
+    }
+}
+
 let currentPendingAuth = null;
 
 function getUserMessageText(m) {
@@ -4152,6 +4273,13 @@ async function sendMessage(options = {}) {
                 },
                 max_thinking_tokens: budgetVal,
                 reasoning_effort: isThinking ? reasoningEffort.value : "none",
+                enable_spec: speculativeSettings.enableMtp,
+                enable_mtp: speculativeSettings.enableMtp,
+                mtp: speculativeSettings.enableMtp,
+                mtp_k: speculativeSettings.mtpK,
+                enable_tree_mtp: speculativeSettings.enableMtp && speculativeSettings.enableTreeMtp,
+                tree_mtp: speculativeSettings.enableMtp && speculativeSettings.enableTreeMtp,
+                tree_nodes: speculativeSettings.treeNodes,
                 execution_timeout_sec: agenticSettings.timeoutSec || 60,
                 workspace_boundary_enforced: agenticSettings.boundaryEnforced !== false,
                 require_external_authorization: agenticSettings.requireAuth !== false,
@@ -4890,6 +5018,13 @@ async function sendMessage(options = {}) {
                     temperature: parseFloat(tempSlider.value),
                     stream: true,
                     enable_thinking: false,
+                    enable_spec: speculativeSettings.enableMtp,
+                    enable_mtp: speculativeSettings.enableMtp,
+                    mtp: speculativeSettings.enableMtp,
+                    mtp_k: speculativeSettings.mtpK,
+                    enable_tree_mtp: speculativeSettings.enableMtp && speculativeSettings.enableTreeMtp,
+                    tree_mtp: speculativeSettings.enableMtp && speculativeSettings.enableTreeMtp,
+                    tree_nodes: speculativeSettings.treeNodes,
                     tools: [],
                     client_tool_execution: true
                 };
@@ -9680,6 +9815,7 @@ document.addEventListener('DOMContentLoaded', () => {
     initPreviewPanel();
     initExpertProfileUI();
     initAgenticSettingsUI();
+    loadSpeculativeSettings();
     initSystemPromptSync();
     initModelSelector();
     initMCPUI();

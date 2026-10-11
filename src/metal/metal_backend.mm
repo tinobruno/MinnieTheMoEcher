@@ -4037,3 +4037,135 @@ void quantize_bf16_to_int4_symmetric_cuda(
 {
     (void)out_packed; (void)out_scale; (void)in_bf16; (void)N; (void)K; (void)stream;
 }
+
+// ── Metal Speculative Tree Attention Support (Apple Silicon) ───────────────────
+
+void top2_f32_cuda(
+    int32_t* out_indices,
+    float* out_values,
+    const float* logits,
+    int n,
+    cudaStream_t stream)
+{
+    metal_stream_synchronize(stream);
+    if (n <= 0) return;
+    int best_idx1 = 0, best_idx2 = (n > 1 ? 1 : 0);
+    float best_val1 = logits[0];
+    float best_val2 = (n > 1 ? logits[1] : -1e30f);
+    if (n > 1 && best_val2 > best_val1) {
+        std::swap(best_val1, best_val2);
+        std::swap(best_idx1, best_idx2);
+    }
+    for (int i = 2; i < n; i++) {
+        float val = logits[i];
+        if (val > best_val1) {
+            best_val2 = best_val1; best_idx2 = best_idx1;
+            best_val1 = val; best_idx1 = i;
+        } else if (val > best_val2) {
+            best_val2 = val; best_idx2 = i;
+        }
+    }
+    out_indices[0] = best_idx1; out_indices[1] = best_idx2;
+    out_values[0] = best_val1; out_values[1] = best_val2;
+}
+
+void compact_tree_kv_cache_cuda(
+    uint8_t* k_cache,
+    uint8_t* v_cache,
+    const int32_t* d_winning_slots,
+    int pos_base,
+    int L,
+    int n_kv_heads,
+    int head_dim,
+    cudaStream_t stream)
+{
+    metal_stream_synchronize(stream);
+    if (L <= 0 || !d_winning_slots) return;
+    size_t kv_tok_bytes = (size_t)n_kv_heads * head_dim;
+    for (int l = 0; l < L; l++) {
+        int winning_slot = d_winning_slots[l];
+        int src_pos = pos_base + winning_slot;
+        int dst_pos = pos_base + l;
+        if (src_pos != dst_pos) {
+            std::memcpy(k_cache + (size_t)dst_pos * kv_tok_bytes, k_cache + (size_t)src_pos * kv_tok_bytes, kv_tok_bytes);
+            std::memcpy(v_cache + (size_t)dst_pos * kv_tok_bytes, v_cache + (size_t)src_pos * kv_tok_bytes, kv_tok_bytes);
+        }
+    }
+}
+
+void deltanet_linear_attention_tree_cuda(
+    __nv_bfloat16* out,
+    const __nv_bfloat16* in_qkv,
+    const __nv_bfloat16* in_z,
+    const __nv_bfloat16* in_a,
+    const __nv_bfloat16* in_b,
+    const __nv_bfloat16* conv1d_w,
+    const __nv_bfloat16* in_conv_state,
+    __nv_bfloat16* out_conv_state,
+    __nv_bfloat16* slot_conv_0,
+    __nv_bfloat16* slot_conv_1,
+    __nv_bfloat16* slot_conv_2,
+    __nv_bfloat16* slot_conv_3,
+    __nv_bfloat16* slot_conv_4,
+    __nv_bfloat16* slot_conv_5,
+    __nv_bfloat16* slot_conv_6,
+    __nv_bfloat16* slot_conv_7,
+    const __nv_bfloat16* A_log,
+    const __nv_bfloat16* dt_bias,
+    const __nv_bfloat16* norm_w,
+    const __nv_bfloat16* in_ssm_state,
+    __nv_bfloat16* out_ssm_state,
+    __nv_bfloat16* slot_ssm_0,
+    __nv_bfloat16* slot_ssm_1,
+    __nv_bfloat16* slot_ssm_2,
+    __nv_bfloat16* slot_ssm_3,
+    __nv_bfloat16* slot_ssm_4,
+    __nv_bfloat16* slot_ssm_5,
+    __nv_bfloat16* slot_ssm_6,
+    __nv_bfloat16* slot_ssm_7,
+    const int32_t* d_parent_indices,
+    int num_k_heads,
+    int num_v_heads,
+    int head_dim,
+    int M,
+    cudaStream_t stream)
+{
+    (void)slot_conv_4; (void)slot_conv_5; (void)slot_conv_6; (void)slot_conv_7;
+    (void)slot_ssm_4; (void)slot_ssm_5; (void)slot_ssm_6; (void)slot_ssm_7;
+    (void)d_parent_indices;
+    deltanet_linear_attention_decode_batch_cuda(
+        out, in_qkv, in_z, in_a, in_b,
+        conv1d_w, in_conv_state, out_conv_state,
+        slot_conv_0, slot_conv_1, slot_conv_2, slot_conv_3,
+        A_log, dt_bias, norm_w, in_ssm_state, out_ssm_state,
+        slot_ssm_0, slot_ssm_1, slot_ssm_2, slot_ssm_3,
+        num_k_heads, num_v_heads, head_dim, M, stream);
+}
+
+void qwen_gqa_decode_tree_fp8_batch_cuda(
+    __nv_bfloat16* out,
+    const __nv_bfloat16* q_and_gate,
+    __nv_bfloat16* k,
+    const __nv_bfloat16* v,
+    const __nv_bfloat16* q_norm_w,
+    const __nv_bfloat16* k_norm_w,
+    uint8_t* k_cache,
+    uint8_t* v_cache,
+    int n_q_heads,
+    int n_kv_heads,
+    int head_dim,
+    const int32_t* d_pos,
+    const uint64_t* d_ancestor_mask,
+    int pos_base,
+    int M,
+    int max_seq_len,
+    float rope_theta,
+    float eps,
+    cudaStream_t stream)
+{
+    (void)d_ancestor_mask;
+    qwen_gqa_decode_gated_fp8_batch_cuda(
+        out, q_and_gate, k, v, q_norm_w, k_norm_w,
+        k_cache, v_cache, n_q_heads, n_kv_heads, head_dim,
+        d_pos, pos_base, M, max_seq_len, rope_theta, eps, stream);
+}

@@ -38,9 +38,14 @@
                 <summary>Performance Stats</summary>
 
                 <div class="stats-group">
-                    <div class="stats-group-title">
-                        <span class="material-symbols-outlined stat-icon">bolt</span>
-                        <span>Last Message</span>
+                    <div class="stats-group-title" style="display: flex; justify-content: space-between; align-items: center;">
+                        <div style="display: flex; align-items: center; gap: 6px;">
+                            <span class="material-symbols-outlined stat-icon">bolt</span>
+                            <span>Last Message</span>
+                        </div>
+                        <span id="speculative-mode-badge" onclick="openSettingsPanel('settings-tab-general')" style="cursor: pointer; font-size: 10px; padding: 2px 7px; border-radius: 4px; background: rgba(56, 189, 248, 0.15); color: #38bdf8; border: 1px solid rgba(56, 189, 248, 0.3); font-weight: 500;" title="Click to adjust MTP & Tree Speculative parameters in Settings">
+                            Tree (2B)
+                        </span>
                     </div>
                     <div class="stats-grid">
                         <div class="stat-card">
@@ -873,6 +878,53 @@
                                     <input type="checkbox" id="sidebar-fast-media-search" checked onchange="syncFastMediaSearchToggle(this.checked)">
                                     Fast Media / YouTube (0 Cost)
                                 </label>
+                            </div>
+                        </div>
+
+                        <!-- Speculative Decoding (MTP & Tree Attention) Settings Card -->
+                        <div class="agentic-card" style="margin-top: 14px; border: 1px solid rgba(56, 189, 248, 0.35);">
+                            <div class="agentic-card-header">
+                                <span class="material-symbols-outlined agentic-card-icon" style="color: #38bdf8;">bolt</span>
+                                <div class="agentic-card-title-group">
+                                    <h4>Speculative Decoding (MTP &amp; Tree)</h4>
+                                    <p class="agentic-subtitle">MTP self-drafter, drafting depth (mtp-k), and Tree Attention multi-branch verification</p>
+                                </div>
+                            </div>
+
+                            <div class="setting-item" style="margin-top: 10px;">
+                                <label class="checkbox-label" title="Enable MTP (Multi-Token Prediction) self-speculative draft layer">
+                                    <input type="checkbox" id="mtp-enabled" checked onchange="updateSpeculativeControls(); saveSpeculativeSettings();">
+                                    Enable MTP Speculation (mtp)
+                                </label>
+                            </div>
+
+                            <div class="setting-item" id="mtp-k-container">
+                                <label for="mtp-k-select">MTP Draft Depth (mtp-k)</label>
+                                <select id="mtp-k-select" class="select-input" onchange="saveSpeculativeSettings()">
+                                    <option value="0" selected>Auto (1 for 16GB, 4 for ≥24GB)</option>
+                                    <option value="1">K=1 (Single draft token)</option>
+                                    <option value="2">K=2 (Two draft tokens)</option>
+                                    <option value="3">K=3 (Three draft tokens)</option>
+                                    <option value="4">K=4 (Four draft tokens)</option>
+                                </select>
+                                <small style="color: var(--text-secondary); font-size: 11px; margin-top: 4px; display: block;">Maximum sequential drafting depth per speculative cycle.</small>
+                            </div>
+
+                            <div class="setting-item" id="tree-mtp-container">
+                                <label class="checkbox-label" title="Enable Tree Attention to verify multiple speculative candidate paths simultaneously">
+                                    <input type="checkbox" id="tree-mtp-enabled" checked onchange="updateSpeculativeControls(); saveSpeculativeSettings();">
+                                    Enable Tree Attention (tree-mtp)
+                                </label>
+                            </div>
+
+                            <div class="setting-item" id="tree-nodes-container">
+                                <label for="tree-nodes-select">Tree Topology / Branches (tree-nodes)</label>
+                                <select id="tree-nodes-select" class="select-input" onchange="saveSpeculativeSettings()">
+                                    <option value="1">1 Branch (Top-1 only, M=2, ~50ms verify)</option>
+                                    <option value="2" selected>2 Branches (Top-1 + Top-2, M=3, ~65ms verify - Recommended)</option>
+                                    <option value="3">3 Branches (Top-1, Top-2, Depth-2, M=4, ~85ms verify)</option>
+                                </select>
+                                <small style="color: var(--text-secondary); font-size: 11px; margin-top: 4px; display: block;">Number of alternative draft candidate branches verified in parallel.</small>
                             </div>
                         </div>
 

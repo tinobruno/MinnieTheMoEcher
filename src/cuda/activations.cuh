@@ -1277,3 +1277,80 @@ void dequant_int3_to_fp8_block_cuda(
     int N, int K,
     int block_size = 32,
     cudaStream_t stream = 0);
+
+// ── Speculative Tree Attention Kernels ─────────────────────────────────────────
+void top2_f32_cuda(
+    int32_t* out_indices,
+    float* out_values,
+    const float* logits,
+    int n,
+    cudaStream_t stream = 0);
+
+void qwen_gqa_decode_tree_fp8_batch_cuda(
+    __nv_bfloat16* out,
+    const __nv_bfloat16* q_and_gate,
+    __nv_bfloat16* k,
+    const __nv_bfloat16* v,
+    const __nv_bfloat16* q_norm_w,
+    const __nv_bfloat16* k_norm_w,
+    uint8_t* k_cache,
+    uint8_t* v_cache,
+    int n_q_heads,
+    int n_kv_heads,
+    int head_dim,
+    const int32_t* d_pos,
+    const uint64_t* d_ancestor_mask,
+    int pos_base,
+    int M,
+    int max_seq_len,
+    float rope_theta,
+    float eps,
+    cudaStream_t stream = 0);
+
+void deltanet_linear_attention_tree_cuda(
+    __nv_bfloat16* out,
+    const __nv_bfloat16* in_qkv,
+    const __nv_bfloat16* in_z,
+    const __nv_bfloat16* in_a,
+    const __nv_bfloat16* in_b,
+    const __nv_bfloat16* conv1d_w,
+    const __nv_bfloat16* in_conv_state,
+    __nv_bfloat16* out_conv_state,
+    __nv_bfloat16* slot_conv_0,
+    __nv_bfloat16* slot_conv_1,
+    __nv_bfloat16* slot_conv_2,
+    __nv_bfloat16* slot_conv_3,
+    __nv_bfloat16* slot_conv_4,
+    __nv_bfloat16* slot_conv_5,
+    __nv_bfloat16* slot_conv_6,
+    __nv_bfloat16* slot_conv_7,
+    const __nv_bfloat16* A_log,
+    const __nv_bfloat16* dt_bias,
+    const __nv_bfloat16* norm_w,
+    const __nv_bfloat16* in_ssm_state,
+    __nv_bfloat16* out_ssm_state,
+    __nv_bfloat16* slot_ssm_0,
+    __nv_bfloat16* slot_ssm_1,
+    __nv_bfloat16* slot_ssm_2,
+    __nv_bfloat16* slot_ssm_3,
+    __nv_bfloat16* slot_ssm_4,
+    __nv_bfloat16* slot_ssm_5,
+    __nv_bfloat16* slot_ssm_6,
+    __nv_bfloat16* slot_ssm_7,
+    const int32_t* d_parent_indices,
+    int num_k_heads,
+    int num_v_heads,
+    int head_dim,
+    int M,
+    cudaStream_t stream = 0);
+
+void compact_tree_kv_cache_cuda(
+    uint8_t* k_cache,
+    uint8_t* v_cache,
+    const int32_t* d_winning_slots,
+    int pos_base,
+    int L,
+    int n_kv_heads,
+    int head_dim,
+    cudaStream_t stream = 0);
+
