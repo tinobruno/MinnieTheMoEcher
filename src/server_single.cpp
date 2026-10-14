@@ -14680,13 +14680,63 @@ static void run_server(MoecherEngine& engine, int port, int default_thinking_bud
                 } else {
                     if (stream) {
                         time_t now_sec = std::chrono::system_clock::to_time_t(std::chrono::system_clock::now());
-                        std::string sse = "data: {\"id\":\"" + req_id + "\",\"object\":\"chat.completion.chunk\",\"created\":" +
-                                          std::to_string(now_sec) +
-                                          ",\"model\":\"" + model_id + "\",\"choices\":[{\"index\":0,\"delta\":{\"role\":\"assistant\",\"content\":" +
-                                          json(zdb_res.rendered_output).dump() + "},\"finish_reason\":null}]}\n\n" +
-                                          "data: {\"id\":\"" + req_id + "\",\"object\":\"chat.completion.chunk\",\"created\":" +
-                                          std::to_string(now_sec) +
-                                          ",\"model\":\"" + model_id + "\",\"choices\":[{\"index\":0,\"delta\":{},\"finish_reason\":\"stop\"}]}\n\n" +
+                        json usage_obj = {
+                            {"prompt_tokens", zdb_res.prompt_tokens},
+                            {"completion_tokens", 0},
+                            {"total_tokens", zdb_res.prompt_tokens},
+                            {"evaluated_prompt_tokens", zdb_res.prompt_tokens},
+                            {"prefill_sec", zdb_res.prefill_sec},
+                            {"prefill_tps", (zdb_res.prefill_sec > 0.0) ? (double)zdb_res.prompt_tokens / zdb_res.prefill_sec : 0.0},
+                            {"decode_sec", 0.0},
+                            {"decode_tps", 0.0}
+                        };
+                        json zdb_obj = {
+                            {"enabled", true},
+                            {"selected_choice", zdb_res.winning_choice},
+                            {"winning_index", zdb_res.winning_index},
+                            {"confidence", zdb_res.confidence},
+                            {"decode_passes", 0},
+                            {"probabilities", zdb_res.probabilities},
+                            {"arbiter", {
+                                {"gate_passed", zdb_res.gate_passed},
+                                {"system_path", zdb_res.system_path},
+                                {"top1_gap", zdb_res.top1_gap},
+                                {"candidate_margin", zdb_res.candidate_margin},
+                                {"is_choice_top1", zdb_res.is_choice_top1}
+                            }},
+                            {"global_top1", {
+                                {"token_id", zdb_res.global_argmax_token_id},
+                                {"token", zdb_res.global_argmax_token_str},
+                                {"logit", zdb_res.global_argmax_logit},
+                                {"is_candidate", zdb_res.is_choice_top1}
+                            }},
+                            {"timing", {
+                                {"prefill_ms", zdb_res.prefill_sec * 1000.0},
+                                {"total_ms", zdb_res.total_sec * 1000.0}
+                            }}
+                        };
+                        json chunk1 = {
+                            {"id", req_id},
+                            {"object", "chat.completion.chunk"},
+                            {"created", now_sec},
+                            {"model", model_id},
+                            {"choices", json::array({
+                                {{"index", 0}, {"delta", {{"role", "assistant"}, {"content", zdb_res.rendered_output}}}, {"finish_reason", nullptr}}
+                            })}
+                        };
+                        json chunk2 = {
+                            {"id", req_id},
+                            {"object", "chat.completion.chunk"},
+                            {"created", now_sec},
+                            {"model", model_id},
+                            {"choices", json::array({
+                                {{"index", 0}, {"delta", json::object()}, {"finish_reason", "stop"}}
+                            })},
+                            {"usage", usage_obj},
+                            {"zero_decode_bypass", zdb_obj}
+                        };
+                        std::string sse = "data: " + chunk1.dump() + "\n\n" +
+                                          "data: " + chunk2.dump() + "\n\n" +
                                           "data: [DONE]\n\n";
                         res.set_content(sse, "text/event-stream");
                         return;

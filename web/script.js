@@ -1809,7 +1809,7 @@ function saveZdbSettings() {
         if (elMinConf) zdbSettings.minConfidence = parseFloat(elMinConf.value) || 0.70;
 
         const elMaxGap = document.getElementById('zdb-max-top1-gap');
-        if (elMaxGap) zdbSettings.maxTop1Gap = parseFloat(elMaxGap.value) || 0.50;
+        if (elMaxGap) zdbSettings.maxTop1Gap = parseFloat(elMaxGap.value) || 1.50;
 
         localStorage.setItem('moecher_zdb_enabled', String(zdbSettings.enabled));
         localStorage.setItem('moecher_zdb_choices', JSON.stringify(zdbSettings.choices));
@@ -4353,7 +4353,9 @@ async function sendMessage(options = {}) {
         <span class="status-msg-text">${
             isVoiceBypassThinking
                 ? '⚡ Fast voice response (thinking bypassed)'
-                : (isThinking ? 'Thinking and preparing response' : (attachedImg ? 'Analyzing image and preparing response' : 'Preparing response'))
+                : ((zdbSettings && zdbSettings.enabled)
+                    ? '⚡ Zero Decode Bypass: Evaluating step-0 logit distribution...'
+                    : (isThinking ? 'Thinking and preparing response' : (attachedImg ? 'Analyzing image and preparing response' : 'Preparing response')))
         }</span>
         <div class="elaboration-dots"><span></span><span></span><span></span></div>
     `;
@@ -4368,6 +4370,7 @@ async function sendMessage(options = {}) {
     let isReasoningDone = false;
     let turnMediaPreviewLoaded = false;
     let lastRoundContent = "";
+    let turnZdbMetadata = null;
 
     // Engine performance & tool execution timing tracking
     let round1TtftMs = null;
@@ -4382,7 +4385,7 @@ async function sendMessage(options = {}) {
     let turnPrefillTps = 0;
     let turnPrefillSec = 0;
 
-    const maxRounds = agenticSettings.maxToolRounds || 10;
+    const maxRounds = (zdbSettings && zdbSettings.enabled) ? 1 : (agenticSettings.maxToolRounds || 10);
     let round = 0;
     const turnExecutedToolKeys = new Set();
     let turnExecutedSearch = false;
@@ -4543,6 +4546,10 @@ async function sendMessage(options = {}) {
                                 if (data.usage.prompt_tokens_details && data.usage.prompt_tokens_details.cached_tokens !== undefined) {
                                     turnCachedTokens = data.usage.prompt_tokens_details.cached_tokens;
                                 }
+                            }
+
+                            if (data.zero_decode_bypass) {
+                                turnZdbMetadata = data.zero_decode_bypass;
                             }
 
                             if (data.choices && data.choices.length > 0) {
@@ -5063,10 +5070,12 @@ async function sendMessage(options = {}) {
             }
 
             // If the model in synthesis generated an unfulfilled preamble or truncated header but forgot to give the answer:
-            const isUnfulfilledPreamble = ((turnRetrievedDocs.length > 0 || turnExecutedSearch) &&
+            const isUnfulfilledPreamble = !(zdbSettings && zdbSettings.enabled) && !turnZdbMetadata && (
+                ((turnRetrievedDocs.length > 0 || turnExecutedSearch) &&
                 roundContent.trim().length < 140 &&
                 /(?:found it|got it|let me|i'll|i will|going to|one moment|allow me to)\s+(?:fetch|search|check|look|find|get)\b/i.test(roundContent)) ||
-                (round === 1 && roundContent.trim().length > 0 && roundContent.trim().length < 60 && !/[.!?]$/.test(roundContent.trim()) && !validToolCalls.length);
+                (round === 1 && roundContent.trim().length > 0 && roundContent.trim().length < 60 && !/[.!?]$/.test(roundContent.trim()) && !validToolCalls.length)
+            );
 
             if (isUnfulfilledPreamble && round < maxRounds - 1) {
                 console.log('[Agentic Auto-Continuation] Model generated incomplete preamble or truncated header; prompting completion...');
@@ -5303,6 +5312,22 @@ async function sendMessage(options = {}) {
             const summary = reasoningBlock.querySelector('summary');
             if (summary && summary.querySelector('.thinking-spinner')) {
                 summary.innerHTML = 'Thought process';
+            }
+        }
+
+        // Render sleek ZDB confirmation badge if this turn was completed via Zero Decode Bypass
+        if (turnZdbMetadata && turnZdbMetadata.enabled) {
+            const existingBadge = assistantMsgDiv.querySelector('.zdb-completion-badge');
+            if (!existingBadge) {
+                const zdbBadge = document.createElement('div');
+                zdbBadge.className = 'zdb-completion-badge';
+                zdbBadge.style.cssText = 'display: inline-flex; align-items: center; gap: 8px; padding: 6px 12px; margin-top: 10px; border-radius: 8px; font-size: 11px; font-weight: 500; background: rgba(168, 85, 247, 0.12); border: 1px solid rgba(168, 85, 247, 0.35); color: #e9d5ff; font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, monospace;';
+                const confPct = (turnZdbMetadata.confidence * 100).toFixed(1);
+                const latMs = turnZdbMetadata.timing ? turnZdbMetadata.timing.total_ms.toFixed(0) : (totalPrefillMs.toFixed(0));
+                const isSys1 = turnZdbMetadata.arbiter ? turnZdbMetadata.arbiter.gate_passed : (turnZdbMetadata.decode_passes === 0);
+                const gateStr = isSys1 ? '<span style="color: #4ade80;">⚡ System 1 Fast Path</span>' : '<span style="color: #f59e0b;">🔄 System 2 Fallback</span>';
+                zdbBadge.innerHTML = `<b>ZDB</b> | ${gateStr} | Winner: <b style="color: #f8fafc;">${escapeHtml(turnZdbMetadata.selected_choice || lastRoundContent)}</b> (${confPct}% conf) | 0 decodes | ${latMs}ms`;
+                mainContent.appendChild(zdbBadge);
             }
         }
 
