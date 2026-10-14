@@ -1758,7 +1758,10 @@ let agenticSettings = {
 
 let zdbSettings = {
     enabled: false,
-    choices: ["APPROVED", "REJECTED"]
+    choices: ["APPROVED", "REJECTED"],
+    autoFallback: true,
+    minConfidence: 0.70,
+    maxTop1Gap: 0.50
 };
 
 function loadZdbSettings() {
@@ -1776,6 +1779,15 @@ function loadZdbSettings() {
             }
         }
 
+        const savedFallback = localStorage.getItem('moecher_zdb_autofallback');
+        if (savedFallback !== null) zdbSettings.autoFallback = (savedFallback === 'true');
+
+        const savedMinConf = localStorage.getItem('moecher_zdb_minconf');
+        if (savedMinConf !== null) zdbSettings.minConfidence = parseFloat(savedMinConf) || 0.70;
+
+        const savedMaxGap = localStorage.getItem('moecher_zdb_maxgap');
+        if (savedMaxGap !== null) zdbSettings.maxTop1Gap = parseFloat(savedMaxGap) || 0.50;
+
         updateZdbUi();
     } catch (e) {
         console.warn('Could not load ZDB settings from localStorage', e);
@@ -1789,8 +1801,21 @@ function saveZdbSettings() {
             zdbSettings.choices = elInput.value.split(',').map(s => s.trim()).filter(Boolean);
             if (zdbSettings.choices.length === 0) zdbSettings.choices = ["APPROVED", "REJECTED"];
         }
+
+        const elFallback = document.getElementById('zdb-auto-fallback');
+        if (elFallback) zdbSettings.autoFallback = elFallback.checked;
+
+        const elMinConf = document.getElementById('zdb-min-confidence');
+        if (elMinConf) zdbSettings.minConfidence = parseFloat(elMinConf.value) || 0.70;
+
+        const elMaxGap = document.getElementById('zdb-max-top1-gap');
+        if (elMaxGap) zdbSettings.maxTop1Gap = parseFloat(elMaxGap.value) || 0.50;
+
         localStorage.setItem('moecher_zdb_enabled', String(zdbSettings.enabled));
         localStorage.setItem('moecher_zdb_choices', JSON.stringify(zdbSettings.choices));
+        localStorage.setItem('moecher_zdb_autofallback', String(zdbSettings.autoFallback));
+        localStorage.setItem('moecher_zdb_minconf', String(zdbSettings.minConfidence));
+        localStorage.setItem('moecher_zdb_maxgap', String(zdbSettings.maxTop1Gap));
         updateZdbUi();
     } catch (e) {
         console.warn('Could not save ZDB settings to localStorage', e);
@@ -1830,6 +1855,23 @@ function updateZdbUi() {
     const elInput = document.getElementById('zdb-choices-input');
     if (elInput && (!elInput.value || elInput.value.trim() === '')) {
         elInput.value = zdbSettings.choices.join(', ');
+    }
+
+    const elFallback = document.getElementById('zdb-auto-fallback');
+    if (elFallback) elFallback.checked = (zdbSettings.autoFallback !== false);
+
+    const elMinConf = document.getElementById('zdb-min-confidence');
+    const elMinConfVal = document.getElementById('zdb-min-conf-val');
+    if (elMinConf) {
+        elMinConf.value = zdbSettings.minConfidence || 0.70;
+        if (elMinConfVal) elMinConfVal.textContent = elMinConf.value;
+    }
+
+    const elMaxGap = document.getElementById('zdb-max-top1-gap');
+    const elMaxGapVal = document.getElementById('zdb-max-gap-val');
+    if (elMaxGap) {
+        elMaxGap.value = zdbSettings.maxTop1Gap || 0.50;
+        if (elMaxGapVal) elMaxGapVal.textContent = elMaxGap.value;
     }
 
     const elQuickIcon = document.getElementById('zdb-quick-icon');
@@ -4422,10 +4464,15 @@ async function sendMessage(options = {}) {
             if (zdbSettings && zdbSettings.enabled) {
                 payload.zero_decode_bypass = true;
                 payload.choices = (zdbSettings.choices && zdbSettings.choices.length > 0) ? zdbSettings.choices : ["APPROVED", "REJECTED"];
-                payload.enable_thinking = false;
-                payload.reasoning_effort = "none";
-                if (payload.thinking) payload.thinking.type = "disabled";
-                payload.tools = [];
+                payload.auto_fallback = zdbSettings.autoFallback !== false;
+                payload.min_confidence = zdbSettings.minConfidence || 0.70;
+                payload.max_top1_gap = zdbSettings.maxTop1Gap || 0.50;
+                if (!payload.auto_fallback) {
+                    payload.enable_thinking = false;
+                    payload.reasoning_effort = "none";
+                    if (payload.thinking) payload.thinking.type = "disabled";
+                    payload.tools = [];
+                }
             }
 
             const bypassKvCache = !!(agenticSettings.bypassKvCache || document.getElementById('agentic-bypass-kv-cache')?.checked);

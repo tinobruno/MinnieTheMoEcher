@@ -5057,6 +5057,10 @@ public:
         std::string global_argmax_token_str;
         float global_argmax_logit = -1e9f;
         bool is_choice_top1 = false;
+        float top1_gap = 0.0f;           // distance between global argmax logit and best candidate logit
+        float candidate_margin = 0.0f;   // distance between #1 candidate logit and #2 candidate logit
+        bool gate_passed = false;        // true if candidate passes System 1 confidence & alignment arbiter
+        std::string system_path = "system_1_zdb"; // "system_1_zdb" or "system_2_fallback"
         double prefill_sec = 0.0;
         double total_sec = 0.0;
         size_t prompt_tokens = 0;
@@ -5069,7 +5073,9 @@ public:
         const std::vector<std::string>& candidate_choices,
         float temperature = 1.0f,
         const std::string& output_format = "json",
-        bool bypass_prefix_cache = false
+        bool bypass_prefix_cache = false,
+        float min_confidence = 0.70f,
+        float max_top1_gap = 0.5f
     ) {
         ZeroDecodeResult result;
         result.decode_passes = 0;
@@ -5340,6 +5346,27 @@ public:
             result.confidence = result.candidates[result.winning_index].probability;
         }
 
+        // ── Hybrid Arbiter (System 1 vs System 2 Confidence & Alignment) ───────
+        float second_choice_logit = -1e9f;
+        for (size_t c_idx = 0; c_idx < result.candidates.size(); c_idx++) {
+            if ((int)c_idx != result.winning_index && result.candidates[c_idx].raw_logit > second_choice_logit) {
+                second_choice_logit = result.candidates[c_idx].raw_logit;
+            }
+        }
+        result.candidate_margin = max_choice_logit - second_choice_logit;
+
+        if (result.is_choice_top1) {
+            result.top1_gap = 0.0f;
+        } else {
+            result.top1_gap = std::max(0.0f, result.global_argmax_logit - max_choice_logit);
+        }
+
+        // Arbiter gating decision:
+        // Pass System 1 if candidate was global top-1 OR if top1_gap is within tolerance AND confidence >= min_confidence
+        result.gate_passed = (result.is_choice_top1 || result.top1_gap <= max_top1_gap) &&
+                             (result.confidence >= min_confidence);
+        result.system_path = result.gate_passed ? "system_1_zdb" : "system_2_fallback";
+
         auto total_end_time = std::chrono::steady_clock::now();
         result.total_sec = std::chrono::duration<double>(total_end_time - start_time).count();
 
@@ -5354,6 +5381,13 @@ public:
                 {"probabilities", result.probabilities},
                 {"zero_decode_bypass", true},
                 {"decode_passes", 0},
+                {"arbiter", {
+                    {"gate_passed", result.gate_passed},
+                    {"system_path", result.system_path},
+                    {"top1_gap", result.top1_gap},
+                    {"candidate_margin", result.candidate_margin},
+                    {"is_choice_top1", result.is_choice_top1}
+                }},
                 {"global_top1", {
                     {"token_id", result.global_argmax_token_id},
                     {"token", result.global_argmax_token_str},
@@ -14204,6 +14238,9 @@ static void run_server(MoecherEngine& engine, int port, int default_thinking_bud
         float temperature = request.value("temperature", 1.0f);
         std::string format = request.value("format", "json");
         bool bypass_prefix_cache = request.value("bypass_prefix_cache", false);
+        bool auto_fallback = request.value("auto_fallback", false);
+        float min_confidence = request.value("min_confidence", 0.70f);
+        float max_top1_gap = request.value("max_top1_gap", 0.5f);
 
         std::vector<int> prompt;
         if (request.contains("messages") && request["messages"].is_array()) {
@@ -14219,7 +14256,51 @@ static void run_server(MoecherEngine& engine, int port, int default_thinking_bud
         }
 
         std::lock_guard<std::mutex> lock(g_engine_mutex);
-        auto result = engine.execute_zero_decode_bypass(prompt, choices, temperature, format, bypass_prefix_cache);
+        auto result = engine.execute_zero_decode_bypass(prompt, choices, temperature, format, bypass_prefix_cache, min_confidence, max_top1_gap);
+
+        if (auto_fallback && !result.gate_passed) {
+            LOG_INFO("[ZDB-Arbiter] /v1/decide: Gate REJECTED System 1 fast path (top1_gap=%.2f > %.2f, conf=%.2f < %.2f). Falling back to System 2 decode...",
+                     result.top1_gap, max_top1_gap, result.confidence, min_confidence);
+            std::string sys2_text = engine.generate(prompt, 512, temperature);
+            while (!sys2_text.empty() && (sys2_text.front() == ' ' || sys2_text.front() == '\n' || sys2_text.front() == '\r')) sys2_text.erase(0, 1);
+            while (!sys2_text.empty() && (sys2_text.back() == ' ' || sys2_text.back() == '\n' || sys2_text.back() == '\r')) sys2_text.pop_back();
+
+            std::string matched_choice = result.winning_choice;
+            for (const auto& ch : choices) {
+                if (sys2_text.find(ch) != std::string::npos) {
+                    matched_choice = ch;
+                    break;
+                }
+            }
+
+            if (format == "text" || format == "choice") {
+                res.set_content(matched_choice, "text/plain");
+            } else {
+                json out_json = {
+                    {"decision", matched_choice},
+                    {"system_2_output", sys2_text},
+                    {"zero_decode_bypass", false},
+                    {"decode_passes", engine.completion_token_count_},
+                    {"arbiter", {
+                        {"gate_passed", false},
+                        {"system_path", "system_2_fallback"},
+                        {"top1_gap", result.top1_gap},
+                        {"candidate_margin", result.candidate_margin},
+                        {"is_choice_top1", result.is_choice_top1},
+                        {"fallback_triggered", true}
+                    }},
+                    {"global_top1", {
+                        {"token_id", result.global_argmax_token_id},
+                        {"token", result.global_argmax_token_str},
+                        {"logit", result.global_argmax_logit},
+                        {"is_candidate", result.is_choice_top1}
+                    }},
+                    {"probabilities", result.probabilities}
+                };
+                res.set_content(out_json.dump(-1, ' ', false, json::error_handler_t::replace), "application/json");
+            }
+            return;
+        }
 
         if (format == "text" || format == "choice") {
             res.set_content(result.rendered_output, "text/plain");
@@ -14555,67 +14636,93 @@ static void run_server(MoecherEngine& engine, int port, int default_thinking_bud
                     return;
                 }
 
-                std::lock_guard<std::mutex> lock(g_engine_mutex);
+                bool auto_fallback = request.value("auto_fallback", true);
+                float min_confidence = request.value("min_confidence", 0.70f);
+                float max_top1_gap = request.value("max_top1_gap", 0.5f);
                 std::string zdb_format = request.value("format", "choice");
-                // For ZDB in chat completions, apply chat template with thinking disabled
-                auto mm_prompt = apply_chat_template_multimodal(messages, engine.tokenizer_, false, "none", json(), false);
-                std::vector<int> prompt = mm_prompt.prompt;
 
-                auto zdb_res = engine.execute_zero_decode_bypass(prompt, zdb_choices, temperature, zdb_format, bypass_prefix_cache);
+                MoecherEngine::ZeroDecodeResult zdb_res;
+                {
+                    std::lock_guard<std::mutex> lock(g_engine_mutex);
+                    // For ZDB in chat completions, apply chat template with thinking disabled for step-0 logit extraction
+                    auto mm_prompt = apply_chat_template_multimodal(messages, engine.tokenizer_, false, "none", json(), false);
+                    std::vector<int> prompt = mm_prompt.prompt;
+                    zdb_res = engine.execute_zero_decode_bypass(prompt, zdb_choices, temperature, zdb_format, bypass_prefix_cache, min_confidence, max_top1_gap);
+                }
 
-                if (stream) {
-                    time_t now_sec = std::chrono::system_clock::to_time_t(std::chrono::system_clock::now());
-                    std::string sse = "data: {\"id\":\"" + req_id + "\",\"object\":\"chat.completion.chunk\",\"created\":" +
-                                      std::to_string(now_sec) +
-                                      ",\"model\":\"" + model_id + "\",\"choices\":[{\"index\":0,\"delta\":{\"role\":\"assistant\",\"content\":" +
-                                      json(zdb_res.rendered_output).dump() + "},\"finish_reason\":null}]}\n\n" +
-                                      "data: {\"id\":\"" + req_id + "\",\"object\":\"chat.completion.chunk\",\"created\":" +
-                                      std::to_string(now_sec) +
-                                      ",\"model\":\"" + model_id + "\",\"choices\":[{\"index\":0,\"delta\":{},\"finish_reason\":\"stop\"}]}\n\n" +
-                                      "data: [DONE]\n\n";
-                    res.set_content(sse, "text/event-stream");
-                    return;
+                if (auto_fallback && !zdb_res.gate_passed) {
+                    LOG_INFO("[ZDB-Arbiter] Gate REJECTED System 1 fast path (top1_gap=%.2f > %.2f, confidence=%.2f < %.2f, global_argmax='%s' [id=%d]). Falling back to System 2 autoregressive decode.",
+                             zdb_res.top1_gap, max_top1_gap, zdb_res.confidence, min_confidence,
+                             zdb_res.global_argmax_token_str.c_str(), zdb_res.global_argmax_token_id);
+                    // Seamlessly fall through to standard stream/non-stream decode loops below!
                 } else {
-                    json choice = {
-                        {"index", 0},
-                        {"message", {
-                            {"role", "assistant"},
-                            {"content", zdb_res.rendered_output}
-                        }},
-                        {"finish_reason", "stop"}
-                    };
+                    if (stream) {
+                        time_t now_sec = std::chrono::system_clock::to_time_t(std::chrono::system_clock::now());
+                        std::string sse = "data: {\"id\":\"" + req_id + "\",\"object\":\"chat.completion.chunk\",\"created\":" +
+                                          std::to_string(now_sec) +
+                                          ",\"model\":\"" + model_id + "\",\"choices\":[{\"index\":0,\"delta\":{\"role\":\"assistant\",\"content\":" +
+                                          json(zdb_res.rendered_output).dump() + "},\"finish_reason\":null}]}\n\n" +
+                                          "data: {\"id\":\"" + req_id + "\",\"object\":\"chat.completion.chunk\",\"created\":" +
+                                          std::to_string(now_sec) +
+                                          ",\"model\":\"" + model_id + "\",\"choices\":[{\"index\":0,\"delta\":{},\"finish_reason\":\"stop\"}]}\n\n" +
+                                          "data: [DONE]\n\n";
+                        res.set_content(sse, "text/event-stream");
+                        return;
+                    } else {
+                        json choice = {
+                            {"index", 0},
+                            {"message", {
+                                {"role", "assistant"},
+                                {"content", zdb_res.rendered_output}
+                            }},
+                            {"finish_reason", "stop"}
+                        };
 
-                    json response = {
-                        {"id", req_id},
-                        {"object", "chat.completion"},
-                        {"created", std::chrono::system_clock::to_time_t(std::chrono::system_clock::now())},
-                        {"model", model_id},
-                        {"choices", {choice}},
-                        {"usage", {
-                            {"prompt_tokens", zdb_res.prompt_tokens},
-                            {"completion_tokens", 0},
-                            {"total_tokens", zdb_res.prompt_tokens},
-                            {"evaluated_prompt_tokens", zdb_res.prompt_tokens},
-                            {"prefill_sec", zdb_res.prefill_sec},
-                            {"prefill_tps", (zdb_res.prefill_sec > 0.0) ? (double)zdb_res.prompt_tokens / zdb_res.prefill_sec : 0.0},
-                            {"decode_sec", 0.0},
-                            {"decode_tps", 0.0}
-                        }},
-                        {"zero_decode_bypass", {
-                            {"enabled", true},
-                            {"selected_choice", zdb_res.winning_choice},
-                            {"winning_index", zdb_res.winning_index},
-                            {"confidence", zdb_res.confidence},
-                            {"decode_passes", 0},
-                            {"probabilities", zdb_res.probabilities},
-                            {"timing", {
-                                {"prefill_ms", zdb_res.prefill_sec * 1000.0},
-                                {"total_ms", zdb_res.total_sec * 1000.0}
+                        json response = {
+                            {"id", req_id},
+                            {"object", "chat.completion"},
+                            {"created", std::chrono::system_clock::to_time_t(std::chrono::system_clock::now())},
+                            {"model", model_id},
+                            {"choices", {choice}},
+                            {"usage", {
+                                {"prompt_tokens", zdb_res.prompt_tokens},
+                                {"completion_tokens", 0},
+                                {"total_tokens", zdb_res.prompt_tokens},
+                                {"evaluated_prompt_tokens", zdb_res.prompt_tokens},
+                                {"prefill_sec", zdb_res.prefill_sec},
+                                {"prefill_tps", (zdb_res.prefill_sec > 0.0) ? (double)zdb_res.prompt_tokens / zdb_res.prefill_sec : 0.0},
+                                {"decode_sec", 0.0},
+                                {"decode_tps", 0.0}
+                            }},
+                            {"zero_decode_bypass", {
+                                {"enabled", true},
+                                {"selected_choice", zdb_res.winning_choice},
+                                {"winning_index", zdb_res.winning_index},
+                                {"confidence", zdb_res.confidence},
+                                {"decode_passes", 0},
+                                {"probabilities", zdb_res.probabilities},
+                                {"arbiter", {
+                                    {"gate_passed", zdb_res.gate_passed},
+                                    {"system_path", zdb_res.system_path},
+                                    {"top1_gap", zdb_res.top1_gap},
+                                    {"candidate_margin", zdb_res.candidate_margin},
+                                    {"is_choice_top1", zdb_res.is_choice_top1}
+                                }},
+                                {"global_top1", {
+                                    {"token_id", zdb_res.global_argmax_token_id},
+                                    {"token", zdb_res.global_argmax_token_str},
+                                    {"logit", zdb_res.global_argmax_logit},
+                                    {"is_candidate", zdb_res.is_choice_top1}
+                                }},
+                                {"timing", {
+                                    {"prefill_ms", zdb_res.prefill_sec * 1000.0},
+                                    {"total_ms", zdb_res.total_sec * 1000.0}
+                                }}
                             }}
-                        }}
-                    };
-                    res.set_content(response.dump(-1, ' ', false, json::error_handler_t::replace), "application/json");
-                    return;
+                        };
+                        res.set_content(response.dump(-1, ' ', false, json::error_handler_t::replace), "application/json");
+                        return;
+                    }
                 }
             }
 

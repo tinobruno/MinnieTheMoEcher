@@ -24,13 +24,20 @@ class DecisionResult:
     winning_index: int
     prefill_ms: float
     total_ms: float
+    gate_passed: bool = True
+    system_path: str = "system_1_zdb"
+    top1_gap: float = 0.0
+    candidate_margin: float = 0.0
     global_top1_token: Optional[str] = None
     global_top1_logit: Optional[float] = None
+    system_2_output: Optional[str] = None
     raw_response: Dict[str, Any] = field(default_factory=dict)
 
     def __repr__(self) -> str:
         return (f"<DecisionResult: winner='{self.decision}' "
+                f"path={self.system_path} "
                 f"confidence={self.confidence*100:.2f}% "
+                f"gate_passed={self.gate_passed} "
                 f"decode_passes={self.decode_passes} "
                 f"latency={self.total_ms:.1f}ms>")
 
@@ -47,7 +54,10 @@ class MoecherClient:
         prompt: Union[str, List[Dict[str, str]]],
         choices: List[str],
         temperature: float = 1.0,
-        bypass_prefix_cache: bool = False
+        bypass_prefix_cache: bool = False,
+        auto_fallback: bool = False,
+        min_confidence: float = 0.70,
+        max_top1_gap: float = 0.50
     ) -> DecisionResult:
         """
         Executes a Zero Decode Bypass (ZDB) non-autoregressive decision.
@@ -58,6 +68,9 @@ class MoecherClient:
             choices: List of candidate options (e.g. ["APPROVED", "REJECTED"]).
             temperature: Softmax calibration temperature (default: 1.0).
             bypass_prefix_cache: If True, forces fresh prefill without reusing KV cache.
+            auto_fallback: If True, automatically falls back to System 2 decode if Arbiter gate fails.
+            min_confidence: Minimum winning candidate probability to pass System 1 gate.
+            max_top1_gap: Maximum allowed logit distance between global top-1 and choice top-1.
 
         Returns:
             DecisionResult containing the chosen label, confidence, and timings.
@@ -67,7 +80,10 @@ class MoecherClient:
             "choices": choices,
             "temperature": temperature,
             "format": "json",
-            "bypass_prefix_cache": bypass_prefix_cache
+            "bypass_prefix_cache": bypass_prefix_cache,
+            "auto_fallback": auto_fallback,
+            "min_confidence": min_confidence,
+            "max_top1_gap": max_top1_gap
         }
 
         if isinstance(prompt, list):
@@ -99,6 +115,7 @@ class MoecherClient:
         total_ms = timing.get("total_ms", wall_latency_ms)
 
         global_top1 = data.get("global_top1", {})
+        arbiter = data.get("arbiter", {})
 
         return DecisionResult(
             decision=data.get("decision", ""),
@@ -108,8 +125,13 @@ class MoecherClient:
             winning_index=int(data.get("winning_index", -1)),
             prefill_ms=float(prefill_ms),
             total_ms=float(total_ms),
+            gate_passed=bool(arbiter.get("gate_passed", True)),
+            system_path=str(arbiter.get("system_path", "system_1_zdb")),
+            top1_gap=float(arbiter.get("top1_gap", 0.0)),
+            candidate_margin=float(arbiter.get("candidate_margin", 0.0)),
             global_top1_token=global_top1.get("token"),
             global_top1_logit=global_top1.get("logit"),
+            system_2_output=data.get("system_2_output"),
             raw_response=data
         )
 
