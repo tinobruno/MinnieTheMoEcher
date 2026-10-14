@@ -1753,6 +1753,109 @@ let agenticSettings = {
 };
 
 // ============================================================================
+// Zero Decode Bypass (ZDB) Settings & Controls
+// ============================================================================
+
+let zdbSettings = {
+    enabled: false,
+    choices: ["APPROVED", "REJECTED"]
+};
+
+function loadZdbSettings() {
+    try {
+        const savedEnabled = localStorage.getItem('moecher_zdb_enabled');
+        if (savedEnabled !== null) zdbSettings.enabled = (savedEnabled === 'true');
+
+        const savedChoices = localStorage.getItem('moecher_zdb_choices');
+        if (savedChoices) {
+            try {
+                const parsed = JSON.parse(savedChoices);
+                if (Array.isArray(parsed) && parsed.length > 0) zdbSettings.choices = parsed;
+            } catch (_) {
+                zdbSettings.choices = savedChoices.split(',').map(s => s.trim()).filter(Boolean);
+            }
+        }
+
+        updateZdbUi();
+    } catch (e) {
+        console.warn('Could not load ZDB settings from localStorage', e);
+    }
+}
+
+function saveZdbSettings() {
+    try {
+        const elInput = document.getElementById('zdb-choices-input');
+        if (elInput && elInput.value) {
+            zdbSettings.choices = elInput.value.split(',').map(s => s.trim()).filter(Boolean);
+            if (zdbSettings.choices.length === 0) zdbSettings.choices = ["APPROVED", "REJECTED"];
+        }
+        localStorage.setItem('moecher_zdb_enabled', String(zdbSettings.enabled));
+        localStorage.setItem('moecher_zdb_choices', JSON.stringify(zdbSettings.choices));
+        updateZdbUi();
+    } catch (e) {
+        console.warn('Could not save ZDB settings to localStorage', e);
+    }
+}
+
+function toggleZdbMode(enabled) {
+    zdbSettings.enabled = !!enabled;
+    saveZdbSettings();
+}
+
+function toggleZdbQuick() {
+    toggleZdbMode(!zdbSettings.enabled);
+}
+
+function promptZdbChoices() {
+    const current = zdbSettings.choices.join(', ');
+    const userVal = prompt("Enter comma-separated candidate choices for Zero Decode Bypass:", current);
+    if (userVal !== null && userVal.trim().length > 0) {
+        setZdbPreset(userVal);
+    }
+}
+
+function setZdbPreset(presetStr) {
+    const elInput = document.getElementById('zdb-choices-input');
+    if (elInput) elInput.value = presetStr;
+    saveZdbSettings();
+}
+
+function updateZdbUi() {
+    const elEnabled = document.getElementById('zdb-enabled');
+    if (elEnabled) elEnabled.checked = zdbSettings.enabled;
+
+    const elPanel = document.getElementById('zdb-options-panel');
+    if (elPanel) elPanel.style.display = zdbSettings.enabled ? 'block' : 'none';
+
+    const elInput = document.getElementById('zdb-choices-input');
+    if (elInput && (!elInput.value || elInput.value.trim() === '')) {
+        elInput.value = zdbSettings.choices.join(', ');
+    }
+
+    const elQuickIcon = document.getElementById('zdb-quick-icon');
+    const elQuickBtn = document.getElementById('zdb-quick-btn');
+    if (elQuickIcon) {
+        elQuickIcon.style.color = zdbSettings.enabled ? '#c084fc' : '#94a3b8';
+    }
+    if (elQuickBtn) {
+        elQuickBtn.style.background = zdbSettings.enabled ? 'rgba(168, 85, 247, 0.25)' : '';
+        elQuickBtn.style.borderColor = zdbSettings.enabled ? 'rgba(168, 85, 247, 0.5)' : '';
+        elQuickBtn.title = zdbSettings.enabled ?
+            `Zero Decode Bypass ACTIVE (${zdbSettings.choices.join(', ')}) - Click to disable` :
+            'Enable Zero Decode Bypass (Sub-100ms System 1 Decision Mode)';
+    }
+
+    const elBanner = document.getElementById('zdb-active-banner');
+    const elBannerChoices = document.getElementById('zdb-banner-choices');
+    if (elBanner) {
+        elBanner.style.display = zdbSettings.enabled ? 'flex' : 'none';
+    }
+    if (elBannerChoices) {
+        elBannerChoices.textContent = JSON.stringify(zdbSettings.choices);
+    }
+}
+
+// ============================================================================
 // Speculative Decoding (MTP & Tree Attention) Settings
 // ============================================================================
 
@@ -4280,6 +4383,8 @@ async function sendMessage(options = {}) {
                 enable_tree_mtp: speculativeSettings.enableMtp && speculativeSettings.enableTreeMtp,
                 tree_mtp: speculativeSettings.enableMtp && speculativeSettings.enableTreeMtp,
                 tree_nodes: speculativeSettings.treeNodes,
+                zero_decode_bypass: (zdbSettings && zdbSettings.enabled),
+                choices: (zdbSettings && zdbSettings.enabled) ? zdbSettings.choices : undefined,
                 execution_timeout_sec: agenticSettings.timeoutSec || 60,
                 workspace_boundary_enforced: agenticSettings.boundaryEnforced !== false,
                 require_external_authorization: agenticSettings.requireAuth !== false,
@@ -9816,6 +9921,7 @@ document.addEventListener('DOMContentLoaded', () => {
     initExpertProfileUI();
     initAgenticSettingsUI();
     loadSpeculativeSettings();
+    loadZdbSettings();
     initSystemPromptSync();
     initModelSelector();
     initMCPUI();

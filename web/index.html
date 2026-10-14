@@ -300,8 +300,24 @@
                         </div>
                     </div>
 
+                    <!-- Zero Decode Bypass (ZDB) Active Chip / Banner -->
+                    <div id="zdb-active-banner" class="zdb-banner" style="display: none; align-items: center; justify-content: space-between; padding: 6px 12px; margin-bottom: 6px; background: linear-gradient(90deg, rgba(168, 85, 247, 0.2) 0%, rgba(56, 189, 248, 0.1) 100%); border: 1px solid rgba(168, 85, 247, 0.4); border-radius: 8px; font-size: 11px; color: #e9d5ff;">
+                        <div style="display: flex; align-items: center; gap: 6px;">
+                            <span class="material-symbols-outlined" style="font-size: 16px; color: #c084fc;">bolt</span>
+                            <span style="font-weight: 600; color: #fff;">ZDB Mode Active:</span>
+                            <span id="zdb-banner-choices" style="color: #cbd5e1; font-family: monospace;">["APPROVED", "REJECTED"]</span>
+                        </div>
+                        <div style="display: flex; align-items: center; gap: 8px;">
+                            <button type="button" onclick="promptZdbChoices()" style="background: none; border: none; color: #38bdf8; cursor: pointer; font-size: 11px; text-decoration: underline;" title="Edit decision candidate choices">Edit Choices</button>
+                            <button type="button" onclick="toggleZdbMode(false)" style="background: none; border: none; color: #94a3b8; cursor: pointer; font-size: 14px;" title="Disable ZDB">✕</button>
+                        </div>
+                    </div>
+
                     <textarea id="chat-input" placeholder="Enter a prompt here..." rows="1"></textarea>
                     <div class="input-controls">
+                        <button type="button" id="zdb-quick-btn" class="voice-mode-btn" onclick="toggleZdbQuick()" title="Toggle Zero Decode Bypass (Sub-100ms System 1 Decision Mode)">
+                            <span class="material-symbols-outlined" id="zdb-quick-icon" style="color: #94a3b8;">bolt</span>
+                        </button>
                         <button type="button" id="voice-mode-btn" class="voice-mode-btn" onclick="toggleVoiceMode()" title="Toggle Voice Mode (Auto read-aloud responses)">
                             <span class="material-symbols-outlined" id="voice-mode-icon">volume_off</span>
                         </button>
@@ -878,6 +894,38 @@
                                     <input type="checkbox" id="sidebar-fast-media-search" checked onchange="syncFastMediaSearchToggle(this.checked)">
                                     Fast Media / YouTube (0 Cost)
                                 </label>
+                            </div>
+                        </div>
+
+                        <!-- Zero Decode Bypass (ZDB) / Fast Decision Mode Card -->
+                        <div class="agentic-card" style="margin-top: 14px; border: 1px solid rgba(168, 85, 247, 0.45); background: linear-gradient(180deg, rgba(168, 85, 247, 0.05) 0%, rgba(15, 23, 42, 0.4) 100%);">
+                            <div class="agentic-card-header">
+                                <span class="material-symbols-outlined agentic-card-icon" style="color: #c084fc;">bolt</span>
+                                <div class="agentic-card-title-group">
+                                    <h4 style="color: #e9d5ff;">Zero Decode Bypass (ZDB)</h4>
+                                    <p class="agentic-subtitle">Sub-100ms Non-Autoregressive System 1 classification &amp; deterministic routing (0 decode passes)</p>
+                                </div>
+                            </div>
+
+                            <div class="setting-item" style="margin-top: 10px;">
+                                <label class="checkbox-label" title="Enable Zero Decode Bypass (ZDB) for instant decision making without autoregressive decode loops">
+                                    <input type="checkbox" id="zdb-enabled" onchange="toggleZdbMode(this.checked);">
+                                    <span style="font-weight: 600; color: #f3e8ff;">Enable Zero Decode Bypass (ZDB)</span>
+                                </label>
+                            </div>
+
+                            <div id="zdb-options-panel" style="display: none; margin-top: 10px; padding: 10px; background: rgba(0,0,0,0.25); border-radius: 6px; border: 1px dashed rgba(192, 132, 252, 0.3);">
+                                <div class="setting-item">
+                                    <label for="zdb-choices-input" style="font-size: 12px; color: #d8b4fe;">Candidate Choices (comma-separated):</label>
+                                    <input type="text" id="zdb-choices-input" class="text-input" style="font-size: 12px; padding: 6px 10px; width: 100%; border-radius: 4px; border: 1px solid rgba(192, 132, 252, 0.4); background: #0f172a; color: #fff;" value="APPROVED, REJECTED" placeholder="e.g. APPROVED, REJECTED or POSITIVE, NEGATIVE, NEUTRAL" onchange="saveZdbSettings();">
+                                    <small style="color: var(--text-secondary); font-size: 11px; margin-top: 4px; display: block;">Choices will be evaluated at step-zero prefill boundary with 0 decode passes.</small>
+                                </div>
+                                <div style="display: flex; gap: 6px; margin-top: 8px; flex-wrap: wrap;">
+                                    <button type="button" class="btn-preset" style="font-size: 10px; padding: 4px 8px; border-radius: 4px; background: rgba(192, 132, 252, 0.15); border: 1px solid rgba(192, 132, 252, 0.3); color: #e9d5ff; cursor: pointer;" onclick="setZdbPreset('APPROVED, REJECTED');">Preset: Approval</button>
+                                    <button type="button" class="btn-preset" style="font-size: 10px; padding: 4px 8px; border-radius: 4px; background: rgba(192, 132, 252, 0.15); border: 1px solid rgba(192, 132, 252, 0.3); color: #e9d5ff; cursor: pointer;" onclick="setZdbPreset('POSITIVE, NEGATIVE, NEUTRAL');">Preset: Sentiment</button>
+                                    <button type="button" class="btn-preset" style="font-size: 10px; padding: 4px 8px; border-radius: 4px; background: rgba(192, 132, 252, 0.15); border: 1px solid rgba(192, 132, 252, 0.3); color: #e9d5ff; cursor: pointer;" onclick="setZdbPreset('web_search, read_file, fetch_url, none');">Preset: Tool Router</button>
+                                    <button type="button" class="btn-preset" style="font-size: 10px; padding: 4px 8px; border-radius: 4px; background: rgba(192, 132, 252, 0.15); border: 1px solid rgba(192, 132, 252, 0.3); color: #e9d5ff; cursor: pointer;" onclick="setZdbPreset('CRITICAL, HIGH, MEDIUM, LOW');">Preset: Compliance</button>
+                                </div>
                             </div>
                         </div>
 

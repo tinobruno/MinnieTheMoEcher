@@ -13,7 +13,8 @@ Bare-metal C++/CUDA and Apple Metal inference engine for **Qwen 3.8 27B** and **
 - **O_DIRECT SSD Offloading + Pinned DRAM L2 Cache**: Seamless fallback to stream experts from NVMe / DRAM on consumer GPUs (e.g. RTX 3090 24GB).
 - **Cross-Architecture Multi-Model Support**: Safe runtime architectural gating seamlessly running both DeltaNet Transformer (Qwen 3.8) and Sparse MoE + MLA (DeepSeek V4 Flash) on the same unified bare-metal engine.
 - **FrankensTin Vision & Sub-Model Visual Delegation**: High-speed, lightweight vision delegation architecture running native Qwen2.5-VL ViT (32 blocks, 4 full-attention + 28 window-attention blocks) and INT4 delegate decoder in **~3.3 GB VRAM**. Plug-and-play compatible with **any** quantized DeepSeek V4-Flash model, providing 100% accurate OCR and multimodal visual perception with zero fine-tuning of base weights.
-- **Modern Web UI & Interactive Chat Client**: Full-featured Gemini-styled web interface with live HTML sandbox workbench, real-time reasoning traces, stop generation, and live TTFT/throughput telemetry.
+- **Zero Decode Bypass (ZDB) System 1 Non-Autoregressive Engine**: Sub-100ms structured decision making, routing, and classification bypassing 100% of memory-bandwidth-bound decode loops (`completion_tokens = 0`). Delivers **6.5x to 20.3x speedups** over standard autoregressive decoding. See [BENCHMARK_ZERO_DECODE_BYPASS.md](BENCHMARK_ZERO_DECODE_BYPASS.md) and [ARTICLE_FOLLOWUP_ZERO_DECODE_BYPASS.md](ARTICLE_FOLLOWUP_ZERO_DECODE_BYPASS.md).
+- **Modern Web UI & Interactive Chat Client**: Full-featured Gemini-styled web interface with live HTML sandbox workbench, real-time reasoning traces, stop generation, ZDB quick toggle, and live TTFT/throughput telemetry.
 
 ---
 
@@ -289,6 +290,76 @@ curl -s http://localhost:8001/v1/chat/completions \
     }
   }' | jq .
 ```
+
+### 4. Zero Decode Bypass (ZDB) — Sub-100ms System 1 Non-Autoregressive Decisions
+
+Zero Decode Bypass taps logits directly at the prefill boundary (step 0), skipping 100% of memory-bandwidth-bound decode sweeps. Ideal for structured classifications, agentic tool routing, policy guardrails, and deterministic underwriting.
+
+#### Dedicated `/v1/decide` Endpoint:
+```bash
+curl -s http://localhost:8001/v1/decide \
+  -H "Content-Type: application/json" \
+  -d '{
+    "prompt": "Evaluate applicant: Credit Score 790, Income $145,000, DTI 18%, Late Payments 0.\nDecision:",
+    "choices": ["APPROVED", "REJECTED"],
+    "format": "json"
+  }' | jq .
+```
+```json
+{
+  "decision": "APPROVED",
+  "confidence": 0.958,
+  "probabilities": { "APPROVED": 0.958, "REJECTED": 0.042 },
+  "zero_decode_bypass": true,
+  "decode_passes": 0,
+  "timing": { "prefill_ms": 91.6, "total_ms": 91.8 }
+}
+```
+
+#### OpenAI-Compatible API (`/v1/chat/completions`):
+```bash
+curl -s http://localhost:8001/v1/chat/completions \
+  -H "Content-Type: application/json" \
+  -d '{
+    "model": "qwen3.8-27b",
+    "messages": [
+      {"role": "user", "content": "Classify sentiment: This engine is blazing fast!\nSentiment:"}
+    ],
+    "zero_decode_bypass": true,
+    "choices": ["POSITIVE", "NEGATIVE", "NEUTRAL"]
+  }' | jq .
+```
+
+#### Python SDK:
+```python
+from examples.zero_decode_bypass.moecher_zdb_client import MoecherClient
+
+client = MoecherClient("http://127.0.0.1:8001")
+
+# Instant Classification (0 Decode Passes)
+res = client.classify("The package arrived damaged.", ["POSITIVE", "NEGATIVE", "NEUTRAL"])
+print(f"Sentiment: {res.decision} ({res.confidence*100:.1f}%) in {res.total_ms:.1f}ms")
+
+# Instant Agent Tool Router
+tools = {
+    "web_search": "Search live internet for news/quotes",
+    "read_file": "Read filesystem files/logs",
+    "none": "Answer with internal knowledge"
+}
+router = client.route_tool("What is NVDA price today?", tools)
+print(f"Route to: {router.decision} in {router.total_ms:.1f}ms")
+```
+
+#### Empirical Benchmark Results (RTX 5060 Ti / Qwen 27B INT3):
+| Scenario | Choices | ZDB Latency (0 Decodes) | Standard Decode Latency | Speedup Factor | Selected Winner |
+| :--- | :---: | :---: | :---: | :---: | :---: |
+| **Loan Risk Underwriting** | 2 | **293.7 ms** | 3,165.1 ms | **10.78x** | `APPROVED` (95.8%) |
+| **Customer Sentiment Analysis** | 3 | **281.6 ms** | 1,854.2 ms | **6.59x** | `POSITIVE` (90.8%) |
+| **Agent Tool Router** | 4 | **275.8 ms** | 5,592.6 ms | **20.28x** | `web_search` (79.8%) |
+| **Security Risk Audit** | 4 | **287.7 ms** | 1,870.4 ms | **6.50x** | `HIGH` (88.4%) |
+
+*With prefix caching active, hardware engine latency drops to **91.82 ms** (91.6 ms prefill + 0.22 ms slicing).*  
+*Detailed analysis: [BENCHMARK_ZERO_DECODE_BYPASS.md](BENCHMARK_ZERO_DECODE_BYPASS.md) and [ARTICLE_FOLLOWUP_ZERO_DECODE_BYPASS.md](ARTICLE_FOLLOWUP_ZERO_DECODE_BYPASS.md).*
 
 ---
 

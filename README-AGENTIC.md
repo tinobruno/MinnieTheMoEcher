@@ -313,3 +313,31 @@ Returns the server's current working directory and configuration defaults:
   "default_timeout_sec": 60
 }
 ```
+
+---
+
+## Zero Decode Bypass (ZDB) for Ultra-Fast Agent Tool Routing & Guardrails
+
+In multi-agent architectures, agents spend significant latency deciding *which tool to dispatch* or whether a request complies with security policies. Autoregressive generation takes 1,500ms to 5,500ms to output tool choice text.
+
+With **Zero Decode Bypass (ZDB)**, MinnieTheMoEcher performs non-autoregressive logit slicing at the prefill boundary (step 0), returning the optimal tool selection or policy classification in **sub-100ms** on consumer hardware with **0 decode passes**:
+
+```python
+from examples.zero_decode_bypass.moecher_zdb_client import MoecherClient
+
+client = MoecherClient("http://127.0.0.1:8001")
+
+# Sub-100ms Agent Router (20.3x faster than autoregressive decoding)
+tools = {
+    "web_search": "Search live internet for news/quotes",
+    "read_file": "Read filesystem files/logs",
+    "fetch_url": "Download and scrape content from a web URL",
+    "none": "Answer with internal model knowledge"
+}
+
+routing = client.route_tool("What is the stock price of NVDA today?", tools)
+print(f"Tool: {routing.decision} (Confidence: {routing.confidence*100:.1f}%) in {routing.total_ms:.1f}ms")
+```
+
+For more details, see [`BENCHMARK_ZERO_DECODE_BYPASS.md`](BENCHMARK_ZERO_DECODE_BYPASS.md) and [`ARTICLE_FOLLOWUP_ZERO_DECODE_BYPASS.md`](ARTICLE_FOLLOWUP_ZERO_DECODE_BYPASS.md).
+
