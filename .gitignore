@@ -42,6 +42,7 @@ cookie_jar.json
 
 # Scratch scripts & temporary test files
 /*.html
+!ARTICLE_*.html
 scratch_*
 check_gpu.py
 test_*
