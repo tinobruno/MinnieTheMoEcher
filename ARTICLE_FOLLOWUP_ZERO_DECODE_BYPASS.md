@@ -3,6 +3,8 @@
 **By Tino Bruno**  
 *Follow-up to "Demystifying 'System 1' Foundation Models: Reproducing Sub-50ms Non-Autoregressive Speeds in MinnieTheMoEcher"*
 
+![Zero Decode Bypass 20x Faster — LinkedIn Article Cover](graphics/linkedin_cover_zdb.jpg)
+
 ---
 
 ### The Question That Started It All
