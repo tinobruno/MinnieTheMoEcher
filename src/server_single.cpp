@@ -5286,6 +5286,16 @@ public:
                 add_tok(tokenizer_.encode(upper_c));
                 add_tok(tokenizer_.encode(" " + upper_c));
             }
+
+            std::string title_c = choice;
+            if (!title_c.empty()) {
+                title_c[0] = (char)::toupper((unsigned char)title_c[0]);
+                for (size_t i = 1; i < title_c.size(); i++) title_c[i] = (char)::tolower((unsigned char)title_c[i]);
+                if (title_c != choice && title_c != lower_c && title_c != upper_c) {
+                    add_tok(tokenizer_.encode(title_c));
+                    add_tok(tokenizer_.encode(" " + title_c));
+                }
+            }
         }
 
         // Asynchronously copy candidate logits from GPU to CPU

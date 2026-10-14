@@ -3,7 +3,7 @@
 
 $BaseUrl = "http://127.0.0.1:8001"
 
-$PromptGood = @"
+$PromptGood = @'
 Evaluate applicant for loan risk:
 - Applicant: Jane Doe
 - Credit Score: 790
@@ -13,9 +13,9 @@ Evaluate applicant for loan risk:
 - Requested Amount: $15,000
 
 Underwriting Decision:
-"@
+'@
 
-$PromptBad = @"
+$PromptBad = @'
 Evaluate applicant for loan risk:
 - Applicant: Jane Doe
 - Credit Score: 79
@@ -25,9 +25,9 @@ Evaluate applicant for loan risk:
 - Requested Amount: $150,000
 
 Underwriting Decision:
-"@
+'@
 
-$PromptBadWithRule = @"
+$PromptBadWithRule = @'
 Evaluate applicant for loan risk:
 - Applicant: Jane Doe
 - Credit Score: 79
@@ -39,7 +39,7 @@ Evaluate applicant for loan risk:
 Rule: If credit score is below 600 or requested amount exceeds annual income, the decision must be REJECTED.
 
 Underwriting Decision:
-"@
+'@
 
 $Choices = @("APPROVED", "REJECTED")
 
@@ -65,6 +65,7 @@ function Test-ChatCompletion {
         temperature = 0.0
         enable_thinking = $true
         max_tokens = 512
+        bypass_prefix_cache = $true
     }
 
     if ($ZdbEnabled) {
@@ -123,6 +124,7 @@ function Test-DecideEndpoint {
         auto_fallback = $AutoFallback
         min_confidence = 0.70
         max_top1_gap = 0.50
+        bypass_prefix_cache = $true
         format = "json"
     }
 
