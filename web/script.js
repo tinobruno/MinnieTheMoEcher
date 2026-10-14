@@ -3190,6 +3190,24 @@ function resolveCaptchaPrompt(retried) {
 // ============================================================================
 
 function buildOptimizedMessagesPayload() {
+    // In Zero Decode Bypass mode, evaluate the decision query cleanly without multi-turn history or tool schema pollution
+    if (zdbSettings && zdbSettings.enabled) {
+        let lastUserMsg = null;
+        if (typeof chatHistory !== 'undefined' && Array.isArray(chatHistory)) {
+            for (let i = chatHistory.length - 1; i >= 0; i--) {
+                if (chatHistory[i].role === 'user') {
+                    lastUserMsg = chatHistory[i];
+                    break;
+                }
+            }
+        }
+        if (lastUserMsg) {
+            return [
+                { role: "user", content: lastUserMsg.content }
+            ];
+        }
+    }
+
     const messagesToSend = [];
     let sysPrompt = systemPromptInput ? systemPromptInput.value.trim() : '';
     const activeTools = getActiveToolsPayload();
