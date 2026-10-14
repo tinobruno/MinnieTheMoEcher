@@ -99,6 +99,9 @@ When prefix caching is active (e.g., standard agent system prompts and tool defi
 
 We achieved **sub-100 millisecond decision latency on a 27-billion parameter foundation model on a single consumer GPU.**
 
+![Zero Decode Bypass System 1 Fast Path in MinnieTheMoEcher Web UI](graphics/zdb_system1_fast_path.jpg)
+*Figure 1: The Zero Decode Bypass (ZDB) fast path executing a loan underwriting decision non-autoregressively in 379ms with 0 decode passes, 99.8% confidence, and 100% GPU memory bandwidth savings.*
+
 ---
 
 ### The Missing Piece: The Automatic System 1 / System 2 Confidence Arbiter
@@ -178,6 +181,9 @@ flowchart TD
    The engine takes the **System 1 Fast Path**. Logits are sliced, calibrated via softmax, and returned immediately. The GPU executes **0 decode passes**, returning the answer in sub-100ms.
 2. **Gate Rejected ($\Delta_{\text{top1}} > 0.50$ or $\text{Conf} < 0.70$)**:
    The engine takes the **System 2 Fallback**. Because the KV cache is already resident in GPU memory from the prefill step, the engine transitions seamlessly into the autoregressive generation loop without re-evaluating prompt tokens. The model spends tokens thinking, reasoning, and calculating.
+
+![ZDB Hybrid Arbiter System 2 Fallback in MinnieTheMoEcher Web UI](graphics/zdb_system2_arbiter_fallback.jpg)
+*Figure 2: The Hybrid Confidence Arbiter in action. When a complex prompt requires arithmetic verification ($1,500,000 requested loan vs. $14,000 annual income against a 790 credit score), step-0 hesitation is detected ($\Delta_{\text{top1}} = 1.85, \text{Conf} = 59.8\% < 70\%$). The Arbiter intercepts execution and seamlessly diverts to System 2 autoregressive thinking to calculate the ratio and output the correct REJECTED decision.*
 
 #### Empirical Verification: The Complete Underwriting Suite
 
