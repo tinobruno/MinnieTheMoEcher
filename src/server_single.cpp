@@ -5038,6 +5038,343 @@ public:
         snapshot_system_kv(prefix_tokens);
     }
 
+    // ── Zero Decode Bypass (ZDB) Structures & Method ────────────────────────
+
+    struct ZeroDecodeCandidate {
+        std::string choice;
+        std::vector<int> token_ids;
+        float raw_logit = -1e9f;
+        float probability = 0.0f;
+    };
+
+    struct ZeroDecodeResult {
+        int winning_index = -1;
+        std::string winning_choice;
+        float confidence = 0.0f;
+        std::vector<ZeroDecodeCandidate> candidates;
+        std::map<std::string, float> probabilities;
+        int global_argmax_token_id = -1;
+        std::string global_argmax_token_str;
+        float global_argmax_logit = -1e9f;
+        bool is_choice_top1 = false;
+        double prefill_sec = 0.0;
+        double total_sec = 0.0;
+        size_t prompt_tokens = 0;
+        int decode_passes = 0; // strictly 0
+        std::string rendered_output;
+    };
+
+    ZeroDecodeResult execute_zero_decode_bypass(
+        const std::vector<int>& prompt_in,
+        const std::vector<std::string>& candidate_choices,
+        float temperature = 1.0f,
+        const std::string& output_format = "json",
+        bool bypass_prefix_cache = false
+    ) {
+        ZeroDecodeResult result;
+        result.decode_passes = 0;
+        if (prompt_in.empty() || candidate_choices.empty()) {
+            return result;
+        }
+
+        auto start_time = std::chrono::steady_clock::now();
+
+        std::vector<int> prompt = prompt_in;
+        if (prompt.size() > (size_t)cfg_.max_seq_len) {
+            LOG_WARN("[ZDB] Prompt size (%zu) exceeds max_seq_len (%d). Clamping prompt.",
+                     prompt.size(), cfg_.max_seq_len);
+            size_t excess = prompt.size() - (size_t)cfg_.max_seq_len;
+            prompt.erase(prompt.begin(), prompt.begin() + excess);
+        }
+        result.prompt_tokens = prompt.size();
+
+        // ── Prefix Matching against existing KV cache ────────────────────────────
+        size_t prefix_len = 0;
+        if (bypass_prefix_cache) {
+            reset_all_kv_caches();
+            cached_tokens_.clear();
+            turn_kv_snapshot_.valid = false;
+            turn_kv_snapshot_.tokens.clear();
+        } else {
+            while (prefix_len < prompt.size() && prefix_len < cached_tokens_.size() &&
+                   prompt[prefix_len] == cached_tokens_[prefix_len]) {
+                prefix_len++;
+            }
+        }
+
+        bool can_reuse_prefix = (prefix_len > 0);
+        if (cfg_.architecture == ModelArch::DEEPSEEK_V4 && prefix_len < cached_tokens_.size()) {
+            can_reuse_prefix = false;
+            prefix_len = 0;
+        }
+
+        if (!bypass_prefix_cache && !can_reuse_prefix && turn_kv_snapshot_.valid && !turn_kv_snapshot_.tokens.empty()) {
+            size_t turn_len = turn_kv_snapshot_.tokens.size();
+            if (prompt.size() >= turn_len) {
+                bool turn_matches = true;
+                for (size_t i = 0; i < turn_len; i++) {
+                    if (prompt[i] != turn_kv_snapshot_.tokens[i]) {
+                        turn_matches = false;
+                        break;
+                    }
+                }
+                if (turn_matches) {
+                    restore_kv(turn_kv_snapshot_);
+                    prefix_len = turn_len;
+                    can_reuse_prefix = true;
+                }
+            }
+        }
+
+        if (!bypass_prefix_cache && !can_reuse_prefix && system_kv_snapshot_.valid && !system_kv_snapshot_.tokens.empty()) {
+            size_t sys_len = system_kv_snapshot_.tokens.size();
+            if (prompt.size() >= sys_len) {
+                bool sys_matches = true;
+                for (size_t i = 0; i < sys_len; i++) {
+                    if (prompt[i] != system_kv_snapshot_.tokens[i]) {
+                        sys_matches = false;
+                        break;
+                    }
+                }
+                if (sys_matches) {
+                    restore_system_kv();
+                    prefix_len = sys_len;
+                    can_reuse_prefix = true;
+                }
+            }
+        }
+
+        // Ensure at least the last token is forwarded so buf_logits_ is correctly populated
+        if (prefix_len >= prompt.size() && !prompt.empty()) {
+            prefix_len = prompt.size() - 1;
+        }
+
+        if (!can_reuse_prefix || prefix_len == 0) {
+            reset_all_kv_caches();
+            prefix_len = 0;
+        }
+
+        track_current_token_ = false;
+        auto prefill_start_time = std::chrono::steady_clock::now();
+
+        if (prefix_len < prompt.size()) {
+            ensure_prefill_host_capacity(prompt.size());
+            for (size_t i = prefix_len; i < prompt.size(); i++) {
+                h_prefill_tok_[i] = prompt[i];
+                h_prefill_pos_[i] = (int32_t)i;
+            }
+
+            if (!h_single_flag_) {
+                CUDA_CHECK(cudaMallocHost(&h_single_flag_, sizeof(int32_t)));
+            }
+            *h_single_flag_ = 0;
+
+            bool draft_model_active = (!mtp_drafter_.loaded_ && qwen_draft_.loaded_);
+
+            if (cfg_.is_qwen()) {
+                size_t curr = prefix_len;
+                while (curr + 1 < prompt.size()) {
+                    size_t remaining = (prompt.size() - 1) - curr;
+                    int chunk_m = (remaining >= 512) ? 512 : (int)remaining;
+                    CUDA_CHECK(cudaMemcpyAsync(buf_input_pos_batch_.i32(), &h_prefill_pos_[curr],
+                                               chunk_m * sizeof(int32_t), cudaMemcpyHostToDevice, main_stream_));
+                    CUDA_CHECK(cudaMemcpyAsync(buf_input_tokens_batch_.i32(), &h_prefill_tok_[curr],
+                                               chunk_m * sizeof(int32_t), cudaMemcpyHostToDevice, main_stream_));
+                    forward_token_batch_qwen_device_body((int)curr, chunk_m, /*compute_logits=*/false);
+                    if (draft_model_active) {
+                        for (int m = 0; m < chunk_m; m++) {
+                            qwen_draft_.forward_token_async_pinned(&h_prefill_tok_[curr + m],
+                                                                   &h_prefill_pos_[curr + m],
+                                                                   (int)(curr + m), main_stream_);
+                        }
+                    }
+                    curr += chunk_m;
+                }
+
+                if (curr < prompt.size()) {
+                    if (graph_captured_) {
+                        CUDA_CHECK(cudaMemcpyAsync(buf_track_flag_.i32(), h_single_flag_, sizeof(int32_t), cudaMemcpyHostToDevice, main_stream_));
+                        CUDA_CHECK(cudaMemcpyAsync(buf_input_token_.i32(), &h_prefill_tok_[curr], sizeof(int32_t), cudaMemcpyHostToDevice, main_stream_));
+                        CUDA_CHECK(cudaMemcpyAsync(buf_input_pos_.i32(), &h_prefill_pos_[curr], sizeof(int32_t), cudaMemcpyHostToDevice, main_stream_));
+                        CUDA_CHECK(cudaGraphLaunch(graph_exec_, main_stream_));
+                    } else {
+                        forward_token_eager(prompt[curr], (int)curr);
+                    }
+                    if (draft_model_active) {
+                        qwen_draft_.forward_token_async_pinned(&h_prefill_tok_[curr],
+                                                               &h_prefill_pos_[curr],
+                                                               (int)curr, main_stream_);
+                    }
+                }
+            } else {
+                // ModelArch::DEEPSEEK_V4
+                size_t remaining = (prompt.size() > prefix_len) ? (prompt.size() - prefix_len) : 0;
+                if (enable_batched_prefill_ && remaining > 1) {
+                    prefill_prompt_batched_deepseek(prompt, (int)prefix_len);
+                } else {
+                    for (size_t i = prefix_len; i < prompt.size(); i++) {
+                        if (graph_captured_) {
+                            CUDA_CHECK(cudaMemcpyAsync(buf_track_flag_.i32(), h_single_flag_, sizeof(int32_t), cudaMemcpyHostToDevice, main_stream_));
+                            CUDA_CHECK(cudaMemcpyAsync(buf_input_token_.i32(), &h_prefill_tok_[i], sizeof(int32_t), cudaMemcpyHostToDevice, main_stream_));
+                            CUDA_CHECK(cudaMemcpyAsync(buf_input_pos_.i32(), &h_prefill_pos_[i], sizeof(int32_t), cudaMemcpyHostToDevice, main_stream_));
+                            CUDA_CHECK(cudaGraphLaunch(graph_exec_, main_stream_));
+                        } else {
+                            forward_token_eager(prompt[i], (int)i);
+                        }
+                    }
+                }
+            }
+            CUDA_CHECK(cudaStreamSynchronize(main_stream_));
+        }
+
+        auto prefill_end_time = std::chrono::steady_clock::now();
+        result.prefill_sec = std::chrono::duration<double>(prefill_end_time - prefill_start_time).count();
+        cached_tokens_ = prompt;
+
+        // ── Step-Zero Logit Slicing ──────────────────────────────────────────────
+        // Retrieve global unconstrained argmax
+        if (buf_argmax_out_.data) {
+            CUDA_CHECK(cudaMemcpy(&result.global_argmax_token_id, buf_argmax_out_.i32(), sizeof(int32_t), cudaMemcpyDeviceToHost));
+            result.global_argmax_token_str = tokenizer_.decode({result.global_argmax_token_id});
+            if (result.global_argmax_token_id >= 0 && result.global_argmax_token_id < cfg_.vocab_size) {
+                CUDA_CHECK(cudaMemcpy(&result.global_argmax_logit, buf_logits_.f32() + result.global_argmax_token_id, sizeof(float), cudaMemcpyDeviceToHost));
+            }
+        }
+
+        // Map each candidate choice to its token IDs and collect all unique tokens to read
+        result.candidates.resize(candidate_choices.size());
+        std::vector<int> all_tokens_to_read;
+
+        for (size_t c_idx = 0; c_idx < candidate_choices.size(); c_idx++) {
+            const std::string& choice = candidate_choices[c_idx];
+            auto& cand = result.candidates[c_idx];
+            cand.choice = choice;
+
+            auto add_tok = [&](const std::vector<int>& toks) {
+                if (!toks.empty()) {
+                    int t = toks[0];
+                    if (t >= 0 && t < cfg_.vocab_size) {
+                        if (std::find(cand.token_ids.begin(), cand.token_ids.end(), t) == cand.token_ids.end()) {
+                            cand.token_ids.push_back(t);
+                        }
+                        if (std::find(all_tokens_to_read.begin(), all_tokens_to_read.end(), t) == all_tokens_to_read.end()) {
+                            all_tokens_to_read.push_back(t);
+                        }
+                    }
+                }
+            };
+
+            add_tok(tokenizer_.encode(choice));
+            add_tok(tokenizer_.encode(" " + choice));
+
+            std::string lower_c = choice;
+            for (char& ch : lower_c) ch = (char)::tolower((unsigned char)ch);
+            if (lower_c != choice) {
+                add_tok(tokenizer_.encode(lower_c));
+                add_tok(tokenizer_.encode(" " + lower_c));
+            }
+
+            std::string upper_c = choice;
+            for (char& ch : upper_c) ch = (char)::toupper((unsigned char)ch);
+            if (upper_c != choice) {
+                add_tok(tokenizer_.encode(upper_c));
+                add_tok(tokenizer_.encode(" " + upper_c));
+            }
+        }
+
+        // Asynchronously copy candidate logits from GPU to CPU
+        std::vector<float> host_logits(all_tokens_to_read.size(), -1e9f);
+        for (size_t i = 0; i < all_tokens_to_read.size(); ++i) {
+            int tid = all_tokens_to_read[i];
+            CUDA_CHECK(cudaMemcpyAsync(&host_logits[i], buf_logits_.f32() + tid, sizeof(float), cudaMemcpyDeviceToHost, main_stream_));
+        }
+        CUDA_CHECK(cudaStreamSynchronize(main_stream_));
+
+        std::unordered_map<int, float> logit_lookup;
+        for (size_t i = 0; i < all_tokens_to_read.size(); ++i) {
+            logit_lookup[all_tokens_to_read[i]] = host_logits[i];
+        }
+
+        float max_choice_logit = -1e9f;
+        for (size_t c_idx = 0; c_idx < result.candidates.size(); c_idx++) {
+            auto& cand = result.candidates[c_idx];
+            cand.raw_logit = -1e9f;
+
+            for (int tid : cand.token_ids) {
+                auto it = logit_lookup.find(tid);
+                if (it != logit_lookup.end()) {
+                    float l_val = it->second;
+                    if (l_val > cand.raw_logit) {
+                        cand.raw_logit = l_val;
+                    }
+                }
+                if (tid == result.global_argmax_token_id) {
+                    result.is_choice_top1 = true;
+                }
+            }
+
+            if (cand.raw_logit > max_choice_logit) {
+                max_choice_logit = cand.raw_logit;
+                result.winning_index = (int)c_idx;
+                result.winning_choice = cand.choice;
+            }
+        }
+
+        // Softmax normalization across candidate choices
+        float eff_temp = std::max(temperature, 0.01f);
+        float sum_exp = 0.0f;
+        for (auto& cand : result.candidates) {
+            float exp_val = std::exp((cand.raw_logit - max_choice_logit) / eff_temp);
+            cand.probability = exp_val;
+            sum_exp += exp_val;
+        }
+
+        if (sum_exp > 0.0f) {
+            for (auto& cand : result.candidates) {
+                cand.probability /= sum_exp;
+                result.probabilities[cand.choice] = cand.probability;
+            }
+        }
+
+        if (result.winning_index >= 0 && result.winning_index < (int)result.candidates.size()) {
+            result.confidence = result.candidates[result.winning_index].probability;
+        }
+
+        auto total_end_time = std::chrono::steady_clock::now();
+        result.total_sec = std::chrono::duration<double>(total_end_time - start_time).count();
+
+        // Direct CPU Memory Stitch
+        if (output_format == "text" || output_format == "choice") {
+            result.rendered_output = result.winning_choice;
+        } else {
+            json out_json = {
+                {"decision", result.winning_choice},
+                {"winning_index", result.winning_index},
+                {"confidence", result.confidence},
+                {"probabilities", result.probabilities},
+                {"zero_decode_bypass", true},
+                {"decode_passes", 0},
+                {"global_top1", {
+                    {"token_id", result.global_argmax_token_id},
+                    {"token", result.global_argmax_token_str},
+                    {"logit", result.global_argmax_logit},
+                    {"is_candidate", result.is_choice_top1}
+                }},
+                {"timing", {
+                    {"prefill_ms", result.prefill_sec * 1000.0},
+                    {"total_ms", result.total_sec * 1000.0}
+                }}
+            };
+            result.rendered_output = out_json.dump(-1, ' ', false, json::error_handler_t::replace);
+        }
+
+        LOG_INFO("[ZDB] Zero Decode Bypass: winner='%s' (conf=%.4f) | choices=%zu | prefill=%.2fms total=%.2fms | decode passes=0",
+                 result.winning_choice.c_str(), result.confidence, candidate_choices.size(),
+                 result.prefill_sec * 1000.0, result.total_sec * 1000.0);
+
+        return result;
+    }
+
     // ── Generate tokens ─────────────────────────────────────────────────────
 
     std::string generate(const std::vector<int>& prompt_in, int max_tokens = 20000,
@@ -13826,6 +14163,86 @@ static void run_server(MoecherEngine& engine, int port, int default_thinking_bud
         res.status = 204;
     });
 
+    // ── Zero Decode Bypass (ZDB) Endpoints ───────────────────────────────────
+    auto handle_decide_request = [&engine](const httplib::Request& req, httplib::Response& res) {
+        res.set_header("Access-Control-Allow-Origin", "*");
+        res.set_header("Access-Control-Allow-Methods", "POST, OPTIONS");
+        res.set_header("Access-Control-Allow-Headers", "*");
+
+        auto busy_guard = std::make_shared<EngineBusyGuard>();
+        if (!busy_guard->is_locked()) {
+            res.status = 429;
+            res.set_content("{\"error\":\"Engine is currently busy processing another request.\"}", "application/json");
+            return;
+        }
+
+        json request;
+        try { request = json::parse(req.body); }
+        catch (...) {
+            res.status = 400;
+            res.set_content("{\"error\":\"Invalid JSON\"}", "application/json");
+            return;
+        }
+
+        std::vector<std::string> choices;
+        if (request.contains("choices") && request["choices"].is_array()) {
+            for (const auto& c : request["choices"]) {
+                if (c.is_string()) choices.push_back(c.get<std::string>());
+            }
+        } else if (request.contains("decision_choices") && request["decision_choices"].is_array()) {
+            for (const auto& c : request["decision_choices"]) {
+                if (c.is_string()) choices.push_back(c.get<std::string>());
+            }
+        }
+
+        if (choices.empty()) {
+            res.status = 400;
+            res.set_content("{\"error\":\"Missing or empty 'choices' array for Zero Decode Bypass\"}", "application/json");
+            return;
+        }
+
+        float temperature = request.value("temperature", 1.0f);
+        std::string format = request.value("format", "json");
+        bool bypass_prefix_cache = request.value("bypass_prefix_cache", false);
+
+        std::vector<int> prompt;
+        if (request.contains("messages") && request["messages"].is_array()) {
+            prompt = apply_chat_template(request["messages"], engine.tokenizer_, /*enable_thinking=*/false, /*reasoning_effort=*/"none");
+        } else if (request.contains("prompt") && request["prompt"].is_string()) {
+            prompt = engine.tokenizer_.encode(request["prompt"].get<std::string>());
+        }
+
+        if (prompt.empty()) {
+            res.status = 400;
+            res.set_content("{\"error\":\"Missing or empty 'messages' or 'prompt'\"}", "application/json");
+            return;
+        }
+
+        std::lock_guard<std::mutex> lock(g_engine_mutex);
+        auto result = engine.execute_zero_decode_bypass(prompt, choices, temperature, format, bypass_prefix_cache);
+
+        if (format == "text" || format == "choice") {
+            res.set_content(result.rendered_output, "text/plain");
+        } else {
+            res.set_content(result.rendered_output, "application/json");
+        }
+    };
+
+    svr.Post("/v1/decide", handle_decide_request);
+    svr.Post("/v1/classify", handle_decide_request);
+    svr.Options("/v1/decide", [](const httplib::Request&, httplib::Response& res) {
+        res.set_header("Access-Control-Allow-Origin", "*");
+        res.set_header("Access-Control-Allow-Methods", "POST, OPTIONS");
+        res.set_header("Access-Control-Allow-Headers", "*");
+        res.status = 204;
+    });
+    svr.Options("/v1/classify", [](const httplib::Request&, httplib::Response& res) {
+        res.set_header("Access-Control-Allow-Origin", "*");
+        res.set_header("Access-Control-Allow-Methods", "POST, OPTIONS");
+        res.set_header("Access-Control-Allow-Headers", "*");
+        res.status = 204;
+    });
+
     // Chat completions
     svr.Post("/v1/chat/completions",
         [&engine, default_thinking_budget](const httplib::Request& req, httplib::Response& res) {
@@ -14106,6 +14523,101 @@ static void run_server(MoecherEngine& engine, int port, int default_thinking_bud
 
             std::string req_id = "chatcmpl-moecher-" + std::to_string(++g_request_counter);
             std::string model_id = engine.get_model_id();
+
+            // ── Zero Decode Bypass (ZDB) Handling in /v1/chat/completions ───────────
+            bool req_zdb = request.value("zero_decode_bypass", false) || request.value("zdb", false);
+            std::vector<std::string> zdb_choices;
+            auto extract_choices = [&](const std::string& key) {
+                if (request.contains(key) && request[key].is_array()) {
+                    for (const auto& item : request[key]) {
+                        if (item.is_string()) {
+                            std::string s = item.get<std::string>();
+                            if (!s.empty()) zdb_choices.push_back(s);
+                        } else if (item.is_object() && item.contains("text") && item["text"].is_string()) {
+                            std::string s = item["text"].get<std::string>();
+                            if (!s.empty()) zdb_choices.push_back(s);
+                        }
+                    }
+                }
+            };
+            extract_choices("decision_choices");
+            extract_choices("classification_choices");
+            extract_choices("candidate_labels");
+            extract_choices("zdb_choices");
+            if (zdb_choices.empty()) {
+                extract_choices("choices");
+            }
+
+            if (req_zdb) {
+                if (zdb_choices.empty()) {
+                    res.status = 400;
+                    res.set_content("{\"error\":\"zero_decode_bypass requires a non-empty 'choices', 'decision_choices', or 'candidate_labels' array.\"}", "application/json");
+                    return;
+                }
+
+                std::lock_guard<std::mutex> lock(g_engine_mutex);
+                std::string zdb_format = request.value("format", "choice");
+                // For ZDB in chat completions, apply chat template with thinking disabled
+                auto mm_prompt = apply_chat_template_multimodal(messages, engine.tokenizer_, false, "none", json(), false);
+                std::vector<int> prompt = mm_prompt.prompt;
+
+                auto zdb_res = engine.execute_zero_decode_bypass(prompt, zdb_choices, temperature, zdb_format, bypass_prefix_cache);
+
+                if (stream) {
+                    time_t now_sec = std::chrono::system_clock::to_time_t(std::chrono::system_clock::now());
+                    std::string sse = "data: {\"id\":\"" + req_id + "\",\"object\":\"chat.completion.chunk\",\"created\":" +
+                                      std::to_string(now_sec) +
+                                      ",\"model\":\"" + model_id + "\",\"choices\":[{\"index\":0,\"delta\":{\"role\":\"assistant\",\"content\":" +
+                                      json(zdb_res.rendered_output).dump() + "},\"finish_reason\":null}]}\n\n" +
+                                      "data: {\"id\":\"" + req_id + "\",\"object\":\"chat.completion.chunk\",\"created\":" +
+                                      std::to_string(now_sec) +
+                                      ",\"model\":\"" + model_id + "\",\"choices\":[{\"index\":0,\"delta\":{},\"finish_reason\":\"stop\"}]}\n\n" +
+                                      "data: [DONE]\n\n";
+                    res.set_content(sse, "text/event-stream");
+                    return;
+                } else {
+                    json choice = {
+                        {"index", 0},
+                        {"message", {
+                            {"role", "assistant"},
+                            {"content", zdb_res.rendered_output}
+                        }},
+                        {"finish_reason", "stop"}
+                    };
+
+                    json response = {
+                        {"id", req_id},
+                        {"object", "chat.completion"},
+                        {"created", std::chrono::system_clock::to_time_t(std::chrono::system_clock::now())},
+                        {"model", model_id},
+                        {"choices", {choice}},
+                        {"usage", {
+                            {"prompt_tokens", zdb_res.prompt_tokens},
+                            {"completion_tokens", 0},
+                            {"total_tokens", zdb_res.prompt_tokens},
+                            {"evaluated_prompt_tokens", zdb_res.prompt_tokens},
+                            {"prefill_sec", zdb_res.prefill_sec},
+                            {"prefill_tps", (zdb_res.prefill_sec > 0.0) ? (double)zdb_res.prompt_tokens / zdb_res.prefill_sec : 0.0},
+                            {"decode_sec", 0.0},
+                            {"decode_tps", 0.0}
+                        }},
+                        {"zero_decode_bypass", {
+                            {"enabled", true},
+                            {"selected_choice", zdb_res.winning_choice},
+                            {"winning_index", zdb_res.winning_index},
+                            {"confidence", zdb_res.confidence},
+                            {"decode_passes", 0},
+                            {"probabilities", zdb_res.probabilities},
+                            {"timing", {
+                                {"prefill_ms", zdb_res.prefill_sec * 1000.0},
+                                {"total_ms", zdb_res.total_sec * 1000.0}
+                            }}
+                        }}
+                    };
+                    res.set_content(response.dump(-1, ' ', false, json::error_handler_t::replace), "application/json");
+                    return;
+                }
+            }
 
             if (stream) {
                 // Fast SSE delta writer avoiding heap-allocated JSON ASTs
