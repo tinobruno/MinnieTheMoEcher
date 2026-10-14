@@ -4332,7 +4332,7 @@ async function sendMessage(options = {}) {
         const apiUrl = `${getApiBase()}/v1/chat/completions`;
 
         function pythonJsonDumps(obj) {
-            if (obj === null) return 'null';
+            if (obj === undefined || obj === null) return 'null';
             if (typeof obj === 'boolean') return obj ? 'true' : 'false';
             if (typeof obj === 'number') return String(obj);
             if (typeof obj === 'string') return JSON.stringify(obj);
@@ -4340,10 +4340,12 @@ async function sendMessage(options = {}) {
                 return '[' + obj.map(pythonJsonDumps).join(', ') + ']';
             }
             if (typeof obj === 'object') {
-                const entries = Object.entries(obj).map(([k, v]) => `${JSON.stringify(k)}: ${pythonJsonDumps(v)}`);
+                const entries = Object.entries(obj)
+                    .filter(([_, v]) => v !== undefined)
+                    .map(([k, v]) => `${JSON.stringify(k)}: ${pythonJsonDumps(v)}`);
                 return '{' + entries.join(', ') + '}';
             }
-            return JSON.stringify(obj);
+            return JSON.stringify(obj) || 'null';
         }
 
         const clientUa = navigator.userAgent || '';
@@ -4383,8 +4385,6 @@ async function sendMessage(options = {}) {
                 enable_tree_mtp: speculativeSettings.enableMtp && speculativeSettings.enableTreeMtp,
                 tree_mtp: speculativeSettings.enableMtp && speculativeSettings.enableTreeMtp,
                 tree_nodes: speculativeSettings.treeNodes,
-                zero_decode_bypass: (zdbSettings && zdbSettings.enabled),
-                choices: (zdbSettings && zdbSettings.enabled) ? zdbSettings.choices : undefined,
                 execution_timeout_sec: agenticSettings.timeoutSec || 60,
                 workspace_boundary_enforced: agenticSettings.boundaryEnforced !== false,
                 require_external_authorization: agenticSettings.requireAuth !== false,
@@ -4400,6 +4400,15 @@ async function sendMessage(options = {}) {
                     cookies: clientCookies
                 }
             };
+
+            if (zdbSettings && zdbSettings.enabled) {
+                payload.zero_decode_bypass = true;
+                payload.choices = (zdbSettings.choices && zdbSettings.choices.length > 0) ? zdbSettings.choices : ["APPROVED", "REJECTED"];
+                payload.enable_thinking = false;
+                payload.reasoning_effort = "none";
+                if (payload.thinking) payload.thinking.type = "disabled";
+                payload.tools = [];
+            }
 
             const bypassKvCache = !!(agenticSettings.bypassKvCache || document.getElementById('agentic-bypass-kv-cache')?.checked);
             if (bypassKvCache) {
