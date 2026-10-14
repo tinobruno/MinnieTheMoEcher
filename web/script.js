@@ -1761,7 +1761,7 @@ let zdbSettings = {
     choices: ["APPROVED", "REJECTED"],
     autoFallback: true,
     minConfidence: 0.70,
-    maxTop1Gap: 0.50
+    maxTop1Gap: 1.50
 };
 
 function loadZdbSettings() {
@@ -1786,7 +1786,7 @@ function loadZdbSettings() {
         if (savedMinConf !== null) zdbSettings.minConfidence = parseFloat(savedMinConf) || 0.70;
 
         const savedMaxGap = localStorage.getItem('moecher_zdb_maxgap');
-        if (savedMaxGap !== null) zdbSettings.maxTop1Gap = parseFloat(savedMaxGap) || 0.50;
+        if (savedMaxGap !== null) zdbSettings.maxTop1Gap = parseFloat(savedMaxGap) || 1.50;
 
         updateZdbUi();
     } catch (e) {
@@ -4466,12 +4466,12 @@ async function sendMessage(options = {}) {
                 payload.choices = (zdbSettings.choices && zdbSettings.choices.length > 0) ? zdbSettings.choices : ["APPROVED", "REJECTED"];
                 payload.auto_fallback = zdbSettings.autoFallback !== false;
                 payload.min_confidence = zdbSettings.minConfidence || 0.70;
-                payload.max_top1_gap = zdbSettings.maxTop1Gap || 0.50;
+                payload.max_top1_gap = (zdbSettings.maxTop1Gap !== undefined && zdbSettings.maxTop1Gap !== null) ? zdbSettings.maxTop1Gap : 1.50;
+                payload.tools = [];
                 if (!payload.auto_fallback) {
                     payload.enable_thinking = false;
                     payload.reasoning_effort = "none";
                     if (payload.thinking) payload.thinking.type = "disabled";
-                    payload.tools = [];
                 }
             }
 
@@ -4482,8 +4482,12 @@ async function sendMessage(options = {}) {
             }
 
             // Disable tools once search has executed in this turn, or if a tool returned an issue/error, or if round >= maxRounds,
-            // forcing the assistant to formulate and stream its complete conversational answer directly to the user.
-            payload.tools = (round >= maxRounds || turnExecutedSearch || turnEncounteredToolIssue) ? [] : activeTools;
+            // or if ZDB is enabled (deterministic decision / routing without tools)
+            if (zdbSettings && zdbSettings.enabled) {
+                payload.tools = [];
+            } else {
+                payload.tools = (round >= maxRounds || turnExecutedSearch || turnEncounteredToolIssue) ? [] : activeTools;
+            }
 
             let roundReasoning = "";
             let roundContent = "";

@@ -5372,8 +5372,20 @@ public:
         }
 
         // Arbiter gating decision:
+        // Distinguish surface formatting tokens (e.g. "**", "*", "\"", "#", ":", "-")
+        // from genuine hesitation/scratchpad tokens (e.g. "\n\n", "<think>", "Based", "I").
+        bool is_formatting_token = (result.global_argmax_token_str == "**" ||
+                                    result.global_argmax_token_str == "*" ||
+                                    result.global_argmax_token_str == "#" ||
+                                    result.global_argmax_token_str == "##" ||
+                                    result.global_argmax_token_str == "\"" ||
+                                    result.global_argmax_token_str == ":" ||
+                                    result.global_argmax_token_str == "-");
+
+        float effective_gap_tolerance = is_formatting_token ? std::max(max_top1_gap, 2.0f) : max_top1_gap;
+
         // Pass System 1 if candidate was global top-1 OR if top1_gap is within tolerance AND confidence >= min_confidence
-        result.gate_passed = (result.is_choice_top1 || result.top1_gap <= max_top1_gap) &&
+        result.gate_passed = (result.is_choice_top1 || result.top1_gap <= effective_gap_tolerance) &&
                              (result.confidence >= min_confidence);
         result.system_path = result.gate_passed ? "system_1_zdb" : "system_2_fallback";
 
@@ -14250,7 +14262,7 @@ static void run_server(MoecherEngine& engine, int port, int default_thinking_bud
         bool bypass_prefix_cache = request.value("bypass_prefix_cache", false);
         bool auto_fallback = request.value("auto_fallback", false);
         float min_confidence = request.value("min_confidence", 0.70f);
-        float max_top1_gap = request.value("max_top1_gap", 0.5f);
+        float max_top1_gap = request.value("max_top1_gap", 1.5f);
 
         std::vector<int> prompt;
         if (request.contains("messages") && request["messages"].is_array()) {
@@ -14269,8 +14281,8 @@ static void run_server(MoecherEngine& engine, int port, int default_thinking_bud
         auto result = engine.execute_zero_decode_bypass(prompt, choices, temperature, format, bypass_prefix_cache, min_confidence, max_top1_gap);
 
         if (auto_fallback && !result.gate_passed) {
-            LOG_INFO("[ZDB-Arbiter] /v1/decide: Gate REJECTED System 1 fast path (top1_gap=%.2f > %.2f, conf=%.2f < %.2f). Falling back to System 2 decode...",
-                     result.top1_gap, max_top1_gap, result.confidence, min_confidence);
+            LOG_INFO("[ZDB-Arbiter] /v1/decide: Gate REJECTED System 1 fast path (top1_gap=%.2f, conf=%.2f [min=%.2f]). Falling back to System 2 decode...",
+                     result.top1_gap, result.confidence, min_confidence);
             std::string sys2_text = engine.generate(prompt, 512, temperature);
             while (!sys2_text.empty() && (sys2_text.front() == ' ' || sys2_text.front() == '\n' || sys2_text.front() == '\r')) sys2_text.erase(0, 1);
             while (!sys2_text.empty() && (sys2_text.back() == ' ' || sys2_text.back() == '\n' || sys2_text.back() == '\r')) sys2_text.pop_back();
@@ -14648,7 +14660,7 @@ static void run_server(MoecherEngine& engine, int port, int default_thinking_bud
 
                 bool auto_fallback = request.value("auto_fallback", true);
                 float min_confidence = request.value("min_confidence", 0.70f);
-                float max_top1_gap = request.value("max_top1_gap", 0.5f);
+                float max_top1_gap = request.value("max_top1_gap", 1.5f);
                 std::string zdb_format = request.value("format", "choice");
 
                 MoecherEngine::ZeroDecodeResult zdb_res;
@@ -14661,8 +14673,8 @@ static void run_server(MoecherEngine& engine, int port, int default_thinking_bud
                 }
 
                 if (auto_fallback && !zdb_res.gate_passed) {
-                    LOG_INFO("[ZDB-Arbiter] Gate REJECTED System 1 fast path (top1_gap=%.2f > %.2f, confidence=%.2f < %.2f, global_argmax='%s' [id=%d]). Falling back to System 2 autoregressive decode.",
-                             zdb_res.top1_gap, max_top1_gap, zdb_res.confidence, min_confidence,
+                    LOG_INFO("[ZDB-Arbiter] Gate REJECTED System 1 fast path (top1_gap=%.2f, conf=%.2f [min=%.2f], global_argmax='%s' [id=%d]). Falling back to System 2 autoregressive decode.",
+                             zdb_res.top1_gap, zdb_res.confidence, min_confidence,
                              zdb_res.global_argmax_token_str.c_str(), zdb_res.global_argmax_token_id);
                     // Seamlessly fall through to standard stream/non-stream decode loops below!
                 } else {
