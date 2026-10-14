@@ -12,6 +12,7 @@ Evaluate applicant for loan risk:
 - Late Payments (past 24 mo): 0
 - Requested Amount: $15,000
 
+Choices: APPROVED, REJECTED.
 Underwriting Decision:
 '@
 
@@ -36,8 +37,9 @@ Evaluate applicant for loan risk:
 - Late Payments (past 24 mo): 0
 - Requested Amount: $150,000
 
-Rule: If credit score is below 600 or requested amount exceeds annual income, the decision must be REJECTED.
+Rule: If credit score is below 600 or requested amount exceeds annual income, the decision is REJECTED. Otherwise, the decision is APPROVED.
 
+Choices: APPROVED, REJECTED.
 Underwriting Decision:
 '@
 

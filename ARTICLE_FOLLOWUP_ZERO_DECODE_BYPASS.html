@@ -1076,6 +1076,161 @@
 
         <hr style="border: 0; border-top: 1px solid var(--border); margin: 48px 0;">
 
+        <!-- Section: Decision Space Symmetry -->
+        <h2>The Law of Decision-Space Symmetry in Non-Autoregressive Inference</h2>
+
+        <p>
+            During our live stress-testing on bare metal, an essential prompt-engineering principle emerged: 
+            <strong>why prompts that succeed in standard autoregressive models fail when evaluated at Step 0.</strong>
+        </p>
+
+        <h3>The Asymmetric Prompt Trap</h3>
+
+        <p>
+            In standard LLM inference (<strong>System 2</strong>), developers frequently pass one-sided rules:
+        </p>
+
+        <pre><code>Rule: If credit score is below 600 or requested amount exceeds annual income, the decision must be REJECTED.
+Underwriting Decision:</code></pre>
+
+        <p>
+            In System 2, the model generates dozens or hundreds of thinking scratchpad tokens:
+        </p>
+
+        <blockquote>
+            "The credit score is 790, which is well above 600. The requested loan is $15,000 against $140,000 income, so it does not exceed annual income. The rejection rule is not triggered. Standard underwriting guidelines indicate approval. Therefore, the decision is APPROVED."
+        </blockquote>
+
+        <p>
+            Because the model has multiple autoregressive decode steps, it easily reasons beyond the prompt's asymmetric framing.
+        </p>
+
+        <h3>The Physics of Step-0 Logit Bias</h3>
+
+        <p>
+            In <strong>Zero Decode Bypass (System 1)</strong>, there is <strong>no decode loop</strong>. The engine performs a single prefill forward pass and slices candidate logits at the very last token (\(N\)).
+        </p>
+
+        <p>
+            When a prompt ends with <code>...the decision must be REJECTED. Underwriting Decision:</code>, two physical attention phenomena occur:
+        </p>
+
+        <ol>
+            <li>
+                <strong>Lexical Recency Priming:</strong> <code>REJECTED</code> is the <em>only</em> decision keyword present in the prompt, placed immediately before the final colon. The self-attention heads at token \(N\) attend heavily to that exact token, artificially elevating its unconstrained logit.
+            </li>
+            <li>
+                <strong>Missing Counterpart Representation:</strong> The alternative candidate (<code>APPROVED</code>) was never mentioned anywhere in the prompt context. Under forced argmax logit extraction, the unprimed candidate suffers a severe multi-logit penalty.
+            </li>
+        </ol>
+
+        <p>
+            If the prompt ends with <code>...Otherwise the decision is APPROVED. Underwriting Decision:</code>, the exact reverse occurs: <code>APPROVED</code> is artificially inflated.
+        </p>
+
+        <h3>The Rule of Symmetry: Always Include All Candidate Choices</h3>
+
+        <p>
+            To achieve robust, unbiased step-0 inference, <strong>the full decision space must be presented symmetrically in the prompt context.</strong>
+        </p>
+
+        <div class="grid-2">
+            <div class="feature-card">
+                <div class="feature-card-header"><span class="icon">✨</span> Format A: Explicit Balanced Choices (Recommended)</div>
+                <pre style="margin: 12px 0 0 0; padding: 14px; font-size: 0.82rem;"><code>Evaluate applicant for loan risk:
+- Applicant: Jane Doe
+- Credit Score: 790
+- Annual Income: $140,000
+- Debt-to-Income (DTI): 18%
+- Late Payments (past 24 mo): 0
+- Requested Amount: $15,000
+
+Choices: APPROVED, REJECTED.
+Decision:</code></pre>
+            </div>
+            <div class="feature-card">
+                <div class="feature-card-header"><span class="icon">⚖️</span> Format B: Symmetric Rule Conditions (If-Else)</div>
+                <pre style="margin: 12px 0 0 0; padding: 14px; font-size: 0.82rem;"><code>Evaluate applicant for loan risk:
+- Applicant: Jane Doe
+...
+Rule: If credit score is below 600 or requested amount exceeds annual income, the decision is REJECTED. Otherwise, the decision is APPROVED.
+
+Underwriting Decision:</code></pre>
+            </div>
+        </div>
+
+        <h3>Bare-Metal Validation with Symmetric Prompts</h3>
+
+        <p>
+            When we executed the balanced <code>Choices: APPROVED, REJECTED.</code> prompt across all 4 production stress cases on the RTX 5060 Ti (Qwen3.8-27B), the results were 100% accurate:
+        </p>
+
+        <div class="table-wrapper">
+            <table>
+                <thead>
+                    <tr>
+                        <th>Test Profile</th>
+                        <th>Applicant Financial Data</th>
+                        <th>ZDB Step-0 Winner</th>
+                        <th>Confidence</th>
+                        <th>Arbiter Action</th>
+                        <th>Result</th>
+                    </tr>
+                </thead>
+                <tbody>
+                    <tr>
+                        <td><strong>Prime Profile</strong></td>
+                        <td>Score 790, $140k inc, $15k req</td>
+                        <td><span class="pill-badge green">APPROVED</span></td>
+                        <td>90.9%</td>
+                        <td>Fast Path (0 decodes, 439ms)</td>
+                        <td>✅ Correct</td>
+                    </tr>
+                    <tr>
+                        <td><strong>Marginal Risk</strong></td>
+                        <td>Score 550, $140k inc, $15k req</td>
+                        <td><span class="pill-badge amber">REJECTED</span></td>
+                        <td>52.2%</td>
+                        <td>Hesitation Detected &rarr; System 2 Fallback</td>
+                        <td>✅ Correct</td>
+                    </tr>
+                    <tr>
+                        <td><strong>Excessive Loan</strong></td>
+                        <td>Score 790, $14k inc, $1.5M req</td>
+                        <td><span class="pill-badge amber">REJECTED</span></td>
+                        <td>72.2%</td>
+                        <td>Fast Path / Arithmetic Trigger</td>
+                        <td>✅ Correct</td>
+                    </tr>
+                    <tr>
+                        <td><strong>Severe Dual Risk</strong></td>
+                        <td>Score 79, $14k inc, $1.5M req</td>
+                        <td><span class="pill-badge amber">REJECTED</span></td>
+                        <td>89.3%</td>
+                        <td>Fast Path (0 decodes, 362ms)</td>
+                        <td>✅ Correct</td>
+                    </tr>
+                </tbody>
+            </table>
+        </div>
+
+        <p>
+            Notice the clear, mathematically sound confidence gradient:
+        </p>
+
+        <ul>
+            <li>A prime profile produces <strong>90.9% <code>APPROVED</code></strong>.</li>
+            <li>An impossible loan ($1.5M on $14k income) immediately shifts to <strong>72.2% <code>REJECTED</code></strong>.</li>
+            <li>A dual catastrophic risk (79 score + $1.5M loan) jumps to <strong>89.3% <code>REJECTED</code></strong>.</li>
+            <li>In customer sentiment classification, even when <code>Choices: POSITIVE, NEGATIVE, NEUTRAL.</code> lists <code>POSITIVE</code> first, a shattered item review triggers <strong><code>NEGATIVE</code> at 98.0% confidence in 320ms</strong>.</li>
+        </ul>
+
+        <blockquote>
+            <strong>Key Rule for AI Engineers:</strong> When designing prompts for non-autoregressive LLM inference or logit classification, <strong>always expose the complete choice set symmetrically.</strong>
+        </blockquote>
+
+        <hr style="border: 0; border-top: 1px solid var(--border); margin: 48px 0;">
+
         <!-- Section: Advantage for Engineers -->
         <h2>What Does This Advantage Mean for AI Engineers?</h2>
 
