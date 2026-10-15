@@ -22,7 +22,7 @@ tools/extract_vit_features
 *.dat
 *.patch
 *.diff
-models/
+/models/
 bin_bck/
 manifest_bck/
 offload/
