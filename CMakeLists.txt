@@ -94,6 +94,7 @@ if(APPLE)
         src/web_ui.cpp
         src/tokenizer.cpp
         src/multimodal.cpp
+        src/zdb.cpp
         src/metal/metal_backend.mm
     )
 else()
@@ -104,6 +105,7 @@ else()
         src/web_ui.cpp
         src/tokenizer.cpp
         src/multimodal.cpp
+        src/zdb.cpp
         src/cuda/activations.cu
         src/cuda/vision_kernels.cu
     )

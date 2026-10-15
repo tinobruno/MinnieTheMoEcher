@@ -112,6 +112,10 @@ static constexpr const char* MOECHER_VERSION = moecher::VERSION;
 #include "agentic.hpp"
 #include "tokenizer.hpp"
 #include "multimodal.hpp"
+#include "zdb.hpp"
+
+using moecher::zdb::ZeroDecodeCandidate;
+using moecher::zdb::ZeroDecodeResult;
 
 
 // ════════════════════════════════════════════════════════════════════════════════
@@ -4578,33 +4582,9 @@ public:
 
     // ── Zero Decode Bypass (ZDB) Structures & Method ────────────────────────
 
-    struct ZeroDecodeCandidate {
-        std::string choice;
-        std::vector<int> token_ids;
-        float raw_logit = -1e9f;
-        float probability = 0.0f;
-    };
+    using ZeroDecodeCandidate = moecher::zdb::ZeroDecodeCandidate;
+    using ZeroDecodeResult = moecher::zdb::ZeroDecodeResult;
 
-    struct ZeroDecodeResult {
-        int winning_index = -1;
-        std::string winning_choice;
-        float confidence = 0.0f;
-        std::vector<ZeroDecodeCandidate> candidates;
-        std::map<std::string, float> probabilities;
-        int global_argmax_token_id = -1;
-        std::string global_argmax_token_str;
-        float global_argmax_logit = -1e9f;
-        bool is_choice_top1 = false;
-        float top1_gap = 0.0f;           // distance between global argmax logit and best candidate logit
-        float candidate_margin = 0.0f;   // distance between #1 candidate logit and #2 candidate logit
-        bool gate_passed = false;        // true if candidate passes System 1 confidence & alignment arbiter
-        std::string system_path = "system_1_zdb"; // "system_1_zdb" or "system_2_fallback"
-        double prefill_sec = 0.0;
-        double total_sec = 0.0;
-        size_t prompt_tokens = 0;
-        int decode_passes = 0; // strictly 0
-        std::string rendered_output;
-    };
 
     ZeroDecodeResult execute_zero_decode_bypass(
         const std::vector<int>& prompt_in,
@@ -4786,55 +4766,8 @@ public:
         }
 
         // Map each candidate choice to its token IDs and collect all unique tokens to read
-        result.candidates.resize(candidate_choices.size());
-        std::vector<int> all_tokens_to_read;
-
-        for (size_t c_idx = 0; c_idx < candidate_choices.size(); c_idx++) {
-            const std::string& choice = candidate_choices[c_idx];
-            auto& cand = result.candidates[c_idx];
-            cand.choice = choice;
-
-            auto add_tok = [&](const std::vector<int>& toks) {
-                if (!toks.empty()) {
-                    int t = toks[0];
-                    if (t >= 0 && t < cfg_.vocab_size) {
-                        if (std::find(cand.token_ids.begin(), cand.token_ids.end(), t) == cand.token_ids.end()) {
-                            cand.token_ids.push_back(t);
-                        }
-                        if (std::find(all_tokens_to_read.begin(), all_tokens_to_read.end(), t) == all_tokens_to_read.end()) {
-                            all_tokens_to_read.push_back(t);
-                        }
-                    }
-                }
-            };
-
-            add_tok(tokenizer_.encode(choice));
-            add_tok(tokenizer_.encode(" " + choice));
-
-            std::string lower_c = choice;
-            for (char& ch : lower_c) ch = (char)::tolower((unsigned char)ch);
-            if (lower_c != choice) {
-                add_tok(tokenizer_.encode(lower_c));
-                add_tok(tokenizer_.encode(" " + lower_c));
-            }
-
-            std::string upper_c = choice;
-            for (char& ch : upper_c) ch = (char)::toupper((unsigned char)ch);
-            if (upper_c != choice) {
-                add_tok(tokenizer_.encode(upper_c));
-                add_tok(tokenizer_.encode(" " + upper_c));
-            }
-
-            std::string title_c = choice;
-            if (!title_c.empty()) {
-                title_c[0] = (char)::toupper((unsigned char)title_c[0]);
-                for (size_t i = 1; i < title_c.size(); i++) title_c[i] = (char)::tolower((unsigned char)title_c[i]);
-                if (title_c != choice && title_c != lower_c && title_c != upper_c) {
-                    add_tok(tokenizer_.encode(title_c));
-                    add_tok(tokenizer_.encode(" " + title_c));
-                }
-            }
-        }
+        std::vector<std::vector<int>> choice_tokens;
+        std::vector<int> all_tokens_to_read = moecher::zdb::collect_candidate_tokens(candidate_choices, tokenizer_, cfg_.vocab_size, choice_tokens);
 
         // Asynchronously copy candidate logits from GPU to CPU
         std::vector<float> host_logits(all_tokens_to_read.size(), -1e9f);
@@ -4849,118 +4782,16 @@ public:
             logit_lookup[all_tokens_to_read[i]] = host_logits[i];
         }
 
-        float max_choice_logit = -1e9f;
-        for (size_t c_idx = 0; c_idx < result.candidates.size(); c_idx++) {
-            auto& cand = result.candidates[c_idx];
-            cand.raw_logit = -1e9f;
-
-            for (int tid : cand.token_ids) {
-                auto it = logit_lookup.find(tid);
-                if (it != logit_lookup.end()) {
-                    float l_val = it->second;
-                    if (l_val > cand.raw_logit) {
-                        cand.raw_logit = l_val;
-                    }
-                }
-                if (tid == result.global_argmax_token_id) {
-                    result.is_choice_top1 = true;
-                }
-            }
-
-            if (cand.raw_logit > max_choice_logit) {
-                max_choice_logit = cand.raw_logit;
-                result.winning_index = (int)c_idx;
-                result.winning_choice = cand.choice;
-            }
-        }
-
-        // Softmax normalization across candidate choices
-        float eff_temp = std::max(temperature, 0.01f);
-        float sum_exp = 0.0f;
-        for (auto& cand : result.candidates) {
-            float exp_val = std::exp((cand.raw_logit - max_choice_logit) / eff_temp);
-            cand.probability = exp_val;
-            sum_exp += exp_val;
-        }
-
-        if (sum_exp > 0.0f) {
-            for (auto& cand : result.candidates) {
-                cand.probability /= sum_exp;
-                result.probabilities[cand.choice] = cand.probability;
-            }
-        }
-
-        if (result.winning_index >= 0 && result.winning_index < (int)result.candidates.size()) {
-            result.confidence = result.candidates[result.winning_index].probability;
-        }
-
-        // ── Hybrid Arbiter (System 1 vs System 2 Confidence & Alignment) ───────
-        float second_choice_logit = -1e9f;
-        for (size_t c_idx = 0; c_idx < result.candidates.size(); c_idx++) {
-            if ((int)c_idx != result.winning_index && result.candidates[c_idx].raw_logit > second_choice_logit) {
-                second_choice_logit = result.candidates[c_idx].raw_logit;
-            }
-        }
-        result.candidate_margin = max_choice_logit - second_choice_logit;
-
-        if (result.is_choice_top1) {
-            result.top1_gap = 0.0f;
-        } else {
-            result.top1_gap = std::max(0.0f, result.global_argmax_logit - max_choice_logit);
-        }
-
-        // Arbiter gating decision:
-        // Distinguish surface formatting tokens (e.g. "**", "*", "\"", "#", ":", "-")
-        // from genuine hesitation/scratchpad tokens (e.g. "\n\n", "<think>", "Based", "I").
-        bool is_formatting_token = (result.global_argmax_token_str == "**" ||
-                                    result.global_argmax_token_str == "*" ||
-                                    result.global_argmax_token_str == "#" ||
-                                    result.global_argmax_token_str == "##" ||
-                                    result.global_argmax_token_str == "\"" ||
-                                    result.global_argmax_token_str == ":" ||
-                                    result.global_argmax_token_str == "-");
-
-        float effective_gap_tolerance = is_formatting_token ? std::max(max_top1_gap, 2.0f) : max_top1_gap;
-
-        // Pass System 1 if candidate was global top-1 OR if top1_gap is within tolerance AND confidence >= min_confidence
-        result.gate_passed = (result.is_choice_top1 || result.top1_gap <= effective_gap_tolerance) &&
-                             (result.confidence >= min_confidence);
-        result.system_path = result.gate_passed ? "system_1_zdb" : "system_2_fallback";
-
+        double prefill_sec = result.prefill_sec;
+        result = moecher::zdb::score_and_underwrite_candidates(
+            candidate_choices, choice_tokens, logit_lookup,
+            result.global_argmax_token_id, result.global_argmax_token_str, result.global_argmax_logit,
+            temperature, min_confidence, max_top1_gap, output_format
+        );
+        result.prefill_sec = prefill_sec;
         auto total_end_time = std::chrono::steady_clock::now();
         result.total_sec = std::chrono::duration<double>(total_end_time - start_time).count();
-
-        // Direct CPU Memory Stitch
-        if (output_format == "text" || output_format == "choice") {
-            result.rendered_output = result.winning_choice;
-        } else {
-            json out_json = {
-                {"decision", result.winning_choice},
-                {"winning_index", result.winning_index},
-                {"confidence", result.confidence},
-                {"probabilities", result.probabilities},
-                {"zero_decode_bypass", true},
-                {"decode_passes", 0},
-                {"arbiter", {
-                    {"gate_passed", result.gate_passed},
-                    {"system_path", result.system_path},
-                    {"top1_gap", result.top1_gap},
-                    {"candidate_margin", result.candidate_margin},
-                    {"is_choice_top1", result.is_choice_top1}
-                }},
-                {"global_top1", {
-                    {"token_id", result.global_argmax_token_id},
-                    {"token", result.global_argmax_token_str},
-                    {"logit", result.global_argmax_logit},
-                    {"is_candidate", result.is_choice_top1}
-                }},
-                {"timing", {
-                    {"prefill_ms", result.prefill_sec * 1000.0},
-                    {"total_ms", result.total_sec * 1000.0}
-                }}
-            };
-            result.rendered_output = out_json.dump(-1, ' ', false, json::error_handler_t::replace);
-        }
+        result.prompt_tokens = prompt.size();
 
         LOG_INFO("[ZDB] Zero Decode Bypass: winner='%s' (conf=%.4f) | choices=%zu | prefill=%.2fms total=%.2fms | decode passes=0",
                  result.winning_choice.c_str(), result.confidence, candidate_choices.size(),
@@ -11328,27 +11159,7 @@ static void run_server(MoecherEngine& engine, int port, int default_thinking_bud
             if (format == "text" || format == "choice") {
                 res.set_content(matched_choice, "text/plain");
             } else {
-                json out_json = {
-                    {"decision", matched_choice},
-                    {"system_2_output", sys2_text},
-                    {"zero_decode_bypass", false},
-                    {"decode_passes", engine.completion_token_count_},
-                    {"arbiter", {
-                        {"gate_passed", false},
-                        {"system_path", "system_2_fallback"},
-                        {"top1_gap", result.top1_gap},
-                        {"candidate_margin", result.candidate_margin},
-                        {"is_choice_top1", result.is_choice_top1},
-                        {"fallback_triggered", true}
-                    }},
-                    {"global_top1", {
-                        {"token_id", result.global_argmax_token_id},
-                        {"token", result.global_argmax_token_str},
-                        {"logit", result.global_argmax_logit},
-                        {"is_candidate", result.is_choice_top1}
-                    }},
-                    {"probabilities", result.probabilities}
-                };
+                json out_json = moecher::zdb::build_zdb_fallback_response_json(result, matched_choice, sys2_text, engine.completion_token_count_);
                 res.set_content(out_json.dump(-1, ' ', false, json::error_handler_t::replace), "application/json");
             }
             return;
@@ -11720,31 +11531,7 @@ static void run_server(MoecherEngine& engine, int port, int default_thinking_bud
                             {"decode_sec", 0.0},
                             {"decode_tps", 0.0}
                         };
-                        json zdb_obj = {
-                            {"enabled", true},
-                            {"selected_choice", zdb_res.winning_choice},
-                            {"winning_index", zdb_res.winning_index},
-                            {"confidence", zdb_res.confidence},
-                            {"decode_passes", 0},
-                            {"probabilities", zdb_res.probabilities},
-                            {"arbiter", {
-                                {"gate_passed", zdb_res.gate_passed},
-                                {"system_path", zdb_res.system_path},
-                                {"top1_gap", zdb_res.top1_gap},
-                                {"candidate_margin", zdb_res.candidate_margin},
-                                {"is_choice_top1", zdb_res.is_choice_top1}
-                            }},
-                            {"global_top1", {
-                                {"token_id", zdb_res.global_argmax_token_id},
-                                {"token", zdb_res.global_argmax_token_str},
-                                {"logit", zdb_res.global_argmax_logit},
-                                {"is_candidate", zdb_res.is_choice_top1}
-                            }},
-                            {"timing", {
-                                {"prefill_ms", zdb_res.prefill_sec * 1000.0},
-                                {"total_ms", zdb_res.total_sec * 1000.0}
-                            }}
-                        };
+                        json zdb_obj = moecher::zdb::build_zdb_json_object(zdb_res);
                         json chunk1 = {
                             {"id", req_id},
                             {"object", "chat.completion.chunk"},
@@ -11796,31 +11583,7 @@ static void run_server(MoecherEngine& engine, int port, int default_thinking_bud
                                 {"decode_sec", 0.0},
                                 {"decode_tps", 0.0}
                             }},
-                            {"zero_decode_bypass", {
-                                {"enabled", true},
-                                {"selected_choice", zdb_res.winning_choice},
-                                {"winning_index", zdb_res.winning_index},
-                                {"confidence", zdb_res.confidence},
-                                {"decode_passes", 0},
-                                {"probabilities", zdb_res.probabilities},
-                                {"arbiter", {
-                                    {"gate_passed", zdb_res.gate_passed},
-                                    {"system_path", zdb_res.system_path},
-                                    {"top1_gap", zdb_res.top1_gap},
-                                    {"candidate_margin", zdb_res.candidate_margin},
-                                    {"is_choice_top1", zdb_res.is_choice_top1}
-                                }},
-                                {"global_top1", {
-                                    {"token_id", zdb_res.global_argmax_token_id},
-                                    {"token", zdb_res.global_argmax_token_str},
-                                    {"logit", zdb_res.global_argmax_logit},
-                                    {"is_candidate", zdb_res.is_choice_top1}
-                                }},
-                                {"timing", {
-                                    {"prefill_ms", zdb_res.prefill_sec * 1000.0},
-                                    {"total_ms", zdb_res.total_sec * 1000.0}
-                                }}
-                            }}
+                            {"zero_decode_bypass", moecher::zdb::build_zdb_json_object(zdb_res)}
                         };
                         res.set_content(response.dump(-1, ' ', false, json::error_handler_t::replace), "application/json");
                         return;
