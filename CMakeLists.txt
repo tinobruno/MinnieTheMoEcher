@@ -92,6 +92,8 @@ if(APPLE)
         src/logging.cpp
         src/agentic.cpp
         src/web_ui.cpp
+        src/tokenizer.cpp
+        src/multimodal.cpp
         src/metal/metal_backend.mm
     )
 else()
@@ -100,6 +102,8 @@ else()
         src/logging.cpp
         src/agentic.cpp
         src/web_ui.cpp
+        src/tokenizer.cpp
+        src/multimodal.cpp
         src/cuda/activations.cu
         src/cuda/vision_kernels.cu
     )
