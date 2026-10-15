@@ -89,11 +89,13 @@ endif()
 if(APPLE)
     set(MOECHER_SOURCES
         src/server_single.cpp
+        src/web_ui.cpp
         src/metal/metal_backend.mm
     )
 else()
     set(MOECHER_SOURCES
         src/server_single.cpp
+        src/web_ui.cpp
         src/cuda/activations.cu
         src/cuda/vision_kernels.cu
     )
