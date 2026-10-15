@@ -88,7 +88,8 @@ endif()
 # ── Main executable ────────────────────────────────────────────────────────────
 if(APPLE)
     set(MOECHER_SOURCES
-        src/server_single.cpp
+        src/main.cpp
+        src/server.cpp
         src/logging.cpp
         src/agentic.cpp
         src/web_ui.cpp
@@ -99,7 +100,8 @@ if(APPLE)
     )
 else()
     set(MOECHER_SOURCES
-        src/server_single.cpp
+        src/main.cpp
+        src/server.cpp
         src/logging.cpp
         src/agentic.cpp
         src/web_ui.cpp

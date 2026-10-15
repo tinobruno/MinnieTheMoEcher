@@ -6,11 +6,21 @@
 #include <stdexcept>
 #include <algorithm>
 
+#ifndef STB_IMAGE_STATIC
+#define STB_IMAGE_STATIC
+#endif
+#ifndef STB_IMAGE_IMPLEMENTATION
 #define STB_IMAGE_IMPLEMENTATION
+#endif
 #define STBI_NO_STDIO
 #include "stb_image.h"
 
+#ifndef STB_IMAGE_RESIZE_STATIC
+#define STB_IMAGE_RESIZE_STATIC
+#endif
+#ifndef STB_IMAGE_RESIZE_IMPLEMENTATION
 #define STB_IMAGE_RESIZE_IMPLEMENTATION
+#endif
 #include "stb_image_resize2.h"
 
 namespace moecher::vision {
