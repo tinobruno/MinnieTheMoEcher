@@ -1275,6 +1275,86 @@ Underwriting Decision:</code></pre>
             </div>
         </div>
 
+        <hr style="border: 0; border-top: 1px solid var(--border); margin: 48px 0;">
+
+        <!-- Section: Architectural Boundaries & Future Work -->
+        <h2>Architectural Boundaries, Rigorous Metrics &amp; The Path Forward</h2>
+
+        <p>
+            Following our initial technical disclosure, peer reviewers and systems architects raised essential questions: 
+            <em>What are the precise scientific boundaries of this claim, and where should this architecture be taken next?</em>
+        </p>
+
+        <p>
+            Here is an objective, peer-review-grade breakdown of how to evaluate ZDB with systems-level precision:
+        </p>
+
+        <h3>1. Decision Latency vs. Per-Token Reasoning Workload</h3>
+        <p>
+            A rigorous evaluation must distinguish between two different metrics:
+        </p>
+        <ul>
+            <li><strong>Product Decision Latency:</strong> The total wall-clock time required to deliver a validated, bounded classification or route.</li>
+            <li><strong>Equivalent Computational Workload:</strong> Comparing per-token FLOPs across identical operations.</li>
+        </ul>
+        <p>
+            In standard autoregressive inference, generating 40 conversational tokens (e.g., <em>"Based on my evaluation, the selected tool is web_search"</em>) performs vastly more compute and streams gigabytes of model weights dozens of times. ZDB does <strong>not</strong> claim to accelerate multi-step chain-of-thought calculation by 20x; rather, it proves that for bounded decisions, <strong>the decode passes themselves were redundant work</strong>. Bypassing that redundancy is what unlocks the 20x latency reduction for user-facing agent systems.
+        </p>
+
+        <h3>2. Reconciling Timing Boundaries: Cold vs. Cached Prefill</h3>
+        <p>
+            To ensure absolute scientific clarity across all reported latency measurements:
+        </p>
+        <div class="grid-2">
+            <div class="feature-card">
+                <div class="feature-card-header"><span class="icon">❄️</span> Cold Hardware Latency (275ms – 293ms)</div>
+                <p>
+                    Represents full, un-cached prompt prefill forward passes across 100–300 tokens on our NVIDIA RTX 5060 Ti 16 GB, followed by step-0 logit extraction and the 220&mu;s PCIe device-to-host asynchronous transfer.
+                </p>
+            </div>
+            <div class="feature-card">
+                <div class="feature-card-header"><span class="icon">⚡</span> Prefix-Cached Latency (91.8ms)</div>
+                <p>
+                    Occurs when system instructions, tool signatures, or multi-turn agent prefixes are already pinned in the GPU KV-cache. The GPU only forwards the incremental prompt delta tokens before immediately slicing the logits.
+                </p>
+            </div>
+        </div>
+
+        <h3>3. Defining the Accuracy Baseline &amp; The "False-Fast-Path Rate"</h3>
+        <p>
+            In our benchmark tables, <strong>Exact Match</strong> denotes that the step-0 ZDB decision strictly agreed with the ground-truth verified label.
+        </p>
+        <p>
+            However, as correctly observed by rigorous reviewers, <em>confidence does not equal correctness</em>, and a fixed threshold (\(\Delta_{\text{top1}} \le 1.5, \tau \ge 0.70\)) tested on handcrafted edge cases is a proof-of-concept, not an exhaustive statistical distribution.
+        </p>
+        <p>
+            We formally define the primary reliability metric for hybrid inference engines:
+        </p>
+
+        <div class="math-card">
+            $$\text{False-Fast-Path Rate} = \frac{N_{\text{incorrect fast-path decisions}}}{N_{\text{total fast-path queries}}}$$
+        </div>
+
+        <p>
+            The primary objective of the Confidence Arbiter is to drive the <strong>False-Fast-Path Rate toward zero</strong>. When a problem contains hidden arithmetic conflicts or numeric ambiguity, the Arbiter must conservatively escalate execution to the System 2 thinking loop.
+        </p>
+        <p>
+            The immediate next empirical step for MinnieTheMoEcher is benchmarking ZDB and the Arbiter across thousands of held-out samples on standardized benchmarks (such as <strong>ToolBench</strong>, <strong>MMLU-Pro</strong>, and structured financial audit datasets) to plot complete reliability calibration curves across varying quantization schemes.
+        </p>
+
+        <h3>4. Beyond Inference: ZDB as a Runtime Scheduling Primitive</h3>
+        <p>
+            Perhaps the most exciting insight highlighted by systems architects is that Zero Decode Bypass is not merely a single-model inference optimization—it has the potential to become an <strong>OS-level runtime scheduling primitive</strong> for agentic platforms.
+        </p>
+        <blockquote>
+            "ZDB could become a runtime scheduling primitive, not merely an inference optimization. A kernel could make fast-path decisions for routine actions and reserve expensive autoregressive generation for cases that actually benefit from it."
+        </blockquote>
+        <p>
+            Instead of statically assigning models or spinning up separate micro-models, a unified inference engine can dynamically schedule bounded, high-frequency actions (tool routing, validation gates, message triage) onto the zero-decode fast path, while reserving memory-bandwidth-heavy autoregressive generation exclusively for deep reasoning.
+        </p>
+
+        <hr style="border: 0; border-top: 1px solid var(--border); margin: 48px 0;">
+
         <!-- Conclusion -->
         <h2>Conclusion &amp; What's Next</h2>
 
