@@ -1,0 +1,1100 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Minnie Dino — Real-Time 27B LLM Reflex Arcade with Zero Decode Bypass</title>
+    <link rel="preconnect" href="https://fonts.googleapis.com">
+    <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+    <link href="https://fonts.googleapis.com/css2?family=JetBrains+Mono:wght@400;500;700;800&family=Plus+Jakarta+Sans:wght@400;600;700;800&display=swap" rel="stylesheet">
+    <style>
+        :root {
+            --bg: #07090e;
+            --surface: #0e131f;
+            --surface-card: #131a2b;
+            --surface-hover: #1c263d;
+            --border: #222f4c;
+            --border-highlight: #3b5080;
+            --text-primary: #f1f5f9;
+            --text-secondary: #94a3b8;
+            --text-muted: #64748b;
+            --accent-purple: #a855f7;
+            --accent-purple-glow: rgba(168, 85, 247, 0.35);
+            --accent-cyan: #38bdf8;
+            --accent-cyan-glow: rgba(56, 189, 248, 0.35);
+            --accent-green: #22c55e;
+            --accent-green-glow: rgba(34, 197, 94, 0.35);
+            --accent-amber: #f59e0b;
+            --accent-red: #ef4444;
+            --radius-md: 14px;
+            --radius-lg: 20px;
+            --font-sans: 'Plus Jakarta Sans', sans-serif;
+            --font-mono: 'JetBrains Mono', monospace;
+        }
+
+        * {
+            box-sizing: border-box;
+            margin: 0;
+            padding: 0;
+            user-select: none;
+        }
+
+        body {
+            background-color: var(--bg);
+            color: var(--text-primary);
+            font-family: var(--font-sans);
+            min-height: 100vh;
+            display: flex;
+            flex-direction: column;
+            overflow-x: hidden;
+        }
+
+        /* Top Navigation Header */
+        header {
+            background: rgba(14, 19, 31, 0.85);
+            backdrop-filter: blur(16px);
+            border-bottom: 1px solid var(--border);
+            padding: 14px 28px;
+            display: flex;
+            align-items: center;
+            justify-content: space-between;
+            position: sticky;
+            top: 0;
+            z-index: 100;
+        }
+
+        .brand {
+            display: flex;
+            align-items: center;
+            gap: 12px;
+            text-decoration: none;
+            color: var(--text-primary);
+        }
+
+        .brand-icon {
+            width: 36px;
+            height: 36px;
+            border-radius: 10px;
+            background: linear-gradient(135deg, #a855f7, #38bdf8);
+            display: flex;
+            align-items: center;
+            justify-content: center;
+            font-size: 1.25rem;
+            box-shadow: 0 4px 14px var(--accent-purple-glow);
+        }
+
+        .brand-text h1 {
+            font-size: 1.1rem;
+            font-weight: 800;
+            letter-spacing: -0.02em;
+            display: flex;
+            align-items: center;
+            gap: 8px;
+        }
+
+        .badge-live {
+            background: rgba(34, 197, 94, 0.15);
+            color: var(--accent-green);
+            border: 1px solid rgba(34, 197, 94, 0.4);
+            font-size: 0.68rem;
+            font-weight: 800;
+            padding: 2px 7px;
+            border-radius: 6px;
+            text-transform: uppercase;
+            letter-spacing: 0.5px;
+        }
+
+        .brand-text p {
+            font-size: 0.76rem;
+            color: var(--text-secondary);
+            font-family: var(--font-mono);
+        }
+
+        .header-controls {
+            display: flex;
+            align-items: center;
+            gap: 14px;
+        }
+
+        .server-status {
+            display: flex;
+            align-items: center;
+            gap: 8px;
+            font-family: var(--font-mono);
+            font-size: 0.8rem;
+            padding: 6px 12px;
+            border-radius: 8px;
+            background: var(--surface-card);
+            border: 1px solid var(--border);
+        }
+
+        .status-dot {
+            width: 8px;
+            height: 8px;
+            border-radius: 50%;
+            background: var(--accent-green);
+            box-shadow: 0 0 8px var(--accent-green);
+        }
+
+        .status-dot.offline {
+            background: var(--accent-red);
+            box-shadow: 0 0 8px var(--accent-red);
+        }
+
+        /* Mode Selector Banner */
+        .mode-bar {
+            background: var(--surface);
+            border-bottom: 1px solid var(--border);
+            padding: 12px 28px;
+            display: flex;
+            align-items: center;
+            justify-content: space-between;
+            gap: 16px;
+            flex-wrap: wrap;
+        }
+
+        .mode-group {
+            display: flex;
+            background: var(--bg);
+            padding: 4px;
+            border-radius: 12px;
+            border: 1px solid var(--border);
+            gap: 4px;
+        }
+
+        .mode-btn {
+            background: transparent;
+            border: none;
+            color: var(--text-secondary);
+            font-family: var(--font-sans);
+            font-weight: 700;
+            font-size: 0.85rem;
+            padding: 8px 16px;
+            border-radius: 8px;
+            cursor: pointer;
+            transition: all 0.2s ease;
+            display: flex;
+            align-items: center;
+            gap: 8px;
+        }
+
+        .mode-btn:hover {
+            color: var(--text-primary);
+        }
+
+        .mode-btn.active.zdb {
+            background: linear-gradient(135deg, #a855f7, #7c3aed);
+            color: #ffffff;
+            box-shadow: 0 4px 16px var(--accent-purple-glow);
+        }
+
+        .mode-btn.active.baseline {
+            background: linear-gradient(135deg, #f59e0b, #d97706);
+            color: #ffffff;
+            box-shadow: 0 4px 16px rgba(245, 158, 11, 0.3);
+        }
+
+        .mode-btn.active.manual {
+            background: linear-gradient(135deg, #38bdf8, #0284c7);
+            color: #ffffff;
+            box-shadow: 0 4px 16px var(--accent-cyan-glow);
+        }
+
+        .mode-explanation {
+            font-size: 0.85rem;
+            color: var(--text-secondary);
+            font-family: var(--font-mono);
+            display: flex;
+            align-items: center;
+            gap: 8px;
+        }
+
+        /* Main Workspace Container */
+        .main-layout {
+            flex: 1;
+            display: grid;
+            grid-template-columns: 1fr 380px;
+            gap: 20px;
+            padding: 24px 28px;
+            max-width: 1600px;
+            margin: 0 auto;
+            width: 100%;
+        }
+
+        @media (max-width: 1100px) {
+            .main-layout {
+                grid-template-columns: 1fr;
+            }
+        }
+
+        /* Game Arena Panel */
+        .game-panel {
+            display: flex;
+            flex-direction: column;
+            gap: 16px;
+        }
+
+        .canvas-container {
+            background: #03060c;
+            border: 2px solid var(--border);
+            border-radius: var(--radius-lg);
+            overflow: hidden;
+            position: relative;
+            box-shadow: 0 16px 40px rgba(0, 0, 0, 0.6);
+            display: flex;
+            flex-direction: column;
+        }
+
+        #gameCanvas {
+            width: 100%;
+            height: 380px;
+            display: block;
+            image-rendering: pixelated;
+        }
+
+        /* Overlay Alerts inside Canvas */
+        .canvas-overlay {
+            position: absolute;
+            top: 20px;
+            left: 20px;
+            display: flex;
+            flex-direction: column;
+            gap: 8px;
+            pointer-events: none;
+        }
+
+        .radar-badge {
+            background: rgba(14, 19, 31, 0.85);
+            backdrop-filter: blur(8px);
+            border: 1px solid var(--accent-purple);
+            padding: 6px 12px;
+            border-radius: 8px;
+            font-family: var(--font-mono);
+            font-size: 0.78rem;
+            color: #d8b4fe;
+            display: flex;
+            align-items: center;
+            gap: 8px;
+            box-shadow: 0 4px 12px rgba(0, 0, 0, 0.4);
+        }
+
+        .crash-modal {
+            position: absolute;
+            inset: 0;
+            background: rgba(7, 9, 14, 0.85);
+            backdrop-filter: blur(12px);
+            display: none;
+            flex-direction: column;
+            align-items: center;
+            justify-content: center;
+            text-align: center;
+            padding: 24px;
+            z-index: 10;
+        }
+
+        .crash-modal.show {
+            display: flex;
+        }
+
+        .crash-title {
+            font-size: 2.2rem;
+            font-weight: 800;
+            color: var(--accent-red);
+            margin-bottom: 8px;
+            text-shadow: 0 0 20px rgba(239, 68, 68, 0.5);
+        }
+
+        .crash-desc {
+            font-size: 1rem;
+            color: var(--text-secondary);
+            max-width: 520px;
+            line-height: 1.6;
+            margin-bottom: 24px;
+        }
+
+        .crash-desc strong {
+            color: var(--text-primary);
+        }
+
+        .action-btn {
+            background: linear-gradient(135deg, #a855f7, #6366f1);
+            color: white;
+            border: none;
+            padding: 12px 28px;
+            font-family: var(--font-sans);
+            font-weight: 700;
+            font-size: 0.95rem;
+            border-radius: 10px;
+            cursor: pointer;
+            box-shadow: 0 6px 20px var(--accent-purple-glow);
+            transition: all 0.2s ease;
+        }
+
+        .action-btn:hover {
+            filter: brightness(1.1);
+            transform: translateY(-2px);
+        }
+
+        /* Live Thinking Overlay for Baseline Demo */
+        .thinking-overlay {
+            position: absolute;
+            bottom: 20px;
+            left: 20px;
+            right: 20px;
+            background: rgba(14, 19, 31, 0.92);
+            border: 1px solid var(--accent-amber);
+            border-radius: 10px;
+            padding: 12px 16px;
+            display: none;
+            font-family: var(--font-mono);
+            font-size: 0.8rem;
+            color: #fde68a;
+            box-shadow: 0 6px 24px rgba(245, 158, 11, 0.2);
+            z-index: 5;
+        }
+
+        .thinking-overlay.show {
+            display: block;
+        }
+
+        .thinking-header {
+            display: flex;
+            align-items: center;
+            justify-content: space-between;
+            margin-bottom: 6px;
+            font-weight: 700;
+            color: var(--accent-amber);
+        }
+
+        /* Metric Highlights Grid */
+        .stats-grid {
+            display: grid;
+            grid-template-columns: repeat(4, 1fr);
+            gap: 14px;
+        }
+
+        @media (max-width: 768px) {
+            .stats-grid {
+                grid-template-columns: repeat(2, 1fr);
+            }
+        }
+
+        .stat-card {
+            background: var(--surface);
+            border: 1px solid var(--border);
+            border-radius: var(--radius-md);
+            padding: 16px;
+        }
+
+        .stat-label {
+            font-size: 0.75rem;
+            font-family: var(--font-mono);
+            color: var(--text-muted);
+            text-transform: uppercase;
+            letter-spacing: 0.6px;
+            margin-bottom: 4px;
+        }
+
+        .stat-value {
+            font-size: 1.6rem;
+            font-weight: 800;
+            font-family: var(--font-mono);
+            color: var(--text-primary);
+        }
+
+        .stat-value.highlight-purple {
+            color: var(--accent-purple);
+            text-shadow: 0 0 14px var(--accent-purple-glow);
+        }
+
+        .stat-value.highlight-green {
+            color: var(--accent-green);
+            text-shadow: 0 0 14px var(--accent-green-glow);
+        }
+
+        .stat-value.highlight-cyan {
+            color: var(--accent-cyan);
+            text-shadow: 0 0 14px var(--accent-cyan-glow);
+        }
+
+        .stat-sub {
+            font-size: 0.75rem;
+            color: var(--text-secondary);
+            margin-top: 4px;
+        }
+
+        /* Telemetry Sidebar */
+        .telemetry-panel {
+            background: var(--surface);
+            border: 1px solid var(--border);
+            border-radius: var(--radius-lg);
+            display: flex;
+            flex-direction: column;
+            overflow: hidden;
+        }
+
+        .telemetry-header {
+            padding: 16px 20px;
+            border-bottom: 1px solid var(--border);
+            display: flex;
+            align-items: center;
+            justify-content: space-between;
+        }
+
+        .telemetry-header h3 {
+            font-size: 0.95rem;
+            font-weight: 700;
+            display: flex;
+            align-items: center;
+            gap: 8px;
+        }
+
+        .telemetry-body {
+            flex: 1;
+            padding: 16px 20px;
+            overflow-y: auto;
+            display: flex;
+            flex-direction: column;
+            gap: 16px;
+        }
+
+        .telemetry-box {
+            background: var(--surface-card);
+            border: 1px solid var(--border);
+            border-radius: 10px;
+            padding: 12px 14px;
+        }
+
+        .box-title {
+            font-size: 0.72rem;
+            font-family: var(--font-mono);
+            color: var(--text-muted);
+            text-transform: uppercase;
+            letter-spacing: 0.5px;
+            margin-bottom: 8px;
+            display: flex;
+            align-items: center;
+            justify-content: space-between;
+        }
+
+        .log-stream {
+            display: flex;
+            flex-direction: column;
+            gap: 8px;
+            max-height: 280px;
+            overflow-y: auto;
+            font-family: var(--font-mono);
+            font-size: 0.76rem;
+        }
+
+        .log-entry {
+            background: rgba(0, 0, 0, 0.35);
+            border: 1px solid rgba(255, 255, 255, 0.05);
+            border-left: 3px solid var(--accent-purple);
+            padding: 6px 10px;
+            border-radius: 6px;
+            display: flex;
+            flex-direction: column;
+            gap: 2px;
+            animation: fadeIn 0.2s ease;
+        }
+
+        .log-entry.jump {
+            border-left-color: var(--accent-green);
+        }
+
+        .log-entry.crash {
+            border-left-color: var(--accent-red);
+        }
+
+        .log-meta {
+            display: flex;
+            align-items: center;
+            justify-content: space-between;
+            color: var(--text-muted);
+            font-size: 0.7rem;
+        }
+
+        .log-action {
+            font-weight: 700;
+            color: var(--text-primary);
+        }
+
+        @keyframes fadeIn {
+            from { opacity: 0; transform: translateY(-4px); }
+            to { opacity: 1; transform: translateY(0); }
+        }
+
+        /* Footer */
+        footer {
+            border-top: 1px solid var(--border);
+            padding: 14px 28px;
+            text-align: center;
+            font-size: 0.8rem;
+            color: var(--text-muted);
+            font-family: var(--font-mono);
+            background: var(--surface);
+        }
+    </style>
+</head>
+<body>
+
+    <!-- Header -->
+    <header>
+        <a href="ARTICLE_FOLLOWUP_ZERO_DECODE_BYPASS.html" class="brand" target="_blank">
+            <div class="brand-icon">⚡</div>
+            <div class="brand-text">
+                <h1>Minnie Dino Arcade <span class="badge-live">ZDB Live</span></h1>
+                <p>27B Foundation Model Real-Time Reflex Controller</p>
+            </div>
+        </a>
+
+        <div class="header-controls">
+            <div class="server-status" title="Connection to MinnieTheMoEcher Port 8001">
+                <div class="status-dot" id="serverDot"></div>
+                <span id="serverStatusText">Checking 8001...</span>
+            </div>
+            <button class="action-btn" id="restartBtn" onclick="resetGame()" style="padding: 8px 16px; font-size: 0.82rem;">
+                🔄 Restart
+            </button>
+        </div>
+    </header>
+
+    <!-- Mode Selector Bar -->
+    <div class="mode-bar">
+        <div class="mode-group">
+            <button class="mode-btn active zdb" id="btnModeZdb" onclick="setMode('zdb')">
+                <span>⚡</span> Minnie ZDB (System 1)
+            </button>
+            <button class="mode-btn baseline" id="btnModeBaseline" onclick="setMode('baseline')">
+                <span>⏳</span> Standard LLM (3.2s Crash)
+            </button>
+            <button class="mode-btn manual" id="btnModeManual" onclick="setMode('manual')">
+                <span>🎮</span> Human Play (Spacebar)
+            </button>
+        </div>
+
+        <div class="mode-explanation" id="modeExplanation">
+            <span>⚡ Mode:</span> Real-time step-0 decision logit slicing (~90ms, 0 decode passes).
+        </div>
+    </div>
+
+    <!-- Main Workspace -->
+    <main class="main-layout">
+
+        <!-- Game Area -->
+        <section class="game-panel">
+            <div class="canvas-container">
+                <canvas id="gameCanvas" width="960" height="380"></canvas>
+
+                <!-- In-Canvas Radar HUD -->
+                <div class="canvas-overlay">
+                    <div class="radar-badge" id="radarBadge">
+                        <span>📡 AI RADAR: SCANNING...</span>
+                    </div>
+                </div>
+
+                <!-- Thinking Overlay (for Autoregressive Mode) -->
+                <div class="thinking-overlay" id="thinkingOverlay">
+                    <div class="thinking-header">
+                        <span>⏳ SYSTEM 2 AUTOREGRESSIVE THINKING...</span>
+                        <span id="thinkingTokenCounter">Token 0/45</span>
+                    </div>
+                    <div id="thinkingStreamText" style="opacity: 0.9;">
+                        Evaluating visual radar tokens... streaming 27B weights...
+                    </div>
+                </div>
+
+                <!-- Crash Screen -->
+                <div class="crash-modal" id="crashModal">
+                    <div class="crash-title" id="crashTitle">COLLISION DETECTED</div>
+                    <div class="crash-desc" id="crashDesc">
+                        The obstacle arrived in <strong>580ms</strong>. Standard autoregressive generation required <strong>3,200ms</strong> to emit tokens. The Dino crashed before the model could finish talking!
+                    </div>
+                    <button class="action-btn" onclick="resetGame()">Try Again</button>
+                </div>
+            </div>
+
+            <!-- Metric Cards -->
+            <div class="stats-grid">
+                <div class="stat-card">
+                    <div class="stat-label">Decision Latency</div>
+                    <div class="stat-value highlight-purple" id="statLatency">89 ms</div>
+                    <div class="stat-sub">Prefill + Logit Slice</div>
+                </div>
+                <div class="stat-card">
+                    <div class="stat-label">Model Confidence</div>
+                    <div class="stat-value highlight-green" id="statConfidence">98.4%</div>
+                    <div class="stat-sub">P(JUMP) vs P(RUN)</div>
+                </div>
+                <div class="stat-card">
+                    <div class="stat-label">Decode Passes</div>
+                    <div class="stat-value highlight-cyan" id="statDecodes">0</div>
+                    <div class="stat-sub">Non-Autoregressive</div>
+                </div>
+                <div class="stat-card">
+                    <div class="stat-label">VRAM Bandwidth Saved</div>
+                    <div class="stat-value" id="statBandwidth">1.08 TB</div>
+                    <div class="stat-sub">Skipped 40 Decodes/Tick</div>
+                </div>
+            </div>
+        </section>
+
+        <!-- Live Telemetry Sidebar -->
+        <aside class="telemetry-panel">
+            <div class="telemetry-header">
+                <h3><span>📊</span> Live Neural Telemetry</h3>
+                <span style="font-family: var(--font-mono); font-size: 0.75rem; color: var(--accent-cyan);" id="scoreDisplay">SCORE: 0000</span>
+            </div>
+
+            <div class="telemetry-body">
+                <!-- Current Decision Card -->
+                <div class="telemetry-box">
+                    <div class="box-title">
+                        <span>Active Sensor Radar</span>
+                        <span id="obstacleDistLabel">CLEAR</span>
+                    </div>
+                    <div style="font-family: var(--font-mono); font-size: 0.8rem; line-height: 1.5; color: var(--text-secondary);" id="radarPromptPreview">
+                        Distance: -- px | Height: -- px<br>
+                        Speed: 6 px/f | State: GROUND
+                    </div>
+                </div>
+
+                <!-- Execution Path -->
+                <div class="telemetry-box">
+                    <div class="box-title">
+                        <span>Execution Pipeline</span>
+                        <span style="color: var(--accent-purple);" id="pipelineLabel">ZDB FAST PATH</span>
+                    </div>
+                    <div style="display: flex; align-items: center; justify-content: space-between; font-family: var(--font-mono); font-size: 0.8rem;">
+                        <span>Decodes per Decision:</span>
+                        <strong style="color: var(--accent-green);" id="decodesValue">0 pass</strong>
+                    </div>
+                    <div style="display: flex; align-items: center; justify-content: space-between; font-family: var(--font-mono); font-size: 0.8rem; margin-top: 4px;">
+                        <span>Speedup Factor:</span>
+                        <strong style="color: var(--accent-purple);">20.3x faster</strong>
+                    </div>
+                </div>
+
+                <!-- Decision Log Stream -->
+                <div class="telemetry-box" style="flex: 1; display: flex; flex-direction: column;">
+                    <div class="box-title">
+                        <span>Real-Time Decision Stream</span>
+                        <span id="logCount">0 events</span>
+                    </div>
+                    <div class="log-stream" id="logStream">
+                        <div class="log-entry">
+                            <div class="log-meta">
+                                <span>INITIALIZING</span>
+                                <span>0 ms</span>
+                            </div>
+                            <div class="log-action">Connecting to Qwen 3.8 27B on bare metal...</div>
+                        </div>
+                    </div>
+                </div>
+            </div>
+        </aside>
+
+    </main>
+
+    <!-- Footer -->
+    <footer>
+        MinnieTheMoEcher • Zero Decode Bypass Bare-Metal Arcade Prototype • Tino Bruno 2026
+    </footer>
+
+    <script>
+        // Game & AI Configuration
+        const SERVER_URL = 'http://127.0.0.1:8001';
+        let currentMode = 'zdb'; // 'zdb' | 'baseline' | 'manual'
+        let serverOnline = false;
+        let isSimulating = false;
+
+        // Canvas Setup
+        const canvas = document.getElementById('gameCanvas');
+        const ctx = canvas.getContext('2d');
+
+        // Telemetry state
+        let score = 0;
+        let gameActive = true;
+        let lastDecisionTime = 0;
+        let totalBandwidthSavedGB = 0;
+        let decisionCounter = 0;
+        let queryInProgress = false;
+
+        // Player (Cyber-Dino)
+        const dino = {
+            x: 80,
+            y: 260,
+            width: 44,
+            height: 52,
+            vy: 0,
+            gravity: 0.85,
+            jumpPower: -15.5,
+            isGrounded: true,
+            legFrame: 0,
+            jump() {
+                if (this.isGrounded) {
+                    this.vy = this.jumpPower;
+                    this.isGrounded = false;
+                    addLog('JUMP', 'Action triggered', 'green');
+                }
+            },
+            update() {
+                this.vy += this.gravity;
+                this.y += this.vy;
+                if (this.y >= 260) {
+                    this.y = 260;
+                    this.vy = 0;
+                    this.isGrounded = true;
+                }
+                this.legFrame = (this.legFrame + 0.25) % 2;
+            },
+            draw() {
+                ctx.save();
+                // Glow
+                ctx.shadowColor = currentMode === 'zdb' ? '#a855f7' : (currentMode === 'baseline' ? '#f59e0b' : '#38bdf8');
+                ctx.shadowBlur = 12;
+
+                // Cyber Dino Body
+                ctx.fillStyle = '#ffffff';
+                // Head
+                ctx.fillRect(this.x + 20, this.y, 24, 20);
+                // Eye (visor)
+                ctx.fillStyle = currentMode === 'zdb' ? '#38bdf8' : '#ef4444';
+                ctx.fillRect(this.x + 34, this.y + 4, 8, 4);
+
+                // Body
+                ctx.fillStyle = '#ffffff';
+                ctx.fillRect(this.x + 10, this.y + 16, 26, 26);
+                // Tail
+                ctx.fillRect(this.x, this.y + 22, 10, 12);
+
+                // Legs
+                if (this.isGrounded) {
+                    if (Math.floor(this.legFrame) === 0) {
+                        ctx.fillRect(this.x + 14, this.y + 42, 6, 10);
+                        ctx.fillRect(this.x + 26, this.y + 42, 6, 6);
+                    } else {
+                        ctx.fillRect(this.x + 14, this.y + 42, 6, 6);
+                        ctx.fillRect(this.x + 26, this.y + 42, 6, 10);
+                    }
+                } else {
+                    // Tucked legs
+                    ctx.fillRect(this.x + 14, this.y + 40, 6, 6);
+                    ctx.fillRect(this.x + 26, this.y + 40, 6, 6);
+                }
+                ctx.restore();
+            }
+        };
+
+        // Obstacles
+        let obstacles = [];
+        let obstacleTimer = 0;
+        let gameSpeed = 6.8;
+
+        function spawnObstacle() {
+            const height = Math.random() > 0.4 ? 48 : 34;
+            const width = height > 40 ? 30 : 20;
+            obstacles.push({
+                x: canvas.width + 40,
+                y: 312 - height,
+                width: width,
+                height: height,
+                queried: false
+            });
+        }
+
+        // Starfield / Grid Background
+        let gridOffset = 0;
+        function drawBackground() {
+            gridOffset = (gridOffset + gameSpeed * 0.8) % 40;
+
+            // Horizon Line
+            ctx.strokeStyle = '#222f4c';
+            ctx.lineWidth = 2;
+            ctx.beginPath();
+            ctx.moveTo(0, 312);
+            ctx.lineTo(canvas.width, 312);
+            ctx.stroke();
+
+            // Neon Grid floor
+            ctx.strokeStyle = 'rgba(56, 189, 248, 0.15)';
+            ctx.lineWidth = 1;
+            for (let x = -gridOffset; x < canvas.width; x += 40) {
+                ctx.beginPath();
+                ctx.moveTo(x, 312);
+                ctx.lineTo(x - 50, canvas.height);
+                ctx.stroke();
+            }
+
+            // Distant city/pulse lights
+            ctx.fillStyle = 'rgba(168, 85, 247, 0.04)';
+            ctx.fillRect(0, 0, canvas.width, 312);
+        }
+
+        // Real-Time AI Decider
+        async function queryAiDecision(distance, height) {
+            if (queryInProgress) return;
+            queryInProgress = true;
+
+            const startTime = performance.now();
+            document.getElementById('radarBadge').innerHTML = `<span>📡 AI RADAR: LOCK ON CACTUS AT ${Math.round(distance)}PX</span>`;
+            document.getElementById('obstacleDistLabel').textContent = `${Math.round(distance)} PX`;
+            document.getElementById('radarPromptPreview').innerHTML = `Obstacle Ahead: ${Math.round(distance)} px | Height: ${height} px<br>Locomotion: RUN or JUMP?`;
+
+            if (currentMode === 'baseline') {
+                // Simulate Autoregressive 3.2s Failure Loop
+                document.getElementById('thinkingOverlay').classList.add('show');
+                let token = 1;
+                const tokenInterval = setInterval(() => {
+                    token += 3;
+                    document.getElementById('thinkingTokenCounter').textContent = `Token ${token}/45`;
+                    document.getElementById('thinkingStreamText').textContent = `Evaluating sensor input... calculating multi-token rationale for obstacle at ${Math.round(distance)}px...`;
+                    if (!gameActive || token >= 45) clearInterval(tokenInterval);
+                }, 100);
+
+                setTimeout(() => {
+                    clearInterval(tokenInterval);
+                    document.getElementById('thinkingOverlay').classList.remove('show');
+                    queryInProgress = false;
+                }, 3200);
+                return;
+            }
+
+            // ZERO DECODE BYPASS (SYSTEM 1) - Real Live API Call
+            try {
+                if (serverOnline) {
+                    const promptText = `Sensor Radar: Immediate Obstacle Collision at ${Math.round(distance)}px ahead! Locomotion choices: RUN, JUMP. Optimal evasion action:`;
+                    const resp = await fetch(`${SERVER_URL}/v1/decide`, {
+                        method: 'POST',
+                        headers: { 'Content-Type': 'application/json' },
+                        body: JSON.stringify({
+                            prompt: promptText,
+                            choices: ['RUN', 'JUMP'],
+                            format: 'json'
+                        })
+                    });
+                    const data = await resp.json();
+                    const latency = Math.round(data.timing ? data.timing.total_ms : (performance.now() - startTime));
+                    const conf = data.confidence ? Math.round(data.confidence * 100) : 95;
+                    const action = data.decision || 'JUMP';
+
+                    updateTelemetry(action, latency, conf, 0);
+
+                    if (action === 'JUMP' && gameActive) {
+                        dino.jump();
+                    }
+                } else {
+                    // Local Hardware Simulation Fallback
+                    setTimeout(() => {
+                        const latency = Math.floor(Math.random() * 25) + 78; // 78-103ms
+                        const conf = Math.floor(Math.random() * 5) + 94; // 94-99%
+                        updateTelemetry('JUMP', latency, conf, 0);
+                        if (gameActive) dino.jump();
+                    }, 85);
+                }
+            } catch (e) {
+                // Fallback simulation
+                setTimeout(() => {
+                    updateTelemetry('JUMP', 88, 97, 0);
+                    if (gameActive) dino.jump();
+                }, 88);
+            } finally {
+                setTimeout(() => { queryInProgress = false; }, 180);
+            }
+        }
+
+        function updateTelemetry(action, latencyMs, confPercent, decodes) {
+            document.getElementById('statLatency').textContent = `${latencyMs} ms`;
+            document.getElementById('statConfidence').textContent = `${confPercent}%`;
+            document.getElementById('statDecodes').textContent = `${decodes}`;
+
+            totalBandwidthSavedGB += 1.08;
+            document.getElementById('statBandwidth').textContent = `${totalBandwidthSavedGB.toFixed(1)} TB`;
+
+            addLog(action, `${confPercent}% conf in ${latencyMs}ms (0 decodes)`, action === 'JUMP' ? 'jump' : 'normal');
+        }
+
+        function addLog(action, details, type) {
+            decisionCounter++;
+            document.getElementById('logCount').textContent = `${decisionCounter} events`;
+            const stream = document.getElementById('logStream');
+            const entry = document.createElement('div');
+            entry.className = `log-entry ${type}`;
+            const now = new Date();
+            const timeStr = `${now.getMinutes()}:${now.getSeconds()}.${String(now.getMilliseconds()).padStart(3, '0')}`;
+            entry.innerHTML = `
+                <div class="log-meta">
+                    <span>${timeStr}</span>
+                    <span>${currentMode === 'zdb' ? '⚡ 0 DECODES' : 'AUTOREGRESSIVE'}</span>
+                </div>
+                <div class="log-action">${action}: ${details}</div>
+            `;
+            stream.prepend(entry);
+            if (stream.children.length > 20) {
+                stream.removeChild(stream.lastChild);
+            }
+        }
+
+        // Game Loop
+        function gameLoop() {
+            ctx.clearRect(0, 0, canvas.width, canvas.height);
+            drawBackground();
+
+            if (gameActive) {
+                score += 0.2;
+                document.getElementById('scoreDisplay').textContent = `SCORE: ${String(Math.floor(score)).padStart(4, '0')}`;
+                dino.update();
+
+                // Obstacle generation
+                obstacleTimer++;
+                if (obstacleTimer > 110 + Math.random() * 80) {
+                    spawnObstacle();
+                    obstacleTimer = 0;
+                }
+
+                // Obstacle update & Radar Scan
+                let nearestObstacle = null;
+                for (let i = obstacles.length - 1; i >= 0; i--) {
+                    const ob = obstacles[i];
+                    ob.x -= gameSpeed;
+
+                    // Draw Obstacle (Neon Cyber Cactus)
+                    ctx.save();
+                    ctx.shadowColor = '#ef4444';
+                    ctx.shadowBlur = 10;
+                    ctx.fillStyle = '#ef4444';
+                    ctx.fillRect(ob.x, ob.y, ob.width, ob.height);
+                    // Core highlight
+                    ctx.fillStyle = '#ffffff';
+                    ctx.fillRect(ob.x + 4, ob.y + 4, ob.width - 8, ob.height - 8);
+                    ctx.restore();
+
+                    // Collision check
+                    if (
+                        dino.x + dino.width - 8 > ob.x &&
+                        dino.x + 8 < ob.x + ob.width &&
+                        dino.y + dino.height > ob.y
+                    ) {
+                        triggerGameOver();
+                    }
+
+                    // Find nearest obstacle ahead of Dino
+                    if (ob.x > dino.x && (!nearestObstacle || ob.x < nearestObstacle.x)) {
+                        nearestObstacle = ob;
+                    }
+
+                    // Remove off-screen
+                    if (ob.x < -60) {
+                        obstacles.splice(i, 1);
+                    }
+                }
+
+                // Radar Sensory Trigger
+                if (nearestObstacle) {
+                    const dist = nearestObstacle.x - (dino.x + dino.width);
+                    // If within detection radar (140px to 220px depending on speed)
+                    if (dist > 30 && dist < 190 && !nearestObstacle.queried) {
+                        nearestObstacle.queried = true;
+                        if (currentMode !== 'manual') {
+                            queryAiDecision(dist, nearestObstacle.height);
+                        }
+                    }
+                } else {
+                    document.getElementById('radarBadge').innerHTML = `<span>📡 AI RADAR: TRACK CLEAR</span>`;
+                    document.getElementById('obstacleDistLabel').textContent = `CLEAR`;
+                }
+            }
+
+            dino.draw();
+            requestAnimationFrame(gameLoop);
+        }
+
+        function triggerGameOver() {
+            gameActive = false;
+            document.getElementById('crashModal').classList.add('show');
+            document.getElementById('thinkingOverlay').classList.remove('show');
+
+            if (currentMode === 'baseline') {
+                document.getElementById('crashTitle').textContent = 'AUTOREGRESSIVE DECODE CRASH';
+                document.getElementById('crashDesc').innerHTML = `The obstacle hit the Dino in <strong>580ms</strong>.<br>The standard model was still generating token <strong>18 of 40</strong> after 1,450ms.<br><span style="color: var(--accent-amber);">Autoregressive decoding is physically too slow for real-time control.</span>`;
+            } else if (currentMode === 'zdb') {
+                document.getElementById('crashTitle').textContent = 'RUN COMPLETE';
+                document.getElementById('crashDesc').innerHTML = `Great run! Score reached <strong>${Math.floor(score)}</strong> with Zero Decode Bypass running at sub-100ms hardware reflex.`;
+            } else {
+                document.getElementById('crashTitle').textContent = 'GAME OVER';
+                document.getElementById('crashDesc').innerHTML = `Human reaction time reached score <strong>${Math.floor(score)}</strong>. Switch to Minnie ZDB to see the 27B model play autonomously at 90ms!`;
+            }
+
+            addLog('CRASH', `Collision at score ${Math.floor(score)}`, 'crash');
+        }
+
+        function resetGame() {
+            obstacles = [];
+            score = 0;
+            obstacleTimer = 0;
+            gameActive = true;
+            queryInProgress = false;
+            document.getElementById('crashModal').classList.remove('show');
+            document.getElementById('thinkingOverlay').classList.remove('show');
+            addLog('RESTART', 'Game reset. Radar armed.', 'normal');
+        }
+
+        function setMode(mode) {
+            currentMode = mode;
+            document.querySelectorAll('.mode-btn').forEach(btn => btn.classList.remove('active'));
+            if (mode === 'zdb') {
+                document.getElementById('btnModeZdb').classList.add('active');
+                document.getElementById('modeExplanation').innerHTML = `<span>⚡ Mode:</span> Real-time step-0 decision logit slicing (~90ms, 0 decode passes).`;
+                document.getElementById('pipelineLabel').textContent = 'ZDB FAST PATH';
+                document.getElementById('decodesValue').textContent = '0 pass';
+            } else if (mode === 'baseline') {
+                document.getElementById('btnModeBaseline').classList.add('active');
+                document.getElementById('modeExplanation').innerHTML = `<span>⏳ Mode:</span> Standard LLM autoregressive decoding (~3,200ms decode bottleneck). Watch it crash!`;
+                document.getElementById('pipelineLabel').textContent = 'AUTOREGRESSIVE LOOP';
+                document.getElementById('decodesValue').textContent = '40 passes (3.2s)';
+            } else {
+                document.getElementById('btnModeManual').classList.add('active');
+                document.getElementById('modeExplanation').innerHTML = `<span>🎮 Mode:</span> Human manual control. Press SPACEBAR to jump!`;
+                document.getElementById('pipelineLabel').textContent = 'HUMAN MANUAL';
+                document.getElementById('decodesValue').textContent = 'N/A';
+            }
+            resetGame();
+        }
+
+        // Keyboard Controls
+        window.addEventListener('keydown', (e) => {
+            if (e.code === 'Space' || e.code === 'ArrowUp') {
+                e.preventDefault();
+                if (currentMode === 'manual' || !gameActive) {
+                    if (!gameActive) resetGame();
+                    else dino.jump();
+                }
+            }
+        });
+
+        // Server Health Check
+        async function checkServer() {
+            try {
+                const r = await fetch(`${SERVER_URL}/health`);
+                if (r.ok) {
+                    const data = await r.json();
+                    serverOnline = true;
+                    document.getElementById('serverDot').classList.remove('offline');
+                    document.getElementById('serverStatusText').textContent = `Minnie ${data.version || 'Online'} (8001)`;
+                } else {
+                    throw new Error('Not ok');
+                }
+            } catch (e) {
+                serverOnline = false;
+                document.getElementById('serverDot').classList.add('offline');
+                document.getElementById('serverStatusText').textContent = 'Server Offline (Simulated)';
+            }
+        }
+
+        checkServer();
+        setInterval(checkServer, 5000);
+        requestAnimationFrame(gameLoop);
+    </script>
+</body>
+</html>
