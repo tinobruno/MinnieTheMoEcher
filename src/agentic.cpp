@@ -930,6 +930,16 @@ json resolve_canonical_tools(const json& tools_input) {
             json arr = json::array();
             static const std::vector<std::string> default_order = {"web_search", "youtube_search", "google_search", "fetch_url", "create_3d_model", "read_file", "write_file", "edit_file", "execute_command"};
             for (const auto& name : default_order) {
+                if (name == "execute_command" && (!g_server_exec
+#ifndef ENABLE_UNSAFE_HOST_EXEC
+                    || true
+#endif
+                )) {
+                    continue;
+                }
+                if ((name == "write_file" || name == "edit_file") && !g_allow_file_write) {
+                    continue;
+                }
                 if (CANONICAL_TOOLS.count(name)) arr.push_back(CANONICAL_TOOLS.at(name));
             }
             return arr;

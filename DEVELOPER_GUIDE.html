@@ -720,7 +720,8 @@
                     <li><a href="#web-ui">6. Web UI & Frontend Assets</a></li>
                     <li><a href="#zdb">7. ZDB & Hybrid Arbiter</a></li>
                     <li><a href="#branching">8. Multi-Agent Branching Matrix</a></li>
-                    <li><a href="#build-verify">9. Build & 0% Loss Verification</a></li>
+                    <li><a href="#safety">9. Tooling Safety & Sandboxing</a></li>
+                    <li><a href="#build-verify">10. Build & 0% Loss Verification</a></li>
                 </ul>
             </nav>
 
@@ -1101,9 +1102,54 @@ python scripts/embed_web.py web/ src/web_ui.cpp
                 </section>
 
                 <!-- Section 9 -->
-                <section id="build-verify">
+                <section id="safety">
                     <div class="section-header">
                         <span class="section-num">09</span>
+                        <h2 class="section-title">Tooling Safety & Sandboxing Architecture</h2>
+                    </div>
+
+                    <div class="card-panel">
+                        <p style="margin-bottom: 16px; color: var(--text-secondary);">
+                            MinnieTheMoEcher implements a strict 3-pillar defense-in-depth security model to guarantee enterprise-grade safety for LLM tool calling and MCP integrations:
+                        </p>
+
+                        <div class="comp-grid">
+                            <div class="comp-box positive">
+                                <div class="comp-title">🛡️ 1. Secure-by-Default Runtime</div>
+                                <ul class="comp-list">
+                                    <li><strong>Safe Mode:</strong> Server-side host execution (<code>g_server_exec</code>), tooling schemas (<code>g_enable_tools</code>), and write operations (<code>g_allow_file_write</code>) are disabled by default.</li>
+                                    <li><strong>Pure Inference:</strong> Standard OpenAI client-side tool calling is supported out-of-the-box without touching the host OS.</li>
+                                    <li><strong>Opt-In Gating:</strong> Host execution requires explicit <code>--allow-host-exec</code>, which prints a high-visibility terminal security warning banner.</li>
+                                </ul>
+                            </div>
+                            <div class="comp-box positive">
+                                <div class="comp-title">🔒 2. Compile-Time Host Gating</div>
+                                <ul class="comp-list">
+                                    <li><strong>Physically Inert:</strong> Default release builds compile with <code>-DENABLE_UNSAFE_HOST_EXEC=OFF</code>.</li>
+                                    <li><strong>Zero Shell Access:</strong> <code>execute_system_command()</code> physically cannot run arbitrary host shell commands unless explicitly enabled at build time via <code>-DENABLE_UNSAFE_HOST_EXEC=ON</code>.</li>
+                                </ul>
+                            </div>
+                        </div>
+
+                        <div style="margin-top: 16px;" class="card-panel">
+                            <h4>📁 3. Strict Workspace Path Sandboxing</h4>
+                            <p style="color: var(--text-secondary); font-size: 13px; margin-bottom: 12px;">
+                                All built-in file operations (<code>read_file</code>, <code>write_file</code>, <code>edit_file</code>) are strictly confined within <code>--workspace &lt;path&gt;</code> (default: <code>./workspace</code>):
+                            </p>
+                            <ul style="color: var(--text-secondary); font-size: 13px; line-height: 1.8; margin-left: 20px;">
+                                <li><strong>Path Traversal Protection:</strong> Any attempt to escape via <code>../</code> or parent directory climbing is rejected.</li>
+                                <li><strong>Drive Root Isolation:</strong> Absolute paths to root directories (e.g. <code>C:\Windows</code>, <code>/etc/</code>) are intercepted.</li>
+                                <li><strong>Sensitive Credential Blocking:</strong> Access to sensitive credential patterns (<code>.env</code>, <code>.git</code>, <code>.ssh</code>, <code>id_rsa</code>, <code>cookie_jar.json</code>, <code>authorized_keys</code>) is permanently blocked.</li>
+                                <li><strong>Write Access Gating:</strong> File creation and modification are rejected unless launched with <code>--allow-file-write</code>.</li>
+                            </ul>
+                        </div>
+                    </div>
+                </section>
+
+                <!-- Section 10 -->
+                <section id="build-verify">
+                    <div class="section-header">
+                        <span class="section-num">10</span>
                         <h2 class="section-title">Build & 0% Loss Verification Battery</h2>
                     </div>
 

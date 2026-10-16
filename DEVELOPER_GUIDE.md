@@ -182,6 +182,28 @@ cmake -B build -DUSE_METAL=ON
 cmake --build build --config Release
 ```
 
+---
+
+## 8. Tooling Safety & Sandboxing Architecture
+
+MinnieTheMoEcher implements a strict 3-pillar defense-in-depth safety architecture to prevent unintended system execution or data leakage:
+
+1. **Secure-by-Default Runtime:**
+   - Server-side OS shell execution (`g_server_exec`), tool schemas (`g_enable_tools`), and file writes (`g_allow_file_write`) are disabled by default.
+   - Standard pure inference and client-side tool calling (OpenAI standard `choices[0].message.tool_calls`) remain fully functional.
+   - Server-side execution requires explicit opt-in via `--allow-host-exec` and `--allow-file-write`, which outputs a high-visibility security warning banner at startup.
+
+2. **Compile-Time Host Gating:**
+   - Standard release builds compile with `-DENABLE_UNSAFE_HOST_EXEC=OFF` (the CMake default).
+   - In this mode, `execute_system_command()` is physically inert in the compiled binary.
+   - Compiling a binary with host execution capability requires explicitly passing `-DENABLE_UNSAFE_HOST_EXEC=ON` to CMake.
+
+3. **Strict Workspace Path Sandboxing:**
+   - All built-in file operations (`read_file`, `write_file`, `edit_file`) are sandboxed within `--workspace <path>` (default: `./workspace`).
+   - Directory traversal attempts (`../`) and absolute paths outside the workspace are blocked.
+   - Access to sensitive files and credentials (`.env`, `.git`, `.ssh`, `id_rsa`, `cookie_jar.json`, `authorized_keys`) is rejected.
+   - File modification requires runtime opt-in via `--allow-file-write`.
+
 ### 0% Loss Verification Battery
 Before submitting a PR or merging into `main`, run the test suite to verify 0% regression:
 

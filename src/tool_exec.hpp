@@ -18,6 +18,7 @@
 #include <unordered_map>
 #include <regex>
 #include <nlohmann/json.hpp>
+#include "logging.hpp"
 
 #if defined(_WIN32) || defined(_WIN64)
     #ifndef WIN32_LEAN_AND_MEAN
@@ -607,26 +608,74 @@ namespace fs = std::filesystem;
 
 inline std::string get_workspace_directory() {
     try {
-        return fs::current_path().string();
+        fs::path ws = g_workspace_root.empty() ? (fs::current_path() / "workspace") : fs::path(g_workspace_root);
+        if (!fs::exists(ws)) {
+            std::error_code ec;
+            fs::create_directories(ws, ec);
+        }
+        return fs::canonical(ws).lexically_normal().string();
     } catch (...) {
-        return "";
+        return g_workspace_root.empty() ? "./workspace" : g_workspace_root;
     }
 }
 
-inline bool is_path_inside_workspace(const std::string& raw_path, const std::string& workspace_root = "") {
-    try {
-        if (raw_path.empty()) return true;
-        fs::path ws = workspace_root.empty() ? fs::current_path() : fs::path(workspace_root);
-        fs::path target = fs::absolute(fs::path(raw_path)).lexically_normal();
-        fs::path root = fs::canonical(ws).lexically_normal();
+inline bool validate_workspace_path(const std::string& raw_path, bool is_write, fs::path& out_safe_path, std::string& err_msg, const std::string& override_workspace_root = "") {
+    if (raw_path.empty()) {
+        err_msg = "[Security Error: Empty file path provided]";
+        return false;
+    }
 
-        if (fs::exists(target)) {
-            target = fs::canonical(target);
-        } else if (target.has_parent_path() && fs::exists(target.parent_path())) {
-            target = fs::canonical(target.parent_path()) / target.filename();
+    if (is_write && !g_allow_file_write) {
+        err_msg = "[Security Error: File write/edit operations are disabled. Launch server with --allow-file-write to permit modifications in workspace.]";
+        return false;
+    }
+
+    try {
+        std::string ws_target_str = !override_workspace_root.empty() ? override_workspace_root : g_workspace_root;
+        fs::path ws_root = ws_target_str.empty() ? (fs::current_path() / "workspace") : fs::path(ws_target_str);
+        if (!fs::exists(ws_root)) {
+            std::error_code ec;
+            fs::create_directories(ws_root, ec);
+        }
+        fs::path root = fs::canonical(ws_root).lexically_normal();
+
+        fs::path p(raw_path);
+        fs::path candidate;
+        if (p.is_relative()) {
+            candidate = fs::absolute(root / p).lexically_normal();
+        } else {
+            candidate = fs::absolute(p).lexically_normal();
         }
 
-        std::string target_str = target.string();
+        fs::path final_path;
+        if (fs::exists(candidate)) {
+            final_path = fs::canonical(candidate).lexically_normal();
+        } else if (candidate.has_parent_path() && fs::exists(candidate.parent_path())) {
+            final_path = (fs::canonical(candidate.parent_path()) / candidate.filename()).lexically_normal();
+        } else {
+            final_path = candidate.lexically_normal();
+        }
+
+        // 1. Strict credential & sensitive file pattern blocking
+        for (const auto& comp : final_path) {
+            std::string part = comp.string();
+            std::string part_lower = part;
+            std::transform(part_lower.begin(), part_lower.end(), part_lower.begin(), [](unsigned char c){ return (char)::tolower(c); });
+
+            if (part_lower == ".env" || part_lower.rfind(".env.", 0) == 0 ||
+                part_lower == ".git" || part_lower == ".ssh" || part_lower == ".aws" ||
+                part_lower == "id_rsa" || part_lower == "id_ed25519" || part_lower == "id_ecdsa" ||
+                part_lower == "id_dsa" || part_lower == "cookie_jar.json" ||
+                part_lower == "authorized_keys" || part_lower == "known_hosts" ||
+                part_lower == ".bashrc" || part_lower == ".zshrc" || part_lower == ".netrc" ||
+                part_lower == ".bash_history" || part_lower == ".history") {
+                err_msg = "[Security Error: Access to sensitive file or pattern is forbidden: " + part + "]";
+                return false;
+            }
+        }
+
+        // 2. Strict boundary check against sandbox root
+        std::string final_str = final_path.string();
         std::string root_str = root.string();
 
 #if defined(_WIN32) || defined(_WIN64)
@@ -634,18 +683,49 @@ inline bool is_path_inside_workspace(const std::string& raw_path, const std::str
             std::transform(s.begin(), s.end(), s.begin(), [](unsigned char c){ return (char)::tolower(c); });
             return s;
         };
-        target_str = to_lower(target_str);
+        final_str = to_lower(final_str);
         root_str = to_lower(root_str);
+        std::replace(final_str.begin(), final_str.end(), '\\', '/');
+        std::replace(root_str.begin(), root_str.end(), '\\', '/');
 #endif
 
-        if (target_str.rfind(root_str, 0) == 0) {
-            if (target_str.size() == root_str.size() || 
-                target_str[root_str.size()] == '/' || 
-                target_str[root_str.size()] == '\\') {
-                return true;
+        while (!root_str.empty() && (root_str.back() == '/' || root_str.back() == '\\')) {
+            root_str.pop_back();
+        }
+
+        bool is_inside = false;
+        if (final_str == root_str) {
+            is_inside = true;
+        } else if (final_str.rfind(root_str, 0) == 0) {
+            if (final_str.size() > root_str.size() && 
+                (final_str[root_str.size()] == '/' || final_str[root_str.size()] == '\\')) {
+                is_inside = true;
             }
         }
+
+        if (!is_inside) {
+            err_msg = "[Security Error: Path traversal blocked. Path '" + raw_path + 
+                      "' resolves outside the designated workspace sandbox (" + root.string() + ")]";
+            return false;
+        }
+
+        out_safe_path = final_path;
+        return true;
+    } catch (const std::exception& e) {
+        err_msg = std::string("[Security Error: Path validation exception: ") + e.what() + "]";
         return false;
+    } catch (...) {
+        err_msg = "[Security Error: Unknown exception validating path: " + raw_path + "]";
+        return false;
+    }
+}
+
+inline bool is_path_inside_workspace(const std::string& raw_path, const std::string& workspace_root = "") {
+    try {
+        if (raw_path.empty()) return true;
+        fs::path out_safe_path;
+        std::string err_msg;
+        return validate_workspace_path(raw_path, /*is_write=*/false, out_safe_path, err_msg, workspace_root);
     } catch (...) {
         return false;
     }
@@ -653,16 +733,21 @@ inline bool is_path_inside_workspace(const std::string& raw_path, const std::str
 
 inline std::string read_file(const std::string& path, int start_line = 1, int end_line = -1, size_t max_bytes = 64000) {
     if (path.empty()) return "[Error: Empty file path]";
+    fs::path safe_p;
+    std::string err_msg;
+    if (!validate_workspace_path(path, /*is_write=*/false, safe_p, err_msg)) {
+        return err_msg;
+    }
+
     try {
-        fs::path p(path);
-        if (!fs::exists(p)) {
+        if (!fs::exists(safe_p)) {
             return "[Error: File does not exist: " + path + "]";
         }
-        if (fs::is_directory(p)) {
+        if (fs::is_directory(safe_p)) {
             return "[Error: Path is a directory, not a file: " + path + "]";
         }
 
-        std::ifstream file(p, std::ios::in | std::ios::binary);
+        std::ifstream file(safe_p, std::ios::in | std::ios::binary);
         if (!file.is_open()) {
             return "[Error: Could not open file for reading: " + path + "]";
         }
@@ -703,16 +788,22 @@ inline std::string read_file(const std::string& path, int start_line = 1, int en
 
 inline std::string write_file(const std::string& path, const std::string& content, bool overwrite = true) {
     if (path.empty()) return "[Error: Empty file path]";
+    fs::path safe_p;
+    std::string err_msg;
+    if (!validate_workspace_path(path, /*is_write=*/true, safe_p, err_msg)) {
+        return err_msg;
+    }
+
     try {
-        fs::path p(path);
-        if (fs::exists(p) && !overwrite) {
+        if (fs::exists(safe_p) && !overwrite) {
             return "[Error: File already exists and overwrite is false: " + path + "]";
         }
-        if (p.has_parent_path()) {
-            fs::create_directories(p.parent_path());
+        if (safe_p.has_parent_path()) {
+            std::error_code ec;
+            fs::create_directories(safe_p.parent_path(), ec);
         }
 
-        std::ofstream file(p, std::ios::out | std::ios::binary | std::ios::trunc);
+        std::ofstream file(safe_p, std::ios::out | std::ios::binary | std::ios::trunc);
         if (!file.is_open()) {
             return "[Error: Could not open file for writing: " + path + "]";
         }
@@ -731,13 +822,18 @@ inline std::string write_file(const std::string& path, const std::string& conten
 inline std::string edit_file(const std::string& path, const std::string& target_content, const std::string& replacement_content) {
     if (path.empty()) return "[Error: Empty file path]";
     if (target_content.empty()) return "[Error: Target content to replace cannot be empty]";
+    fs::path safe_p;
+    std::string err_msg;
+    if (!validate_workspace_path(path, /*is_write=*/true, safe_p, err_msg)) {
+        return err_msg;
+    }
+
     try {
-        fs::path p(path);
-        if (!fs::exists(p)) {
+        if (!fs::exists(safe_p)) {
             return "[Error: File does not exist: " + path + "]";
         }
 
-        std::ifstream in(p, std::ios::in | std::ios::binary);
+        std::ifstream in(safe_p, std::ios::in | std::ios::binary);
         if (!in.is_open()) {
             return "[Error: Could not open file for reading: " + path + "]";
         }
@@ -759,7 +855,7 @@ inline std::string edit_file(const std::string& path, const std::string& target_
 
         full_text.replace(first_pos, target_content.size(), replacement_content);
 
-        std::ofstream out(p, std::ios::out | std::ios::binary | std::ios::trunc);
+        std::ofstream out(safe_p, std::ios::out | std::ios::binary | std::ios::trunc);
         if (!out.is_open()) {
             return "[Error: Could not open file for writing replacement: " + path + "]";
         }
@@ -775,6 +871,14 @@ inline std::string edit_file(const std::string& path, const std::string& target_
 }
 
 inline std::string execute_system_command(const std::string& command, int timeout_ms = 60000, size_t max_output_bytes = 8192) {
+#ifndef ENABLE_UNSAFE_HOST_EXEC
+    (void)timeout_ms;
+    (void)max_output_bytes;
+    return "[Security Error: Host system command execution is disabled at compile time for security. To enable, recompile with -DENABLE_UNSAFE_HOST_EXEC=ON.]";
+#else
+    if (!g_server_exec) {
+        return "[Security Error: Server-side host command execution is disabled by runtime configuration. Launch with --allow-host-exec to enable.]";
+    }
     if (command.empty()) return "[Error: Empty command]";
 
     std::string block_reason;
@@ -958,6 +1062,7 @@ inline std::string execute_system_command(const std::string& command, int timeou
         output = "[Command completed with no output]";
     }
     return output;
+#endif
 #endif
 }
 

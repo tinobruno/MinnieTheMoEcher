@@ -50,6 +50,7 @@ scratch_*
 check_gpu.py
 test_*
 !tests/test_metal.cpp
+!tests/test_security_sandboxing.cpp
 print_curl_*
 train_mtp_ref.py
 scripts/parse_saved_gbv.py

@@ -13,6 +13,8 @@ extern bool g_track_experts;
 extern bool g_track_reset;
 extern bool g_enable_tools;
 extern bool g_server_exec;
+extern bool g_allow_file_write;
+extern std::string g_workspace_root;
 extern bool g_headless_browsing;
 extern int g_max_tool_rounds;
 extern std::atomic<bool> g_stop_requested;

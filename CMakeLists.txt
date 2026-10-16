@@ -59,6 +59,14 @@ else()
     endif()
 endif()
 
+option(ENABLE_UNSAFE_HOST_EXEC "Enable server-side OS command execution and shell invocation" OFF)
+if(ENABLE_UNSAFE_HOST_EXEC)
+    add_compile_definitions(ENABLE_UNSAFE_HOST_EXEC)
+    message(STATUS "[SECURITY WARNING] ENABLE_UNSAFE_HOST_EXEC is ON. Server-side host shell execution compiled in.")
+else()
+    message(STATUS "[SECURITY] ENABLE_UNSAFE_HOST_EXEC is OFF. Binary cannot execute host OS shell commands.")
+endif()
+
 # ── Fetch header-only dependencies ──────────────────────────────────────────────
 include(FetchContent)
 
