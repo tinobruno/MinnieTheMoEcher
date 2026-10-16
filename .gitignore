@@ -45,6 +45,7 @@ cookie_jar.json
 !ARTICLE_*.html
 !DINO_*.html
 !WHITE_PAPER_*.html
+!DEVELOPER_GUIDE.html
 scratch_*
 check_gpu.py
 test_*
