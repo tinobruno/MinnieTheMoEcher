@@ -3,7 +3,7 @@
 Bare-metal C++/CUDA and Apple Metal inference engine for **Qwen 3.8 27B** and **DeepSeek V4-Flash** (284B total / 13B active) featuring ultra-fast **Multi-Token Prediction (MTP) Speculative Decoding** reaching **~98 tok/s** on NVIDIA GPUs and **143.3 - 172.0 tok/s prefill** on Apple Silicon (M6).
 
 **Key features**:
-- **Native Apple Silicon Metal Backend & Hardware MPP Tiled Prefill Engine**: High-performance bare-metal Apple Metal implementation utilizing Apple's native `<metal_tensor>` and `<MetalPerformancePrimitives/MetalPerformancePrimitives.h>` (`mpp::tensor_ops::matmul2d`). Features on-the-fly threadgroup SRAM tile dequantization (`threadgroup bfloat s_w[64][32]`), eliminating 48 GB of intermediate DRAM dequantization traffic and delivering **143.3 to 172.0 tok/s prefill** (2.67x faster than Apple MLX) and **11.27 to 11.38 tok/s decode** with 95.1% memory bus saturation (146.0 GB/s) on Apple M6. See [README.METAL.md](README.METAL.md) and [WHITEPAPER.md](WHITEPAPER.md).
+- **Native Apple Silicon Metal Backend & Hardware MPP Tiled Prefill Engine**: High-performance bare-metal Apple Metal implementation utilizing Apple's native `<metal_tensor>` and `<MetalPerformancePrimitives/MetalPerformancePrimitives.h>` (`mpp::tensor_ops::matmul2d`). Features on-the-fly threadgroup SRAM tile dequantization (`threadgroup bfloat s_w[64][32]`), eliminating 48 GB of intermediate DRAM dequantization traffic and delivering **143.3 to 172.0 tok/s prefill** (2.67x faster than Apple MLX) and **11.27 to 11.38 tok/s decode** with 95.1% memory bus saturation (146.0 GB/s) on Apple M6. See [README.METAL.md](README.METAL.md) and [WHITEPAPER.md](whitepaper/WHITEPAPER.md).
 - **Ultra-Fast MTP Speculative Decoding Engine (~98 tok/s)**: Native target-model Multi-Token Prediction (MTP) self-drafting with a compact 40,000-token draft vocabulary and BF16 projection head, yielding 62–74% token acceptance with only ~1.18 ms draft latency on RTX PRO 6000 Blackwell.
 - **Batched Shared-Memory DeltaNet Recurrence**: Fused `deltanet_ssm_batch_kernel` keeping head recurrence in 32 KB on-chip shared memory across verification steps, completely eliminating intermediate VRAM roundtrips and 360 redundant D2D memory copies.
 - **Prompt-Lookup Speculative Decoding (PLD)**: Zero-overhead candidate proposal via n-gram prompt matching for recurring code, templates, and patterns.
@@ -49,7 +49,7 @@ Bare-metal C++/CUDA and Apple Metal inference engine for **Qwen 3.8 27B** and **
 
 ### Apple Silicon (Apple Mac mini, Apple M6, 24 GB Unified Memory, macOS 15+)
 
-Comprehensive GuideLLM v0.3.1 benchmark suite (see [BENCHMARKS.md](BENCHMARKS.md) and [WHITEPAPER.md](WHITEPAPER.md)):
+Comprehensive GuideLLM v0.3.1 benchmark suite (see [BENCHMARKS.md](BENCHMARKS.md) and [WHITEPAPER.md](whitepaper/WHITEPAPER.md)):
 
 #### GuideLLM Suite A (prompt_tokens=64, output_tokens=128, samples=4)
 
@@ -422,7 +422,7 @@ print(f"Route to: {router.decision} in {router.total_ms:.1f}ms")
 - **SIMD-Reduced DeltaNet A/B Projections (`deltanet_in_proj_ab_batch_kernel`)**: Vectorized projection head evaluation using SIMD horizontal reduction (`simd_sum`), reducing projection time from 1.75 ms to 0.178 ms per layer (9.8x speedup) and shaving 75 ms per prefill pass across all 48 DeltaNet layers.
 - **Fused SwiGLU Metal Pipeline**: Point-wise vectorization of SiLU activation and multiplication with memory barrier synchronization, eliminating redundant DRAM activation passes.
 - **Zero-Copy Unified Memory Architecture**: Replaced PCIe staging buffers and mirror allocations with `MTLResourceStorageModeShared`, allowing zero-copy sharing between host runtime and GPU compute pipelines.
-- **Documentation & Whitepaper**: Published comprehensive technical specification in [WHITEPAPER.md](WHITEPAPER.md), Apple Silicon user manual in [README.METAL.md](README.METAL.md), and full benchmark matrix in [BENCHMARKS.md](BENCHMARKS.md).
+- **Documentation & Whitepaper**: Published comprehensive technical specification in [WHITEPAPER.md](whitepaper/WHITEPAPER.md), Apple Silicon user manual in [README.METAL.md](README.METAL.md), and full benchmark matrix in [BENCHMARKS.md](BENCHMARKS.md).
 
 ### v2.09 — Ampere-Gated Architecture, 4-Slot Speculative Rollback & Sliced KV Snapshotting
 - **Dynamic Hardware Capability Gating (`GpuCapabilities`)**: Added runtime GPU capability detection and gating ensuring 100% stability on Ampere architectures (RTX 3080/3090, CC 8.0/8.6). Bypasses unsupported hardware FP8 Tensor Core / FP4 paths and provides clean fallback paths.

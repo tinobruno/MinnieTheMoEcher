@@ -6,7 +6,7 @@
 
 ---
 
-![Unifying Cerebrum and Cerebellum in Foundation Models](graphics/cervelletto_whitepaper_cover.jpg)
+![Unifying Cerebrum and Cerebellum in Foundation Models](../graphics/cervelletto_whitepaper_cover.jpg)
 
 ---
 

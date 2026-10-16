@@ -132,4 +132,4 @@ curl -s http://localhost:8001/v1/chat/completions \
 
 For full benchmarking methodology, microbenchmarks, and architectural details:
 - See [BENCHMARKS.md](file:///Users/tinobruno/Developer/MinnieTheMoEcher/BENCHMARKS.md)
-- See [WHITEPAPER.md](file:///Users/tinobruno/Developer/MinnieTheMoEcher/WHITEPAPER.md)
+- See [WHITEPAPER.md](whitepaper/WHITEPAPER.md)
