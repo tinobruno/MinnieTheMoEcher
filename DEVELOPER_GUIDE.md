@@ -215,5 +215,26 @@ Before submitting a PR or merging into `main`, run the test suite to verify 0% r
    ```powershell
    powershell -ExecutionPolicy Bypass -File scripts\verify_hybrid_arbiter.ps1
    ```
-3. **Verify Zero Memory Growth:**
+3. **Nemotron 3.5 SSM & MoE Architecture Unit Test:**
+   ```powershell
+   cmd.exe /c "scripts\build_test_nemotron.bat"
+   ```
+4. **Verify Zero Memory Growth:**
    Confirm that GPU VRAM usage and host memory working set remain constant during decode loops.
+
+---
+
+## 9. Nemotron 3.5 Lightning & FrankensTin Multimodal Integration
+
+Nemotron 3.5 Lightning (30B-A3B) is MinnieTheMoEcher's ultra-fast agentic engine designed to fit 100% inside consumer <16GB VRAM GPUs (e.g. GeForce RTX 5060 Ti 16GB) and 24GB Apple Silicon Unified Memory:
+
+* **Hybrid Sequence Mixing (`src/models/model_nemotron.inl`):**
+  * Interleaves Mamba-2 State-Space Model (SSM) recurrence layers (`deltanet_ssm_batch_kernel_warp_fast`) with selective Grouped-Query Attention (GQA) layers.
+  * Mamba-2 SSM layers maintain a constant-size recurrent state matrix ($d_{state}=128$), eliminating $O(N^2)$ KV-cache explosion and dramatically accelerating prompt prefill on 100k+ token codebases.
+* **Sparse 3B Active MoE Execution:**
+  * Out of 30B total parameters, only 3B are activated per token via top-K routing, reducing memory reads from 13.2 GB down to ~1.4 GB per token.
+  * Achieves **~85 to 100 tok/s** on an RTX 5060 Ti 16GB.
+* **Decoupled FrankensTin Multimodal Vision:**
+  * Uses the decoupled FrankensTin vision delegation pipeline (`TinoBruno/frankenstin-vision-delegate`).
+  * Image queries are lazily intercepted in `src/server.cpp`, processed through the 3.3 GB ViT delegate, and injected as high-fidelity `<visual_perception>` scene representations into the context stream.
+

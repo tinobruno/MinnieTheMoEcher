@@ -5,6 +5,10 @@
             forward_layer_qwen(layer_id, position);
             return;
         }
+        if (cfg_.is_nemotron()) {
+            forward_layer_nemotron(layer_id, token_id, position);
+            return;
+        }
 
         auto& lw = layers_[layer_id];
         int dim = cfg_.hidden_size;

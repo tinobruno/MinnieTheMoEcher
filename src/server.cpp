@@ -75,7 +75,7 @@ void rebuild_system_prefix(
     if (!custom_full_prompt.empty()) {
         full_prompt_text = custom_full_prompt;
     } else {
-        bool is_qwen = (engine.cfg_.architecture == ModelArch::QWEN);
+        bool is_qwen = (engine.cfg_.architecture == ModelArch::QWEN || engine.cfg_.architecture == ModelArch::NEMOTRON_35);
         full_prompt_text = base_prompt + build_dynamic_tools_prompt(resolved_tools, is_qwen);
     }
 

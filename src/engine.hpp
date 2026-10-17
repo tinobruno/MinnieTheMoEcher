@@ -1506,6 +1506,30 @@ public:
         int dim = cfg_.hidden_size;
         int hc = cfg_.hc_mult;
 
+        if (cfg_.is_nemotron()) {
+            // 1. Embedding lookup
+            if (embed_weight_.dtype == "fp4") {
+                embedding_fp4_cuda(buf_hidden_.bf16(), (const uint8_t*)embed_weight_.data, (const uint8_t*)embed_weight_scale_.data, buf_input_token_.i32(), 1, dim, main_stream_);
+            } else if (embed_weight_.dtype == "int4") {
+                embedding_int4_cuda(buf_hidden_.bf16(), (uint8_t*)embed_weight_.data, embed_weight_scale_.bf16(), buf_input_token_.i32(), 1, dim, main_stream_);
+            } else {
+                embedding_cuda(buf_hidden_.bf16(), embed_weight_.bf16(), buf_input_token_.i32(), 1, dim, main_stream_);
+            }
+
+            // 2. Process each layer
+            for (int layer = 0; layer < cfg_.num_hidden_layers; layer++) {
+                forward_layer_nemotron(layer, token_id, position);
+            }
+
+            // 3. Final RMSNorm
+            rms_norm_cuda(buf_hidden_.bf16(), buf_hidden_.bf16(),
+                          norm_weight_.bf16(), dim, cfg_.rms_norm_eps, main_stream_);
+
+            // 4. Compute logits
+            compute_logits();
+            return;
+        }
+
         if (cfg_.is_qwen()) {
             // 1. Standard Embedding lookup
             if (embed_weight_.dtype == "fp4") {
@@ -4371,6 +4395,8 @@ private:
     }
 
 #include "models/model_qwen.inl"
+
+#include "models/model_nemotron.inl"
 
 #include "models/model_deepseek.inl"
 

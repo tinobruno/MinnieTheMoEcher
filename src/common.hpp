@@ -58,11 +58,13 @@ static constexpr const char* MOECHER_VERSION = moecher::VERSION;
 //  Model Config (from manifest)
 // ════════════════════════════════════════════════════════════════════════════════
 
-enum class ModelArch { DEEPSEEK_V4, QWEN, QWEN2 };
+enum class ModelArch { DEEPSEEK_V4, QWEN, QWEN2, NEMOTRON_35 };
 
 struct ModelConfig {
     ModelArch architecture = ModelArch::DEEPSEEK_V4;
     bool is_qwen() const { return architecture == ModelArch::QWEN || architecture == ModelArch::QWEN2; }
+    bool is_nemotron() const { return architecture == ModelArch::NEMOTRON_35; }
+    bool is_deepseek() const { return architecture == ModelArch::DEEPSEEK_V4; }
     std::string model_name = "";
     std::string model_id = "";
     int vocab_size = 129280;
@@ -103,6 +105,13 @@ struct ModelConfig {
     std::vector<int> compress_ratios;  // per-layer compression ratios
     int max_compressed_entries = 0;    // max compressed KV entries per layer
 
+    // Nemotron 3.5 hybrid Mamba-2 SSM parameters
+    int ssm_d_state = 128;
+    int ssm_d_conv = 4;
+    int ssm_expand = 2;
+    int ssm_dt_rank = 256;
+    std::vector<int> layer_types;      // 0: Attention, 1: Mamba-2 SSM, 2: MoE (or hybrid)
+
     int layer_compress_ratio(int layer_id) const {
         if (layer_id < (int)compress_ratios.size()) return compress_ratios[layer_id];
         return 0;
@@ -118,7 +127,9 @@ struct ModelConfig {
         if (model_id.empty()) get(model_id, "id");
         if (j.contains("architecture")) {
             std::string arch_str = j["architecture"].get<std::string>();
-            if (model_id.find("qwen3") != std::string::npos || model_name.find("Qwen 3") != std::string::npos || arch_str == "qwen3") {
+            if (model_id.find("nemotron") != std::string::npos || model_name.find("Nemotron") != std::string::npos || arch_str == "nemotron" || arch_str == "nemotron_35" || arch_str == "nemotron_h") {
+                architecture = ModelArch::NEMOTRON_35;
+            } else if (model_id.find("qwen3") != std::string::npos || model_name.find("Qwen 3") != std::string::npos || arch_str == "qwen3") {
                 architecture = ModelArch::QWEN;
             } else if (arch_str == "qwen2" || arch_str == "qwen2.5") {
                 architecture = ModelArch::QWEN2;
@@ -166,6 +177,13 @@ struct ModelConfig {
         get(eos_token_id, "eos_token_id");
         get(compress_rope_theta, "compress_rope_theta");
         get(expert_dtype, "expert_dtype");
+        get(ssm_d_state, "ssm_d_state");
+        get(ssm_d_conv, "ssm_d_conv");
+        get(ssm_expand, "ssm_expand");
+        get(ssm_dt_rank, "ssm_dt_rank");
+        if (j.contains("layer_types") && j["layer_types"].is_array()) {
+            layer_types = j["layer_types"].get<std::vector<int>>();
+        }
         if (j.contains("compress_ratios") && j["compress_ratios"].is_array()) {
             compress_ratios = j["compress_ratios"].get<std::vector<int>>();
         }
