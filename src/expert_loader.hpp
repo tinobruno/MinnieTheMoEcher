@@ -50,6 +50,7 @@ public:
     struct StagingBuffer {
         void* ptr = nullptr;
         cudaEvent_t event = nullptr;
+        bool is_pinned = false;
     };
     std::vector<StagingBuffer> staging_ring_;
     int staging_idx_ = 0;
@@ -294,7 +295,18 @@ public:
         // Initialize staging ring buffer
         staging_ring_.resize(NUM_STAGING_BUFFERS);
         for (auto& s : staging_ring_) {
-            CUDA_CHECK(cudaMallocHost(&s.ptr, block_size));
+            cudaError_t err = cudaMallocHost(&s.ptr, block_size);
+            if (err == cudaSuccess) {
+                s.is_pinned = true;
+            } else {
+                cudaGetLastError();
+                s.is_pinned = false;
+#if defined(_WIN32) || defined(_WIN64)
+                s.ptr = VirtualAlloc(NULL, block_size, MEM_COMMIT | MEM_RESERVE, PAGE_READWRITE);
+#else
+                s.ptr = aligned_alloc(4096, block_size);
+#endif
+            }
             CUDA_CHECK(cudaEventCreateWithFlags(&s.event, cudaEventDisableTiming));
         }
 
@@ -315,7 +327,15 @@ public:
             LOG_INFO("Allocating %d pinned DMA staging buffers (%.1f MB each) for async DRAM→VRAM transfers",
                      NUM_DMA_STAGING, (double)block_size / (1024.0 * 1024.0));
             for (int i = 0; i < NUM_DMA_STAGING; i++) {
-                CUDA_CHECK(cudaMallocHost(&dma_staging_[i], block_size));
+                cudaError_t err = cudaMallocHost(&dma_staging_[i], block_size);
+                if (err != cudaSuccess) {
+                    cudaGetLastError();
+#if defined(_WIN32) || defined(_WIN64)
+                    dma_staging_[i] = VirtualAlloc(NULL, block_size, MEM_COMMIT | MEM_RESERVE, PAGE_READWRITE);
+#else
+                    dma_staging_[i] = aligned_alloc(4096, block_size);
+#endif
+                }
             }
         }
         return true;
@@ -775,8 +795,17 @@ public:
 
             workers.emplace_back([this, start_idx, end_idx, &loaded, to_load]() {
                 void* stage_ptr = nullptr;
+                bool is_pinned = true;
+                if (cudaMallocHost(&stage_ptr, expert_block_size_) != cudaSuccess) {
+                    cudaGetLastError();
+                    is_pinned = false;
+#if defined(_WIN32) || defined(_WIN64)
+                    stage_ptr = VirtualAlloc(NULL, expert_block_size_, MEM_COMMIT | MEM_RESERVE, PAGE_READWRITE);
+#else
+                    stage_ptr = aligned_alloc(4096, expert_block_size_);
+#endif
+                }
                 cudaStream_t stream = nullptr;
-                CUDA_CHECK(cudaMallocHost(&stage_ptr, expert_block_size_));
                 CUDA_CHECK(cudaStreamCreate(&stream));
 
                 for (int i = start_idx; i < end_idx; i++) {
@@ -800,7 +829,16 @@ public:
                     }
                 }
                 CUDA_CHECK(cudaStreamDestroy(stream));
-                CUDA_CHECK(cudaFreeHost(stage_ptr));
+                if (stage_ptr) {
+                    if (is_pinned) cudaFreeHost(stage_ptr);
+                    else {
+#if defined(_WIN32) || defined(_WIN64)
+                        VirtualFree(stage_ptr, 0, MEM_RELEASE);
+#else
+                        free(stage_ptr);
+#endif
+                    }
+                }
             });
         }
 
@@ -951,8 +989,17 @@ public:
             workers.emplace_back([this, start_idx, end_idx, &loaded, total]() {
                 size_t max_block = std::max(hot_block_size_, cold_block_size_);
                 void* stage_ptr = nullptr;
+                bool is_pinned = true;
+                if (cudaMallocHost(&stage_ptr, max_block) != cudaSuccess) {
+                    cudaGetLastError();
+                    is_pinned = false;
+#if defined(_WIN32) || defined(_WIN64)
+                    stage_ptr = VirtualAlloc(NULL, max_block, MEM_COMMIT | MEM_RESERVE, PAGE_READWRITE);
+#else
+                    stage_ptr = aligned_alloc(4096, max_block);
+#endif
+                }
                 cudaStream_t stream = nullptr;
-                CUDA_CHECK(cudaMallocHost(&stage_ptr, max_block));
                 CUDA_CHECK(cudaStreamCreate(&stream));
 
                 for (int i = start_idx; i < end_idx; i++) {
@@ -985,7 +1032,16 @@ public:
                     }
                 }
                 CUDA_CHECK(cudaStreamDestroy(stream));
-                CUDA_CHECK(cudaFreeHost(stage_ptr));
+                if (stage_ptr) {
+                    if (is_pinned) cudaFreeHost(stage_ptr);
+                    else {
+#if defined(_WIN32) || defined(_WIN64)
+                        VirtualFree(stage_ptr, 0, MEM_RELEASE);
+#else
+                        free(stage_ptr);
+#endif
+                    }
+                }
             });
         }
 
@@ -1129,7 +1185,16 @@ public:
         flat_vram_ptrs_gpu_.free();
         for (auto& stage : staging_ring_) {
             if (stage.event) cudaEventDestroy(stage.event);
-            if (stage.ptr) cudaFreeHost(stage.ptr);
+            if (stage.ptr) {
+                if (stage.is_pinned) cudaFreeHost(stage.ptr);
+                else {
+#if defined(_WIN32) || defined(_WIN64)
+                    VirtualFree(stage.ptr, 0, MEM_RELEASE);
+#else
+                    free(stage.ptr);
+#endif
+                }
+            }
         }
     }
 private:
