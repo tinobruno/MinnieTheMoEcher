@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """
 download_nemotron_bolt.py — Download NVIDIA Nemotron 3.5 Bolt (74B-A9B NVFP4) from Hugging Face
-and automatically prepare it for MinnieTheMoEcher.
+and automatically prepare it for MinnieTheMoEcher. Includes automatic retry and resume.
 """
 
 import os
@@ -26,19 +26,33 @@ def main():
 
     # Download config, index, tokenizer and the 61 language model shards
     # (Shards 62 and 63 only contain unused vision encoder weights)
-    print("Starting download from Hugging Face Hub (resume enabled)...")
-    path = snapshot_download(
-        repo_id=REPO_ID,
-        local_dir=TARGET_DIR,
-        max_workers=8,
-        ignore_patterns=[
-            "model-00062-of-00063.safetensors",
-            "model-00063-of-00063.safetensors",
-            "model-summary-idxs.safetensors",
-            "*.png",
-            "*.md"
-        ]
-    )
+    path = None
+    max_retries = 20
+    for attempt in range(1, max_retries + 1):
+        try:
+            print(f"Starting download attempt {attempt}/{max_retries} (resume enabled)...")
+            path = snapshot_download(
+                repo_id=REPO_ID,
+                local_dir=TARGET_DIR,
+                max_workers=4,
+                ignore_patterns=[
+                    "model-00062-of-00063.safetensors",
+                    "model-00063-of-00063.safetensors",
+                    "model-summary-idxs.safetensors",
+                    "*.png",
+                    "*.md"
+                ]
+            )
+            print("Download phase verified & completed!")
+            break
+        except Exception as e:
+            print(f"\n[WARN] Connection issue on attempt {attempt}: {type(e).__name__} ({e})")
+            if attempt == max_retries:
+                print("\n[ERROR] Maximum retries reached. Please check network connection.")
+                raise
+            wait_s = min(30, 2 * attempt)
+            print(f"Retrying in {wait_s}s (local shards preserved, resuming remaining files)...\n")
+            time.sleep(wait_s)
 
     elapsed = time.time() - t0
     print("\n=================================================================")
