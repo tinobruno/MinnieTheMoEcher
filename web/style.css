@@ -5233,6 +5233,208 @@ iframe#preview-iframe {
     font-size: 16px;
 }
 
+/* ── Sleek Glassmorphism Odoo Conversion Progress Card ── */
+.odoo-progress-card {
+    background: linear-gradient(135deg, rgba(30, 27, 75, 0.6) 0%, rgba(15, 23, 42, 0.85) 100%);
+    border: 1px solid rgba(168, 85, 247, 0.4);
+    border-radius: 12px;
+    padding: 16px 18px;
+    margin: 8px 0;
+    box-shadow: 0 8px 24px -4px rgba(0, 0, 0, 0.35), 0 0 16px rgba(168, 85, 247, 0.15);
+    backdrop-filter: blur(12px);
+    transition: all 0.35s cubic-bezier(0.4, 0, 0.2, 1);
+    min-width: 320px;
+    max-width: 680px;
+}
+.odoo-progress-card.completed {
+    border-color: rgba(52, 211, 153, 0.5);
+    box-shadow: 0 8px 24px -4px rgba(0, 0, 0, 0.35), 0 0 20px rgba(52, 211, 153, 0.2);
+    background: linear-gradient(135deg, rgba(6, 78, 59, 0.35) 0%, rgba(15, 23, 42, 0.85) 100%);
+}
+.odoo-progress-header {
+    display: flex;
+    justify-content: space-between;
+    align-items: center;
+    margin-bottom: 14px;
+}
+.odoo-progress-title-row {
+    display: flex;
+    align-items: center;
+    gap: 12px;
+}
+.odoo-progress-icon {
+    font-size: 26px;
+    color: #c084fc;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+}
+.odoo-progress-icon.spinning {
+    animation: odooSpin 1.6s linear infinite;
+}
+@keyframes odooSpin {
+    from { transform: rotate(0deg); }
+    to { transform: rotate(360deg); }
+}
+.odoo-progress-title-group {
+    display: flex;
+    flex-direction: column;
+    gap: 2px;
+}
+.odoo-progress-title {
+    font-size: 14px;
+    font-weight: 600;
+    color: #f8fafc;
+}
+.odoo-progress-sub {
+    font-size: 11px;
+    color: #94a3b8;
+}
+.odoo-progress-badge {
+    font-size: 10px;
+    font-weight: 700;
+    letter-spacing: 0.5px;
+    padding: 3px 8px;
+    border-radius: 9999px;
+    background: rgba(168, 85, 247, 0.2);
+    color: #e9d5ff;
+    border: 1px solid rgba(168, 85, 247, 0.4);
+}
+.odoo-progress-card.completed .odoo-progress-badge {
+    background: rgba(16, 185, 129, 0.2);
+    color: #a7f3d0;
+    border-color: rgba(16, 185, 129, 0.4);
+}
+.odoo-progress-track {
+    width: 100%;
+    height: 8px;
+    background: rgba(255, 255, 255, 0.08);
+    border-radius: 9999px;
+    overflow: hidden;
+    position: relative;
+    box-shadow: inset 0 1px 2px rgba(0, 0, 0, 0.4);
+}
+.odoo-progress-bar {
+    height: 100%;
+    background: linear-gradient(90deg, #a855f7 0%, #38bdf8 50%, #34d399 100%);
+    background-size: 200% 100%;
+    border-radius: 9999px;
+    transition: width 0.25s cubic-bezier(0.4, 0, 0.2, 1);
+    animation: odooGradientPulse 2s ease infinite;
+}
+@keyframes odooGradientPulse {
+    0% { background-position: 0% 50%; }
+    50% { background-position: 100% 50%; }
+    100% { background-position: 0% 50%; }
+}
+.odoo-progress-footer {
+    display: flex;
+    justify-content: space-between;
+    align-items: center;
+    margin-top: 10px;
+    font-size: 11px;
+}
+.odoo-progress-status {
+    color: #cbd5e1;
+    display: flex;
+    align-items: center;
+    gap: 6px;
+}
+.odoo-progress-pct {
+    font-family: monospace;
+    font-weight: 700;
+    color: #e9d5ff;
+}
+.odoo-progress-details {
+    margin-top: 14px;
+    padding-top: 12px;
+    border-top: 1px solid rgba(255, 255, 255, 0.08);
+    display: grid;
+    grid-template-columns: repeat(auto-fit, minmax(110px, 1fr));
+    gap: 8px 14px;
+    font-size: 12px;
+    animation: odooFadeIn 0.3s ease;
+}
+@keyframes odooFadeIn {
+    from { opacity: 0; transform: translateY(4px); }
+    to { opacity: 1; transform: translateY(0); }
+}
+.odoo-detail-item {
+    display: flex;
+    flex-direction: column;
+    gap: 2px;
+}
+.odoo-detail-label {
+    font-size: 10px;
+    text-transform: uppercase;
+    color: #94a3b8;
+    letter-spacing: 0.5px;
+    font-weight: 600;
+}
+.odoo-detail-val {
+    font-weight: 600;
+    color: #f1f5f9;
+    white-space: nowrap;
+    overflow: hidden;
+    text-overflow: ellipsis;
+}
+.odoo-progress-actions {
+    margin-top: 14px;
+    display: flex;
+    gap: 8px;
+    align-items: center;
+    flex-wrap: wrap;
+    animation: odooFadeIn 0.35s ease;
+}
+.odoo-btn {
+    display: inline-flex;
+    align-items: center;
+    gap: 6px;
+    padding: 6px 12px;
+    border-radius: 8px;
+    font-size: 12px;
+    font-weight: 600;
+    cursor: pointer;
+    transition: all 0.2s cubic-bezier(0.4, 0, 0.2, 1);
+    border: none;
+    text-decoration: none;
+}
+.odoo-btn-primary {
+    background: linear-gradient(135deg, #10b981 0%, #059669 100%);
+    color: #ffffff;
+    box-shadow: 0 2px 8px rgba(16, 185, 129, 0.3);
+}
+.odoo-btn-primary:hover {
+    filter: brightness(1.12);
+    transform: translateY(-1px);
+    box-shadow: 0 4px 12px rgba(16, 185, 129, 0.4);
+}
+.odoo-btn-secondary {
+    background: rgba(255, 255, 255, 0.08);
+    color: #e2e8f0;
+    border: 1px solid rgba(255, 255, 255, 0.15);
+}
+.odoo-btn-secondary:hover {
+    background: rgba(255, 255, 255, 0.15);
+    color: #ffffff;
+    border-color: rgba(255, 255, 255, 0.25);
+}
+.odoo-xml-inspector {
+    margin-top: 10px;
+    max-height: 220px;
+    overflow-y: auto;
+    background: rgba(0, 0, 0, 0.55);
+    border-radius: 8px;
+    padding: 10px 12px;
+    font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, monospace;
+    font-size: 11px;
+    white-space: pre;
+    border: 1px solid rgba(255, 255, 255, 0.1);
+    color: #94a3b8;
+    line-height: 1.4;
+    user-select: text;
+}
+
 .doc-remove-btn {
     background: transparent;
     border: none;

@@ -314,7 +314,7 @@
                                 <span class="material-symbols-outlined">receipt_long</span>
                                 <span>Extract</span>
                             </button>
-                            <button type="button" class="doc-action-btn doc-btn-odoo-xml" onclick="quickPromptOdooXml()" title="Convert invoice directly into standard UBL 2.1 XML for Odoo import">
+                            <button type="button" class="doc-action-btn doc-btn-odoo-xml" onclick="quickPromptOdooXml()" title="1-Click: Auto-extract invoice and download standard UBL 2.1 XML for Odoo">
                                 <span class="material-symbols-outlined">integration_instructions</span>
                                 <span>Odoo XML</span>
                             </button>
@@ -333,7 +333,7 @@
                             <span class="material-symbols-outlined">receipt</span>
                             <span>Invoice Breakdown</span>
                         </button>
-                        <button type="button" class="quick-chip chip-odoo" onclick="applyInvoiceQuickPrompt('odoo')" title="Generate standard UBL 2.1 XML ready to import directly into Odoo Accounting">
+                        <button type="button" class="quick-chip chip-odoo" onclick="applyInvoiceQuickPrompt('odoo')" title="1-Click: Auto-extract, compile and download standard UBL 2.1 XML for Odoo">
                             <span class="material-symbols-outlined" style="color: #c084fc;">integration_instructions</span>
                             <span style="color: #e9d5ff; font-weight: 500;">Generate Odoo XML</span>
                         </button>
@@ -1716,6 +1716,30 @@
                                     <option value="E">E - Exempt from tax</option>
                                 </select>
                             </div>
+                        </div>
+
+                        <!-- Card: Embedded Original PDF Attachment for Odoo -->
+                        <div class="agentic-card" style="border: 1px solid rgba(236, 72, 153, 0.35); background: linear-gradient(180deg, rgba(236, 72, 153, 0.05) 0%, rgba(15, 23, 42, 0.4) 100%);">
+                            <div class="agentic-card-header" style="justify-content: space-between; align-items: center;">
+                                <div style="display: flex; align-items: center; gap: 10px;">
+                                    <span class="material-symbols-outlined agentic-card-icon" style="color: #f472b6; background: rgba(244, 114, 182, 0.15);">picture_as_pdf</span>
+                                    <div class="agentic-card-title-group">
+                                        <h4 style="color: #fdf2f8;">Embed Original PDF in UBL XML</h4>
+                                        <p class="agentic-subtitle">Embeds Base64 binary PDF inside &lt;cac:AdditionalDocumentReference&gt; so Odoo displays side-by-side</p>
+                                    </div>
+                                </div>
+                                <span class="mcp-tab-badge" style="background: rgba(236, 72, 153, 0.2); color: #fbcfe8; border: 1px solid rgba(236, 72, 153, 0.4);">Odoo Split-Screen Ready</span>
+                            </div>
+
+                            <label style="display: flex; align-items: flex-start; gap: 10px; cursor: pointer; padding: 10px 12px; border-radius: 8px; background: rgba(15, 23, 42, 0.6); border: 1px solid rgba(255, 255, 255, 0.08);">
+                                <input type="checkbox" id="acct-embed-pdf" checked onchange="onAccountingSettingChange()" style="margin-top: 3px; width: 16px; height: 16px; accent-color: #ec4899;">
+                                <div>
+                                    <strong style="color: #fdf2f8; font-size: 13px;">Embed Original PDF Binary in UBL XML (&lt;cac:AdditionalDocumentReference&gt;)</strong>
+                                    <p style="margin: 2px 0 0 0; font-size: 11px; color: #cbd5e1; line-height: 1.4;">
+                                        When enabled, the original dropped PDF is encoded in Base64 and embedded into the XML. When uploaded into Odoo Accounting, Odoo extracts the PDF automatically, attaches it to the vendor bill, and opens the split-screen PDF preview.
+                                    </p>
+                                </div>
+                            </label>
                         </div>
 
                         <!-- Card 4: Configurable Odoo UBL 2.1 XML Template -->

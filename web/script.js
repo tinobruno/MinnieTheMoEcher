@@ -1448,7 +1448,7 @@ const DEFAULT_UBL_TEMPLATE = `<?xml version="1.0" encoding="UTF-8"?>
     <cbc:DueDate>{{DUE_DATE}}</cbc:DueDate>
     <cbc:InvoiceTypeCode>380</cbc:InvoiceTypeCode>
     <cbc:DocumentCurrencyCode>{{CURRENCY}}</cbc:DocumentCurrencyCode>
-    <cac:AccountingSupplierParty>
+{{ADDITIONAL_DOCUMENT_REFERENCE}}    <cac:AccountingSupplierParty>
         <cac:Party>
             <cac:PartyName><cbc:Name>{{SUPPLIER_NAME}}</cbc:Name></cac:PartyName>
             <cac:PostalAddress>
@@ -1525,6 +1525,7 @@ const DEFAULT_ACCOUNTING_SETTINGS = {
     defaultTaxRate: '21',
     taxCategoryId: 'S',
     taxScheme: 'VAT',
+    embedOriginalPdf: true,
     ublTemplate: DEFAULT_UBL_TEMPLATE,
     ublLineTemplate: DEFAULT_UBL_LINE_TEMPLATE
 };
@@ -1587,6 +1588,9 @@ function updateAccountingUI() {
     const ublLineTplEl = document.getElementById('acct-ubl-line-template');
     if (ublLineTplEl) ublLineTplEl.value = accountingSettings.ublLineTemplate || DEFAULT_UBL_LINE_TEMPLATE;
 
+    const embedPdfInput = document.getElementById('acct-embed-pdf');
+    if (embedPdfInput) embedPdfInput.checked = (accountingSettings.embedOriginalPdf !== false);
+
     const mode = accountingSettings.supplierCountryMode || 'force_company';
     const radioId = mode === 'force_company' ? 'acct-supp-mode-force-company' :
                     mode === 'smart' ? 'acct-supp-mode-smart' :
@@ -1626,6 +1630,9 @@ function onAccountingSettingChange() {
 
     const ublLineTplEl = document.getElementById('acct-ubl-line-template');
     if (ublLineTplEl && ublLineTplEl.value.trim()) accountingSettings.ublLineTemplate = ublLineTplEl.value;
+
+    const embedPdfInput = document.getElementById('acct-embed-pdf');
+    if (embedPdfInput) accountingSettings.embedOriginalPdf = embedPdfInput.checked;
 
     const checkedRadio = document.querySelector('input[name="acct_supp_country_mode"]:checked');
     if (checkedRadio) accountingSettings.supplierCountryMode = checkedRadio.value;
@@ -1816,6 +1823,29 @@ function fillOdooXmlTemplate(invoiceData, customTemplate = null, customLineTempl
         .replace(/\{\{VAT_RATE\}\}/g, vatRate.toFixed(2))
         .replace(/\{\{TAX_CATEGORY_ID\}\}/g, taxCategoryId)
         .replace(/\{\{LINE_ITEMS\}\}/g, renderedLines);
+
+    // PDF Attachment Embedding for Odoo (Peppol BIS 3.0 / UBL 2.1 <cac:AdditionalDocumentReference>)
+    let pdfBlock = '';
+    const shouldEmbedPdf = (acct.embedOriginalPdf !== false);
+    const pdfBase64 = invoiceData.pdf_base64 || window.__lastPdfBase64 || (activeDocumentAttachment && activeDocumentAttachment.base64);
+    const pdfFilename = invoiceData.pdf_filename || window.__lastPdfFilename || (activeDocumentAttachment && activeDocumentAttachment.filename) || 'invoice.pdf';
+
+    if (shouldEmbedPdf && pdfBase64) {
+        pdfBlock = `    <cac:AdditionalDocumentReference>\n` +
+                   `        <cbc:ID>${escapeXml(pdfFilename)}</cbc:ID>\n` +
+                   `        <cbc:DocumentTypeCode>130</cbc:DocumentTypeCode>\n` +
+                   `        <cbc:DocumentDescription>Original Invoice PDF</cbc:DocumentDescription>\n` +
+                   `        <cac:Attachment>\n` +
+                   `            <cbc:EmbeddedDocumentBinaryObject mimeCode="application/pdf" filename="${escapeXml(pdfFilename)}">${pdfBase64}</cbc:EmbeddedDocumentBinaryObject>\n` +
+                   `        </cac:Attachment>\n` +
+                   `    </cac:AdditionalDocumentReference>\n`;
+    }
+
+    if (xml.includes('{{ADDITIONAL_DOCUMENT_REFERENCE}}')) {
+        xml = xml.replace('{{ADDITIONAL_DOCUMENT_REFERENCE}}\n', pdfBlock).replace('{{ADDITIONAL_DOCUMENT_REFERENCE}}', pdfBlock);
+    } else if (pdfBlock) {
+        xml = xml.replace('<cac:AccountingSupplierParty>', pdfBlock + '    <cac:AccountingSupplierParty>');
+    }
 
     return normalizeOdooUblXml(xml);
 }
@@ -5248,7 +5278,7 @@ async function executeClientToolCall(tc, turnRetrievedDocs = null) {
 }
 
 async function sendMessage(options = {}) {
-    const text = chatInput.value.trim();
+    const text = (options && typeof options.promptText === 'string') ? options.promptText.trim() : chatInput.value.trim();
     if (!text || isGenerating) return;
 
     const wasVoicePrompt = (options && options.fromVoice === true) || isCurrentInputFromVoice || (typeof isVoiceRecording !== 'undefined' && isVoiceRecording);
@@ -5341,7 +5371,8 @@ async function sendMessage(options = {}) {
             ThreeStudio.updatePhotoTextureButtons();
         }
     }
-    appendMessage('user', text || (attachedDoc ? "Extract invoice information from attached document" : "Describe this image"), attachedImg, wasVoicePrompt, attachedDoc);
+    const displayMsg = (options && options.displayText) ? options.displayText : (text || (attachedDoc ? "Extract invoice information from attached document" : "Describe this image"));
+    appendMessage('user', displayMsg, attachedImg, wasVoicePrompt, attachedDoc);
     chatHistory.push({ role: 'user', content: userMsgContent });
 
     // Create assistant message container
@@ -5351,33 +5382,44 @@ async function sendMessage(options = {}) {
         resetStreamingTtsSession(assistantMsgDiv);
     }
 
+    const isOdooConversion = Boolean(options && options.autoDownloadOdooXml);
+
     // Add reasoning block (hidden initially)
     let reasoningBlock = null;
     let reasoningContent = null;
     let mainContent = document.createElement('div');
     assistantMsgDiv.querySelector('.msg-content').appendChild(mainContent);
 
-    const baseThinking = (attachedImg && !attachedDoc) ? false : (thinkingEnabled ? thinkingEnabled.checked : true);
-    // Voice prompt speed optimization: disable thinking on the fly for fast conversational responses
-    const isVoiceBypassThinking = wasVoicePrompt && (typeof voiceSettings === 'undefined' || voiceSettings.disableThinkingForVoice !== false);
-    const isThinking = isVoiceBypassThinking ? false : baseThinking;
+    let odooProgressCard = null;
+    let liveIndicator = null;
 
-    // Initial visual feedback while engine starts thinking/elaborating
-    const liveIndicator = document.createElement('div');
-    liveIndicator.className = 'elaboration-status-badge';
-    liveIndicator.id = 'live-status-indicator';
-    liveIndicator.innerHTML = `
-        <span class="tool-pulse-spinner"></span>
-        <span class="status-msg-text">${
-            isVoiceBypassThinking
-                ? '⚡ Fast voice response (thinking bypassed)'
-                : ((zdbSettings && zdbSettings.enabled)
-                    ? '⚡ Zero Decode Bypass: Evaluating step-0 logit distribution...'
-                    : (isThinking ? 'Thinking and preparing response' : (attachedImg ? 'Analyzing image and preparing response' : 'Preparing response')))
-        }</span>
-        <div class="elaboration-dots"><span></span><span></span><span></span></div>
-    `;
-    mainContent.appendChild(liveIndicator);
+    if (isOdooConversion) {
+        const docTitle = (attachedDoc && attachedDoc.filename) ? attachedDoc.filename : (window.__lastPdfFilename || 'Invoice Document');
+        odooProgressCard = createOdooProgressCard(docTitle);
+        mainContent.appendChild(odooProgressCard);
+    } else {
+        const baseThinking = (attachedImg && !attachedDoc) ? false : (thinkingEnabled ? thinkingEnabled.checked : true);
+        // Voice prompt speed optimization: disable thinking on the fly for fast conversational responses
+        const isVoiceBypassThinking = wasVoicePrompt && (typeof voiceSettings === 'undefined' || voiceSettings.disableThinkingForVoice !== false);
+        const isThinking = isVoiceBypassThinking ? false : baseThinking;
+
+        // Initial visual feedback while engine starts thinking/elaborating
+        liveIndicator = document.createElement('div');
+        liveIndicator.className = 'elaboration-status-badge';
+        liveIndicator.id = 'live-status-indicator';
+        liveIndicator.innerHTML = `
+            <span class="tool-pulse-spinner"></span>
+            <span class="status-msg-text">${
+                isVoiceBypassThinking
+                    ? '⚡ Fast voice response (thinking bypassed)'
+                    : ((zdbSettings && zdbSettings.enabled)
+                        ? '⚡ Zero Decode Bypass: Evaluating step-0 logit distribution...'
+                        : (isThinking ? 'Thinking and preparing response' : (attachedImg ? 'Analyzing image and preparing response' : 'Preparing response')))
+            }</span>
+            <div class="elaboration-dots"><span></span><span></span><span></span></div>
+        `;
+        mainContent.appendChild(liveIndicator);
+    }
     const budgetVal = isThinking ? (thinkingBudget ? parseInt(thinkingBudget.value, 10) : 4096) : 0;
     const activeTools = getActiveToolsPayload();
 
@@ -5548,6 +5590,13 @@ async function sendMessage(options = {}) {
                 streamRafPending = true;
                 requestAnimationFrame(() => {
                     streamRafPending = false;
+                    if (isOdooConversion) {
+                        if (odooProgressCard) {
+                            updateOdooProgressUI(odooProgressCard, roundContent, roundReasoning, false);
+                        }
+                        messagesContainer.scrollTop = messagesContainer.scrollHeight;
+                        return;
+                    }
                     if (streamNeedsReasoning && reasoningContent) {
                         reasoningContent.innerHTML = marked.parse(stripToolCallsFromText(roundReasoning));
                         streamNeedsReasoning = false;
@@ -5680,43 +5729,49 @@ async function sendMessage(options = {}) {
                                         }
                                     }
 
-                                    const statusText = liveIndicator ? liveIndicator.querySelector('.status-msg-text') : null;
-                                    if (statusText) statusText.textContent = 'Reasoning and analyzing query...';
-
-                                    if (!reasoningBlock) {
-                                        reasoningBlock = document.createElement('details');
-                                        reasoningBlock.className = 'reasoning-block';
-                                        reasoningBlock.open = true;
-                                        const summary = document.createElement('summary');
-                                        summary.innerHTML = '<span class="thinking-spinner">progress_activity</span> Thinking...';
-                                        reasoningContent = document.createElement('div');
-                                        reasoningContent.className = 'reasoning-content';
-                                        reasoningBlock.appendChild(summary);
-                                        reasoningBlock.appendChild(reasoningContent);
-                                        assistantMsgDiv.querySelector('.msg-content').insertBefore(reasoningBlock, mainContent);
-                                    } else {
-                                        reasoningBlock.open = true;
-                                        const summary = reasoningBlock.querySelector('summary');
-                                        if (summary && !summary.querySelector('.thinking-spinner')) {
-                                            summary.innerHTML = '<span class="thinking-spinner">progress_activity</span> Thinking...';
-                                        }
-                                    }
-
-                                    const toolIdMatch = delta.reasoning_content.match(/id="(tool-act-[^"]+)"/);
-                                    let replaced = false;
-                                    if (toolIdMatch) {
-                                        const actId = toolIdMatch[1];
-                                        const regex = new RegExp('<div class="tool-activity-block active"[^>]*id="' + actId + '"[\\s\\S]*?<\\/div>', 'g');
-                                        if (regex.test(roundReasoning)) {
-                                            roundReasoning = roundReasoning.replace(regex, delta.reasoning_content.trim());
-                                            replaced = true;
-                                        }
-                                    }
-                                    if (!replaced) {
+                                    if (isOdooConversion) {
                                         roundReasoning += delta.reasoning_content;
+                                        streamNeedsReasoning = true;
+                                        scheduleStreamingRender();
+                                    } else {
+                                        const statusText = liveIndicator ? liveIndicator.querySelector('.status-msg-text') : null;
+                                        if (statusText) statusText.textContent = 'Reasoning and analyzing query...';
+
+                                        if (!reasoningBlock) {
+                                            reasoningBlock = document.createElement('details');
+                                            reasoningBlock.className = 'reasoning-block';
+                                            reasoningBlock.open = true;
+                                            const summary = document.createElement('summary');
+                                            summary.innerHTML = '<span class="thinking-spinner">progress_activity</span> Thinking...';
+                                            reasoningContent = document.createElement('div');
+                                            reasoningContent.className = 'reasoning-content';
+                                            reasoningBlock.appendChild(summary);
+                                            reasoningBlock.appendChild(reasoningContent);
+                                            assistantMsgDiv.querySelector('.msg-content').insertBefore(reasoningBlock, mainContent);
+                                        } else {
+                                            reasoningBlock.open = true;
+                                            const summary = reasoningBlock.querySelector('summary');
+                                            if (summary && !summary.querySelector('.thinking-spinner')) {
+                                                summary.innerHTML = '<span class="thinking-spinner">progress_activity</span> Thinking...';
+                                            }
+                                        }
+
+                                        const toolIdMatch = delta.reasoning_content.match(/id="(tool-act-[^"]+)"/);
+                                        let replaced = false;
+                                        if (toolIdMatch) {
+                                            const actId = toolIdMatch[1];
+                                            const regex = new RegExp('<div class="tool-activity-block active"[^>]*id="' + actId + '"[\\s\\S]*?<\\/div>', 'g');
+                                            if (regex.test(roundReasoning)) {
+                                                roundReasoning = roundReasoning.replace(regex, delta.reasoning_content.trim());
+                                                replaced = true;
+                                            }
+                                        }
+                                        if (!replaced) {
+                                            roundReasoning += delta.reasoning_content;
+                                        }
+                                        streamNeedsReasoning = true;
+                                        scheduleStreamingRender();
                                     }
-                                    streamNeedsReasoning = true;
-                                    scheduleStreamingRender();
                                 }
 
                                 if (delta.content !== undefined) {
@@ -5746,68 +5801,80 @@ async function sendMessage(options = {}) {
                                         liveIndicator.remove();
                                     }
 
-                                    const toolIdMatch = delta.content.match(/id="(tool-act-[^"]+)"/);
-                                    let replaced = false;
-                                    if (toolIdMatch) {
-                                        const actId = toolIdMatch[1];
-                                        const regex = new RegExp('<div class="tool-activity-block active"[^>]*id="' + actId + '"[\\s\\S]*?<\\/div>', 'g');
-                                        if (regex.test(roundContent)) {
-                                            roundContent = roundContent.replace(regex, delta.content.trim());
-                                            replaced = true;
-                                            renderMarkdownContent(roundContent, mainContent);
-                                        }
-                                    }
-
-                                    if (!replaced) {
+                                    if (isOdooConversion) {
                                         rawRoundContent += delta.content;
-
-                                        // Partition incoming stream to detect reasoning blocks vs true response content
                                         const partition = partitionContentAndThinking(rawRoundContent);
-
                                         if (partition.thinking) {
-                                            if (!reasoningBlock) {
-                                                reasoningBlock = document.createElement('details');
-                                                reasoningBlock.className = 'reasoning-block';
-                                                reasoningBlock.open = true;
-                                                const summary = document.createElement('summary');
-                                                summary.innerHTML = '<span class="thinking-spinner">progress_activity</span> Thinking...';
-                                                reasoningContent = document.createElement('div');
-                                                reasoningContent.className = 'reasoning-content';
-                                                reasoningBlock.appendChild(summary);
-                                                reasoningBlock.appendChild(reasoningContent);
-                                                assistantMsgDiv.querySelector('.msg-content').insertBefore(reasoningBlock, mainContent);
+                                            roundReasoning = partition.thinking;
+                                        }
+                                        roundContent = partition.content;
+                                        lastRoundContent = roundContent;
+                                        streamNeedsContent = true;
+                                        scheduleStreamingRender();
+                                    } else {
+                                        const toolIdMatch = delta.content.match(/id="(tool-act-[^"]+)"/);
+                                        let replaced = false;
+                                        if (toolIdMatch) {
+                                            const actId = toolIdMatch[1];
+                                            const regex = new RegExp('<div class="tool-activity-block active"[^>]*id="' + actId + '"[\\s\\S]*?<\\/div>', 'g');
+                                            if (regex.test(roundContent)) {
+                                                roundContent = roundContent.replace(regex, delta.content.trim());
+                                                replaced = true;
+                                                renderMarkdownContent(roundContent, mainContent);
                                             }
-                                            if (partition.isThinkingOpen) {
-                                                reasoningBlock.open = true;
-                                                isReasoningDone = false;
-                                                const summary = reasoningBlock.querySelector('summary');
-                                                if (summary && !summary.querySelector('.thinking-spinner')) {
+                                        }
+
+                                        if (!replaced) {
+                                            rawRoundContent += delta.content;
+
+                                            // Partition incoming stream to detect reasoning blocks vs true response content
+                                            const partition = partitionContentAndThinking(rawRoundContent);
+
+                                            if (partition.thinking) {
+                                                if (!reasoningBlock) {
+                                                    reasoningBlock = document.createElement('details');
+                                                    reasoningBlock.className = 'reasoning-block';
+                                                    reasoningBlock.open = true;
+                                                    const summary = document.createElement('summary');
                                                     summary.innerHTML = '<span class="thinking-spinner">progress_activity</span> Thinking...';
+                                                    reasoningContent = document.createElement('div');
+                                                    reasoningContent.className = 'reasoning-content';
+                                                    reasoningBlock.appendChild(summary);
+                                                    reasoningBlock.appendChild(reasoningContent);
+                                                    assistantMsgDiv.querySelector('.msg-content').insertBefore(reasoningBlock, mainContent);
                                                 }
-                                            } else if (!isReasoningDone) {
+                                                if (partition.isThinkingOpen) {
+                                                    reasoningBlock.open = true;
+                                                    isReasoningDone = false;
+                                                    const summary = reasoningBlock.querySelector('summary');
+                                                    if (summary && !summary.querySelector('.thinking-spinner')) {
+                                                        summary.innerHTML = '<span class="thinking-spinner">progress_activity</span> Thinking...';
+                                                    }
+                                                } else if (!isReasoningDone) {
+                                                    isReasoningDone = true;
+                                                    reasoningBlock.open = false;
+                                                    const summary = reasoningBlock.querySelector('summary');
+                                                    if (summary) summary.innerHTML = 'Thought process';
+                                                }
+                                                roundReasoning = partition.thinking;
+                                                streamNeedsReasoning = true;
+                                            } else if (reasoningBlock && !isReasoningDone) {
                                                 isReasoningDone = true;
                                                 reasoningBlock.open = false;
                                                 const summary = reasoningBlock.querySelector('summary');
                                                 if (summary) summary.innerHTML = 'Thought process';
                                             }
-                                            roundReasoning = partition.thinking;
-                                            streamNeedsReasoning = true;
-                                        } else if (reasoningBlock && !isReasoningDone) {
-                                            isReasoningDone = true;
-                                            reasoningBlock.open = false;
-                                            const summary = reasoningBlock.querySelector('summary');
-                                            if (summary) summary.innerHTML = 'Thought process';
-                                        }
 
-                                        roundContent = partition.content;
-                                        lastRoundContent = roundContent;
-                                        streamNeedsContent = true;
-                                        scheduleStreamingRender();
+                                            roundContent = partition.content;
+                                            lastRoundContent = roundContent;
+                                            streamNeedsContent = true;
+                                            scheduleStreamingRender();
 
-                                        // Real-time streaming text-to-speech (speaks sentences as tokens arrive)
-                                        // ONLY speak when not inside an active thinking block
-                                        if (typeof voiceSettings !== 'undefined' && voiceSettings.autoRead && voiceSettings.streamingTts && !partition.isThinkingOpen) {
-                                            processStreamingTtsChunk(stripToolCallsFromText(roundContent), assistantMsgDiv);
+                                            // Real-time streaming text-to-speech (speaks sentences as tokens arrive)
+                                            // ONLY speak when not inside an active thinking block
+                                            if (typeof voiceSettings !== 'undefined' && voiceSettings.autoRead && voiceSettings.streamingTts && !partition.isThinkingOpen) {
+                                                processStreamingTtsChunk(stripToolCallsFromText(roundContent), assistantMsgDiv);
+                                            }
                                         }
                                     }
                                 }
@@ -5824,15 +5891,21 @@ async function sendMessage(options = {}) {
             if (streamRafPending) {
                 streamRafPending = false;
             }
-            if (reasoningContent && roundReasoning) {
-                reasoningContent.innerHTML = marked.parse(stripToolCallsFromText(roundReasoning));
-            }
-            if (mainContent && roundContent) {
-                const finalDisplay = stripToolCallsFromText(roundContent);
-                if (finalDisplay.length > 0) {
-                    renderMarkdownContent(finalDisplay, mainContent);
-                } else if (isRawToolCallString(roundContent) || isRawToolCallString(rawRoundContent)) {
-                    mainContent.innerHTML = '';
+            if (isOdooConversion) {
+                if (odooProgressCard) {
+                    updateOdooProgressUI(odooProgressCard, roundContent, roundReasoning, true);
+                }
+            } else {
+                if (reasoningContent && roundReasoning) {
+                    reasoningContent.innerHTML = marked.parse(stripToolCallsFromText(roundReasoning));
+                }
+                if (mainContent && roundContent) {
+                    const finalDisplay = stripToolCallsFromText(roundContent);
+                    if (finalDisplay.length > 0) {
+                        renderMarkdownContent(finalDisplay, mainContent);
+                    } else if (isRawToolCallString(roundContent) || isRawToolCallString(rawRoundContent)) {
+                        mainContent.innerHTML = '';
+                    }
                 }
             }
             messagesContainer.scrollTop = messagesContainer.scrollHeight;
@@ -6379,8 +6452,13 @@ async function sendMessage(options = {}) {
         }
 
         // Attach interactive message actions (Read aloud & Copy)
-        if (typeof attachAssistantMessageActions === 'function') {
+        if (typeof attachAssistantMessageActions === 'function' && !isOdooConversion) {
             attachAssistantMessageActions(assistantMsgDiv, lastRoundContent);
+        }
+
+        // Auto-download Odoo XML if requested for this generation turn
+        if (options && options.autoDownloadOdooXml) {
+            triggerAutoOdooDownload(assistantMsgDiv, lastRoundContent, odooProgressCard);
         }
 
         // If Voice Mode / Auto-read is enabled, flush remaining streaming speech or speak full response
@@ -8108,10 +8186,22 @@ function handleIncomingFile(file) {
 
 // ── In-Browser PDF Text Extraction & Page Rasterizer via Mozilla PDF.js ─────
 
+function arrayBufferToBase64(buffer) {
+    let binary = '';
+    const bytes = new Uint8Array(buffer);
+    const len = bytes.byteLength;
+    const chunkSize = 8192;
+    for (let i = 0; i < len; i += chunkSize) {
+        binary += String.fromCharCode.apply(null, bytes.subarray(i, Math.min(i + chunkSize, len)));
+    }
+    return btoa(binary);
+}
+
 async function processPdfFile(file) {
     showToast(`Reading PDF: ${file.name}...`, 'info');
     try {
         const arrayBuffer = await file.arrayBuffer();
+        const base64Pdf = arrayBufferToBase64(arrayBuffer);
 
         if (typeof pdfjsLib === 'undefined') {
             throw new Error('PDF.js engine is not ready. Please refresh or check connection.');
@@ -8193,8 +8283,12 @@ async function processPdfFile(file) {
             text: fullExtractedText.trim(),
             pageTexts: pageTexts,
             thumbnailDataUrl: thumbnailDataUrl,
-            charCount: fullExtractedText.trim().length
+            charCount: fullExtractedText.trim().length,
+            base64: base64Pdf
         };
+
+        window.__lastPdfBase64 = base64Pdf;
+        window.__lastPdfFilename = file.name;
 
         renderDocumentAttachmentChip();
         showToast(`Loaded PDF: ${file.name} (${numPages} page${numPages > 1 ? 's' : ''}, ${activeDocumentAttachment.charCount.toLocaleString()} chars)`, 'success');
@@ -8283,6 +8377,12 @@ function quickPromptExtractInvoice() {
 }
 
 function quickPromptOdooXml() {
+    // If a document is actively attached, trigger the automated 1-click pipeline directly
+    if (activeDocumentAttachment) {
+        triggerAutoOdooXmlWorkflow();
+        return;
+    }
+
     // 1. Direct check: any code block wrapper marked with data-invoice-json
     const invoiceWrappers = document.querySelectorAll('[data-invoice-json]');
     if (invoiceWrappers.length > 0) {
@@ -8329,7 +8429,398 @@ function quickPromptOdooXml() {
         return;
     }
 
-    applyInvoiceQuickPrompt('odoo');
+    triggerAutoOdooXmlWorkflow();
+}
+
+function extractInvoiceJsonFromText(text) {
+    if (!text || typeof text !== 'string') return null;
+    const codeBlockRegex = /```(?:json|ubl|xml)?\s*([\s\S]*?)```/gi;
+    let match;
+    while ((match = codeBlockRegex.exec(text)) !== null) {
+        const candidate = match[1].trim();
+        if (candidate.startsWith('{') && isInvoiceJsonString(candidate)) {
+            try {
+                const clean = candidate.replace(/\/\*[\s\S]*?\*\/|\/\/.*/g, '').replace(/,\s*([}\]])/g, '$1');
+                const parsed = JSON.parse(clean);
+                if (isInvoicePayload(parsed)) return parsed.invoice || parsed.data || parsed;
+            } catch (e) {}
+        }
+    }
+
+    const start = text.indexOf('{');
+    const end = text.lastIndexOf('}');
+    if (start !== -1 && end > start) {
+        const candidate = text.slice(start, end + 1).replace(/\/\*[\s\S]*?\*\/|\/\/.*/g, '').replace(/,\s*([}\]])/g, '$1');
+        try {
+            const parsed = JSON.parse(candidate);
+            if (isInvoicePayload(parsed)) return parsed.invoice || parsed.data || parsed;
+        } catch (e) {}
+    }
+    return null;
+}
+
+function createOdooProgressCard(filename = 'Document') {
+    const card = document.createElement('div');
+    card.className = 'odoo-progress-card';
+    card.id = 'odoo-card-' + Date.now();
+    card.innerHTML = `
+        <div class="odoo-progress-header">
+            <div class="odoo-progress-title-row">
+                <div class="odoo-progress-icon spinning">
+                    <span class="material-symbols-outlined" style="font-size: 28px;">sync</span>
+                </div>
+                <div class="odoo-progress-title-group">
+                    <div class="odoo-progress-title">Converting to Odoo UBL 2.1 XML</div>
+                    <div class="odoo-progress-sub">${escapeHtml(filename)}</div>
+                </div>
+            </div>
+            <div class="odoo-progress-badge">PROCESSING</div>
+        </div>
+        <div class="odoo-progress-track">
+            <div class="odoo-progress-bar" style="width: 15%;"></div>
+        </div>
+        <div class="odoo-progress-footer">
+            <div class="odoo-progress-status">
+                <span class="material-symbols-outlined" style="font-size: 14px; animation: odooSpin 2s linear infinite;">hourglass_top</span>
+                <span class="odoo-status-text">Analyzing document layout and tax data...</span>
+            </div>
+            <div class="odoo-progress-pct">15%</div>
+        </div>
+        <div class="odoo-completed-view hidden"></div>
+    `;
+    return card;
+}
+
+function updateOdooProgressUI(card, content = '', reasoning = '', isStreamDone = false) {
+    if (!card) return;
+    const bar = card.querySelector('.odoo-progress-bar');
+    const pctEl = card.querySelector('.odoo-progress-pct');
+    const statusTextEl = card.querySelector('.odoo-status-text');
+    if (!bar || !pctEl || !statusTextEl) return;
+
+    let pct = 15;
+    let status = 'Analyzing document and tax structure...';
+
+    if (isStreamDone) {
+        pct = 95;
+        status = 'Compiling standard UBL 2.1 XML and preparing download...';
+    } else if (content && content.length > 0) {
+        const lower = content.toLowerCase();
+        if (lower.includes('"lines"') || lower.includes('"line_items"')) {
+            pct = 85;
+            status = 'Itemizing products, quantities and unit prices...';
+        } else if (lower.includes('"totals"') || lower.includes('"vat_amount"') || lower.includes('"gross"')) {
+            pct = 70;
+            status = 'Calculating net, VAT rates and total amounts...';
+        } else if (lower.includes('"customer"') || lower.includes('"buyer"')) {
+            pct = 50;
+            status = 'Extracting customer details and address...';
+        } else if (lower.includes('"supplier"') || lower.includes('"seller"')) {
+            pct = 35;
+            status = 'Extracting supplier info and VAT / Tax ID...';
+        } else if (lower.includes('"invoice_number"') || lower.includes('{')) {
+            pct = 25;
+            status = 'Reading invoice number and dates...';
+        } else {
+            pct = Math.min(60, 15 + Math.floor((content.length / 500) * 30));
+            status = 'Extracting structured invoice data...';
+        }
+    } else if (reasoning && reasoning.length > 0) {
+        pct = Math.min(25, 10 + Math.floor((reasoning.length / 800) * 15));
+        status = 'Analyzing document structure & financial rules...';
+    }
+
+    bar.style.width = `${pct}%`;
+    pctEl.textContent = `${pct}%`;
+    statusTextEl.textContent = status;
+}
+
+function completeOdooProgressCard(card, invoiceData, xml, filename = 'odoo_invoice.xml') {
+    if (!card) return;
+    card.classList.add('completed');
+
+    const iconContainer = card.querySelector('.odoo-progress-icon');
+    if (iconContainer) {
+        iconContainer.classList.remove('spinning');
+        iconContainer.innerHTML = '<span class="material-symbols-outlined" style="font-size: 28px; color: #34d399;">check_circle</span>';
+    }
+
+    const badge = card.querySelector('.odoo-progress-badge');
+    if (badge) {
+        badge.textContent = 'READY & DOWNLOADED';
+    }
+
+    const bar = card.querySelector('.odoo-progress-bar');
+    if (bar) {
+        bar.style.width = '100%';
+    }
+
+    const pctEl = card.querySelector('.odoo-progress-pct');
+    if (pctEl) {
+        pctEl.textContent = '100%';
+        pctEl.style.color = '#34d399';
+    }
+
+    const statusIcon = card.querySelector('.odoo-progress-status .material-symbols-outlined');
+    if (statusIcon) {
+        statusIcon.style.animation = 'none';
+        statusIcon.textContent = 'download_done';
+        statusIcon.style.color = '#34d399';
+    }
+
+    const statusTextEl = card.querySelector('.odoo-status-text');
+    if (statusTextEl) {
+        statusTextEl.innerHTML = `Successfully converted &amp; saved as <b>${escapeHtml(filename)}</b>`;
+        statusTextEl.style.color = '#e2e8f0';
+    }
+
+    const completedView = card.querySelector('.odoo-completed-view');
+    if (completedView) {
+        completedView.classList.remove('hidden');
+
+        let detailsHtml = '';
+        if (invoiceData) {
+            const invNum = invoiceData.invoice_number || invoiceData.invoice_id || 'N/A';
+            const invDate = invoiceData.issue_date || invoiceData.date || 'N/A';
+            const supName = (invoiceData.supplier && (invoiceData.supplier.name || invoiceData.supplier.company_name)) || 'N/A';
+            const supVat = (invoiceData.supplier && (invoiceData.supplier.vat || invoiceData.supplier.vat_id || invoiceData.supplier.tax_id)) || 'N/A';
+            const totalGross = invoiceData.totals ? (invoiceData.totals.gross !== undefined ? invoiceData.totals.gross : invoiceData.totals.total) : 'N/A';
+            const curr = invoiceData.currency || 'EUR';
+
+            detailsHtml = `
+                <div class="odoo-progress-details">
+                    <div class="odoo-detail-item">
+                        <span class="odoo-detail-label">Invoice #</span>
+                        <span class="odoo-detail-val">${escapeHtml(String(invNum))}</span>
+                    </div>
+                    <div class="odoo-detail-item">
+                        <span class="odoo-detail-label">Date</span>
+                        <span class="odoo-detail-val">${escapeHtml(String(invDate))}</span>
+                    </div>
+                    <div class="odoo-detail-item">
+                        <span class="odoo-detail-label">Supplier</span>
+                        <span class="odoo-detail-val" title="${escapeHtml(String(supName))}">${escapeHtml(String(supName))}</span>
+                    </div>
+                    <div class="odoo-detail-item">
+                        <span class="odoo-detail-label">VAT ID</span>
+                        <span class="odoo-detail-val">${escapeHtml(String(supVat))}</span>
+                    </div>
+                    <div class="odoo-detail-item">
+                        <span class="odoo-detail-label">Total Amount</span>
+                        <span class="odoo-detail-val" style="color: #34d399;">${escapeHtml(String(curr))} ${escapeHtml(String(totalGross))}</span>
+                    </div>
+                </div>
+            `;
+        }
+
+        completedView.innerHTML = `
+            ${detailsHtml}
+            <div class="odoo-progress-actions">
+                <button type="button" class="odoo-btn odoo-btn-primary" onclick="downloadStoredXml('${card.id}')">
+                    <span class="material-symbols-outlined" style="font-size: 16px;">download</span>
+                    <span>Download Again</span>
+                </button>
+                <button type="button" class="odoo-btn odoo-btn-secondary" onclick="copyStoredXml('${card.id}')">
+                    <span class="material-symbols-outlined" style="font-size: 16px;">content_copy</span>
+                    <span>Copy XML</span>
+                </button>
+                <button type="button" class="odoo-btn odoo-btn-secondary" onclick="toggleOdooXmlInspector('${card.id}')">
+                    <span class="material-symbols-outlined" style="font-size: 16px;">code</span>
+                    <span>Inspect XML</span>
+                </button>
+            </div>
+            <div id="inspector-${card.id}" class="odoo-xml-inspector hidden">${escapeHtml(xml || '')}</div>
+        `;
+
+        card.__storedXml = xml;
+        card.__storedFilename = filename;
+    }
+}
+
+function failOdooProgressCard(card, errorMsg) {
+    if (!card) return;
+    const iconContainer = card.querySelector('.odoo-progress-icon');
+    if (iconContainer) {
+        iconContainer.classList.remove('spinning');
+        iconContainer.innerHTML = '<span class="material-symbols-outlined" style="font-size: 28px; color: #f87171;">error</span>';
+    }
+    const badge = card.querySelector('.odoo-progress-badge');
+    if (badge) {
+        badge.textContent = 'FAILED';
+        badge.style.background = 'rgba(239, 68, 68, 0.2)';
+        badge.style.color = '#fca5a5';
+        badge.style.borderColor = 'rgba(239, 68, 68, 0.4)';
+    }
+    const bar = card.querySelector('.odoo-progress-bar');
+    if (bar) {
+        bar.style.background = '#ef4444';
+        bar.style.width = '100%';
+    }
+    const statusTextEl = card.querySelector('.odoo-status-text');
+    if (statusTextEl) {
+        statusTextEl.textContent = errorMsg || 'Could not extract invoice fields automatically.';
+        statusTextEl.style.color = '#fca5a5';
+    }
+}
+
+function downloadStoredXml(cardId) {
+    const card = document.getElementById(cardId);
+    if (card && card.__storedXml) {
+        downloadXmlFile(card.__storedXml, card.__storedFilename || 'odoo_invoice.xml');
+    }
+}
+
+function copyStoredXml(cardId) {
+    const card = document.getElementById(cardId);
+    if (card && card.__storedXml) {
+        navigator.clipboard.writeText(card.__storedXml).then(() => {
+            showToast('UBL 2.1 XML copied to clipboard!', 'success');
+        }).catch(() => {
+            showToast('Failed to copy XML to clipboard', 'error');
+        });
+    }
+}
+
+function toggleOdooXmlInspector(cardId) {
+    const inspector = document.getElementById('inspector-' + cardId);
+    if (inspector) {
+        inspector.classList.toggle('hidden');
+    }
+}
+
+function triggerAutoOdooDownload(assistantMsgDiv, rawContent, odooProgressCard = null) {
+    try {
+        const card = odooProgressCard || (assistantMsgDiv ? assistantMsgDiv.querySelector('.odoo-progress-card') : null);
+        let invoiceData = null;
+
+        // 1. Check if markdown code block post-processing decorated with data-invoice-json
+        if (assistantMsgDiv) {
+            const wrapper = assistantMsgDiv.querySelector('[data-invoice-json]');
+            if (wrapper && wrapper.dataset.invoiceJson) {
+                try {
+                    invoiceData = JSON.parse(wrapper.dataset.invoiceJson);
+                } catch (e) {}
+            }
+        }
+
+        // 2. Fallback: Parse raw content directly
+        if (!invoiceData && rawContent) {
+            invoiceData = extractInvoiceJsonFromText(rawContent);
+        }
+
+        if (invoiceData) {
+            const compiledXml = fillOdooXmlTemplate(invoiceData);
+            const invNum = invoiceData.invoice_number || invoiceData.invoice_id || 'invoice';
+            const cleanNum = String(invNum).trim().replace(/[^a-zA-Z0-9_-]/g, '_');
+            const filename = `odoo_${cleanNum}.xml`;
+            downloadXmlFile(compiledXml, filename);
+            if (card) {
+                completeOdooProgressCard(card, invoiceData, compiledXml, filename);
+            }
+            showToast(`Odoo UBL XML for ${invNum} generated & downloaded!`, 'success');
+            return;
+        }
+
+        // 3. Fallback: Check if the model generated raw XML directly
+        if (rawContent && (rawContent.includes('<Invoice') || rawContent.includes('<odoo') || rawContent.includes('urn:oasis:names:specification:ubl'))) {
+            const xmlMatch = /(<\?xml\b[\s\S]*?<\/Invoice>|<Invoice\b[\s\S]*?<\/Invoice>|<\?xml\b[\s\S]*?<\/odoo>|<odoo\b[\s\S]*?<\/odoo>)/i.exec(rawContent);
+            if (xmlMatch) {
+                const cleanXml = normalizeOdooUblXml(xmlMatch[1]);
+                downloadXmlFile(cleanXml, 'odoo_invoice.xml');
+                if (card) {
+                    completeOdooProgressCard(card, null, cleanXml, 'odoo_invoice.xml');
+                }
+                showToast('Odoo UBL XML generated & downloaded!', 'success');
+                return;
+            }
+        }
+
+        if (card) {
+            failOdooProgressCard(card, 'Could not detect structured invoice JSON in output.');
+            const fallbackDiv = document.createElement('div');
+            fallbackDiv.style.marginTop = '12px';
+            renderMarkdownContent(rawContent, fallbackDiv);
+            card.appendChild(fallbackDiv);
+        }
+        showToast('Invoice extracted. You can review and click "Download for Odoo (.xml)".', 'info');
+    } catch (err) {
+        console.error('Error during auto Odoo XML download:', err);
+        const card = odooProgressCard || (assistantMsgDiv ? assistantMsgDiv.querySelector('.odoo-progress-card') : null);
+        if (card) {
+            failOdooProgressCard(card, 'Error compiling XML: ' + (err.message || 'unknown error'));
+        }
+        showToast('Failed to auto-download Odoo XML. Click Download button in message.', 'error');
+    }
+}
+
+function triggerAutoOdooXmlWorkflow() {
+    if (isGenerating) {
+        showToast('Engine is currently busy generating a response', 'warning');
+        return;
+    }
+
+    if (!activeDocumentAttachment && (!chatInput || !chatInput.value.trim())) {
+        showToast('Please drop or attach an invoice PDF first', 'info');
+        return;
+    }
+
+    const docName = activeDocumentAttachment ? activeDocumentAttachment.filename : 'Document';
+
+    // Clear chat input so user does not see the preconfigured prompt
+    if (chatInput) {
+        chatInput.value = '';
+        chatInput.style.height = 'auto';
+    }
+
+    showToast(`Converting "${docName}" to Odoo XML...`, 'info');
+
+    const prompt = 'Extract all invoice fields from this document and output them in structured JSON format:\n\n' +
+                   '```json\n' +
+                   '{\n' +
+                   '  "invoice_number": "...",\n' +
+                   '  "issue_date": "YYYY-MM-DD",\n' +
+                   '  "due_date": "YYYY-MM-DD",\n' +
+                   '  "currency": "EUR",\n' +
+                   '  "supplier": {\n' +
+                   '    "name": "...",\n' +
+                   '    "vat": "...",\n' +
+                   '    "country": "...",\n' +
+                   '    "street": "...",\n' +
+                   '    "city": "...",\n' +
+                   '    "zip": "..."\n' +
+                   '  },\n' +
+                   '  "customer": {\n' +
+                   '    "name": "...",\n' +
+                   '    "vat": "...",\n' +
+                   '    "country": "...",\n' +
+                   '    "street": "...",\n' +
+                   '    "city": "...",\n' +
+                   '    "zip": "..."\n' +
+                   '  },\n' +
+                   '  "totals": {\n' +
+                   '    "net": 0.00,\n' +
+                   '    "vat_rate": 21.0,\n' +
+                   '    "vat_amount": 0.00,\n' +
+                   '    "gross": 0.00\n' +
+                   '  },\n' +
+                   '  "lines": [\n' +
+                   '    {\n' +
+                   '      "description": "...",\n' +
+                   '      "quantity": 1,\n' +
+                   '      "unit_price": 0.00,\n' +
+                   '      "net_amount": 0.00,\n' +
+                   '      "vat_rate": 21.0\n' +
+                   '    }\n' +
+                   '  ]\n' +
+                   '}\n' +
+                   '```\n\n' +
+                   'Output only the structured JSON code block containing the extracted invoice values. Our Odoo template will automatically compile the electronic invoice from your extracted JSON values.';
+
+    sendMessage({
+        promptText: prompt,
+        displayText: `📄 Convert "${docName}" to Odoo UBL 2.1 XML`,
+        autoDownloadOdooXml: true
+    });
 }
 
 function downloadXmlFile(xmlText, defaultFilename = 'odoo_invoice.xml') {
@@ -8354,6 +8845,10 @@ function downloadXmlFile(xmlText, defaultFilename = 'odoo_invoice.xml') {
 }
 
 function applyInvoiceQuickPrompt(type) {
+    if (type === 'odoo') {
+        triggerAutoOdooXmlWorkflow();
+        return;
+    }
     if (!chatInput) return;
     let prompt = '';
     switch (type) {
