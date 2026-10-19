@@ -5435,6 +5435,115 @@ iframe#preview-iframe {
     user-select: text;
 }
 
+/* Decoded Invoice Synopsis Container */
+.odoo-synopsis-container {
+    margin-top: 14px;
+    background: rgba(15, 23, 42, 0.7);
+    border: 1px solid rgba(168, 85, 247, 0.25);
+    border-radius: 10px;
+    padding: 14px 16px;
+    animation: odooFadeIn 0.3s ease;
+    font-size: 13px;
+    color: #e2e8f0;
+}
+.odoo-synopsis-header {
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    margin-bottom: 12px;
+    padding-bottom: 8px;
+    border-bottom: 1px solid rgba(255, 255, 255, 0.08);
+}
+.odoo-synopsis-title {
+    font-size: 12px;
+    font-weight: 700;
+    text-transform: uppercase;
+    letter-spacing: 0.5px;
+    color: #c084fc;
+    display: flex;
+    align-items: center;
+    gap: 6px;
+}
+.odoo-synopsis-text {
+    line-height: 1.6;
+    color: #cbd5e1;
+    margin-bottom: 14px;
+}
+.odoo-synopsis-text p {
+    margin: 0 0 8px 0;
+}
+.odoo-synopsis-text p:last-child {
+    margin-bottom: 0;
+}
+.odoo-synopsis-table-wrap {
+    overflow-x: auto;
+    margin: 12px 0;
+    border-radius: 6px;
+    border: 1px solid rgba(255, 255, 255, 0.08);
+    background: rgba(0, 0, 0, 0.25);
+}
+.odoo-synopsis-table {
+    width: 100%;
+    border-collapse: collapse;
+    font-size: 12px;
+    text-align: left;
+}
+.odoo-synopsis-table th {
+    background: rgba(255, 255, 255, 0.06);
+    color: #94a3b8;
+    padding: 8px 12px;
+    font-weight: 600;
+    border-bottom: 1px solid rgba(255, 255, 255, 0.1);
+    white-space: nowrap;
+}
+.odoo-synopsis-table td {
+    padding: 8px 12px;
+    border-bottom: 1px solid rgba(255, 255, 255, 0.04);
+    color: #f1f5f9;
+}
+.odoo-synopsis-table tr:last-child td {
+    border-bottom: none;
+}
+.odoo-synopsis-table tr:hover td {
+    background: rgba(255, 255, 255, 0.04);
+}
+.odoo-synopsis-grid {
+    display: grid;
+    grid-template-columns: 1fr 1fr;
+    gap: 12px;
+    margin: 12px 0;
+}
+@media (max-width: 600px) {
+    .odoo-synopsis-grid {
+        grid-template-columns: 1fr;
+    }
+}
+.odoo-synopsis-party-card {
+    background: rgba(255, 255, 255, 0.03);
+    border: 1px solid rgba(255, 255, 255, 0.06);
+    border-radius: 8px;
+    padding: 10px 12px;
+}
+.odoo-party-title {
+    font-size: 10px;
+    text-transform: uppercase;
+    font-weight: 700;
+    color: #38bdf8;
+    letter-spacing: 0.5px;
+    margin-bottom: 4px;
+}
+.odoo-party-name {
+    font-weight: 600;
+    color: #f8fafc;
+    font-size: 13px;
+    margin-bottom: 2px;
+}
+.odoo-party-meta {
+    font-size: 11px;
+    color: #94a3b8;
+    line-height: 1.4;
+}
+
 .doc-remove-btn {
     background: transparent;
     border: none;

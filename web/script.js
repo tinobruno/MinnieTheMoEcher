@@ -8570,7 +8570,7 @@ function updateOdooProgressUI(card, content = '', reasoning = '', isStreamDone =
     statusTextEl.textContent = status;
 }
 
-function completeOdooProgressCard(card, invoiceData, xml, filename = 'odoo_invoice.xml') {
+function completeOdooProgressCard(card, invoiceData, xml, filename = 'odoo_invoice.xml', rawContent = '') {
     if (!card) return;
     if (card.__prefillTicker) {
         clearInterval(card.__prefillTicker);
@@ -8652,12 +8652,108 @@ function completeOdooProgressCard(card, invoiceData, xml, filename = 'odoo_invoi
             `;
         }
 
+        // 1. Build narrative synopsis if present
+        let narrativeHtml = '';
+        if (rawContent && typeof rawContent === 'string') {
+            const narrativeText = rawContent
+                .replace(/```(?:json|ubl|xml)?\s*[\s\S]*?```/gi, '')
+                .replace(/\{[\s\S]*"invoice_number"[\s\S]*\}/gi, '')
+                .trim();
+            if (narrativeText.length > 0) {
+                const parsedMd = (typeof marked !== 'undefined' && marked.parse) ? marked.parse(narrativeText) : escapeHtml(narrativeText);
+                narrativeHtml = `<div class="odoo-synopsis-text">${parsedMd}</div>`;
+            }
+        }
+
+        // 2. Build Parties breakdown
+        let partiesHtml = '';
+        if (invoiceData && (invoiceData.supplier || invoiceData.customer)) {
+            const s = invoiceData.supplier || {};
+            const c = invoiceData.customer || {};
+            partiesHtml = `
+                <div class="odoo-synopsis-grid">
+                    <div class="odoo-synopsis-party-card">
+                        <div class="odoo-party-title">Supplier / Issuer</div>
+                        <div class="odoo-party-name">${escapeHtml(s.name || s.company_name || 'N/A')}</div>
+                        <div class="odoo-party-meta">
+                            ${s.vat ? `<div>VAT ID: <b>${escapeHtml(s.vat)}</b></div>` : ''}
+                            ${s.street ? `<div>${escapeHtml(s.street)}</div>` : ''}
+                            ${(s.city || s.zip || s.country) ? `<div>${escapeHtml(s.zip || '')} ${escapeHtml(s.city || '')} ${s.country ? `(${escapeHtml(s.country)})` : ''}</div>` : ''}
+                        </div>
+                    </div>
+                    <div class="odoo-synopsis-party-card">
+                        <div class="odoo-party-title" style="color: #a78bfa;">Customer / Buyer</div>
+                        <div class="odoo-party-name">${escapeHtml(c.name || c.company_name || 'N/A')}</div>
+                        <div class="odoo-party-meta">
+                            ${c.vat ? `<div>VAT ID: <b>${escapeHtml(c.vat)}</b></div>` : ''}
+                            ${c.street ? `<div>${escapeHtml(c.street)}</div>` : ''}
+                            ${(c.city || c.zip || c.country) ? `<div>${escapeHtml(c.zip || '')} ${escapeHtml(c.city || '')} ${c.country ? `(${escapeHtml(c.country)})` : ''}</div>` : ''}
+                        </div>
+                    </div>
+                </div>
+            `;
+        }
+
+        // 3. Build line items table
+        let linesHtml = '';
+        if (invoiceData && Array.isArray(invoiceData.lines) && invoiceData.lines.length > 0) {
+            linesHtml = `
+                <div class="odoo-synopsis-table-wrap">
+                    <table class="odoo-synopsis-table">
+                        <thead>
+                            <tr>
+                                <th>Item Description</th>
+                                <th style="text-align: right;">Qty</th>
+                                <th style="text-align: right;">Unit Price</th>
+                                <th style="text-align: right;">Net Amount</th>
+                                <th style="text-align: right;">VAT %</th>
+                            </tr>
+                        </thead>
+                        <tbody>
+            `;
+            for (const line of invoiceData.lines) {
+                const desc = line.description || line.name || line.item || 'Item';
+                const qty = line.quantity !== undefined ? line.quantity : 1;
+                const unitPrice = line.unit_price !== undefined ? Number(line.unit_price).toFixed(2) : '-';
+                const netAmount = line.net_amount !== undefined ? Number(line.net_amount).toFixed(2) : '-';
+                const vatRate = line.vat_rate !== undefined ? `${line.vat_rate}%` : '-';
+                linesHtml += `
+                    <tr>
+                        <td>${escapeHtml(String(desc))}</td>
+                        <td style="text-align: right;">${escapeHtml(String(qty))}</td>
+                        <td style="text-align: right;">${escapeHtml(String(unitPrice))}</td>
+                        <td style="text-align: right;">${escapeHtml(String(netAmount))}</td>
+                        <td style="text-align: right; color: #a78bfa;">${escapeHtml(String(vatRate))}</td>
+                    </tr>
+                `;
+            }
+            linesHtml += `</tbody></table></div>`;
+        }
+
+        // 4. Build totals breakdown
+        let totalsHtml = '';
+        if (invoiceData && invoiceData.totals) {
+            const t = invoiceData.totals;
+            const curr = invoiceData.currency || 'EUR';
+            totalsHtml = `
+                <div style="display: flex; justify-content: flex-end; gap: 16px; margin-top: 10px; font-size: 12px; padding: 8px 12px; background: rgba(255,255,255,0.03); border-radius: 6px; flex-wrap: wrap;">
+                    ${t.net !== undefined ? `<div>Net Taxable: <b>${escapeHtml(String(curr))} ${Number(t.net).toFixed(2)}</b></div>` : ''}
+                    ${t.vat_amount !== undefined ? `<div>VAT (${t.vat_rate !== undefined ? t.vat_rate : '0'}%): <b>${escapeHtml(String(curr))} ${Number(t.vat_amount).toFixed(2)}</b></div>` : ''}
+                    ${(t.gross !== undefined || t.total !== undefined) ? `<div style="color: #34d399; font-weight: 700;">Gross Total: ${escapeHtml(String(curr))} ${Number(t.gross !== undefined ? t.gross : t.total).toFixed(2)}</div>` : ''}
+                </div>
+            `;
+        }
+
         completedView.innerHTML = `
             ${detailsHtml}
             <div class="odoo-progress-actions">
                 <button type="button" class="odoo-btn odoo-btn-primary" onclick="downloadStoredXml('${card.id}')">
                     <span class="material-symbols-outlined" style="font-size: 16px;">download</span>
                     <span>Download Again</span>
+                </button>
+                <button type="button" class="odoo-btn odoo-btn-secondary" onclick="toggleOdooSynopsis('${card.id}')">
+                    <span class="material-symbols-outlined" style="font-size: 16px;" id="btn-synopsis-icon-${card.id}">description</span>
+                    <span id="btn-synopsis-text-${card.id}">View Synopsis</span>
                 </button>
                 <button type="button" class="odoo-btn odoo-btn-secondary" onclick="copyStoredXml('${card.id}')">
                     <span class="material-symbols-outlined" style="font-size: 16px;">content_copy</span>
@@ -8668,11 +8764,47 @@ function completeOdooProgressCard(card, invoiceData, xml, filename = 'odoo_invoi
                     <span>Inspect XML</span>
                 </button>
             </div>
+            <div id="synopsis-${card.id}" class="odoo-synopsis-container hidden">
+                <div class="odoo-synopsis-header">
+                    <div class="odoo-synopsis-title">
+                        <span class="material-symbols-outlined" style="font-size: 16px;">receipt_long</span>
+                        <span>Decoded Invoice Synopsis</span>
+                    </div>
+                    <button type="button" class="doc-remove-btn" onclick="toggleOdooSynopsis('${card.id}')" title="Close Synopsis">
+                        <span class="material-symbols-outlined" style="font-size: 16px;">close</span>
+                    </button>
+                </div>
+                ${narrativeHtml}
+                ${partiesHtml}
+                ${linesHtml}
+                ${totalsHtml}
+            </div>
             <div id="inspector-${card.id}" class="odoo-xml-inspector hidden">${escapeHtml(xml || '')}</div>
         `;
 
         card.__storedXml = xml;
         card.__storedFilename = filename;
+        card.__rawContent = rawContent;
+    }
+}
+
+function toggleOdooSynopsis(cardId) {
+    const card = document.getElementById(cardId);
+    if (!card) return;
+    const container = card.querySelector('#synopsis-' + cardId);
+    const btnText = card.querySelector('#btn-synopsis-text-' + cardId);
+    const btnIcon = card.querySelector('#btn-synopsis-icon-' + cardId);
+    if (!container) return;
+
+    const isHidden = container.classList.contains('hidden');
+    if (isHidden) {
+        container.classList.remove('hidden');
+        if (btnText) btnText.textContent = 'Hide Synopsis';
+        if (btnIcon) btnIcon.textContent = 'expand_less';
+    } else {
+        container.classList.add('hidden');
+        if (btnText) btnText.textContent = 'View Synopsis';
+        if (btnIcon) btnIcon.textContent = 'description';
     }
 }
 
@@ -8758,7 +8890,7 @@ function triggerAutoOdooDownload(assistantMsgDiv, rawContent, odooProgressCard =
             const filename = `odoo_${cleanNum}.xml`;
             downloadXmlFile(compiledXml, filename);
             if (card) {
-                completeOdooProgressCard(card, invoiceData, compiledXml, filename);
+                completeOdooProgressCard(card, invoiceData, compiledXml, filename, rawContent);
             }
             showToast(`Odoo UBL XML for ${invNum} generated & downloaded!`, 'success');
             return;
@@ -8771,7 +8903,7 @@ function triggerAutoOdooDownload(assistantMsgDiv, rawContent, odooProgressCard =
                 const cleanXml = normalizeOdooUblXml(xmlMatch[1]);
                 downloadXmlFile(cleanXml, 'odoo_invoice.xml');
                 if (card) {
-                    completeOdooProgressCard(card, null, cleanXml, 'odoo_invoice.xml');
+                    completeOdooProgressCard(card, null, cleanXml, 'odoo_invoice.xml', rawContent);
                 }
                 showToast('Odoo UBL XML generated & downloaded!', 'success');
                 return;
@@ -8817,7 +8949,9 @@ function triggerAutoOdooXmlWorkflow() {
 
     showToast(`Converting "${docName}" to Odoo XML...`, 'info');
 
-    const prompt = 'Extract all invoice fields from this document and output them in structured JSON format:\n\n' +
+    const prompt = 'Extract all invoice fields from this document.\n\n' +
+                   'First, provide a brief 2-3 sentence invoice synopsis (summarizing the supplier, customer, products/services, and key amounts).\n\n' +
+                   'Then, output the structured JSON code block in this exact schema:\n' +
                    '```json\n' +
                    '{\n' +
                    '  "invoice_number": "...",\n' +
@@ -8857,7 +8991,7 @@ function triggerAutoOdooXmlWorkflow() {
                    '  ]\n' +
                    '}\n' +
                    '```\n\n' +
-                   'Output only the structured JSON code block containing the extracted invoice values. Our Odoo template will automatically compile the electronic invoice from your extracted JSON values.';
+                   'Our Odoo template will automatically compile the electronic UBL 2.1 XML from your extracted JSON values.';
 
     sendMessage({
         promptText: prompt,
