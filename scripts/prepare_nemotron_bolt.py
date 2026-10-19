@@ -10,7 +10,7 @@ Produces:
                                    • 8 GQA Attention layers (32 heads, 2 KV heads)
                                    • 40 LatentMoE bottlenecks (fc1_latent_proj 4096->1024, fc2_latent_proj 1024->4096)
                                    • 40 Shared Experts (5376 intermediate)
-                                   • 40 Router Gates (128 experts, sigmoid + bias)
+                                   • 40 Router Gates (128-496 experts, sigmoid + bias)
   2. expert_weights.bin          — Page-aligned (4096-byte) routed LatentMoE experts (1024->moe_inter->1024)
   3. expert_scales.bin           — Per-expert float32 scales (up and down)
   4. moecher_manifest_24gb.json  — Manifest for 24GB VRAM target (100% in-VRAM resident execution)
@@ -22,6 +22,7 @@ import sys
 import json
 import time
 import struct
+import shutil
 import re
 from pathlib import Path
 
@@ -33,11 +34,11 @@ def read_safetensor_header(path):
         header = json.loads(f.read(hlen))
     return header, 8 + hlen
 
-def compute_expert_block_layout(latent_size=1024, moe_inter=2048):
-    up_w_bytes = moe_inter * (latent_size // 2)      # 2048 * 512 = 1,048,576
-    up_s_bytes = moe_inter * (latent_size // 16)     # 2048 * 64  =   131,072
-    down_w_bytes = latent_size * (moe_inter // 2)    # 1024 * 1024 = 1,048,576
-    down_s_bytes = latent_size * (moe_inter // 16)   # 1024 * 128  =   131,072
+def compute_expert_block_layout(latent_size=1024, moe_inter=2560):
+    up_w_bytes = moe_inter * (latent_size // 2)
+    up_s_bytes = moe_inter * (latent_size // 16)
+    down_w_bytes = latent_size * (moe_inter // 2)
+    down_s_bytes = latent_size * (moe_inter // 16)
 
     up_w_off = 0
     up_s_off = up_w_off + up_w_bytes
@@ -86,9 +87,9 @@ def main():
             "num_key_value_heads": 2,
             "head_dim": 128,
             "moe_latent_size": 1024,
-            "moe_intermediate_size": 2048,
+            "moe_intermediate_size": 2560,
             "moe_shared_expert_intermediate_size": 5376,
-            "n_routed_experts": 128,
+            "n_routed_experts": 512,
             "num_experts_per_tok": 9,
             "routed_scaling_factor": 5.0,
             "norm_eps": 1e-5,
@@ -102,14 +103,6 @@ def main():
             "mamba_num_heads": 128,
             "mamba_head_dim": 64,
         }
-    else:
-        with open(config_path, "r", encoding="utf-8") as f:
-            config = json.load(f)
-
-    layers_block_type = config.get("layers_block_type", [])
-    if not layers_block_type:
-        # Default Nemotron-H Puzzle 88-layer pattern: alternating Mamba and LatentMoE with periodic Attention
-        # 40 Mamba, 40 LatentMoE, 8 Attention = 88 total
         layers_block_type = []
         attn_positions = {3, 11, 23, 35, 47, 59, 71, 83}
         non_attn_toggle = 0
@@ -122,23 +115,49 @@ def main():
             else:
                 layers_block_type.append("moe")
                 non_attn_toggle += 1
+        blockwise_n_routed = [512 if t == "moe" else 0 for t in layers_block_type]
+        blockwise_moe_inter = [2560 if t == "moe" else 0 for t in layers_block_type]
+        blockwise_top_k = [9 if t == "moe" else 0 for t in layers_block_type]
+    else:
+        with open(config_path, "r", encoding="utf-8") as f:
+            raw_cfg = json.load(f)
+        if "llm_config" in raw_cfg:
+            config = raw_cfg["llm_config"]
+            for k, v in raw_cfg.items():
+                if k not in config and k != "llm_config":
+                    config[k] = v
+        else:
+            config = raw_cfg
+
+        block_configs = config.get("block_configs", [])
+        if block_configs:
+            layers_block_type = [b.get("block_type") for b in block_configs]
+            blockwise_n_routed = [b.get("n_routed_experts", 0) for b in block_configs]
+            blockwise_moe_inter = [b.get("moe_intermediate_size", 0) for b in block_configs]
+            blockwise_top_k = [b.get("num_experts_per_tok", 0) for b in block_configs]
+        else:
+            layers_block_type = config.get("layers_block_type", [])
+            blockwise_n_routed = [config.get("n_routed_experts", 128) if t == "moe" else 0 for t in layers_block_type]
+            blockwise_moe_inter = [config.get("moe_intermediate_size", 2048) if t == "moe" else 0 for t in layers_block_type]
+            blockwise_top_k = [config.get("num_experts_per_tok", 9) if t == "moe" else 0 for t in layers_block_type]
 
     num_layers = len(layers_block_type)
     moe_layers = [l for l, t in enumerate(layers_block_type) if t == "moe"]
-    n_routed_experts = config.get("n_routed_experts", 128)
+    max_routed_experts = max([e for e in blockwise_n_routed if e > 0] or [config.get("n_routed_experts", 512)])
     latent_size = config.get("moe_latent_size", 1024)
-    moe_inter = config.get("moe_intermediate_size", 2048)
+    max_moe_inter = max([m for m in blockwise_moe_inter if m > 0] or [config.get("moe_intermediate_size", 2560)])
 
-    expert_block_size, expert_parts = compute_expert_block_layout(latent_size, moe_inter)
+    # Stride expert block size by max_moe_inter
+    expert_block_size, expert_parts = compute_expert_block_layout(latent_size, max_moe_inter)
 
     print(f"Total layers: {num_layers} ({len(moe_layers)} MoE layers, {sum(1 for t in layers_block_type if t == 'mamba')} Mamba, {sum(1 for t in layers_block_type if t == 'attention')} Attention)")
-    print(f"LatentMoE Bottleneck: {config.get('hidden_size', 4096)} -> {latent_size} -> {moe_inter}")
-    print(f"Total routed experts: {len(moe_layers)} * {n_routed_experts} = {len(moe_layers) * n_routed_experts}")
+    print(f"LatentMoE Bottleneck: {config.get('hidden_size', 4096)} -> {latent_size} -> {max_moe_inter}")
+    print(f"Max routed experts: {max_routed_experts} (Stride capacity: {len(moe_layers) * max_routed_experts})")
     print(f"Expert block size: {expert_block_size} bytes ({expert_block_size / 1024 / 1024:.2f} MB aligned to {PAGE_SIZE})")
 
     has_raw_shards = index_path.exists()
     dense_manifest = {}
-    total_experts = len(moe_layers) * n_routed_experts
+    total_stride_experts = len(moe_layers) * max_routed_experts
 
     if has_raw_shards:
         with open(index_path, "r", encoding="utf-8") as f:
@@ -149,9 +168,12 @@ def main():
         moe_layer_to_idx = {l: i for i, l in enumerate(moe_layers)}
         dense_shard_tensors = {}
         expert_shard_tensors = {}
-        expert_pattern = re.compile(r"backbone\.layers\.(\d+)\.mixer\.experts\.(\d+)\.(.+)")
+        expert_pattern = re.compile(r"(?:language_model\.)?backbone\.layers\.(\d+)\.mixer\.experts\.(\d+)\.(.+)")
 
         for name, shard in weight_map.items():
+            # Skip vision-only shards if present
+            if name.startswith("vision_model.") or name.startswith("mlp1."):
+                continue
             m = expert_pattern.match(name)
             if m:
                 layer_id = int(m.group(1))
@@ -172,6 +194,9 @@ def main():
         with open(dense_bin_path, "wb") as dense_f:
             for shard in sorted(dense_shard_tensors.keys()):
                 shard_path = raw_dir / shard
+                if not shard_path.exists():
+                    print(f"Warning: Shard {shard_path} does not exist, skipping.")
+                    continue
                 header, data_start = read_safetensor_header(shard_path)
                 with open(shard_path, "rb") as sf:
                     for tensor_name in sorted(dense_shard_tensors[shard]):
@@ -180,7 +205,13 @@ def main():
                         nbytes = offsets[1] - offsets[0]
                         sf.seek(data_start + offsets[0])
                         dense_f.write(sf.read(nbytes))
-                        dense_manifest[tensor_name] = {
+
+                        # Normalize tensor key for C++ engine: strip "language_model."
+                        clean_name = tensor_name
+                        if clean_name.startswith("language_model."):
+                            clean_name = clean_name[len("language_model."):]
+
+                        dense_manifest[clean_name] = {
                             "offset": current_dense_offset,
                             "nbytes": nbytes,
                             "dtype": tmeta.get("dtype", "BF16"),
@@ -191,7 +222,7 @@ def main():
 
         # 2. Write expert_weights.bin
         expert_bin_path = out_dir / "expert_weights.bin"
-        total_expert_bytes = total_experts * expert_block_size
+        total_expert_bytes = total_stride_experts * expert_block_size
         print(f"\n[2/3] Writing {expert_bin_path} ({total_expert_bytes / (1024**3):.2f} GB)...")
         t0 = time.time()
         part_offsets = {p[0]: (p[1], p[2]) for p in expert_parts}
@@ -204,6 +235,8 @@ def main():
         with open(expert_bin_path, "r+b") as exp_f:
             for shard in sorted(expert_shard_tensors.keys()):
                 shard_path = raw_dir / shard
+                if not shard_path.exists():
+                    continue
                 header, data_start = read_safetensor_header(shard_path)
                 with open(shard_path, "rb") as sf:
                     for name, moe_idx, expert_id, part_suffix in expert_shard_tensors[shard]:
@@ -214,21 +247,28 @@ def main():
                         offsets = tmeta["data_offsets"]
                         nbytes = offsets[1] - offsets[0]
                         sf.seek(data_start + offsets[0])
-                        block_idx = moe_idx * n_routed_experts + expert_id
+                        block_idx = moe_idx * max_routed_experts + expert_id
                         file_pos = block_idx * expert_block_size + part_off
                         exp_f.seek(file_pos)
                         exp_f.write(sf.read(nbytes))
                         written_count += 1
-        print(f"  [OK] Done! Expert bin written in {time.time() - t0:.1f}s")
+        print(f"  [OK] Done! Expert bin written ({written_count} tensors) in {time.time() - t0:.1f}s")
     else:
-        print("Note: Raw safetensors not provided. Generating manifest blueprints for 24GB and 16GB targets...")
+        print("Note: Raw safetensors not found in source directory. Manifest blueprints will be generated.")
 
     # Write default expert_scales.bin (1.0f)
     scales_path = out_dir / "expert_scales.bin"
     if not scales_path.exists():
         with open(scales_path, "wb") as sf:
-            sf.write(struct.pack(f"<{total_experts * 2}f", *([1.0] * (total_experts * 2))))
+            sf.write(struct.pack(f"<{total_stride_experts * 2}f", *([1.0] * (total_stride_experts * 2))))
         print(f"  [OK] Initialized unit expert scales at {scales_path}")
+
+    # Copy tokenizer and template files
+    for fname in ["tokenizer.json", "tokenizer_config.json", "chat_template.jinja"]:
+        src_f = raw_dir / fname
+        if src_f.exists():
+            shutil.copy2(src_f, out_dir / fname)
+            print(f"  [OK] Copied {fname} to {out_dir / fname}")
 
     # Generate Manifests:
     layer_types_int = [1 if t == "mamba" else (0 if t == "attention" else 2) for t in layers_block_type]
@@ -245,10 +285,10 @@ def main():
             "num_key_value_heads": config.get("num_key_value_heads", 2),
             "head_dim": config.get("head_dim", 128),
             "intermediate_size": config.get("intermediate_size", 2048),
-            "moe_intermediate_size": moe_inter,
+            "moe_intermediate_size": max_moe_inter,
             "moe_latent_size": latent_size,
             "moe_shared_expert_intermediate_size": config.get("moe_shared_expert_intermediate_size", 5376),
-            "n_routed_experts": n_routed_experts,
+            "n_routed_experts": max_routed_experts,
             "num_experts_per_tok": config.get("num_experts_per_tok", 9),
             "routed_scaling_factor": config.get("routed_scaling_factor", 5.0),
             "rms_norm_eps": config.get("norm_eps", 1e-5),
@@ -263,6 +303,9 @@ def main():
             "mamba_head_dim": config.get("mamba_head_dim", 64),
             "layer_types": layer_types_int,
             "layers_block_type": layers_block_type,
+            "blockwise_n_routed_experts": blockwise_n_routed,
+            "blockwise_moe_intermediate_size": blockwise_moe_inter,
+            "blockwise_num_experts_per_tok": blockwise_top_k,
             "has_vision": True,
             "vision_delegate": "models/frankenstin/vision/moecher_manifest.json"
         },
@@ -273,7 +316,7 @@ def main():
         "expert_layout": {
             "block_size": expert_block_size,
             "n_layers": len(moe_layers),
-            "n_experts": n_routed_experts,
+            "n_experts": max_routed_experts,
             "parts": {
                 p[0]: {
                     "offset_in_block": p[1],
