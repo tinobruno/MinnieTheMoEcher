@@ -798,6 +798,17 @@ void moe_route_top6_from_bf16_cuda(
     int n_experts, int top_k, float routed_scaling_factor,
     cudaStream_t stream = 0);
 
+inline void moe_route_topk_from_bf16_cuda(
+    int32_t* topk_ids,
+    float* topk_weights,
+    const __nv_bfloat16* scores_bf16,
+    const float* gate_bias,
+    int n_experts, int top_k, float routed_scaling_factor,
+    cudaStream_t stream = 0)
+{
+    moe_route_top6_from_bf16_cuda(topk_ids, topk_weights, scores_bf16, gate_bias, n_experts, top_k, routed_scaling_factor, stream);
+}
+
 void gemv_f32_cuda(
     float* out,
     const float* vec,
@@ -811,7 +822,19 @@ void fused_moe_accum_dynamic_cuda(
     const float* topk_weights,
     const __nv_bfloat16* shared_down,
     int dim,
+    int top_k = 6,
     cudaStream_t stream = 0);
+
+inline void fused_moe_accum_dynamic_cuda(
+    __nv_bfloat16* accum,
+    const __nv_bfloat16* down_buf,
+    const float* topk_weights,
+    const __nv_bfloat16* shared_down,
+    int dim,
+    cudaStream_t stream)
+{
+    fused_moe_accum_dynamic_cuda(accum, down_buf, topk_weights, shared_down, dim, 6, stream);
+}
 
 void fused_moe_accum_6_cuda(
     __nv_bfloat16* accum,
@@ -1198,6 +1221,17 @@ void moe_route_top6_from_bf16_batch_cuda(
     int M, int n_experts, int top_k, float routed_scaling_factor,
     cudaStream_t stream = 0);
 
+inline void moe_route_topk_from_bf16_batch_cuda(
+    int32_t* topk_ids,
+    float* topk_weights,
+    const __nv_bfloat16* scores_bf16,
+    const float* gate_bias,
+    int M, int n_experts, int top_k, float routed_scaling_factor,
+    cudaStream_t stream = 0)
+{
+    moe_route_top6_from_bf16_batch_cuda(topk_ids, topk_weights, scores_bf16, gate_bias, M, n_experts, top_k, routed_scaling_factor, stream);
+}
+
 void moe_route_hash_device_id_batch_cuda(
     int32_t* topk_ids,
     float* topk_weights,
@@ -1415,20 +1449,22 @@ void gemv_fp8_scalar_scale_residual_cuda(
     cudaStream_t stream = 0);
 
 void mamba2_nemotron_step_cuda(
-    __nv_bfloat16* ssm_out,       // [4096]
-    const __nv_bfloat16* in_proj, // [10304]
-    const __nv_bfloat16* conv1d_w,// [6144, 4]
-    const __nv_bfloat16* conv1d_b,// [6144]
-    __nv_bfloat16* conv_state,    // [6144, 4]
-    const __nv_bfloat16* A_log,   // [64]
-    const __nv_bfloat16* D,       // [64]
-    const __nv_bfloat16* dt_bias, // [64]
-    const __nv_bfloat16* norm_w,  // [4096]
-    float* ssm_state,             // [64, 64, 128] FP32 state for numerical stability
-    __nv_bfloat16* conv_buf,      // [6144]
-    float* temp_out,              // [4096]
+    __nv_bfloat16* ssm_out,       // [intermediate_size] (4096 or 8192)
+    const __nv_bfloat16* in_proj, // [in_proj_dim] (10304 or 18568)
+    const __nv_bfloat16* conv1d_w,// [conv_channels, 4]
+    const __nv_bfloat16* conv1d_b,// [conv_channels]
+    __nv_bfloat16* conv_state,    // [conv_channels, 4]
+    const __nv_bfloat16* A_log,   // [num_heads]
+    const __nv_bfloat16* D,       // [num_heads]
+    const __nv_bfloat16* dt_bias, // [num_heads]
+    const __nv_bfloat16* norm_w,  // [intermediate_size]
+    float* ssm_state,             // [num_heads, head_dim, 128] FP32 state for numerical stability
+    __nv_bfloat16* conv_buf,      // [conv_channels]
+    float* temp_out,              // [intermediate_size]
     float rms_norm_eps,
-    cudaStream_t stream = 0);
+    cudaStream_t stream = 0,
+    int num_heads = 64,
+    int head_dim = 64);
 
 void mamba2_nemotron_step_batch_cuda(
     __nv_bfloat16* ssm_out_batch,
@@ -1445,7 +1481,9 @@ void mamba2_nemotron_step_batch_cuda(
     float* temp_out_batch,
     int M,
     float rms_norm_eps,
-    cudaStream_t stream = 0);
+    cudaStream_t stream = 0,
+    int num_heads = 64,
+    int head_dim = 64);
 
 void gemm_fp8_scalar_scale_batch_cuda(
     __nv_bfloat16* out,
@@ -1496,6 +1534,8 @@ void moe_bin_tokens_cuda(
     int32_t* expert_token_slots,
     const int32_t* topk_ids,
     int total_selections,
+    int top_k = 6,
+    int n_experts = 128,
     cudaStream_t stream = 0);
 
 void moe_nemotron_up_relu2_batch_cuda(
@@ -1508,7 +1548,9 @@ void moe_nemotron_up_relu2_batch_cuda(
     const void* const* expert_ptrs,
     const float* expert_scales,
     int M, int N, int K,
-    cudaStream_t stream = 0);
+    cudaStream_t stream = 0,
+    int top_k = 6,
+    int n_experts = 128);
 
 void moe_nemotron_down_scaled_residual_batch_cuda(
     __nv_bfloat16* hidden_out,
@@ -1521,5 +1563,7 @@ void moe_nemotron_down_scaled_residual_batch_cuda(
     const void* const* expert_ptrs,
     const float* expert_scales,
     int M, int N, int K,
-    cudaStream_t stream = 0);
+    cudaStream_t stream = 0,
+    int top_k = 6,
+    int n_experts = 128);
 

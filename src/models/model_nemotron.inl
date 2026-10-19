@@ -13,17 +13,22 @@
 
         if (ltype == 1) {
             // ════════════════════════════════════════════════════════════════════════
-            // 1. MAMBA-2 SSM MIXER LAYER (Nemotron 3.5 Lightning)
+            // 1. MAMBA-2 SSM MIXER LAYER (Nemotron 3.5 Lightning / Bolt)
             // ════════════════════════════════════════════════════════════════════════
+            int mamba_heads = cfg_.is_nemotron_bolt() ? 128 : 64;
+            int mamba_head_dim = 64;
+            int mamba_inter = mamba_heads * mamba_head_dim;
+            int in_proj_dim = cfg_.is_nemotron_bolt() ? 18568 : 10304;
+
             rms_norm_cuda(buf_hidden2_.bf16(), buf_hidden_.bf16(),
                           lw.attn_norm_w.bf16(), dim, cfg_.rms_norm_eps, main_stream_);
 
-            // In-projection: FP8 [10304, 2688] with scalar scale -> buf_q_ [10304]
+            // In-projection: FP8 [in_proj_dim, dim] with scalar scale -> buf_q_ [in_proj_dim]
             gemv_fp8_scalar_scale_cuda(buf_q_.bf16(), buf_hidden2_.bf16(),
                                        (const uint8_t*)lw.w_in_qkv.data, lw.w_in_qkv_scale_val,
-                                       10304, dim, main_stream_);
+                                       in_proj_dim, dim, main_stream_);
 
-            // Mamba-2 SSM Decode Step (Causal Conv1d + SSM recurrent update + Gated RMSNorm) -> buf_attn_out_ [4096]
+            // Mamba-2 SSM Decode Step (Causal Conv1d + SSM recurrent update + Gated RMSNorm) -> buf_attn_out_ [mamba_inter]
             mamba2_nemotron_step_cuda(
                 buf_attn_out_.bf16(),
                 buf_q_.bf16(),
@@ -38,23 +43,25 @@
                 buf_mamba_conv_.bf16(),
                 buf_mamba_temp_.f32(),
                 cfg_.rms_norm_eps,
-                main_stream_);
+                main_stream_,
+                mamba_heads,
+                mamba_head_dim);
 
-            // Out-projection: FP8 [2688, 4096] with scalar scale + residual accumulation -> buf_hidden_ [2688]
+            // Out-projection: FP8 [dim, mamba_inter] with scalar scale + residual accumulation -> buf_hidden_ [dim]
             gemv_fp8_scalar_scale_residual_cuda(
                 buf_hidden_.bf16(), buf_attn_out_.bf16(),
                 (const uint8_t*)lw.linear_out_proj.data, lw.linear_out_proj_scale_val,
-                dim, 4096, main_stream_);
+                dim, mamba_inter, main_stream_);
             return;
         } else if (ltype == 0) {
             // ════════════════════════════════════════════════════════════════════════
-            // 2. STANDARD GQA ATTENTION MIXER LAYER (Nemotron 3.5 Lightning)
+            // 2. STANDARD GQA ATTENTION MIXER LAYER (Nemotron 3.5 Lightning / Bolt)
             // ════════════════════════════════════════════════════════════════════════
             rms_norm_cuda(buf_hidden2_.bf16(), buf_hidden_.bf16(),
                           lw.attn_norm_w.bf16(), dim, cfg_.rms_norm_eps, main_stream_);
 
             int q_dim = n_q_heads * head_dim; // 32 * 128 = 4096
-            int kv_dim = n_kv_heads * head_dim; // 2 * 128 = 256
+            int kv_dim = n_kv_heads * head_dim;
 
             gemv_bf16_out_bf16_cuda(buf_q_.bf16(), lw.w_q.bf16(), buf_hidden2_.bf16(), q_dim, dim, main_stream_);
             gemv_bf16_out_bf16_cuda(buf_gate_.bf16(), lw.w_k.bf16(), buf_hidden2_.bf16(), kv_dim, dim, main_stream_);
@@ -76,16 +83,22 @@
                 nullptr,
                 main_stream_);
 
-            // Attention Output Projection: BF16 [2688, 4096] + residual accumulation into buf_hidden_
+            // Attention Output Projection: BF16 [dim, q_dim] + residual accumulation into buf_hidden_
             gemv_bf16_out_bf16_cuda(buf_hidden2_.bf16(), lw.w_o.bf16(), buf_attn_out_.bf16(), dim, q_dim, main_stream_);
             vector_add_bf16_cuda(buf_hidden_.bf16(), buf_hidden2_.bf16(), dim, main_stream_);
             return;
         } else {
             // ════════════════════════════════════════════════════════════════════════
-            // 3. SPARSE MoE FEED-FORWARD LAYER (Nemotron 3.5 Lightning)
+            // 3. SPARSE MoE FEED-FORWARD LAYER (Nemotron 3.5 Lightning / Bolt)
             // ════════════════════════════════════════════════════════════════════════
             rms_norm_cuda(buf_hidden2_.bf16(), buf_hidden_.bf16(),
                           lw.ffn_norm_w.bf16(), dim, cfg_.rms_norm_eps, main_stream_);
+
+            // Find MoE layer index
+            int moe_layer_idx = 0;
+            for (int i = 0; i < layer_id; i++) {
+                if (cfg_.layer_types[i] == 2) moe_layer_idx++;
+            }
 
             // 3a. Shared Expert (NVFP4, Squared ReLU, residual)
             if (lw.shared_w1_w.data && lw.shared_w2_w.data) {
@@ -99,8 +112,113 @@
                                          lw.shared_w2_s2, dim, shared_inter, main_stream_);
             }
 
-            // 3b. Routed Experts (Top-6, Squared ReLU, scaled residual)
-            if (cfg_.n_routed_experts > 0 && lw.gate_w.data) {
+            // 3b. Routed Experts
+            if (cfg_.is_nemotron_bolt()) {
+                // ── Nemotron Bolt LatentMoE Forward Pass ─────────────────────────────
+                int n_experts = cfg_.get_layer_n_routed_experts(layer_id);
+                int top_k = cfg_.get_layer_num_experts_per_tok(layer_id);
+                int moe_inter = cfg_.get_layer_moe_intermediate_size(layer_id);
+                int latent_dim = cfg_.moe_latent_size > 0 ? cfg_.moe_latent_size : 1024;
+
+                if (n_experts > 0 && lw.gate_w.data) {
+                    gemm_bf16(buf_scores_bf16_.bf16(), 1, n_experts, dim,
+                              buf_hidden2_.bf16(), lw.gate_w.bf16());
+
+                    moe_route_topk_from_bf16_cuda(buf_topk_idx_.i32(), buf_topk_vals_.f32(),
+                                                  buf_scores_bf16_.bf16(),
+                                                  lw.gate_bias.data ? lw.gate_bias.f32() : nullptr,
+                                                  n_experts, top_k, cfg_.routed_scaling_factor, main_stream_);
+
+                    CUDA_CHECK(cudaMemcpyAsync(topk_ids_host_, buf_topk_idx_.i32(),
+                                               top_k * sizeof(int32_t), cudaMemcpyDeviceToHost, main_stream_));
+                    CUDA_CHECK(cudaMemcpyAsync(topk_weights_host_, buf_topk_vals_.f32(),
+                                               top_k * sizeof(float), cudaMemcpyDeviceToHost, main_stream_));
+                    CUDA_CHECK(cudaEventRecord(dma_event_, main_stream_));
+                    CUDA_CHECK(cudaEventSynchronize(dma_event_));
+
+                    // Latent Down-Projection: buf_hidden2_ [4096] -> buf_latent_down_ [1024]
+                    if (lw.fc1_latent_proj.dtype == "fp8") {
+                        gemv_fp8_scalar_scale_cuda(buf_latent_down_.bf16(), buf_hidden2_.bf16(),
+                                                   (const uint8_t*)lw.fc1_latent_proj.data, lw.fc1_scale_val,
+                                                   latent_dim, dim, main_stream_);
+                    } else {
+                        gemv_bf16_out_bf16_cuda(buf_latent_down_.bf16(), lw.fc1_latent_proj.bf16(),
+                                                buf_hidden2_.bf16(), latent_dim, dim, main_stream_);
+                    }
+
+                    // Resolve pointers / DMA for all active top-k experts
+                    void* exp_ptrs[16] = {nullptr};
+                    for (int k = 0; k < top_k; k++) {
+                        int eid = topk_ids_host_[k];
+                        if (eid < 0 || eid >= n_experts || topk_weights_host_[k] == 0.0f) continue;
+                        exp_ptrs[k] = expert_loader_.try_get_expert_cached(moe_layer_idx, eid);
+                        if (!exp_ptrs[k]) {
+                            void* dram_src = expert_loader_.get_dram_expert_ptr(moe_layer_idx, eid);
+                            void* scratch_gpu = (char*)buf_dram_moe_scratch_.data + (size_t)k * expert_loader_.expert_block_size();
+                            if (dram_src && scratch_gpu) {
+                                CUDA_CHECK(cudaMemcpyAsync(scratch_gpu, dram_src, expert_loader_.expert_block_size(),
+                                                           cudaMemcpyHostToDevice, main_stream_));
+                                exp_ptrs[k] = scratch_gpu;
+                            }
+                        }
+                    }
+
+                    size_t up_w_bytes = (size_t)moe_inter * (latent_dim / 2);
+                    size_t up_s_bytes = (size_t)moe_inter * (latent_dim / 16);
+                    size_t down_w_bytes = (size_t)latent_dim * (moe_inter / 2);
+                    size_t down_s_bytes = (size_t)latent_dim * (moe_inter / 16);
+
+                    for (int k = 0; k < top_k; k++) {
+                        int eid = topk_ids_host_[k];
+                        float weight = topk_weights_host_[k];
+                        if (eid < 0 || eid >= n_experts || weight == 0.0f) continue;
+
+                        void* exp_ptr = exp_ptrs[k];
+                        if (!exp_ptr) continue;
+
+                        const uint8_t* up_w = (const uint8_t*)exp_ptr;
+                        const uint8_t* up_s = up_w + up_w_bytes;
+                        const uint8_t* down_w = up_s + up_s_bytes;
+                        const uint8_t* down_s = down_w + down_w_bytes;
+
+                        float up_s2 = 1.0f;
+                        float down_s2 = 1.0f;
+                        int stride_exp = std::max({cfg_.n_routed_experts, cfg_.max_n_routed_experts(), 128});
+                        size_t s_idx = ((size_t)moe_layer_idx * stride_exp + eid) * 2;
+                        if (s_idx + 1 < nemotron_expert_scales_.size()) {
+                            up_s2 = nemotron_expert_scales_[s_idx];
+                            down_s2 = nemotron_expert_scales_[s_idx + 1];
+                        }
+
+                        // 1. Up-projection on latent input vector: [moe_inter, latent_dim]
+                        gemv_nvfp4_cuda(buf_gate_.bf16(), buf_latent_down_.bf16(),
+                                        up_w, up_s, up_s2, moe_inter, latent_dim, main_stream_);
+
+                        // 2. Squared ReLU:
+                        relu2_cuda(buf_gate_.bf16(), buf_gate_.bf16(), moe_inter, main_stream_);
+
+                        // 3. Down-projection into buf_down_ slot k: [latent_dim, moe_inter]
+                        gemv_nvfp4_cuda(buf_down_.bf16() + (size_t)k * latent_dim, buf_gate_.bf16(),
+                                        down_w, down_s, down_s2, latent_dim, moe_inter, main_stream_);
+                    }
+
+                    // 4. Accumulate active top-k experts in latent space [latent_dim]
+                    fused_moe_accum_dynamic_cuda(buf_latent_accum_.bf16(), buf_down_.bf16(),
+                                                 buf_topk_vals_.f32(), nullptr, latent_dim, top_k, main_stream_);
+
+                    // 5. Latent Up-Projection: buf_latent_accum_ [1024] -> residual addition into buf_hidden_ [4096]
+                    if (lw.fc2_latent_proj.dtype == "fp8") {
+                        gemv_fp8_scalar_scale_residual_cuda(buf_hidden_.bf16(), buf_latent_accum_.bf16(),
+                                                            (const uint8_t*)lw.fc2_latent_proj.data, lw.fc2_scale_val,
+                                                            dim, latent_dim, main_stream_);
+                    } else {
+                        gemv_bf16_out_bf16_cuda(buf_hidden2_.bf16(), lw.fc2_latent_proj.bf16(),
+                                                buf_latent_accum_.bf16(), dim, latent_dim, main_stream_);
+                        vector_add_bf16_cuda(buf_hidden_.bf16(), buf_hidden2_.bf16(), dim, main_stream_);
+                    }
+                }
+            } else if (cfg_.n_routed_experts > 0 && lw.gate_w.data) {
+                // ── Nemotron Lightning Top-6 Routed Experts ──────────────────────────
                 int n_experts = cfg_.n_routed_experts;
                 int top_k = cfg_.num_experts_per_tok > 0 ? cfg_.num_experts_per_tok : 6;
                 int moe_inter = cfg_.moe_intermediate_size > 0 ? cfg_.moe_intermediate_size : inter_size;
@@ -119,12 +237,6 @@
                                            top_k * sizeof(float), cudaMemcpyDeviceToHost, main_stream_));
                 CUDA_CHECK(cudaEventRecord(dma_event_, main_stream_));
                 CUDA_CHECK(cudaEventSynchronize(dma_event_));
-
-                // Find MoE layer index (0..22)
-                int moe_layer_idx = 0;
-                for (int i = 0; i < layer_id; i++) {
-                    if (cfg_.layer_types[i] == 2) moe_layer_idx++;
-                }
 
                 // Batch resolve / pipeline DMA transfers for all top-k experts
                 void* exp_ptrs[8] = {nullptr};
@@ -163,7 +275,8 @@
 
                     float up_s2 = 1.0f;
                     float down_s2 = 1.0f;
-                    size_t s_idx = ((size_t)moe_layer_idx * 128 + eid) * 2;
+                    int stride_exp = std::max({cfg_.n_routed_experts, cfg_.max_n_routed_experts(), 128});
+                    size_t s_idx = ((size_t)moe_layer_idx * stride_exp + eid) * 2;
                     if (s_idx + 1 < nemotron_expert_scales_.size()) {
                         up_s2 = nemotron_expert_scales_[s_idx];
                         down_s2 = nemotron_expert_scales_[s_idx + 1];
@@ -199,15 +312,20 @@
 
         if (ltype == 1) {
             // ════════════════════════════════════════════════════════════════════════
-            // 1. MAMBA-2 SSM MIXER LAYER (Nemotron 3.5 Lightning)
+            // 1. MAMBA-2 SSM MIXER LAYER (Nemotron 3.5 Lightning / Bolt)
             // ════════════════════════════════════════════════════════════════════════
+            int mamba_heads = cfg_.is_nemotron_bolt() ? 128 : 64;
+            int mamba_head_dim = 64;
+            int mamba_inter = mamba_heads * mamba_head_dim;
+            int in_proj_dim = cfg_.is_nemotron_bolt() ? 18568 : 10304;
+
             rms_norm_cuda_batched(buf_hidden2_batch_.bf16(), buf_hidden_batch_.bf16(),
                                   lw.attn_norm_w.bf16(), M, dim, cfg_.rms_norm_eps, main_stream_);
 
-            // In-projection: Batched FP8 [M, 10304] with scalar scale -> buf_q_batch_
+            // In-projection: Batched FP8 [M, in_proj_dim] with scalar scale -> buf_q_batch_
             gemm_fp8_scalar_scale_cublaslt(buf_q_batch_.bf16(), buf_hidden2_batch_.bf16(),
                                            (const uint8_t*)lw.w_in_qkv.data, lw.w_in_qkv_scale_val,
-                                           M, 10304, dim, 0.0f, main_stream_);
+                                           M, in_proj_dim, dim, 0.0f, main_stream_);
 
             // Mamba-2 SSM Step (Single batched launch across all M tokens)
             mamba2_nemotron_step_batch_cuda(
@@ -225,17 +343,19 @@
                 buf_mamba_temp_batch_.f32(),
                 M,
                 cfg_.rms_norm_eps,
-                main_stream_);
+                main_stream_,
+                mamba_heads,
+                mamba_head_dim);
 
-            // Out-projection: Batched FP8 [M, 2688] with scalar scale + residual accumulation -> buf_hidden_batch_
+            // Out-projection: Batched FP8 [M, dim] with scalar scale + residual accumulation -> buf_hidden_batch_
             gemm_fp8_scalar_scale_cublaslt(
                 buf_hidden_batch_.bf16(), buf_attn_out_batch_.bf16(),
                 (const uint8_t*)lw.linear_out_proj.data, lw.linear_out_proj_scale_val,
-                M, dim, 4096, 1.0f, main_stream_);
+                M, dim, mamba_inter, 1.0f, main_stream_);
             return;
         } else if (ltype == 0) {
             // ════════════════════════════════════════════════════════════════════════
-            // 2. STANDARD GQA ATTENTION MIXER LAYER (Nemotron 3.5 Lightning)
+            // 2. STANDARD GQA ATTENTION MIXER LAYER (Nemotron 3.5 Lightning / Bolt)
             // ════════════════════════════════════════════════════════════════════════
             rms_norm_cuda_batched(buf_hidden2_batch_.bf16(), buf_hidden_batch_.bf16(),
                                   lw.attn_norm_w.bf16(), M, dim, cfg_.rms_norm_eps, main_stream_);
@@ -267,24 +387,25 @@
                 buf_mrope_pos_.data ? buf_mrope_pos_.i32() : nullptr,
                 main_stream_);
 
-            // Attention Output Projection: BF16 [M, 2688] + residual accumulation into buf_hidden_batch_
+            // Attention Output Projection: BF16 [M, dim] + residual accumulation into buf_hidden_batch_
             gemm_bf16(buf_hidden2_batch_.bf16(), M, dim, q_dim, buf_attn_out_batch_.bf16(), lw.w_o.bf16());
             vector_add_bf16_cuda(buf_hidden_batch_.bf16(), buf_hidden2_batch_.bf16(), M * dim, main_stream_);
             return;
         } else {
             // ════════════════════════════════════════════════════════════════════════
-            // 3. SPARSE MoE FEED-FORWARD LAYER (Nemotron 3.5 Lightning)
+            // 3. SPARSE MoE FEED-FORWARD LAYER (Nemotron 3.5 Lightning / Bolt)
             // ════════════════════════════════════════════════════════════════════════
             rms_norm_cuda_batched(buf_hidden2_batch_.bf16(), buf_hidden_batch_.bf16(),
                                   lw.ffn_norm_w.bf16(), M, dim, cfg_.rms_norm_eps, main_stream_);
 
-            // Find MoE layer index (0..22)
+            // Find MoE layer index (0..39 for Bolt, 0..22 for Lightning)
             int moe_layer_idx = 0;
             for (int i = 0; i < layer_id; i++) {
                 if (cfg_.layer_types[i] == 2) moe_layer_idx++;
             }
 
-            const float* layer_scales = (const float*)buf_expert_scales_gpu_.data + (size_t)moe_layer_idx * 128 * 2;
+            int stride_exp = std::max({cfg_.n_routed_experts, cfg_.max_n_routed_experts(), 128});
+            const float* layer_scales = (const float*)buf_expert_scales_gpu_.data + (size_t)moe_layer_idx * stride_exp * 2;
 
             if (!s_moe_sub_init) {
                 s_moe_sub_init = true;
@@ -292,7 +413,119 @@
             }
             if (layer_id == 1) CUDA_CHECK(cudaEventRecord(s_moe_sub_ev[0], main_stream_));
 
-            // 1. Router + Top-6 + Token Binning on main_stream_ (runs clean in ~0.05ms)
+            // Shared Expert: Run synchronously on main_stream_ with direct residual accumulation
+            bool has_shared = (lw.shared_w1_w.data && lw.shared_w2_w.data);
+            if (has_shared) {
+                int shared_inter = cfg_.moe_shared_expert_intermediate_size > 0 ? cfg_.moe_shared_expert_intermediate_size : (cfg_.is_nemotron_bolt() ? 5376 : 3712);
+                gemm_nvfp4_relu2_batch_cuda(buf_gate_batch_.bf16(), buf_hidden2_batch_.bf16(),
+                                            (const uint8_t*)lw.shared_w1_w.data, (const uint8_t*)lw.shared_w1_s.data,
+                                            lw.shared_w1_s2, M, shared_inter, dim, main_stream_);
+                gemm_nvfp4_residual_batch_cuda(buf_hidden_batch_.bf16(), buf_gate_batch_.bf16(),
+                                               (const uint8_t*)lw.shared_w2_w.data, (const uint8_t*)lw.shared_w2_s.data,
+                                               lw.shared_w2_s2, M, dim, shared_inter, main_stream_);
+            }
+
+            if (layer_id == 1) CUDA_CHECK(cudaEventRecord(s_moe_sub_ev[1], main_stream_));
+
+            if (cfg_.is_nemotron_bolt()) {
+                // ── Nemotron Bolt Batched LatentMoE Forward Pass ─────────────────────
+                int n_experts = cfg_.get_layer_n_routed_experts(layer_id);
+                int top_k = cfg_.get_layer_num_experts_per_tok(layer_id);
+                int moe_inter = cfg_.get_layer_moe_intermediate_size(layer_id);
+                int latent_dim = cfg_.moe_latent_size > 0 ? cfg_.moe_latent_size : 1024;
+                int total_moe_layers = 40;
+
+                if (n_experts > 0 && lw.gate_w.data) {
+                    gemm_bf16(buf_scores_bf16_batch_.bf16(), M, n_experts, dim,
+                              buf_hidden2_batch_.bf16(), lw.gate_w.bf16());
+
+                    moe_route_top6_from_bf16_batch_cuda(
+                        buf_topk_idx_batch_.i32(), buf_topk_vals_batch_.f32(),
+                        buf_scores_bf16_batch_.bf16(),
+                        lw.gate_bias.data ? lw.gate_bias.f32() : nullptr,
+                        M, n_experts, top_k, cfg_.routed_scaling_factor, main_stream_);
+
+                    moe_bin_tokens_cuda(buf_moe_offsets_.i32(), buf_moe_token_indices_.i32(), buf_moe_token_slots_.i32(),
+                                        buf_topk_idx_batch_.i32(), M * top_k, top_k, n_experts, main_stream_);
+
+                    // Latent Down-Projection: buf_hidden2_batch_ [M, 4096] -> buf_latent_down_batch_ [M, 1024]
+                    if (lw.fc1_latent_proj.dtype == "fp8") {
+                        gemm_fp8_scalar_scale_cublaslt(buf_latent_down_batch_.bf16(), buf_hidden2_batch_.bf16(),
+                                                       (const uint8_t*)lw.fc1_latent_proj.data, lw.fc1_scale_val,
+                                                       M, latent_dim, dim, 0.0f, main_stream_);
+                    } else {
+                        gemm_bf16(buf_latent_down_batch_.bf16(), M, latent_dim, dim,
+                                  buf_hidden2_batch_.bf16(), lw.fc1_latent_proj.bf16());
+                    }
+
+                    // Zero latent accumulation buffer: [M, latent_dim]
+                    CUDA_CHECK(cudaMemsetAsync(buf_latent_accum_batch_.data, 0,
+                                               (size_t)M * latent_dim * sizeof(__nv_bfloat16), main_stream_));
+
+                    const void* const* layer_ptrs = nullptr;
+                    if (layer_fully_resident_[moe_layer_idx]) {
+                        // Lookahead DRAM prefetch if needed (for 16GB mode: 18 layers in VRAM, 22 in DRAM)
+                        int vram_threshold = 18;
+                        if (dma_stream_ && moe_layer_idx >= (vram_threshold - NUM_DRAM_MOE_BUFFERS) && moe_layer_idx < vram_threshold) {
+                            int prefetch_layer = moe_layer_idx + NUM_DRAM_MOE_BUFFERS;
+                            int buf_idx = prefetch_layer - vram_threshold;
+                            prefetch_dram_layer_async(prefetch_layer, buf_idx);
+                        }
+                        layer_ptrs = (const void* const*)buf_all_expert_ptrs_.data + (size_t)moe_layer_idx * stride_exp;
+                    } else {
+                        int vram_threshold = 18;
+                        int buf_idx = (moe_layer_idx - vram_threshold) % NUM_DRAM_MOE_BUFFERS;
+                        if (dma_stream_) {
+                            CUDA_CHECK(cudaStreamWaitEvent(main_stream_, dma_ready_event_[buf_idx], 0));
+                        }
+                        layer_ptrs = (const void* const*)buf_dram_expert_ptrs_gpu_[buf_idx].data;
+                    }
+
+                    // Routed Up on latent down: [M, latent_dim] -> buf_moe_gate_batch_ [M * top_k, moe_inter]
+                    moe_nemotron_up_relu2_batch_cuda(
+                        buf_moe_gate_batch_.bf16(), buf_latent_down_batch_.bf16(),
+                        buf_topk_idx_batch_.i32(),
+                        buf_moe_offsets_.i32(), buf_moe_token_indices_.i32(), buf_moe_token_slots_.i32(),
+                        layer_ptrs,
+                        layer_scales,
+                        M, moe_inter, latent_dim, main_stream_, top_k, n_experts);
+
+                    // Routed Down onto latent accumulation buffer: [M * top_k, moe_inter] -> buf_latent_accum_batch_ [M, latent_dim]
+                    moe_nemotron_down_scaled_residual_batch_cuda(
+                        buf_latent_accum_batch_.bf16(), buf_moe_gate_batch_.bf16(),
+                        buf_topk_idx_batch_.i32(), buf_topk_vals_batch_.f32(),
+                        buf_moe_offsets_.i32(), buf_moe_token_indices_.i32(), buf_moe_token_slots_.i32(),
+                        layer_ptrs,
+                        layer_scales,
+                        M, latent_dim, moe_inter, main_stream_, top_k, n_experts);
+
+                    // If DRAM layer, trigger prefetch for next DRAM layer
+                    if (!layer_fully_resident_[moe_layer_idx] && dma_stream_) {
+                        int vram_threshold = 18;
+                        int buf_idx = (moe_layer_idx - vram_threshold) % NUM_DRAM_MOE_BUFFERS;
+                        CUDA_CHECK(cudaEventRecord(compute_done_event_[buf_idx], main_stream_));
+                        int next_layer = moe_layer_idx + NUM_DRAM_MOE_BUFFERS;
+                        if (next_layer < total_moe_layers) {
+                            CUDA_CHECK(cudaStreamWaitEvent(dma_stream_, compute_done_event_[buf_idx], 0));
+                            prefetch_dram_layer_async(next_layer, buf_idx);
+                        }
+                    }
+
+                    // Latent Up-Projection: buf_latent_accum_batch_ [M, 1024] -> residual add into buf_hidden_batch_ [M, 4096]
+                    if (lw.fc2_latent_proj.dtype == "fp8") {
+                        gemm_fp8_scalar_scale_cublaslt(buf_hidden_batch_.bf16(), buf_latent_accum_batch_.bf16(),
+                                                       (const uint8_t*)lw.fc2_latent_proj.data, lw.fc2_scale_val,
+                                                       M, dim, latent_dim, 1.0f, main_stream_);
+                    } else {
+                        gemm_bf16(buf_hidden2_batch_.bf16(), M, dim, latent_dim,
+                                  buf_latent_accum_batch_.bf16(), lw.fc2_latent_proj.bf16());
+                        vector_add_bf16_cuda(buf_hidden_batch_.bf16(), buf_hidden2_batch_.bf16(), M * dim, main_stream_);
+                    }
+                }
+                return;
+            }
+
+            // ── Nemotron Lightning Routed MoE ────────────────────────────────────────
             int n_experts = cfg_.n_routed_experts;
             int top_k = cfg_.num_experts_per_tok > 0 ? cfg_.num_experts_per_tok : 6;
             int moe_inter = cfg_.moe_intermediate_size > 0 ? cfg_.moe_intermediate_size : inter_size;
@@ -309,25 +542,8 @@
 
                 // Bin tokens into expert bins for accelerated batched execution
                 moe_bin_tokens_cuda(buf_moe_offsets_.i32(), buf_moe_token_indices_.i32(), buf_moe_token_slots_.i32(),
-                                    buf_topk_idx_batch_.i32(), M * top_k, main_stream_);
+                                    buf_topk_idx_batch_.i32(), M * top_k, top_k, n_experts, main_stream_);
             }
-
-            if (layer_id == 1) CUDA_CHECK(cudaEventRecord(s_moe_sub_ev[1], main_stream_));
-
-            // 2. Shared Expert: Run synchronously on main_stream_ with direct residual accumulation
-            // Running sequentially eliminates SM and memory bus contention on 36-SM GPUs.
-            bool has_shared = (lw.shared_w1_w.data && lw.shared_w2_w.data);
-            if (has_shared) {
-                int shared_inter = cfg_.moe_shared_expert_intermediate_size > 0 ? cfg_.moe_shared_expert_intermediate_size : 3712;
-                gemm_nvfp4_relu2_batch_cuda(buf_gate_batch_.bf16(), buf_hidden2_batch_.bf16(),
-                                            (const uint8_t*)lw.shared_w1_w.data, (const uint8_t*)lw.shared_w1_s.data,
-                                            lw.shared_w1_s2, M, shared_inter, dim, main_stream_);
-                gemm_nvfp4_residual_batch_cuda(buf_hidden_batch_.bf16(), buf_gate_batch_.bf16(),
-                                               (const uint8_t*)lw.shared_w2_w.data, (const uint8_t*)lw.shared_w2_s.data,
-                                               lw.shared_w2_s2, M, dim, shared_inter, main_stream_);
-            }
-
-            if (layer_id == 1) CUDA_CHECK(cudaEventRecord(s_moe_sub_ev[2], main_stream_));
 
             if (layer_fully_resident_[moe_layer_idx]) {
                 // Staged Lookahead Prefetch: Stream one DRAM layer at a time during late VRAM MoE layers (7..10)
@@ -340,7 +556,7 @@
 
                 // Routed Experts (Top-6, Squared ReLU, scaled residual)
                 if (cfg_.n_routed_experts > 0 && lw.gate_w.data) {
-                    const void* const* layer_ptrs = (const void* const*)buf_all_expert_ptrs_.data + (size_t)moe_layer_idx * 128;
+                    const void* const* layer_ptrs = (const void* const*)buf_all_expert_ptrs_.data + (size_t)moe_layer_idx * stride_exp;
 
                     moe_nemotron_up_relu2_batch_cuda(
                         buf_moe_gate_batch_.bf16(), buf_hidden2_batch_.bf16(),
@@ -348,7 +564,7 @@
                         buf_moe_offsets_.i32(), buf_moe_token_indices_.i32(), buf_moe_token_slots_.i32(),
                         layer_ptrs,
                         layer_scales,
-                        M, moe_inter, dim, main_stream_);
+                        M, moe_inter, dim, main_stream_, top_k, n_experts);
 
                     if (layer_id == 1) CUDA_CHECK(cudaEventRecord(s_moe_sub_ev[3], main_stream_));
 
@@ -358,7 +574,7 @@
                         buf_moe_offsets_.i32(), buf_moe_token_indices_.i32(), buf_moe_token_slots_.i32(),
                         layer_ptrs,
                         layer_scales,
-                        M, dim, moe_inter, main_stream_);
+                        M, dim, moe_inter, main_stream_, top_k, n_experts);
 
                     if (layer_id == 1) CUDA_CHECK(cudaEventRecord(s_moe_sub_ev[4], main_stream_));
                 }
@@ -384,7 +600,7 @@
                 buf_moe_offsets_.i32(), buf_moe_token_indices_.i32(), buf_moe_token_slots_.i32(),
                 layer_ptrs,
                 layer_scales,
-                M, moe_inter, dim, main_stream_);
+                M, moe_inter, dim, main_stream_, top_k, n_experts);
 
             moe_nemotron_down_scaled_residual_batch_cuda(
                 buf_hidden_batch_.bf16(), buf_moe_gate_batch_.bf16(),
@@ -392,7 +608,7 @@
                 buf_moe_offsets_.i32(), buf_moe_token_indices_.i32(), buf_moe_token_slots_.i32(),
                 layer_ptrs,
                 layer_scales,
-                M, dim, moe_inter, main_stream_);
+                M, dim, moe_inter, main_stream_, top_k, n_experts);
 
             // Signal compute done on buf_idx and trigger prefetch for next layer using this buffer (Lookahead = NUM_DRAM_MOE_BUFFERS)
             if (dma_stream_) {
@@ -436,11 +652,11 @@
         // 2. Process all layers with profiling
         cudaStreamSynchronize(main_stream_);
         auto t_layers_start = std::chrono::high_resolution_clock::now();
-        static cudaEvent_t s_layer_events[53] = {nullptr};
+        static cudaEvent_t s_layer_events[128] = {nullptr};
         static bool s_events_init = false;
         if (!s_events_init) {
             s_events_init = true;
-            for (int i = 0; i < 53; i++) {
+            for (int i = 0; i < 128; i++) {
                 CUDA_CHECK(cudaEventCreate(&s_layer_events[i]));
             }
         }
@@ -479,9 +695,20 @@
             }
         }
 
-        LOG_INFO("[NEMOTRON BREAKDOWN M=%d] Total: %.2f ms (%.1f tok/s) | SSM: %.2f ms | GQA: %.2f ms | VRAM MoE (11 layers): %.2f ms (%.2f ms/l) | DRAM MoE (12 layers): %.2f ms (%.2f ms/l)",
+        int n_vram_moe = 0, n_dram_moe = 0;
+        int n_moe_total = 0;
+        for (int i = 0; i < cfg_.num_hidden_layers; i++) {
+            if (cfg_.layer_types[i] == 2) {
+                if (layer_fully_resident_[n_moe_total]) n_vram_moe++;
+                else n_dram_moe++;
+                n_moe_total++;
+            }
+        }
+
+        LOG_INFO("[NEMOTRON BREAKDOWN M=%d] Total: %.2f ms (%.1f tok/s) | SSM: %.2f ms | GQA: %.2f ms | VRAM MoE (%d layers): %.2f ms (%.2f ms/l) | DRAM MoE (%d layers): %.2f ms (%.2f ms/l)",
                  M, total_layers_ms, (float)M / (total_layers_ms / 1000.0f),
-                 ms_ssm, ms_gqa, ms_vram_moe, ms_vram_moe / 11.0f, ms_dram_moe, ms_dram_moe / 12.0f);
+                 ms_ssm, ms_gqa, ms_vram_moe, n_vram_moe > 0 ? (ms_vram_moe / n_vram_moe) : 0.0f,
+                 n_dram_moe, ms_dram_moe, n_dram_moe > 0 ? (ms_dram_moe / n_dram_moe) : 0.0f);
 
         if (s_moe_sub_init) {
             float t_router = 0, t_shared = 0, t_up = 0, t_down = 0, t_end = 0;

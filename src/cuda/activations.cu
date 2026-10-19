@@ -6168,22 +6168,21 @@ void fused_moe_accum_6_cuda(
         accum, down_ptrs, w0, w1, w2, w3, w4, w5, dim);
 }
 
-// ── Fused 6-way MoE dynamic accumulation ─────────────────────────────────────
+// ── Fused MoE dynamic accumulation (supports arbitrary top_k, default 6) ─────
 __global__ void fused_moe_accum_dynamic_kernel(
     __nv_bfloat16* __restrict__ accum,
-    const __nv_bfloat16* __restrict__ down_buf, // [6 * dim]
-    const float* __restrict__ topk_weights,     // [6]
+    const __nv_bfloat16* __restrict__ down_buf, // [top_k * dim]
+    const float* __restrict__ topk_weights,     // [top_k]
     const __nv_bfloat16* __restrict__ shared_down, // [dim]
-    int dim)
+    int dim, int top_k)
 {
     int idx = blockIdx.x * blockDim.x + threadIdx.x;
     if (idx >= dim) return;
 
     float sum = shared_down ? __bfloat162float(shared_down[idx]) : 0.0f;
-    #pragma unroll
-    for (int k = 0; k < 6; k++) {
+    for (int k = 0; k < top_k; k++) {
         float w = topk_weights[k];
-        sum += __bfloat162float(down_buf[k * dim + idx]) * w;
+        sum += __bfloat162float(down_buf[(size_t)k * dim + idx]) * w;
     }
     accum[idx] = __float2bfloat16(sum);
 }
@@ -6194,14 +6193,15 @@ void fused_moe_accum_dynamic_cuda(
     const float* topk_weights,
     const __nv_bfloat16* shared_down,
     int dim,
+    int top_k,
     cudaStream_t stream)
 {
     int threads = 256;
     int blocks = (dim + threads - 1) / threads;
-    fused_moe_accum_dynamic_kernel<<<blocks, threads, 0, stream>>>(accum, down_buf, topk_weights, shared_down, dim);
+    fused_moe_accum_dynamic_kernel<<<blocks, threads, 0, stream>>>(accum, down_buf, topk_weights, shared_down, dim, top_k);
 }
 
-// ── GPU-Native MoE Top-6 Routing Kernel ───────────────────────────────────────
+// ── GPU-Native MoE Top-K Routing Kernel (supports up to 512 experts) ────────
 __global__ void moe_route_top6_from_bf16_kernel(
     int32_t* __restrict__ topk_ids,
     float* __restrict__ topk_weights,
@@ -6209,21 +6209,22 @@ __global__ void moe_route_top6_from_bf16_kernel(
     const float* __restrict__ gate_bias,
     int n_experts, int top_k, float routed_scaling_factor)
 {
-    __shared__ float s_probs[256];
-    __shared__ float s_scores[256];
-    __shared__ int   s_indices[256];
+    __shared__ float s_probs[512];
+    __shared__ float s_scores[512];
+    __shared__ int   s_indices[512];
 
     int tid = threadIdx.x;
-    if (tid < n_experts) {
-        float raw = __bfloat162float(scores_bf16[tid]);
+    for (int i = tid; i < n_experts; i += blockDim.x) {
+        float raw = __bfloat162float(scores_bf16[i]);
         float prob = (raw < -80.0f) ? 0.0f : ((raw > 80.0f) ? 1.0f : (1.0f / (1.0f + __expf(-raw))));
-        s_probs[tid] = prob;
-        s_scores[tid] = prob + (gate_bias ? gate_bias[tid] : 0.0f);
-        s_indices[tid] = tid;
-    } else {
-        s_probs[tid] = 0.0f;
-        s_scores[tid] = -1e38f;
-        s_indices[tid] = -1;
+        s_probs[i] = prob;
+        s_scores[i] = prob + (gate_bias ? gate_bias[i] : 0.0f);
+        s_indices[i] = i;
+    }
+    for (int i = n_experts + tid; i < 512; i += blockDim.x) {
+        s_probs[i] = 0.0f;
+        s_scores[i] = -1e38f;
+        s_indices[i] = -1;
     }
     __syncthreads();
 
@@ -6263,7 +6264,8 @@ void moe_route_top6_from_bf16_cuda(
     int n_experts, int top_k, float routed_scaling_factor,
     cudaStream_t stream)
 {
-    moe_route_top6_from_bf16_kernel<<<1, 256, 0, stream>>>(
+    int threads = (n_experts > 256) ? 512 : 256;
+    moe_route_top6_from_bf16_kernel<<<1, threads, 0, stream>>>(
         topk_ids, topk_weights, scores_bf16, gate_bias, n_experts, top_k, routed_scaling_factor);
 }
 
@@ -10413,9 +10415,9 @@ __global__ void moe_route_top6_from_bf16_batch_kernel(
     const float* __restrict__ gate_bias,
     int n_experts, int top_k, float routed_scaling_factor)
 {
-    __shared__ float s_probs[256];
-    __shared__ float s_scores[256];
-    __shared__ int   s_indices[256];
+    __shared__ float s_probs[512];
+    __shared__ float s_scores[512];
+    __shared__ int   s_indices[512];
 
     int t = blockIdx.x;
     int tid = threadIdx.x;
@@ -10424,16 +10426,17 @@ __global__ void moe_route_top6_from_bf16_batch_kernel(
     int32_t* tok_ids = topk_ids + (size_t)t * top_k;
     float* tok_weights = topk_weights + (size_t)t * top_k;
 
-    if (tid < n_experts) {
-        float raw = __bfloat162float(tok_scores[tid]);
+    for (int i = tid; i < n_experts; i += blockDim.x) {
+        float raw = __bfloat162float(tok_scores[i]);
         float prob = (raw < -80.0f) ? 0.0f : ((raw > 80.0f) ? 1.0f : (1.0f / (1.0f + __expf(-raw))));
-        s_probs[tid] = prob;
-        s_scores[tid] = prob + (gate_bias ? gate_bias[tid] : 0.0f);
-        s_indices[tid] = tid;
-    } else {
-        s_probs[tid] = 0.0f;
-        s_scores[tid] = -1e38f;
-        s_indices[tid] = -1;
+        s_probs[i] = prob;
+        s_scores[i] = prob + (gate_bias ? gate_bias[i] : 0.0f);
+        s_indices[i] = i;
+    }
+    for (int i = n_experts + tid; i < 512; i += blockDim.x) {
+        s_probs[i] = 0.0f;
+        s_scores[i] = -1e38f;
+        s_indices[i] = -1;
     }
     __syncthreads();
 
@@ -10473,7 +10476,9 @@ void moe_route_top6_from_bf16_batch_cuda(
     int M, int n_experts, int top_k, float routed_scaling_factor,
     cudaStream_t stream)
 {
-    moe_route_top6_from_bf16_batch_kernel<<<M, 256, 0, stream>>>(
+    if (M <= 0) return;
+    int threads = (n_experts > 256) ? 512 : 256;
+    moe_route_top6_from_bf16_batch_kernel<<<M, threads, 0, stream>>>(
         topk_ids, topk_weights, scores_bf16, gate_bias, n_experts, top_k, routed_scaling_factor);
 }
 
@@ -12623,7 +12628,8 @@ __global__ void mamba2_nemotron_conv_kernel(
     const __nv_bfloat16* __restrict__ conv1d_w,
     const __nv_bfloat16* __restrict__ conv1d_b,
     __nv_bfloat16* __restrict__ conv_state,
-    int channels)
+    int channels,
+    int in_proj_offset = 0)
 {
     int c = blockIdx.x * blockDim.x + threadIdx.x;
     if (c >= channels) return;
@@ -12634,7 +12640,7 @@ __global__ void mamba2_nemotron_conv_kernel(
     float s0 = __bfloat162float(cs[1]);
     float s1 = __bfloat162float(cs[2]);
     float s2 = __bfloat162float(cs[3]);
-    float s3 = __bfloat162float(in_proj[4096 + c]);
+    float s3 = __bfloat162float(in_proj[in_proj_offset + c]);
 
     cs[0] = __float2bfloat16(s0);
     cs[1] = __float2bfloat16(s1);
@@ -12659,10 +12665,11 @@ __global__ void mamba2_nemotron_ssm_step_kernel(
     const __nv_bfloat16* __restrict__ A_log,
     const __nv_bfloat16* __restrict__ D,
     const __nv_bfloat16* __restrict__ dt_bias,
-    float* __restrict__ ssm_state)
+    float* __restrict__ ssm_state,
+    int num_heads, int intermediate_size, int dt_offset)
 {
     int h = blockIdx.x;
-    if (h >= 64) return;
+    if (h >= num_heads) return;
 
     int p = threadIdx.x;
 
@@ -12672,14 +12679,15 @@ __global__ void mamba2_nemotron_ssm_step_kernel(
     __shared__ float s_dA;
     __shared__ float s_D;
 
-    int group = h / 8;
-    s_B[p] = __bfloat162float(conv_out[4096 + group * 128 + p]);
-    s_B[p + 64] = __bfloat162float(conv_out[4096 + group * 128 + p + 64]);
-    s_C[p] = __bfloat162float(conv_out[5120 + group * 128 + p]);
-    s_C[p + 64] = __bfloat162float(conv_out[5120 + group * 128 + p + 64]);
+    int heads_per_group = num_heads / 8;
+    int group = h / heads_per_group;
+    s_B[p] = __bfloat162float(conv_out[intermediate_size + group * 128 + p]);
+    s_B[p + 64] = __bfloat162float(conv_out[intermediate_size + group * 128 + p + 64]);
+    s_C[p] = __bfloat162float(conv_out[intermediate_size + 1024 + group * 128 + p]);
+    s_C[p + 64] = __bfloat162float(conv_out[intermediate_size + 1024 + group * 128 + p + 64]);
 
     if (p == 0) {
-        float raw_dt = __bfloat162float(in_proj[10240 + h]) + (dt_bias ? __bfloat162float(dt_bias[h]) : 0.0f);
+        float raw_dt = __bfloat162float(in_proj[dt_offset + h]) + (dt_bias ? __bfloat162float(dt_bias[h]) : 0.0f);
         float dt_val = (raw_dt > 20.0f) ? raw_dt : ((raw_dt < -20.0f) ? __expf(raw_dt) : log1pf(__expf(raw_dt)));
         s_dt_val = dt_val;
         float a_log = __bfloat162float(A_log[h]);
@@ -12713,17 +12721,20 @@ __global__ void mamba2_nemotron_group_norm_kernel(
     __nv_bfloat16* __restrict__ ssm_out,
     const float* __restrict__ temp_out,
     const __nv_bfloat16* __restrict__ norm_w,
-    float eps)
+    float eps,
+    int group_size)
 {
     int g = blockIdx.x;
     if (g >= 8) return;
 
     int tid = threadIdx.x;
-    const float* g_in = temp_out + g * 512;
+    const float* g_in = temp_out + g * group_size;
 
-    float v0 = g_in[tid];
-    float v1 = g_in[tid + 256];
-    float sum_sq = v0 * v0 + v1 * v1;
+    float sum_sq = 0.0f;
+    for (int i = tid; i < group_size; i += blockDim.x) {
+        float v = g_in[i];
+        sum_sq += v * v;
+    }
 
     #pragma unroll
     for (int offset = 16; offset > 0; offset /= 2) {
@@ -12740,20 +12751,18 @@ __global__ void mamba2_nemotron_group_norm_kernel(
         float total_sq = 0.0f;
         #pragma unroll
         for (int w = 0; w < 8; w++) total_sq += s_warp_sums[w];
-        float var = total_sq / 512.0f;
+        float var = total_sq / (float)group_size;
         s_warp_sums[0] = rsqrtf(var + eps);
     }
     __syncthreads();
 
     float rscale = s_warp_sums[0];
-    int idx0 = g * 512 + tid;
-    int idx1 = g * 512 + tid + 256;
-
-    float w0 = norm_w ? __bfloat162float(norm_w[idx0]) : 1.0f;
-    float w1 = norm_w ? __bfloat162float(norm_w[idx1]) : 1.0f;
-
-    ssm_out[idx0] = __float2bfloat16(v0 * rscale * w0);
-    ssm_out[idx1] = __float2bfloat16(v1 * rscale * w1);
+    for (int i = tid; i < group_size; i += blockDim.x) {
+        int idx = g * group_size + i;
+        float v = g_in[i];
+        float w = norm_w ? __bfloat162float(norm_w[idx]) : 1.0f;
+        ssm_out[idx] = __float2bfloat16(v * rscale * w);
+    }
 }
 
 void mamba2_nemotron_step_cuda(
@@ -12770,16 +12779,24 @@ void mamba2_nemotron_step_cuda(
     __nv_bfloat16* conv_buf,
     float* temp_out,
     float rms_norm_eps,
-    cudaStream_t stream)
+    cudaStream_t stream,
+    int num_heads,
+    int head_dim)
 {
-    mamba2_nemotron_conv_kernel<<<24, 256, 0, stream>>>(
-        conv_buf, in_proj, conv1d_w, conv1d_b, conv_state, 6144);
+    int intermediate_size = num_heads * head_dim;
+    int conv_channels = intermediate_size + 2048; // 2 * 8 * 128
+    int dt_offset = intermediate_size + conv_channels;
+    int group_size = intermediate_size / 8;
 
-    mamba2_nemotron_ssm_step_kernel<<<64, 64, 0, stream>>>(
-        temp_out, conv_buf, in_proj, A_log, D, dt_bias, ssm_state);
+    int conv_blocks = (conv_channels + 255) / 256;
+    mamba2_nemotron_conv_kernel<<<conv_blocks, 256, 0, stream>>>(
+        conv_buf, in_proj, conv1d_w, conv1d_b, conv_state, conv_channels, intermediate_size);
+
+    mamba2_nemotron_ssm_step_kernel<<<num_heads, 64, 0, stream>>>(
+        temp_out, conv_buf, in_proj, A_log, D, dt_bias, ssm_state, num_heads, intermediate_size, dt_offset);
 
     mamba2_nemotron_group_norm_kernel<<<8, 256, 0, stream>>>(
-        ssm_out, temp_out, norm_w, rms_norm_eps);
+        ssm_out, temp_out, norm_w, rms_norm_eps, group_size);
 }
 
 __global__ void mamba2_nemotron_conv_batch_kernel(
@@ -12788,7 +12805,7 @@ __global__ void mamba2_nemotron_conv_batch_kernel(
     const __nv_bfloat16* __restrict__ conv1d_w,
     const __nv_bfloat16* __restrict__ conv1d_b,
     __nv_bfloat16* __restrict__ conv_state,
-    int channels, int M)
+    int channels, int in_proj_stride, int in_proj_offset, int M)
 {
     int c = blockIdx.x * blockDim.x + threadIdx.x;
     if (c >= channels) return;
@@ -12808,15 +12825,15 @@ __global__ void mamba2_nemotron_conv_batch_kernel(
     float b  = conv1d_b ? __bfloat162float(conv1d_b[c]) : 0.0f;
 
     for (int m = 0; m < M; m++) {
-        const __nv_bfloat16* in_p = in_proj_batch + (size_t)m * 10304;
+        const __nv_bfloat16* in_p = in_proj_batch + (size_t)m * in_proj_stride;
         s0 = s1;
         s1 = s2;
         s2 = s3;
-        s3 = __bfloat162float(in_p[4096 + c]);
+        s3 = __bfloat162float(in_p[in_proj_offset + c]);
 
         float val = s0 * w0 + s1 * w1 + s2 * w2 + s3 * w3 + b;
         float silu_val = val / (1.0f + __expf(-val));
-        conv_out_batch[(size_t)m * 6144 + c] = __float2bfloat16(silu_val);
+        conv_out_batch[(size_t)m * channels + c] = __float2bfloat16(silu_val);
     }
 
     cs[0] = __float2bfloat16(s0);
@@ -12833,10 +12850,10 @@ __global__ void mamba2_nemotron_ssm_step_batch_kernel(
     const __nv_bfloat16* __restrict__ D,
     const __nv_bfloat16* __restrict__ dt_bias,
     float* __restrict__ ssm_state,
-    int M)
+    int num_heads, int intermediate_size, int conv_channels, int in_proj_stride, int dt_offset, int M)
 {
     int h = blockIdx.x;
-    if (h >= 64) return;
+    if (h >= num_heads) return;
 
     int p = threadIdx.x;
 
@@ -12847,7 +12864,8 @@ __global__ void mamba2_nemotron_ssm_step_batch_kernel(
     __shared__ float s_D;
 
     float* state_row = ssm_state + (size_t)(h * 64 + p) * 128;
-    int group = h / 8;
+    int heads_per_group = num_heads / 8;
+    int group = h / heads_per_group;
 
     float r_state[128];
     #pragma unroll
@@ -12856,17 +12874,17 @@ __global__ void mamba2_nemotron_ssm_step_batch_kernel(
     }
 
     for (int m = 0; m < M; m++) {
-        const __nv_bfloat16* conv_out = conv_out_batch + (size_t)m * 6144;
-        const __nv_bfloat16* in_proj = in_proj_batch + (size_t)m * 10304;
-        float* temp_out = temp_out_batch + (size_t)m * 4096;
+        const __nv_bfloat16* conv_out = conv_out_batch + (size_t)m * conv_channels;
+        const __nv_bfloat16* in_proj = in_proj_batch + (size_t)m * in_proj_stride;
+        float* temp_out = temp_out_batch + (size_t)m * intermediate_size;
 
-        s_B[p] = __bfloat162float(conv_out[4096 + group * 128 + p]);
-        s_B[p + 64] = __bfloat162float(conv_out[4096 + group * 128 + p + 64]);
-        s_C[p] = __bfloat162float(conv_out[5120 + group * 128 + p]);
-        s_C[p + 64] = __bfloat162float(conv_out[5120 + group * 128 + p + 64]);
+        s_B[p] = __bfloat162float(conv_out[intermediate_size + group * 128 + p]);
+        s_B[p + 64] = __bfloat162float(conv_out[intermediate_size + group * 128 + p + 64]);
+        s_C[p] = __bfloat162float(conv_out[intermediate_size + 1024 + group * 128 + p]);
+        s_C[p + 64] = __bfloat162float(conv_out[intermediate_size + 1024 + group * 128 + p + 64]);
 
         if (p == 0) {
-            float raw_dt = __bfloat162float(in_proj[10240 + h]) + (dt_bias ? __bfloat162float(dt_bias[h]) : 0.0f);
+            float raw_dt = __bfloat162float(in_proj[dt_offset + h]) + (dt_bias ? __bfloat162float(dt_bias[h]) : 0.0f);
             float dt_val = (raw_dt > 20.0f) ? raw_dt : ((raw_dt < -20.0f) ? __expf(raw_dt) : log1pf(__expf(raw_dt)));
             s_dt_val = dt_val;
             float a_log = __bfloat162float(A_log[h]);
@@ -12904,6 +12922,7 @@ __global__ void mamba2_nemotron_group_norm_batch_kernel(
     __nv_bfloat16* __restrict__ ssm_out_batch,
     const float* __restrict__ temp_out_batch,
     const __nv_bfloat16* __restrict__ norm_w,
+    int intermediate_size, int group_size,
     int M, float eps)
 {
     int g = blockIdx.x;
@@ -12911,11 +12930,13 @@ __global__ void mamba2_nemotron_group_norm_batch_kernel(
     if (g >= 8 || m >= M) return;
 
     int tid = threadIdx.x;
-    const float* g_in = temp_out_batch + (size_t)m * 4096 + g * 512;
+    const float* g_in = temp_out_batch + (size_t)m * intermediate_size + g * group_size;
 
-    float v0 = g_in[tid];
-    float v1 = g_in[tid + 256];
-    float sum_sq = v0 * v0 + v1 * v1;
+    float sum_sq = 0.0f;
+    for (int i = tid; i < group_size; i += blockDim.x) {
+        float v = g_in[i];
+        sum_sq += v * v;
+    }
 
     #pragma unroll
     for (int offset = 16; offset > 0; offset /= 2) {
@@ -12932,20 +12953,18 @@ __global__ void mamba2_nemotron_group_norm_batch_kernel(
         float total_sq = 0.0f;
         #pragma unroll
         for (int w = 0; w < 8; w++) total_sq += s_warp_sums[w];
-        float var = total_sq / 512.0f;
+        float var = total_sq / (float)group_size;
         s_warp_sums[0] = rsqrtf(var + eps);
     }
     __syncthreads();
 
     float rscale = s_warp_sums[0];
-    int idx0 = g * 512 + tid;
-    int idx1 = g * 512 + tid + 256;
-
-    float w0 = norm_w ? __bfloat162float(norm_w[idx0]) : 1.0f;
-    float w1 = norm_w ? __bfloat162float(norm_w[idx1]) : 1.0f;
-
-    ssm_out_batch[(size_t)m * 4096 + idx0] = __float2bfloat16(v0 * rscale * w0);
-    ssm_out_batch[(size_t)m * 4096 + idx1] = __float2bfloat16(v1 * rscale * w1);
+    for (int i = tid; i < group_size; i += blockDim.x) {
+        int idx = g * group_size + i;
+        float v = g_in[i];
+        float w = norm_w ? __bfloat162float(norm_w[idx]) : 1.0f;
+        ssm_out_batch[(size_t)m * intermediate_size + idx] = __float2bfloat16(v * rscale * w);
+    }
 }
 
 void mamba2_nemotron_step_batch_cuda(
@@ -12963,17 +12982,27 @@ void mamba2_nemotron_step_batch_cuda(
     float* temp_out_batch,
     int M,
     float rms_norm_eps,
-    cudaStream_t stream)
+    cudaStream_t stream,
+    int num_heads,
+    int head_dim)
 {
-    mamba2_nemotron_conv_batch_kernel<<<24, 256, 0, stream>>>(
-        conv_buf_batch, in_proj_batch, conv1d_w, conv1d_b, conv_state, 6144, M);
+    int intermediate_size = num_heads * head_dim;
+    int conv_channels = intermediate_size + 2048; // 2 * 8 * 128
+    int in_proj_stride = intermediate_size + conv_channels + num_heads; // 10304 or 18568
+    int dt_offset = intermediate_size + conv_channels;
+    int group_size = intermediate_size / 8;
 
-    mamba2_nemotron_ssm_step_batch_kernel<<<64, 64, 0, stream>>>(
-        temp_out_batch, conv_buf_batch, in_proj_batch, A_log, D, dt_bias, ssm_state, M);
+    int conv_blocks = (conv_channels + 255) / 256;
+    mamba2_nemotron_conv_batch_kernel<<<conv_blocks, 256, 0, stream>>>(
+        conv_buf_batch, in_proj_batch, conv1d_w, conv1d_b, conv_state, conv_channels, in_proj_stride, intermediate_size, M);
+
+    mamba2_nemotron_ssm_step_batch_kernel<<<num_heads, 64, 0, stream>>>(
+        temp_out_batch, conv_buf_batch, in_proj_batch, A_log, D, dt_bias, ssm_state,
+        num_heads, intermediate_size, conv_channels, in_proj_stride, dt_offset, M);
 
     dim3 grid_norm(8, M);
     mamba2_nemotron_group_norm_batch_kernel<<<grid_norm, 256, 0, stream>>>(
-        ssm_out_batch, temp_out_batch, norm_w, M, rms_norm_eps);
+        ssm_out_batch, temp_out_batch, norm_w, intermediate_size, group_size, M, rms_norm_eps);
 }
 
 // ════════════════════════════════════════════════════════════════════════════════
@@ -13205,18 +13234,20 @@ __global__ void moe_nemotron_up_relu2_batch_kernel(
     const int32_t* __restrict__ topk_ids,
     const void* const* __restrict__ expert_ptrs,
     const float* __restrict__ expert_scales,
-    int M, int N, int K)
+    int M, int N, int K,
+    int top_k = 6,
+    int n_experts = 128)
 {
     int row = blockIdx.x * blockDim.y + threadIdx.y;
     int k = blockIdx.y;
     int m = blockIdx.z;
 
-    if (row >= N || k >= 6 || m >= M) return;
+    if (row >= N || k >= top_k || m >= M) return;
 
-    size_t out_idx = ((size_t)m * 6 + k) * N + row;
-    int eid = topk_ids[m * 6 + k];
+    size_t out_idx = ((size_t)m * top_k + k) * N + row;
+    int eid = topk_ids[m * top_k + k];
 
-    if (eid < 0 || eid >= 128 || !expert_ptrs || !expert_ptrs[eid]) {
+    if (eid < 0 || eid >= n_experts || !expert_ptrs || !expert_ptrs[eid]) {
         if (threadIdx.x == 0) {
             gate_out[out_idx] = __float2bfloat16(0.0f);
         }
@@ -13225,7 +13256,7 @@ __global__ void moe_nemotron_up_relu2_batch_kernel(
 
     const uint8_t* exp_ptr = (const uint8_t*)expert_ptrs[eid];
     const uint8_t* up_w = exp_ptr;
-    const uint8_t* up_s = exp_ptr + 2494464;
+    const uint8_t* up_s = exp_ptr + (size_t)N * (K / 2);
     float scale_2 = expert_scales ? expert_scales[eid * 2 + 0] : 1.0f;
 
     int lane = threadIdx.x; // 0..31
@@ -13284,7 +13315,9 @@ __global__ void moe_nemotron_down_scaled_residual_batch_kernel(
     const float* __restrict__ topk_weights,
     const void* const* __restrict__ expert_ptrs,
     const float* __restrict__ expert_scales,
-    int M, int N, int K)
+    int M, int N, int K,
+    int top_k = 6,
+    int n_experts = 128)
 {
     int row = blockIdx.x * blockDim.y + threadIdx.y;
     int m = blockIdx.y;
@@ -13294,24 +13327,28 @@ __global__ void moe_nemotron_down_scaled_residual_batch_kernel(
     int lane = threadIdx.x; // 0..31
     int num_groups = K / 16;
 
+    size_t up_w_bytes = (size_t)K * (N / 2);
+    size_t up_s_bytes = (size_t)K * (N / 16);
+    size_t down_w_bytes = (size_t)N * (K / 2);
+
     float total_down_acc = 0.0f;
 
-    for (int k = 0; k < 6; k++) {
-        int eid = topk_ids[m * 6 + k];
-        float weight = topk_weights[m * 6 + k];
-        if (eid < 0 || eid >= 128 || weight == 0.0f || !expert_ptrs) continue;
+    for (int k = 0; k < top_k; k++) {
+        int eid = topk_ids[m * top_k + k];
+        float weight = topk_weights[m * top_k + k];
+        if (eid < 0 || eid >= n_experts || weight == 0.0f || !expert_ptrs) continue;
 
         const void* ptr = expert_ptrs[eid];
         if (!ptr) continue;
 
         const uint8_t* exp_ptr = (const uint8_t*)ptr;
-        const uint8_t* down_w = exp_ptr + 2806288;
-        const uint8_t* down_s = exp_ptr + 5300752;
+        const uint8_t* down_w = exp_ptr + up_w_bytes + up_s_bytes;
+        const uint8_t* down_s = down_w + down_w_bytes;
         float scale_2 = expert_scales ? expert_scales[eid * 2 + 1] : 1.0f;
 
         const uint8_t* row_w = down_w + (size_t)row * (K / 2);
         const uint8_t* row_s = down_s + (size_t)row * num_groups;
-        const __nv_bfloat16* vec = gate_in + ((size_t)m * 6 + k) * K;
+        const __nv_bfloat16* vec = gate_in + ((size_t)m * top_k + k) * K;
 
         float acc = 0.0f;
 
@@ -13361,36 +13398,40 @@ __global__ void moe_nemotron_down_scaled_residual_batch_kernel(
 }
 
 __global__ void moe_bin_tokens_kernel(
-    int32_t* __restrict__ expert_offsets,       // [129]
+    int32_t* __restrict__ expert_offsets,       // [n_experts + 1]
     int32_t* __restrict__ expert_token_indices, // [total_selections]
     int32_t* __restrict__ expert_token_slots,   // [total_selections]
     const int32_t* __restrict__ topk_ids,       // [total_selections]
-    int total_selections)
+    int total_selections,
+    int top_k,
+    int n_experts)
 {
-    __shared__ int counts[128];
-    __shared__ int offsets[129];
-    __shared__ int cur_pos[128];
+    __shared__ int counts[512];
+    __shared__ int offsets[513];
+    __shared__ int cur_pos[512];
 
-    int tid = threadIdx.x; // 0..127
+    int tid = threadIdx.x;
 
     // 1. Initialize counts
-    counts[tid] = 0;
+    for (int i = tid; i < n_experts; i += blockDim.x) {
+        counts[i] = 0;
+    }
     __syncthreads();
 
     // 2. Count selections per expert
-    for (int i = tid; i < total_selections; i += 128) {
+    for (int i = tid; i < total_selections; i += blockDim.x) {
         int eid = topk_ids[i];
-        if (eid >= 0 && eid < 128) {
+        if (eid >= 0 && eid < n_experts) {
             atomicAdd(&counts[eid], 1);
         }
     }
     __syncthreads();
 
-    // 3. Single thread prefix sum for 128 counts
+    // 3. Single thread prefix sum
     if (tid == 0) {
         int sum = 0;
         offsets[0] = 0;
-        for (int e = 0; e < 128; e++) {
+        for (int e = 0; e < n_experts; e++) {
             sum += counts[e];
             offsets[e + 1] = sum;
             cur_pos[e] = offsets[e];
@@ -13399,18 +13440,17 @@ __global__ void moe_bin_tokens_kernel(
     __syncthreads();
 
     // Write expert_offsets to global memory
-    expert_offsets[tid] = offsets[tid];
-    if (tid == 0) {
-        expert_offsets[128] = offsets[128];
+    for (int i = tid; i <= n_experts; i += blockDim.x) {
+        expert_offsets[i] = offsets[i];
     }
 
     // 4. Scatter token and slot indices into contiguous expert bins
-    for (int i = tid; i < total_selections; i += 128) {
+    for (int i = tid; i < total_selections; i += blockDim.x) {
         int eid = topk_ids[i];
-        if (eid >= 0 && eid < 128) {
+        if (eid >= 0 && eid < n_experts) {
             int pos = atomicAdd(&cur_pos[eid], 1);
-            expert_token_indices[pos] = i / 6;
-            expert_token_slots[pos] = i % 6;
+            expert_token_indices[pos] = i / top_k;
+            expert_token_slots[pos] = i % top_k;
         }
     }
 }
@@ -13421,10 +13461,13 @@ void moe_bin_tokens_cuda(
     int32_t* expert_token_slots,
     const int32_t* topk_ids,
     int total_selections,
+    int top_k,
+    int n_experts,
     cudaStream_t stream)
 {
-    moe_bin_tokens_kernel<<<1, 128, 0, stream>>>(
-        expert_offsets, expert_token_indices, expert_token_slots, topk_ids, total_selections);
+    int threads = (n_experts > 256) ? 512 : ((n_experts > 128) ? 256 : 128);
+    moe_bin_tokens_kernel<<<1, threads, 0, stream>>>(
+        expert_offsets, expert_token_indices, expert_token_slots, topk_ids, total_selections, top_k, n_experts);
 }
 
 __launch_bounds__(256)
@@ -13436,12 +13479,14 @@ __global__ void moe_nemotron_binned_up_relu2_batch_kernel(
     const int32_t* __restrict__ expert_token_slots,
     const void* const* __restrict__ expert_ptrs,
     const float* expert_scales,
-    int M, int N, int K)
+    int M, int N, int K,
+    int top_k = 6,
+    int n_experts = 128)
 {
     int row = blockIdx.x * blockDim.y + threadIdx.y;
-    int eid = blockIdx.y; // 0..127
+    int eid = blockIdx.y;
 
-    if (row >= N || eid >= 128) return;
+    if (row >= N || eid >= n_experts) return;
 
     int start_idx = expert_offsets[eid];
     int end_idx = expert_offsets[eid + 1];
@@ -13452,7 +13497,7 @@ __global__ void moe_nemotron_binned_up_relu2_batch_kernel(
 
     const uint8_t* exp_ptr = (const uint8_t*)expert_ptrs[eid];
     const uint8_t* up_w = exp_ptr;
-    const uint8_t* up_s = exp_ptr + 2494464;
+    const uint8_t* up_s = exp_ptr + (size_t)N * (K / 2);
     float scale_2 = expert_scales ? expert_scales[eid * 2 + 0] : 1.0f;
 
     int lane = threadIdx.x; // 0..31
@@ -13524,7 +13569,7 @@ __global__ void moe_nemotron_binned_up_relu2_batch_kernel(
                 int k = expert_token_slots[start_idx + t_base + i];
                 float r = acc[i] * scale_2;
                 float r2 = (r > 0.0f) ? (r * r) : 0.0f;
-                gate_out[((size_t)m * 6 + k) * N + row] = __float2bfloat16(r2);
+                gate_out[((size_t)m * top_k + k) * N + row] = __float2bfloat16(r2);
             }
         }
     }
@@ -13540,14 +13585,16 @@ __global__ void moe_nemotron_binned_down_scaled_residual_batch_kernel(
     const int32_t* __restrict__ expert_token_slots,
     const void* const* __restrict__ expert_ptrs,
     const float* expert_scales,
-    int M, int N, int K)
+    int M, int N, int K,
+    int top_k = 6,
+    int n_experts = 128)
 {
     int r = blockIdx.x * blockDim.y + threadIdx.y;
     int row0 = r * 2;
     int row1 = row0 + 1;
-    int eid = blockIdx.y; // 0..127
+    int eid = blockIdx.y;
 
-    if (row0 >= N || eid >= 128) return;
+    if (row0 >= N || eid >= n_experts) return;
 
     int start_idx = expert_offsets[eid];
     int end_idx = expert_offsets[eid + 1];
@@ -13556,9 +13603,13 @@ __global__ void moe_nemotron_binned_down_scaled_residual_batch_kernel(
     if (num_toks <= 0) return;
     if (!expert_ptrs || !expert_ptrs[eid]) return;
 
+    size_t up_w_bytes = (size_t)K * (N / 2);
+    size_t up_s_bytes = (size_t)K * (N / 16);
+    size_t down_w_bytes = (size_t)N * (K / 2);
+
     const uint8_t* exp_ptr = (const uint8_t*)expert_ptrs[eid];
-    const uint8_t* down_w = exp_ptr + 2806288;
-    const uint8_t* down_s = exp_ptr + 5300752;
+    const uint8_t* down_w = exp_ptr + up_w_bytes + up_s_bytes;
+    const uint8_t* down_s = down_w + down_w_bytes;
     float scale_2 = expert_scales ? expert_scales[eid * 2 + 1] : 1.0f;
 
     int lane = threadIdx.x; // 0..31
@@ -13582,9 +13633,9 @@ __global__ void moe_nemotron_binned_down_scaled_residual_batch_kernel(
                 int m = expert_token_indices[start_idx + t_base + i];
                 int k = expert_token_slots[start_idx + t_base + i];
                 tok_m[i] = m;
-                float w = topk_weights ? topk_weights[m * 6 + k] : 1.0f;
+                float w = topk_weights ? topk_weights[m * top_k + k] : 1.0f;
                 scaled_weights[i] = w * scale_2;
-                vecs[i] = gate_in + ((size_t)m * 6 + k) * K;
+                vecs[i] = gate_in + ((size_t)m * top_k + k) * K;
             } else {
                 scaled_weights[i] = 0.0f;
                 tok_m[i] = 0;
@@ -13695,19 +13746,21 @@ void moe_nemotron_up_relu2_batch_cuda(
     const void* const* expert_ptrs,
     const float* expert_scales,
     int M, int N, int K,
-    cudaStream_t stream)
+    cudaStream_t stream,
+    int top_k,
+    int n_experts)
 {
     if (M > 1 && expert_offsets != nullptr) {
         dim3 threads(32, 4);
-        dim3 blocks((N + 3) / 4, 128);
+        dim3 blocks((N + 3) / 4, n_experts);
         moe_nemotron_binned_up_relu2_batch_kernel<<<blocks, threads, 0, stream>>>(
             gate_out, hidden_in, expert_offsets, expert_token_indices, expert_token_slots,
-            expert_ptrs, expert_scales, M, N, K);
+            expert_ptrs, expert_scales, M, N, K, top_k, n_experts);
     } else {
         dim3 threads(32, 4);
-        dim3 blocks((N + 3) / 4, 6, 1);
+        dim3 blocks((N + 3) / 4, top_k, M);
         moe_nemotron_up_relu2_batch_kernel<<<blocks, threads, 0, stream>>>(
-            gate_out, hidden_in, topk_ids, expert_ptrs, expert_scales, 1, N, K);
+            gate_out, hidden_in, topk_ids, expert_ptrs, expert_scales, M, N, K, top_k, n_experts);
     }
 }
 
@@ -13722,19 +13775,21 @@ void moe_nemotron_down_scaled_residual_batch_cuda(
     const void* const* expert_ptrs,
     const float* expert_scales,
     int M, int N, int K,
-    cudaStream_t stream)
+    cudaStream_t stream,
+    int top_k,
+    int n_experts)
 {
     if (M > 1 && expert_offsets != nullptr) {
         dim3 threads(32, 4);
-        dim3 blocks(((N / 2) + 3) / 4, 128);
+        dim3 blocks(((N / 2) + 3) / 4, n_experts);
         moe_nemotron_binned_down_scaled_residual_batch_kernel<<<blocks, threads, 0, stream>>>(
             hidden_out, gate_in, topk_weights, expert_offsets, expert_token_indices, expert_token_slots,
-            expert_ptrs, expert_scales, M, N, K);
+            expert_ptrs, expert_scales, M, N, K, top_k, n_experts);
     } else {
         dim3 threads(32, 4);
         dim3 blocks((N + 3) / 4, M);
         moe_nemotron_down_scaled_residual_batch_kernel<<<blocks, threads, 0, stream>>>(
-            hidden_out, gate_in, topk_ids, topk_weights, expert_ptrs, expert_scales, M, N, K);
+            hidden_out, gate_in, topk_ids, topk_weights, expert_ptrs, expert_scales, M, N, K, top_k, n_experts);
     }
 }
 

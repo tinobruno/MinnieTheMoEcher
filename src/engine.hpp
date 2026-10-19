@@ -144,17 +144,24 @@ public:
 
     void refresh_resident_pointers() {
         if (cfg_.is_nemotron() && buf_all_expert_ptrs_.data) {
-            std::vector<void*> h_all_ptrs(23 * 128, nullptr);
-            for (int l = 0; l < 23; l++) {
+            int total_moe_layers = 0;
+            for (auto t : cfg_.layer_types) if (t == 2) total_moe_layers++;
+            if (total_moe_layers == 0) total_moe_layers = cfg_.is_nemotron_bolt() ? 40 : 23;
+            int max_routed_exp = std::max({cfg_.n_routed_experts, cfg_.max_n_routed_experts(), 128});
+
+            std::vector<void*> h_all_ptrs((size_t)total_moe_layers * max_routed_exp, nullptr);
+            for (int l = 0; l < total_moe_layers && l < 64; l++) {
                 bool all_in = true;
-                for (int e = 0; e < 128; e++) {
-                    h_all_ptrs[l * 128 + e] = expert_loader_.try_get_expert_cached(l, e);
-                    if (!h_all_ptrs[l * 128 + e]) all_in = false;
+                int n_e = cfg_.layer_n_routed_experts.empty() ? cfg_.n_routed_experts : 128;
+                if (n_e <= 0) n_e = 128;
+                for (int e = 0; e < n_e && e < max_routed_exp; e++) {
+                    h_all_ptrs[(size_t)l * max_routed_exp + e] = expert_loader_.try_get_expert_cached(l, e);
+                    if (!h_all_ptrs[(size_t)l * max_routed_exp + e]) all_in = false;
                 }
                 layer_fully_resident_[l] = all_in;
             }
             CUDA_CHECK(cudaMemcpy(buf_all_expert_ptrs_.data, h_all_ptrs.data(),
-                                  23 * 128 * sizeof(void*), cudaMemcpyHostToDevice));
+                                  (size_t)total_moe_layers * max_routed_exp * sizeof(void*), cudaMemcpyHostToDevice));
         }
     }
 
@@ -435,6 +442,13 @@ public:
         float linear_out_proj_scale_val = 1.0f;
         float shared_w1_s2 = 1.0f;
         float shared_w2_s2 = 1.0f;
+
+        // Nemotron Bolt LatentMoE projections
+        GPUTensor fc1_latent_proj, fc1_latent_proj_scale; // [moe_latent_size, hidden_size]
+        GPUTensor fc2_latent_proj, fc2_latent_proj_scale; // [hidden_size, moe_latent_size]
+        float fc1_scale_val = 1.0f;
+        float fc2_scale_val = 1.0f;
+
         GPUTensor ssm_state;      // [48, 128, 128] BF16 (50% memory cut)
         GPUTensor conv_state;     // [10240, 4] BF16
         GPUTensor ssm_state_slots[8];
@@ -482,6 +496,8 @@ public:
     GPUTensor buf_down_;         // same
     GPUTensor buf_expert_out_;   // [hidden_size] BF16
     GPUTensor buf_moe_accum_;    // [hidden_size] BF16 (accumulated expert output)
+    GPUTensor buf_latent_down_;  // [moe_latent_size] BF16 for Nemotron Bolt LatentMoE
+    GPUTensor buf_latent_accum_; // [moe_latent_size] BF16 for Nemotron Bolt LatentMoE
     GPUTensor buf_dequant_;      // temp buffer for dequantized weights
     GPUTensor buf_dequant_2_;    // second buffer for concurrent dual-stream prefill
     GPUTensor buf_logits_;       // [vocab_size] F32
@@ -518,28 +534,33 @@ public:
     GPUTensor buf_topk_vals_batch_;     // [max_batch_m, top_k] F32
     int32_t* topk_ids_batch_host_ = nullptr;
     float* topk_weights_batch_host_ = nullptr;
-    GPUTensor buf_moe_offsets_;        // [129] int32_t for MoE token binning
-    GPUTensor buf_moe_token_indices_;  // [max_batch_m * 6] int32_t for MoE token binning
-    GPUTensor buf_moe_token_slots_;    // [max_batch_m * 6] int32_t for MoE token binning
-    GPUTensor buf_moe_gate_batch_;      // [max_batch_m, 6, 1856] BF16 for Nemotron batched MoE
-    GPUTensor buf_layer_expert_ptrs_;  // [128] void* GPU pointers
-    GPUTensor buf_all_expert_ptrs_;    // [23 * 128] void* GPU pointers for resident MoE layers
-    bool layer_fully_resident_[23] = {false};
-    void* h_layer_expert_ptrs_[128] = {nullptr};
-    GPUTensor buf_expert_scales_gpu_;  // [23 * 128 * 2] F32 GPU scales
+    GPUTensor buf_moe_offsets_;        // [513] int32_t for MoE token binning
+    GPUTensor buf_moe_token_indices_;  // [max_batch_m * top_k] int32_t for MoE token binning
+    GPUTensor buf_moe_token_slots_;    // [max_batch_m * top_k] int32_t for MoE token binning
+    GPUTensor buf_moe_gate_batch_;      // [max_batch_m, top_k, moe_inter] BF16 for Nemotron batched MoE
+    GPUTensor buf_latent_down_batch_;  // [max_batch_m, moe_latent_size] BF16 for Bolt
+    GPUTensor buf_latent_accum_batch_; // [max_batch_m, moe_latent_size] BF16 for Bolt
+    GPUTensor buf_layer_expert_ptrs_;  // [512] void* GPU pointers
+    GPUTensor buf_all_expert_ptrs_;    // [64 * 512] void* GPU pointers for resident MoE layers
+    bool layer_fully_resident_[64] = {false};
+    void* h_layer_expert_ptrs_[512] = {nullptr};
+    GPUTensor buf_expert_scales_gpu_;  // GPU scales
     static constexpr int NUM_DRAM_MOE_BUFFERS = 4;
-    GPUTensor buf_dram_moe_scratch_;   // [NUM_DRAM_MOE_BUFFERS * 128 * expert_block_size] dedicated VRAM scratch for DRAM MoE layers
-    GPUTensor buf_dram_expert_ptrs_gpu_[NUM_DRAM_MOE_BUFFERS]; // [128] void* GPU pointers for 4-buffer circular ring
+    GPUTensor buf_dram_moe_scratch_;   // [NUM_DRAM_MOE_BUFFERS * max_experts * expert_block_size] dedicated VRAM scratch for DRAM MoE layers
+    GPUTensor buf_dram_expert_ptrs_gpu_[NUM_DRAM_MOE_BUFFERS]; // [512] void* GPU pointers for 4-buffer circular ring
     cudaEvent_t dma_ready_event_[NUM_DRAM_MOE_BUFFERS] = {nullptr};
     cudaEvent_t compute_done_event_[NUM_DRAM_MOE_BUFFERS] = {nullptr};
 
     void prefetch_dram_layer_async(int moe_layer_idx, int buf_idx) {
-        if (!dma_stream_ || moe_layer_idx < 11 || moe_layer_idx > 22 || buf_idx < 0 || buf_idx >= NUM_DRAM_MOE_BUFFERS) return;
+        if (!dma_stream_ || buf_idx < 0 || buf_idx >= NUM_DRAM_MOE_BUFFERS) return;
+        if (moe_layer_idx < 0 || moe_layer_idx >= 64 || layer_fully_resident_[moe_layer_idx]) return;
         size_t exp_bytes = expert_loader_.expert_block_size();
         void* dram_src = expert_loader_.get_dram_expert_ptr(moe_layer_idx, 0);
-        void* scratch_dst = (char*)buf_dram_moe_scratch_.data + (size_t)buf_idx * 128 * exp_bytes;
+        int n_exp = cfg_.layer_n_routed_experts.empty() ? cfg_.n_routed_experts : 128;
+        if (n_exp <= 0) n_exp = 128;
+        void* scratch_dst = (char*)buf_dram_moe_scratch_.data + (size_t)buf_idx * n_exp * exp_bytes;
         if (dram_src && scratch_dst) {
-            CUDA_CHECK(cudaMemcpyAsync(scratch_dst, dram_src, 128 * exp_bytes, cudaMemcpyHostToDevice, dma_stream_));
+            CUDA_CHECK(cudaMemcpyAsync(scratch_dst, dram_src, (size_t)n_exp * exp_bytes, cudaMemcpyHostToDevice, dma_stream_));
             CUDA_CHECK(cudaEventRecord(dma_ready_event_[buf_idx], dma_stream_));
         }
     }
@@ -1191,11 +1212,16 @@ public:
             load_expert_profile_json(json_profile_path);
 
             if (cfg_.is_nemotron()) {
+                int total_moe_layers = 0;
+                for (auto t : cfg_.layer_types) if (t == 2) total_moe_layers++;
+                if (total_moe_layers == 0) total_moe_layers = cfg_.is_nemotron_bolt() ? 40 : 23;
+                int max_routed_exp = std::max({cfg_.n_routed_experts, cfg_.max_n_routed_experts(), 128});
+
                 std::string scales_bin = (base_dir / "expert_scales.bin").string();
                 if (!std::filesystem::exists(scales_bin) && std::filesystem::exists("models/nemotron_3.5_lightning/expert_scales.bin")) {
                     scales_bin = "models/nemotron_3.5_lightning/expert_scales.bin";
                 }
-                nemotron_expert_scales_.resize(23 * 128 * 2, 1.0f);
+                nemotron_expert_scales_.resize((size_t)total_moe_layers * max_routed_exp * 2, 1.0f);
                 FILE* fp = fopen(scales_bin.c_str(), "rb");
                 if (fp) {
                     size_t nread = fread(nemotron_expert_scales_.data(), sizeof(float), nemotron_expert_scales_.size(), fp);
@@ -1209,29 +1235,31 @@ public:
                                       nemotron_expert_scales_.size() * sizeof(float),
                                       cudaMemcpyHostToDevice));
 
-                buf_all_expert_ptrs_.alloc(23 * 128 * sizeof(void*));
-                std::vector<void*> h_all_ptrs(23 * 128, nullptr);
-                for (int l = 0; l < 23; l++) {
+                buf_all_expert_ptrs_.alloc((size_t)total_moe_layers * max_routed_exp * sizeof(void*));
+                std::vector<void*> h_all_ptrs((size_t)total_moe_layers * max_routed_exp, nullptr);
+                for (int l = 0; l < total_moe_layers && l < 64; l++) {
                     bool all_in = true;
-                    for (int e = 0; e < 128; e++) {
-                        h_all_ptrs[l * 128 + e] = expert_loader_.try_get_expert_cached(l, e);
-                        if (!h_all_ptrs[l * 128 + e]) all_in = false;
+                    int n_e = cfg_.layer_n_routed_experts.empty() ? cfg_.n_routed_experts : 128;
+                    if (n_e <= 0) n_e = 128;
+                    for (int e = 0; e < n_e && e < max_routed_exp; e++) {
+                        h_all_ptrs[(size_t)l * max_routed_exp + e] = expert_loader_.try_get_expert_cached(l, e);
+                        if (!h_all_ptrs[(size_t)l * max_routed_exp + e]) all_in = false;
                     }
                     layer_fully_resident_[l] = all_in;
                 }
                 CUDA_CHECK(cudaMemcpy(buf_all_expert_ptrs_.data, h_all_ptrs.data(),
-                                      23 * 128 * sizeof(void*), cudaMemcpyHostToDevice));
+                                      (size_t)total_moe_layers * max_routed_exp * sizeof(void*), cudaMemcpyHostToDevice));
 
-                buf_dram_moe_scratch_.alloc((size_t)NUM_DRAM_MOE_BUFFERS * 128 * expert_block_size);
+                buf_dram_moe_scratch_.alloc((size_t)NUM_DRAM_MOE_BUFFERS * max_routed_exp * expert_block_size);
                 for (int b = 0; b < NUM_DRAM_MOE_BUFFERS; b++) {
-                    buf_dram_expert_ptrs_gpu_[b].alloc(128 * sizeof(void*));
-                    std::vector<void*> h_ptrs(128);
-                    char* base = (char*)buf_dram_moe_scratch_.data + (size_t)b * 128 * expert_block_size;
-                    for (int e = 0; e < 128; e++) {
+                    buf_dram_expert_ptrs_gpu_[b].alloc((size_t)max_routed_exp * sizeof(void*));
+                    std::vector<void*> h_ptrs(max_routed_exp);
+                    char* base = (char*)buf_dram_moe_scratch_.data + (size_t)b * max_routed_exp * expert_block_size;
+                    for (int e = 0; e < max_routed_exp; e++) {
                         h_ptrs[e] = base + (size_t)e * expert_block_size;
                     }
                     CUDA_CHECK(cudaMemcpy(buf_dram_expert_ptrs_gpu_[b].data, h_ptrs.data(),
-                                          128 * sizeof(void*), cudaMemcpyHostToDevice));
+                                          (size_t)max_routed_exp * sizeof(void*), cudaMemcpyHostToDevice));
                 }
             }
 
@@ -3790,7 +3818,9 @@ private:
                         CUDA_CHECK(cudaMemcpy(f32_gate.data, lw.gate_w.data, lw.gate_w.size_bytes, cudaMemcpyDeviceToDevice));
                         lw.gate_w.free();
                         lw.gate_w.dtype = "bfloat16";
-                        int gate_elements = 128 * cfg_.hidden_size;
+                        int n_exp = cfg_.layer_n_routed_experts.empty() ? cfg_.n_routed_experts : cfg_.get_layer_n_routed_experts(l);
+                        if (n_exp <= 0) n_exp = 128;
+                        int gate_elements = n_exp * cfg_.hidden_size;
                         lw.gate_w.alloc(gate_elements * sizeof(__nv_bfloat16));
                         f32_to_bf16_cuda(lw.gate_w.bf16(), f32_gate.f32(), gate_elements, main_stream_);
                         CUDA_CHECK(cudaStreamSynchronize(main_stream_));
@@ -3808,6 +3838,20 @@ private:
                     std::string shared_down_name = prefix + ".mixer.shared_experts.down_proj.weight";
                     if (tensor_map.contains(shared_down_name) && tensor_map[shared_down_name].contains("scale_2")) {
                         lw.shared_w2_s2 = tensor_map[shared_down_name]["scale_2"].get<float>();
+                    }
+
+                    // LatentMoE Projections (Nemotron Bolt)
+                    if (cfg_.is_nemotron_bolt() || tensor_map.contains(prefix + ".mixer.fc1_latent_proj.weight")) {
+                        load_layer_weight(lw.fc1_latent_proj, lw.fc1_latent_proj_scale, prefix + ".mixer.fc1_latent_proj.weight");
+                        load_layer_weight(lw.fc2_latent_proj, lw.fc2_latent_proj_scale, prefix + ".mixer.fc2_latent_proj.weight");
+                        std::string fc1_name = prefix + ".mixer.fc1_latent_proj.weight";
+                        if (tensor_map.contains(fc1_name) && tensor_map[fc1_name].contains("scalar_scale")) {
+                            lw.fc1_scale_val = tensor_map[fc1_name]["scalar_scale"].get<float>();
+                        }
+                        std::string fc2_name = prefix + ".mixer.fc2_latent_proj.weight";
+                        if (tensor_map.contains(fc2_name) && tensor_map[fc2_name].contains("scalar_scale")) {
+                            lw.fc2_scale_val = tensor_map[fc2_name]["scalar_scale"].get<float>();
+                        }
                     }
                 }
 
@@ -3957,11 +4001,11 @@ private:
             int n_linear = 0;
             for (auto& lw : layers_) if (lw.is_linear_attn) n_linear++;
             if (n_linear > 0) {
-                size_t ssm_heads = cfg_.ssm_dt_rank > 0 ? cfg_.ssm_dt_rank : 48;
+                size_t ssm_heads = cfg_.ssm_dt_rank > 0 ? cfg_.ssm_dt_rank : (cfg_.is_nemotron_bolt() ? 128 : (cfg_.is_nemotron() ? 64 : 48));
                 size_t ssm_d = cfg_.ssm_d_state > 0 ? cfg_.ssm_d_state : 128;
                 size_t ssm_bytes_per_layer = ssm_heads * ssm_d * ssm_d * (cfg_.is_nemotron() ? sizeof(float) : sizeof(__nv_bfloat16));
                 size_t conv_dim = cfg_.ssm_d_conv > 0 ? cfg_.ssm_d_conv : 4;
-                size_t conv_channels = cfg_.is_nemotron() ? 6144 : 10240;
+                size_t conv_channels = cfg_.is_nemotron_bolt() ? 10248 : (cfg_.is_nemotron() ? 6144 : 10240);
                 size_t conv_bytes_per_layer = conv_channels * conv_dim * sizeof(__nv_bfloat16);
                 target_ssm_pool_.alloc(n_linear * ssm_bytes_per_layer);
                 target_conv_pool_.alloc(n_linear * conv_bytes_per_layer);
@@ -4073,6 +4117,7 @@ private:
         });
         size_t max_q_dim = std::max({
             (size_t)n_heads * head_dim_val,
+            (size_t)18568,
             (size_t)12288,
             (size_t)dim
         });
@@ -4092,6 +4137,9 @@ private:
         buf_down_.alloc(max_down * sizeof(__nv_bfloat16));
         buf_expert_out_.alloc(dim * sizeof(__nv_bfloat16));
         buf_moe_accum_.alloc(dim * sizeof(__nv_bfloat16));
+        int latent_size = cfg_.moe_latent_size > 0 ? cfg_.moe_latent_size : 1024;
+        buf_latent_down_.alloc(latent_size * sizeof(__nv_bfloat16));
+        buf_latent_accum_.alloc(latent_size * sizeof(__nv_bfloat16));
         size_t dequant_needed;
         if (cfg_.n_routed_experts > 0) {
             dequant_needed = std::max((size_t)256 * 1024 * 1024, (size_t)max_inter * dim * sizeof(__nv_bfloat16));
@@ -4101,14 +4149,18 @@ private:
         buf_dequant_.alloc(dequant_needed);
         buf_dequant_2_.alloc(dequant_needed);
         buf_logits_.alloc((size_t)cfg_.vocab_size * sizeof(float));
-        buf_scores_f32_.alloc(std::max(cfg_.n_routed_experts, 64) * sizeof(float));
-        buf_scores_bf16_.alloc(std::max(cfg_.n_routed_experts, 64) * sizeof(__nv_bfloat16));
-        buf_topk_vals_.alloc(std::max(cfg_.num_experts_per_tok, 64) * sizeof(float));
-        buf_topk_idx_.alloc(std::max(cfg_.num_experts_per_tok, 64) * sizeof(int32_t));
+        int max_n_routed = std::max({cfg_.n_routed_experts, cfg_.max_n_routed_experts(), 512});
+        int max_k_val = std::max({cfg_.num_experts_per_tok, cfg_.max_num_experts_per_tok(), 64});
+        buf_scores_f32_.alloc(max_n_routed * sizeof(float));
+        buf_scores_bf16_.alloc(max_n_routed * sizeof(__nv_bfloat16));
+        buf_topk_vals_.alloc(max_k_val * sizeof(float));
+        buf_topk_idx_.alloc(max_k_val * sizeof(int32_t));
         buf_linear_a_.alloc(64 * sizeof(__nv_bfloat16));
         buf_linear_b_.alloc(64 * sizeof(__nv_bfloat16));
-        buf_mamba_conv_.alloc(6144 * sizeof(__nv_bfloat16));
-        buf_mamba_temp_.alloc(4096 * sizeof(float));
+        size_t conv_channels = cfg_.is_nemotron_bolt() ? 10248 : (cfg_.is_nemotron() ? 6144 : 10240);
+        size_t temp_channels = cfg_.is_nemotron_bolt() ? 8192 : 4096;
+        buf_mamba_conv_.alloc(conv_channels * sizeof(__nv_bfloat16));
+        buf_mamba_temp_.alloc(temp_channels * sizeof(float));
         buf_input_ids_.alloc(sizeof(int32_t));
         buf_input_token_.alloc(sizeof(int32_t));
         buf_input_pos_.alloc(sizeof(int32_t));
@@ -4130,16 +4182,16 @@ private:
         buf_input_pos_batch_.alloc(max_batch_m * sizeof(int32_t));
         buf_hidden_batch_.alloc(max_batch_m * dim * sizeof(__nv_bfloat16));
         buf_hidden2_batch_.alloc(max_batch_m * dim * sizeof(__nv_bfloat16));
-        int max_act_k = (int)std::max({(size_t)dim, (size_t)max_inter, (size_t)10304, (size_t)10240, (size_t)6144});
+        int max_act_k = (int)std::max({(size_t)dim, (size_t)max_inter, (size_t)18568, (size_t)10304, (size_t)10240, (size_t)6144});
         int max_act_m = 1024;
         buf_activation_fp4_.alloc((size_t)max_act_m * (max_act_k / 2));
         buf_activation_scale_.alloc((size_t)max_act_m * (max_act_k / 32));
         buf_activation_fp8_.alloc((size_t)max_act_m * max_act_k);
         buf_activation_fp8_side_.alloc((size_t)max_act_m * max_act_k);
-        buf_q_batch_.alloc(max_batch_m * std::max({(size_t)10304, (size_t)10240, (size_t)(2 * n_heads * head_dim_val)}) * sizeof(__nv_bfloat16));
+        buf_q_batch_.alloc(max_batch_m * std::max({(size_t)18568, (size_t)10304, (size_t)10240, (size_t)(2 * n_heads * head_dim_val)}) * sizeof(__nv_bfloat16));
         buf_gate_batch_.alloc(max_batch_m * max_inter * sizeof(__nv_bfloat16));
         buf_up_batch_.alloc(max_batch_m * max_inter * sizeof(__nv_bfloat16));
-        buf_attn_out_batch_.alloc(max_batch_m * std::max(6144, n_heads * head_dim_val) * sizeof(__nv_bfloat16));
+        buf_attn_out_batch_.alloc(max_batch_m * std::max((size_t)8192, (size_t)n_heads * head_dim_val) * sizeof(__nv_bfloat16));
         buf_linear_a_batch_.alloc(max_batch_m * 64 * sizeof(__nv_bfloat16));
         buf_linear_b_batch_.alloc(max_batch_m * 64 * sizeof(__nv_bfloat16));
         buf_logits_batch_.alloc((size_t)std::min(max_batch_m, 8) * cfg_.vocab_size * sizeof(float));
@@ -4148,8 +4200,8 @@ private:
         buf_tree_parent_indices_.alloc(8 * sizeof(int32_t));
         buf_tree_winning_slots_.alloc(8 * sizeof(int32_t));
 
-        int max_routed_exp = std::max(cfg_.n_routed_experts, 128);
-        int max_top_k = std::max(cfg_.num_experts_per_tok, 8);
+        int max_routed_exp = std::max({cfg_.n_routed_experts, cfg_.max_n_routed_experts(), 512});
+        int max_top_k = std::max({cfg_.num_experts_per_tok, cfg_.max_num_experts_per_tok(), 16});
         buf_scores_bf16_batch_.alloc(max_batch_m * max_routed_exp * sizeof(__nv_bfloat16));
         buf_topk_idx_batch_.alloc(max_batch_m * max_top_k * sizeof(int32_t));
         buf_topk_vals_batch_.alloc(max_batch_m * max_top_k * sizeof(float));
@@ -4159,17 +4211,23 @@ private:
         if (!topk_weights_batch_host_) {
             CUDA_CHECK(cudaMallocHost(&topk_weights_batch_host_, max_batch_m * max_top_k * sizeof(float)));
         }
-        int moe_inter_val = cfg_.moe_intermediate_size > 0 ? cfg_.moe_intermediate_size : 1856;
-        buf_moe_offsets_.alloc(129 * sizeof(int32_t));
-        buf_moe_token_indices_.alloc((size_t)max_batch_m * 6 * sizeof(int32_t));
-        buf_moe_token_slots_.alloc((size_t)max_batch_m * 6 * sizeof(int32_t));
-        buf_moe_gate_batch_.alloc((size_t)max_batch_m * 6 * moe_inter_val * sizeof(__nv_bfloat16));
-        buf_layer_expert_ptrs_.alloc(128 * sizeof(void*));
-        buf_all_expert_ptrs_.alloc(23 * 128 * sizeof(void*));
-        buf_mamba_conv_batch_.alloc((size_t)max_batch_m * 6144 * sizeof(__nv_bfloat16));
-        buf_mamba_temp_batch_.alloc((size_t)max_batch_m * 4096 * sizeof(float));
+        int moe_inter_val = cfg_.moe_intermediate_size > 0 ? cfg_.moe_intermediate_size : 2560;
+        buf_moe_offsets_.alloc(513 * sizeof(int32_t));
+        buf_moe_token_indices_.alloc((size_t)max_batch_m * max_top_k * sizeof(int32_t));
+        buf_moe_token_slots_.alloc((size_t)max_batch_m * max_top_k * sizeof(int32_t));
+        buf_moe_gate_batch_.alloc((size_t)max_batch_m * max_top_k * moe_inter_val * sizeof(__nv_bfloat16));
+        buf_latent_down_batch_.alloc((size_t)max_batch_m * latent_size * sizeof(__nv_bfloat16));
+        buf_latent_accum_batch_.alloc((size_t)max_batch_m * latent_size * sizeof(__nv_bfloat16));
+        buf_layer_expert_ptrs_.alloc(max_routed_exp * sizeof(void*));
+        int n_moe_layers = 0;
+        for (auto t : cfg_.layer_types) if (t == 2) n_moe_layers++;
+        if (n_moe_layers == 0) n_moe_layers = cfg_.is_nemotron_bolt() ? 40 : 23;
+        buf_all_expert_ptrs_.alloc((size_t)n_moe_layers * max_routed_exp * sizeof(void*));
+        buf_mamba_conv_batch_.alloc((size_t)max_batch_m * conv_channels * sizeof(__nv_bfloat16));
+        buf_mamba_temp_batch_.alloc((size_t)max_batch_m * temp_channels * sizeof(float));
         if (cfg_.is_nemotron()) {
-            buf_dram_moe_scratch_.alloc((size_t)NUM_DRAM_MOE_BUFFERS * 128 * 5898240);
+            size_t exp_block_sz = expert_loader_.expert_block_size() > 0 ? expert_loader_.expert_block_size() : 5898240;
+            buf_dram_moe_scratch_.alloc((size_t)NUM_DRAM_MOE_BUFFERS * max_routed_exp * exp_block_sz);
         }
 
         // Compressor working buffers
