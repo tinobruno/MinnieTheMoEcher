@@ -24,7 +24,8 @@ MultimodalPrompt apply_chat_template_multimodal(
     bool enable_thinking = true,
     const std::string& reasoning_effort = "high",
     const nlohmann::json& tools = nlohmann::json(),
-    bool model_has_vision = false
+    bool model_has_vision = false,
+    bool is_nemotron = false
 );
 
 std::vector<int> apply_chat_template(
@@ -32,7 +33,8 @@ std::vector<int> apply_chat_template(
     const BPETokenizer& tok,
     bool enable_thinking = true,
     const std::string& reasoning_effort = "high",
-    const nlohmann::json& tools = nlohmann::json()
+    const nlohmann::json& tools = nlohmann::json(),
+    bool is_nemotron = false
 );
 
 } // namespace moecher::multimodal

@@ -38,6 +38,7 @@ src_backups/
 *.txt
 *.jsonl
 .moecher_*
+server_config.json
 cookie_jar.json
 
 # Scratch scripts & temporary test files

@@ -41,6 +41,7 @@ $RequiredFiles = @(
     "installer\Moecher_Setup.iss",
     "installer\start_qwen_13g_server.bat",
     "installer\start_qwen_server.bat",
+    "installer\start_nemotron_server.bat",
     "installer\start_deepseek_server.bat",
     "installer\test_qwen.bat",
     "installer\download_model.ps1",

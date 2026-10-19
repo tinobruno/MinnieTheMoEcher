@@ -114,7 +114,8 @@ MultimodalPrompt apply_chat_template_multimodal(
     bool enable_thinking,
     const std::string& reasoning_effort,
     const json& tools,
-    bool model_has_vision)
+    bool model_has_vision,
+    bool is_nemotron)
 {
     MultimodalPrompt out;
     json resolved_tools = tools;
@@ -132,17 +133,21 @@ MultimodalPrompt apply_chat_template_multimodal(
         // ChatML template (Qwen / Llama / SmolLM)
         std::vector<int> result;
         bool has_system = (!messages.empty() && messages[0].value("role", "") == "system");
-        if (!has_system && (enable_thinking || has_tools)) {
-            std::string sys_prompt = "You are a helpful assistant";
+        if (!has_system) {
+            std::string sys_prompt = "";
             if (has_tools) {
-                sys_prompt += tools_system_prompt;
+                sys_prompt = tools_system_prompt;
+            } else if (!is_nemotron && enable_thinking) {
+                sys_prompt = "You are a helpful assistant";
             }
-            result.push_back(IM_START);
-            auto sys_role = tok.encode("system\n" + sys_prompt);
-            result.insert(result.end(), sys_role.begin(), sys_role.end());
-            result.push_back(IM_END);
-            auto nl_enc = tok.encode("\n");
-            result.insert(result.end(), nl_enc.begin(), nl_enc.end());
+            if (!sys_prompt.empty()) {
+                result.push_back(IM_START);
+                auto sys_role = tok.encode("system\n" + sys_prompt);
+                result.insert(result.end(), sys_role.begin(), sys_role.end());
+                result.push_back(IM_END);
+                auto nl_enc = tok.encode("\n");
+                result.insert(result.end(), nl_enc.begin(), nl_enc.end());
+            }
         }
         for (size_t i = 0; i < messages.size(); i++) {
             std::string role = messages[i].value("role", "user");
@@ -247,10 +252,23 @@ MultimodalPrompt apply_chat_template_multimodal(
                 }
             }
             if (role == "assistant") {
-                if (messages[i].contains("reasoning_content") && messages[i]["reasoning_content"].is_string()) {
-                    std::string r_content = messages[i]["reasoning_content"].get<std::string>();
-                    if (!r_content.empty()) {
-                        body = "<think>\n" + r_content + "\n</think>\n" + body;
+                if (is_nemotron) {
+                    if (messages[i].contains("reasoning_content") && messages[i]["reasoning_content"].is_string()) {
+                        std::string r_content = messages[i]["reasoning_content"].get<std::string>();
+                        if (!r_content.empty()) {
+                            body = "<think>\n" + r_content + "</think>" + body;
+                        } else {
+                            body = "<think></think>" + body;
+                        }
+                    } else {
+                        body = "<think></think>" + body;
+                    }
+                } else {
+                    if (messages[i].contains("reasoning_content") && messages[i]["reasoning_content"].is_string()) {
+                        std::string r_content = messages[i]["reasoning_content"].get<std::string>();
+                        if (!r_content.empty()) {
+                            body = "<think>\n" + r_content + "\n</think>\n" + body;
+                        }
                     }
                 }
                 if (messages[i].contains("tool_calls") && messages[i]["tool_calls"].is_array()) {
@@ -276,13 +294,23 @@ MultimodalPrompt apply_chat_template_multimodal(
                 result.push_back(IM_START);
                 auto asst_enc = tok.encode("assistant\n");
                 result.insert(result.end(), asst_enc.begin(), asst_enc.end());
-                bool actual_thinking = enable_thinking && out.image_b64.empty();
-                if (actual_thinking) {
-                    auto think_enc = tok.encode("<think>\n");
-                    result.insert(result.end(), think_enc.begin(), think_enc.end());
+                if (is_nemotron) {
+                    if (enable_thinking) {
+                        auto think_enc = tok.encode("<think>\n");
+                        result.insert(result.end(), think_enc.begin(), think_enc.end());
+                    } else {
+                        auto think_enc = tok.encode("<think></think>");
+                        result.insert(result.end(), think_enc.begin(), think_enc.end());
+                    }
                 } else {
-                    auto think_enc = tok.encode("<think>\n\n</think>\n");
-                    result.insert(result.end(), think_enc.begin(), think_enc.end());
+                    bool actual_thinking = enable_thinking && out.image_b64.empty();
+                    if (actual_thinking) {
+                        auto think_enc = tok.encode("<think>\n");
+                        result.insert(result.end(), think_enc.begin(), think_enc.end());
+                    } else {
+                        auto think_enc = tok.encode("<think>\n\n</think>\n");
+                        result.insert(result.end(), think_enc.begin(), think_enc.end());
+                    }
                 }
             }
         }
@@ -489,9 +517,10 @@ std::vector<int> apply_chat_template(
     const BPETokenizer& tok,
     bool enable_thinking,
     const std::string& reasoning_effort,
-    const json& tools)
+    const json& tools,
+    bool is_nemotron)
 {
-    return apply_chat_template_multimodal(messages, tok, enable_thinking, reasoning_effort, tools, false).prompt;
+    return apply_chat_template_multimodal(messages, tok, enable_thinking, reasoning_effort, tools, false, is_nemotron).prompt;
 }
 
 } // namespace moecher::multimodal

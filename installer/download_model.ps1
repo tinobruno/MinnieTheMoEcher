@@ -4,7 +4,7 @@
 
 param (
     [Parameter(Mandatory=$true)]
-    [ValidateSet("qwen", "qwen_13g", "deepseek", "deepseek_q4", "both")]
+    [ValidateSet("qwen", "qwen_13g", "deepseek", "deepseek_q4", "nemotron", "both")]
     [string]$Model,
 
     [string]$DestDir = "",
@@ -30,6 +30,17 @@ if (-not $DestDir -or $DestDir.Trim() -eq "") {
 $DestDir = [System.IO.Path]::GetFullPath($DestDir)
 
 $ModelConfigs = @{
+    "nemotron" = @{
+        "Repo"  = "$Username/moecher-nemotron-3.5-lightning-vision"
+        "Dir"   = (Join-Path $DestDir "nemotron_3.5_lightning")
+        "Files" = @(
+            "moecher_manifest.json",
+            "tokenizer.json",
+            "expert_scales.bin",
+            "attention_dense_layers.bin",
+            "expert_weights.bin"
+        )
+    }
     "qwen" = @{
         "Repo"  = "$Username/moecher-qwen-3.8-27b-q4"
         "Dir"   = (Join-Path $DestDir "qwen3_8_27b_q4")
@@ -134,6 +145,29 @@ foreach ($t in $targets) {
 
     foreach ($f in $cfg.Files) {
         Download-HuggingFaceFile -RepoId $cfg.Repo -FileName $f -TargetFolder $cfg.Dir
+    }
+
+    # Automatically install multimodal vision delegate by default for Nemotron
+    if ($t -eq "nemotron") {
+        $delDir = Join-Path $DestDir "frankenstin\vision"
+        $delRepo = "$Username/frankenstin-vision-delegate"
+        $delFiles = @(
+            "moecher_manifest.json",
+            "tokenizer.json",
+            "tokenizer_config.json",
+            "preprocessor_config.json",
+            "chat_template.json",
+            "merges.txt",
+            "vocab.json",
+            "attention_dense_layers.bin"
+        )
+        Write-Host "================================================================" -ForegroundColor Cyan
+        Write-Host "  Downloading Vision Delegate: $delRepo" -ForegroundColor Cyan
+        Write-Host "  Destination Folder: $delDir" -ForegroundColor Cyan
+        Write-Host "================================================================" -ForegroundColor Cyan
+        foreach ($df in $delFiles) {
+            Download-HuggingFaceFile -RepoId $delRepo -FileName $df -TargetFolder $delDir
+        }
     }
 }
 

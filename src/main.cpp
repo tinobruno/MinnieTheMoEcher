@@ -241,8 +241,16 @@ int main(int argc, char** argv) {
              tree_nodes,
              mtp_k);
 
-    if (!engine.load(manifest_path, max_vram_gb, dram_cache_gb, expert_dtype_override, buffered_io, max_seq_len_override)) {
-        LOG_ERROR("Failed to load model");
+    try {
+        if (!engine.load(manifest_path, max_vram_gb, dram_cache_gb, expert_dtype_override, buffered_io, max_seq_len_override)) {
+            LOG_ERROR("Failed to load model");
+            return 1;
+        }
+    } catch (const std::exception& e) {
+        LOG_ERROR("FATAL EXCEPTION in engine.load: %s", e.what());
+        return 1;
+    } catch (...) {
+        LOG_ERROR("FATAL UNKNOWN EXCEPTION in engine.load");
         return 1;
     }
 

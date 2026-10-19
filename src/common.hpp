@@ -79,6 +79,7 @@ struct ModelConfig {
     int o_lora_rank = 1024;
     int o_groups = 8;
     int moe_intermediate_size = 2048;
+    int moe_shared_expert_intermediate_size = 3712;
     int n_routed_experts = 256;
     int num_experts_per_tok = 6;
     int n_shared_experts = 1;
@@ -111,6 +112,12 @@ struct ModelConfig {
     int ssm_expand = 2;
     int ssm_dt_rank = 256;
     std::vector<int> layer_types;      // 0: Attention, 1: Mamba-2 SSM, 2: MoE (or hybrid)
+
+    // Recommended / default inference parameters per model
+    float default_temperature = -1.0f;
+    float default_repetition_penalty = -1.0f;
+    std::string default_reasoning_effort = "";
+    int default_thinking_budget = -1;
 
     int layer_compress_ratio(int layer_id) const {
         if (layer_id < (int)compress_ratios.size()) return compress_ratios[layer_id];
@@ -151,6 +158,7 @@ struct ModelConfig {
         get(o_lora_rank, "o_lora_rank");
         get(o_groups, "o_groups");
         get(moe_intermediate_size, "moe_intermediate_size");
+        get(moe_shared_expert_intermediate_size, "moe_shared_expert_intermediate_size");
         get(n_routed_experts, "n_routed_experts");
         get(num_experts_per_tok, "num_experts_per_tok");
         get(n_shared_experts, "n_shared_experts");
@@ -187,13 +195,30 @@ struct ModelConfig {
         if (j.contains("compress_ratios") && j["compress_ratios"].is_array()) {
             compress_ratios = j["compress_ratios"].get<std::vector<int>>();
         }
-        // Compute max compressed entries: max_seq_len / min_ratio
+        // Compute max compressed entries: max_seq_len / min_ratio (critical for DeepSeek MLA compressed KV cache)
         max_compressed_entries = 0;
         for (int r : compress_ratios) {
             if (r > 0) {
                 int entries = max_seq_len / r + 2;
                 if (entries > max_compressed_entries) max_compressed_entries = entries;
             }
+        }
+        get(default_temperature, "default_temperature");
+        get(default_repetition_penalty, "default_repetition_penalty");
+        get(default_reasoning_effort, "default_reasoning_effort");
+        get(default_thinking_budget, "default_thinking_budget");
+
+        if (default_temperature < 0.0f) {
+            default_temperature = is_nemotron() ? 0.6f : 0.7f;
+        }
+        if (default_repetition_penalty < 0.0f) {
+            default_repetition_penalty = 1.00f;
+        }
+        if (default_reasoning_effort.empty()) {
+            default_reasoning_effort = is_nemotron() ? "high" : "medium";
+        }
+        if (default_thinking_budget < 0) {
+            default_thinking_budget = 4096;
         }
     }
 };

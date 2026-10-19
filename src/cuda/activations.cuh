@@ -1354,3 +1354,172 @@ void compact_tree_kv_cache_cuda(
     int head_dim,
     cudaStream_t stream = 0);
 
+// ── NVIDIA Nemotron 3.5 Lightning (NVFP4, Squared ReLU, FP8 Scalar, Mamba-2) ───
+void gemv_nvfp4_cuda(
+    __nv_bfloat16* out,
+    const __nv_bfloat16* vec,
+    const uint8_t* weight,
+    const uint8_t* scale_fp8,
+    float scale_2,
+    int N, int K,
+    cudaStream_t stream = 0);
+
+void gemv_nvfp4_f32_cuda(
+    float* out,
+    const __nv_bfloat16* vec,
+    const uint8_t* weight,
+    const uint8_t* scale_fp8,
+    float scale_2,
+    int N, int K,
+    cudaStream_t stream = 0);
+
+void gemv_nvfp4_residual_cuda(
+    __nv_bfloat16* inout,
+    const __nv_bfloat16* vec,
+    const uint8_t* weight,
+    const uint8_t* scale_fp8,
+    float scale_2,
+    int N, int K,
+    cudaStream_t stream = 0);
+
+void gemv_nvfp4_scaled_residual_cuda(
+    __nv_bfloat16* inout,
+    const __nv_bfloat16* vec,
+    const uint8_t* weight,
+    const uint8_t* scale_fp8,
+    float scale_2,
+    float alpha,
+    int N, int K,
+    cudaStream_t stream = 0);
+
+void relu2_cuda(
+    __nv_bfloat16* out,
+    const __nv_bfloat16* in,
+    int n,
+    cudaStream_t stream = 0);
+
+void gemv_fp8_scalar_scale_cuda(
+    __nv_bfloat16* out,
+    const __nv_bfloat16* vec,
+    const uint8_t* weight,
+    float scale_val,
+    int N, int K,
+    cudaStream_t stream = 0);
+
+void gemv_fp8_scalar_scale_residual_cuda(
+    __nv_bfloat16* inout,
+    const __nv_bfloat16* vec,
+    const uint8_t* weight,
+    float scale_val,
+    int N, int K,
+    cudaStream_t stream = 0);
+
+void mamba2_nemotron_step_cuda(
+    __nv_bfloat16* ssm_out,       // [4096]
+    const __nv_bfloat16* in_proj, // [10304]
+    const __nv_bfloat16* conv1d_w,// [6144, 4]
+    const __nv_bfloat16* conv1d_b,// [6144]
+    __nv_bfloat16* conv_state,    // [6144, 4]
+    const __nv_bfloat16* A_log,   // [64]
+    const __nv_bfloat16* D,       // [64]
+    const __nv_bfloat16* dt_bias, // [64]
+    const __nv_bfloat16* norm_w,  // [4096]
+    float* ssm_state,             // [64, 64, 128] FP32 state for numerical stability
+    __nv_bfloat16* conv_buf,      // [6144]
+    float* temp_out,              // [4096]
+    float rms_norm_eps,
+    cudaStream_t stream = 0);
+
+void mamba2_nemotron_step_batch_cuda(
+    __nv_bfloat16* ssm_out_batch,
+    const __nv_bfloat16* in_proj_batch,
+    const __nv_bfloat16* conv1d_w,
+    const __nv_bfloat16* conv1d_b,
+    __nv_bfloat16* conv_state,
+    const __nv_bfloat16* A_log,
+    const __nv_bfloat16* D,
+    const __nv_bfloat16* dt_bias,
+    const __nv_bfloat16* norm_w,
+    float* ssm_state,
+    __nv_bfloat16* conv_buf_batch,
+    float* temp_out_batch,
+    int M,
+    float rms_norm_eps,
+    cudaStream_t stream = 0);
+
+void gemm_fp8_scalar_scale_batch_cuda(
+    __nv_bfloat16* out,
+    const __nv_bfloat16* mat,
+    const uint8_t* weight,
+    float scale_val,
+    int M, int N, int K,
+    cudaStream_t stream = 0);
+
+void gemm_fp8_scalar_scale_residual_batch_cuda(
+    __nv_bfloat16* inout,
+    const __nv_bfloat16* mat,
+    const uint8_t* weight,
+    float scale_val,
+    int M, int N, int K,
+    cudaStream_t stream = 0);
+
+void gemm_nvfp4_batch_cuda(
+    __nv_bfloat16* out,
+    const __nv_bfloat16* mat,
+    const uint8_t* weight,
+    const uint8_t* scale_fp8,
+    float scale_2,
+    int M, int N, int K,
+    cudaStream_t stream = 0);
+
+void gemm_nvfp4_relu2_batch_cuda(
+    __nv_bfloat16* out,
+    const __nv_bfloat16* mat,
+    const uint8_t* weight,
+    const uint8_t* scale_fp8,
+    float scale_2,
+    int M, int N, int K,
+    cudaStream_t stream = 0);
+
+void gemm_nvfp4_residual_batch_cuda(
+    __nv_bfloat16* inout,
+    const __nv_bfloat16* mat,
+    const uint8_t* weight,
+    const uint8_t* scale_fp8,
+    float scale_2,
+    int M, int N, int K,
+    cudaStream_t stream = 0);
+
+void moe_bin_tokens_cuda(
+    int32_t* expert_offsets,
+    int32_t* expert_token_indices,
+    int32_t* expert_token_slots,
+    const int32_t* topk_ids,
+    int total_selections,
+    cudaStream_t stream = 0);
+
+void moe_nemotron_up_relu2_batch_cuda(
+    __nv_bfloat16* gate_out,
+    const __nv_bfloat16* hidden_in,
+    const int32_t* topk_ids,
+    const int32_t* expert_offsets,
+    const int32_t* expert_token_indices,
+    const int32_t* expert_token_slots,
+    const void* const* expert_ptrs,
+    const float* expert_scales,
+    int M, int N, int K,
+    cudaStream_t stream = 0);
+
+void moe_nemotron_down_scaled_residual_batch_cuda(
+    __nv_bfloat16* hidden_out,
+    const __nv_bfloat16* gate_in,
+    const int32_t* topk_ids,
+    const float* topk_weights,
+    const int32_t* expert_offsets,
+    const int32_t* expert_token_indices,
+    const int32_t* expert_token_slots,
+    const void* const* expert_ptrs,
+    const float* expert_scales,
+    int M, int N, int K,
+    cudaStream_t stream = 0);
+

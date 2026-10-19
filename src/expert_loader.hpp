@@ -84,6 +84,17 @@ public:
         return layer_id < n_pinned_layers();
     }
 
+    int expert_block_size() const { return expert_block_size_; }
+
+    void* get_dram_expert_ptr(int layer_id, int expert_id) {
+        int64_t key = (int64_t)layer_id * n_experts_ + expert_id;
+        if (key >= 0 && key < (int64_t)flat_dram_ptrs_.size() && flat_dram_ptrs_[key]) {
+            return flat_dram_ptrs_[key];
+        }
+        return get_dram_or_disk_ptr(layer_id, expert_id);
+    }
+
+
     inline void* get_dram_or_disk_ptr(int layer_id, int expert_id) {
         int64_t key = (int64_t)layer_id * n_experts_ + expert_id;
         if (key >= 0 && key < (int64_t)flat_dram_ptrs_.size()) {
@@ -148,9 +159,12 @@ public:
     static constexpr int MAX_DEMOTIONS_PER_TOKEN = 16;
     int demotions_this_token_ = 0;
     int64_t demotion_token_id_ = -1;  // access_counter_ of current token
+    bool disable_demotion_ = false;
+
+    void set_demotion_enabled(bool enabled) { disable_demotion_ = !enabled; }
 
     void demote_to_l2(int layer_id, int expert_id, int64_t key, void* vram_src) {
-        if (dram_cache_capacity_ <= 0 || !dram_writeback_stream_) return;
+        if (disable_demotion_ || dram_cache_capacity_ <= 0 || !dram_writeback_stream_) return;
 
         // Reset demotion counter on new token
         if (access_counter_ != demotion_token_id_) {
@@ -285,6 +299,7 @@ public:
         }
 
         flat_vram_ptrs_.assign((size_t)n_layers * n_experts, nullptr);
+        flat_dram_ptrs_.assign((size_t)n_layers * n_experts, nullptr);
         flat_vram_ptrs_gpu_.alloc((size_t)n_layers * n_experts * sizeof(void*));
         CUDA_CHECK(cudaMemset(flat_vram_ptrs_gpu_.data, 0, (size_t)n_layers * n_experts * sizeof(void*)));
 
@@ -464,10 +479,13 @@ public:
             return slot.gpu_data;
         }
 
-        // L1 Miss: find eviction candidate in L1
+        // L1 Miss: find eviction candidate in L1 (never evict from pinned resident layers)
         int evict_slot = -1;
         int64_t oldest_time = INT64_MAX;
         for (int i = 0; i < cache_capacity_; i++) {
+            if (cache_slots_[i].layer_id >= 0 && is_layer_pinned(cache_slots_[i].layer_id)) {
+                continue;
+            }
             if (cache_slots_[i].layer_id < 0) {
                 evict_slot = i;
                 break;
@@ -476,6 +494,10 @@ public:
                 oldest_time = cache_slots_[i].last_used;
                 evict_slot = i;
             }
+        }
+
+        if (evict_slot < 0) {
+            return nullptr;
         }
 
         auto& slot = cache_slots_[evict_slot];
@@ -620,10 +642,13 @@ public:
                     continue;
                 }
 
-                // L1 miss — find eviction candidate
+                // L1 miss — find eviction candidate (never evict from pinned resident layers)
                 int evict_slot = -1;
                 int64_t oldest_time = INT64_MAX;
                 for (int i = 0; i < cache_capacity_; i++) {
+                    if (cache_slots_[i].layer_id >= 0 && is_layer_pinned(cache_slots_[i].layer_id)) {
+                        continue;
+                    }
                     if (cache_slots_[i].layer_id < 0) {
                         evict_slot = i;
                         break;
@@ -734,6 +759,7 @@ public:
     bool preload_all(int n_threads = 16, const std::vector<uint32_t>& freq_counts = {}) {
         int total = n_layers_ * n_experts_;
         int to_load = std::min(total, cache_capacity_);
+        flat_dram_ptrs_.assign(total, nullptr);
         LOG_INFO("Preloading %d/%d experts into VRAM L1 cache...", to_load, total);
         
         auto start = std::chrono::steady_clock::now();
@@ -851,6 +877,9 @@ public:
                     if (dram_cache_slots_[i].layer_id >= 0) {
                         int64_t key = (int64_t)dram_cache_slots_[i].layer_id * n_experts_ + dram_cache_slots_[i].expert_id;
                         dram_key_to_slot_[key] = i;
+                        if (key >= 0 && key < (int64_t)flat_dram_ptrs_.size()) {
+                            flat_dram_ptrs_[key] = dram_cache_slots_[i].gpu_data;
+                        }
                     }
                 }
             } else {
@@ -887,6 +916,9 @@ public:
                     if (dram_cache_slots_[i].layer_id >= 0) {
                         int64_t key = (int64_t)dram_cache_slots_[i].layer_id * n_experts_ + dram_cache_slots_[i].expert_id;
                         dram_key_to_slot_[key] = i;
+                        if (key >= 0 && key < (int64_t)flat_dram_ptrs_.size()) {
+                            flat_dram_ptrs_[key] = dram_cache_slots_[i].gpu_data;
+                        }
                     }
                 }
             }
@@ -970,6 +1002,97 @@ public:
         return true;
     }
 
+    void* host_l1_backup_ = nullptr;
+    size_t host_l1_backup_bytes_ = 0;
+
+    bool evict_l1_to_host() {
+        if (!cache_pool_gpu_ || cache_capacity_ <= 0) return true;
+        std::unique_lock<std::mutex> lock(cache_mutex_);
+        host_l1_backup_bytes_ = (size_t)cache_capacity_ * expert_block_size_;
+        LOG_INFO("[ExpertCache] Evicting L1 expert cache (%.2f GB) to DRAM for Vision Delegate...",
+                 (double)host_l1_backup_bytes_ / (1024.0 * 1024.0 * 1024.0));
+#if defined(_WIN32) || defined(_WIN64)
+        host_l1_backup_ = VirtualAlloc(NULL, host_l1_backup_bytes_, MEM_COMMIT | MEM_RESERVE, PAGE_READWRITE);
+#else
+        host_l1_backup_ = malloc(host_l1_backup_bytes_);
+#endif
+        if (!host_l1_backup_) {
+            LOG_WARN("[ExpertCache] Failed to allocate host DRAM for L1 eviction, will reload from SSD upon restore");
+        } else {
+            cudaError_t err = cudaMemcpy(host_l1_backup_, cache_pool_gpu_, host_l1_backup_bytes_, cudaMemcpyDeviceToHost);
+            if (err != cudaSuccess) {
+                LOG_WARN("[ExpertCache] cudaMemcpy D2H failed: %s, will reload from SSD upon restore", cudaGetErrorString(err));
+#if defined(_WIN32) || defined(_WIN64)
+                VirtualFree(host_l1_backup_, 0, MEM_RELEASE);
+#else
+                free(host_l1_backup_);
+#endif
+                host_l1_backup_ = nullptr;
+            }
+        }
+
+        cudaFree(cache_pool_gpu_);
+        cache_pool_gpu_ = nullptr;
+        if (flat_vram_ptrs_gpu_.data) {
+            CUDA_CHECK(cudaMemset(flat_vram_ptrs_gpu_.data, 0, flat_vram_ptrs_.size() * sizeof(void*)));
+        }
+        for (auto& ptr : flat_vram_ptrs_) {
+            ptr = nullptr;
+        }
+        LOG_INFO("[ExpertCache] L1 expert cache unloaded. VRAM freed!");
+        return true;
+    }
+
+    bool restore_l1_from_host(const std::vector<uint32_t>& freq_counts = {}) {
+        if (cache_pool_gpu_) return true;
+        std::unique_lock<std::mutex> lock(cache_mutex_);
+        size_t bytes = (size_t)cache_capacity_ * expert_block_size_;
+        LOG_INFO("[ExpertCache] Restoring L1 expert cache (%.2f GB) to VRAM...",
+                 (double)bytes / (1024.0 * 1024.0 * 1024.0));
+        cudaError_t err = cudaMalloc(&cache_pool_gpu_, bytes);
+        if (err != cudaSuccess) {
+            LOG_ERROR("[ExpertCache] Failed to reallocate VRAM pool: %s", cudaGetErrorString(err));
+            return false;
+        }
+
+        if (host_l1_backup_ != nullptr) {
+            err = cudaMemcpy(cache_pool_gpu_, host_l1_backup_, bytes, cudaMemcpyHostToDevice);
+#if defined(_WIN32) || defined(_WIN64)
+            VirtualFree(host_l1_backup_, 0, MEM_RELEASE);
+#else
+            free(host_l1_backup_);
+#endif
+            host_l1_backup_ = nullptr;
+            host_l1_backup_bytes_ = 0;
+
+            if (err == cudaSuccess) {
+                for (int i = 0; i < cache_capacity_; i++) {
+                    cache_slots_[i].gpu_data = (char*)cache_pool_gpu_ + (size_t)i * expert_block_size_;
+                    if (cache_slots_[i].layer_id >= 0) {
+                        int64_t key = (int64_t)cache_slots_[i].layer_id * n_experts_ + cache_slots_[i].expert_id;
+                        if (key >= 0 && key < (int64_t)flat_vram_ptrs_.size()) {
+                            flat_vram_ptrs_[key] = cache_slots_[i].gpu_data;
+                        }
+                    }
+                }
+                if (flat_vram_ptrs_gpu_.data) {
+                    CUDA_CHECK(cudaMemcpy(flat_vram_ptrs_gpu_.data, flat_vram_ptrs_.data(),
+                                          flat_vram_ptrs_.size() * sizeof(void*), cudaMemcpyHostToDevice));
+                }
+                LOG_INFO("[ExpertCache] L1 cache restored from host DRAM in fast DMA transfer!");
+                return true;
+            }
+        }
+
+        // Fallback: reload from SSD if host backup was not present or failed
+        LOG_INFO("[ExpertCache] Restoring L1 cache from SSD storage...");
+        for (int i = 0; i < cache_capacity_; i++) {
+            cache_slots_[i].gpu_data = (char*)cache_pool_gpu_ + (size_t)i * expert_block_size_;
+        }
+        lock.unlock();
+        return preload_all(16, freq_counts);
+    }
+
     const void* const* flat_vram_ptrs_gpu() const {
         return (const void* const*)flat_vram_ptrs_gpu_.data;
     }
@@ -982,6 +1105,14 @@ public:
             if (hot_pool_gpu_) { cudaFree(hot_pool_gpu_); hot_pool_gpu_ = nullptr; }
             if (cold_pool_gpu_) { cudaFree(cold_pool_gpu_); cold_pool_gpu_ = nullptr; }
             expert_type_map_gpu_.free();
+        }
+        if (host_l1_backup_) {
+#if defined(_WIN32) || defined(_WIN64)
+            VirtualFree(host_l1_backup_, 0, MEM_RELEASE);
+#else
+            free(host_l1_backup_);
+#endif
+            host_l1_backup_ = nullptr;
         }
         if (cache_pool_gpu_) cudaFree(cache_pool_gpu_);
         if (dram_cache_pool_) {

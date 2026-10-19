@@ -772,7 +772,11 @@
         int dim = cfg_.hidden_size;
         int vocab = cfg_.vocab_size;
 
-        if (head_weight_.dtype == "fp4") {
+        if (head_weight_.dtype == "nvfp4") {
+            gemv_nvfp4_f32_cuda(buf_logits_.f32(), buf_hidden_.bf16(),
+                                (const uint8_t*)head_weight_.data, (const uint8_t*)head_weight_scale_.data,
+                                head_weight_scale_2_, vocab, dim, main_stream_);
+        } else if (head_weight_.dtype == "fp4") {
             if (is_blackwell_tc_active_) {
                 quantize_bf16_to_fp4_e2m1_cuda(buf_activation_fp4_.u8(), buf_activation_scale_.u8(),
                                                buf_hidden_.bf16(), 1, dim, main_stream_);
