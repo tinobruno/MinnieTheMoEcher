@@ -9,6 +9,12 @@
     <link href="https://fonts.googleapis.com/css2?family=Outfit:wght@300;400;500;600&family=Inter:wght@300;400;500;600&display=swap" rel="stylesheet">
     <link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=Material+Symbols+Outlined:opsz,wght,FILL,GRAD@20..48,100..700,0..1,-50..200" />
     <script src="https://cdn.jsdelivr.net/npm/marked/marked.min.js"></script>
+    <script src="pdf.min.js"></script>
+    <script>
+        if (typeof pdfjsLib === 'undefined') {
+            document.write('<script src="https://cdnjs.cloudflare.com/ajax/libs/pdf.js/3.11.174/pdf.min.js"><\/script>');
+        }
+    </script>
 </head>
 <body>
     <div class="app-container">
@@ -281,6 +287,67 @@
                     </div>
                 </div>
 
+                <!-- Document / PDF Attachment Preview Chip -->
+                <div id="document-attachment-preview" class="document-attachment-preview hidden">
+                    <div class="doc-attachment-card">
+                        <div class="doc-attachment-thumb">
+                            <img id="doc-thumb-img" src="" alt="PDF Preview" class="doc-thumb-img hidden" />
+                            <div id="doc-thumb-icon" class="doc-thumb-icon">
+                                <span class="material-symbols-outlined">picture_as_pdf</span>
+                            </div>
+                        </div>
+                        <div class="doc-attachment-info">
+                            <div class="doc-filename-row">
+                                <span id="doc-attachment-filename" class="doc-filename">document.pdf</span>
+                                <span class="doc-badge-pill" id="doc-page-badge"><span class="badge-dot"></span>1 Page</span>
+                            </div>
+                            <div class="doc-meta-row">
+                                <span id="doc-attachment-stats" class="doc-stats">0 chars extracted</span>
+                                <button type="button" class="doc-text-toggle-btn" onclick="openPdfTextModal()" title="View extracted document text">
+                                    <span class="material-symbols-outlined">visibility</span>
+                                    <span>Preview Text</span>
+                                </button>
+                            </div>
+                        </div>
+                        <div class="doc-attachment-actions">
+                            <button type="button" class="doc-action-btn doc-btn-extract-invoice" onclick="quickPromptExtractInvoice()" title="Fill prompt to extract invoice fields (VAT, Supplier, Totals, Dates)">
+                                <span class="material-symbols-outlined">receipt_long</span>
+                                <span>Extract</span>
+                            </button>
+                            <button type="button" class="doc-action-btn doc-btn-odoo-xml" onclick="quickPromptOdooXml()" title="Convert invoice directly into standard UBL 2.1 XML for Odoo import">
+                                <span class="material-symbols-outlined">integration_instructions</span>
+                                <span>Odoo XML</span>
+                            </button>
+                            <button type="button" class="doc-action-btn" onclick="openAccountingSettingsTab()" title="Configure Odoo & Accounting Settings (Company Country, Force Domestic, etc.)" style="padding: 5px 8px;">
+                                <span class="material-symbols-outlined" style="font-size: 16px; color: #c084fc;">tune</span>
+                            </button>
+                            <button type="button" class="doc-remove-btn" onclick="removeDocumentAttachment()" title="Remove document">
+                                <span class="material-symbols-outlined">close</span>
+                            </button>
+                        </div>
+                    </div>
+
+                    <!-- Quick Invoice & Document Suggestion Chips -->
+                    <div class="invoice-quick-chips" id="invoice-quick-chips">
+                        <button type="button" class="quick-chip" onclick="applyInvoiceQuickPrompt('invoice')" title="Extract supplier, VAT, net, gross, dates">
+                            <span class="material-symbols-outlined">receipt</span>
+                            <span>Invoice Breakdown</span>
+                        </button>
+                        <button type="button" class="quick-chip chip-odoo" onclick="applyInvoiceQuickPrompt('odoo')" title="Generate standard UBL 2.1 XML ready to import directly into Odoo Accounting">
+                            <span class="material-symbols-outlined" style="color: #c084fc;">integration_instructions</span>
+                            <span style="color: #e9d5ff; font-weight: 500;">Generate Odoo XML</span>
+                        </button>
+                        <button type="button" class="quick-chip" onclick="applyInvoiceQuickPrompt('vat')" title="Verify VAT calculation and taxable amounts">
+                            <span class="material-symbols-outlined">calculate</span>
+                            <span>Verify VAT & Math</span>
+                        </button>
+                        <button type="button" class="quick-chip" onclick="applyInvoiceQuickPrompt('summary')" title="Brief executive summary of document">
+                            <span class="material-symbols-outlined">summarize</span>
+                            <span>Summarize PDF</span>
+                        </button>
+                    </div>
+                </div>
+
                 <div class="input-box">
                     <!-- Live Voice Recognition Indicator Banner -->
                     <div id="voice-indicator" class="voice-indicator hidden">
@@ -313,7 +380,7 @@
                         </div>
                     </div>
 
-                    <textarea id="chat-input" placeholder="Enter a prompt here..." rows="1"></textarea>
+                    <textarea id="chat-input" placeholder="Enter a prompt or drop a PDF invoice here..." rows="1"></textarea>
                     <div class="input-controls">
                         <button type="button" id="zdb-quick-btn" class="voice-mode-btn" onclick="toggleZdbQuick()" title="Toggle Zero Decode Bypass (Sub-100ms System 1 Decision Mode)">
                             <span class="material-symbols-outlined" id="zdb-quick-icon" style="color: #94a3b8;">bolt</span>
@@ -324,10 +391,10 @@
                         <button type="button" id="mic-btn" class="mic-btn" onclick="toggleVoiceRecognition()" title="Voice input / Dictation (Click to talk)">
                             <span class="material-symbols-outlined" id="mic-icon">mic</span>
                         </button>
-                        <button type="button" id="vision-upload-btn" class="vision-upload-btn hidden" onclick="triggerVisionUpload()" title="Attach image (PNG, JPG, WebP, BMP)">
-                            <span class="material-symbols-outlined">add_photo_alternate</span>
+                        <button type="button" id="attachment-upload-btn" class="vision-upload-btn" onclick="triggerAttachmentUpload()" title="Attach PDF invoice, document, or image (PNG, JPG, WebP)">
+                            <span class="material-symbols-outlined">attach_file</span>
                         </button>
-                        <input type="file" id="vision-file-input" accept="image/png,image/jpeg,image/webp,image/bmp" class="hidden" onchange="handleVisionFileSelect(event)">
+                        <input type="file" id="attachment-file-input" accept="application/pdf,image/png,image/jpeg,image/webp,image/bmp" class="hidden" onchange="handleAttachmentFileSelect(event)">
                         <button type="button" id="preview-btn-chatbar" class="code-action-btn preview-btn chatbar-preview-btn hidden" onclick="previewLatestHtmlSnippet()" title="Test and render HTML code in preview panel">
                             <span class="material-symbols-outlined btn-icon">play_circle</span> Preview
                         </button>
@@ -799,6 +866,10 @@
                     <button type="button" class="settings-tab" data-tab="settings-tab-agentic" title="Agentic Guardrails & Tools">
                         <span class="material-symbols-outlined tab-icon">shield_person</span>
                         <span>Agentic & Tools</span>
+                    </button>
+                    <button type="button" class="settings-tab" data-tab="settings-tab-accounting" title="Accounting, Odoo & UBL Settings">
+                        <span class="material-symbols-outlined tab-icon">receipt_long</span>
+                        <span>Accounting & Odoo</span>
                     </button>
                 </div>
                 <div class="settings-actions">
@@ -1500,6 +1571,221 @@
                         </div>
                     </div>
                 </div>
+
+                <!-- Tab 3: Accounting & Odoo Settings -->
+                <div class="settings-tab-pane" id="settings-tab-accounting">
+                    <div style="display: flex; flex-direction: column; gap: 14px; padding-bottom: 24px;">
+
+                        <!-- Card 1: Supplier Country & Reverse-Charge Override -->
+                        <div class="agentic-card" style="border: 1px solid rgba(168, 85, 247, 0.4); background: linear-gradient(180deg, rgba(168, 85, 247, 0.06) 0%, rgba(15, 23, 42, 0.4) 100%);">
+                            <div class="agentic-card-header" style="justify-content: space-between; align-items: center;">
+                                <div style="display: flex; align-items: center; gap: 10px;">
+                                    <span class="material-symbols-outlined agentic-card-icon" style="color: #c084fc; background: rgba(192, 132, 252, 0.15);">public</span>
+                                    <div class="agentic-card-title-group">
+                                        <h4 style="color: #f3e8ff;">Supplier Country & Odoo Fiscal Position Control</h4>
+                                        <p class="agentic-subtitle">Prevent Odoo from routing foreign EU invoices (Google, Adobe, Zoom) into Intra-Community reverse-charge</p>
+                                    </div>
+                                </div>
+                                <span class="mcp-tab-badge" style="background: rgba(168, 85, 247, 0.2); color: #e9d5ff; border: 1px solid rgba(168, 85, 247, 0.4);">Odoo Reverse-Charge Guard</span>
+                            </div>
+
+                            <div style="background: rgba(15, 23, 42, 0.6); border: 1px solid rgba(255, 255, 255, 0.08); border-radius: 8px; padding: 12px 14px;">
+                                <label class="agentic-section-label" style="margin-bottom: 8px; display: block; font-weight: 600; color: #e2e8f0;">Supplier Country Strategy in XML (&lt;cac:Country&gt;&lt;cbc:IdentificationCode&gt;):</label>
+                                
+                                <div style="display: flex; flex-direction: column; gap: 8px;">
+                                    <label style="display: flex; align-items: flex-start; gap: 10px; cursor: pointer; padding: 8px 10px; border-radius: 6px; background: rgba(255,255,255,0.02); border: 1px solid rgba(255,255,255,0.05);">
+                                        <input type="radio" name="acct_supp_country_mode" id="acct-supp-mode-force-company" value="force_company" checked onchange="onAccountingSettingChange()" style="margin-top: 3px;">
+                                        <div>
+                                            <strong style="color: #f8fafc; font-size: 13px;">Force Domestic (Match Buyer Country, e.g. <span id="acct-preview-comp-country" style="color: #a855f7;">BE</span>)</strong>
+                                            <p style="margin: 2px 0 0 0; font-size: 11px; color: #94a3b8; line-height: 1.4;">
+                                                Forces the supplier country in the XML to match your company's country code (<span class="acct-preview-comp-code">BE</span>). Odoo will treat every bill as a domestic purchase, applying standard deductible VAT (e.g. <b>21% S</b>) and maintaining the full gross amount due.
+                                            </p>
+                                        </div>
+                                    </label>
+
+                                    <label style="display: flex; align-items: flex-start; gap: 10px; cursor: pointer; padding: 8px 10px; border-radius: 6px; background: rgba(255,255,255,0.02); border: 1px solid rgba(255,255,255,0.05);">
+                                        <input type="radio" name="acct_supp_country_mode" id="acct-supp-mode-smart" value="smart" onchange="onAccountingSettingChange()" style="margin-top: 3px;">
+                                        <div>
+                                            <strong style="color: #f8fafc; font-size: 13px;">Smart Mode (Force Domestic only when VAT is charged)</strong>
+                                            <p style="margin: 2px 0 0 0; font-size: 11px; color: #94a3b8; line-height: 1.4;">
+                                                If the invoice has VAT &gt; 0 (e.g. YouTube Premium with 21% VAT), it forces domestic to keep the gross total. If the invoice has 0% VAT (true B2B reverse charge), it retains the supplier's actual country.
+                                            </p>
+                                        </div>
+                                    </label>
+
+                                    <label style="display: flex; align-items: flex-start; gap: 10px; cursor: pointer; padding: 8px 10px; border-radius: 6px; background: rgba(255,255,255,0.02); border: 1px solid rgba(255,255,255,0.05);">
+                                        <input type="radio" name="acct_supp_country_mode" id="acct-supp-mode-custom" value="custom" onchange="onAccountingSettingChange()" style="margin-top: 3px;">
+                                        <div style="flex: 1;">
+                                            <div style="display: flex; align-items: center; justify-content: space-between;">
+                                                <strong style="color: #f8fafc; font-size: 13px;">Force Custom Country Code</strong>
+                                                <input type="text" id="acct-custom-supplier-country" value="BE" maxlength="2" placeholder="BE" class="agentic-text-field" style="width: 54px; text-transform: uppercase; font-family: monospace; font-weight: 700; text-align: center; padding: 4px 6px;" oninput="onAccountingSettingChange()">
+                                            </div>
+                                            <p style="margin: 2px 0 0 0; font-size: 11px; color: #94a3b8; line-height: 1.4;">
+                                                Explicitly hardcode a 2-letter ISO country code (e.g. BE, FR, DE, IT) in every generated XML.
+                                            </p>
+                                        </div>
+                                    </label>
+
+                                    <label style="display: flex; align-items: flex-start; gap: 10px; cursor: pointer; padding: 8px 10px; border-radius: 6px; background: rgba(255,255,255,0.02); border: 1px solid rgba(255,255,255,0.05);">
+                                        <input type="radio" name="acct_supp_country_mode" id="acct-supp-mode-auto" value="auto" onchange="onAccountingSettingChange()" style="margin-top: 3px;">
+                                        <div>
+                                            <strong style="color: #f8fafc; font-size: 13px;">Auto-Detect from Invoice (Strict Cross-Border)</strong>
+                                            <p style="margin: 2px 0 0 0; font-size: 11px; color: #94a3b8; line-height: 1.4;">
+                                                Uses whatever country is written on the invoice (e.g. IE for Google Dublin). Note: Odoo may automatically trigger EU reverse charge and exclude VAT from the invoice total.
+                                            </p>
+                                        </div>
+                                    </label>
+                                </div>
+                            </div>
+                        </div>
+
+                        <!-- Card 2: Company / Buyer Profile -->
+                        <div class="agentic-card">
+                            <div class="agentic-card-header">
+                                <span class="material-symbols-outlined agentic-card-icon" style="color: #38bdf8;">domain</span>
+                                <div class="agentic-card-title-group">
+                                    <h4>Buyer Company & Tax Jurisdiction</h4>
+                                    <p class="agentic-subtitle">Your company information for &lt;cac:AccountingCustomerParty&gt;</p>
+                                </div>
+                            </div>
+
+                            <div style="display: grid; grid-template-columns: 1fr 1fr; gap: 12px;">
+                                <div class="setting-field-group">
+                                    <label class="agentic-section-label" for="acct-company-country">Company Country (2-Letter ISO)</label>
+                                    <div style="display: flex; gap: 8px; align-items: center;">
+                                        <input type="text" id="acct-company-country" value="BE" maxlength="2" placeholder="BE" class="agentic-text-field" style="width: 64px; text-transform: uppercase; font-family: monospace; font-weight: 700; text-align: center;" oninput="onAccountingCompanyCountryChange()">
+                                        <div style="display: flex; gap: 4px; flex-wrap: wrap;">
+                                            <button type="button" class="editor-btn" onclick="setCompanyCountryQuick('BE')" style="padding: 2px 8px; font-size: 11px;">BE</button>
+                                            <button type="button" class="editor-btn" onclick="setCompanyCountryQuick('FR')" style="padding: 2px 8px; font-size: 11px;">FR</button>
+                                            <button type="button" class="editor-btn" onclick="setCompanyCountryQuick('DE')" style="padding: 2px 8px; font-size: 11px;">DE</button>
+                                            <button type="button" class="editor-btn" onclick="setCompanyCountryQuick('NL')" style="padding: 2px 8px; font-size: 11px;">NL</button>
+                                            <button type="button" class="editor-btn" onclick="setCompanyCountryQuick('IT')" style="padding: 2px 8px; font-size: 11px;">IT</button>
+                                            <button type="button" class="editor-btn" onclick="setCompanyCountryQuick('ES')" style="padding: 2px 8px; font-size: 11px;">ES</button>
+                                            <button type="button" class="editor-btn" onclick="setCompanyCountryQuick('LU')" style="padding: 2px 8px; font-size: 11px;">LU</button>
+                                        </div>
+                                    </div>
+                                    <div class="agentic-hint">Used as your domestic base country in Odoo.</div>
+                                </div>
+
+                                <div class="setting-field-group">
+                                    <label class="agentic-section-label" for="acct-company-vat">Your VAT Number (Optional)</label>
+                                    <input type="text" id="acct-company-vat" placeholder="e.g. BE0403170701" class="agentic-text-field" style="font-family: monospace; text-transform: uppercase;" oninput="onAccountingSettingChange()">
+                                    <div class="agentic-hint">Auto-inserted in &lt;cac:AccountingCustomerParty&gt; if missing from invoice.</div>
+                                </div>
+                            </div>
+                        </div>
+
+                        <!-- Card 3: Odoo Accounting & Tax Defaults -->
+                        <div class="agentic-card">
+                            <div class="agentic-card-header">
+                                <span class="material-symbols-outlined agentic-card-icon" style="color: #34d399;">account_balance</span>
+                                <div class="agentic-card-title-group">
+                                    <h4>Odoo Accounting & Chart of Accounts Defaults</h4>
+                                    <p class="agentic-subtitle">Default accounts and tax rates to guide the LLM and XML normalizer</p>
+                                </div>
+                            </div>
+
+                            <div style="display: grid; grid-template-columns: 1fr 1fr; gap: 12px;">
+                                <div class="setting-field-group">
+                                    <label class="agentic-section-label" for="acct-default-expense-account">Default Expense Account</label>
+                                    <input type="text" id="acct-default-expense-account" value="610000" placeholder="610000" class="agentic-text-field" style="font-family: monospace;" oninput="onAccountingSettingChange()">
+                                    <div class="agentic-hint">e.g. <b>610000</b> (Belgian Services/Subscriptions) or <b>600000</b> (Raw Materials).</div>
+                                </div>
+
+                                <div class="setting-field-group">
+                                    <label class="agentic-section-label" for="acct-default-vat-rate">Default Domestic VAT Rate (%)</label>
+                                    <div style="display: flex; gap: 8px; align-items: center;">
+                                        <input type="number" id="acct-default-vat-rate" value="21" min="0" max="30" step="0.5" class="agentic-text-field" style="width: 70px; font-family: monospace; font-weight: 700;" oninput="onAccountingSettingChange()">
+                                        <div style="display: flex; gap: 4px;">
+                                            <button type="button" class="editor-btn" onclick="setDefaultVatQuick(21)" style="padding: 2px 8px; font-size: 11px;">21%</button>
+                                            <button type="button" class="editor-btn" onclick="setDefaultVatQuick(20)" style="padding: 2px 8px; font-size: 11px;">20%</button>
+                                            <button type="button" class="editor-btn" onclick="setDefaultVatQuick(19)" style="padding: 2px 8px; font-size: 11px;">19%</button>
+                                            <button type="button" class="editor-btn" onclick="setDefaultVatQuick(0)" style="padding: 2px 8px; font-size: 11px;">0%</button>
+                                        </div>
+                                    </div>
+                                    <div class="agentic-hint">Default rate used for tax subtotal and classified tax category.</div>
+                                </div>
+                            </div>
+
+                            <div class="setting-field-group" style="margin-top: 4px;">
+                                <label class="agentic-section-label" for="acct-tax-category-id">Default Tax Category Code</label>
+                                <select id="acct-tax-category-id" class="agentic-select" onchange="onAccountingSettingChange()" style="max-width: 320px;">
+                                    <option value="S" selected>S - Standard rate (VAT calculated and added)</option>
+                                    <option value="AE">AE - Reverse charge (VAT reverse-assessed)</option>
+                                    <option value="Z">Z - Zero rated goods</option>
+                                    <option value="E">E - Exempt from tax</option>
+                                </select>
+                            </div>
+                        </div>
+
+                        <!-- Card 4: Configurable Odoo UBL 2.1 XML Template -->
+                        <div class="agentic-card" style="border: 1px solid rgba(56, 189, 248, 0.35); background: linear-gradient(180deg, rgba(56, 189, 248, 0.05) 0%, rgba(15, 23, 42, 0.4) 100%);">
+                            <div class="agentic-card-header" style="justify-content: space-between; align-items: center;">
+                                <div style="display: flex; align-items: center; gap: 10px;">
+                                    <span class="material-symbols-outlined agentic-card-icon" style="color: #38bdf8; background: rgba(56, 189, 248, 0.15);">code_blocks</span>
+                                    <div class="agentic-card-title-group">
+                                        <h4 style="color: #f0f9ff;">Configurable Odoo UBL 2.1 XML Template</h4>
+                                        <p class="agentic-subtitle">Deterministic template engine — fills extracted JSON values into compliant XML with zero LLM XML hallucination</p>
+                                    </div>
+                                </div>
+                                <div style="display: flex; gap: 6px;">
+                                    <button type="button" class="editor-btn" onclick="testUblTemplateUI()" title="Test template with sample YouTube Premium invoice data" style="background: rgba(56, 189, 248, 0.15); border-color: rgba(56, 189, 248, 0.4); color: #38bdf8; font-size: 11px; padding: 4px 10px;">
+                                        <span class="material-symbols-outlined" style="font-size: 14px;">play_arrow</span> Test Template
+                                    </button>
+                                    <button type="button" class="editor-btn" onclick="resetUblTemplateUI()" title="Reset template back to built-in default" style="font-size: 11px; padding: 4px 10px;">
+                                        <span class="material-symbols-outlined" style="font-size: 14px;">restart_alt</span> Reset Template
+                                    </button>
+                                </div>
+                            </div>
+
+                            <!-- Placeholder Info Bar -->
+                            <div style="background: rgba(15, 23, 42, 0.6); border: 1px solid rgba(255, 255, 255, 0.08); border-radius: 6px; padding: 8px 10px; font-size: 11px; color: #94a3b8; line-height: 1.5;">
+                                <strong style="color: #e2e8f0;">Available Placeholders:</strong><br>
+                                <code style="color: #38bdf8;">{{INVOICE_NUMBER}}</code>, <code style="color: #38bdf8;">{{ISSUE_DATE}}</code>, <code style="color: #38bdf8;">{{DUE_DATE}}</code>, <code style="color: #38bdf8;">{{CURRENCY}}</code>,
+                                <code style="color: #a78bfa;">{{SUPPLIER_NAME}}</code>, <code style="color: #a78bfa;">{{SUPPLIER_VAT}}</code>, <code style="color: #a78bfa;">{{SUPPLIER_STREET}}</code>, <code style="color: #a78bfa;">{{SUPPLIER_CITY}}</code>, <code style="color: #a78bfa;">{{SUPPLIER_ZIP}}</code>, <code style="color: #a78bfa;">{{SUPPLIER_COUNTRY}}</code>,
+                                <code style="color: #34d399;">{{CUSTOMER_NAME}}</code>, <code style="color: #34d399;">{{CUSTOMER_VAT}}</code>, <code style="color: #34d399;">{{CUSTOMER_STREET}}</code>, <code style="color: #34d399;">{{CUSTOMER_CITY}}</code>, <code style="color: #34d399;">{{CUSTOMER_ZIP}}</code>, <code style="color: #34d399;">{{CUSTOMER_COUNTRY}}</code>,
+                                <code style="color: #f59e0b;">{{TOTAL_NET}}</code>, <code style="color: #f59e0b;">{{TOTAL_VAT}}</code>, <code style="color: #f59e0b;">{{TOTAL_GROSS}}</code>, <code style="color: #f59e0b;">{{VAT_RATE}}</code>, <code style="color: #f59e0b;">{{TAX_CATEGORY_ID}}</code>,
+                                <code style="color: #ec4899;">{{LINE_ITEMS}}</code>
+                            </div>
+
+                            <!-- Template Textarea -->
+                            <div class="setting-field-group">
+                                <label class="agentic-section-label" for="acct-ubl-template">Main UBL 2.1 Invoice Template</label>
+                                <textarea id="acct-ubl-template" class="agentic-text-field" style="width: 100%; height: 240px; font-family: 'Fira Code', Consolas, monospace; font-size: 11px; line-height: 1.4; white-space: pre; background: #0f172a; color: #e2e8f0; border: 1px solid rgba(255, 255, 255, 0.12); border-radius: 6px; resize: vertical; padding: 10px;" oninput="onAccountingSettingChange()"></textarea>
+                            </div>
+
+                            <!-- Line Item Template Textarea -->
+                            <div class="setting-field-group">
+                                <div style="display: flex; justify-content: space-between; align-items: center; margin-bottom: 4px;">
+                                    <label class="agentic-section-label" for="acct-ubl-line-template" style="margin: 0;">Line Item Template (<code style="color: #ec4899;">{{LINE_ITEMS}}</code>)</label>
+                                    <span style="font-size: 11px; color: #94a3b8;">Placeholders: <code>{{LINE_ID}}</code>, <code>{{LINE_QTY}}</code>, <code>{{LINE_PRICE}}</code>, <code>{{LINE_NET}}</code>, <code>{{LINE_DESC}}</code>, <code>{{LINE_VAT_RATE}}</code></span>
+                                </div>
+                                <textarea id="acct-ubl-line-template" class="agentic-text-field" style="width: 100%; height: 130px; font-family: 'Fira Code', Consolas, monospace; font-size: 11px; line-height: 1.4; white-space: pre; background: #0f172a; color: #e2e8f0; border: 1px solid rgba(255, 255, 255, 0.12); border-radius: 6px; resize: vertical; padding: 10px;" oninput="onAccountingSettingChange()"></textarea>
+                            </div>
+                        </div>
+
+                        <!-- Card 5: Quick Presets & Control Bar -->
+                        <div class="agentic-card" style="background: rgba(255,255,255,0.02);">
+                            <div style="display: flex; align-items: center; justify-content: space-between; flex-wrap: wrap; gap: 10px;">
+                                <div style="display: flex; align-items: center; gap: 8px;">
+                                    <button type="button" class="editor-btn" onclick="applyBelgianPcmnPreset()" style="background: rgba(168, 85, 247, 0.15); border-color: rgba(168, 85, 247, 0.4); color: #e9d5ff; font-weight: 500; padding: 6px 12px;">
+                                        <span class="material-symbols-outlined" style="font-size: 16px; vertical-align: middle;">flag</span>
+                                        <span>Apply Belgian PCMN Preset (BE / 21%)</span>
+                                    </button>
+                                    <button type="button" class="editor-btn" onclick="resetAccountingSettingsUI()" style="padding: 6px 12px;" title="Reset accounting settings to initial defaults">
+                                        <span class="material-symbols-outlined" style="font-size: 16px; vertical-align: middle;">restart_alt</span>
+                                        <span>Reset</span>
+                                    </button>
+                                </div>
+                                <button type="button" class="editor-btn" onclick="saveAccountingSettingsUI()" style="background: rgba(59, 130, 246, 0.2); border-color: rgba(59, 130, 246, 0.4); color: #93c5fd; padding: 6px 16px; font-weight: 600;">
+                                    <span class="material-symbols-outlined" style="font-size: 16px; vertical-align: middle;">save</span>
+                                    <span>Save Accounting Settings</span>
+                                </button>
+                            </div>
+                        </div>
+
+                    </div>
+                </div>
             </div>
         </aside>
     </div>
@@ -1883,7 +2169,44 @@
     <script src="https://cdn.jsdelivr.net/npm/three@0.128.0/examples/js/controls/TransformControls.js"></script>
     <script src="https://cdn.jsdelivr.net/npm/three@0.128.0/examples/js/exporters/GLTFExporter.js"></script>
     <script src="https://cdn.jsdelivr.net/npm/three@0.128.0/examples/js/exporters/OBJExporter.js"></script>
-    <script src="https://cdn.jsdelivr.net/npm/three@0.128.0/examples/js/utils/BufferGeometryUtils.js"></script>
+    <!-- Global PDF & File Drag-and-Drop Overlay -->
+    <div id="pdf-drop-overlay" class="pdf-drop-overlay hidden">
+        <div class="drop-overlay-card">
+            <div class="drop-icon-pulse">
+                <span class="material-symbols-outlined">upload_file</span>
+            </div>
+            <h3>Drop PDF Invoices or Images Here</h3>
+            <p>Instant in-browser text extraction, page rasterization, and invoice elaboration.</p>
+            <div class="drop-badges-row">
+                <span class="drop-format-pill">PDF (Invoices / Docs)</span>
+                <span class="drop-format-pill">PNG / JPEG / WebP</span>
+                <span class="drop-format-pill">100% In-Browser & Local</span>
+            </div>
+        </div>
+    </div>
+
+    <!-- Extracted Document Text Preview Modal -->
+    <div id="pdf-text-modal" class="pdf-modal-backdrop hidden" onclick="closePdfTextModal(event)">
+        <div class="pdf-modal-dialog" onclick="event.stopPropagation()">
+            <div class="pdf-modal-header">
+                <div class="pdf-modal-title-row">
+                    <span class="material-symbols-outlined" style="color: #f87171;">picture_as_pdf</span>
+                    <h3 id="pdf-modal-doc-title">Extracted Document Text</h3>
+                </div>
+                <button type="button" class="pdf-modal-close" onclick="closePdfTextModal()">&times;</button>
+            </div>
+            <div class="pdf-modal-body">
+                <div class="pdf-modal-meta-bar">
+                    <span id="pdf-modal-stats">Page 1 of 1 · 0 characters</span>
+                    <button type="button" class="action-btn" onclick="copyExtractedPdfText()" style="padding: 4px 10px; font-size: 11px;">
+                        <span class="material-symbols-outlined" style="font-size: 14px;">content_copy</span>
+                        <span>Copy Text</span>
+                    </button>
+                </div>
+                <pre id="pdf-modal-text-content" class="pdf-modal-text-content"></pre>
+            </div>
+        </div>
+    </div>
 
     <script src="script.js"></script>
 </body>

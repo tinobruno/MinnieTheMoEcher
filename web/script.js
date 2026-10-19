@@ -212,6 +212,9 @@ function stopGeneration() {
 
 tempSlider.addEventListener('input', (e) => {
     tempVal.textContent = e.target.value;
+    if (typeof pushConfigToServer === 'function') {
+        pushConfigToServer({ temperature: parseFloat(e.target.value) });
+    }
 });
 
 const repPenaltySlider = document.getElementById('rep-penalty-slider');
@@ -219,6 +222,9 @@ const repPenaltyVal = document.getElementById('rep-penalty-val');
 if (repPenaltySlider && repPenaltyVal) {
     repPenaltySlider.addEventListener('input', (e) => {
         repPenaltyVal.textContent = parseFloat(e.target.value).toFixed(2);
+        if (typeof pushConfigToServer === 'function') {
+            pushConfigToServer({ repetition_penalty: parseFloat(e.target.value) });
+        }
     });
 }
 
@@ -374,6 +380,7 @@ function initPreviewPanel() {
     setupResizer();
     setupTabs();
     setupSettingsTabs();
+    loadAccountingSettings();
     setupViewportControls();
     setupCodeEditor();
     setupConsoleListener();
@@ -589,6 +596,10 @@ function switchSettingsTab(tabId) {
 
 function openAgenticSettingsTab() {
     openSettingsPanel('settings-tab-agentic');
+}
+
+function openAccountingSettingsTab() {
+    openSettingsPanel('settings-tab-accounting');
 }
 
 // Viewport Emulation
@@ -1334,9 +1345,742 @@ function createYouTubePlayerHtml(videoId, title = 'YouTube Video') {
 </html>`;
 }
 
+// Robust cross-browser clipboard copy with fallback
+function copyTextToClipboard(text) {
+    if (navigator.clipboard && navigator.clipboard.writeText) {
+        return navigator.clipboard.writeText(text);
+    }
+    return new Promise((resolve, reject) => {
+        const ta = document.createElement('textarea');
+        ta.value = text;
+        ta.style.position = 'fixed';
+        ta.style.left = '-9999px';
+        ta.style.top = '-9999px';
+        ta.style.opacity = '0';
+        document.body.appendChild(ta);
+        ta.focus();
+        ta.select();
+        try {
+            const success = document.execCommand('copy');
+            document.body.removeChild(ta);
+            if (success) resolve();
+            else reject(new Error('execCommand copy failed'));
+        } catch (err) {
+            document.body.removeChild(ta);
+            reject(err);
+        }
+    });
+}
+
+// ==========================================
+// Accounting & Odoo Electronic Invoicing Settings & Template Engine
+// ==========================================
+
+// Helper to reliably detect structured invoice JSON and prevent false-positive agentic tool stripping
+function isInvoiceJsonString(text) {
+    if (!text || typeof text !== 'string') return false;
+    const lower = text.toLowerCase();
+    if (lower.includes('"invoice_number"') || lower.includes('"invoice_id"') || lower.includes('"invoice_no"')) return true;
+    if (lower.includes('"issue_date"') && (lower.includes('"supplier"') || lower.includes('"totals"') || lower.includes('"lines"') || lower.includes('"gross"'))) return true;
+    if (lower.includes('"due_date"') && (lower.includes('"supplier"') || lower.includes('"totals"') || lower.includes('"lines"'))) return true;
+    if (lower.includes('"supplier"') && (lower.includes('"totals"') || lower.includes('"lines"') || lower.includes('"vat"') || lower.includes('"vat_rate"') || lower.includes('"net"') || lower.includes('"country"'))) return true;
+    if (lower.includes('"customer"') && (lower.includes('"totals"') || lower.includes('"lines"') || lower.includes('"vat"') || lower.includes('"vat_amount"'))) return true;
+    if (lower.includes('"totals"') && (lower.includes('"lines"') || lower.includes('"gross"') || lower.includes('"net"') || lower.includes('"vat"'))) return true;
+    if (lower.includes('"lines"') && (lower.includes('"unit_price"') || lower.includes('"net_amount"') || lower.includes('"vat_rate"'))) return true;
+    if (lower.includes('"subtotal"') && (lower.includes('"vat"') || lower.includes('"total"') || lower.includes('"tax"'))) return true;
+    if (lower.includes('cac:') || lower.includes('cbc:') || lower.includes('urn:oasis:names:specification:ubl') || lower.includes('fatturaelettronica')) return true;
+    return false;
+}
+
+function isInvoicePayload(obj) {
+    if (!obj || typeof obj !== 'object' || Array.isArray(obj)) return false;
+    if (obj.invoice_number || obj.invoice_id || obj.invoice_no || obj.invoice) return true;
+    if (obj.supplier && (obj.totals || obj.lines || obj.vat || obj.total || obj.country || obj.city)) return true;
+    if (obj.customer && (obj.totals || obj.lines || obj.vat)) return true;
+    if (obj.totals && (obj.lines || obj.net !== undefined || obj.gross !== undefined || obj.vat_amount !== undefined || obj.vat_rate !== undefined)) return true;
+    if (Array.isArray(obj.lines) && obj.lines.length > 0 && (obj.lines[0].unit_price !== undefined || obj.lines[0].net_amount !== undefined || obj.lines[0].vat_rate !== undefined)) return true;
+    return false;
+}
+
+function isRegisteredOrKnownTool(name) {
+    if (!name || typeof name !== 'string') return false;
+    name = name.trim();
+    if (/\s/.test(name)) return false; // Genuine tool names NEVER contain spaces
+    const standardTools = [
+        'web_search', 'youtube_search', 'fetch_url', 'read_file', 'write_file', 
+        'edit_file', 'execute_command', 'list_directory', 'get_weather', 'calculator',
+        'google_search', 'duckduckgo_search', 'shell', 'bash', 'python'
+    ];
+    if (standardTools.includes(name.toLowerCase())) return true;
+    if (name.startsWith('mcp_') || name.startsWith('tool_')) return true;
+    if (typeof agenticSettings !== 'undefined' && agenticSettings && agenticSettings.tools && agenticSettings.tools[name] !== undefined) return true;
+    return false;
+}
+
+function escapeXml(str) {
+    if (str === null || str === undefined) return '';
+    return String(str)
+        .replace(/&/g, '&amp;')
+        .replace(/</g, '&lt;')
+        .replace(/>/g, '&gt;')
+        .replace(/"/g, '&quot;')
+        .replace(/'/g, '&apos;');
+}
+
+function escapeHtml(str) {
+    if (str === null || str === undefined) return '';
+    return String(str)
+        .replace(/&/g, '&amp;')
+        .replace(/</g, '&lt;')
+        .replace(/>/g, '&gt;')
+        .replace(/"/g, '&quot;')
+        .replace(/'/g, '&#39;');
+}
+
+const DEFAULT_UBL_TEMPLATE = `<?xml version="1.0" encoding="UTF-8"?>
+<Invoice xmlns="urn:oasis:names:specification:ubl:schema:xsd:Invoice-2"
+         xmlns:cac="urn:oasis:names:specification:ubl:schema:xsd:CommonAggregateComponents-2"
+         xmlns:cbc="urn:oasis:names:specification:ubl:schema:xsd:CommonBasicComponents-2">
+    <cbc:CustomizationID>urn:cen.eu:en16931:2017#compliant#urn:fdc:peppol.eu:2017:poacc:billing:3.0</cbc:CustomizationID>
+    <cbc:ProfileID>urn:fdc:peppol.eu:2017:poacc:billing:01:1.0</cbc:ProfileID>
+    <cbc:ID>{{INVOICE_NUMBER}}</cbc:ID>
+    <cbc:IssueDate>{{ISSUE_DATE}}</cbc:IssueDate>
+    <cbc:DueDate>{{DUE_DATE}}</cbc:DueDate>
+    <cbc:InvoiceTypeCode>380</cbc:InvoiceTypeCode>
+    <cbc:DocumentCurrencyCode>{{CURRENCY}}</cbc:DocumentCurrencyCode>
+    <cac:AccountingSupplierParty>
+        <cac:Party>
+            <cac:PartyName><cbc:Name>{{SUPPLIER_NAME}}</cbc:Name></cac:PartyName>
+            <cac:PostalAddress>
+                <cbc:StreetName>{{SUPPLIER_STREET}}</cbc:StreetName>
+                <cbc:CityName>{{SUPPLIER_CITY}}</cbc:CityName>
+                <cbc:PostalZone>{{SUPPLIER_ZIP}}</cbc:PostalZone>
+                <cac:Country><cbc:IdentificationCode>{{SUPPLIER_COUNTRY}}</cbc:IdentificationCode></cac:Country>
+            </cac:PostalAddress>
+            <cac:PartyTaxScheme>
+                <cbc:CompanyID>{{SUPPLIER_VAT}}</cbc:CompanyID>
+                <cac:TaxScheme><cbc:ID>VAT</cbc:ID></cac:TaxScheme>
+            </cac:PartyTaxScheme>
+        </cac:Party>
+    </cac:AccountingSupplierParty>
+    <cac:AccountingCustomerParty>
+        <cac:Party>
+            <cac:PartyName><cbc:Name>{{CUSTOMER_NAME}}</cbc:Name></cac:PartyName>
+            <cac:PostalAddress>
+                <cbc:StreetName>{{CUSTOMER_STREET}}</cbc:StreetName>
+                <cbc:CityName>{{CUSTOMER_CITY}}</cbc:CityName>
+                <cbc:PostalZone>{{CUSTOMER_ZIP}}</cbc:PostalZone>
+                <cac:Country><cbc:IdentificationCode>{{CUSTOMER_COUNTRY}}</cbc:IdentificationCode></cac:Country>
+            </cac:PostalAddress>
+            <cac:PartyTaxScheme>
+                <cbc:CompanyID>{{CUSTOMER_VAT}}</cbc:CompanyID>
+                <cac:TaxScheme><cbc:ID>VAT</cbc:ID></cac:TaxScheme>
+            </cac:PartyTaxScheme>
+        </cac:Party>
+    </cac:AccountingCustomerParty>
+    <cac:TaxTotal>
+        <cbc:TaxAmount currencyID="{{CURRENCY}}">{{TOTAL_VAT}}</cbc:TaxAmount>
+        <cac:TaxSubtotal>
+            <cbc:TaxableAmount currencyID="{{CURRENCY}}">{{TOTAL_NET}}</cbc:TaxableAmount>
+            <cbc:TaxAmount currencyID="{{CURRENCY}}">{{TOTAL_VAT}}</cbc:TaxAmount>
+            <cac:TaxCategory>
+                <cbc:ID>{{TAX_CATEGORY_ID}}</cbc:ID>
+                <cbc:Percent>{{VAT_RATE}}</cbc:Percent>
+                <cac:TaxScheme><cbc:ID>VAT</cbc:ID></cac:TaxScheme>
+            </cac:TaxCategory>
+        </cac:TaxSubtotal>
+    </cac:TaxTotal>
+    <cac:LegalMonetaryTotal>
+        <cbc:LineExtensionAmount currencyID="{{CURRENCY}}">{{TOTAL_NET}}</cbc:LineExtensionAmount>
+        <cbc:TaxExclusiveAmount currencyID="{{CURRENCY}}">{{TOTAL_NET}}</cbc:TaxExclusiveAmount>
+        <cbc:TaxInclusiveAmount currencyID="{{CURRENCY}}">{{TOTAL_GROSS}}</cbc:TaxInclusiveAmount>
+        <cbc:PayableAmount currencyID="{{CURRENCY}}">{{TOTAL_GROSS}}</cbc:PayableAmount>
+    </cac:LegalMonetaryTotal>
+{{LINE_ITEMS}}
+</Invoice>`;
+
+const DEFAULT_UBL_LINE_TEMPLATE = `    <cac:InvoiceLine>
+        <cbc:ID>{{LINE_ID}}</cbc:ID>
+        <cbc:InvoicedQuantity unitCode="C62">{{LINE_QTY}}</cbc:InvoicedQuantity>
+        <cbc:LineExtensionAmount currencyID="{{CURRENCY}}">{{LINE_NET}}</cbc:LineExtensionAmount>
+        <cac:Item>
+            <cbc:Description>{{LINE_DESC}}</cbc:Description>
+            <cac:ClassifiedTaxCategory>
+                <cbc:ID>{{TAX_CATEGORY_ID}}</cbc:ID>
+                <cbc:Percent>{{LINE_VAT_RATE}}</cbc:Percent>
+                <cac:TaxScheme><cbc:ID>VAT</cbc:ID></cac:TaxScheme>
+            </cac:ClassifiedTaxCategory>
+        </cac:Item>
+        <cac:Price>
+            <cbc:PriceAmount currencyID="{{CURRENCY}}">{{LINE_PRICE}}</cbc:PriceAmount>
+        </cac:Price>
+    </cac:InvoiceLine>`;
+
+const DEFAULT_ACCOUNTING_SETTINGS = {
+    companyCountry: 'BE',
+    companyVat: '',
+    supplierCountryMode: 'force_company', // 'force_company' | 'smart' | 'custom' | 'auto'
+    customSupplierCountry: 'BE',
+    defaultExpenseAccount: '610000',
+    defaultTaxRate: '21',
+    taxCategoryId: 'S',
+    taxScheme: 'VAT',
+    ublTemplate: DEFAULT_UBL_TEMPLATE,
+    ublLineTemplate: DEFAULT_UBL_LINE_TEMPLATE
+};
+
+let accountingSettings = { ...DEFAULT_ACCOUNTING_SETTINGS };
+
+function getAccountingSettings() {
+    return accountingSettings;
+}
+
+function loadAccountingSettings() {
+    try {
+        const saved = localStorage.getItem('moecher_accounting_settings');
+        if (saved) {
+            const parsed = JSON.parse(saved);
+            accountingSettings = { ...DEFAULT_ACCOUNTING_SETTINGS, ...parsed };
+        }
+    } catch (e) {
+        console.warn('Could not load accounting settings from localStorage', e);
+    }
+    updateAccountingUI();
+}
+
+function saveAccountingSettings(silent = false) {
+    try {
+        localStorage.setItem('moecher_accounting_settings', JSON.stringify(accountingSettings));
+        if (!silent) {
+            showToast('Accounting & Odoo settings saved', 'success');
+        }
+    } catch (e) {
+        console.warn('Could not save accounting settings to localStorage', e);
+        if (!silent) {
+            showToast('Failed to save accounting settings', 'error');
+        }
+    }
+}
+
+function updateAccountingUI() {
+    const compCountryInput = document.getElementById('acct-company-country');
+    if (compCountryInput) compCountryInput.value = accountingSettings.companyCountry || 'BE';
+
+    const compVatInput = document.getElementById('acct-company-vat');
+    if (compVatInput) compVatInput.value = accountingSettings.companyVat || '';
+
+    const customCountryInput = document.getElementById('acct-custom-supplier-country');
+    if (customCountryInput) customCountryInput.value = accountingSettings.customSupplierCountry || 'BE';
+
+    const expenseAcctInput = document.getElementById('acct-default-expense-account');
+    if (expenseAcctInput) expenseAcctInput.value = accountingSettings.defaultExpenseAccount || '610000';
+
+    const vatRateInput = document.getElementById('acct-default-vat-rate');
+    if (vatRateInput) vatRateInput.value = accountingSettings.defaultTaxRate || '21';
+
+    const taxCatSelect = document.getElementById('acct-tax-category-id');
+    if (taxCatSelect) taxCatSelect.value = accountingSettings.taxCategoryId || 'S';
+
+    const ublTplEl = document.getElementById('acct-ubl-template');
+    if (ublTplEl) ublTplEl.value = accountingSettings.ublTemplate || DEFAULT_UBL_TEMPLATE;
+
+    const ublLineTplEl = document.getElementById('acct-ubl-line-template');
+    if (ublLineTplEl) ublLineTplEl.value = accountingSettings.ublLineTemplate || DEFAULT_UBL_LINE_TEMPLATE;
+
+    const mode = accountingSettings.supplierCountryMode || 'force_company';
+    const radioId = mode === 'force_company' ? 'acct-supp-mode-force-company' :
+                    mode === 'smart' ? 'acct-supp-mode-smart' :
+                    mode === 'custom' ? 'acct-supp-mode-custom' :
+                    'acct-supp-mode-auto';
+    const radioEl = document.getElementById(radioId);
+    if (radioEl) radioEl.checked = true;
+
+    const previewCompCountry = document.getElementById('acct-preview-comp-country');
+    if (previewCompCountry) previewCompCountry.textContent = accountingSettings.companyCountry || 'BE';
+    document.querySelectorAll('.acct-preview-comp-code').forEach(el => {
+        el.textContent = accountingSettings.companyCountry || 'BE';
+    });
+}
+
+function onAccountingSettingChange() {
+    const compCountryInput = document.getElementById('acct-company-country');
+    if (compCountryInput) accountingSettings.companyCountry = (compCountryInput.value || 'BE').trim().toUpperCase();
+
+    const compVatInput = document.getElementById('acct-company-vat');
+    if (compVatInput) accountingSettings.companyVat = compVatInput.value.trim().toUpperCase();
+
+    const customCountryInput = document.getElementById('acct-custom-supplier-country');
+    if (customCountryInput) accountingSettings.customSupplierCountry = (customCountryInput.value || 'BE').trim().toUpperCase();
+
+    const expenseAcctInput = document.getElementById('acct-default-expense-account');
+    if (expenseAcctInput) accountingSettings.defaultExpenseAccount = expenseAcctInput.value.trim();
+
+    const vatRateInput = document.getElementById('acct-default-vat-rate');
+    if (vatRateInput) accountingSettings.defaultTaxRate = vatRateInput.value.trim() || '21';
+
+    const taxCatSelect = document.getElementById('acct-tax-category-id');
+    if (taxCatSelect) accountingSettings.taxCategoryId = taxCatSelect.value || 'S';
+
+    const ublTplEl = document.getElementById('acct-ubl-template');
+    if (ublTplEl && ublTplEl.value.trim()) accountingSettings.ublTemplate = ublTplEl.value;
+
+    const ublLineTplEl = document.getElementById('acct-ubl-line-template');
+    if (ublLineTplEl && ublLineTplEl.value.trim()) accountingSettings.ublLineTemplate = ublLineTplEl.value;
+
+    const checkedRadio = document.querySelector('input[name="acct_supp_country_mode"]:checked');
+    if (checkedRadio) accountingSettings.supplierCountryMode = checkedRadio.value;
+
+    const previewCompCountry = document.getElementById('acct-preview-comp-country');
+    if (previewCompCountry) previewCompCountry.textContent = accountingSettings.companyCountry || 'BE';
+    document.querySelectorAll('.acct-preview-comp-code').forEach(el => {
+        el.textContent = accountingSettings.companyCountry || 'BE';
+    });
+
+    saveAccountingSettings(true);
+}
+
+function onAccountingCompanyCountryChange() {
+    onAccountingSettingChange();
+}
+
+function setCompanyCountryQuick(code) {
+    const compCountryInput = document.getElementById('acct-company-country');
+    if (compCountryInput) {
+        compCountryInput.value = code;
+        onAccountingSettingChange();
+    }
+}
+
+function setDefaultVatQuick(rate) {
+    const vatRateInput = document.getElementById('acct-default-vat-rate');
+    if (vatRateInput) {
+        vatRateInput.value = rate;
+        onAccountingSettingChange();
+    }
+}
+
+function saveAccountingSettingsUI() {
+    onAccountingSettingChange();
+    saveAccountingSettings(false);
+}
+
+function resetAccountingSettingsUI() {
+    accountingSettings = { ...DEFAULT_ACCOUNTING_SETTINGS };
+    updateAccountingUI();
+    saveAccountingSettings(true);
+    showToast('Accounting settings reset to default', 'info');
+}
+
+function resetUblTemplateUI() {
+    accountingSettings.ublTemplate = DEFAULT_UBL_TEMPLATE;
+    accountingSettings.ublLineTemplate = DEFAULT_UBL_LINE_TEMPLATE;
+    updateAccountingUI();
+    saveAccountingSettings(false);
+    showToast('Odoo UBL XML template reset to default', 'info');
+}
+
+function escapeXml(unsafe) {
+    if (!unsafe || typeof unsafe !== 'string') return unsafe ? String(unsafe) : '';
+    return unsafe.replace(/[<>&'"]/g, c => {
+        switch (c) {
+            case '<': return '&lt;';
+            case '>': return '&gt;';
+            case '&': return '&amp;';
+            case '\'': return '&apos;';
+            case '"': return '&quot;';
+            default: return c;
+        }
+    });
+}
+
+// Deterministically fills the configurable UBL 2.1 XML template from extracted invoice JSON
+function fillOdooXmlTemplate(invoiceData, customTemplate = null, customLineTemplate = null) {
+    if (!invoiceData || typeof invoiceData !== 'object') return '';
+    const acct = getAccountingSettings();
+    const template = customTemplate || acct.ublTemplate || DEFAULT_UBL_TEMPLATE;
+    const lineTemplate = customLineTemplate || acct.ublLineTemplate || DEFAULT_UBL_LINE_TEMPLATE;
+
+    const currency = (invoiceData.currency || 'EUR').toUpperCase();
+    const invoiceNumber = invoiceData.invoice_number || invoiceData.number || invoiceData.id || ('INV-' + new Date().toISOString().slice(0, 10).replace(/-/g, ''));
+    const issueDate = invoiceData.issue_date || invoiceData.date || new Date().toISOString().slice(0, 10);
+    const dueDate = invoiceData.due_date || issueDate;
+
+    // Supplier
+    const supp = invoiceData.supplier || {};
+    const suppName = supp.name || 'Unknown Supplier';
+    const suppVat = supp.vat || supp.vat_number || supp.tax_id || (supp.country ? `${supp.country}0000000000` : 'BE0000000000');
+    const suppStreet = supp.street || supp.address || 'Business Street';
+    const suppCity = supp.city || 'Brussels';
+    const suppZip = supp.zip || supp.postal_code || '1000';
+
+    // Supplier Country determination based on settings
+    let suppCountry = (supp.country || 'BE').trim().toUpperCase();
+    const compCountry = (acct.companyCountry || 'BE').trim().toUpperCase();
+
+    if (acct.supplierCountryMode === 'force_company') {
+        suppCountry = compCountry;
+    } else if (acct.supplierCountryMode === 'custom' && acct.customSupplierCountry) {
+        suppCountry = acct.customSupplierCountry.trim().toUpperCase();
+    } else if (acct.supplierCountryMode === 'smart') {
+        const net = parseFloat(invoiceData.totals?.net ?? invoiceData.subtotal ?? 0);
+        const gross = parseFloat(invoiceData.totals?.gross ?? invoiceData.total ?? 0);
+        const vat = parseFloat(invoiceData.totals?.vat_amount ?? invoiceData.vat ?? (gross - net));
+        if (vat > 0) {
+            suppCountry = compCountry;
+        }
+    }
+
+    // Customer
+    const cust = invoiceData.customer || {};
+    const custName = cust.name || acct.companyName || 'My Company';
+    const custVat = acct.companyVat || cust.vat || cust.vat_number || `${compCountry}0000000000`;
+    const custStreet = cust.street || 'Business Avenue';
+    const custCity = cust.city || 'Brussels';
+    const custZip = cust.zip || '1000';
+    const custCountry = compCountry;
+
+    // Totals
+    const totals = invoiceData.totals || {};
+    let net = parseFloat(totals.net ?? invoiceData.subtotal ?? 0);
+    let gross = parseFloat(totals.gross ?? invoiceData.total ?? 0);
+    let vatAmount = parseFloat(totals.vat_amount ?? invoiceData.vat ?? 0);
+    let vatRate = parseFloat(totals.vat_rate ?? invoiceData.vat_rate ?? acct.defaultTaxRate ?? 21);
+
+    if (isNaN(net) || net <= 0) {
+        if (gross > 0 && vatRate > 0) net = gross / (1 + vatRate / 100);
+        else net = 0;
+    }
+    if (isNaN(gross) || gross <= 0) {
+        gross = net + (isNaN(vatAmount) ? 0 : vatAmount);
+    }
+    if (isNaN(vatAmount) || vatAmount < 0) {
+        vatAmount = gross - net;
+    }
+
+    const taxCategoryId = acct.taxCategoryId || 'S';
+
+    // Render Lines
+    const lines = invoiceData.lines && Array.isArray(invoiceData.lines) && invoiceData.lines.length > 0 
+        ? invoiceData.lines 
+        : [{
+            description: invoiceData.description || suppName + ' Item',
+            quantity: 1,
+            unit_price: net,
+            net_amount: net,
+            vat_rate: vatRate
+        }];
+
+    let renderedLines = '';
+    lines.forEach((line, idx) => {
+        const lineId = idx + 1;
+        const lineQty = parseFloat(line.quantity || 1).toFixed(2);
+        const linePrice = parseFloat(line.unit_price ?? line.net_amount ?? net).toFixed(2);
+        const lineNet = parseFloat(line.net_amount ?? (lineQty * linePrice)).toFixed(2);
+        const lineDesc = escapeXml(line.description || suppName);
+        const lineVatRate = parseFloat(line.vat_rate ?? vatRate).toFixed(2);
+
+        let lineXml = lineTemplate
+            .replace(/\{\{LINE_ID\}\}/g, lineId)
+            .replace(/\{\{LINE_QTY\}\}/g, lineQty)
+            .replace(/\{\{LINE_PRICE\}\}/g, linePrice)
+            .replace(/\{\{LINE_NET\}\}/g, lineNet)
+            .replace(/\{\{LINE_DESC\}\}/g, lineDesc)
+            .replace(/\{\{LINE_VAT_RATE\}\}/g, lineVatRate)
+            .replace(/\{\{CURRENCY\}\}/g, currency)
+            .replace(/\{\{TAX_CATEGORY_ID\}\}/g, taxCategoryId);
+
+        renderedLines += (renderedLines ? '\n' : '') + lineXml;
+    });
+
+    // Populate main template
+    let xml = template
+        .replace(/\{\{INVOICE_NUMBER\}\}/g, escapeXml(invoiceNumber))
+        .replace(/\{\{ISSUE_DATE\}\}/g, escapeXml(issueDate))
+        .replace(/\{\{DUE_DATE\}\}/g, escapeXml(dueDate))
+        .replace(/\{\{CURRENCY\}\}/g, currency)
+        .replace(/\{\{SUPPLIER_NAME\}\}/g, escapeXml(suppName))
+        .replace(/\{\{SUPPLIER_VAT\}\}/g, escapeXml(suppVat))
+        .replace(/\{\{SUPPLIER_STREET\}\}/g, escapeXml(suppStreet))
+        .replace(/\{\{SUPPLIER_CITY\}\}/g, escapeXml(suppCity))
+        .replace(/\{\{SUPPLIER_ZIP\}\}/g, escapeXml(suppZip))
+        .replace(/\{\{SUPPLIER_COUNTRY\}\}/g, suppCountry)
+        .replace(/\{\{CUSTOMER_NAME\}\}/g, escapeXml(custName))
+        .replace(/\{\{CUSTOMER_VAT\}\}/g, escapeXml(custVat))
+        .replace(/\{\{CUSTOMER_STREET\}\}/g, escapeXml(custStreet))
+        .replace(/\{\{CUSTOMER_CITY\}\}/g, escapeXml(custCity))
+        .replace(/\{\{CUSTOMER_ZIP\}\}/g, escapeXml(custZip))
+        .replace(/\{\{CUSTOMER_COUNTRY\}\}/g, custCountry)
+        .replace(/\{\{TOTAL_NET\}\}/g, net.toFixed(2))
+        .replace(/\{\{TOTAL_VAT\}\}/g, vatAmount.toFixed(2))
+        .replace(/\{\{TOTAL_GROSS\}\}/g, gross.toFixed(2))
+        .replace(/\{\{VAT_RATE\}\}/g, vatRate.toFixed(2))
+        .replace(/\{\{TAX_CATEGORY_ID\}\}/g, taxCategoryId)
+        .replace(/\{\{LINE_ITEMS\}\}/g, renderedLines);
+
+    return normalizeOdooUblXml(xml);
+}
+
+function testUblTemplateUI() {
+    onAccountingSettingChange();
+    const sampleInvoice = {
+        invoice_number: "3612693697828449-51",
+        issue_date: "2026-06-25",
+        due_date: "2026-07-13",
+        currency: "EUR",
+        supplier: {
+            name: "Google Ireland Limited",
+            vat: "IE6388047V",
+            country: "IE",
+            street: "Gordon House, Barrow Street",
+            city: "Dublin 4",
+            zip: "D04 V4X7"
+        },
+        customer: {
+            name: "My Company SRL",
+            vat: accountingSettings.companyVat || "BE0403170701",
+            country: "BE",
+            street: "Boulevard Simón Bolívar 36",
+            city: "Bruxelles",
+            zip: "1000"
+        },
+        totals: {
+            net: 21.48,
+            vat_rate: 21.0,
+            vat_amount: 4.51,
+            gross: 25.99
+        },
+        lines: [
+            {
+                description: "YouTube Premium",
+                quantity: 1,
+                unit_price: 21.48,
+                net_amount: 21.48,
+                vat_rate: 21.0
+            }
+        ]
+    };
+    const compiledXml = fillOdooXmlTemplate(sampleInvoice);
+    downloadXmlFile(compiledXml, 'odoo_sample_test.xml');
+    showToast('Compiled sample YouTube Premium invoice into XML and downloaded!', 'success');
+}
+
+function applyBelgianPcmnPreset() {
+    accountingSettings = {
+        companyCountry: 'BE',
+        companyVat: accountingSettings.companyVat || '',
+        supplierCountryMode: 'force_company',
+        customSupplierCountry: 'BE',
+        defaultExpenseAccount: '610000',
+        defaultTaxRate: '21',
+        taxCategoryId: 'S',
+        taxScheme: 'VAT',
+        ublTemplate: DEFAULT_UBL_TEMPLATE,
+        ublLineTemplate: DEFAULT_UBL_LINE_TEMPLATE
+    };
+    updateAccountingUI();
+    saveAccountingSettings(false);
+    showToast('Belgian PCMN Preset applied (BE / 21% / 610000)', 'success');
+}
+
+// Normalizes and validates UBL 2.1 / Peppol BIS 3.0 XML specifically for Odoo Accounting import
+function normalizeOdooUblXml(xml) {
+    if (!xml || typeof xml !== 'string') return xml;
+    if (!xml.includes('<Invoice') && !xml.includes('Invoice-2') && !xml.includes('cac:') && !xml.includes('cbc:')) {
+        return xml;
+    }
+
+    let result = xml;
+
+    // Rule 2: Address Country - use <cac:Country><cbc:IdentificationCode>2-LETTER-CODE</cbc:IdentificationCode></cac:Country> (Do NOT use CountryID)
+    result = result.replace(/<cac:Country>\s*<cbc:CountryID>(.*?)<\/cbc:CountryID>\s*<\/cac:Country>/gi,
+        '<cac:Country><cbc:IdentificationCode>$1</cbc:IdentificationCode></cac:Country>');
+    result = result.replace(/<cbc:CountryID>(.*?)<\/cbc:CountryID>/gi,
+        '<cbc:IdentificationCode>$1</cbc:IdentificationCode>');
+
+    // Rule 4: Global Taxes - never use <cbc:TaxRate>; use <cbc:Percent>
+    result = result.replace(/<cbc:TaxRate>(.*?)<\/cbc:TaxRate>/gi, '<cbc:Percent>$1</cbc:Percent>');
+
+    // Rule 5: Quantities - use attribute unitCode="C62" (never unit="EA" or unitCode="EA")
+    result = result.replace(/<cbc:InvoicedQuantity\b([^>]*)>/gi, (match, attrs) => {
+        let cleanAttrs = attrs.replace(/\bunit="[^"]*"/gi, '').replace(/\bunitCode="[^"]*"/gi, '').trim();
+        return `<cbc:InvoicedQuantity unitCode="C62"${cleanAttrs ? ' ' + cleanAttrs : ''}>`;
+    });
+
+    // Rule 1: Supplier & Customer VAT inside <cac:PartyTaxScheme><cbc:CompanyID> (full VAT including country prefix)
+    result = result.replace(/<cac:PartyTaxScheme>([\s\S]*?)<\/cac:PartyTaxScheme>/gi, (match, inner) => {
+        let updated = inner.replace(/<cbc:CompanyRegistrationID>(.*?)<\/cbc:CompanyRegistrationID>/gi, '<cbc:CompanyID>$1</cbc:CompanyID>');
+        updated = updated.replace(/<cbc:TaxRegistrationID>(.*?)<\/cbc:TaxRegistrationID>/gi, '<cbc:CompanyID>$1</cbc:CompanyID>');
+        return `<cac:PartyTaxScheme>${updated}</cac:PartyTaxScheme>`;
+    });
+
+    // Extract VAT percent from TaxTotal or TaxSubtotal if present
+    const acctSettings = getAccountingSettings();
+    let globalVatPercent = acctSettings.defaultTaxRate || '21';
+    const vatPctMatch = result.match(/<cac:TaxCategory>[\s\S]*?<cbc:Percent>([0-9.]+)<\/cbc:Percent>/i) ||
+                        result.match(/<cbc:Percent>([0-9.]+)<\/cbc:Percent>/i);
+    if (vatPctMatch && vatPctMatch[1]) {
+        globalVatPercent = vatPctMatch[1];
+    }
+
+    // Rule 4 (cont): In TaxTotal / TaxSubtotal, ensure TaxCategory has ID S, Percent, TaxScheme VAT
+    result = result.replace(/<cac:TaxSubtotal>([\s\S]*?)<\/cac:TaxSubtotal>/gi, (match, inner) => {
+        if (!inner.includes('<cac:TaxCategory>')) {
+            const taxCatBlock = `\n            <cac:TaxCategory>\n                <cbc:ID>S</cbc:ID>\n                <cbc:Percent>${globalVatPercent}</cbc:Percent>\n                <cac:TaxScheme>\n                    <cbc:ID>VAT</cbc:ID>\n                </cac:TaxScheme>\n            </cac:TaxCategory>`;
+            return `<cac:TaxSubtotal>${inner}${taxCatBlock}\n        </cac:TaxSubtotal>`;
+        }
+        return match;
+    });
+
+    // Rule 3: Every Invoice Line MUST include <cac:Item><cac:ClassifiedTaxCategory> with S, Percent, VAT
+    result = result.replace(/<cac:InvoiceLine>([\s\S]*?)<\/cac:InvoiceLine>/gi, (lineMatch, lineInner) => {
+        // If InvoiceLine already has ClassifiedTaxCategory, keep it
+        if (lineInner.includes('<cac:ClassifiedTaxCategory>')) {
+            return lineMatch;
+        }
+
+        // If InvoiceLine has <cac:Item>, inject ClassifiedTaxCategory right before </cac:Item>
+        if (lineInner.includes('<cac:Item>')) {
+            const classifiedTaxBlock = `\n            <cac:ClassifiedTaxCategory>\n                <cbc:ID>S</cbc:ID>\n                <cbc:Percent>${globalVatPercent}</cbc:Percent>\n                <cac:TaxScheme>\n                    <cbc:ID>VAT</cbc:ID>\n                </cac:TaxScheme>\n            </cac:ClassifiedTaxCategory>\n        </cac:Item>`;
+            const updatedInner = lineInner.replace(/<\/cac:Item>/i, classifiedTaxBlock);
+            return `<cac:InvoiceLine>${updatedInner}</cac:InvoiceLine>`;
+        }
+
+        return lineMatch;
+    });
+
+    // Rule 6: Supplier Country & Odoo Fiscal Position Override (Prevent Intra-EU reverse charge on gross bills)
+    let targetSupplierCountry = null;
+    const compCountry = (acctSettings.companyCountry || 'BE').trim().toUpperCase();
+
+    if (acctSettings.supplierCountryMode === 'force_company') {
+        targetSupplierCountry = compCountry;
+    } else if (acctSettings.supplierCountryMode === 'smart') {
+        // If the invoice specifies a VAT tax amount > 0, force company country so Odoo doesn't zero out VAT
+        const hasVat = /<cbc:TaxAmount\b[^>]*>([1-9][0-9.]*|0\.[0-9]*[1-9])<\/cbc:TaxAmount>/i.test(result);
+        if (hasVat) {
+            targetSupplierCountry = compCountry;
+        }
+    } else if (acctSettings.supplierCountryMode === 'custom' && acctSettings.customSupplierCountry) {
+        targetSupplierCountry = acctSettings.customSupplierCountry.trim().toUpperCase();
+    }
+
+    if (targetSupplierCountry) {
+        result = result.replace(/<cac:AccountingSupplierParty>([\s\S]*?)<\/cac:AccountingSupplierParty>/gi, (suppMatch, suppInner) => {
+            let updatedSupp = suppInner;
+            if (updatedSupp.includes('<cac:Country>')) {
+                updatedSupp = updatedSupp.replace(/<cac:Country>\s*<cbc:IdentificationCode>[^<]*<\/cbc:IdentificationCode>\s*<\/cac:Country>/gi,
+                    `<cac:Country><cbc:IdentificationCode>${targetSupplierCountry}</cbc:IdentificationCode></cac:Country>`);
+            } else if (updatedSupp.includes('</cac:PostalAddress>')) {
+                updatedSupp = updatedSupp.replace(/<\/cac:PostalAddress>/gi,
+                    `    <cac:Country><cbc:IdentificationCode>${targetSupplierCountry}</cbc:IdentificationCode></cac:Country>\n            </cac:PostalAddress>`);
+            }
+            return `<cac:AccountingSupplierParty>${updatedSupp}</cac:AccountingSupplierParty>`;
+        });
+    }
+
+    // Customer Country & Company VAT injection
+    result = result.replace(/<cac:AccountingCustomerParty>([\s\S]*?)<\/cac:AccountingCustomerParty>/gi, (custMatch, custInner) => {
+        let updatedCust = custInner;
+        if (compCountry) {
+            if (updatedCust.includes('<cac:Country>')) {
+                updatedCust = updatedCust.replace(/<cac:Country>\s*<cbc:IdentificationCode>[^<]*<\/cbc:IdentificationCode>\s*<\/cac:Country>/gi,
+                    `<cac:Country><cbc:IdentificationCode>${compCountry}</cbc:IdentificationCode></cac:Country>`);
+            } else if (updatedCust.includes('</cac:PostalAddress>')) {
+                updatedCust = updatedCust.replace(/<\/cac:PostalAddress>/gi,
+                    `    <cac:Country><cbc:IdentificationCode>${compCountry}</cbc:IdentificationCode></cac:Country>\n            </cac:PostalAddress>`);
+            }
+        }
+        if (acctSettings.companyVat && acctSettings.companyVat.trim()) {
+            const cVat = acctSettings.companyVat.trim().toUpperCase();
+            if (updatedCust.includes('<cac:PartyTaxScheme>')) {
+                updatedCust = updatedCust.replace(/<cac:PartyTaxScheme>[\s\S]*?<\/cac:PartyTaxScheme>/gi,
+                    `<cac:PartyTaxScheme><cbc:CompanyID>${cVat}</cbc:CompanyID><cac:TaxScheme><cbc:ID>VAT</cbc:ID></cac:TaxScheme></cac:PartyTaxScheme>`);
+            } else if (updatedCust.includes('</cac:Party>')) {
+                updatedCust = updatedCust.replace(/<\/cac:Party>/gi,
+                    `    <cac:PartyTaxScheme><cbc:CompanyID>${cVat}</cbc:CompanyID><cac:TaxScheme><cbc:ID>VAT</cbc:ID></cac:TaxScheme></cac:PartyTaxScheme>\n        </cac:Party>`);
+            }
+        }
+        return `<cac:AccountingCustomerParty>${updatedCust}</cac:AccountingCustomerParty>`;
+    });
+
+    return result;
+}
+
+// Preprocess markdown text to ensure raw XML documents and tags are never swallowed as invisible HTML elements
+function preprocessMarkdownForXml(text) {
+    if (!text || typeof text !== 'string') return text;
+
+    // Check if there are already code blocks in the text
+    // Split by markdown code fence blocks ```...``` (or open ```... at the end during streaming)
+    const codeBlockRegex = /(```[\s\S]*?(?:```|$))/g;
+    const segments = [];
+    let lastIndex = 0;
+    let match;
+
+    while ((match = codeBlockRegex.exec(text)) !== null) {
+        if (match.index > lastIndex) {
+            segments.push({ type: 'text', content: text.substring(lastIndex, match.index) });
+        }
+        segments.push({ type: 'code', content: match[0] });
+        lastIndex = match.index + match[0].length;
+    }
+    if (lastIndex < text.length) {
+        segments.push({ type: 'text', content: text.substring(lastIndex) });
+    }
+
+    function escapeStandaloneXmlTags(str) {
+        if (!str || typeof str !== 'string') return str;
+        // Escape namespaced tags like <cbc:ID>, </cac:Party>, <cac:TaxTotal>, etc. so they render as visible code
+        str = str.replace(/<\/?([a-zA-Z0-9_-]+:[a-zA-Z0-9_-]+)([^>]*)>/g, (m, tag, attrs) => {
+            return '`<' + (m.startsWith('</') ? '/' : '') + tag + attrs + '>`';
+        });
+        // Escape standalone PascalCase XML tags like <InvoiceLine>, </InvoiceLine>, <TaxSubtotal> that are not standard HTML
+        const standardHtml = /^(a|abbr|address|area|article|aside|audio|b|base|bdi|bdo|blockquote|body|br|button|canvas|caption|cite|code|col|colgroup|data|datalist|dd|del|details|dfn|dialog|div|dl|dt|em|embed|fieldset|figcaption|figure|footer|form|h1|h2|h3|h4|h5|h6|head|header|hr|html|i|iframe|img|input|ins|kbd|label|legend|li|link|main|map|mark|meta|meter|nav|noscript|object|ol|optgroup|option|output|p|param|picture|pre|progress|q|rp|rt|ruby|s|samp|script|section|select|small|source|span|strong|style|sub|summary|sup|svg|table|tbody|td|template|textarea|tfoot|th|thead|time|title|tr|track|u|ul|var|video|wbr)$/i;
+        str = str.replace(/<\/?([A-Z][a-zA-Z0-9_-]+)([^>]*)>/g, (m, tag, attrs) => {
+            if (standardHtml.test(tag)) return m;
+            return '`<' + (m.startsWith('</') ? '/' : '') + tag + attrs + '>`';
+        });
+        return str;
+    }
+
+    for (let i = 0; i < segments.length; i++) {
+        if (segments[i].type !== 'text') continue;
+        let segmentText = segments[i].content;
+
+        // Detect if this un-fenced text segment contains a full or streaming XML document
+        const docXmlMatch = /(<\?xml\b[\s\S]*?|<Invoice\b[\s\S]*?|<odoo\b[\s\S]*?|<FatturaElettronica\b[\s\S]*?)/i.exec(segmentText);
+        if (docXmlMatch) {
+            const startIdx = docXmlMatch.index;
+            const beforeXml = segmentText.substring(0, startIdx);
+            let xmlBody = segmentText.substring(startIdx);
+
+            // Check if there is trailing plain text after a root closing tag
+            const closeMatch = /(<\/Invoice>|<\/odoo>|<\/FatturaElettronica>)/i.exec(xmlBody);
+            let afterXml = '';
+            if (closeMatch) {
+                const endPos = closeMatch.index + closeMatch[0].length;
+                afterXml = xmlBody.substring(endPos);
+                xmlBody = xmlBody.substring(0, endPos);
+            }
+
+            const cleanXml = normalizeOdooUblXml(xmlBody.trim());
+            const escapedBefore = escapeStandaloneXmlTags(beforeXml);
+            const escapedAfter = escapeStandaloneXmlTags(afterXml);
+            segments[i].content = escapedBefore + (escapedBefore && !escapedBefore.endsWith('\n') ? '\n\n' : '') +
+                                  '```xml\n' + cleanXml + '\n```' +
+                                  (escapedAfter && !escapedAfter.startsWith('\n') ? '\n\n' : '') + escapedAfter;
+        } else {
+            segments[i].content = escapeStandaloneXmlTags(segmentText);
+        }
+    }
+
+    return segments.map(s => s.content).join('');
+}
+
 // Markdown rendering and code-block post-processing
 function renderMarkdownContent(rawText, containerElement) {
-    containerElement.innerHTML = marked.parse(rawText);
+    const processedText = preprocessMarkdownForXml(rawText);
+    containerElement.innerHTML = marked.parse(processedText);
 
     // Decorate code blocks
     const codeBlocks = containerElement.querySelectorAll('pre > code');
@@ -1347,7 +2091,13 @@ function renderMarkdownContent(rawText, containerElement) {
         const codeContent = codeEl.textContent || '';
         const rawClass = codeEl.className || '';
         const match = /language-(\w+)/.exec(rawClass);
-        const lang = match ? match[1] : '';
+        let lang = match ? match[1] : '';
+
+        const isXmlCandidate = (lang === 'xml' || lang === 'ubl' || !lang || lang === 'code') &&
+            (codeContent.includes('<Invoice') || codeContent.includes('<odoo') || codeContent.includes('<?xml') || codeContent.includes('urn:oasis:names:specification:ubl') || codeContent.includes('cac:') || codeContent.includes('cbc:') || codeContent.includes('FatturaElettronica'));
+        if (isXmlCandidate && (!lang || lang === 'code')) {
+            lang = 'xml';
+        }
 
         const isHtmlCandidate = isHtmlContent(codeContent, lang);
         if (isHtmlCandidate) {
@@ -1362,7 +2112,7 @@ function renderMarkdownContent(rawText, containerElement) {
 
         const langDiv = document.createElement('div');
         langDiv.className = 'code-block-lang';
-        langDiv.textContent = (lang || 'code').toUpperCase();
+        langDiv.textContent = (isXmlCandidate ? 'XML' : (lang || 'code')).toUpperCase();
 
         const is3dCandidate = is3DContent(codeContent, lang);
 
@@ -1392,13 +2142,135 @@ function renderMarkdownContent(rawText, containerElement) {
         copyBtn.className = 'code-action-btn';
         copyBtn.innerHTML = `<span class="material-symbols-outlined btn-icon">content_copy</span> Copy`;
         copyBtn.addEventListener('click', () => {
-            navigator.clipboard.writeText(codeContent).then(() => {
+            const textToCopy = isXmlCandidate ? normalizeOdooUblXml(codeContent) : codeContent;
+            copyTextToClipboard(textToCopy).then(() => {
                 copyBtn.innerHTML = `<span class="material-symbols-outlined btn-icon">done</span> Copied!`;
+                if (typeof showToast === 'function') showToast('Code copied to clipboard!', 'success');
                 setTimeout(() => {
                     copyBtn.innerHTML = `<span class="material-symbols-outlined btn-icon">content_copy</span> Copy`;
                 }, 2000);
+            }).catch(err => {
+                console.error('Clipboard copy error:', err);
+                if (typeof showToast === 'function') showToast('Failed to copy to clipboard', 'error');
             });
         });
+
+        const isOdooXml = isXmlCandidate && (codeContent.includes('<Invoice') || codeContent.includes('<odoo') || codeContent.includes('ubl') || codeContent.includes('FatturaElettronica') || codeContent.includes('cac:'));
+        if (isOdooXml) {
+            const odooBtn = document.createElement('button');
+            odooBtn.className = 'code-action-btn odoo-export-btn';
+            odooBtn.innerHTML = `<span class="material-symbols-outlined btn-icon">download</span> Download for Odoo (.xml)`;
+            odooBtn.title = 'Download this XML invoice file ready to import directly into Odoo Accounting';
+            odooBtn.addEventListener('click', () => {
+                downloadXmlFile(codeContent, 'odoo_invoice.xml');
+            });
+            actionsDiv.appendChild(odooBtn);
+        }
+
+        // Check if this code block contains structured invoice JSON
+        let invoiceData = null;
+        const trimmedCode = codeContent.trim();
+        if (lang === 'json' || (!lang && trimmedCode.startsWith('{')) || isInvoiceJsonString(trimmedCode)) {
+            try {
+                let parsed = null;
+                try {
+                    parsed = JSON.parse(trimmedCode);
+                } catch (pe) {
+                    const sanitized = trimmedCode
+                        .replace(/\/\*[\s\S]*?\*\/|\/\/.*/g, '')
+                        .replace(/,\s*([}\]])/g, '$1');
+                    parsed = JSON.parse(sanitized);
+                }
+                if (parsed && typeof parsed === 'object') {
+                    if (parsed.invoice_number || parsed.invoice_id || parsed.invoice_no || (parsed.supplier && parsed.totals) || (parsed.totals && parsed.lines) || parsed.invoice || parsed.data?.invoice_number) {
+                        invoiceData = parsed.invoice || parsed.data || parsed;
+                    }
+                }
+            } catch (e) {
+                const startBrace = trimmedCode.indexOf('{');
+                const endBrace = trimmedCode.lastIndexOf('}');
+                if (startBrace !== -1 && endBrace > startBrace) {
+                    try {
+                        const sub = trimmedCode.slice(startBrace, endBrace + 1).replace(/,\s*([}\]])/g, '$1');
+                        const parsedSub = JSON.parse(sub);
+                        if (parsedSub && typeof parsedSub === 'object') {
+                            if (parsedSub.invoice_number || parsedSub.invoice_id || (parsedSub.supplier && parsedSub.totals) || parsedSub.invoice) {
+                                invoiceData = parsedSub.invoice || parsedSub;
+                            }
+                        }
+                    } catch (e2) {}
+                }
+            }
+        }
+
+        if (invoiceData) {
+            wrapper.dataset.invoiceJson = JSON.stringify(invoiceData);
+
+            // 1. Download for Odoo XML button in header
+            const odooJsonBtn = document.createElement('button');
+            odooJsonBtn.className = 'code-action-btn odoo-export-btn';
+            odooJsonBtn.innerHTML = `<span class="material-symbols-outlined btn-icon">download</span> Download for Odoo (.xml)`;
+            odooJsonBtn.title = 'Compile this JSON invoice into UBL 2.1 XML and download for Odoo Accounting';
+            odooJsonBtn.addEventListener('click', () => {
+                const compiledXml = fillOdooXmlTemplate(invoiceData);
+                downloadXmlFile(compiledXml, `odoo_${invoiceData.invoice_number || 'invoice'}.xml`);
+            });
+            actionsDiv.appendChild(odooJsonBtn);
+
+            // 2. Copy Odoo XML button in header
+            const copyOdooXmlBtn = document.createElement('button');
+            copyOdooXmlBtn.className = 'code-action-btn';
+            copyOdooXmlBtn.innerHTML = `<span class="material-symbols-outlined btn-icon">receipt_long</span> Copy Odoo XML`;
+            copyOdooXmlBtn.title = 'Generate UBL 2.1 XML from template and copy to clipboard';
+            copyOdooXmlBtn.addEventListener('click', () => {
+                const compiledXml = fillOdooXmlTemplate(invoiceData);
+                copyTextToClipboard(compiledXml).then(() => {
+                    if (typeof showToast === 'function') showToast('Odoo UBL XML compiled from template & copied!', 'success');
+                });
+            });
+            actionsDiv.appendChild(copyOdooXmlBtn);
+
+            // 3. High-visibility dedicated Invoice Card directly above the code block
+            const invBanner = document.createElement('div');
+            invBanner.className = 'msg-invoice-banner';
+            const supplierName = invoiceData.supplier?.name || (typeof invoiceData.supplier === 'string' ? invoiceData.supplier : 'Supplier');
+            const invNum = invoiceData.invoice_number || invoiceData.invoice_id || 'Invoice';
+            const totalAmount = invoiceData.totals?.gross ?? invoiceData.totals?.total ?? invoiceData.totals?.net ?? '';
+            const curr = invoiceData.currency || 'EUR';
+            invBanner.innerHTML = `
+                <div class="msg-invoice-banner-left">
+                    <span class="material-symbols-outlined msg-invoice-banner-icon">receipt_long</span>
+                    <div>
+                        <div class="msg-invoice-banner-text">Odoo-Ready Invoice JSON (${escapeHtml(invNum)})</div>
+                        <div class="msg-invoice-banner-sub">${escapeHtml(supplierName)}${totalAmount ? ` · Total: ${totalAmount} ${curr}` : ''} · 1-click compile into UBL 2.1 XML</div>
+                    </div>
+                </div>
+                <div class="msg-invoice-banner-actions">
+                    <button type="button" class="msg-invoice-banner-btn btn-dl-odoo" title="Compile and download UBL 2.1 XML for Odoo">
+                        <span class="material-symbols-outlined">download</span> Download for Odoo (.xml)
+                    </button>
+                    <button type="button" class="msg-invoice-banner-btn btn-copy-odoo" title="Copy compiled UBL 2.1 XML to clipboard">
+                        <span class="material-symbols-outlined">content_copy</span> Copy XML
+                    </button>
+                </div>
+            `;
+            invBanner.querySelector('.btn-dl-odoo').addEventListener('click', () => {
+                const compiledXml = fillOdooXmlTemplate(invoiceData);
+                downloadXmlFile(compiledXml, `odoo_${invoiceData.invoice_number || 'invoice'}.xml`);
+            });
+            invBanner.querySelector('.btn-copy-odoo').addEventListener('click', () => {
+                const compiledXml = fillOdooXmlTemplate(invoiceData);
+                copyTextToClipboard(compiledXml).then(() => {
+                    if (typeof showToast === 'function') showToast('Odoo UBL XML compiled from template & copied!', 'success');
+                });
+            });
+            setTimeout(() => {
+                if (wrapper.parentNode && !wrapper.previousElementSibling?.classList.contains('msg-invoice-banner')) {
+                    wrapper.parentNode.insertBefore(invBanner, wrapper);
+                }
+            }, 0);
+        }
+
         actionsDiv.appendChild(previewBtn);
         actionsDiv.appendChild(copyBtn);
 
@@ -1753,7 +2625,7 @@ let agenticSettings = {
 };
 
 // ============================================================================
-// Zero Decode Bypass (ZDB) Settings & Controls
+// Server Configuration Synchronization & Zero Decode Bypass (ZDB) Settings
 // ============================================================================
 
 let zdbSettings = {
@@ -1763,6 +2635,86 @@ let zdbSettings = {
     minConfidence: 0.70,
     maxTop1Gap: 1.50
 };
+
+let pushConfigDebounceTimer = null;
+function pushConfigToServer(patch) {
+    if (pushConfigDebounceTimer) clearTimeout(pushConfigDebounceTimer);
+    pushConfigDebounceTimer = setTimeout(async () => {
+        try {
+            await fetch(`${getApiBase()}/api/system/config`, {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify(patch)
+            });
+        } catch (e) {
+            console.warn('Failed to push config to server', e);
+        }
+    }, 200);
+}
+
+let isSyncingServerConfig = false;
+async function syncServerConfig() {
+    try {
+        isSyncingServerConfig = true;
+        const res = await fetch(`${getApiBase()}/api/system/config`);
+        if (!res.ok) return;
+        const cfg = await res.json();
+
+        // 1. Synchronize Zero Decode Bypass (ZDB)
+        if (cfg.zdb_enabled !== undefined) zdbSettings.enabled = !!cfg.zdb_enabled;
+        if (Array.isArray(cfg.zdb_choices) && cfg.zdb_choices.length > 0) zdbSettings.choices = cfg.zdb_choices;
+        if (cfg.zdb_auto_fallback !== undefined) zdbSettings.autoFallback = !!cfg.zdb_auto_fallback;
+        if (cfg.zdb_min_confidence !== undefined) zdbSettings.minConfidence = parseFloat(cfg.zdb_min_confidence) || 0.70;
+        if (cfg.zdb_max_top1_gap !== undefined) zdbSettings.maxTop1Gap = parseFloat(cfg.zdb_max_top1_gap) || 1.50;
+
+        localStorage.setItem('moecher_zdb_enabled', String(zdbSettings.enabled));
+        localStorage.setItem('moecher_zdb_choices', JSON.stringify(zdbSettings.choices));
+        localStorage.setItem('moecher_zdb_autofallback', String(zdbSettings.autoFallback));
+        localStorage.setItem('moecher_zdb_minconf', String(zdbSettings.minConfidence));
+        localStorage.setItem('moecher_zdb_maxgap', String(zdbSettings.maxTop1Gap));
+
+        const elInput = document.getElementById('zdb-choices-input');
+        if (elInput) elInput.value = zdbSettings.choices.join(', ');
+        updateZdbUi();
+
+        // 2. Synchronize active tools in UI without triggering re-evaluation
+        if (Array.isArray(cfg.active_tools) && cfg.active_tools.length > 0) {
+            const activeSet = new Set(cfg.active_tools);
+            const knownTools = ['web_search', 'youtube_search', 'google_search', 'fetch_url', 'create_3d_model', 'read_file', 'write_file', 'edit_file', 'execute_command'];
+            knownTools.forEach(toolName => {
+                const el = document.getElementById(`tool-enable-${toolName}`);
+                if (el) el.checked = activeSet.has(toolName);
+                if (agenticSettings && agenticSettings.tools) {
+                    agenticSettings.tools[toolName] = activeSet.has(toolName);
+                }
+            });
+            saveAgenticSettings();
+        }
+
+        // 3. Synchronize sampling sliders if present and not user-focused
+        if (cfg.temperature !== undefined && tempSlider && document.activeElement !== tempSlider) {
+            tempSlider.value = cfg.temperature;
+            if (tempVal) tempVal.textContent = parseFloat(cfg.temperature).toFixed(1);
+        }
+        if (cfg.repetition_penalty !== undefined && repPenaltySlider && document.activeElement !== repPenaltySlider) {
+            repPenaltySlider.value = cfg.repetition_penalty;
+            if (repPenaltyVal) repPenaltyVal.textContent = parseFloat(cfg.repetition_penalty).toFixed(2);
+        }
+        if (cfg.thinking_budget !== undefined && thinkingBudget && document.activeElement !== thinkingBudget) {
+            thinkingBudget.value = cfg.thinking_budget;
+        }
+        if (cfg.reasoning_effort && reasoningEffort) {
+            reasoningEffort.value = cfg.reasoning_effort;
+        }
+        if (cfg.thinking_enabled !== undefined && thinkingEnabled) {
+            thinkingEnabled.checked = !!cfg.thinking_enabled;
+        }
+    } catch (e) {
+        console.warn('Could not sync server config:', e);
+    } finally {
+        isSyncingServerConfig = false;
+    }
+}
 
 function loadZdbSettings() {
     try {
@@ -1817,6 +2769,14 @@ function saveZdbSettings() {
         localStorage.setItem('moecher_zdb_minconf', String(zdbSettings.minConfidence));
         localStorage.setItem('moecher_zdb_maxgap', String(zdbSettings.maxTop1Gap));
         updateZdbUi();
+
+        pushConfigToServer({
+            zdb_enabled: zdbSettings.enabled,
+            zdb_choices: zdbSettings.choices,
+            zdb_auto_fallback: zdbSettings.autoFallback,
+            zdb_min_confidence: zdbSettings.minConfidence,
+            zdb_max_top1_gap: zdbSettings.maxTop1Gap
+        });
     } catch (e) {
         console.warn('Could not save ZDB settings to localStorage', e);
     }
@@ -3030,14 +3990,6 @@ async function initSystemPromptSync() {
     }
     await fetchBackendSystemPrompt();
 
-    if (!window.serverToolsDisabled) {
-        const activeTools = getActiveToolsPayload();
-        const allTools = ['web_search', 'youtube_search', 'google_search', 'fetch_url', 'create_3d_model', 'read_file', 'write_file', 'edit_file', 'execute_command'];
-        const hasCustomToolConfig = (activeTools.length !== allTools.length);
-        if (hasCustomToolConfig) {
-            syncToolSettingsWithBackend();
-        }
-    }
     window.addEventListener('focus', () => fetchBackendSystemPrompt());
     setInterval(() => fetchBackendSystemPrompt(), 30000);
 }
@@ -3254,12 +4206,16 @@ function buildOptimizedMessagesPayload() {
     let sysPrompt = systemPromptInput ? systemPromptInput.value.trim() : '';
     const activeTools = getActiveToolsPayload();
 
+    const isNemotron = (typeof currentModelId === 'string' && currentModelId.toLowerCase().includes('nemotron')) ||
+                       (typeof window.activeModelArchitecture === 'string' && window.activeModelArchitecture.toLowerCase().includes('nemotron'));
+    const hasSearchTool = activeTools.some(t => typeof t === 'string' && (t === 'web_search' || t === 'google_search'));
+
     const now = new Date();
     const dateStr = now.toLocaleDateString('en-US', { weekday: 'long', year: 'numeric', month: 'long', day: '2-digit' });
 
     if (window.serverToolsDisabled) {
-        sysPrompt = `You are an assistant.\nCurrent date: ${dateStr}`;
-        messagesToSend.push({ role: "system", content: sysPrompt });
+        let baseSys = sysPrompt || "You are a helpful assistant.";
+        messagesToSend.push({ role: "system", content: baseSys });
     } else {
         let baseSys = sysPrompt || "You are a helpful assistant.";
         // Strip any stale # Tools or <tools> block if activeTools has changed or youtube_search was disabled
@@ -3280,11 +4236,13 @@ function buildOptimizedMessagesPayload() {
             if (basicIdx === -1) basicIdx = baseSys.indexOf('# 3D Modeling Instructions');
             if (basicIdx === -1) basicIdx = baseSys.indexOf('\n\n## 3D Modeling Instructions');
             if (basicIdx === -1) basicIdx = baseSys.indexOf('## 3D Modeling Instructions');
+            if (basicIdx === -1) basicIdx = baseSys.indexOf('\n\n# High-Fidelity Analytic 3D Modeling Instructions');
+            if (basicIdx === -1) basicIdx = baseSys.indexOf('# High-Fidelity Analytic 3D Modeling Instructions');
             if (basicIdx !== -1) {
                 baseSys = baseSys.substring(0, basicIdx).trim();
             }
             baseSys += "\n\n# High-Fidelity Analytic 3D Modeling Instructions\n" +
-                "When asked to create, model, or reconstruct in 3D (or reconstruct an object from an image), always output Three.js representation code defining `function createModel(scene, THREE, inputImage, helpers) { ... }` inside a ```javascript code block (never output a full HTML file), adding all meshes to `scene`.\n\n" +
+                "When asked to create, model, or reconstruct in 3D (or reconstruct an object from an image), always output Three.js representation code defining `function createModel(scene, THREE, inputImage, helpers) { ... }` inside a ```javascript code block, adding all meshes to `scene`.\n\n" +
                 "CRITICAL RULES FOR ANALYTIC MODELING, PART-SPECIFIC TEXTURING & UV MAPPING:\n" +
                 "1. SEMANTIC & GEOMETRIC PART DECOMPOSITION:\n" +
                 "   - Never model an object as a single monolithic blob. Analytically decompose the subject into its distinct structural and anatomical parts (e.g. for an apple: body, stem, leaf; for a teapot: vessel body, lid, knob, handle, spout, foot ring; for furniture/vehicles/shoes: separate functional components).\n" +
@@ -3301,9 +4259,16 @@ function buildOptimizedMessagesPayload() {
                 "   - Revolved profiles must start and end at x=0 (use `helpers.createWatertightLathe` or `helpers.createHollowVessel` for vessels with solid wall thickness).\n" +
                 "   - Tubes, pipes, stems, and handles must have sealed end caps (use `helpers.createCappedTube`).\n" +
                 "   - Attachments (stems, leaves, handles, spouts) must penetrate 5-10% deep into parent meshes to prevent floating seams or gaps.";
+        } else if (!window.lastUserPromptWas3D && baseSys) {
+            // Strip any lingering 3D instructions so general coding / HTML tasks are completely unconstrained
+            let hfIdx = baseSys.indexOf('\n\n# High-Fidelity Analytic 3D Modeling Instructions');
+            if (hfIdx === -1) hfIdx = baseSys.indexOf('# High-Fidelity Analytic 3D Modeling Instructions');
+            if (hfIdx !== -1) {
+                baseSys = baseSys.substring(0, hfIdx).trim();
+            }
         }
         let fullSys = baseSys;
-        if (!fullSys.includes('Current date:')) {
+        if (!isNemotron && hasSearchTool && !fullSys.includes('Current date:')) {
             fullSys += `\nCurrent date: ${dateStr}`;
         }
         messagesToSend.push({ role: 'system', content: fullSys });
@@ -3406,6 +4371,7 @@ function extractToolCallsFromContent(text) {
         if (!name || typeof name !== 'string') return;
         name = name.trim();
         if (name === '<function>' || name === 'function') name = 'web_search';
+        if (!isRegisteredOrKnownTool(name)) return; // CRITICAL: Only accept real tools, NEVER company/supplier names!
         let argsStr = '';
         if (typeof args === 'string') {
             argsStr = args;
@@ -3504,27 +4470,29 @@ function extractToolCallsFromContent(text) {
 
             if (end !== -1) {
                 const candidate = text.slice(start, end + 1);
-                try {
-                    const parsed = JSON.parse(candidate);
-                    if (parsed && typeof parsed === 'object') {
-                        let name = parsed.name || parsed.tool || parsed.action || parsed.tool_name || parsed.function_name || (typeof parsed.function === 'string' ? parsed.function : parsed.function?.name);
-                        let args = parsed.arguments || parsed.parameters || parsed.args || parsed.function?.arguments;
-                        if (!args && (parsed.query || parsed.url || parsed.path || parsed.command)) {
-                            const { name: _n, function: _f, type: _t, tool: _tool, action: _act, tool_name: _tn, function_name: _fn, ...rest } = parsed;
-                            args = rest;
-                        }
-                        if (!name) {
-                            if (parsed.query && typeof parsed.query === 'string' && parsed.query.length >= 2) {
-                                name = (agenticSettings.tools['youtube_search'] && isMediaSearchQuery(parsed.query)) ? 'youtube_search' : 'web_search';
-                            } else if (parsed.url && typeof parsed.url === 'string') {
-                                name = 'fetch_url';
+                if (!isInvoiceJsonString(candidate)) {
+                    try {
+                        const parsed = JSON.parse(candidate);
+                        if (parsed && typeof parsed === 'object' && !isInvoicePayload(parsed)) {
+                            let name = parsed.name || parsed.tool || parsed.action || parsed.tool_name || parsed.function_name || (typeof parsed.function === 'string' ? parsed.function : parsed.function?.name);
+                            let args = parsed.arguments || parsed.parameters || parsed.args || parsed.function?.arguments;
+                            if (!args && (parsed.query || parsed.url || parsed.path || parsed.command)) {
+                                const { name: _n, function: _f, type: _t, tool: _tool, action: _act, tool_name: _tn, function_name: _fn, ...rest } = parsed;
+                                args = rest;
+                            }
+                            if (!name) {
+                                if (parsed.query && typeof parsed.query === 'string' && parsed.query.length >= 2 && !parsed.invoice_number) {
+                                    name = (typeof agenticSettings !== 'undefined' && agenticSettings && agenticSettings.tools && agenticSettings.tools['youtube_search'] && isMediaSearchQuery(parsed.query)) ? 'youtube_search' : 'web_search';
+                                } else if (parsed.url && typeof parsed.url === 'string') {
+                                    name = 'fetch_url';
+                                }
+                            }
+                            if (name && typeof name === 'string' && isRegisteredOrKnownTool(name)) {
+                                addCall(name, args || {});
                             }
                         }
-                        if (name && typeof name === 'string') {
-                            addCall(name, args || {});
-                        }
-                    }
-                } catch (e) {}
+                    } catch (e) {}
+                }
                 i = end + 1;
                 continue;
             }
@@ -3551,8 +4519,28 @@ function stripToolCallsFromText(text) {
     out = out.replace(/<\s*[｜|]?tool (?:call begin|call end|sep|outputs begin|outputs end)[｜|]?>/gi, '');
 
     // 3. Remove markdown blocks wrapping tool call JSON: ```(?:json)?\s*\{[\s\S]*?\}\s*```
-    out = out.replace(/```(?:json)?\s*\{[\s\S]*?(?:"name"|"function"|"tool"|"query"|"action")[\s\S]*?\}\s*```/gi, '');
-    out = out.replace(/```(?:json)?\s*\{[\s\S]*?(?:"name"|"function"|"tool"|"query"|"action")[\s\S]*$/gi, '');
+    // CRITICAL: NEVER strip invoice JSON or user data! Only strip genuine tool calls.
+    out = out.replace(/```(?:json)?\s*(\{[\s\S]*?\})\s*```/gi, (match, jsonBody) => {
+        if (isInvoiceJsonString(jsonBody)) return match;
+        try {
+            const parsed = JSON.parse(jsonBody);
+            if (isInvoicePayload(parsed)) return match;
+            const fnName = parsed.name || parsed.tool || parsed.action || parsed.tool_name || parsed.function_name || (typeof parsed.function === 'string' ? parsed.function : parsed.function?.name);
+            if (isRegisteredOrKnownTool(fnName)) return '';
+        } catch (e) {
+            if (/"(?:name|tool)"\s*:\s*"(?:web_search|youtube_search|fetch_url|read_file|write_file|edit_file|execute_command|list_directory|mcp_[a-zA-Z0-9_-]+)"/i.test(jsonBody)) {
+                return '';
+            }
+        }
+        return match;
+    });
+    out = out.replace(/```(?:json)?\s*(\{[\s\S]*$)/gi, (match, trailingBody) => {
+        if (isInvoiceJsonString(trailingBody)) return match;
+        if (/"(?:name|tool)"\s*:\s*"(?:web_search|youtube_search|fetch_url|read_file|write_file|edit_file|execute_command|list_directory|mcp_[a-zA-Z0-9_-]+)"/i.test(trailingBody)) {
+            return '';
+        }
+        return match;
+    });
 
     // 4. Remove balanced JSON objects that represent tool calls
     let result = '';
@@ -3595,18 +4583,22 @@ function stripToolCallsFromText(text) {
             if (end !== -1) {
                 const candidate = out.slice(start, end + 1);
                 let isTool = false;
-                try {
-                    const parsed = JSON.parse(candidate);
-                    if (parsed && typeof parsed === 'object') {
-                        if (parsed.name || parsed.tool || parsed.action || parsed.tool_name || parsed.function_name ||
-                            (parsed.function && (typeof parsed.function === 'string' || parsed.function.name)) ||
-                            (parsed.query && typeof parsed.query === 'string')) {
+                if (!isInvoiceJsonString(candidate)) {
+                    try {
+                        const parsed = JSON.parse(candidate);
+                        if (parsed && typeof parsed === 'object' && !isInvoicePayload(parsed)) {
+                            let fnName = parsed.name || parsed.tool || parsed.action || parsed.tool_name || parsed.function_name ||
+                                (parsed.function && (typeof parsed.function === 'string' ? parsed.function : parsed.function.name));
+                            if (isRegisteredOrKnownTool(fnName)) {
+                                isTool = true;
+                            } else if (parsed.query && typeof parsed.query === 'string' && (parsed.engine || parsed.tool === 'web_search')) {
+                                isTool = true;
+                            }
+                        }
+                    } catch (e) {
+                        if (/"(?:name|tool)"\s*:\s*"(?:web_search|youtube_search|fetch_url|read_file|write_file|edit_file|execute_command|list_directory|mcp_[a-zA-Z0-9_-]+)"/i.test(candidate)) {
                             isTool = true;
                         }
-                    }
-                } catch (e) {
-                    if (/"(?:name|function|tool|query|action)"\s*:\s*"[^"]+"/.test(candidate)) {
-                        isTool = true;
                     }
                 }
 
@@ -3616,7 +4608,7 @@ function stripToolCallsFromText(text) {
                 }
             } else {
                 const trailing = out.slice(start);
-                if (/"(?:name|function|tool|query|action)"\s*:\s*"[^"]+"/.test(trailing)) {
+                if (!isInvoiceJsonString(trailing) && /"(?:name|tool)"\s*:\s*"(?:web_search|youtube_search|fetch_url|read_file|write_file|edit_file|execute_command|list_directory|mcp_[a-zA-Z0-9_-]+)"/i.test(trailing)) {
                     break;
                 }
             }
@@ -3632,19 +4624,22 @@ function stripToolCallsFromText(text) {
 
 function isRawToolCallString(text) {
     if (!text) return false;
+    if (isInvoiceJsonString(text)) return false;
     const trimmed = text.trim();
     if (trimmed.startsWith('<tool_call') || trimmed.startsWith('<function_call') ||
         trimmed.startsWith('<｜tool call begin') || trimmed.startsWith('<|tool call begin') ||
         trimmed.startsWith('<｜DSML') || trimmed.startsWith('<|DSML') || trimmed.startsWith('<DSML')) {
         return true;
     }
-    if (trimmed.startsWith('```json') || trimmed.startsWith('```')) {
-        if (trimmed.includes('"name"') || trimmed.includes('"function"')) return true;
+    if (trimmed.startsWith('```json') || trimmed.startsWith('```') || trimmed.startsWith('{')) {
+        if (isInvoiceJsonString(trimmed)) return false;
+        if (/\b(?:call_id|tool_call|function_call)\b/i.test(trimmed)) return true;
+        if (/"(?:name|tool)"\s*:\s*"(?:web_search|youtube_search|fetch_url|read_file|write_file|edit_file|execute_command|list_directory|mcp_[a-zA-Z0-9_-]+)"/i.test(trimmed)) return true;
+        if (/"function"\s*:\s*\{[^}]*"name"\s*:/i.test(trimmed)) return true;
     }
-    if (trimmed.startsWith('{')) {
-        if (trimmed.includes('"name"') || trimmed.includes('"function"')) return true;
-    }
-    return stripToolCallsFromText(text).length === 0;
+    const stripped = stripToolCallsFromText(text);
+    if (stripped.length === 0 && !isInvoiceJsonString(text)) return true;
+    return false;
 }
 
 
@@ -4285,9 +5280,9 @@ async function sendMessage(options = {}) {
     chatInput.style.height = 'auto';
     sendBtn.disabled = true;
     setGeneratingState(true);
-    // Detect if user prompt is asking for 3D model creation
-    const is3dPrompt = /(?:\b3d\b|three\.?js|\bmodel\b|\bmesh\b|\bobj\b|\bgltf\b)/i.test(text) ||
-                       (activeImageAttachment && /(?:model|3d|mesh|render|create)/i.test(text));
+    // Detect if user prompt is explicitly asking for 3D model creation/reconstruction
+    const is3dPrompt = /(?:\b3d\b|three\.?js|\b3d\s+model\b|\bmesh\b|\bgltf\b|\bobj\s+model\b)/i.test(text) ||
+                       (activeImageAttachment && /(?:reconstruct\s+in\s+3d|model\s+in\s+3d|make\s+a\s+3d\s+model|generate\s+3d)/i.test(text));
     window.lastUserPromptWas3D = is3dPrompt;
     if (is3dPrompt) {
         if (!isPreviewOpen) openPreviewPanel();
@@ -4300,7 +5295,30 @@ async function sendMessage(options = {}) {
     // Add user message (with optional image attachment)
     let userMsgContent = text;
     let attachedImg = null;
-    if (activeImageAttachment) {
+    let attachedDoc = null;
+
+    if (activeDocumentAttachment) {
+        attachedDoc = Object.assign({}, activeDocumentAttachment);
+        let sendText = text ? text.trim() : "";
+        if (!sendText) {
+            sendText = "Extract and explain all invoice information from this document: Supplier, Customer, Invoice Number, Issue and Due Date, Subtotal Net, VAT rate and amount, Total Gross, and Line items.";
+        }
+        const docPrompt = `[Attached Document: "${attachedDoc.filename}" (${attachedDoc.numPages} page${attachedDoc.numPages > 1 ? 's' : ''})]\n` +
+                          `--- Begin Document Content ---\n` +
+                          `${attachedDoc.text}\n` +
+                          `--- End Document Content ---\n\n` +
+                          `${sendText}`;
+
+        if (currentModelHasVision && attachedDoc.thumbnailDataUrl) {
+            userMsgContent = [
+                { type: "text", text: docPrompt },
+                { type: "image_url", image_url: { url: attachedDoc.thumbnailDataUrl } }
+            ];
+        } else {
+            userMsgContent = docPrompt;
+        }
+        removeDocumentAttachment();
+    } else if (activeImageAttachment) {
         attachedImg = Object.assign({}, activeImageAttachment);
         window.__lastUploadedImage = attachedImg.dataUrl;
         if (!window.__lastUploadedImageElement || window.__lastUploadedImageElement.src !== attachedImg.dataUrl) {
@@ -4323,7 +5341,7 @@ async function sendMessage(options = {}) {
             ThreeStudio.updatePhotoTextureButtons();
         }
     }
-    appendMessage('user', text || "Describe this image", attachedImg, wasVoicePrompt);
+    appendMessage('user', text || (attachedDoc ? "Extract invoice information from attached document" : "Describe this image"), attachedImg, wasVoicePrompt, attachedDoc);
     chatHistory.push({ role: 'user', content: userMsgContent });
 
     // Create assistant message container
@@ -4339,7 +5357,7 @@ async function sendMessage(options = {}) {
     let mainContent = document.createElement('div');
     assistantMsgDiv.querySelector('.msg-content').appendChild(mainContent);
 
-    const baseThinking = attachedImg ? false : (thinkingEnabled ? thinkingEnabled.checked : true);
+    const baseThinking = (attachedImg && !attachedDoc) ? false : (thinkingEnabled ? thinkingEnabled.checked : true);
     // Voice prompt speed optimization: disable thinking on the fly for fast conversational responses
     const isVoiceBypassThinking = wasVoicePrompt && (typeof voiceSettings === 'undefined' || voiceSettings.disableThinkingForVoice !== false);
     const isThinking = isVoiceBypassThinking ? false : baseThinking;
@@ -4520,6 +5538,34 @@ async function sendMessage(options = {}) {
             const decoder = new TextDecoder('utf-8');
             let buffer = '';
 
+            // RAF-throttled streaming render scheduler to eliminate 60Hz DOM thrashing and layout flicker
+            let streamRafPending = false;
+            let streamNeedsReasoning = false;
+            let streamNeedsContent = false;
+
+            function scheduleStreamingRender() {
+                if (streamRafPending) return;
+                streamRafPending = true;
+                requestAnimationFrame(() => {
+                    streamRafPending = false;
+                    if (streamNeedsReasoning && reasoningContent) {
+                        reasoningContent.innerHTML = marked.parse(stripToolCallsFromText(roundReasoning));
+                        streamNeedsReasoning = false;
+                    }
+                    if (streamNeedsContent && mainContent) {
+                        const displayContent = stripToolCallsFromText(roundContent);
+                        if (displayContent.length > 0) {
+                            renderMarkdownContent(displayContent, mainContent);
+                        } else if (isRawToolCallString(roundContent) || isRawToolCallString(rawRoundContent)) {
+                            mainContent.innerHTML = '';
+                        }
+                        streamNeedsContent = false;
+                    }
+                    // Instant direct scroll locked to bottom during token streaming (prevents Edge scroll physics jitter)
+                    messagesContainer.scrollTop = messagesContainer.scrollHeight;
+                });
+            }
+
             while (true) {
                 const { done, value } = await reader.read();
                 if (done) break;
@@ -4588,10 +5634,7 @@ async function sendMessage(options = {}) {
                                         <span class="tool-action-label">${escapeHtml(delta.processing_status)}</span>
                                         <div class="elaboration-dots"><span></span><span></span><span></span></div>
                                     `;
-                                    messagesContainer.scrollTo({
-                                        top: messagesContainer.scrollHeight,
-                                        behavior: 'smooth'
-                                    });
+                                    messagesContainer.scrollTop = messagesContainer.scrollHeight;
                                 }
 
                                 if (delta.tool_calls && Array.isArray(delta.tool_calls)) {
@@ -4623,10 +5666,7 @@ async function sendMessage(options = {}) {
                                         <span class="thinking-spinner">progress_activity</span>
                                         <span class="tool-action-label">${escapeHtml(delta.status)}</span>
                                     `;
-                                    messagesContainer.scrollTo({
-                                        top: messagesContainer.scrollHeight,
-                                        behavior: 'smooth'
-                                    });
+                                    messagesContainer.scrollTop = messagesContainer.scrollHeight;
                                 }
 
                                 if (delta.reasoning_content !== undefined) {
@@ -4675,7 +5715,8 @@ async function sendMessage(options = {}) {
                                     if (!replaced) {
                                         roundReasoning += delta.reasoning_content;
                                     }
-                                    reasoningContent.innerHTML = marked.parse(stripToolCallsFromText(roundReasoning));
+                                    streamNeedsReasoning = true;
+                                    scheduleStreamingRender();
                                 }
 
                                 if (delta.content !== undefined) {
@@ -4750,7 +5791,7 @@ async function sendMessage(options = {}) {
                                                 if (summary) summary.innerHTML = 'Thought process';
                                             }
                                             roundReasoning = partition.thinking;
-                                            reasoningContent.innerHTML = marked.parse(stripToolCallsFromText(roundReasoning));
+                                            streamNeedsReasoning = true;
                                         } else if (reasoningBlock && !isReasoningDone) {
                                             isReasoningDone = true;
                                             reasoningBlock.open = false;
@@ -4760,28 +5801,17 @@ async function sendMessage(options = {}) {
 
                                         roundContent = partition.content;
                                         lastRoundContent = roundContent;
-
-                                        // Filter out raw tool call JSON so it never pollutes the chat UI
-                                        const displayContent = stripToolCallsFromText(roundContent);
-                                        if (displayContent.length > 0) {
-                                            renderMarkdownContent(displayContent, mainContent);
-                                        } else if (isRawToolCallString(roundContent) || isRawToolCallString(rawRoundContent)) {
-                                            mainContent.innerHTML = '';
-                                        }
+                                        streamNeedsContent = true;
+                                        scheduleStreamingRender();
 
                                         // Real-time streaming text-to-speech (speaks sentences as tokens arrive)
                                         // ONLY speak when not inside an active thinking block
                                         if (typeof voiceSettings !== 'undefined' && voiceSettings.autoRead && voiceSettings.streamingTts && !partition.isThinkingOpen) {
-                                            processStreamingTtsChunk(displayContent, assistantMsgDiv);
+                                            processStreamingTtsChunk(stripToolCallsFromText(roundContent), assistantMsgDiv);
                                         }
                                     }
                                 }
                             }
-
-                            messagesContainer.scrollTo({
-                                top: messagesContainer.scrollHeight,
-                                behavior: 'smooth'
-                            });
 
                         } catch (e) {
                             console.error('JSON Parse error', e, dataStr);
@@ -4789,6 +5819,23 @@ async function sendMessage(options = {}) {
                     }
                 }
             }
+
+            // Flush final rendered content synchronously when stream completes
+            if (streamRafPending) {
+                streamRafPending = false;
+            }
+            if (reasoningContent && roundReasoning) {
+                reasoningContent.innerHTML = marked.parse(stripToolCallsFromText(roundReasoning));
+            }
+            if (mainContent && roundContent) {
+                const finalDisplay = stripToolCallsFromText(roundContent);
+                if (finalDisplay.length > 0) {
+                    renderMarkdownContent(finalDisplay, mainContent);
+                } else if (isRawToolCallString(roundContent) || isRawToolCallString(rawRoundContent)) {
+                    mainContent.innerHTML = '';
+                }
+            }
+            messagesContainer.scrollTop = messagesContainer.scrollHeight;
 
             const roundStreamEndTime = performance.now();
             const roundPrefillMs = (roundFirstTokenTime !== null ? roundFirstTokenTime : roundStreamEndTime) - roundStartTime;
@@ -5393,7 +6440,7 @@ function createMessageContainer(role) {
     return div;
 }
 
-function appendMessage(role, text, attachedImg = null, isVoice = false) {
+function appendMessage(role, text, attachedImg = null, isVoice = false, attachedDoc = null) {
     const div = createMessageContainer(role);
     if (role === 'user') {
         const contentEl = div.querySelector('.msg-content');
@@ -5403,6 +6450,31 @@ function appendMessage(role, text, attachedImg = null, isVoice = false) {
             voiceBadge.className = 'voice-prompt-pill';
             voiceBadge.innerHTML = `<span class="material-symbols-outlined" style="font-size: 13px;">mic</span> Spoken prompt`;
             contentEl.appendChild(voiceBadge);
+        }
+        if (attachedDoc) {
+            const docCard = document.createElement('div');
+            docCard.className = 'user-msg-doc-card';
+            const pageStr = `${attachedDoc.numPages || 1} Page${(attachedDoc.numPages || 1) > 1 ? 's' : ''}`;
+            const charStr = `${(attachedDoc.charCount || attachedDoc.text.length).toLocaleString()} chars`;
+            docCard.innerHTML = `
+                ${attachedDoc.thumbnailDataUrl ? `<img src="${attachedDoc.thumbnailDataUrl}" style="width: 38px; height: 48px; object-fit: cover; border-radius: 4px; border: 1px solid rgba(255,255,255,0.15);" alt="PDF Thumbnail" />` : `<span class="material-symbols-outlined doc-icon">picture_as_pdf</span>`}
+                <div class="doc-details">
+                    <div class="doc-name">${escapeHtml(attachedDoc.filename || 'document.pdf')}</div>
+                    <div class="doc-sub">${pageStr} · ${charStr}</div>
+                </div>
+                <button type="button" class="doc-text-toggle-btn" style="margin-left: auto; padding: 4px 8px; background: rgba(56,189,248,0.12); border: 1px solid rgba(56,189,248,0.25); border-radius: 6px; color: #38bdf8; font-size: 11px; cursor: pointer; display: inline-flex; align-items: center; gap: 4px;" title="View extracted document text">
+                    <span class="material-symbols-outlined" style="font-size: 14px;">visibility</span>
+                    <span>View Text</span>
+                </button>
+            `;
+            const viewBtn = docCard.querySelector('.doc-text-toggle-btn');
+            if (viewBtn) {
+                viewBtn.addEventListener('click', () => {
+                    window.__viewingDocText = attachedDoc;
+                    openPdfTextModal();
+                });
+            }
+            contentEl.appendChild(docCard);
         }
         if (attachedImg && attachedImg.dataUrl) {
             const thumbCard = document.createElement('div');
@@ -5699,6 +6771,34 @@ async function initModelSelector() {
                             dropdownVisionText.textContent = 'Vision Disabled';
                             dropdownVisionBadge.title = 'Text-only model profile';
                         }
+                    }
+
+                    // Apply model-specific inference presets to UI controls
+                    const sampling = active.recommended_sampling || (
+                        (active.id && active.id.toLowerCase().includes('nemotron'))
+                            ? { temperature: 0.6, repetition_penalty: 1.05, reasoning_effort: "medium", thinking_budget: 4096 }
+                            : { temperature: 0.7, repetition_penalty: 1.00, reasoning_effort: "medium", thinking_budget: 4096 }
+                    );
+
+                    if (sampling) {
+                        if (sampling.repetition_penalty !== undefined && repPenaltySlider) {
+                            repPenaltySlider.value = sampling.repetition_penalty;
+                            if (repPenaltyVal) repPenaltyVal.textContent = parseFloat(sampling.repetition_penalty).toFixed(2);
+                        }
+                        if (sampling.temperature !== undefined && tempSlider) {
+                            tempSlider.value = sampling.temperature;
+                            if (tempVal) tempVal.textContent = parseFloat(sampling.temperature).toFixed(1);
+                        }
+                        if (sampling.reasoning_effort && reasoningEffort) {
+                            reasoningEffort.value = sampling.reasoning_effort;
+                        }
+                        if (sampling.thinking_budget !== undefined && thinkingBudget) {
+                            thinkingBudget.value = sampling.thinking_budget;
+                        }
+                        if (thinkingEnabled) {
+                            thinkingEnabled.checked = (sampling.thinking_budget > 0 && sampling.reasoning_effort !== "none");
+                        }
+                        console.log(`[Model] Configured model-specific sampling parameters for ${active.id}:`, sampling);
                     }
 
                     // Update System Resources (VRAM, RAM, SSD)
@@ -6960,34 +8060,367 @@ function is3DContent(code, lang) {
 }
 
 // ════════════════════════════════════════════════════════════════════════════════
-//  Vision Capabilities & Image Attachment Handling
+//  Document (PDF) & Vision Attachment Handling
 // ════════════════════════════════════════════════════════════════════════════════
 
 let activeImageAttachment = null;
+let activeDocumentAttachment = null;
 let currentModelHasVision = false;
 
 function updateVisionUploadVisibility() {
-    const uploadBtn = document.getElementById('vision-upload-btn');
+    const uploadBtn = document.getElementById('attachment-upload-btn') || document.getElementById('vision-upload-btn');
     if (!uploadBtn) return;
-    if (currentModelHasVision) {
-        uploadBtn.classList.remove('hidden');
-    } else {
-        uploadBtn.classList.add('hidden');
-        removeImageAttachment();
-    }
+    // Always keep upload button accessible so users can attach PDF documents regardless of model architecture
+    uploadBtn.classList.remove('hidden');
 }
 
-function triggerVisionUpload() {
-    const fileInput = document.getElementById('vision-file-input');
+function triggerAttachmentUpload() {
+    const fileInput = document.getElementById('attachment-file-input') || document.getElementById('vision-file-input');
     if (fileInput) fileInput.click();
 }
 
-function handleVisionFileSelect(event) {
+function triggerVisionUpload() {
+    triggerAttachmentUpload();
+}
+
+function handleAttachmentFileSelect(event) {
     const file = event.target.files && event.target.files[0];
     if (!file) return;
-    processImageFile(file);
+    handleIncomingFile(file);
     event.target.value = '';
 }
+
+function handleVisionFileSelect(event) {
+    handleAttachmentFileSelect(event);
+}
+
+function handleIncomingFile(file) {
+    if (!file) return;
+    const isPdf = file.type === 'application/pdf' || file.name.toLowerCase().endsWith('.pdf');
+    if (isPdf) {
+        processPdfFile(file);
+    } else if (file.type.startsWith('image/')) {
+        processImageFile(file);
+    } else {
+        showToast('Please drop or select a PDF document or an image file (PNG, JPG, WebP).', 'warn');
+    }
+}
+
+// ── In-Browser PDF Text Extraction & Page Rasterizer via Mozilla PDF.js ─────
+
+async function processPdfFile(file) {
+    showToast(`Reading PDF: ${file.name}...`, 'info');
+    try {
+        const arrayBuffer = await file.arrayBuffer();
+
+        if (typeof pdfjsLib === 'undefined') {
+            throw new Error('PDF.js engine is not ready. Please refresh or check connection.');
+        }
+
+        if (pdfjsLib.GlobalWorkerOptions) {
+            pdfjsLib.GlobalWorkerOptions.workerSrc = 'https://cdnjs.cloudflare.com/ajax/libs/pdf.js/3.11.174/pdf.worker.min.js';
+        }
+
+        const loadingTask = pdfjsLib.getDocument({ data: arrayBuffer });
+        const pdf = await loadingTask.promise;
+        const numPages = pdf.numPages;
+
+        let fullExtractedText = '';
+        let pageTexts = [];
+
+        for (let p = 1; p <= numPages; p++) {
+            const page = await pdf.getPage(p);
+            const textContent = await page.getTextContent();
+            const items = textContent.items || [];
+
+            // Sort text items top-to-bottom then left-to-right to preserve invoice tables and columns
+            items.sort((a, b) => {
+                const yA = a.transform[5];
+                const yB = b.transform[5];
+                if (Math.abs(yA - yB) > 4) {
+                    return yB - yA; // Higher Y coordinate is higher up on page
+                }
+                return a.transform[4] - b.transform[4];
+            });
+
+            let pageStr = '';
+            let lastY = null;
+            for (const item of items) {
+                if (!item.str && item.str !== ' ') continue;
+                const curY = item.transform[5];
+                if (lastY !== null && Math.abs(curY - lastY) > 5) {
+                    pageStr += '\n';
+                } else if (lastY !== null && pageStr.length > 0 && !pageStr.endsWith(' ') && !pageStr.endsWith('\n')) {
+                    pageStr += ' ';
+                }
+                pageStr += item.str;
+                lastY = curY;
+            }
+
+            const cleanPage = pageStr.trim();
+            pageTexts.push(cleanPage);
+            fullExtractedText += `--- Page ${p} of ${numPages} ---\n` + cleanPage + '\n\n';
+        }
+
+        // Render Page 1 to high-resolution canvas (150 DPI) for visual thumbnail & Qwen2.5-VL vision tower
+        let thumbnailDataUrl = '';
+        try {
+            const firstPage = await pdf.getPage(1);
+            const scale = 1.5;
+            const viewport = firstPage.getViewport({ scale: scale });
+            const canvas = document.createElement('canvas');
+            canvas.width = viewport.width;
+            canvas.height = viewport.height;
+            const ctx = canvas.getContext('2d');
+            await firstPage.render({ canvasContext: ctx, viewport: viewport }).promise;
+            thumbnailDataUrl = canvas.toDataURL('image/png');
+        } catch (renderErr) {
+            console.warn('Could not render PDF page canvas thumbnail:', renderErr);
+        }
+
+        function formatFileSize(bytes) {
+            if (!bytes || bytes <= 0) return '0 B';
+            if (bytes < 1024) return bytes + ' B';
+            if (bytes < 1048576) return (bytes / 1024).toFixed(1) + ' KB';
+            return (bytes / 1048576).toFixed(1) + ' MB';
+        }
+
+        activeDocumentAttachment = {
+            type: 'pdf',
+            filename: file.name,
+            numPages: numPages,
+            filesize: formatFileSize(file.size),
+            text: fullExtractedText.trim(),
+            pageTexts: pageTexts,
+            thumbnailDataUrl: thumbnailDataUrl,
+            charCount: fullExtractedText.trim().length
+        };
+
+        renderDocumentAttachmentChip();
+        showToast(`Loaded PDF: ${file.name} (${numPages} page${numPages > 1 ? 's' : ''}, ${activeDocumentAttachment.charCount.toLocaleString()} chars)`, 'success');
+
+        if (chatInput) {
+            chatInput.focus();
+            if (sendBtn) sendBtn.disabled = false;
+        }
+    } catch (err) {
+        console.error('Error parsing PDF file:', err);
+        showToast(`Failed to parse PDF: ${err.message}`, 'error');
+    }
+}
+
+function renderDocumentAttachmentChip() {
+    const chip = document.getElementById('document-attachment-preview');
+    const thumbImg = document.getElementById('doc-thumb-img');
+    const thumbIcon = document.getElementById('doc-thumb-icon');
+    const nameEl = document.getElementById('doc-attachment-filename');
+    const badgeEl = document.getElementById('doc-page-badge');
+    const statsEl = document.getElementById('doc-attachment-stats');
+    if (!chip) return;
+
+    if (activeDocumentAttachment) {
+        if (nameEl) nameEl.textContent = activeDocumentAttachment.filename;
+        if (badgeEl) badgeEl.innerHTML = `<span class="badge-dot"></span>${activeDocumentAttachment.numPages} Page${activeDocumentAttachment.numPages > 1 ? 's' : ''}`;
+        if (statsEl) statsEl.textContent = `${activeDocumentAttachment.charCount.toLocaleString()} chars extracted · ${activeDocumentAttachment.filesize}`;
+
+        if (thumbImg && activeDocumentAttachment.thumbnailDataUrl) {
+            thumbImg.src = activeDocumentAttachment.thumbnailDataUrl;
+            thumbImg.classList.remove('hidden');
+            if (thumbIcon) thumbIcon.classList.add('hidden');
+        } else {
+            if (thumbImg) thumbImg.classList.add('hidden');
+            if (thumbIcon) thumbIcon.classList.remove('hidden');
+        }
+        chip.classList.remove('hidden');
+    } else {
+        chip.classList.add('hidden');
+    }
+}
+
+function removeDocumentAttachment() {
+    activeDocumentAttachment = null;
+    const chip = document.getElementById('document-attachment-preview');
+    if (chip) chip.classList.add('hidden');
+}
+
+function openPdfTextModal() {
+    const doc = activeDocumentAttachment || window.__viewingDocText;
+    if (!doc) return;
+    const modal = document.getElementById('pdf-text-modal');
+    const titleEl = document.getElementById('pdf-modal-doc-title');
+    const statsEl = document.getElementById('pdf-modal-stats');
+    const contentEl = document.getElementById('pdf-modal-text-content');
+    if (!modal) return;
+
+    if (titleEl) titleEl.textContent = doc.filename || 'Extracted Document Text';
+    if (statsEl) statsEl.textContent = `${doc.numPages || 1} Page(s) · ${(doc.charCount || (doc.text ? doc.text.length : 0)).toLocaleString()} characters`;
+    if (contentEl) contentEl.textContent = doc.text || '(No text extracted from document)';
+
+    modal.classList.remove('hidden');
+}
+
+function closePdfTextModal(event) {
+    if (event && event.target && event.target.id !== 'pdf-text-modal' && !event.target.classList.contains('pdf-modal-close')) {
+        return;
+    }
+    const modal = document.getElementById('pdf-text-modal');
+    if (modal) modal.classList.add('hidden');
+    window.__viewingDocText = null;
+}
+
+function copyExtractedPdfText() {
+    const contentEl = document.getElementById('pdf-modal-text-content');
+    if (!contentEl) return;
+    navigator.clipboard.writeText(contentEl.textContent).then(() => {
+        showToast('Extracted document text copied to clipboard!', 'success');
+    }).catch(() => {
+        showToast('Failed to copy text', 'error');
+    });
+}
+
+function quickPromptExtractInvoice() {
+    applyInvoiceQuickPrompt('invoice');
+}
+
+function quickPromptOdooXml() {
+    // 1. Direct check: any code block wrapper marked with data-invoice-json
+    const invoiceWrappers = document.querySelectorAll('[data-invoice-json]');
+    if (invoiceWrappers.length > 0) {
+        const lastWrapper = invoiceWrappers[invoiceWrappers.length - 1];
+        try {
+            const data = JSON.parse(lastWrapper.dataset.invoiceJson);
+            if (data && (data.invoice_number || (data.supplier && data.totals))) {
+                const xml = fillOdooXmlTemplate(data);
+                downloadXmlFile(xml, `odoo_${data.invoice_number || 'invoice'}.xml`);
+                showToast('Generated Odoo XML directly from extracted invoice data in 0.1s!', 'success');
+                return;
+            }
+        } catch (e) {}
+    }
+
+    // 2. Scan recent messages for invoice JSON
+    const msgs = document.querySelectorAll('.message-content');
+    let foundJson = null;
+    for (let i = msgs.length - 1; i >= 0; i--) {
+        const text = msgs[i].textContent || '';
+        if (isInvoiceJsonString(text)) {
+            const startIdx = text.indexOf('{');
+            const endIdx = text.lastIndexOf('}');
+            if (startIdx !== -1 && endIdx > startIdx) {
+                try {
+                    const cleanText = text.slice(startIdx, endIdx + 1)
+                        .replace(/\/\*[\s\S]*?\*\/|\/\/.*/g, '')
+                        .replace(/,\s*([}\]])/g, '$1');
+                    const parsed = JSON.parse(cleanText);
+                    if (isInvoicePayload(parsed)) {
+                        foundJson = parsed.invoice || parsed.data || parsed;
+                        break;
+                    }
+                } catch (e) {}
+            }
+        }
+    }
+
+    if (foundJson) {
+        // Fast path: We already have invoice JSON! Compile and download directly from template in 0.1s!
+        const xml = fillOdooXmlTemplate(foundJson);
+        downloadXmlFile(xml, `odoo_${foundJson.invoice_number || 'invoice'}.xml`);
+        showToast('Generated Odoo XML directly from extracted data in 0.1s!', 'success');
+        return;
+    }
+
+    applyInvoiceQuickPrompt('odoo');
+}
+
+function downloadXmlFile(xmlText, defaultFilename = 'odoo_invoice.xml') {
+    if (!xmlText) return;
+    const cleanXml = normalizeOdooUblXml(xmlText);
+    let filename = defaultFilename;
+    const idMatch = cleanXml.match(/<cbc:ID>(.*?)<\/cbc:ID>/i) || cleanXml.match(/<Numero>(.*?)<\/Numero>/i) || cleanXml.match(/id="([^"]+)"/i);
+    if (idMatch && idMatch[1]) {
+        const cleanId = idMatch[1].trim().replace(/[^a-zA-Z0-9_-]/g, '_');
+        filename = `odoo_${cleanId}.xml`;
+    }
+    const blob = new Blob([cleanXml], { type: 'application/xml;charset=utf-8' });
+    const url = URL.createObjectURL(blob);
+    const a = document.createElement('a');
+    a.href = url;
+    a.download = filename;
+    document.body.appendChild(a);
+    a.click();
+    document.body.removeChild(a);
+    URL.revokeObjectURL(url);
+    showToast(`Downloaded ${filename} (Odoo UBL 2.1 Compliant)`, 'success');
+}
+
+function applyInvoiceQuickPrompt(type) {
+    if (!chatInput) return;
+    let prompt = '';
+    switch (type) {
+        case 'invoice':
+            prompt = 'Extract all invoice information from this document:\n- Supplier (Name, VAT Number, Tax ID, Address)\n- Customer (Name, VAT Number, Address)\n- Invoice Details (Invoice #, Issue Date, Due Date, Currency)\n- Financials (Subtotal Net, VAT Rate % and VAT Amount, Total Gross)\n- Line Items (Description, Quantity, Unit Price, Total Net)\n\nProvide the result formatted as a clear Markdown summary and as a valid JSON object.';
+            break;
+        case 'odoo': {
+            prompt = 'Extract all invoice fields from this document and output them in structured JSON format:\n\n' +
+                     '```json\n' +
+                     '{\n' +
+                     '  "invoice_number": "...",\n' +
+                     '  "issue_date": "YYYY-MM-DD",\n' +
+                     '  "due_date": "YYYY-MM-DD",\n' +
+                     '  "currency": "EUR",\n' +
+                     '  "supplier": {\n' +
+                     '    "name": "...",\n' +
+                     '    "vat": "...",\n' +
+                     '    "country": "...",\n' +
+                     '    "street": "...",\n' +
+                     '    "city": "...",\n' +
+                     '    "zip": "..."\n' +
+                     '  },\n' +
+                     '  "customer": {\n' +
+                     '    "name": "...",\n' +
+                     '    "vat": "...",\n' +
+                     '    "country": "...",\n' +
+                     '    "street": "...",\n' +
+                     '    "city": "...",\n' +
+                     '    "zip": "..."\n' +
+                     '  },\n' +
+                     '  "totals": {\n' +
+                     '    "net": 0.00,\n' +
+                     '    "vat_rate": 21.0,\n' +
+                     '    "vat_amount": 0.00,\n' +
+                     '    "gross": 0.00\n' +
+                     '  },\n' +
+                     '  "lines": [\n' +
+                     '    {\n' +
+                     '      "description": "...",\n' +
+                     '      "quantity": 1,\n' +
+                     '      "unit_price": 0.00,\n' +
+                     '      "net_amount": 0.00,\n' +
+                     '      "vat_rate": 21.0\n' +
+                     '    }\n' +
+                     '  ]\n' +
+                     '}\n' +
+                     '```\n\n' +
+                     'Include a brief human-readable Markdown summary first, followed by the JSON code block. Our Odoo template will automatically compile the electronic invoice from your extracted JSON values.';
+            break;
+        }
+        case 'vat':
+            prompt = 'Verify the VAT and arithmetic on this invoice:\n1. Check the taxable subtotal and each VAT rate applied.\n2. Confirm if Subtotal Net + Total VAT equals the Total Gross amount.\n3. Verify line item totals against the subtotal.\nReport any calculation discrepancies or confirm if the numbers are mathematically consistent.';
+            break;
+        case 'summary':
+            prompt = 'Please summarize this document, highlighting the main parties involved, dates, totals, and any important terms or notes.';
+            break;
+        default:
+            prompt = 'Extract the key information and values from this document.';
+    }
+    chatInput.value = prompt;
+    chatInput.focus();
+    chatInput.style.height = 'auto';
+    chatInput.style.height = Math.min(chatInput.scrollHeight, 180) + 'px';
+    if (sendBtn) sendBtn.disabled = false;
+}
+
+// ── Standard Image Processing (PNG, JPG, WebP) ──────────────────────────────
 
 function processImageFile(file) {
     if (!file.type.startsWith('image/')) {
@@ -7076,22 +8509,43 @@ function quickPromptModel3D() {
     }
 }
 
+// ── Drag & Drop & Paste Handlers for PDFs and Images ────────────────────────
+
 function setupVisionDragAndDrop() {
+    const dropOverlay = document.getElementById('pdf-drop-overlay');
+    let dragCounter = 0;
+
+    window.addEventListener('dragenter', (e) => {
+        const types = e.dataTransfer?.types;
+        if (types && (types.includes('Files') || types.includes('public.file-url'))) {
+            e.preventDefault();
+            dragCounter++;
+            if (dropOverlay) dropOverlay.classList.remove('hidden');
+        }
+    });
+
     window.addEventListener('dragover', (e) => {
         const types = e.dataTransfer?.types;
         if (types && (types.includes('Files') || types.includes('public.file-url'))) {
             e.preventDefault();
         }
     });
+
+    window.addEventListener('dragleave', (e) => {
+        dragCounter--;
+        if (dragCounter <= 0) {
+            dragCounter = 0;
+            if (dropOverlay) dropOverlay.classList.add('hidden');
+        }
+    });
+
     window.addEventListener('drop', (e) => {
+        dragCounter = 0;
+        if (dropOverlay) dropOverlay.classList.add('hidden');
         if (e.dataTransfer && e.dataTransfer.files && e.dataTransfer.files.length > 0) {
+            e.preventDefault();
             const file = e.dataTransfer.files[0];
-            if (file.type.startsWith('image/')) {
-                e.preventDefault();
-                currentModelHasVision = true;
-                updateVisionUploadVisibility();
-                processImageFile(file);
-            }
+            handleIncomingFile(file);
         }
     });
 
@@ -7099,12 +8553,11 @@ function setupVisionDragAndDrop() {
         const items = (e.clipboardData || e.originalEvent?.clipboardData)?.items;
         if (!items) return;
         for (let i = 0; i < items.length; i++) {
-            if (items[i].type && items[i].type.indexOf('image') !== -1) {
-                const file = items[i].getAsFile();
+            const item = items[i];
+            if (item.kind === 'file') {
+                const file = item.getAsFile();
                 if (file) {
-                    currentModelHasVision = true;
-                    updateVisionUploadVisibility();
-                    processImageFile(file);
+                    handleIncomingFile(file);
                     e.preventDefault();
                     if (chatInput) chatInput.focus();
                     break;
@@ -9981,17 +11434,19 @@ function copyMessageText(btn) {
     if (footer) footer.remove();
     const text = clone.innerText.trim();
 
-    if (navigator.clipboard && navigator.clipboard.writeText) {
-        navigator.clipboard.writeText(text).then(() => {
-            btn.classList.add('copied');
-            const origHtml = btn.innerHTML;
-            btn.innerHTML = `<span class="material-symbols-outlined">done</span> Copied!`;
-            setTimeout(() => {
-                btn.classList.remove('copied');
-                btn.innerHTML = origHtml;
-            }, 1800);
-        });
-    }
+    copyTextToClipboard(text).then(() => {
+        btn.classList.add('copied');
+        const origHtml = btn.innerHTML;
+        btn.innerHTML = `<span class="material-symbols-outlined">done</span> Copied!`;
+        if (typeof showToast === 'function') showToast('Message copied to clipboard!', 'success');
+        setTimeout(() => {
+            btn.classList.remove('copied');
+            btn.innerHTML = origHtml;
+        }, 1800);
+    }).catch(err => {
+        console.error('Clipboard copy error:', err);
+        if (typeof showToast === 'function') showToast('Failed to copy to clipboard', 'error');
+    });
 }
 
 function attachAssistantMessageActions(assistantMsgDiv, rawContent) {
@@ -10025,6 +11480,7 @@ document.addEventListener('DOMContentLoaded', () => {
     initAgenticSettingsUI();
     loadSpeculativeSettings();
     loadZdbSettings();
+    syncServerConfig();
     initSystemPromptSync();
     initModelSelector();
     initMCPUI();

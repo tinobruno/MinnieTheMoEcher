@@ -1,0 +1,82 @@
+%PDF-1.4
+1 0 obj
+<< /Type /Catalog /Pages 2 0 R >>
+endobj
+2 0 obj
+<< /Type /Pages /Kids [3 0 R] /Count 1 >>
+endobj
+3 0 obj
+<< /Type /Page /Parent 2 0 R /MediaBox [0 0 612 792] /Resources << /Font << /F1 4 0 R /F2 6 0 R >> >> /Contents 5 0 R >>
+endobj
+4 0 obj
+<< /Type /Font /Subtype /Type1 /BaseFont /Helvetica-Bold >>
+endobj
+6 0 obj
+<< /Type /Font /Subtype /Type1 /BaseFont /Helvetica >>
+endobj
+5 0 obj
+<< /Length 920 >>
+stream
+BT
+/F1 18 Tf
+50 740 Td
+(INVOICE #INV-2026-0042) Tj
+/F2 11 Tf
+0 -25 Td
+(Date: 2026-03-15    Due Date: 2026-04-15) Tj
+0 -30 Td
+/F1 12 Tf
+(SUPPLIER:) Tj
+/F2 11 Tf
+0 -16 Td
+(Acme Cloud Services SRL) Tj
+0 -14 Td
+(Via Monte Napoleone 8, 20121 Milano, Italy) Tj
+0 -14 Td
+(VAT ID / Partita IVA: IT12345678901) Tj
+0 -26 Td
+/F1 12 Tf
+(CUSTOMER:) Tj
+/F2 11 Tf
+0 -16 Td
+(Enterprise Solutions S.p.A.) Tj
+0 -14 Td
+(Corso Vittorio Emanuele II 101, 10128 Torino, Italy) Tj
+0 -14 Td
+(VAT ID / Partita IVA: IT98765432109) Tj
+0 -35 Td
+/F1 11 Tf
+(DESCRIPTION                                      QTY     PRICE        TOTAL) Tj
+/F2 10 Tf
+0 -16 Td
+(NVIDIA H100 Cloud Compute (Hours)               100     EUR 2.50     EUR 250.00) Tj
+0 -16 Td
+(High-Speed NVMe Storage Tier 2TB                  1     EUR 50.00     EUR  50.00) Tj
+0 -30 Td
+/F1 11 Tf
+(FINANCIAL SUMMARY:) Tj
+/F2 11 Tf
+0 -18 Td
+(Subtotal (Net Amount):       EUR 300.00) Tj
+0 -16 Td
+(VAT (22.0%):                 EUR  66.00) Tj
+0 -20 Td
+/F1 13 Tf
+(TOTAL GROSS AMOUNT DUE:      EUR 366.00) Tj
+ET
+endstream
+endobj
+xref
+0 7
+0000000000 65535 f 
+0000000009 00000 n 
+0000000058 00000 n 
+0000000115 00000 n 
+0000000244 00000 n 
+0000000388 00000 n 
+0000000318 00000 n 
+trailer
+<< /Size 7 /Root 1 0 R >>
+startxref
+1359
+%%EOF

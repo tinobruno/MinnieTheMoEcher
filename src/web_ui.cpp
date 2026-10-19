@@ -45,6 +45,12 @@ void register_web_routes(httplib::Server& svr) {
         res.set_header("Service-Worker-Allowed", "/");
         serve_asset("web/sw.js", moecher::embedded_web::SW_JS(), "application/javascript; charset=utf-8", res);
     });
+    svr.Get("/pdf.min.js", [&serve_asset](const httplib::Request&, httplib::Response& res) {
+        serve_asset("web/pdf.min.js", "", "application/javascript; charset=utf-8", res);
+    });
+    svr.Get("/pdf.worker.min.js", [&serve_asset](const httplib::Request&, httplib::Response& res) {
+        serve_asset("web/pdf.worker.min.js", "", "application/javascript; charset=utf-8", res);
+    });
 
     // Health & status check
     svr.Get("/health", [](const httplib::Request&, httplib::Response& res) {
