@@ -5390,6 +5390,11 @@ async function sendMessage(options = {}) {
     let mainContent = document.createElement('div');
     assistantMsgDiv.querySelector('.msg-content').appendChild(mainContent);
 
+    const baseThinking = (attachedImg && !attachedDoc) ? false : (thinkingEnabled ? thinkingEnabled.checked : true);
+    // Voice prompt speed optimization: disable thinking on the fly for fast conversational responses
+    const isVoiceBypassThinking = wasVoicePrompt && (typeof voiceSettings === 'undefined' || voiceSettings.disableThinkingForVoice !== false);
+    const isThinking = isVoiceBypassThinking ? false : baseThinking;
+
     let odooProgressCard = null;
     let liveIndicator = null;
 
@@ -5398,11 +5403,6 @@ async function sendMessage(options = {}) {
         odooProgressCard = createOdooProgressCard(docTitle);
         mainContent.appendChild(odooProgressCard);
     } else {
-        const baseThinking = (attachedImg && !attachedDoc) ? false : (thinkingEnabled ? thinkingEnabled.checked : true);
-        // Voice prompt speed optimization: disable thinking on the fly for fast conversational responses
-        const isVoiceBypassThinking = wasVoicePrompt && (typeof voiceSettings === 'undefined' || voiceSettings.disableThinkingForVoice !== false);
-        const isThinking = isVoiceBypassThinking ? false : baseThinking;
-
         // Initial visual feedback while engine starts thinking/elaborating
         liveIndicator = document.createElement('div');
         liveIndicator.className = 'elaboration-status-badge';
@@ -8488,6 +8488,28 @@ function createOdooProgressCard(filename = 'Document') {
         </div>
         <div class="odoo-completed-view hidden"></div>
     `;
+
+    // Active prefill ticker to provide real-time visual feedback while prompt/image is being evaluated
+    const prefillTicker = setInterval(() => {
+        if (!card || card.classList.contains('completed') || !card.isConnected) {
+            clearInterval(prefillTicker);
+            return;
+        }
+        const pctEl = card.querySelector('.odoo-progress-pct');
+        const bar = card.querySelector('.odoo-progress-bar');
+        if (!pctEl || !bar) {
+            clearInterval(prefillTicker);
+            return;
+        }
+        let cur = parseInt(pctEl.textContent, 10) || 15;
+        if (cur < 26) {
+            cur += 1;
+            bar.style.width = `${cur}%`;
+            pctEl.textContent = `${cur}%`;
+        }
+    }, 350);
+    card.__prefillTicker = prefillTicker;
+
     return card;
 }
 
@@ -8498,38 +8520,51 @@ function updateOdooProgressUI(card, content = '', reasoning = '', isStreamDone =
     const statusTextEl = card.querySelector('.odoo-status-text');
     if (!bar || !pctEl || !statusTextEl) return;
 
-    let pct = 15;
-    let status = 'Analyzing document and tax structure...';
+    if (card.__prefillTicker && (content.length > 0 || isStreamDone || reasoning.length > 50)) {
+        clearInterval(card.__prefillTicker);
+        card.__prefillTicker = null;
+    }
+
+    const currentPct = parseInt(pctEl.textContent, 10) || 15;
+    let pct = currentPct;
+    let status = statusTextEl.textContent || 'Analyzing document and tax structure...';
 
     if (isStreamDone) {
         pct = 95;
         status = 'Compiling standard UBL 2.1 XML and preparing download...';
     } else if (content && content.length > 0) {
         const lower = content.toLowerCase();
+        let targetPct = 30;
+        let targetStatus = 'Extracting structured invoice data...';
+
         if (lower.includes('"lines"') || lower.includes('"line_items"')) {
-            pct = 85;
-            status = 'Itemizing products, quantities and unit prices...';
+            targetPct = 85;
+            targetStatus = 'Itemizing products, quantities and unit prices...';
         } else if (lower.includes('"totals"') || lower.includes('"vat_amount"') || lower.includes('"gross"')) {
-            pct = 70;
-            status = 'Calculating net, VAT rates and total amounts...';
+            targetPct = 70;
+            targetStatus = 'Calculating net, VAT rates and total amounts...';
         } else if (lower.includes('"customer"') || lower.includes('"buyer"')) {
-            pct = 50;
-            status = 'Extracting customer details and address...';
+            targetPct = 50;
+            targetStatus = 'Extracting customer details and address...';
         } else if (lower.includes('"supplier"') || lower.includes('"seller"')) {
-            pct = 35;
-            status = 'Extracting supplier info and VAT / Tax ID...';
+            targetPct = 35;
+            targetStatus = 'Extracting supplier info and VAT / Tax ID...';
         } else if (lower.includes('"invoice_number"') || lower.includes('{')) {
-            pct = 25;
-            status = 'Reading invoice number and dates...';
-        } else {
-            pct = Math.min(60, 15 + Math.floor((content.length / 500) * 30));
-            status = 'Extracting structured invoice data...';
+            targetPct = 25;
+            targetStatus = 'Reading invoice number and dates...';
         }
+
+        // Monotonic scaling with content length
+        const lengthScaledPct = Math.min(92, 25 + Math.floor((content.length / 1000) * 65));
+        pct = Math.max(pct, targetPct, lengthScaledPct);
+        status = targetStatus;
     } else if (reasoning && reasoning.length > 0) {
-        pct = Math.min(25, 10 + Math.floor((reasoning.length / 800) * 15));
+        const reasoningPct = Math.min(28, 15 + Math.floor((reasoning.length / 400) * 13));
+        pct = Math.max(pct, reasoningPct);
         status = 'Analyzing document structure & financial rules...';
     }
 
+    pct = Math.min(95, Math.max(15, pct));
     bar.style.width = `${pct}%`;
     pctEl.textContent = `${pct}%`;
     statusTextEl.textContent = status;
@@ -8537,6 +8572,10 @@ function updateOdooProgressUI(card, content = '', reasoning = '', isStreamDone =
 
 function completeOdooProgressCard(card, invoiceData, xml, filename = 'odoo_invoice.xml') {
     if (!card) return;
+    if (card.__prefillTicker) {
+        clearInterval(card.__prefillTicker);
+        card.__prefillTicker = null;
+    }
     card.classList.add('completed');
 
     const iconContainer = card.querySelector('.odoo-progress-icon');
@@ -8639,6 +8678,10 @@ function completeOdooProgressCard(card, invoiceData, xml, filename = 'odoo_invoi
 
 function failOdooProgressCard(card, errorMsg) {
     if (!card) return;
+    if (card.__prefillTicker) {
+        clearInterval(card.__prefillTicker);
+        card.__prefillTicker = null;
+    }
     const iconContainer = card.querySelector('.odoo-progress-icon');
     if (iconContainer) {
         iconContainer.classList.remove('spinning');
