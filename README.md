@@ -53,47 +53,31 @@ Bare-metal C++/CUDA and Apple Metal inference engine for **NVIDIA Nemotron 3.5 B
 `MinnieTheMoEcher` is engineered with a static-linked modular architecture where model compute logic (`src/models/*.inl`) is decoupled from the underlying hardware execution backend:
 
 ```mermaid
-flowchart TB
-    subgraph Core ["MinnieTheMoEcher Core Engine"]
-        API["HTTP Server & Web UI (/v1/chat/completions)"]
-        Router["Dynamic Architecture Dispatcher"]
-        ZDB["Zero Decode Bypass (ZDB) System 1"]
-        MemMgr["Hierarchical Memory Manager (L1 VRAM / L2 DRAM / L3 NVMe)"]
+flowchart TD
+    API["🌐 Web UI & OpenAI-Compatible API (/v1/chat/completions)"]
+    --> Router["⚡ Runtime Dispatcher & Zero Decode Bypass (ZDB)"]
+    --> Arch["🧠 Static-Linked Modular Architecture (src/models/*.inl)"]
+
+    subgraph Models ["Supported Model Family"]
+        direction TB
+        M_Bolt["• Nemotron 3.5 Bolt: Mamba-2 SSM + GQA + LatentMoE (496 routed experts)"]
+        --> M_Light["• Nemotron 3.5 Lightning: Mamba-2 SSM + GQA + Top-6 MoE (23 layers)"]
+        --> M_Qwen["• Qwen 3.8 27B: DeltaNet Linear Attention + Native MTP 40k Draft Head"]
+        --> M_DS["• DeepSeek V4-Flash: Multi-Head Latent Attention + 11,008 MoE Experts"]
+        --> M_Vis["• FrankensTin Vision: Qwen2.5-VL ViT Delegate (~3.3GB) + 70B+ Base LLM"]
     end
 
-    subgraph Models ["Modular Architecture Passes (src/models/*.inl)"]
-        M_Bolt["Nemotron 3.5 Bolt (Mamba-2 SSM + LatentMoE)"]
-        M_Light["Nemotron 3.5 Lightning (Mamba-2 SSM + Top-6 MoE)"]
-        M_Qwen["Qwen 3.8 (DeltaNet SSM + GQA)"]
-        M_DS["DeepSeek V4-Flash (MLA + 11,008 MoE)"]
-        M_Vis["FrankensTin Vision Delegate (Qwen2.5-VL ViT)"]
+    Arch --> Models
+    Models --> Mem["💾 Hierarchical Memory & Execution Engine (L1 VRAM / L2 Host DRAM / L3 NVMe)"]
+
+    subgraph Backends ["Hardware Execution Backends & OS Constraints"]
+        direction TB
+        Linux["🐧 Linux (Ubuntu / RHEL)<br>CUDA 12/13 • Unlimited Pinned RAM (mlock) • Native O_DIRECT NVMe"]
+        --> Win["🪟 Windows 10/11 x64<br>CUDA 12/13 • VirtualAlloc Pinned L2 • Async Double-Buffered DMA (Avoids WDDM Paging)"]
+        --> Mac["🍏 Apple Silicon (macOS 15+)<br>Apple Metal 3.1+ • Hardware MPP Tiled Engine • Zero-Copy UMA Shared Memory"]
     end
 
-    subgraph OS_Linux ["Linux (Ubuntu 22.04 / 24.04 LTS)"]
-        L1["CUDA 12.x / 13.x (cuBLASLt & PTX)"]
-        L2["Direct Host Pinning via mlock() (Unlimited)"]
-        L3["Native O_DIRECT Asynchronous Block I/O"]
-    end
-
-    subgraph OS_Win ["Windows 10 / 11 (x64)"]
-        W1["CUDA 12.x / 13.x (MSVC 2019/2022/2026)"]
-        W2["VirtualAlloc Pinned DRAM L2 Cache"]
-        W3["Async Double-Buffered DMA (Bypasses WDDM 3.x Paging)"]
-    end
-
-    subgraph OS_Apple ["Apple Silicon (macOS 15+)"]
-        A1["Apple Metal 3.1+ (<metal_tensor>)"]
-        A2["MetalPerformancePrimitives (MPP) Tiled Engine"]
-        A3["Unified Memory Architecture (UMA Zero-Copy Shared)"]
-    end
-
-    API --> Router
-    Router --> M_Bolt & M_Light & M_Qwen & M_DS & M_Vis
-    M_Bolt & M_Light & M_Qwen & M_DS & M_Vis --> MemMgr
-
-    MemMgr -.-> OS_Linux
-    MemMgr -.-> OS_Win
-    MemMgr -.-> OS_Apple
+    Mem --> Backends
 ```
 
 ### OS Comparison: Features, Memory Architecture & Hardware Constraints
