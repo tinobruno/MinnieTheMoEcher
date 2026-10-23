@@ -3783,12 +3783,22 @@ inline bool try_parse_tool_json(const std::string& str, ToolCall& tc, int idx) {
         if (!j.is_object()) return false;
 
         std::string fn_name;
-        if (j.contains("name") && j["name"].is_string()) {
-            fn_name = j["name"].get<std::string>();
+        if (j.contains("action") && j["action"].is_string()) {
+            fn_name = j["action"].get<std::string>();
+        } else if (j.contains("tool") && j["tool"].is_string()) {
+            fn_name = j["tool"].get<std::string>();
+        } else if (j.contains("tool_name") && j["tool_name"].is_string()) {
+            fn_name = j["tool_name"].get<std::string>();
         } else if (j.contains("function") && j["function"].is_string()) {
             fn_name = j["function"].get<std::string>();
         } else if (j.contains("function") && j["function"].is_object() && j["function"].contains("name")) {
             fn_name = j["function"]["name"].get<std::string>();
+        } else if (j.contains("name") && j["name"].is_string()) {
+            // Require explicit tool/function signature so standard data objects like {"name": "John", "age": 23} are never mistaken for tool invocations
+            if (j.contains("arguments") || j.contains("parameters") || j.contains("args") ||
+                j.value("type", "") == "function") {
+                fn_name = j["name"].get<std::string>();
+            }
         }
 
         if (fn_name.empty()) return false;

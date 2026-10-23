@@ -43,8 +43,8 @@
                             <span class="material-symbols-outlined stat-icon">bolt</span>
                             <span>Last Message</span>
                         </div>
-                        <span id="speculative-mode-badge" onclick="openSettingsPanel('settings-tab-general')" style="cursor: pointer; font-size: 10px; padding: 2px 7px; border-radius: 4px; background: rgba(56, 189, 248, 0.15); color: #38bdf8; border: 1px solid rgba(56, 189, 248, 0.3); font-weight: 500;" title="Click to adjust MTP & Tree Speculative parameters in Settings">
-                            Tree (2B)
+                        <span id="speculative-mode-badge" onclick="openSettingsPanel('settings-tab-general')" style="cursor: pointer; font-size: 10px; padding: 2px 7px; border-radius: 4px; background: rgba(167, 139, 250, 0.15); color: #a78bfa; border: 1px solid rgba(167, 139, 250, 0.35); font-weight: 500;" title="Click to adjust MTP & Tree Speculative parameters in Settings">
+                            MTP (Auto)
                         </span>
                     </div>
                     <div class="stats-grid">
@@ -840,16 +840,16 @@
                             <div class="setting-item">
                                 <label>Temperature</label>
                                 <div class="slider-container">
-                                    <input type="range" id="temp-slider" min="0" max="1" step="0.1" value="0.7">
-                                    <span id="temp-val">0.7</span>
+                                    <input type="range" id="temp-slider" min="0" max="1" step="0.1" value="0.6">
+                                    <span id="temp-val">0.6</span>
                                 </div>
                             </div>
 
                             <div class="setting-item">
                                 <label>Repetition Penalty</label>
                                 <div class="slider-container">
-                                    <input type="range" id="rep-penalty-slider" min="1.0" max="1.3" step="0.02" value="1.00">
-                                    <span id="rep-penalty-val">1.00</span>
+                                    <input type="range" id="rep-penalty-slider" min="1.0" max="1.3" step="0.02" value="1.05">
+                                    <span id="rep-penalty-val">1.05</span>
                                 </div>
                             </div>
                             
@@ -977,7 +977,7 @@
 
                             <div class="setting-item" id="tree-mtp-container">
                                 <label class="checkbox-label" title="Enable Tree Attention to verify multiple speculative candidate paths simultaneously">
-                                    <input type="checkbox" id="tree-mtp-enabled" checked onchange="updateSpeculativeControls(); saveSpeculativeSettings();">
+                                    <input type="checkbox" id="tree-mtp-enabled" onchange="updateSpeculativeControls(); saveSpeculativeSettings();">
                                     Enable Tree Attention (tree-mtp)
                                 </label>
                             </div>

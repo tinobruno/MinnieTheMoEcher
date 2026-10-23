@@ -104,47 +104,64 @@ static inline uint64_t joyai_consume_letters(const char* s, uint64_t len, uint64
 // ════════════════════════════════════════════════════════════════════════════════
 
 bool BPETokenizer::load(const std::string& path) {
-    std::ifstream f(path);
-    if (!f.is_open()) { LOG_ERROR("Cannot open tokenizer: %s", path.c_str()); return false; }
-    json tok;
-    try { f >> tok; } catch (const std::exception& e) {
-        LOG_ERROR("JSON parse error in tokenizer: %s", e.what()); return false;
-    }
-
-    auto& model = tok["model"];
-    auto& vocab = model["vocab"];
-    for (auto& [k, v] : vocab.items()) {
-        int id = v.get<int>();
-        token_to_id_[k] = id;
-        id_to_token_[id] = k;
-    }
-
-    if (model.contains("merges")) {
-        for (auto& m : model["merges"]) {
-            std::string merge_str = m.get<std::string>();
-            merges_.push_back(merge_str);
-            merge_rank_[merge_str] = (int)merges_.size();
+    LOG_INFO("BPETokenizer: Loading from %s", path.c_str());
+    try {
+        std::ifstream f(path);
+        if (!f.is_open()) {
+            LOG_ERROR("Cannot open tokenizer: %s", path.c_str());
+            return false;
         }
-    }
+        json tok;
+        f >> tok;
 
-    if (tok.contains("added_tokens")) {
-        for (auto& at : tok["added_tokens"]) {
-            int id = at["id"].get<int>();
-            std::string content = at["content"].get<std::string>();
-            token_to_id_[content] = id;
-            id_to_token_[id] = content;
-            special_tokens_.push_back({content, id});
+        auto& model = tok["model"];
+        auto& vocab = model["vocab"];
+        for (auto& [k, v] : vocab.items()) {
+            int id = v.get<int>();
+            token_to_id_[k] = id;
+            id_to_token_[id] = k;
         }
+
+        if (model.contains("merges")) {
+            for (auto& m : model["merges"]) {
+                std::string merge_str;
+                if (m.is_string()) {
+                    merge_str = m.get<std::string>();
+                } else if (m.is_array() && m.size() >= 2) {
+                    merge_str = m[0].get<std::string>() + " " + m[1].get<std::string>();
+                }
+                if (!merge_str.empty()) {
+                    merges_.push_back(merge_str);
+                    merge_rank_[merge_str] = (int)merges_.size();
+                }
+            }
+        }
+
+        if (tok.contains("added_tokens")) {
+            for (auto& at : tok["added_tokens"]) {
+                int id = at["id"].get<int>();
+                std::string content = at["content"].get<std::string>();
+                token_to_id_[content] = id;
+                id_to_token_[id] = content;
+                special_tokens_.push_back({content, id});
+            }
+        }
+
+        std::sort(special_tokens_.begin(), special_tokens_.end(),
+                  [](const auto& a, const auto& b) { return a.first.size() > b.first.size(); });
+
+        build_byte_mapping();
+
+        LOG_INFO("Tokenizer loaded: %zu vocab, %zu merges, %zu special tokens",
+                 token_to_id_.size(), merges_.size(), special_tokens_.size());
+        return true;
+    } catch (const std::exception& e) {
+        LOG_ERROR("Exception in BPETokenizer::load(%s): %s", path.c_str(), e.what());
+        return false;
+    } catch (...) {
+        LOG_ERROR("Unknown exception in BPETokenizer::load(%s)", path.c_str());
+        return false;
     }
-
-    std::sort(special_tokens_.begin(), special_tokens_.end(),
-              [](const auto& a, const auto& b) { return a.first.size() > b.first.size(); });
-
-    build_byte_mapping();
-
-    LOG_INFO("Tokenizer loaded: %zu vocab, %zu merges, %zu special tokens",
-             token_to_id_.size(), merges_.size(), special_tokens_.size());
-    return true;
 }
 
 std::vector<int> BPETokenizer::encode(const std::string& text) const {

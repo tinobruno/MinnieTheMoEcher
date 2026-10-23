@@ -13,7 +13,7 @@ class PromptLookupDrafter {
 public:
     static std::vector<int> draft(const std::vector<int>& history, int max_draft = 4, int max_ngram = 3, int min_ngram = 2) {
         int hist_len = (int)history.size();
-        if (hist_len <= max_ngram + 1) return {};
+        if (hist_len <= min_ngram + 1) return {};
 
         for (int n = max_ngram; n >= min_ngram; n--) {
             if (hist_len <= n + 1) continue;
@@ -35,6 +35,23 @@ public:
                     int avail = hist_len - n - start_cand;
                     int cand_len = std::min(max_draft, avail);
                     if (cand_len > 0) {
+                        // Anti-loop: Never draft a multi-token candidate that has already occurred >= 2 times in history
+                        int count_seen = 0;
+                        for (int p = 0; p <= hist_len - cand_len; p++) {
+                            bool matches_cand = true;
+                            for (int k = 0; k < cand_len; k++) {
+                                if (history[p + k] != history[start_cand + k]) {
+                                    matches_cand = false;
+                                    break;
+                                }
+                            }
+                            if (matches_cand) {
+                                count_seen++;
+                                if (count_seen >= 2) break;
+                            }
+                        }
+                        if (cand_len >= 2 && count_seen >= 2) continue;
+
                         std::vector<int> candidates;
                         candidates.reserve(cand_len);
                         for (int k = 0; k < cand_len; k++) {

@@ -47,7 +47,7 @@ int main(int argc, char** argv) {
     bool enable_pld = true;
     int pld_draft_tokens = 4;
     bool enable_mtp = true;
-    bool enable_tree_mtp = true;
+    bool enable_tree_mtp = false;
     int tree_nodes = 2;
     bool enable_spec = true;
 #endif
@@ -241,8 +241,16 @@ int main(int argc, char** argv) {
              tree_nodes,
              mtp_k);
 
-    if (!engine.load(manifest_path, max_vram_gb, dram_cache_gb, expert_dtype_override, buffered_io, max_seq_len_override)) {
-        LOG_ERROR("Failed to load model");
+    try {
+        if (!engine.load(manifest_path, max_vram_gb, dram_cache_gb, expert_dtype_override, buffered_io, max_seq_len_override)) {
+            LOG_ERROR("Failed to load model");
+            return 1;
+        }
+    } catch (const std::exception& e) {
+        LOG_ERROR("FATAL EXCEPTION in engine.load: %s", e.what());
+        return 1;
+    } catch (...) {
+        LOG_ERROR("FATAL UNKNOWN EXCEPTION in engine.load");
         return 1;
     }
 
@@ -256,7 +264,7 @@ int main(int argc, char** argv) {
         json messages = json::array({
             {{"role", "user"}, {"content", prompt_str}}
         });
-        std::vector<int> prompt = apply_chat_template(messages, engine.tokenizer_, test_thinking, "high");
+        std::vector<int> prompt = apply_chat_template(messages, engine.tokenizer_, test_thinking, "high", json(), engine.cfg_.is_nemotron());
         LOG_INFO("Running test generation for prompt: '%s' (%zu prompt tokens, temp=%.2f, max_tokens=%d, thinking=%d)...",
                  prompt_str.c_str(), prompt.size(), test_temp, test_max_tokens, test_thinking ? 1 : 0);
         std::string result = engine.generate(prompt, test_max_tokens, test_temp, nullptr, 1.0f, test_thinking, default_thinking_budget, 0.95f, 0.0f, 1024);
@@ -283,6 +291,21 @@ int main(int argc, char** argv) {
         mcp_mgr.start_all_enabled();
     }
 
+    // Configure default base prompt and pre-warm into KV Cache
+    std::time_t now = std::time(nullptr);
+    std::tm tm_now;
+#ifdef _WIN32
+    localtime_s(&tm_now, &now);
+#else
+    localtime_r(&now, &tm_now);
+#endif
+    char date_buf[128];
+    std::strftime(date_buf, sizeof(date_buf), "%A, %B %d, %Y", &tm_now);
+
+    if (!g_enable_tools && !g_server_exec) {
+        g_base_system_prompt = "You are a helpful assistant.\nCurrent date: " + std::string(date_buf);
+    }
+
     // Pre-warm default system prompt and tooling into KV Cache for 0ms initial prefill latency
     if (g_enable_tools) {
         json default_tools = resolve_canonical_tools("default");
@@ -291,6 +314,8 @@ int main(int argc, char** argv) {
             default_tools.push_back(mt);
         }
         rebuild_system_prefix(engine, g_base_system_prompt, default_tools);
+    } else {
+        rebuild_system_prefix(engine, g_base_system_prompt, json::array());
     }
 
     moecher::server::run_server(engine, port, default_thinking_budget, proxy_port, enable_forward_proxy, enable_system_proxy);

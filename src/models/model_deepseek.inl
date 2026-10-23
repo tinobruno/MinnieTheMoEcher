@@ -5,6 +5,10 @@
             forward_layer_qwen(layer_id, position);
             return;
         }
+        if (cfg_.is_nemotron()) {
+            forward_layer_nemotron(layer_id, token_id, position);
+            return;
+        }
 
         auto& lw = layers_[layer_id];
         int dim = cfg_.hidden_size;
@@ -316,6 +320,7 @@
                 buf_topk_idx_.i32(),
                 buf_track_flag_.i32(),
                 layer_id,
+                n_experts,
                 n_experts,
                 top_k,
                 main_stream_);
@@ -768,7 +773,11 @@
         int dim = cfg_.hidden_size;
         int vocab = cfg_.vocab_size;
 
-        if (head_weight_.dtype == "fp4") {
+        if (head_weight_.dtype == "nvfp4") {
+            gemv_nvfp4_f32_cuda(buf_logits_.f32(), buf_hidden_.bf16(),
+                                (const uint8_t*)head_weight_.data, (const uint8_t*)head_weight_scale_.data,
+                                head_weight_scale_2_, vocab, dim, main_stream_);
+        } else if (head_weight_.dtype == "fp4") {
             if (is_blackwell_tc_active_) {
                 quantize_bf16_to_fp4_e2m1_cuda(buf_activation_fp4_.u8(), buf_activation_scale_.u8(),
                                                buf_hidden_.bf16(), 1, dim, main_stream_);
@@ -783,6 +792,10 @@
         } else if (head_weight_.dtype == "int4") {
             gemv_int4_f32_cuda(buf_logits_.f32(), buf_hidden_.bf16(),
                                (const uint8_t*)head_weight_.data, head_weight_scale_.bf16(),
+                               vocab, dim, main_stream_);
+        } else if (head_weight_.dtype == "q8_0" || head_weight_.dtype == "Q8_0" || head_weight_.dtype == "U8") {
+            gemv_q8_0_f32_cuda(buf_logits_.f32(), buf_hidden_.bf16(),
+                               (const block_q8_0*)head_weight_.data,
                                vocab, dim, main_stream_);
         } else {
             // Fast CUDA graph compatible matrix-vector multiplication directly to float32 logits

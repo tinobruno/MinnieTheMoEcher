@@ -58,11 +58,14 @@ static constexpr const char* MOECHER_VERSION = moecher::VERSION;
 //  Model Config (from manifest)
 // ════════════════════════════════════════════════════════════════════════════════
 
-enum class ModelArch { DEEPSEEK_V4, QWEN, QWEN2 };
+enum class ModelArch { DEEPSEEK_V4, QWEN, QWEN2, NEMOTRON_35 };
 
 struct ModelConfig {
     ModelArch architecture = ModelArch::DEEPSEEK_V4;
     bool is_qwen() const { return architecture == ModelArch::QWEN || architecture == ModelArch::QWEN2; }
+    bool is_nemotron() const { return architecture == ModelArch::NEMOTRON_35; }
+    bool is_nemotron_bolt() const { return is_nemotron() && (moe_latent_size > 0 || num_hidden_layers > 60); }
+    bool is_deepseek() const { return architecture == ModelArch::DEEPSEEK_V4; }
     std::string model_name = "";
     std::string model_id = "";
     int vocab_size = 129280;
@@ -77,6 +80,7 @@ struct ModelConfig {
     int o_lora_rank = 1024;
     int o_groups = 8;
     int moe_intermediate_size = 2048;
+    int moe_shared_expert_intermediate_size = 3712;
     int n_routed_experts = 256;
     int num_experts_per_tok = 6;
     int n_shared_experts = 1;
@@ -103,6 +107,73 @@ struct ModelConfig {
     std::vector<int> compress_ratios;  // per-layer compression ratios
     int max_compressed_entries = 0;    // max compressed KV entries per layer
 
+    // Nemotron 3.5 hybrid Mamba-2 SSM parameters
+    int ssm_d_state = 128;
+    int ssm_d_conv = 4;
+    int ssm_expand = 2;
+    int ssm_dt_rank = 256;
+    std::vector<int> layer_types;      // 0: Attention, 1: Mamba-2 SSM, 2: MoE (or hybrid)
+
+    // Nemotron 3.5 Bolt LatentMoE & Puzzle parameters
+    int moe_latent_size = 0;           // 0: standard MoE, 1024: Bolt LatentMoE bottleneck
+    int mamba_head_dim = 64;
+    int mamba_num_heads = 128;
+    std::vector<int> layer_n_routed_experts;
+    std::vector<int> layer_moe_intermediate_size;
+    std::vector<int> layer_num_experts_per_tok;
+
+    int moe_layer_to_model_layer(int moe_layer_idx) const {
+        int cur_moe = 0;
+        for (int i = 0; i < (int)layer_types.size(); i++) {
+            if (layer_types[i] == 2) {
+                if (cur_moe == moe_layer_idx) return i;
+                cur_moe++;
+            }
+        }
+        return moe_layer_idx;
+    }
+
+    int get_moe_layer_n_routed_experts(int moe_layer_idx) const {
+        if (layer_n_routed_experts.empty()) return n_routed_experts;
+        int model_l = moe_layer_to_model_layer(moe_layer_idx);
+        return get_layer_n_routed_experts(model_l);
+    }
+
+    int get_layer_n_routed_experts(int l) const {
+        if (l >= 0 && l < (int)layer_n_routed_experts.size() && layer_n_routed_experts[l] > 0)
+            return layer_n_routed_experts[l];
+        return n_routed_experts;
+    }
+    int get_layer_moe_intermediate(int l) const {
+        if (l >= 0 && l < (int)layer_moe_intermediate_size.size() && layer_moe_intermediate_size[l] > 0)
+            return layer_moe_intermediate_size[l];
+        return moe_intermediate_size;
+    }
+    int get_layer_moe_intermediate_size(int l) const {
+        return get_layer_moe_intermediate(l);
+    }
+    int get_layer_num_experts_per_tok(int l) const {
+        if (l >= 0 && l < (int)layer_num_experts_per_tok.size() && layer_num_experts_per_tok[l] > 0)
+            return layer_num_experts_per_tok[l];
+        return num_experts_per_tok;
+    }
+    int max_n_routed_experts() const {
+        int m = n_routed_experts;
+        for (int v : layer_n_routed_experts) if (v > m) m = v;
+        return m;
+    }
+    int max_num_experts_per_tok() const {
+        int m = num_experts_per_tok;
+        for (int v : layer_num_experts_per_tok) if (v > m) m = v;
+        return m;
+    }
+
+    // Recommended / default inference parameters per model
+    float default_temperature = -1.0f;
+    float default_repetition_penalty = -1.0f;
+    std::string default_reasoning_effort = "";
+    int default_thinking_budget = -1;
+
     int layer_compress_ratio(int layer_id) const {
         if (layer_id < (int)compress_ratios.size()) return compress_ratios[layer_id];
         return 0;
@@ -118,7 +189,11 @@ struct ModelConfig {
         if (model_id.empty()) get(model_id, "id");
         if (j.contains("architecture")) {
             std::string arch_str = j["architecture"].get<std::string>();
-            if (model_id.find("qwen3") != std::string::npos || model_name.find("Qwen 3") != std::string::npos || arch_str == "qwen3") {
+            if (model_id.find("nemotron") != std::string::npos || model_name.find("Nemotron") != std::string::npos ||
+                arch_str == "nemotron" || arch_str == "nemotron_35" || arch_str == "nemotron_h" ||
+                arch_str == "nemotron_h_puzzle" || arch_str == "nemotron_h_omni" || arch_str == "nemotron_bolt") {
+                architecture = ModelArch::NEMOTRON_35;
+            } else if (model_id.find("qwen3") != std::string::npos || model_name.find("Qwen 3") != std::string::npos || arch_str == "qwen3") {
                 architecture = ModelArch::QWEN;
             } else if (arch_str == "qwen2" || arch_str == "qwen2.5") {
                 architecture = ModelArch::QWEN2;
@@ -140,6 +215,7 @@ struct ModelConfig {
         get(o_lora_rank, "o_lora_rank");
         get(o_groups, "o_groups");
         get(moe_intermediate_size, "moe_intermediate_size");
+        get(moe_shared_expert_intermediate_size, "moe_shared_expert_intermediate_size");
         get(n_routed_experts, "n_routed_experts");
         get(num_experts_per_tok, "num_experts_per_tok");
         get(n_shared_experts, "n_shared_experts");
@@ -166,16 +242,80 @@ struct ModelConfig {
         get(eos_token_id, "eos_token_id");
         get(compress_rope_theta, "compress_rope_theta");
         get(expert_dtype, "expert_dtype");
+        get(ssm_d_state, "ssm_d_state");
+        get(ssm_d_conv, "ssm_d_conv");
+        get(ssm_expand, "ssm_expand");
+        get(ssm_dt_rank, "ssm_dt_rank");
+        get(moe_latent_size, "moe_latent_size");
+        get(mamba_head_dim, "mamba_head_dim");
+        get(mamba_num_heads, "mamba_num_heads");
+        if (j.contains("layers_block_type") && j["layers_block_type"].is_array()) {
+            layer_types.clear();
+            for (const auto& item : j["layers_block_type"]) {
+                std::string bt = item.get<std::string>();
+                if (bt == "mamba" || bt == "ssm") {
+                    layer_types.push_back(1);
+                } else if (bt == "attention" || bt == "attn") {
+                    layer_types.push_back(0);
+                } else if (bt == "moe" || bt == "latent_moe") {
+                    layer_types.push_back(2);
+                } else {
+                    layer_types.push_back(0);
+                }
+            }
+            num_hidden_layers = (int)layer_types.size();
+        } else if (j.contains("layer_types") && j["layer_types"].is_array()) {
+            layer_types = j["layer_types"].get<std::vector<int>>();
+        }
+        if (j.contains("block_configs") && j["block_configs"].is_array()) {
+            layer_n_routed_experts.assign(num_hidden_layers, n_routed_experts);
+            layer_moe_intermediate_size.assign(num_hidden_layers, moe_intermediate_size);
+            layer_num_experts_per_tok.assign(num_hidden_layers, num_experts_per_tok);
+            const auto& bcs = j["block_configs"];
+            for (size_t l = 0; l < bcs.size() && l < (size_t)num_hidden_layers; l++) {
+                const auto& bc = bcs[l];
+                if (bc.contains("n_routed_experts")) layer_n_routed_experts[l] = bc["n_routed_experts"].get<int>();
+                if (bc.contains("moe_intermediate_size")) layer_moe_intermediate_size[l] = bc["moe_intermediate_size"].get<int>();
+                if (bc.contains("num_experts_per_tok")) layer_num_experts_per_tok[l] = bc["num_experts_per_tok"].get<int>();
+            }
+        } else {
+            if (j.contains("blockwise_n_routed_experts") && j["blockwise_n_routed_experts"].is_array()) {
+                layer_n_routed_experts = j["blockwise_n_routed_experts"].get<std::vector<int>>();
+            }
+            if (j.contains("blockwise_moe_intermediate_size") && j["blockwise_moe_intermediate_size"].is_array()) {
+                layer_moe_intermediate_size = j["blockwise_moe_intermediate_size"].get<std::vector<int>>();
+            }
+            if (j.contains("blockwise_num_experts_per_tok") && j["blockwise_num_experts_per_tok"].is_array()) {
+                layer_num_experts_per_tok = j["blockwise_num_experts_per_tok"].get<std::vector<int>>();
+            }
+        }
         if (j.contains("compress_ratios") && j["compress_ratios"].is_array()) {
             compress_ratios = j["compress_ratios"].get<std::vector<int>>();
         }
-        // Compute max compressed entries: max_seq_len / min_ratio
+        // Compute max compressed entries: max_seq_len / min_ratio (critical for DeepSeek MLA compressed KV cache)
         max_compressed_entries = 0;
         for (int r : compress_ratios) {
             if (r > 0) {
                 int entries = max_seq_len / r + 2;
                 if (entries > max_compressed_entries) max_compressed_entries = entries;
             }
+        }
+        get(default_temperature, "default_temperature");
+        get(default_repetition_penalty, "default_repetition_penalty");
+        get(default_reasoning_effort, "default_reasoning_effort");
+        get(default_thinking_budget, "default_thinking_budget");
+
+        if (default_temperature < 0.0f) {
+            default_temperature = is_nemotron() ? 0.6f : 0.7f;
+        }
+        if (default_repetition_penalty < 0.0f) {
+            default_repetition_penalty = is_nemotron() ? 1.05f : 1.00f;
+        }
+        if (default_reasoning_effort.empty()) {
+            default_reasoning_effort = is_nemotron() ? "high" : "medium";
+        }
+        if (default_thinking_budget < 0) {
+            default_thinking_budget = 4096;
         }
     }
 };
@@ -238,9 +378,11 @@ struct GPUTensor {
         shape = std::move(other.shape);
         dtype = std::move(other.dtype);
         is_host = other.is_host;
+        is_pinned = other.is_pinned;
         other.data = nullptr;
         other.size_bytes = 0;
         other.is_host = false;
+        other.is_pinned = false;
     }
     GPUTensor& operator=(GPUTensor&& other) noexcept {
         if (this != &other) {
@@ -250,12 +392,16 @@ struct GPUTensor {
             shape = std::move(other.shape);
             dtype = std::move(other.dtype);
             is_host = other.is_host;
+            is_pinned = other.is_pinned;
             other.data = nullptr;
             other.size_bytes = 0;
             other.is_host = false;
+            other.is_pinned = false;
         }
         return *this;
     }
+
+    bool is_pinned = false;
 
     void alloc(size_t bytes) {
         if (data) free();
@@ -264,11 +410,22 @@ struct GPUTensor {
 #endif
         size_bytes = bytes;
         is_host = false;
+        is_pinned = false;
     }
     void alloc_host(size_t bytes) {
         if (data) free();
 #if !defined(__APPLE__)
-        CUDA_CHECK(cudaMallocHost(&data, bytes));
+        cudaError_t err = cudaMallocHost(&data, bytes);
+        if (err == cudaSuccess) {
+            is_pinned = true;
+        } else {
+            cudaGetLastError();
+            data = malloc(bytes);
+            is_pinned = false;
+        }
+#else
+        data = malloc(bytes);
+        is_pinned = false;
 #endif
         size_bytes = bytes;
         is_host = true;
@@ -276,12 +433,20 @@ struct GPUTensor {
     void free() {
         if (data) {
 #if !defined(__APPLE__)
-            if (is_host) cudaFreeHost(data);
+            if (is_host) {
+                if (is_pinned) cudaFreeHost(data);
+                else ::free(data);
+            } else {
+                cudaFree(data);
+            }
+#else
+            if (is_host) ::free(data);
             else cudaFree(data);
 #endif
             data = nullptr;
             size_bytes = 0;
             is_host = false;
+            is_pinned = false;
         }
     }
     ~GPUTensor() { free(); }

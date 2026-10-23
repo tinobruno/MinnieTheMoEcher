@@ -36,6 +36,7 @@ void log_msg(const char* level, const char* fmt, ...) {
 
     if (!g_quiet || !g_server_ready || strstr(buf, "[PREFILL STATS]") || strstr(buf, "[GENERATION STATS]") || strstr(buf, "[SPECULATIVE STATS]") || strstr(buf, "VERIFY TIMING") || strstr(buf, "MTP DEBUG") || strstr(buf, "SINGLE FWD TIMING") || strcmp(level, "ERROR") == 0) {
         fprintf(stderr, "[%s] [%s] %s\n", timebuf, level, buf);
+        fflush(stderr);
     }
     if (g_log_file.is_open()) {
         g_log_file << "[" << timebuf << "] [" << level << "] " << buf << "\n";

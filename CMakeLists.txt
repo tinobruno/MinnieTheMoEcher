@@ -192,3 +192,28 @@ if(APPLE)
         ${CMAKE_CURRENT_SOURCE_DIR}/src
     )
 endif()
+
+if(NOT APPLE)
+    add_executable(test_nemotron_ssm
+        tests/test_nemotron_ssm.cu
+    )
+    target_link_libraries(test_nemotron_ssm PRIVATE
+        CUDA::cudart
+        nlohmann_json::nlohmann_json
+    )
+    target_include_directories(test_nemotron_ssm PRIVATE
+        ${CMAKE_CURRENT_SOURCE_DIR}/src
+    )
+
+    add_executable(test_nemotron_bolt
+        tests/test_nemotron_bolt.cu
+    )
+    target_link_libraries(test_nemotron_bolt PRIVATE
+        CUDA::cudart
+        nlohmann_json::nlohmann_json
+    )
+    target_include_directories(test_nemotron_bolt PRIVATE
+        ${CMAKE_CURRENT_SOURCE_DIR}/src
+    )
+endif()
+

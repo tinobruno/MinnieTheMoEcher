@@ -37,6 +37,8 @@ Name: "custom"; Description: "Custom Installation"; Flags: iscustom
 
 [Components]
 Name: "core"; Description: "Moecher Engine Core & Web UI (~40 MB)"; Types: full custom; Flags: fixed
+Name: "dl_nemotron_bolt"; Description: "Download NVIDIA Nemotron 3.5 Bolt 74B-A9B NVFP4 (~67.5 GB) from Hugging Face"; Types: custom
+Name: "dl_nemotron"; Description: "Download NVIDIA Nemotron 3.5 Lightning 30B-A3B NVFP4 (~21.6 GB) from Hugging Face"; Types: full custom
 Name: "dl_qwen_13g"; Description: "Download Qwen 3.8 27B Vision - 16GB GPU Mode (~13.8 GB) from Hugging Face"; Types: full custom
 Name: "dl_qwen"; Description: "Download Qwen 3.8 27B INT4 with MTP Speculative Decoding (~19.1 GB) from Hugging Face"; Types: custom
 Name: "dl_deepseek"; Description: "Download DeepSeek V4 Flash IQ2 - Standard (~81.4 GB) from Hugging Face"; Types: custom
@@ -52,6 +54,9 @@ Source: "C:\Program Files\NVIDIA GPU Computing Toolkit\CUDA\v13.3\bin\x64\cublas
 Source: "C:\Program Files\NVIDIA GPU Computing Toolkit\CUDA\v13.3\bin\x64\cublasLt64_13.dll"; DestDir: "{app}"; Flags: ignoreversion skipifsourcedoesntexist; Components: core
 
 ; Launchers, Scripts, Icons & Web UI
+Source: "..\installer\start_nemotron_bolt_16gb_server.bat"; DestDir: "{app}"; Flags: ignoreversion; Components: core
+Source: "..\installer\start_nemotron_bolt_24gb_server.bat"; DestDir: "{app}"; Flags: ignoreversion; Components: core
+Source: "..\installer\start_nemotron_server.bat"; DestDir: "{app}"; Flags: ignoreversion; Components: core
 Source: "..\installer\start_qwen_13g_server.bat"; DestDir: "{app}"; Flags: ignoreversion; Components: core
 Source: "..\installer\start_qwen_server.bat"; DestDir: "{app}"; Flags: ignoreversion; Components: core
 Source: "..\installer\start_deepseek_server.bat"; DestDir: "{app}"; Flags: ignoreversion; Components: core
@@ -63,6 +68,9 @@ Source: "..\web\*"; DestDir: "{app}\web"; Flags: ignoreversion recursesubdirs cr
 
 [Icons]
 ; Start Menu Shortcuts
+Name: "{group}\Moecher (Nemotron 3.5 Bolt 16GB Hybrid)"; Filename: "{app}\start_nemotron_bolt_16gb_server.bat"; WorkingDir: "{app}"; IconFilename: "{app}\moecher.ico"
+Name: "{group}\Moecher (Nemotron 3.5 Bolt 24GB Resident)"; Filename: "{app}\start_nemotron_bolt_24gb_server.bat"; WorkingDir: "{app}"; IconFilename: "{app}\moecher.ico"
+Name: "{group}\Moecher (Nemotron 3.5 Lightning NVFP4)"; Filename: "{app}\start_nemotron_server.bat"; WorkingDir: "{app}"; IconFilename: "{app}\moecher.ico"
 Name: "{group}\Moecher (Qwen 3.8 27B Vision 13G)"; Filename: "{app}\start_qwen_13g_server.bat"; WorkingDir: "{app}"; IconFilename: "{app}\moecher.ico"
 Name: "{group}\Moecher (Qwen 3.8 27B)"; Filename: "{app}\start_qwen_server.bat"; WorkingDir: "{app}"; IconFilename: "{app}\moecher.ico"
 Name: "{group}\Moecher (DeepSeek V4 Flash Standard)"; Filename: "{app}\start_deepseek_server.bat"; WorkingDir: "{app}"; IconFilename: "{app}\moecher.ico"
@@ -71,6 +79,9 @@ Name: "{group}\Test API"; Filename: "{app}\test_qwen.bat"; WorkingDir: "{app}"
 Name: "{group}\Uninstall Moecher"; Filename: "{uninstallexe}"
 
 ; Desktop Shortcuts
+Name: "{autodesktop}\Moecher (Nemotron 3.5 Bolt 16GB)"; Filename: "{app}\start_nemotron_bolt_16gb_server.bat"; WorkingDir: "{app}"; IconFilename: "{app}\moecher.ico"; Tasks: desktopicon
+Name: "{autodesktop}\Moecher (Nemotron 3.5 Bolt 24GB)"; Filename: "{app}\start_nemotron_bolt_24gb_server.bat"; WorkingDir: "{app}"; IconFilename: "{app}\moecher.ico"; Tasks: desktopicon
+Name: "{autodesktop}\Moecher (Nemotron 3.5 Lightning NVFP4)"; Filename: "{app}\start_nemotron_server.bat"; WorkingDir: "{app}"; IconFilename: "{app}\moecher.ico"; Tasks: desktopicon
 Name: "{autodesktop}\Moecher (Qwen 3.8 27B Vision 13G)"; Filename: "{app}\start_qwen_13g_server.bat"; WorkingDir: "{app}"; IconFilename: "{app}\moecher.ico"; Tasks: desktopicon
 Name: "{autodesktop}\Moecher (Qwen 3.8 27B)"; Filename: "{app}\start_qwen_server.bat"; WorkingDir: "{app}"; IconFilename: "{app}\moecher.ico"; Tasks: desktopicon
 Name: "{autodesktop}\Moecher (DeepSeek V4 Flash Standard)"; Filename: "{app}\start_deepseek_server.bat"; WorkingDir: "{app}"; IconFilename: "{app}\moecher.ico"; Tasks: desktopicon
@@ -101,6 +112,7 @@ procedure CurStepChanged(CurStep: TSetupStep);
 var
   MaxVram: String;
   DramCache: String;
+  NemotronBatContent: String;
   Qwen13gBatContent: String;
   QwenBatContent: String;
   DeepSeekBatContent: String;
@@ -116,6 +128,19 @@ begin
     
     DramCache := HardwarePage.Values[1];
     if DramCache = '' then DramCache := '0';
+
+    // Customize start_nemotron_server.bat
+    NemotronBatContent :=
+      '@echo off' + #13#10 +
+      'setlocal' + #13#10 +
+      'chcp 65001 >nul' + #13#10 +
+      'cd /d "%~dp0"' + #13#10 +
+      'echo ===============================================================================' + #13#10 +
+      'echo   Starting Moecher Server with NVIDIA Nemotron 3.5 Lightning (30B-A3B NVFP4)' + #13#10 +
+      'echo   Web UI: http://localhost:8001' + #13#10 +
+      'echo ===============================================================================' + #13#10 +
+      'start "Moecher Nemotron Server" /high moecher.exe --manifest models\nemotron_3.5_lightning\moecher_manifest.json --max-vram ' + MaxVram + ' --dram-cache-gb ' + DramCache + ' --quiet' + #13#10;
+    SaveStringToFile(AppDir + '\start_nemotron_server.bat', NemotronBatContent, False);
     
     // Customize start_qwen_13g_server.bat
     Qwen13gBatContent :=
@@ -170,6 +195,16 @@ begin
     SaveStringToFile(AppDir + '\start_deepseek_q4_server.bat', DeepSeekQ4BatContent, False);
     
     // Trigger model downloads for selected components
+    if WizardIsComponentSelected('dl_nemotron_bolt') then
+    begin
+      Exec('powershell.exe', '-ExecutionPolicy Bypass -File "' + AppDir + '\download_model.ps1" -Model nemotron_bolt -DestDir "' + AppDir + '\models"', AppDir, SW_SHOWNORMAL, ewWaitUntilTerminated, ResultCode);
+    end;
+
+    if WizardIsComponentSelected('dl_nemotron') then
+    begin
+      Exec('powershell.exe', '-ExecutionPolicy Bypass -File "' + AppDir + '\download_model.ps1" -Model nemotron -DestDir "' + AppDir + '\models"', AppDir, SW_SHOWNORMAL, ewWaitUntilTerminated, ResultCode);
+    end;
+
     if WizardIsComponentSelected('dl_qwen_13g') then
     begin
       Exec('powershell.exe', '-ExecutionPolicy Bypass -File "' + AppDir + '\download_model.ps1" -Model qwen_13g -DestDir "' + AppDir + '\models"', AppDir, SW_SHOWNORMAL, ewWaitUntilTerminated, ResultCode);

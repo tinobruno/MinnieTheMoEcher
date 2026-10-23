@@ -3167,15 +3167,15 @@ void increment_i32_cuda(int32_t* ptr, int inc, cudaStream_t stream) {
 
 void accumulate_expert_freq_cuda(
     uint32_t* expert_counts, int32_t* step_topk, const int32_t* topk_idx,
-    const int32_t* track_flag, int layer_id, int n_experts, int top_k, cudaStream_t stream)
+    const int32_t* track_flag, int layer_id, int stride, int n_experts, int top_k, cudaStream_t stream)
 {
     (void)stream;
     if (track_flag && *track_flag == 0) return;
     for (int k = 0; k < top_k; k++) {
         int idx = topk_idx[k];
         if (idx >= 0 && idx < n_experts) {
-            expert_counts[layer_id * n_experts + idx]++;
-            if (step_topk) step_topk[k] = idx;
+            expert_counts[(size_t)layer_id * stride + idx]++;
+            if (step_topk) step_topk[layer_id * top_k + k] = idx;
         }
     }
 }
