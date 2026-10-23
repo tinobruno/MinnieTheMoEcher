@@ -1,8 +1,9 @@
 # MinnieTheMoECher
 
-Bare-metal C++/CUDA and Apple Metal inference engine for **Qwen 3.8 27B** and **DeepSeek V4-Flash** (284B total / 13B active) featuring ultra-fast **Multi-Token Prediction (MTP) Speculative Decoding** reaching **~98 tok/s** on NVIDIA GPUs and **143.3 - 172.0 tok/s prefill** on Apple Silicon (M6).
+Bare-metal C++/CUDA and Apple Metal inference engine for **NVIDIA Nemotron 3.5 Bolt & Lightning**, **Qwen 3.8 27B**, and **DeepSeek V4-Flash** (284B total / 13B active) featuring ultra-fast **Multi-Token Prediction (MTP) Speculative Decoding** reaching **~98 tok/s** on NVIDIA GPUs, **143.3 - 172.0 tok/s prefill** on Apple Silicon (M6), and **asynchronous double-buffered MoE DMA** achieving **13.5 tok/s decode** on sub-$500 consumer GPUs.
 
 **Key features**:
+- **NVIDIA Nemotron 3.5 Bolt & Lightning Support**: Native bare-metal execution of hybrid Mamba-2 SSM + GQA Attention + LatentMoE (496 routed experts/layer, top-9 routing) running 100% in-memory across VRAM L1 + Pinned Host DRAM L2 on consumer hardware (RTX 5060 Ti 16GB). Outperforms `llama.cpp`'s MoE cache by **3.86x** (13.51 tok/s vs 3.50 tok/s) with 0% CPU core burn.
 - **Native Apple Silicon Metal Backend & Hardware MPP Tiled Prefill Engine**: High-performance bare-metal Apple Metal implementation utilizing Apple's native `<metal_tensor>` and `<MetalPerformancePrimitives/MetalPerformancePrimitives.h>` (`mpp::tensor_ops::matmul2d`). Features on-the-fly threadgroup SRAM tile dequantization (`threadgroup bfloat s_w[64][32]`), eliminating 48 GB of intermediate DRAM dequantization traffic and delivering **143.3 to 172.0 tok/s prefill** (2.67x faster than Apple MLX) and **11.27 to 11.38 tok/s decode** with 95.1% memory bus saturation (146.0 GB/s) on Apple M6. See [README.METAL.md](README.METAL.md) and [WHITEPAPER.md](whitepaper/WHITEPAPER.md).
 - **Ultra-Fast MTP Speculative Decoding Engine (~98 tok/s)**: Native target-model Multi-Token Prediction (MTP) self-drafting with a compact 40,000-token draft vocabulary and BF16 projection head, yielding 62–74% token acceptance with only ~1.18 ms draft latency on RTX PRO 6000 Blackwell.
 - **Batched Shared-Memory DeltaNet Recurrence**: Fused `deltanet_ssm_batch_kernel` keeping head recurrence in 32 KB on-chip shared memory across verification steps, completely eliminating intermediate VRAM roundtrips and 360 redundant D2D memory copies.
@@ -11,8 +12,8 @@ Bare-metal C++/CUDA and Apple Metal inference engine for **Qwen 3.8 27B** and **
 - **Full-Context Compressed Attention Cache (CSA & HCA)**: Dual-tier compressed KV memory spanning the entire 32K context window without token truncation or reasoning amnesia.
 - **Fast BF16/FP16 Dense Prefill & MLA Attention**: High-throughput prompt processing and grouped low-rank MLA projection.
 - **O_DIRECT SSD Offloading + Pinned DRAM L2 Cache**: Seamless fallback to stream experts from NVMe / DRAM on consumer GPUs (e.g. RTX 3090 24GB).
-- **Cross-Architecture Multi-Model Support**: Safe runtime architectural gating seamlessly running both DeltaNet Transformer (Qwen 3.8) and Sparse MoE + MLA (DeepSeek V4 Flash) on the same unified bare-metal engine.
-- **FrankensTin Vision & Sub-Model Visual Delegation**: High-speed, lightweight vision delegation architecture running native Qwen2.5-VL ViT (32 blocks, 4 full-attention + 28 window-attention blocks) and INT4 delegate decoder in **~3.3 GB VRAM**. Plug-and-play compatible with **any** quantized DeepSeek V4-Flash model, providing 100% accurate OCR and multimodal visual perception with zero fine-tuning of base weights.
+- **Cross-Architecture Multi-Model Support**: Safe runtime architectural gating seamlessly running Mamba-2 SSM + LatentMoE (Nemotron), DeltaNet Transformer (Qwen 3.8), and Sparse MoE + MLA (DeepSeek V4 Flash) on the same unified bare-metal engine.
+- **FrankensTin Vision & Sub-Model Visual Delegation**: High-speed, lightweight vision delegation architecture running native Qwen2.5-VL ViT (32 blocks, 4 full-attention + 28 window-attention blocks) and INT4 delegate decoder in **~3.3 GB VRAM**. Plug-and-play compatible with **any** quantized DeepSeek V4-Flash or Nemotron model, providing 100% accurate OCR and multimodal visual perception with zero fine-tuning of base weights.
 - **Zero Decode Bypass (ZDB) System 1 Non-Autoregressive Engine**: Sub-100ms structured decision making, routing, and classification bypassing 100% of memory-bandwidth-bound decode loops (`completion_tokens = 0`). Delivers **6.5x to 20.3x speedups** over standard autoregressive decoding. See [BENCHMARK_ZERO_DECODE_BYPASS.md](BENCHMARK_ZERO_DECODE_BYPASS.md) and [ARTICLE_FOLLOWUP_ZERO_DECODE_BYPASS.md](ARTICLE_FOLLOWUP_ZERO_DECODE_BYPASS.md).
 - **Static-Linked Modular Architecture**: Clean, decoupled translation units and `.inl` model passes allowing multiple developers and AI agents to work in parallel on different architectures and features without git merge conflicts, dynamic loading penalties, or IPC overhead. See [DEVELOPER_GUIDE.md](DEVELOPER_GUIDE.md).
 - **Modern Web UI & Interactive Chat Client**: Full-featured Gemini-styled web interface with live HTML sandbox workbench, real-time reasoning traces, stop generation, ZDB quick toggle, and live TTFT/throughput telemetry.
@@ -23,7 +24,7 @@ Bare-metal C++/CUDA and Apple Metal inference engine for **Qwen 3.8 27B** and **
 
 - macOS 15.0+ on Apple Silicon (Apple M-series / Apple M6, 16 GB+ Unified Memory, Apple Clang / Command Line Tools, CMake 3.22+)
 - Linux (Ubuntu 22.04 / 24.04) or Windows 10/11 x64
-- NVIDIA GPU with CUDA Compute 8.0+ (RTX 3090, 4090, RTX 6000 Ada, RTX PRO 6000 Blackwell)
+- NVIDIA GPU with CUDA Compute 8.0+ (RTX 3090, 4090, RTX 5060 Ti, RTX 6000 Ada, RTX PRO 6000 Blackwell)
 - CUDA Toolkit 12.0+ (CUDA 13.x fully supported)
 - CMake 3.22+ and MSVC 2019/2022 (Windows) or GCC/Clang (Linux)
 - Python 3.10+ (for tools, tokenizers, client, and quantization)
@@ -32,16 +33,83 @@ Bare-metal C++/CUDA and Apple Metal inference engine for **Qwen 3.8 27B** and **
 
 ## Supported Models & Profiles
 
-`MinnieTheMoEcher` supports both dense linear-attention architectures and massive mixture-of-experts architectures:
+`MinnieTheMoEcher` supports dense linear-attention, state-space models (SSM), and massive mixture-of-experts architectures:
 
-| Model Architecture | Quantization / Weight Format | VRAM Footprint | Speculative Decoding | Target Throughput | Primary Features |
+| Model Architecture | Quantization / Weight Format | VRAM Footprint | Host RAM (L2) | Target Throughput | Primary Features |
 | :--- | :--- | :--- | :--- | :--- | :--- |
-| **Qwen 3.8 27B (Apple Silicon)** | Native Packed INT3/INT4 (`attention_dense_layers.bin`) | **13.00 GB** | **Autoregressive (95.1% Bus Saturation)** | **11.38 tok/s (143 - 172 tok/s prefill)** | Native Metal, Hardware MPP Tiled SRAM Dequantization, Zero-Copy UMA, DeltaNet |
-| **Qwen 3.8 27B (NVIDIA)** | Native Packed INT4 (`attention_dense_layers_q4.bin`) | ~17.8 GiB | **MTP Self-Drafting (40k Vocab)** | **~98 tok/s** | DeltaNet Linear Attention, Fused Shared-Memory SSM Recurrence, PLD |
-| **FrankensTin Vision V4** | Mixed NVFP4 (Hot) + IQ2_XXS (Cold) + Vision Delegate | ~85.2 GiB (fits 96GB) | Baseline Autoregressive Decode | **~54 tok/s** | High-res multimodal sight via [`TinoBruno/frankenstin-vision-delegate`](https://huggingface.co/TinoBruno/frankenstin-vision-delegate) (~3.3 GB), 100% VRAM resident 11,008 MoE experts, Q4 MLA |
-| **DeepSeek V4-Flash** | Calibrated `IQ2_XXS` + `Q2_K` (`moe_experts_iq2.bin`) | ~72.6 GiB | Baseline Autoregressive Decode | **~54 tok/s** | 100% resident 11,008 MoE experts, Full-Context CSA/HCA Cache, MLA |
-| **DeepSeek V4-Flash** | Standard / Imatrix INT2 | ~74.0 GiB | Baseline Autoregressive Decode | **~53 tok/s** | Uncalibrated / imatrix 4-level scalar INT2 experts |
-| **DeepSeek V4-Flash** | Base FP4 (`moe_experts.bin`) | 147.0 GiB | Dynamic Streaming | Variable | O_DIRECT NVMe streaming + Pinned DRAM L2 Cache |
+| **NVIDIA Nemotron 3.5 Bolt (74B)** | LatentMoE (24GB / 16GB profile) | **6.40 GB** | **13.50 GB (Pinned)** | **13.51 tok/s decode (21.54 tok/s prefill)** | Hybrid Mamba-2 SSM + GQA Attention, 496 routed experts/layer (top-9), async double-buffered DMA prefetch, 0% CPU load |
+| **NVIDIA Nemotron 3.5 Lightning (14.8B)** | NVFP4 / Scalar FP8 + Squared ReLU | **~9.50 GB** | **~4.00 GB** | **~38.0 tok/s decode** | Hybrid Mamba-2 SSM + GQA Attention, top-6 routed MoE (23 layers), cuBLASLt batched prefill, FrankensTin Vision |
+| **Qwen 3.8 27B (Apple Silicon)** | Native Packed INT3/INT4 (`attention_dense_layers.bin`) | **13.00 GB** | **Unified Memory** | **11.38 tok/s (143 - 172 tok/s prefill)** | Native Metal, Hardware MPP Tiled SRAM Dequantization, Zero-Copy UMA, DeltaNet Linear Attention |
+| **Qwen 3.8 27B (NVIDIA)** | Native Packed INT4 (`attention_dense_layers_q4.bin`) | **~17.8 GiB** | N/A | **~98 tok/s decode** | DeltaNet Linear Attention, Fused Shared-Memory SSM Recurrence, MTP 40k Draft Vocab, PLD |
+| **FrankensTin Vision V4** | Mixed NVFP4 (Hot) + IQ2_XXS (Cold) + Vision Delegate | **~85.2 GiB** | N/A | **~54 tok/s decode** | Multimodal sight via [`TinoBruno/frankenstin-vision-delegate`](https://huggingface.co/TinoBruno/frankenstin-vision-delegate) (~3.3 GB), 100% VRAM resident 11,008 MoE experts, Q4 MLA |
+| **DeepSeek V4-Flash (Resident)** | Calibrated `IQ2_XXS` + `Q2_K` (`moe_experts_iq2.bin`) | **~72.6 GiB** | N/A | **~54 tok/s decode** | 100% resident 11,008 MoE experts, Full-Context CSA/HCA Cache, MLA |
+| **DeepSeek V4-Flash (Consumer)** | Calibrated `IQ2_XXS` + `Q2_K` | **~20.0 GiB** | **24.0 GB (Pinned)** | **~18 - 25 tok/s** | O_DIRECT NVMe streaming + Pinned DRAM L2 Cache for 24GB GPUs (RTX 3090/4090) |
+| **DeepSeek V4-Flash (FP4 Streaming)** | Base FP4 (`moe_experts.bin`) | **~80.0 GiB** | **67.0 GB** | Dynamic Streaming | Dynamic NVMe streaming + O_DIRECT asynchronous block prefetching |
+
+---
+
+## Cross-Platform Architecture & OS Support Matrix
+
+`MinnieTheMoEcher` is engineered with a static-linked modular architecture where model compute logic (`src/models/*.inl`) is decoupled from the underlying hardware execution backend:
+
+```mermaid
+flowchart TB
+    subgraph Core ["MinnieTheMoEcher Core Engine"]
+        API["HTTP Server & Web UI (/v1/chat/completions)"]
+        Router["Dynamic Architecture Dispatcher"]
+        ZDB["Zero Decode Bypass (ZDB) System 1"]
+        MemMgr["Hierarchical Memory Manager (L1 VRAM / L2 DRAM / L3 NVMe)"]
+    end
+
+    subgraph Models ["Modular Architecture Passes (src/models/*.inl)"]
+        M_Bolt["Nemotron 3.5 Bolt (Mamba-2 SSM + LatentMoE)"]
+        M_Light["Nemotron 3.5 Lightning (Mamba-2 SSM + Top-6 MoE)"]
+        M_Qwen["Qwen 3.8 (DeltaNet SSM + GQA)"]
+        M_DS["DeepSeek V4-Flash (MLA + 11,008 MoE)"]
+        M_Vis["FrankensTin Vision Delegate (Qwen2.5-VL ViT)"]
+    end
+
+    subgraph OS_Linux ["Linux (Ubuntu 22.04 / 24.04 LTS)"]
+        L1["CUDA 12.x / 13.x (cuBLASLt & PTX)"]
+        L2["Direct Host Pinning via mlock() (Unlimited)"]
+        L3["Native O_DIRECT Asynchronous Block I/O"]
+    end
+
+    subgraph OS_Win ["Windows 10 / 11 (x64)"]
+        W1["CUDA 12.x / 13.x (MSVC 2019/2022/2026)"]
+        W2["VirtualAlloc Pinned DRAM L2 Cache"]
+        W3["Async Double-Buffered DMA (Bypasses WDDM 3.x Paging)"]
+    end
+
+    subgraph OS_Apple ["Apple Silicon (macOS 15+)"]
+        A1["Apple Metal 3.1+ (<metal_tensor>)"]
+        A2["MetalPerformancePrimitives (MPP) Tiled Engine"]
+        A3["Unified Memory Architecture (UMA Zero-Copy Shared)"]
+    end
+
+    API --> Router
+    Router --> M_Bolt & M_Light & M_Qwen & M_DS & M_Vis
+    M_Bolt & M_Light & M_Qwen & M_DS & M_Vis --> MemMgr
+
+    MemMgr -.-> OS_Linux
+    MemMgr -.-> OS_Win
+    MemMgr -.-> OS_Apple
+```
+
+### OS Comparison: Features, Memory Architecture & Hardware Constraints
+
+| Dimension | Linux (Ubuntu / RHEL) | Windows 10/11 x64 | Apple Silicon (macOS 15+) |
+| :--- | :--- | :--- | :--- |
+| **Primary Backend** | **CUDA 12.x / 13.x** (NVCC, cuBLASLt, PTX) | **CUDA 12.x / 13.x** (MSVC 2019/2022/2026, NVCC) | **Apple Metal 3.1+** (`<metal_tensor>`, MetalPerformancePrimitives) |
+| **Target Hardware** | NVIDIA Ampere, Ada Lovelace, Blackwell (`sm_80`..`sm_120`) | NVIDIA Ampere, Ada Lovelace, Blackwell (`sm_80`..`sm_120`) | Apple M-Series (M1 through M6, Pro/Max/Ultra) |
+| **L1 GPU Tier** | Dedicated GPU VRAM | Dedicated GPU VRAM | Unified Memory Pool (shared CPU/GPU) |
+| **L2 Host DRAM Tier** | Non-pageable pinned memory via `mlock()` / `cudaHostAlloc()` | Non-pageable pinned DRAM via `VirtualAlloc(MEM_COMMIT)` + `cudaHostRegister()` | Native Zero-Copy UMA (`MTLResourceStorageModeShared`) — No PCIe bus |
+| **Max Pinnable Host RAM** | **Unlimited (~90-95% of Physical RAM)**. No arbitrary driver caps. | **WDDM 3.x Driver Limitation**: Windows Display Driver Model typically restricts non-pageable memory available to GPU processes to **~50% of system RAM**. | **OS Process Budget**: macOS allows up to **~75-80% of Unified Memory** per single process before paging to APFS swap. |
+| **OS Driver Gotchas** | None. Standard Linux kernel virtual memory subsystem. | **WDDM Shared Memory Paging Thrash**: When VRAM or GPU allocations exceed physical capacity, WDDM silently virtualizes allocations over PCIe, dropping GPU compute to < 1 tok/s at 20W. *Minnie circumvents this via strict L1 budgeting and asynchronous double-buffered DMA streams.* | None. Unified memory eliminates PCIe bandwidth bottlenecks entirely, though peak bandwidth is limited by chip tier (150 GB/s base up to 800+ GB/s Ultra). |
+| **L3 NVMe Storage Tier** | **`O_DIRECT` direct-to-memory block access**, bypassing Linux page cache. | Win32 **`FILE_FLAG_NO_BUFFERING`** + Overlapped I/O for direct disk reads. | Direct APFS block read via **`fcntl(F_NOCACHE)`**; unified memory allows direct DMA mapping. |
+| **SSM / Mamba-2 Support** | Native Warp-Shuffled Recurrence & Conv1D CUDA Kernels | Native Warp-Shuffled Recurrence & Conv1D CUDA Kernels | Metal Compute SIMD-shuffled threadgroup kernels |
+| **MTP Speculative Decoding** | Full Support (~98 tok/s with batched DeltaNet) | Full Support (~98 tok/s with batched DeltaNet) | Autoregressive MPP Tiled (143-172 tok/s prefill, 11.4 tok/s decode) |
+| **Supported Model Families** | Nemotron Bolt, Nemotron Lightning, Qwen 3.8, DeepSeek V4, FrankensTin | Nemotron Bolt, Nemotron Lightning, Qwen 3.8, DeepSeek V4, FrankensTin | Qwen 3.8 27B INT3/INT4 (Hardware MPP Tiled), DeepSeek V4-Flash MLA (in progress) |
 
 ---
 
@@ -92,6 +160,23 @@ Measured on **NVIDIA RTX PRO 6000 (Blackwell 96GB VRAM, Compute 12.0)**:
 | **Router Latency** | Host D2H sync | **Single GPU Block Reduction** | **Zero CPU-GPU sync stalls** |
 | **Context Retention** | 32-token truncation | **Full 32K token reasoning cache** | **Zero reasoning context amnesia** |
 
+---
+
+### NVIDIA Nemotron 3.5 Bolt (74B / 9B Active) — Consumer RTX 5060 Ti 16GB Showdown
+
+Benchmark conducted on **NVIDIA GeForce RTX 5060 Ti 16GB (Blackwell `sm_120a`) + 32GB DDR5 RAM** using the official 24GB NVIDIA Nemotron 3.5 Bolt model (`NVIDIA-Nemotron-3.5-Bolt-74B-A9B-24GB`, 496 routed experts/layer across 40 layers = 19,840 experts). Prompt: *"Explain the difference between SSD and RAM in simple terms."*
+
+| Engine & Mode | Prefill Speed | Decode Speed | Hardware Load | Bottleneck / Architecture Mechanism |
+| :--- | :--- | :--- | :--- | :--- |
+| **MinnieTheMoEcher** | **21.54 tok/s** | **13.51 tok/s** | **0% CPU (100% GPU)** | **Asynchronous double-buffered DMA** prefetching Layer $N+1$ over PCIe while Layer $N$ computes Mamba-2 SSM & Attention on Tensor Cores. |
+| **llama.cpp (MoE SLRU Cache `--moe-cache-mib 6000`)** | **1.70 tok/s** | **3.50 tok/s** | CPU Stalled on Sync | Synchronous wait-on-miss flaw (`cudaStreamWaitEvent`). 6GB cache holds only ~22% of experts; 78% miss rate causes 48 sequential PCIe stalls per token. |
+| **llama.cpp (Partial CPU Offload `-ngl 48`)** | **5.60 tok/s** | **6.90 tok/s** | 100% CPU Core Burn | 40 layers computed on CPU via AVX-512/AVX2 on DDR5 RAM. |
+| **llama.cpp (Full Offload `-ngl 88`)** | Stalled | **< 1.00 tok/s** | 9% GPU Util (20W) | WDDM 3.x shared memory driver paging thrash over PCIe bus. |
+
+> 📊 **Interactive Analysis & Publication Assets**:  
+> - 📄 **[LinkedIn Article Hub](linkedin_article.html)**: Publication draft with 1-click Unicode-bold formatted copy button and live feed preview.  
+> - 🎬 **[Kai-Style 1080p Video Player](kai_style_video.html)**: Interactive video viewer analyzing the 23:17 cache miss bottleneck.  
+> - 🎥 **[Download 1080p MP4 Video](kai_style_moe_benchmark.mp4)**: Full video presentation with Microsoft Azure Neural Voice narration (`en-US-ChristopherNeural`).
 
 ---
 
@@ -205,7 +290,34 @@ Options:
 
 ### Execution Examples
 
-#### 1. Qwen 3.8 27B INT4 with Native MTP Speculative Decoding (~98 tok/s)
+#### 1. NVIDIA Nemotron 3.5 Bolt (74B Total / 9B Active) — 16GB / 24GB Consumer GPUs
+```bash
+# Automated download & zero-copy preparation (Windows):
+download_nemotron_bolt_24gb.bat
+
+# One-click launch (Windows):
+start_nemotron_bolt_24gb.bat
+
+# Or run directly via CLI (Windows / Linux):
+./build/moecher --manifest models/nemotron_3.5_bolt_24gb/moecher_manifest.json --port 8001
+# On Windows:
+.\moecher.exe --manifest models/nemotron_3.5_bolt_24gb/moecher_manifest.json --port 8001
+```
+*Note: Configures 6.4 GB VRAM L1 (dense attention + Mamba-2 SSM + KV cache) and 13.5 GB non-pageable Pinned Host DRAM L2 for the 19,840 MoE experts. Double-buffered asynchronous DMA prefetching streams Layer N+1 across PCIe concurrently while Layer N executes on Tensor Cores, delivering **13.51 tok/s decode** with 0% CPU core load on an RTX 5060 Ti 16GB.*
+
+#### 2. NVIDIA Nemotron 3.5 Lightning (14.8B Total / 3.8B Active)
+```bash
+# One-click launch (Windows):
+start_nemotron.bat
+
+# Or via CLI (Windows / Linux):
+./build/moecher --manifest models/nemotron_3.5_lightning/moecher_manifest.json --port 8001
+# On Windows:
+.\moecher.exe --manifest models/nemotron_3.5_lightning/moecher_manifest.json --port 8001
+```
+*Note: Boots the 23-layer hybrid Mamba-2 SSM + GQA attention + top-6 routed MoE engine with cuBLASLt batched prefill. Compatible with the FrankensTin multimodal vision delegation pipeline.*
+
+#### 3. Qwen 3.8 27B INT4 with Native MTP Speculative Decoding (~98 tok/s)
 ```bash
 ./build/moecher --manifest moecher_manifest.json --port 8001
 # Or on Windows:
@@ -213,23 +325,30 @@ Options:
 ```
 *Note: Ensure `attention_dense_layers_q4.bin`, `draft_vocab_ids.bin`, and `draft_lm_head_int8_bf16.bin` (from [TinoBruno/moecher-qwen-3.8-27b-q4](https://huggingface.co/TinoBruno/moecher-qwen-3.8-27b-q4)) reside in the working directory. Speculative drafting and batched DeltaNet verification initialize automatically.*
 
-#### 2. FrankensTin Vision V4 (DeepSeek-V4 Flash MoE + Qwen2.5-VL Vision Delegate)
+#### 4. Qwen 3.8 27B on Apple Silicon (Native Metal & Hardware MPP Tiled Engine)
+```bash
+# On macOS (Apple M-Series / M6):
+./build/moecher --manifest moecher_manifest.json --port 8001
+```
+*Note: Automatically engages the native Apple Metal backend utilizing `<metal_tensor>` and `MetalPerformancePrimitives` (`mpp::tensor_ops::matmul2d`). Features on-the-fly threadgroup SRAM tile dequantization, yielding **143.3 to 172.0 tok/s prefill** and **11.38 tok/s decode** with 95.1% memory bus saturation (146.0 GB/s) on Apple M6. See [README.METAL.md](README.METAL.md).*
+
+#### 5. FrankensTin Vision V4 (DeepSeek-V4 Flash MoE + Qwen2.5-VL Vision Delegate)
 ```bash
 ./build/moecher --manifest models/frankenstin/moecher_manifest.json --port 8001
 ```
 *Note: Boots the 100% VRAM resident DeepSeek MoE engine along with the lightweight [FrankensTin Vision Delegate](https://huggingface.co/TinoBruno/frankenstin-vision-delegate) (`models/frankenstin/vision/`, ~3.3 GB). Enables multimodal visual perception and localized OCR via the standard `/v1/chat/completions` API endpoint.*
 
-#### 3. DeepSeek V4-Flash: Calibrated IQ2_XXS (All Experts Resident in 96GB VRAM)
+#### 6. DeepSeek V4-Flash: Calibrated IQ2_XXS (All Experts Resident in 96GB VRAM)
 ```bash
 ./build/moecher --manifest moecher_manifest_iq2.json --max-vram 85 --quiet
 ```
 
-#### 4. DeepSeek V4-Flash: Consumer GPUs with NVMe + DRAM Offloading (e.g. RTX 3090 / 4090 24GB)
+#### 7. DeepSeek V4-Flash: Consumer GPUs with NVMe + DRAM Offloading (e.g. RTX 3090 / 4090 24GB)
 ```bash
 ./build/moecher --manifest moecher_manifest_iq2.json --max-vram 20 --dram-cache-gb 24 --port 8001
 ```
 
-#### 5. DeepSeek V4-Flash: Base FP4 (Dynamic NVMe Streaming)
+#### 8. DeepSeek V4-Flash: Base FP4 (Dynamic NVMe Streaming)
 ```bash
 ./build/moecher --manifest moecher_manifest.json --max-vram 80 --port 8001
 ```
