@@ -458,6 +458,58 @@ void gemv_iq2_xxs_cuda(
     int rows, int cols,
     cudaStream_t stream = 0);
 
+void gemv_iq2_xxs_relu2_cuda(
+    __nv_bfloat16* out,
+    const __nv_bfloat16* vec,
+    const block_iq2_xxs* weight,
+    int rows, int cols,
+    cudaStream_t stream = 0);
+
+void gemv_iq2_xxs_residual_cuda(
+    __nv_bfloat16* inout,
+    const __nv_bfloat16* vec,
+    const block_iq2_xxs* weight,
+    int rows, int cols,
+    cudaStream_t stream = 0);
+
+void gemv_iq2_xxs_scaled_residual_cuda(
+    __nv_bfloat16* inout,
+    const __nv_bfloat16* vec,
+    const block_iq2_xxs* weight,
+    float alpha,
+    int rows, int cols,
+    cudaStream_t stream = 0);
+
+// ── Q8_0 GGML Quantization ──────────────────────────────────────────────────
+#define QK8_0 32
+
+struct __align__(2) block_q8_0 {
+    half d;              // 16-bit scale
+    int8_t qs[32];       // 32 x 8-bit quants
+};
+static_assert(sizeof(block_q8_0) == 34, "wrong q8_0 block size");
+
+void gemv_q8_0_cuda(
+    __nv_bfloat16* out,
+    const __nv_bfloat16* vec,
+    const block_q8_0* weight,
+    int rows, int cols,
+    cudaStream_t stream = 0);
+
+void gemv_q8_0_residual_cuda(
+    __nv_bfloat16* inout,
+    const __nv_bfloat16* vec,
+    const block_q8_0* weight,
+    int rows, int cols,
+    cudaStream_t stream = 0);
+
+void gemv_q8_0_f32_cuda(
+    float* out,
+    const __nv_bfloat16* vec,
+    const block_q8_0* weight,
+    int rows, int cols,
+    cudaStream_t stream = 0);
+
 // ── Q2_K quantization ─────────────────────────────────────────────────────────
 #define QK_K 256
 
@@ -1162,6 +1214,17 @@ void accumulate_expert_freq_cuda(
     const int32_t* topk_idx,
     const int32_t* track_flag,
     int layer_id,
+    int stride,
+    int n_experts,
+    int top_k,
+    cudaStream_t stream = 0);
+
+void accumulate_expert_freq_batch_cuda(
+    uint32_t* expert_counts,
+    const int32_t* topk_idx,
+    int M,
+    int layer_id,
+    int stride,
     int n_experts,
     int top_k,
     cudaStream_t stream = 0);
@@ -1398,6 +1461,15 @@ void gemv_nvfp4_cuda(
     int N, int K,
     cudaStream_t stream = 0);
 
+void gemv_nvfp4_relu2_cuda(
+    __nv_bfloat16* out,
+    const __nv_bfloat16* vec,
+    const uint8_t* weight,
+    const uint8_t* scale_fp8,
+    float scale_2,
+    int N, int K,
+    cudaStream_t stream = 0);
+
 void gemv_nvfp4_f32_cuda(
     float* out,
     const __nv_bfloat16* vec,
@@ -1450,7 +1522,7 @@ void gemv_fp8_scalar_scale_residual_cuda(
 
 void mamba2_nemotron_step_cuda(
     __nv_bfloat16* ssm_out,       // [intermediate_size] (4096 or 8192)
-    const __nv_bfloat16* in_proj, // [in_proj_dim] (10304 or 18568)
+    const __nv_bfloat16* in_proj, // [in_proj_dim] (10304 or 18560)
     const __nv_bfloat16* conv1d_w,// [conv_channels, 4]
     const __nv_bfloat16* conv1d_b,// [conv_channels]
     __nv_bfloat16* conv_state,    // [conv_channels, 4]
@@ -1483,7 +1555,13 @@ void mamba2_nemotron_step_batch_cuda(
     float rms_norm_eps,
     cudaStream_t stream = 0,
     int num_heads = 64,
-    int head_dim = 64);
+    int head_dim = 64,
+    __nv_bfloat16* conv_state_slot0 = nullptr,
+    float* ssm_state_slot0 = nullptr,
+    __nv_bfloat16* conv_state_slot1 = nullptr,
+    float* ssm_state_slot1 = nullptr,
+    __nv_bfloat16* conv_state_slot2 = nullptr,
+    float* ssm_state_slot2 = nullptr);
 
 void gemm_fp8_scalar_scale_batch_cuda(
     __nv_bfloat16* out,

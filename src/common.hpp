@@ -122,6 +122,23 @@ struct ModelConfig {
     std::vector<int> layer_moe_intermediate_size;
     std::vector<int> layer_num_experts_per_tok;
 
+    int moe_layer_to_model_layer(int moe_layer_idx) const {
+        int cur_moe = 0;
+        for (int i = 0; i < (int)layer_types.size(); i++) {
+            if (layer_types[i] == 2) {
+                if (cur_moe == moe_layer_idx) return i;
+                cur_moe++;
+            }
+        }
+        return moe_layer_idx;
+    }
+
+    int get_moe_layer_n_routed_experts(int moe_layer_idx) const {
+        if (layer_n_routed_experts.empty()) return n_routed_experts;
+        int model_l = moe_layer_to_model_layer(moe_layer_idx);
+        return get_layer_n_routed_experts(model_l);
+    }
+
     int get_layer_n_routed_experts(int l) const {
         if (l >= 0 && l < (int)layer_n_routed_experts.size() && layer_n_routed_experts[l] > 0)
             return layer_n_routed_experts[l];
@@ -261,6 +278,16 @@ struct ModelConfig {
                 if (bc.contains("moe_intermediate_size")) layer_moe_intermediate_size[l] = bc["moe_intermediate_size"].get<int>();
                 if (bc.contains("num_experts_per_tok")) layer_num_experts_per_tok[l] = bc["num_experts_per_tok"].get<int>();
             }
+        } else {
+            if (j.contains("blockwise_n_routed_experts") && j["blockwise_n_routed_experts"].is_array()) {
+                layer_n_routed_experts = j["blockwise_n_routed_experts"].get<std::vector<int>>();
+            }
+            if (j.contains("blockwise_moe_intermediate_size") && j["blockwise_moe_intermediate_size"].is_array()) {
+                layer_moe_intermediate_size = j["blockwise_moe_intermediate_size"].get<std::vector<int>>();
+            }
+            if (j.contains("blockwise_num_experts_per_tok") && j["blockwise_num_experts_per_tok"].is_array()) {
+                layer_num_experts_per_tok = j["blockwise_num_experts_per_tok"].get<std::vector<int>>();
+            }
         }
         if (j.contains("compress_ratios") && j["compress_ratios"].is_array()) {
             compress_ratios = j["compress_ratios"].get<std::vector<int>>();
@@ -282,7 +309,7 @@ struct ModelConfig {
             default_temperature = is_nemotron() ? 0.6f : 0.7f;
         }
         if (default_repetition_penalty < 0.0f) {
-            default_repetition_penalty = 1.00f;
+            default_repetition_penalty = is_nemotron() ? 1.05f : 1.00f;
         }
         if (default_reasoning_effort.empty()) {
             default_reasoning_effort = is_nemotron() ? "high" : "medium";
@@ -351,9 +378,11 @@ struct GPUTensor {
         shape = std::move(other.shape);
         dtype = std::move(other.dtype);
         is_host = other.is_host;
+        is_pinned = other.is_pinned;
         other.data = nullptr;
         other.size_bytes = 0;
         other.is_host = false;
+        other.is_pinned = false;
     }
     GPUTensor& operator=(GPUTensor&& other) noexcept {
         if (this != &other) {
@@ -363,12 +392,16 @@ struct GPUTensor {
             shape = std::move(other.shape);
             dtype = std::move(other.dtype);
             is_host = other.is_host;
+            is_pinned = other.is_pinned;
             other.data = nullptr;
             other.size_bytes = 0;
             other.is_host = false;
+            other.is_pinned = false;
         }
         return *this;
     }
+
+    bool is_pinned = false;
 
     void alloc(size_t bytes) {
         if (data) free();
@@ -377,11 +410,22 @@ struct GPUTensor {
 #endif
         size_bytes = bytes;
         is_host = false;
+        is_pinned = false;
     }
     void alloc_host(size_t bytes) {
         if (data) free();
 #if !defined(__APPLE__)
-        CUDA_CHECK(cudaMallocHost(&data, bytes));
+        cudaError_t err = cudaMallocHost(&data, bytes);
+        if (err == cudaSuccess) {
+            is_pinned = true;
+        } else {
+            cudaGetLastError();
+            data = malloc(bytes);
+            is_pinned = false;
+        }
+#else
+        data = malloc(bytes);
+        is_pinned = false;
 #endif
         size_bytes = bytes;
         is_host = true;
@@ -389,12 +433,20 @@ struct GPUTensor {
     void free() {
         if (data) {
 #if !defined(__APPLE__)
-            if (is_host) cudaFreeHost(data);
+            if (is_host) {
+                if (is_pinned) cudaFreeHost(data);
+                else ::free(data);
+            } else {
+                cudaFree(data);
+            }
+#else
+            if (is_host) ::free(data);
             else cudaFree(data);
 #endif
             data = nullptr;
             size_bytes = 0;
             is_host = false;
+            is_pinned = false;
         }
     }
     ~GPUTensor() { free(); }

@@ -711,6 +711,12 @@ function getLastTurnPreviewCode() {
         }
     }
 
+    // Also check getTurnHtmlCode for raw <!DOCTYPE html> or unclosed HTML in the last turn
+    const rawTurnHtml = getTurnHtmlCode(lastAssistantMsg, lastAssistantMsg.textContent || '');
+    if (rawTurnHtml && rawTurnHtml.trim().length > 0) {
+        return rawTurnHtml;
+    }
+
     return '';
 }
 
@@ -732,8 +738,10 @@ function getLatestHtmlCode() {
 // Extract HTML or 3D snippet specifically generated in the current assistant message
 function getTurnHtmlCode(assistantMsgEl, rawText) {
     if (assistantMsgEl) {
-        const codeBlocks = assistantMsgEl.querySelectorAll('pre code');
+        const contentArea = assistantMsgEl.querySelector('.main-content-text') || assistantMsgEl.querySelector('.msg-content') || assistantMsgEl;
+        const codeBlocks = contentArea.querySelectorAll('pre code');
         for (let i = codeBlocks.length - 1; i >= 0; i--) {
+            if (codeBlocks[i].closest('.reasoning-block')) continue;
             const code = codeBlocks[i].textContent || '';
             const lang = (codeBlocks[i].className || '').toLowerCase();
             if (isHtmlContent(code, lang) || is3DContent(code, lang)) {
@@ -741,8 +749,52 @@ function getTurnHtmlCode(assistantMsgEl, rawText) {
             }
         }
     }
+    // Also check if rawText has an embedded ```html ... ``` block or <!DOCTYPE html> ... </html>
+    if (rawText && typeof rawText === 'string') {
+        const mHtml = rawText.match(/```(?:html|xml)?\s*([\s\S]*?<!DOCTYPE[\s\S]*?)```/i) ||
+                      rawText.match(/```(?:html|xml)?\s*(<html[\s\S]*?)```/i) ||
+                      rawText.match(/```(?:html|xml)\s*([\s\S]*?)```/i);
+        if (mHtml) return mHtml[1].trim();
+        const docMatch = rawText.match(/(<!DOCTYPE\s+html[\s\S]*?<\/html>)/i) ||
+                         rawText.match(/(<html[\s\S]*?<\/html>)/i);
+        if (docMatch) return docMatch[1].trim();
+
+        // Handle unclosed HTML blocks or open <!DOCTYPE documents
+        const unclosedHtml = rawText.match(/```(?:html|xml)?\s*(<!DOCTYPE\s+html[\s\S]*)/i) ||
+                             rawText.match(/```(?:html|xml)?\s*(<html[\s\S]*)/i) ||
+                             rawText.match(/(<!DOCTYPE\s+html[\s\S]*)/i);
+        if (unclosedHtml) {
+            let extracted = unclosedHtml[1].trim();
+            const trailingFence = extracted.indexOf('```');
+            if (trailingFence !== -1) extracted = extracted.substring(0, trailingFence).trim();
+            if (!extracted.includes('</html>')) extracted += '\n</html>';
+            return extracted;
+        }
+    }
     if (isFullHtmlDocument(rawText) || is3DContent(rawText)) {
         return rawText;
+    }
+    // Fallback: If code was generated inside reasoning block, extract it so preview still renders
+    if (assistantMsgEl) {
+        const reasoningBlocks = assistantMsgEl.querySelectorAll('.reasoning-block pre code');
+        for (let i = reasoningBlocks.length - 1; i >= 0; i--) {
+            const code = reasoningBlocks[i].textContent || '';
+            const lang = (reasoningBlocks[i].className || '').toLowerCase();
+            if (isHtmlContent(code, lang) || is3DContent(code, lang)) {
+                return code;
+            }
+        }
+        const rEl = assistantMsgEl.querySelector('.reasoning-block') || assistantMsgEl.querySelector('.reasoning-content');
+        if (rEl) {
+            const rText = rEl.textContent || '';
+            const mReasoningHtml = rText.match(/```(?:html|xml)?\s*([\s\S]*?)```/i) ||
+                                  rText.match(/(<!DOCTYPE\s+html[\s\S]*?<\/html>)/i) ||
+                                  rText.match(/(<html[\s\S]*?<\/html>)/i);
+            if (mReasoningHtml) {
+                const code = mReasoningHtml[1].trim();
+                if (isHtmlContent(code) || is3DContent(code)) return code;
+            }
+        }
     }
     return '';
 }
@@ -1281,7 +1333,7 @@ function isFullHtmlDocument(text) {
     if (!text || typeof text !== 'string') return false;
     const trimmed = text.trim();
     if (trimmed.includes('tool-activity-block') || trimmed.includes('<tool_response>') || trimmed.includes('tool-activity-card')) return false;
-    return (/^<!doctype\s+html/i.test(trimmed) || /^<html[\s>]/i.test(trimmed));
+    return (/^<!doctype\s+html/i.test(trimmed) || /^<html[\s>]/i.test(trimmed) || /<!doctype\s+html[\s\S]*<\/html>/i.test(trimmed) || /<html[\s\S]*<\/html>/i.test(trimmed));
 }
 
 function createYouTubePlayerHtml(videoId, title = 'YouTube Video') {
@@ -1904,7 +1956,7 @@ function updateZdbUi() {
 let speculativeSettings = {
     enableMtp: true,
     mtpK: 0,
-    enableTreeMtp: true,
+    enableTreeMtp: false,
     treeNodes: 2
 };
 
@@ -1916,8 +1968,15 @@ function loadSpeculativeSettings() {
         const savedMtpK = localStorage.getItem('moecher_mtp_k');
         if (savedMtpK !== null) speculativeSettings.mtpK = parseInt(savedMtpK, 10) || 0;
 
-        const savedTreeMtp = localStorage.getItem('moecher_enable_tree_mtp');
-        if (savedTreeMtp !== null) speculativeSettings.enableTreeMtp = savedTreeMtp === 'true';
+        const savedTreeMtp = localStorage.getItem('moecher_enable_tree_mtp_v2');
+        if (savedTreeMtp !== null) {
+            speculativeSettings.enableTreeMtp = savedTreeMtp === 'true';
+        } else {
+            // Disabled by default
+            speculativeSettings.enableTreeMtp = false;
+            localStorage.setItem('moecher_enable_tree_mtp_v2', 'false');
+            localStorage.setItem('moecher_enable_tree_mtp', 'false');
+        }
 
         const savedTreeNodes = localStorage.getItem('moecher_tree_nodes');
         if (savedTreeNodes !== null) speculativeSettings.treeNodes = parseInt(savedTreeNodes, 10) || 2;
@@ -1957,6 +2016,7 @@ function saveSpeculativeSettings() {
         localStorage.setItem('moecher_enable_mtp', speculativeSettings.enableMtp);
         localStorage.setItem('moecher_mtp_k', speculativeSettings.mtpK);
         localStorage.setItem('moecher_enable_tree_mtp', speculativeSettings.enableTreeMtp);
+        localStorage.setItem('moecher_enable_tree_mtp_v2', speculativeSettings.enableTreeMtp);
         localStorage.setItem('moecher_tree_nodes', speculativeSettings.treeNodes);
 
         updateSpeculativeControls();
@@ -2936,6 +2996,10 @@ async function fetchBackendSystemPrompt() {
         } else if (data && data.tools_enabled === true) {
             window.serverToolsDisabled = false;
         }
+        if (data && data.repetition_penalty !== undefined && repPenaltySlider) {
+            repPenaltySlider.value = data.repetition_penalty;
+            if (repPenaltyVal) repPenaltyVal.textContent = parseFloat(data.repetition_penalty).toFixed(2);
+        }
         if (data && data.system_prompt !== undefined) {
             if (systemPromptInput) {
                 systemPromptInput.value = data.system_prompt;
@@ -3257,11 +3321,16 @@ function buildOptimizedMessagesPayload() {
     const now = new Date();
     const dateStr = now.toLocaleDateString('en-US', { weekday: 'long', year: 'numeric', month: 'long', day: '2-digit' });
 
+    const defaultBaseSys = "You are a helpful assistant that can write code, analyze data, and create complete applications using HTML, CSS, JavaScript, Python, and other programming languages. When asked to create or build something, always provide complete, functional, working code.";
     if (window.serverToolsDisabled) {
-        sysPrompt = `You are an assistant.\nCurrent date: ${dateStr}`;
-        messagesToSend.push({ role: "system", content: sysPrompt });
+        let baseSys = sysPrompt || defaultBaseSys;
+        let fullSys = baseSys;
+        if (!fullSys.includes('Current date:')) {
+            fullSys += `\nCurrent date: ${dateStr}`;
+        }
+        messagesToSend.push({ role: 'system', content: fullSys });
     } else {
-        let baseSys = sysPrompt || "You are a helpful assistant.";
+        let baseSys = sysPrompt || defaultBaseSys;
         // Strip any stale # Tools or <tools> block if activeTools has changed or youtube_search was disabled
         if (baseSys.includes('# Tools') || baseSys.includes('<tools>')) {
             const hasYt = activeTools.includes('youtube_search');
@@ -3401,11 +3470,17 @@ function extractToolCallsFromContent(text) {
     if (!text || typeof text !== 'string') return [];
     const calls = [];
     const seenCalls = new Set();
+    const activeTools = getActiveToolsPayload();
+    if (!activeTools || activeTools.length === 0) return [];
 
     function addCall(name, args) {
         if (!name || typeof name !== 'string') return;
         name = name.trim();
         if (name === '<function>' || name === 'function') name = 'web_search';
+        // Only accept calls for tools that are currently active or valid MCP servers
+        if (!activeTools.includes(name) && !name.startsWith('mcp__') && !name.startsWith('tinobruno-')) {
+            return;
+        }
         let argsStr = '';
         if (typeof args === 'string') {
             argsStr = args;
@@ -3425,12 +3500,33 @@ function extractToolCallsFromContent(text) {
         });
     }
 
-    // 1. XML <tool_call> tags
+    // 1. XML <tool_call> tags (standard JSON or Nemotron <function=...> XML)
     const toolCallRegex = /<\s*tool_call>([\s\S]*?)(?:<\/\s*tool_call>|$)/gi;
     let m;
     while ((m = toolCallRegex.exec(text)) !== null) {
         const inner = m[1].trim();
         if (!inner) continue;
+
+        // Check Nemotron format: <function=name><parameter=k>v</parameter></function>
+        const nemoFnMatch = inner.match(/<\s*function\s*=\s*([a-zA-Z0-9_-]+)\s*>([\s\S]*?)<\/\s*function\s*>/i);
+        if (nemoFnMatch) {
+            const fnName = nemoFnMatch[1];
+            const fnBody = nemoFnMatch[2];
+            const argsObj = {};
+            const paramRegex = /<\s*parameter\s*=\s*([a-zA-Z0-9_-]+)\s*>([\s\S]*?)<\/\s*parameter\s*>/gi;
+            let pm;
+            while ((pm = paramRegex.exec(fnBody)) !== null) {
+                const pName = pm[1].trim();
+                let pVal = pm[2].trim();
+                try {
+                    pVal = JSON.parse(pVal);
+                } catch (e) {}
+                argsObj[pName] = pVal;
+            }
+            addCall(fnName, argsObj);
+            continue;
+        }
+
         try {
             const parsed = JSON.parse(inner);
             const name = parsed.name || (parsed.function && (typeof parsed.function === 'string' ? parsed.function : parsed.function.name));
@@ -3465,7 +3561,7 @@ function extractToolCallsFromContent(text) {
         }
     }
 
-    // 3. Balanced JSON scan for { ... } (including inside ```json ... ``` codeblocks)
+    // 3. Balanced JSON scan for { ... } (must match explicit tool calling schema)
     let i = 0;
     const len = text.length;
     while (i < len) {
@@ -3507,8 +3603,14 @@ function extractToolCallsFromContent(text) {
                 try {
                     const parsed = JSON.parse(candidate);
                     if (parsed && typeof parsed === 'object') {
-                        let name = parsed.name || parsed.tool || parsed.action || parsed.tool_name || parsed.function_name || (typeof parsed.function === 'string' ? parsed.function : parsed.function?.name);
+                        let name = parsed.tool || parsed.action || parsed.tool_name || parsed.function_name || (typeof parsed.function === 'string' ? parsed.function : parsed.function?.name);
                         let args = parsed.arguments || parsed.parameters || parsed.args || parsed.function?.arguments;
+                        // For generic "name" key: only accept if it has arguments or is an explicit function object
+                        if (!name && parsed.name && typeof parsed.name === 'string') {
+                            if (args || parsed.type === 'function' || activeTools.includes(parsed.name) || parsed.name.startsWith('mcp__') || parsed.name.startsWith('tinobruno-')) {
+                                name = parsed.name;
+                            }
+                        }
                         if (!args && (parsed.query || parsed.url || parsed.path || parsed.command)) {
                             const { name: _n, function: _f, type: _t, tool: _tool, action: _act, tool_name: _tn, function_name: _fn, ...rest } = parsed;
                             args = rest;
@@ -4432,7 +4534,7 @@ async function sendMessage(options = {}) {
                 messages: messagesToSend,
                 max_tokens: parseInt(tokensInput ? tokensInput.value : 20000, 10) || 20000,
                 temperature: parseFloat(tempSlider.value),
-                repetition_penalty: parseFloat(repPenaltySlider ? repPenaltySlider.value : 1.00),
+                repetition_penalty: parseFloat(repPenaltySlider ? repPenaltySlider.value : 1.05),
                 stream: true,
                 enable_thinking: isThinking,
                 thinking: {
@@ -4796,10 +4898,10 @@ async function sendMessage(options = {}) {
             totalPrefillMs += roundPrefillMs;
             totalDecodeMs += roundDecodeMs;
 
-            let validToolCalls = roundToolCalls.filter(tc => tc && tc.name);
+            let validToolCalls = (activeTools && activeTools.length > 0) ? roundToolCalls.filter(tc => tc && tc.name) : [];
 
-            // Extract tool calls from roundContent, rawRoundContent, or roundReasoning if not already received from SSE delta
-            if (validToolCalls.length === 0) {
+            // Extract tool calls from roundContent or rawRoundContent only if tools are active and none received yet
+            if (activeTools && activeTools.length > 0 && validToolCalls.length === 0) {
                 const fromContent = extractToolCallsFromContent(roundContent);
                 if (fromContent.length > 0) {
                     validToolCalls = fromContent;
@@ -4811,12 +4913,6 @@ async function sendMessage(options = {}) {
                         validToolCalls = fromRaw;
                         roundContent = stripToolCallsFromText(rawRoundContent);
                         console.log("[Client Tool Extractor] Extracted tool calls from raw content:", validToolCalls);
-                    }
-                } else if (roundReasoning) {
-                    const fromReasoning = extractToolCallsFromContent(roundReasoning);
-                    if (fromReasoning.length > 0) {
-                        validToolCalls = fromReasoning;
-                        console.log("[Client Tool Extractor] Extracted tool calls from reasoning:", validToolCalls);
                     }
                 }
             }
@@ -4888,7 +4984,7 @@ async function sendMessage(options = {}) {
                 }
             }
 
-            if (validToolCalls.length > 0 && (roundFinishReason === 'tool_calls' || roundFinishReason === 'stop')) {
+            if (activeTools && activeTools.length > 0 && validToolCalls.length > 0 && (roundFinishReason === 'tool_calls' || roundFinishReason === 'stop')) {
                 stopTtsAudio(); // Cancel any speech immediately since this round is executing tools!
                 const toolExecStartTime = performance.now();
                 turnToolCallsCount += validToolCalls.length;

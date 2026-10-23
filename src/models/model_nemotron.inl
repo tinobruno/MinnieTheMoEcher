@@ -18,15 +18,21 @@
             int mamba_heads = cfg_.is_nemotron_bolt() ? 128 : 64;
             int mamba_head_dim = 64;
             int mamba_inter = mamba_heads * mamba_head_dim;
-            int in_proj_dim = cfg_.is_nemotron_bolt() ? 18568 : 10304;
+            int in_proj_dim = cfg_.is_nemotron_bolt() ? 18560 : 10304;
 
             rms_norm_cuda(buf_hidden2_.bf16(), buf_hidden_.bf16(),
                           lw.attn_norm_w.bf16(), dim, cfg_.rms_norm_eps, main_stream_);
 
-            // In-projection: FP8 [in_proj_dim, dim] with scalar scale -> buf_q_ [in_proj_dim]
-            gemv_fp8_scalar_scale_cuda(buf_q_.bf16(), buf_hidden2_.bf16(),
-                                       (const uint8_t*)lw.w_in_qkv.data, lw.w_in_qkv_scale_val,
-                                       in_proj_dim, dim, main_stream_);
+            // In-projection: NVFP4 or FP8 [in_proj_dim, dim] with scalar scale -> buf_q_ [in_proj_dim]
+            if (lw.w_in_qkv.dtype == "nvfp4") {
+                gemv_nvfp4_cuda(buf_q_.bf16(), buf_hidden2_.bf16(),
+                                (const uint8_t*)lw.w_in_qkv.data, (const uint8_t*)lw.w_in_qkv_scale.data, lw.w_in_qkv_scale_val,
+                                in_proj_dim, dim, main_stream_);
+            } else {
+                gemv_fp8_scalar_scale_cuda(buf_q_.bf16(), buf_hidden2_.bf16(),
+                                           (const uint8_t*)lw.w_in_qkv.data, lw.w_in_qkv_scale_val,
+                                           in_proj_dim, dim, main_stream_);
+            }
 
             // Mamba-2 SSM Decode Step (Causal Conv1d + SSM recurrent update + Gated RMSNorm) -> buf_attn_out_ [mamba_inter]
             mamba2_nemotron_step_cuda(
@@ -47,11 +53,17 @@
                 mamba_heads,
                 mamba_head_dim);
 
-            // Out-projection: FP8 [dim, mamba_inter] with scalar scale + residual accumulation -> buf_hidden_ [dim]
-            gemv_fp8_scalar_scale_residual_cuda(
-                buf_hidden_.bf16(), buf_attn_out_.bf16(),
-                (const uint8_t*)lw.linear_out_proj.data, lw.linear_out_proj_scale_val,
-                dim, mamba_inter, main_stream_);
+            // Out-projection: NVFP4 or FP8 [dim, mamba_inter] with scalar scale + residual accumulation -> buf_hidden_ [dim]
+            if (lw.linear_out_proj.dtype == "nvfp4") {
+                gemv_nvfp4_residual_cuda(buf_hidden_.bf16(), buf_attn_out_.bf16(),
+                                         (const uint8_t*)lw.linear_out_proj.data, (const uint8_t*)lw.linear_out_proj_scale.data, lw.linear_out_proj_scale_val,
+                                         dim, mamba_inter, main_stream_);
+            } else {
+                gemv_fp8_scalar_scale_residual_cuda(
+                    buf_hidden_.bf16(), buf_attn_out_.bf16(),
+                    (const uint8_t*)lw.linear_out_proj.data, lw.linear_out_proj_scale_val,
+                    dim, mamba_inter, main_stream_);
+            }
             return;
         } else if (ltype == 0) {
             // ════════════════════════════════════════════════════════════════════════
@@ -63,9 +75,17 @@
             int q_dim = n_q_heads * head_dim; // 32 * 128 = 4096
             int kv_dim = n_kv_heads * head_dim;
 
-            gemv_bf16_out_bf16_cuda(buf_q_.bf16(), lw.w_q.bf16(), buf_hidden2_.bf16(), q_dim, dim, main_stream_);
-            gemv_bf16_out_bf16_cuda(buf_gate_.bf16(), lw.w_k.bf16(), buf_hidden2_.bf16(), kv_dim, dim, main_stream_);
-            gemv_bf16_out_bf16_cuda(buf_up_.bf16(), lw.w_v.bf16(), buf_hidden2_.bf16(), kv_dim, dim, main_stream_);
+            auto gemv_gqa_proj = [&](__nv_bfloat16* out, const GPUTensor& w, const __nv_bfloat16* in, int out_dim, int in_dim) {
+                if (w.dtype == "q8_0" || w.dtype == "Q8_0" || w.dtype == "U8") {
+                    gemv_q8_0_cuda(out, in, (const block_q8_0*)w.data, out_dim, in_dim, main_stream_);
+                } else {
+                    gemv_bf16_out_bf16_cuda(out, w.bf16(), in, out_dim, in_dim, main_stream_);
+                }
+            };
+
+            gemv_gqa_proj(buf_q_.bf16(), lw.w_q, buf_hidden2_.bf16(), q_dim, dim);
+            gemv_gqa_proj(buf_gate_.bf16(), lw.w_k, buf_hidden2_.bf16(), kv_dim, dim);
+            gemv_gqa_proj(buf_up_.bf16(), lw.w_v, buf_hidden2_.bf16(), kv_dim, dim);
 
             // Ungated GQA FP8 Decode (Nemotron-H has NoPE - rope_theta = 0.0f)
             qwen2_gqa_decode_fp8_cuda(
@@ -83,8 +103,8 @@
                 nullptr,
                 main_stream_);
 
-            // Attention Output Projection: BF16 [dim, q_dim] + residual accumulation into buf_hidden_
-            gemv_bf16_out_bf16_cuda(buf_hidden2_.bf16(), lw.w_o.bf16(), buf_attn_out_.bf16(), dim, q_dim, main_stream_);
+            // Attention Output Projection: Q8_0/U8 or BF16 [dim, q_dim] + residual accumulation into buf_hidden_
+            gemv_gqa_proj(buf_hidden2_.bf16(), lw.w_o, buf_attn_out_.bf16(), dim, q_dim);
             vector_add_bf16_cuda(buf_hidden_.bf16(), buf_hidden2_.bf16(), dim, main_stream_);
             return;
         } else {
@@ -100,16 +120,24 @@
                 if (cfg_.layer_types[i] == 2) moe_layer_idx++;
             }
 
-            // 3a. Shared Expert (NVFP4, Squared ReLU, residual)
+            // 3a. Shared Expert (NVFP4 or IQ2_XXS, Squared ReLU, residual)
             if (lw.shared_w1_w.data && lw.shared_w2_w.data) {
                 int shared_inter = cfg_.moe_shared_expert_intermediate_size > 0 ? cfg_.moe_shared_expert_intermediate_size : 3712;
-                gemv_nvfp4_cuda(buf_gate_.bf16(), buf_hidden2_.bf16(),
-                                (const uint8_t*)lw.shared_w1_w.data, (const uint8_t*)lw.shared_w1_s.data,
-                                lw.shared_w1_s2, shared_inter, dim, main_stream_);
-                relu2_cuda(buf_gate_.bf16(), buf_gate_.bf16(), shared_inter, main_stream_);
-                gemv_nvfp4_residual_cuda(buf_hidden_.bf16(), buf_gate_.bf16(),
-                                         (const uint8_t*)lw.shared_w2_w.data, (const uint8_t*)lw.shared_w2_s.data,
-                                         lw.shared_w2_s2, dim, shared_inter, main_stream_);
+                if (lw.shared_w1_w.dtype == "iq2_xxs" || lw.shared_w1_w.dtype == "iq2") {
+                    gemv_iq2_xxs_cuda(buf_gate_.bf16(), buf_hidden2_.bf16(),
+                                      (const block_iq2_xxs*)lw.shared_w1_w.data, shared_inter, dim, main_stream_);
+                    relu2_cuda(buf_gate_.bf16(), buf_gate_.bf16(), shared_inter, main_stream_);
+                    gemv_iq2_xxs_residual_cuda(buf_hidden_.bf16(), buf_gate_.bf16(),
+                                               (const block_iq2_xxs*)lw.shared_w2_w.data, dim, shared_inter, main_stream_);
+                } else {
+                    gemv_nvfp4_cuda(buf_gate_.bf16(), buf_hidden2_.bf16(),
+                                    (const uint8_t*)lw.shared_w1_w.data, (const uint8_t*)lw.shared_w1_s.data,
+                                    lw.shared_w1_s2, shared_inter, dim, main_stream_);
+                    relu2_cuda(buf_gate_.bf16(), buf_gate_.bf16(), shared_inter, main_stream_);
+                    gemv_nvfp4_residual_cuda(buf_hidden_.bf16(), buf_gate_.bf16(),
+                                             (const uint8_t*)lw.shared_w2_w.data, (const uint8_t*)lw.shared_w2_s.data,
+                                             lw.shared_w2_s2, dim, shared_inter, main_stream_);
+                }
             }
 
             // 3b. Routed Experts
@@ -129,57 +157,124 @@
                                                   lw.gate_bias.data ? lw.gate_bias.f32() : nullptr,
                                                   n_experts, top_k, cfg_.routed_scaling_factor, main_stream_);
 
+                    // Track expert activation frequency (GPU-native, 100% CUDA Graph compatible)
+                    int stride = cfg_.n_routed_experts;
+                    if (d_expert_counts_.data) {
+                        accumulate_expert_freq_cuda(
+                            (uint32_t*)d_expert_counts_.data,
+                            (int32_t*)d_step_topk_.data,
+                            buf_topk_idx_.i32(),
+                            buf_track_flag_.i32(),
+                            layer_id,
+                            stride,
+                            n_experts,
+                            top_k,
+                            main_stream_);
+                    }
+
                     CUDA_CHECK(cudaMemcpyAsync(topk_ids_host_, buf_topk_idx_.i32(),
                                                top_k * sizeof(int32_t), cudaMemcpyDeviceToHost, main_stream_));
                     CUDA_CHECK(cudaMemcpyAsync(topk_weights_host_, buf_topk_vals_.f32(),
                                                top_k * sizeof(float), cudaMemcpyDeviceToHost, main_stream_));
-                    CUDA_CHECK(cudaEventRecord(dma_event_, main_stream_));
-                    CUDA_CHECK(cudaEventSynchronize(dma_event_));
 
-                    // Latent Down-Projection: buf_hidden2_ [4096] -> buf_latent_down_ [1024]
+                    // Latent Down-Projection: buf_hidden2_ [4096] -> buf_latent_down_ [1024] (overlapped with D2H!)
                     if (lw.fc1_latent_proj.dtype == "fp8") {
                         gemv_fp8_scalar_scale_cuda(buf_latent_down_.bf16(), buf_hidden2_.bf16(),
                                                    (const uint8_t*)lw.fc1_latent_proj.data, lw.fc1_scale_val,
                                                    latent_dim, dim, main_stream_);
+                    } else if (lw.fc1_latent_proj.dtype == "q8_0" || lw.fc1_latent_proj.dtype == "Q8_0" || lw.fc1_latent_proj.dtype == "U8") {
+                        gemv_q8_0_cuda(buf_latent_down_.bf16(), buf_hidden2_.bf16(),
+                                       (const block_q8_0*)lw.fc1_latent_proj.data,
+                                       latent_dim, dim, main_stream_);
                     } else {
                         gemv_bf16_out_bf16_cuda(buf_latent_down_.bf16(), lw.fc1_latent_proj.bf16(),
                                                 buf_hidden2_.bf16(), latent_dim, dim, main_stream_);
                     }
 
-                    // Resolve pointers / DMA for all active top-k experts
+                    CUDA_CHECK(cudaEventRecord(dma_event_, main_stream_));
+                    CUDA_CHECK(cudaEventSynchronize(dma_event_));
+
+                    // Resolve pointers / DMA for all active top-k experts with static VRAM L1 residency
                     void* exp_ptrs[16] = {nullptr};
+                    bool needs_dma[16] = {false};
+                    void* dram_srcs[16] = {nullptr};
+                    int stream_buf = moe_layer_idx % 2;
+
+                    int n_miss = 0;
                     for (int k = 0; k < top_k; k++) {
                         int eid = topk_ids_host_[k];
                         if (eid < 0 || eid >= n_experts || topk_weights_host_[k] == 0.0f) continue;
-                        exp_ptrs[k] = expert_loader_.try_get_expert_cached(moe_layer_idx, eid);
-                        if (!exp_ptrs[k]) {
-                            void* dram_src = expert_loader_.get_dram_expert_ptr(moe_layer_idx, eid);
-                            void* scratch_gpu = (char*)buf_dram_moe_scratch_.data + (size_t)k * expert_loader_.expert_block_size();
-                            if (dram_src && scratch_gpu) {
-                                CUDA_CHECK(cudaMemcpyAsync(scratch_gpu, dram_src, expert_loader_.expert_block_size(),
-                                                           cudaMemcpyHostToDevice, main_stream_));
-                                exp_ptrs[k] = scratch_gpu;
+                        int s_idx = expert_loader_.try_get_expert_cached_slot(moe_layer_idx, eid, exp_ptrs[k]);
+                        if (s_idx >= 0 && exp_ptrs[k] != nullptr) {
+                            needs_dma[k] = false;
+                        } else {
+                            exp_ptrs[k] = streaming_slots_gpu_[stream_buf][k];
+                            needs_dma[k] = true;
+                            void* p = expert_loader_.try_get_dram_expert_ptr(moe_layer_idx, eid);
+                            dram_srcs[k] = p;
+                            if (!p) n_miss++;
+                        }
+                    }
+
+                    if (n_miss > 0) {
+                        for (int k = 0; k < top_k; k++) {
+                            if (needs_dma[k] && !dram_srcs[k]) {
+                                int eid = topk_ids_host_[k];
+                                dram_srcs[k] = expert_loader_.get_dram_expert_ptr(moe_layer_idx, eid);
                             }
                         }
                     }
 
-                    size_t up_w_bytes = (size_t)moe_inter * (latent_dim / 2);
-                    size_t up_s_bytes = (size_t)moe_inter * (latent_dim / 16);
-                    size_t down_w_bytes = (size_t)latent_dim * (moe_inter / 2);
-                    size_t down_s_bytes = (size_t)latent_dim * (moe_inter / 16);
-
+                    // Asynchronously queue PCIe transfers on dma_stream_ for any uncached experts
+                    bool dma_launched[16] = {false};
                     for (int k = 0; k < top_k; k++) {
+                        if (needs_dma[k] && exp_ptrs[k] && dram_srcs[k]) {
+                            CUDA_CHECK(cudaMemcpyAsync(exp_ptrs[k], dram_srcs[k], expert_loader_.expert_block_size(),
+                                                       cudaMemcpyHostToDevice, dma_stream_));
+                            CUDA_CHECK(cudaEventRecord(expert_events_[k], dma_stream_));
+                            dma_launched[k] = true;
+                        }
+                    }
+
+                    size_t max_moe_inter = cfg_.moe_intermediate_size > 0 ? (size_t)cfg_.moe_intermediate_size : 2560;
+                    size_t up_w_off = 0;
+                    size_t up_s_off = max_moe_inter * (latent_dim / 2);
+                    size_t up_s2_off = up_s_off + max_moe_inter * (latent_dim / 16);
+                    size_t down_w_off = up_s2_off + 16;
+                    size_t down_s_off = down_w_off + (size_t)latent_dim * (max_moe_inter / 2);
+
+                    if (expert_parts_.count("up_proj.weight")) {
+                        up_w_off = expert_parts_["up_proj.weight"].offset_in_block;
+                    }
+                    if (expert_parts_.count("up_proj.weight_scale")) {
+                        up_s_off = expert_parts_["up_proj.weight_scale"].offset_in_block;
+                    }
+                    if (expert_parts_.count("down_proj.weight")) {
+                        down_w_off = expert_parts_["down_proj.weight"].offset_in_block;
+                    }
+                    if (expert_parts_.count("down_proj.weight_scale")) {
+                        down_s_off = expert_parts_["down_proj.weight_scale"].offset_in_block;
+                    }
+
+                    auto compute_expert_k = [&](int k) {
                         int eid = topk_ids_host_[k];
                         float weight = topk_weights_host_[k];
-                        if (eid < 0 || eid >= n_experts || weight == 0.0f) continue;
+                        if (eid < 0 || eid >= n_experts || weight == 0.0f) return;
 
                         void* exp_ptr = exp_ptrs[k];
-                        if (!exp_ptr) continue;
+                        if (!exp_ptr) return;
 
-                        const uint8_t* up_w = (const uint8_t*)exp_ptr;
-                        const uint8_t* up_s = up_w + up_w_bytes;
-                        const uint8_t* down_w = up_s + up_s_bytes;
-                        const uint8_t* down_s = down_w + down_w_bytes;
+                        // GPU main stream waits for expert k DMA to complete before executing kernels
+                        if (dma_launched[k]) {
+                            CUDA_CHECK(cudaStreamWaitEvent(main_stream_, expert_events_[k], 0));
+                        } else if (needs_dma[k]) {
+                            return; // Unresolved DMA source, skip safely
+                        }
+
+                        const uint8_t* up_w = (const uint8_t*)exp_ptr + up_w_off;
+                        const uint8_t* up_s = (const uint8_t*)exp_ptr + up_s_off;
+                        const uint8_t* down_w = (const uint8_t*)exp_ptr + down_w_off;
+                        const uint8_t* down_s = (const uint8_t*)exp_ptr + down_s_off;
 
                         float up_s2 = 1.0f;
                         float down_s2 = 1.0f;
@@ -190,27 +285,53 @@
                             down_s2 = nemotron_expert_scales_[s_idx + 1];
                         }
 
-                        // 1. Up-projection on latent input vector: [moe_inter, latent_dim]
-                        gemv_nvfp4_cuda(buf_gate_.bf16(), buf_latent_down_.bf16(),
-                                        up_w, up_s, up_s2, moe_inter, latent_dim, main_stream_);
+                        if (cfg_.expert_dtype == "iq2_xxs" || cfg_.expert_dtype == "iq2") {
+                            // 1. Fused Up-projection + Squared ReLU on latent input vector: [moe_inter, latent_dim]
+                            gemv_iq2_xxs_relu2_cuda(buf_gate_.bf16(), buf_latent_down_.bf16(),
+                                                    (const block_iq2_xxs*)up_w, moe_inter, latent_dim, main_stream_);
 
-                        // 2. Squared ReLU:
-                        relu2_cuda(buf_gate_.bf16(), buf_gate_.bf16(), moe_inter, main_stream_);
+                            // 2. Fused Down-projection + Weight Scale + Residual Accumulation directly into buf_latent_accum_: [latent_dim, moe_inter]
+                            gemv_iq2_xxs_scaled_residual_cuda(buf_latent_accum_.bf16(), buf_gate_.bf16(),
+                                                              (const block_iq2_xxs*)down_w, weight,
+                                                              latent_dim, moe_inter, main_stream_);
+                        } else {
+                            // 1. Fused Up-projection + Squared ReLU on latent input vector: [moe_inter, latent_dim]
+                            gemv_nvfp4_relu2_cuda(buf_gate_.bf16(), buf_latent_down_.bf16(),
+                                                  up_w, up_s, up_s2, moe_inter, latent_dim, main_stream_);
 
-                        // 3. Down-projection into buf_down_ slot k: [latent_dim, moe_inter]
-                        gemv_nvfp4_cuda(buf_down_.bf16() + (size_t)k * latent_dim, buf_gate_.bf16(),
-                                        down_w, down_s, down_s2, latent_dim, moe_inter, main_stream_);
+                            // 2. Fused Down-projection + Weight Scale + Residual Accumulation directly into buf_latent_accum_: [latent_dim, moe_inter]
+                            gemv_nvfp4_scaled_residual_cuda(buf_latent_accum_.bf16(), buf_gate_.bf16(),
+                                                            down_w, down_s, down_s2, weight,
+                                                            latent_dim, moe_inter, main_stream_);
+                        }
+                    };
+
+                    CUDA_CHECK(cudaMemsetAsync(buf_latent_accum_.data, 0, (size_t)latent_dim * sizeof(__nv_bfloat16), main_stream_));
+
+                    // Pass 1: Compute all resident VRAM L1 experts first with zero DMA wait.
+                    // This keeps sm_120 Tensor Cores busy while PCIe transfers uncached L2 experts concurrently!
+                    for (int k = 0; k < top_k; k++) {
+                        if (!needs_dma[k]) {
+                            compute_expert_k(k);
+                        }
                     }
 
-                    // 4. Accumulate active top-k experts in latent space [latent_dim]
-                    fused_moe_accum_dynamic_cuda(buf_latent_accum_.bf16(), buf_down_.bf16(),
-                                                 buf_topk_vals_.f32(), nullptr, latent_dim, top_k, main_stream_);
+                    // Pass 2: Compute uncached experts (waits for their individual DMA events)
+                    for (int k = 0; k < top_k; k++) {
+                        if (needs_dma[k]) {
+                            compute_expert_k(k);
+                        }
+                    }
 
                     // 5. Latent Up-Projection: buf_latent_accum_ [1024] -> residual addition into buf_hidden_ [4096]
                     if (lw.fc2_latent_proj.dtype == "fp8") {
                         gemv_fp8_scalar_scale_residual_cuda(buf_hidden_.bf16(), buf_latent_accum_.bf16(),
                                                             (const uint8_t*)lw.fc2_latent_proj.data, lw.fc2_scale_val,
                                                             dim, latent_dim, main_stream_);
+                    } else if (lw.fc2_latent_proj.dtype == "q8_0" || lw.fc2_latent_proj.dtype == "Q8_0" || lw.fc2_latent_proj.dtype == "U8") {
+                        gemv_q8_0_residual_cuda(buf_hidden_.bf16(), buf_latent_accum_.bf16(),
+                                                (const block_q8_0*)lw.fc2_latent_proj.data,
+                                                dim, latent_dim, main_stream_);
                     } else {
                         gemv_bf16_out_bf16_cuda(buf_hidden2_.bf16(), lw.fc2_latent_proj.bf16(),
                                                 buf_latent_accum_.bf16(), dim, latent_dim, main_stream_);
@@ -239,7 +360,7 @@
                 CUDA_CHECK(cudaEventSynchronize(dma_event_));
 
                 // Batch resolve / pipeline DMA transfers for all top-k experts
-                void* exp_ptrs[8] = {nullptr};
+                void* exp_ptrs[16] = {nullptr};
                 for (int k = 0; k < top_k; k++) {
                     int eid = topk_ids_host_[k];
                     if (eid < 0 || eid >= n_experts || topk_weights_host_[k] == 0.0f) continue;
@@ -282,12 +403,9 @@
                         down_s2 = nemotron_expert_scales_[s_idx + 1];
                     }
 
-                    // 1. Up proj: [moe_inter, dim]
-                    gemv_nvfp4_cuda(buf_gate_.bf16(), buf_hidden2_.bf16(),
-                                    up_w, up_s, up_s2, moe_inter, dim, main_stream_);
-
-                    // 2. Squared ReLU activation: ReLU(x)^2
-                    relu2_cuda(buf_gate_.bf16(), buf_gate_.bf16(), moe_inter, main_stream_);
+                    // 1. Fused Up proj + Squared ReLU: [moe_inter, dim]
+                    gemv_nvfp4_relu2_cuda(buf_gate_.bf16(), buf_hidden2_.bf16(),
+                                          up_w, up_s, up_s2, moe_inter, dim, main_stream_);
 
                     // 3. Down proj with scaling weight & residual accumulation: [dim, moe_inter]
                     gemv_nvfp4_scaled_residual_cuda(buf_hidden_.bf16(), buf_gate_.bf16(),
@@ -317,15 +435,21 @@
             int mamba_heads = cfg_.is_nemotron_bolt() ? 128 : 64;
             int mamba_head_dim = 64;
             int mamba_inter = mamba_heads * mamba_head_dim;
-            int in_proj_dim = cfg_.is_nemotron_bolt() ? 18568 : 10304;
+            int in_proj_dim = cfg_.is_nemotron_bolt() ? 18560 : 10304;
 
             rms_norm_cuda_batched(buf_hidden2_batch_.bf16(), buf_hidden_batch_.bf16(),
                                   lw.attn_norm_w.bf16(), M, dim, cfg_.rms_norm_eps, main_stream_);
 
-            // In-projection: Batched FP8 [M, in_proj_dim] with scalar scale -> buf_q_batch_
-            gemm_fp8_scalar_scale_cublaslt(buf_q_batch_.bf16(), buf_hidden2_batch_.bf16(),
-                                           (const uint8_t*)lw.w_in_qkv.data, lw.w_in_qkv_scale_val,
-                                           M, in_proj_dim, dim, 0.0f, main_stream_);
+            // In-projection: Batched NVFP4 or FP8 [M, in_proj_dim] with scalar scale -> buf_q_batch_
+            if (lw.w_in_qkv.dtype == "nvfp4") {
+                gemm_nvfp4_batch_cuda(buf_q_batch_.bf16(), buf_hidden2_batch_.bf16(),
+                                      (const uint8_t*)lw.w_in_qkv.data, (const uint8_t*)lw.w_in_qkv_scale.data, lw.w_in_qkv_scale_val,
+                                      M, in_proj_dim, dim, main_stream_);
+            } else {
+                gemm_fp8_scalar_scale_cublaslt(buf_q_batch_.bf16(), buf_hidden2_batch_.bf16(),
+                                               (const uint8_t*)lw.w_in_qkv.data, lw.w_in_qkv_scale_val,
+                                               M, in_proj_dim, dim, 0.0f, main_stream_);
+            }
 
             // Mamba-2 SSM Step (Single batched launch across all M tokens)
             mamba2_nemotron_step_batch_cuda(
@@ -345,13 +469,26 @@
                 cfg_.rms_norm_eps,
                 main_stream_,
                 mamba_heads,
-                mamba_head_dim);
+                mamba_head_dim,
+                (M > 1 && M <= 4) ? lw.conv_state_slots[0].bf16() : nullptr,
+                (M > 1 && M <= 4) ? lw.ssm_state_slots[0].f32() : nullptr,
+                (M > 2 && M <= 4) ? lw.conv_state_slots[1].bf16() : nullptr,
+                (M > 2 && M <= 4) ? lw.ssm_state_slots[1].f32() : nullptr,
+                (M > 3 && M <= 4) ? lw.conv_state_slots[2].bf16() : nullptr,
+                (M > 3 && M <= 4) ? lw.ssm_state_slots[2].f32() : nullptr);
 
-            // Out-projection: Batched FP8 [M, dim] with scalar scale + residual accumulation -> buf_hidden_batch_
-            gemm_fp8_scalar_scale_cublaslt(
-                buf_hidden_batch_.bf16(), buf_attn_out_batch_.bf16(),
-                (const uint8_t*)lw.linear_out_proj.data, lw.linear_out_proj_scale_val,
-                M, dim, mamba_inter, 1.0f, main_stream_);
+            // Out-projection: Batched NVFP4 or FP8 [M, dim] with scalar scale + residual accumulation -> buf_hidden_batch_
+            if (lw.linear_out_proj.dtype == "nvfp4") {
+                gemm_nvfp4_residual_batch_cuda(
+                    buf_hidden_batch_.bf16(), buf_attn_out_batch_.bf16(),
+                    (const uint8_t*)lw.linear_out_proj.data, (const uint8_t*)lw.linear_out_proj_scale.data, lw.linear_out_proj_scale_val,
+                    M, dim, mamba_inter, main_stream_);
+            } else {
+                gemm_fp8_scalar_scale_cublaslt(
+                    buf_hidden_batch_.bf16(), buf_attn_out_batch_.bf16(),
+                    (const uint8_t*)lw.linear_out_proj.data, lw.linear_out_proj_scale_val,
+                    M, dim, mamba_inter, 1.0f, main_stream_);
+            }
             return;
         } else if (ltype == 0) {
             // ════════════════════════════════════════════════════════════════════════
@@ -363,10 +500,23 @@
             int q_dim = n_q_heads * head_dim; // 32 * 128 = 4096
             int kv_dim = n_kv_heads * head_dim; // 2 * 128 = 256
 
+            auto gemm_gqa_proj_batch = [&](__nv_bfloat16* out, const GPUTensor& w, const __nv_bfloat16* in, int out_dim, int in_dim) {
+                if (w.dtype == "q8_0" || w.dtype == "Q8_0" || w.dtype == "U8") {
+                    for (int m = 0; m < M; m++) {
+                        gemv_q8_0_cuda(out + (size_t)m * out_dim,
+                                       in + (size_t)m * in_dim,
+                                       (const block_q8_0*)w.data,
+                                       out_dim, in_dim, main_stream_);
+                    }
+                } else {
+                    gemm_bf16(out, M, out_dim, in_dim, in, w.bf16());
+                }
+            };
+
             // Batched Q, K, V Projections
-            gemm_bf16(buf_q_batch_.bf16(), M, q_dim, dim, buf_hidden2_batch_.bf16(), lw.w_q.bf16());
-            gemm_bf16(buf_gate_batch_.bf16(), M, kv_dim, dim, buf_hidden2_batch_.bf16(), lw.w_k.bf16());
-            gemm_bf16(buf_up_batch_.bf16(), M, kv_dim, dim, buf_hidden2_batch_.bf16(), lw.w_v.bf16());
+            gemm_gqa_proj_batch(buf_q_batch_.bf16(), lw.w_q, buf_hidden2_batch_.bf16(), q_dim, dim);
+            gemm_gqa_proj_batch(buf_gate_batch_.bf16(), lw.w_k, buf_hidden2_batch_.bf16(), kv_dim, dim);
+            gemm_gqa_proj_batch(buf_up_batch_.bf16(), lw.w_v, buf_hidden2_batch_.bf16(), kv_dim, dim);
 
             // Batched Ungated GQA FP8 Decode (Nemotron-H has NoPE - rope_theta = 0.0f)
             qwen2_gqa_decode_fp8_batch_cuda(
@@ -387,8 +537,8 @@
                 buf_mrope_pos_.data ? buf_mrope_pos_.i32() : nullptr,
                 main_stream_);
 
-            // Attention Output Projection: BF16 [M, dim] + residual accumulation into buf_hidden_batch_
-            gemm_bf16(buf_hidden2_batch_.bf16(), M, dim, q_dim, buf_attn_out_batch_.bf16(), lw.w_o.bf16());
+            // Attention Output Projection: Q8_0/U8 or BF16 [M, dim] + residual accumulation into buf_hidden_batch_
+            gemm_gqa_proj_batch(buf_hidden2_batch_.bf16(), lw.w_o, buf_attn_out_batch_.bf16(), dim, q_dim);
             vector_add_bf16_cuda(buf_hidden_batch_.bf16(), buf_hidden2_batch_.bf16(), M * dim, main_stream_);
             return;
         } else {
@@ -417,12 +567,25 @@
             bool has_shared = (lw.shared_w1_w.data && lw.shared_w2_w.data);
             if (has_shared) {
                 int shared_inter = cfg_.moe_shared_expert_intermediate_size > 0 ? cfg_.moe_shared_expert_intermediate_size : (cfg_.is_nemotron_bolt() ? 5376 : 3712);
-                gemm_nvfp4_relu2_batch_cuda(buf_gate_batch_.bf16(), buf_hidden2_batch_.bf16(),
-                                            (const uint8_t*)lw.shared_w1_w.data, (const uint8_t*)lw.shared_w1_s.data,
-                                            lw.shared_w1_s2, M, shared_inter, dim, main_stream_);
-                gemm_nvfp4_residual_batch_cuda(buf_hidden_batch_.bf16(), buf_gate_batch_.bf16(),
-                                               (const uint8_t*)lw.shared_w2_w.data, (const uint8_t*)lw.shared_w2_s.data,
-                                               lw.shared_w2_s2, M, dim, shared_inter, main_stream_);
+                if (lw.shared_w1_w.dtype == "iq2_xxs" || lw.shared_w1_w.dtype == "iq2") {
+                    for (int m = 0; m < M; m++) {
+                        gemv_iq2_xxs_relu2_cuda(buf_gate_batch_.bf16() + (size_t)m * shared_inter,
+                                                buf_hidden2_batch_.bf16() + (size_t)m * dim,
+                                                (const block_iq2_xxs*)lw.shared_w1_w.data,
+                                                shared_inter, dim, main_stream_);
+                        gemv_iq2_xxs_residual_cuda(buf_hidden_batch_.bf16() + (size_t)m * dim,
+                                                   buf_gate_batch_.bf16() + (size_t)m * shared_inter,
+                                                   (const block_iq2_xxs*)lw.shared_w2_w.data,
+                                                   dim, shared_inter, main_stream_);
+                    }
+                } else {
+                    gemm_nvfp4_relu2_batch_cuda(buf_gate_batch_.bf16(), buf_hidden2_batch_.bf16(),
+                                                (const uint8_t*)lw.shared_w1_w.data, (const uint8_t*)lw.shared_w1_s.data,
+                                                lw.shared_w1_s2, M, shared_inter, dim, main_stream_);
+                    gemm_nvfp4_residual_batch_cuda(buf_hidden_batch_.bf16(), buf_gate_batch_.bf16(),
+                                                   (const uint8_t*)lw.shared_w2_w.data, (const uint8_t*)lw.shared_w2_s.data,
+                                                   lw.shared_w2_s2, M, dim, shared_inter, main_stream_);
+                }
             }
 
             if (layer_id == 1) CUDA_CHECK(cudaEventRecord(s_moe_sub_ev[1], main_stream_));
@@ -445,14 +608,38 @@
                         lw.gate_bias.data ? lw.gate_bias.f32() : nullptr,
                         M, n_experts, top_k, cfg_.routed_scaling_factor, main_stream_);
 
-                    moe_bin_tokens_cuda(buf_moe_offsets_.i32(), buf_moe_token_indices_.i32(), buf_moe_token_slots_.i32(),
-                                        buf_topk_idx_batch_.i32(), M * top_k, top_k, n_experts, main_stream_);
+                    int stride = cfg_.n_routed_experts;
+                    if (d_expert_counts_.data && track_expert_freq_) {
+                        accumulate_expert_freq_batch_cuda(
+                            (uint32_t*)d_expert_counts_.data,
+                            buf_topk_idx_batch_.i32(),
+                            M,
+                            layer_id,
+                            stride,
+                            n_experts,
+                            top_k,
+                            main_stream_);
+                    }
 
-                    // Latent Down-Projection: buf_hidden2_batch_ [M, 4096] -> buf_latent_down_batch_ [M, 1024]
+                    // Overlap D2H top-k copy with Latent Down-Projection: launch D2H immediately!
+                    CUDA_CHECK(cudaMemcpyAsync(topk_ids_batch_host_, buf_topk_idx_batch_.i32(),
+                                               (size_t)M * top_k * sizeof(int32_t), cudaMemcpyDeviceToHost, main_stream_));
+                    CUDA_CHECK(cudaMemcpyAsync(topk_weights_batch_host_, buf_topk_vals_batch_.f32(),
+                                               (size_t)M * top_k * sizeof(float), cudaMemcpyDeviceToHost, main_stream_));
+                    CUDA_CHECK(cudaEventRecord(dma_event_, main_stream_));
+
+                    // Latent Down-Projection: buf_hidden2_batch_ [M, 4096] -> buf_latent_down_batch_ [M, 1024] (runs concurrently with D2H!)
                     if (lw.fc1_latent_proj.dtype == "fp8") {
                         gemm_fp8_scalar_scale_cublaslt(buf_latent_down_batch_.bf16(), buf_hidden2_batch_.bf16(),
                                                        (const uint8_t*)lw.fc1_latent_proj.data, lw.fc1_scale_val,
                                                        M, latent_dim, dim, 0.0f, main_stream_);
+                    } else if (lw.fc1_latent_proj.dtype == "q8_0" || lw.fc1_latent_proj.dtype == "Q8_0" || lw.fc1_latent_proj.dtype == "U8") {
+                        for (int m = 0; m < M; m++) {
+                            gemv_q8_0_cuda(buf_latent_down_batch_.bf16() + (size_t)m * latent_dim,
+                                           buf_hidden2_batch_.bf16() + (size_t)m * dim,
+                                           (const block_q8_0*)lw.fc1_latent_proj.data,
+                                           latent_dim, dim, main_stream_);
+                        }
                     } else {
                         gemm_bf16(buf_latent_down_batch_.bf16(), M, latent_dim, dim,
                                   buf_hidden2_batch_.bf16(), lw.fc1_latent_proj.bf16());
@@ -462,60 +649,206 @@
                     CUDA_CHECK(cudaMemsetAsync(buf_latent_accum_batch_.data, 0,
                                                (size_t)M * latent_dim * sizeof(__nv_bfloat16), main_stream_));
 
-                    const void* const* layer_ptrs = nullptr;
-                    if (layer_fully_resident_[moe_layer_idx]) {
-                        // Lookahead DRAM prefetch if needed (for 16GB mode: 18 layers in VRAM, 22 in DRAM)
-                        int vram_threshold = 18;
-                        if (dma_stream_ && moe_layer_idx >= (vram_threshold - NUM_DRAM_MOE_BUFFERS) && moe_layer_idx < vram_threshold) {
-                            int prefetch_layer = moe_layer_idx + NUM_DRAM_MOE_BUFFERS;
-                            int buf_idx = prefetch_layer - vram_threshold;
-                            prefetch_dram_layer_async(prefetch_layer, buf_idx);
-                        }
-                        layer_ptrs = (const void* const*)buf_all_expert_ptrs_.data + (size_t)moe_layer_idx * stride_exp;
-                    } else {
-                        int vram_threshold = 18;
-                        int buf_idx = (moe_layer_idx - vram_threshold) % NUM_DRAM_MOE_BUFFERS;
-                        if (dma_stream_) {
-                            CUDA_CHECK(cudaStreamWaitEvent(main_stream_, dma_ready_event_[buf_idx], 0));
-                        }
-                        layer_ptrs = (const void* const*)buf_dram_expert_ptrs_gpu_[buf_idx].data;
+                    // Wait for D2H top-k copy (which was running in parallel with down-projection)
+                    CUDA_CHECK(cudaEventSynchronize(dma_event_));
+
+                    size_t max_moe_inter = cfg_.moe_intermediate_size > 0 ? (size_t)cfg_.moe_intermediate_size : 2560;
+                    size_t up_w_off = 0;
+                    size_t up_s_off = max_moe_inter * (latent_dim / 2);
+                    size_t up_s2_off = up_s_off + max_moe_inter * (latent_dim / 16);
+                    size_t down_w_off = up_s2_off + 16;
+                    size_t down_s_off = down_w_off + (size_t)latent_dim * (max_moe_inter / 2);
+
+                    if (expert_parts_.count("up_proj.weight")) {
+                        up_w_off = expert_parts_["up_proj.weight"].offset_in_block;
+                    }
+                    if (expert_parts_.count("up_proj.weight_scale")) {
+                        up_s_off = expert_parts_["up_proj.weight_scale"].offset_in_block;
+                    }
+                    if (expert_parts_.count("down_proj.weight")) {
+                        down_w_off = expert_parts_["down_proj.weight"].offset_in_block;
+                    }
+                    if (expert_parts_.count("down_proj.weight_scale")) {
+                        down_s_off = expert_parts_["down_proj.weight_scale"].offset_in_block;
                     }
 
-                    // Routed Up on latent down: [M, latent_dim] -> buf_moe_gate_batch_ [M * top_k, moe_inter]
-                    moe_nemotron_up_relu2_batch_cuda(
-                        buf_moe_gate_batch_.bf16(), buf_latent_down_batch_.bf16(),
-                        buf_topk_idx_batch_.i32(),
-                        buf_moe_offsets_.i32(), buf_moe_token_indices_.i32(), buf_moe_token_slots_.i32(),
-                        layer_ptrs,
-                        layer_scales,
-                        M, moe_inter, latent_dim, main_stream_, top_k, n_experts);
+                    // Group tokens by active expert to transfer each expert's weights exactly once per layer
+                    static std::vector<std::vector<std::pair<int, float>>> s_expert_assignments;
+                    if ((int)s_expert_assignments.size() < n_experts) {
+                        s_expert_assignments.resize(n_experts);
+                    }
+                    for (int e = 0; e < n_experts; e++) {
+                        s_expert_assignments[e].clear();
+                    }
+                    std::vector<int> unique_experts;
+                    unique_experts.reserve(std::min(n_experts, M * top_k));
 
-                    // Routed Down onto latent accumulation buffer: [M * top_k, moe_inter] -> buf_latent_accum_batch_ [M, latent_dim]
-                    moe_nemotron_down_scaled_residual_batch_cuda(
-                        buf_latent_accum_batch_.bf16(), buf_moe_gate_batch_.bf16(),
-                        buf_topk_idx_batch_.i32(), buf_topk_vals_batch_.f32(),
-                        buf_moe_offsets_.i32(), buf_moe_token_indices_.i32(), buf_moe_token_slots_.i32(),
-                        layer_ptrs,
-                        layer_scales,
-                        M, latent_dim, moe_inter, main_stream_, top_k, n_experts);
-
-                    // If DRAM layer, trigger prefetch for next DRAM layer
-                    if (!layer_fully_resident_[moe_layer_idx] && dma_stream_) {
-                        int vram_threshold = 18;
-                        int buf_idx = (moe_layer_idx - vram_threshold) % NUM_DRAM_MOE_BUFFERS;
-                        CUDA_CHECK(cudaEventRecord(compute_done_event_[buf_idx], main_stream_));
-                        int next_layer = moe_layer_idx + NUM_DRAM_MOE_BUFFERS;
-                        if (next_layer < total_moe_layers) {
-                            CUDA_CHECK(cudaStreamWaitEvent(dma_stream_, compute_done_event_[buf_idx], 0));
-                            prefetch_dram_layer_async(next_layer, buf_idx);
+                    for (int m = 0; m < M; m++) {
+                        const int32_t* m_topk_ids = topk_ids_batch_host_ + (size_t)m * top_k;
+                        const float* m_topk_weights = topk_weights_batch_host_ + (size_t)m * top_k;
+                        for (int k = 0; k < top_k; k++) {
+                            int eid = m_topk_ids[k];
+                            float weight = m_topk_weights[k];
+                            if (eid < 0 || eid >= n_experts || weight == 0.0f) continue;
+                            if (s_expert_assignments[eid].empty()) {
+                                unique_experts.push_back(eid);
+                            }
+                            s_expert_assignments[eid].push_back({m, weight});
                         }
                     }
 
-                    // Latent Up-Projection: buf_latent_accum_batch_ [M, 1024] -> residual add into buf_hidden_batch_ [M, 4096]
+                    int n_unique = (int)unique_experts.size();
+                    size_t exp_block_sz = expert_loader_.expert_block_size();
+
+                    std::vector<int> cached_experts;
+                    std::vector<int> uncached_experts;
+                    cached_experts.reserve(unique_experts.size());
+                    uncached_experts.reserve(unique_experts.size());
+                    for (int eid : unique_experts) {
+                        if (expert_loader_.try_get_expert_cached(moe_layer_idx, eid) != nullptr) {
+                            cached_experts.push_back(eid);
+                        } else {
+                            uncached_experts.push_back(eid);
+                        }
+                    }
+
+                    auto execute_prefill_expert = [&](int eid, const void* exp_ptr) {
+                        if (!exp_ptr) return;
+                        const uint8_t* up_w = (const uint8_t*)exp_ptr + up_w_off;
+                        const uint8_t* up_s = (const uint8_t*)exp_ptr + up_s_off;
+                        const uint8_t* down_w = (const uint8_t*)exp_ptr + down_w_off;
+                        const uint8_t* down_s = (const uint8_t*)exp_ptr + down_s_off;
+
+                        float up_s2 = 1.0f;
+                        float down_s2 = 1.0f;
+                        int stride_exp = std::max({cfg_.n_routed_experts, cfg_.max_n_routed_experts(), 128});
+                        size_t s_idx = ((size_t)moe_layer_idx * stride_exp + eid) * 2;
+                        if (s_idx + 1 < nemotron_expert_scales_.size()) {
+                            up_s2 = nemotron_expert_scales_[s_idx];
+                            down_s2 = nemotron_expert_scales_[s_idx + 1];
+                        }
+
+                        for (const auto& item : s_expert_assignments[eid]) {
+                            int m = item.first;
+                            float weight = item.second;
+                            const __nv_bfloat16* token_latent_in = buf_latent_down_batch_.bf16() + (size_t)m * latent_dim;
+                            __nv_bfloat16* token_latent_accum = buf_latent_accum_batch_.bf16() + (size_t)m * latent_dim;
+
+                            if (cfg_.expert_dtype == "iq2_xxs" || cfg_.expert_dtype == "iq2") {
+                                // 1. Fused Up-projection + Squared ReLU: [moe_inter, latent_dim]
+                                gemv_iq2_xxs_relu2_cuda(buf_gate_.bf16(), token_latent_in,
+                                                        (const block_iq2_xxs*)up_w, moe_inter, latent_dim, main_stream_);
+
+                                // 2. Fused Down-projection + Weight Scale + Residual Accumulation:
+                                gemv_iq2_xxs_scaled_residual_cuda(token_latent_accum, buf_gate_.bf16(),
+                                                                  (const block_iq2_xxs*)down_w, weight,
+                                                                  latent_dim, moe_inter, main_stream_);
+                            } else {
+                                // 1. Fused Up-projection + Squared ReLU: [moe_inter, latent_dim]
+                                gemv_nvfp4_relu2_cuda(buf_gate_.bf16(), token_latent_in,
+                                                      up_w, up_s, up_s2, moe_inter, latent_dim, main_stream_);
+
+                                // 2. Fused Down-projection + Weight Scale + Residual Accumulation:
+                                gemv_nvfp4_scaled_residual_cuda(token_latent_accum, buf_gate_.bf16(),
+                                                                down_w, down_s, down_s2, weight,
+                                                                latent_dim, moe_inter, main_stream_);
+                            }
+                        }
+                    };
+
+                    // Multi-threaded concurrent fetch into pinned DRAM slots across up to 16 threads
+                    int n_uncached = (int)uncached_experts.size();
+                    int max_staging = std::min(n_uncached, 64);
+                    std::vector<void*> uncached_dram_ptrs(n_uncached, nullptr);
+
+                    if (n_uncached > 0) {
+                        int n_miss = 0;
+                        for (int i = 0; i < n_uncached; i++) {
+                            void* p = expert_loader_.try_get_dram_expert_ptr(moe_layer_idx, uncached_experts[i]);
+                            uncached_dram_ptrs[i] = p;
+                            if (!p) n_miss++;
+                        }
+                        if (n_miss > 0) {
+                            int n_fetch_threads = std::min(16, n_miss);
+                            std::vector<std::future<void>> fetch_futures;
+                            int chunk = (n_uncached + n_fetch_threads - 1) / n_fetch_threads;
+                            for (int t = 0; t < n_fetch_threads; t++) {
+                                int s = t * chunk;
+                                int e = std::min(s + chunk, n_uncached);
+                                if (s >= e) continue;
+                                if (expert_pool_) {
+                                    fetch_futures.push_back(expert_pool_->enqueue([this, moe_layer_idx, &uncached_experts, &uncached_dram_ptrs, s, e]() {
+                                        for (int i = s; i < e; i++) {
+                                            if (!uncached_dram_ptrs[i]) {
+                                                uncached_dram_ptrs[i] = expert_loader_.get_dram_expert_ptr(moe_layer_idx, uncached_experts[i]);
+                                            }
+                                        }
+                                    }));
+                                } else {
+                                    for (int i = s; i < e; i++) {
+                                        if (!uncached_dram_ptrs[i]) {
+                                            uncached_dram_ptrs[i] = expert_loader_.get_dram_expert_ptr(moe_layer_idx, uncached_experts[i]);
+                                        }
+                                    }
+                                }
+                            }
+                            for (auto& fut : fetch_futures) fut.wait();
+                        }
+                    }
+
+                    // Queue PCIe DMA transfers for uncached experts on dma_stream_ (up to 64 parallel transfers)
+                    for (int u = 0; u < max_staging; u++) {
+                        void* dram_src = uncached_dram_ptrs[u];
+                        void* scratch_gpu = (char*)buf_dram_moe_scratch_.data + (size_t)u * exp_block_sz;
+                        if (dram_src && scratch_gpu) {
+                            CUDA_CHECK(cudaMemcpyAsync(scratch_gpu, dram_src, exp_block_sz,
+                                                       cudaMemcpyHostToDevice, dma_stream_));
+                            CUDA_CHECK(cudaEventRecord(expert_events_[u], dma_stream_));
+                        }
+                    }
+
+                    // Pass 1: Compute ALL resident L1 VRAM experts first (zero DMA wait!)
+                    for (int eid : cached_experts) {
+                        const void* cached = expert_loader_.try_get_expert_cached(moe_layer_idx, eid);
+                        if (cached) {
+                            execute_prefill_expert(eid, cached);
+                        }
+                    }
+
+                    // Pass 2: Compute uncached experts (waits for their individual DMA events)
+                    for (int u = 0; u < n_uncached; u++) {
+                        int slot = u % 64;
+                        if (u >= 64) {
+                            CUDA_CHECK(cudaStreamWaitEvent(dma_stream_, dma_event_, 0));
+                            void* dram_src = uncached_dram_ptrs[u];
+                            void* scratch_gpu = (char*)buf_dram_moe_scratch_.data + (size_t)slot * exp_block_sz;
+                            if (dram_src && scratch_gpu) {
+                                CUDA_CHECK(cudaMemcpyAsync(scratch_gpu, dram_src, exp_block_sz,
+                                                           cudaMemcpyHostToDevice, dma_stream_));
+                                CUDA_CHECK(cudaEventRecord(expert_events_[slot], dma_stream_));
+                            }
+                        }
+
+                        CUDA_CHECK(cudaStreamWaitEvent(main_stream_, expert_events_[slot], 0));
+                        void* scratch_gpu = (char*)buf_dram_moe_scratch_.data + (size_t)slot * exp_block_sz;
+                        execute_prefill_expert(uncached_experts[u], scratch_gpu);
+                        if (u >= 63) {
+                            CUDA_CHECK(cudaEventRecord(dma_event_, main_stream_));
+                        }
+                    }
+
+                    // 5. Latent Up-Projection: buf_latent_accum_batch_ [M, 1024] -> residual add into buf_hidden_batch_ [M, 4096]
                     if (lw.fc2_latent_proj.dtype == "fp8") {
                         gemm_fp8_scalar_scale_cublaslt(buf_hidden_batch_.bf16(), buf_latent_accum_batch_.bf16(),
                                                        (const uint8_t*)lw.fc2_latent_proj.data, lw.fc2_scale_val,
                                                        M, dim, latent_dim, 1.0f, main_stream_);
+                    } else if (lw.fc2_latent_proj.dtype == "q8_0" || lw.fc2_latent_proj.dtype == "Q8_0" || lw.fc2_latent_proj.dtype == "U8") {
+                        for (int m = 0; m < M; m++) {
+                            gemv_q8_0_residual_cuda(buf_hidden_batch_.bf16() + (size_t)m * dim,
+                                                    buf_latent_accum_batch_.bf16() + (size_t)m * latent_dim,
+                                                    (const block_q8_0*)lw.fc2_latent_proj.data,
+                                                    dim, latent_dim, main_stream_);
+                        }
                     } else {
                         gemm_bf16(buf_hidden2_batch_.bf16(), M, dim, latent_dim,
                                   buf_latent_accum_batch_.bf16(), lw.fc2_latent_proj.bf16());
@@ -623,7 +956,7 @@
         }
     }
 
-    void forward_token_batch_nemotron_device_body(int position, int M, bool do_compute_logits = false) {
+    void forward_token_batch_nemotron_device_body(int position, int M, bool do_compute_logits = false, bool compute_all_logits = false) {
         int dim = cfg_.hidden_size;
 
         // 1. Embedding lookup for M tokens
@@ -649,68 +982,70 @@
             }
         }
 
-        // 2. Process all layers with profiling
-        cudaStreamSynchronize(main_stream_);
-        auto t_layers_start = std::chrono::high_resolution_clock::now();
-        static cudaEvent_t s_layer_events[128] = {nullptr};
-        static bool s_events_init = false;
-        if (!s_events_init) {
-            s_events_init = true;
-            for (int i = 0; i < 128; i++) {
-                CUDA_CHECK(cudaEventCreate(&s_layer_events[i]));
-            }
-        }
-
-
-        CUDA_CHECK(cudaEventRecord(s_layer_events[0], main_stream_));
-        for (int layer = 0; layer < cfg_.num_hidden_layers; layer++) {
-            forward_layer_nemotron_batch(layer, position, M);
-            CUDA_CHECK(cudaEventRecord(s_layer_events[layer + 1], main_stream_));
-        }
-
-        cudaStreamSynchronize(main_stream_);
-        auto t_layers_end = std::chrono::high_resolution_clock::now();
-        float total_layers_ms = std::chrono::duration<float, std::milli>(t_layers_end - t_layers_start).count();
-
-        float ms_ssm = 0.0f, ms_gqa = 0.0f, ms_vram_moe = 0.0f, ms_dram_moe = 0.0f;
-        for (int layer = 0; layer < cfg_.num_hidden_layers; layer++) {
-            float ms = 0.0f;
-            cudaEventElapsedTime(&ms, s_layer_events[layer], s_layer_events[layer + 1]);
-            int ltype = (layer < (int)cfg_.layer_types.size()) ? cfg_.layer_types[layer] : 0;
-            if (ltype == 2) {
-                int moe_idx = 0;
-                for (int i = 0; i < layer; i++) if (cfg_.layer_types[i] == 2) moe_idx++;
-                LOG_INFO("  [LAYER %2d] MoE %2d (%s) ms=%.2f", layer, moe_idx, layer_fully_resident_[moe_idx] ? "VRAM" : "DRAM", ms);
-            }
-            if (ltype == 1) ms_ssm += ms;
-            else if (ltype == 0) ms_gqa += ms;
-            else {
-                int moe_idx = 0;
-                for (int i = 0; i < layer; i++) if (cfg_.layer_types[i] == 2) moe_idx++;
-                if (layer_fully_resident_[moe_idx]) {
-                    ms_vram_moe += ms;
-                } else {
-                    ms_dram_moe += ms;
+        // 2. Process all layers with profiling (only for prefill M > 4)
+        bool is_prefill = (M > 4);
+        if (is_prefill) expert_loader_.set_in_prefill(true);
+        if (M > 4) {
+            cudaStreamSynchronize(main_stream_);
+            auto t_layers_start = std::chrono::high_resolution_clock::now();
+            static cudaEvent_t s_layer_events[128] = {nullptr};
+            static bool s_events_init = false;
+            if (!s_events_init) {
+                s_events_init = true;
+                for (int i = 0; i < 128; i++) {
+                    CUDA_CHECK(cudaEventCreate(&s_layer_events[i]));
                 }
             }
-        }
 
-        int n_vram_moe = 0, n_dram_moe = 0;
-        int n_moe_total = 0;
-        for (int i = 0; i < cfg_.num_hidden_layers; i++) {
-            if (cfg_.layer_types[i] == 2) {
-                if (layer_fully_resident_[n_moe_total]) n_vram_moe++;
-                else n_dram_moe++;
-                n_moe_total++;
+            CUDA_CHECK(cudaEventRecord(s_layer_events[0], main_stream_));
+            for (int layer = 0; layer < cfg_.num_hidden_layers; layer++) {
+                forward_layer_nemotron_batch(layer, position, M);
+                CUDA_CHECK(cudaEventRecord(s_layer_events[layer + 1], main_stream_));
+            }
+
+            cudaStreamSynchronize(main_stream_);
+            auto t_layers_end = std::chrono::high_resolution_clock::now();
+            float total_layers_ms = std::chrono::duration<float, std::milli>(t_layers_end - t_layers_start).count();
+
+            float ms_ssm = 0.0f, ms_gqa = 0.0f, ms_vram_moe = 0.0f, ms_dram_moe = 0.0f;
+            for (int layer = 0; layer < cfg_.num_hidden_layers; layer++) {
+                float ms = 0.0f;
+                cudaEventElapsedTime(&ms, s_layer_events[layer], s_layer_events[layer + 1]);
+                int ltype = (layer < (int)cfg_.layer_types.size()) ? cfg_.layer_types[layer] : 0;
+                if (ltype == 1) ms_ssm += ms;
+                else if (ltype == 0) ms_gqa += ms;
+                else {
+                    int moe_idx = 0;
+                    for (int i = 0; i < layer; i++) if (cfg_.layer_types[i] == 2) moe_idx++;
+                    if (layer_fully_resident_[moe_idx]) {
+                        ms_vram_moe += ms;
+                    } else {
+                        ms_dram_moe += ms;
+                    }
+                }
+            }
+
+            int n_vram_moe = 0, n_dram_moe = 0;
+            int n_moe_total = 0;
+            for (int i = 0; i < cfg_.num_hidden_layers; i++) {
+                if (cfg_.layer_types[i] == 2) {
+                    if (layer_fully_resident_[n_moe_total]) n_vram_moe++;
+                    else n_dram_moe++;
+                    n_moe_total++;
+                }
+            }
+
+            LOG_INFO("[NEMOTRON BREAKDOWN M=%d] Total: %.2f ms (%.1f tok/s) | SSM: %.2f ms | GQA: %.2f ms | VRAM MoE (%d layers): %.2f ms (%.2f ms/l) | DRAM MoE (%d layers): %.2f ms (%.2f ms/l)",
+                     M, total_layers_ms, (float)M / (total_layers_ms / 1000.0f),
+                     ms_ssm, ms_gqa, n_vram_moe, ms_vram_moe, n_vram_moe > 0 ? (ms_vram_moe / n_vram_moe) : 0.0f,
+                     n_dram_moe, ms_dram_moe, n_dram_moe > 0 ? (ms_dram_moe / n_dram_moe) : 0.0f);
+        } else {
+            for (int layer = 0; layer < cfg_.num_hidden_layers; layer++) {
+                forward_layer_nemotron_batch(layer, position, M);
             }
         }
 
-        LOG_INFO("[NEMOTRON BREAKDOWN M=%d] Total: %.2f ms (%.1f tok/s) | SSM: %.2f ms | GQA: %.2f ms | VRAM MoE (%d layers): %.2f ms (%.2f ms/l) | DRAM MoE (%d layers): %.2f ms (%.2f ms/l)",
-                 M, total_layers_ms, (float)M / (total_layers_ms / 1000.0f),
-                 ms_ssm, ms_gqa, ms_vram_moe, n_vram_moe > 0 ? (ms_vram_moe / n_vram_moe) : 0.0f,
-                 n_dram_moe, ms_dram_moe, n_dram_moe > 0 ? (ms_dram_moe / n_dram_moe) : 0.0f);
-
-        if (s_moe_sub_init) {
+        if (s_moe_sub_init && !cfg_.is_nemotron_bolt()) {
             float t_router = 0, t_shared = 0, t_up = 0, t_down = 0, t_end = 0;
             cudaEventElapsedTime(&t_router, s_moe_sub_ev[0], s_moe_sub_ev[1]);
             cudaEventElapsedTime(&t_shared, s_moe_sub_ev[1], s_moe_sub_ev[2]);
@@ -727,7 +1062,27 @@
                                    dim * sizeof(__nv_bfloat16),
                                    cudaMemcpyDeviceToDevice, main_stream_));
 
-        if (do_compute_logits) {
+        if (compute_all_logits) {
+            rms_norm_cuda_batched(buf_hidden_batch_.bf16(), buf_hidden_batch_.bf16(),
+                                  norm_weight_.bf16(), M, dim, cfg_.rms_norm_eps, main_stream_);
+            if (head_weight_.dtype == "fp4") {
+                quantize_bf16_to_fp4_e2m1_cuda(buf_activation_fp4_.u8(), buf_activation_scale_.u8(),
+                                               buf_hidden_batch_.bf16(), M, dim, main_stream_);
+                gemm_fp4_f32_blackwell_tensorcore_cuda(buf_logits_batch_.f32(), buf_activation_fp4_.u8(), buf_activation_scale_.u8(),
+                                                       (const uint8_t*)head_weight_.data, (const uint8_t*)head_weight_scale_.data,
+                                                       cfg_.vocab_size, dim, M, main_stream_);
+            } else if (head_weight_.dtype == "q8_0" || head_weight_.dtype == "Q8_0" || head_weight_.dtype == "U8") {
+                for (int m = 0; m < M; m++) {
+                    gemv_q8_0_f32_cuda(buf_logits_batch_.f32() + (size_t)m * cfg_.vocab_size,
+                                       buf_hidden_batch_.bf16() + (size_t)m * dim,
+                                       (const block_q8_0*)head_weight_.data,
+                                       cfg_.vocab_size, dim, main_stream_);
+                }
+            } else {
+                gemm_bf16_f32(buf_logits_batch_.f32(), M, cfg_.vocab_size, dim,
+                              buf_hidden_batch_.bf16(), head_weight_.bf16());
+            }
+        } else if (do_compute_logits) {
             // 3. Final RMSNorm on the last token (in buf_hidden_)
             rms_norm_cuda(buf_hidden_.bf16(), buf_hidden_.bf16(),
                           norm_weight_.bf16(), dim, cfg_.rms_norm_eps, main_stream_);
@@ -735,6 +1090,22 @@
             // 4. Compute logits for the last token
             compute_logits();
         }
+        if (is_prefill) expert_loader_.set_in_prefill(false);
+    }
+
+    void forward_token_batch_nemotron(const int* tokens_host, int position, int M) {
+        if (!h_target_batch_tok_) {
+            CUDA_CHECK(cudaMallocHost(&h_target_batch_tok_, 64 * sizeof(int32_t)));
+            CUDA_CHECK(cudaMallocHost(&h_target_batch_pos_, 64 * sizeof(int32_t)));
+        }
+        for (int m = 0; m < M; m++) {
+            h_target_batch_pos_[m] = position + m;
+            h_target_batch_tok_[m] = tokens_host[m];
+        }
+        CUDA_CHECK(cudaMemcpyAsync(buf_input_pos_batch_.i32(), h_target_batch_pos_, M * sizeof(int32_t), cudaMemcpyHostToDevice, main_stream_));
+        CUDA_CHECK(cudaMemcpyAsync(buf_input_tokens_batch_.i32(), h_target_batch_tok_, M * sizeof(int32_t), cudaMemcpyHostToDevice, main_stream_));
+
+        forward_token_batch_nemotron_device_body(position, M, /*do_compute_logits=*/false, /*compute_all_logits=*/true);
     }
 
     void prefill_prompt_batched_nemotron(const std::vector<int>& prompt, int start_offset = 0, bool compute_last_logits = true) {
@@ -778,6 +1149,7 @@
         LOG_INFO("Nemotron Batched Prefill: %d prompt tokens (start_offset=%d, chunk_size=%d)...",
                  total_tokens, start_offset, chunk_size);
 
+        expert_loader_.set_in_prefill(true);
         expert_loader_.set_demotion_enabled(false);
 
         for (int start = start_offset; start < total_tokens; start += chunk_size) {
@@ -799,12 +1171,17 @@
             forward_token_batch_nemotron_device_body(position, M, need_logits);
         }
 
+        if (track_expert_freq_) {
+            expert_freq_total_tokens_ += remaining_tokens;
+        }
+
         expert_loader_.set_demotion_enabled(true);
+        expert_loader_.set_in_prefill(false);
 
         CUDA_CHECK(cudaStreamSynchronize(main_stream_));
         auto t_end = std::chrono::high_resolution_clock::now();
         double ms = std::chrono::duration<double, std::milli>(t_end - t_start).count();
         double tok_per_sec = (remaining_tokens / (ms / 1000.0));
-        LOG_INFO("Nemotron Batched Prefill completed: %d tokens in %.2f ms (%.1f tok/s)",
-                 remaining_tokens, ms, tok_per_sec);
+        LOG_INFO("Nemotron Batched Prefill completed: %d tokens in %.2f ms (%.1f tok/s, cold disk reads: %llu)",
+                 remaining_tokens, ms, tok_per_sec, (unsigned long long)expert_loader_.cold_disk_reads_.load());
     }

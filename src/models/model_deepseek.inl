@@ -321,6 +321,7 @@
                 buf_track_flag_.i32(),
                 layer_id,
                 n_experts,
+                n_experts,
                 top_k,
                 main_stream_);
         }
@@ -791,6 +792,10 @@
         } else if (head_weight_.dtype == "int4") {
             gemv_int4_f32_cuda(buf_logits_.f32(), buf_hidden_.bf16(),
                                (const uint8_t*)head_weight_.data, head_weight_scale_.bf16(),
+                               vocab, dim, main_stream_);
+        } else if (head_weight_.dtype == "q8_0" || head_weight_.dtype == "Q8_0" || head_weight_.dtype == "U8") {
+            gemv_q8_0_f32_cuda(buf_logits_.f32(), buf_hidden_.bf16(),
+                               (const block_q8_0*)head_weight_.data,
                                vocab, dim, main_stream_);
         } else {
             // Fast CUDA graph compatible matrix-vector multiplication directly to float32 logits

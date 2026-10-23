@@ -152,7 +152,7 @@ public:
             std::vector<void*> h_all_ptrs((size_t)total_moe_layers * max_routed_exp, nullptr);
             for (int l = 0; l < total_moe_layers && l < 64; l++) {
                 bool all_in = true;
-                int n_e = cfg_.layer_n_routed_experts.empty() ? cfg_.n_routed_experts : 128;
+                int n_e = cfg_.get_moe_layer_n_routed_experts(l);
                 if (n_e <= 0) n_e = 128;
                 for (int e = 0; e < n_e && e < max_routed_exp; e++) {
                     h_all_ptrs[(size_t)l * max_routed_exp + e] = expert_loader_.try_get_expert_cached(l, e);
@@ -174,13 +174,8 @@ public:
     int pld_draft_tokens_ = 4;
     bool enable_mtp_ = true;
     bool default_enable_mtp_ = true;
-#if defined(__APPLE__)
     bool enable_tree_mtp_ = false;
     bool default_enable_tree_mtp_ = false;
-#else
-    bool enable_tree_mtp_ = true;
-    bool default_enable_tree_mtp_ = true;
-#endif
     int tree_nodes_ = 2; // 2 = 2 alternative branches (Top-1 and Top-2, M=3 total nodes)
     int default_tree_nodes_ = 2;
     int tree_graph_M_ = 3;
@@ -294,8 +289,8 @@ public:
     cudaEvent_t side_event_ = nullptr;
     cudaEvent_t main_event_ = nullptr;
     cudaEvent_t dma_event_ = nullptr;
-    cudaStream_t expert_streams_[32] = {nullptr};
-    cudaEvent_t expert_events_[32] = {nullptr};
+    cudaStream_t expert_streams_[64] = {nullptr};
+    cudaEvent_t expert_events_[64] = {nullptr};
     cudaStream_t dequant_stream_main_ = nullptr;
     cudaStream_t dequant_stream_side_ = nullptr;
     cudaEvent_t dequant_ready_event_[2][2] = {{nullptr, nullptr}, {nullptr, nullptr}};
@@ -479,8 +474,8 @@ public:
     // Working buffers (reused across forward passes)
     GPUTensor buf_active_expert_ptrs_; // [32] void* GPU pointers
     void* active_expert_ptrs_host_[32] = {nullptr};
-    int32_t topk_ids_host_[32] = {0};
-    float topk_weights_host_[32] = {0.0f};
+    int32_t* topk_ids_host_ = nullptr;
+    float* topk_weights_host_ = nullptr;
     float head_weight_scale_2_ = 1.0f;
     std::vector<float> nemotron_expert_scales_;
     GPUTensor buf_mamba_conv_; // [6144] BF16 for Nemotron Mamba-2 conv output
@@ -556,7 +551,7 @@ public:
         if (moe_layer_idx < 0 || moe_layer_idx >= 64 || layer_fully_resident_[moe_layer_idx]) return;
         size_t exp_bytes = expert_loader_.expert_block_size();
         void* dram_src = expert_loader_.get_dram_expert_ptr(moe_layer_idx, 0);
-        int n_exp = cfg_.layer_n_routed_experts.empty() ? cfg_.n_routed_experts : 128;
+        int n_exp = cfg_.get_moe_layer_n_routed_experts(moe_layer_idx);
         if (n_exp <= 0) n_exp = 128;
         void* scratch_dst = (char*)buf_dram_moe_scratch_.data + (size_t)buf_idx * n_exp * exp_bytes;
         if (dram_src && scratch_dst) {
@@ -727,6 +722,14 @@ public:
         if (h_single_flag_) {
             cudaFreeHost(h_single_flag_);
             h_single_flag_ = nullptr;
+        }
+        if (topk_ids_host_) {
+            cudaFreeHost(topk_ids_host_);
+            topk_ids_host_ = nullptr;
+        }
+        if (topk_weights_host_) {
+            cudaFreeHost(topk_weights_host_);
+            topk_weights_host_ = nullptr;
         }
         if (h_target_batch_tok_) {
             cudaFreeHost(h_target_batch_tok_);
@@ -940,9 +943,13 @@ public:
             CUDA_CHECK(cudaEventCreateWithFlags(&dma_ready_event_[b], cudaEventDisableTiming));
             CUDA_CHECK(cudaEventCreateWithFlags(&compute_done_event_[b], cudaEventDisableTiming));
         }
-        for (int i = 0; i < 32; i++) {
+        for (int i = 0; i < 64; i++) {
             CUDA_CHECK(cudaStreamCreate(&expert_streams_[i]));
             CUDA_CHECK(cudaEventCreate(&expert_events_[i]));
+        }
+        if (!topk_ids_host_) {
+            CUDA_CHECK(cudaMallocHost(&topk_ids_host_, 32 * sizeof(int32_t)));
+            CUDA_CHECK(cudaMallocHost(&topk_weights_host_, 32 * sizeof(float)));
         }
         CUDA_CHECK(cudaStreamCreate(&dequant_stream_main_));
         CUDA_CHECK(cudaStreamCreate(&dequant_stream_side_));
@@ -1108,7 +1115,7 @@ public:
             cache_budget = total_experts_bytes;
         }
 
-        if (cfg_.is_nemotron()) {
+        if (cfg_.is_nemotron() && !cfg_.is_nemotron_bolt()) {
             // Cap resident VRAM cache budget to exactly 11 complete layers (0..10) = 1,408 experts (7.73 GiB).
             // This leaves layers 11..22 (1,536 experts = 8.44 GiB) in pinned DRAM L2 cache.
             // With 4-buffer scratch buffer (512 slots = 2.81 GB) + dense weights (2.80 GB), total VRAM is 14.32 GB,
@@ -1124,13 +1131,20 @@ public:
 #if defined(_WIN32)
             MEMORYSTATUSEX memInfo;
             memInfo.dwLength = sizeof(MEMORYSTATUSEX);
-            if (GlobalMemoryStatusEx(&memInfo) && memInfo.ullAvailPhys > 10ULL * 1024 * 1024 * 1024) {
-                // Nemotron has 2,944 experts * 5.615MB = 16.53GB total.
-                // 1,408 experts (7.73GB) reside in VRAM.
-                // The remaining 1,536 experts need ~8.4GB to be 100% resident in pinned DRAM L2 cache.
-                dram_cache_budget = (size_t)12 * 128 * expert_block_size;
-                LOG_INFO("[Memory] Auto-allocated %.1f GB DRAM L2 cache for Nemotron: 100%% of all 2,944 experts resident in memory (zero SSD disk reads)!",
-                         (double)dram_cache_budget / (1024.0 * 1024.0 * 1024.0));
+            if (GlobalMemoryStatusEx(&memInfo) && memInfo.ullAvailPhys > 4ULL * 1024 * 1024 * 1024) {
+                if (cfg_.is_nemotron_bolt()) {
+                    size_t safe_avail = memInfo.ullAvailPhys - 4ULL * 1024 * 1024 * 1024;
+                    if (safe_avail > (size_t)(13.5 * 1024 * 1024 * 1024)) safe_avail = (size_t)(13.5 * 1024 * 1024 * 1024);
+                    if (safe_avail > total_experts_bytes) safe_avail = total_experts_bytes;
+                    dram_cache_budget = safe_avail;
+                    LOG_INFO("[Memory] Auto-allocated %.1f GB DRAM L2 cache for Nemotron Bolt (out of %.1f GB available physical RAM)",
+                             (double)dram_cache_budget / (1024.0 * 1024.0 * 1024.0),
+                             (double)memInfo.ullAvailPhys / (1024.0 * 1024.0 * 1024.0));
+                } else {
+                    dram_cache_budget = (size_t)12 * 128 * expert_block_size;
+                    LOG_INFO("[Memory] Auto-allocated %.1f GB DRAM L2 cache for Nemotron: 100%% of all 2,944 experts resident in memory (zero SSD disk reads)!",
+                             (double)dram_cache_budget / (1024.0 * 1024.0 * 1024.0));
+                }
             }
 #endif
         }
@@ -1202,7 +1216,7 @@ public:
             if (expert_freq_counts_.empty()) {
                 expert_freq_counts_.assign((size_t)cfg_.num_hidden_layers * cfg_.n_routed_experts, 0);
             }
-            expert_loader_.preload_all(16, expert_freq_counts_);
+            expert_loader_.preload_all(16, get_loader_freq_counts());
 
             expert_token_counts_.resize(cfg_.num_hidden_layers);
             for (int l = 0; l < cfg_.num_hidden_layers; l++) {
@@ -1239,7 +1253,7 @@ public:
                 std::vector<void*> h_all_ptrs((size_t)total_moe_layers * max_routed_exp, nullptr);
                 for (int l = 0; l < total_moe_layers && l < 64; l++) {
                     bool all_in = true;
-                    int n_e = cfg_.layer_n_routed_experts.empty() ? cfg_.n_routed_experts : 128;
+                    int n_e = cfg_.get_moe_layer_n_routed_experts(l);
                     if (n_e <= 0) n_e = 128;
                     for (int e = 0; e < n_e && e < max_routed_exp; e++) {
                         h_all_ptrs[(size_t)l * max_routed_exp + e] = expert_loader_.try_get_expert_cached(l, e);
@@ -1250,16 +1264,20 @@ public:
                 CUDA_CHECK(cudaMemcpy(buf_all_expert_ptrs_.data, h_all_ptrs.data(),
                                       (size_t)total_moe_layers * max_routed_exp * sizeof(void*), cudaMemcpyHostToDevice));
 
-                buf_dram_moe_scratch_.alloc((size_t)NUM_DRAM_MOE_BUFFERS * max_routed_exp * expert_block_size);
-                for (int b = 0; b < NUM_DRAM_MOE_BUFFERS; b++) {
-                    buf_dram_expert_ptrs_gpu_[b].alloc((size_t)max_routed_exp * sizeof(void*));
-                    std::vector<void*> h_ptrs(max_routed_exp);
-                    char* base = (char*)buf_dram_moe_scratch_.data + (size_t)b * max_routed_exp * expert_block_size;
-                    for (int e = 0; e < max_routed_exp; e++) {
-                        h_ptrs[e] = base + (size_t)e * expert_block_size;
+                if (cfg_.is_nemotron_bolt()) {
+                    buf_dram_moe_scratch_.alloc(64 * expert_block_size);
+                } else {
+                    buf_dram_moe_scratch_.alloc((size_t)NUM_DRAM_MOE_BUFFERS * max_routed_exp * expert_block_size);
+                    for (int b = 0; b < NUM_DRAM_MOE_BUFFERS; b++) {
+                        buf_dram_expert_ptrs_gpu_[b].alloc((size_t)max_routed_exp * sizeof(void*));
+                        std::vector<void*> h_ptrs(max_routed_exp);
+                        char* base = (char*)buf_dram_moe_scratch_.data + (size_t)b * max_routed_exp * expert_block_size;
+                        for (int e = 0; e < max_routed_exp; e++) {
+                            h_ptrs[e] = base + (size_t)e * expert_block_size;
+                        }
+                        CUDA_CHECK(cudaMemcpy(buf_dram_expert_ptrs_gpu_[b].data, h_ptrs.data(),
+                                              (size_t)max_routed_exp * sizeof(void*), cudaMemcpyHostToDevice));
                     }
-                    CUDA_CHECK(cudaMemcpy(buf_dram_expert_ptrs_gpu_[b].data, h_ptrs.data(),
-                                          (size_t)max_routed_exp * sizeof(void*), cudaMemcpyHostToDevice));
                 }
             }
 
@@ -1712,10 +1730,18 @@ public:
     }
 
     void forward_token_eager(int token_id, int position, bool do_compute_logits = true) {
+        if (!h_single_tok_) {
+            CUDA_CHECK(cudaMallocHost(&h_single_tok_, sizeof(int32_t)));
+            CUDA_CHECK(cudaMallocHost(&h_single_pos_, sizeof(int32_t)));
+            CUDA_CHECK(cudaMallocHost(&h_single_flag_, sizeof(int32_t)));
+        }
         int track_flag = (track_expert_freq_ && track_current_token_) ? 1 : 0;
-        CUDA_CHECK(cudaMemcpy(buf_track_flag_.i32(), &track_flag, sizeof(int32_t), cudaMemcpyHostToDevice));
-        CUDA_CHECK(cudaMemcpy(buf_input_token_.i32(), &token_id, sizeof(int32_t), cudaMemcpyHostToDevice));
-        CUDA_CHECK(cudaMemcpy(buf_input_pos_.i32(), &position, sizeof(int32_t), cudaMemcpyHostToDevice));
+        *h_single_flag_ = track_flag;
+        *h_single_tok_ = token_id;
+        *h_single_pos_ = position;
+        CUDA_CHECK(cudaMemcpyAsync(buf_track_flag_.i32(), h_single_flag_, sizeof(int32_t), cudaMemcpyHostToDevice, main_stream_));
+        CUDA_CHECK(cudaMemcpyAsync(buf_input_token_.i32(), h_single_tok_, sizeof(int32_t), cudaMemcpyHostToDevice, main_stream_));
+        CUDA_CHECK(cudaMemcpyAsync(buf_input_pos_.i32(), h_single_pos_, sizeof(int32_t), cudaMemcpyHostToDevice, main_stream_));
         forward_token_device_body(token_id, position, do_compute_logits);
 #if defined(__APPLE__)
         CUDA_CHECK(cudaStreamSynchronize(main_stream_));
@@ -2383,6 +2409,7 @@ public:
                          int visual_start_pos = -1,
                          int visual_num_tokens = 0,
                          bool bypass_prefix_cache = false) {
+        expert_loader_.begin_request_epoch();
         // Ensure prompt fits within max_seq_len (defense-in-depth safety clamp)
         std::vector<int> prompt = prompt_in;
         if (prompt.size() > (size_t)cfg_.max_seq_len) {
@@ -2644,6 +2671,25 @@ public:
         LOG_WARN("Think tokens: start=%d end=%d, EOS=%d eos2=%d user=%d asst=%d, think_budget=%d",
                  think_start_id, think_end_id, cfg_.eos_token_id, eos2_id, user_id, asst_id, max_thinking_tokens);
 
+        // Refusal opening tokens to suppress at the start of content generation
+        std::vector<int> refusal_start_tokens;
+        auto add_refusal_phrase = [&](const std::string& phrase) {
+            auto enc = tokenizer_.encode(phrase);
+            if (!enc.empty()) refusal_start_tokens.push_back(enc[0]);
+            auto enc_sp = tokenizer_.encode(" " + phrase);
+            if (!enc_sp.empty()) refusal_start_tokens.push_back(enc_sp[0]);
+        };
+        add_refusal_phrase("I'm sorry");
+        add_refusal_phrase("I cannot");
+        add_refusal_phrase("I can't");
+        add_refusal_phrase("Sorry");
+        add_refusal_phrase("Unfortunately");
+        add_refusal_phrase("As an AI");
+        add_refusal_phrase("I am unable");
+        add_refusal_phrase("I apologize");
+        std::sort(refusal_start_tokens.begin(), refusal_start_tokens.end());
+        refusal_start_tokens.erase(std::unique(refusal_start_tokens.begin(), refusal_start_tokens.end()), refusal_start_tokens.end());
+
         // Track whether we are inside a <think> block
         // DeepSeek V3/V4 and Nemotron thinking mode: the chat template appends <think> to the prompt,
         // so the model starts generation INSIDE the think block.
@@ -2687,14 +2733,26 @@ public:
                 if (!think_block_ended) {
                     in_think_block = true;
                     think_block_ended = false;
+                } else {
+                    return true; // Already past think block, do not push or emit think_start_id
                 }
             }
+            bool just_ended_think = false;
             if (think_end_id >= 0 && next_token == think_end_id) {
-                in_think_block = false;
-                think_block_ended = true;
-                if (content_start_history_idx < 0) {
-                    content_start_history_idx = (int)history.size();
+                if (in_think_block) {
+                    in_think_block = false;
+                    think_block_ended = true;
+                    just_ended_think = true;
+                    if (content_start_history_idx < 0) {
+                        content_start_history_idx = (int)history.size();
+                    }
+                } else {
+                    return true; // Already past think block, do not push duplicate think_end_id
                 }
+            }
+
+            if (think_block_ended && !just_ended_think && (next_token == think_start_id || next_token == think_end_id)) {
+                return true; // Never emit or track think tokens once think block has ended
             }
 
             output_ids.push_back(next_token);
@@ -2733,7 +2791,8 @@ public:
             }
 
             std::string token_text = tokenizer_.decode({next_token});
-            if (in_think_block && (token_text.find("</think>") != std::string::npos || (token_buffer + token_text).find("</think>") != std::string::npos)) {
+            int min_thinking_tokens = std::min(48, max_thinking_tokens > 0 ? max_thinking_tokens : 48);
+            if (in_think_block && thinking_tokens_generated >= min_thinking_tokens && (token_text.find("</think>") != std::string::npos || (token_buffer + token_text).find("</think>") != std::string::npos)) {
                 in_think_block = false;
                 think_block_ended = true;
                 if (content_start_history_idx < 0) {
@@ -2808,14 +2867,156 @@ public:
                 break;
             }
 
+            // N-Gram Repetition Loop Detector & Breaker (breaks attractor loops in reasoning & content)
+            int loop_len = 0;
+            int n_out = (int)output_ids.size();
+            if (in_think_block) {
+                // Reasoning phase: detect exact token repetition loops.
+                // To avoid false positives on legitimate formatting, markdown lists, bullet points,
+                // table dividers, equations, or code planning, require a robust minimum number of cycles
+                // and a substantial total repeated token span (at least 40+ tokens).
+                for (int L = 1; L <= 512; L++) {
+                    int min_cycles = (L == 1) ? 40 :
+                                     ((L == 2) ? 24 :
+                                     ((L <= 4) ? 16 :
+                                     ((L <= 8) ? 10 :
+                                     ((L <= 16) ? 6 :
+                                     ((L <= 32) ? 4 :
+                                     ((L <= 64) ? 4 : 3))))));
+                    if (min_cycles * L > n_out) continue;
+                    if (min_cycles * L < 40) continue; // Safety floor: never trip on less than 40 repeated tokens
+                    bool match = true;
+                    const int* p_last = output_ids.data() + (n_out - L);
+                    for (int c = 1; c < min_cycles; c++) {
+                        const int* p_prev = output_ids.data() + (n_out - (c + 1) * L);
+                        for (int i = 0; i < L; i++) {
+                            if (p_last[i] != p_prev[i]) {
+                                match = false;
+                                break;
+                            }
+                        }
+                        if (!match) break;
+                    }
+                    if (match) {
+                        loop_len = L;
+                        break;
+                    }
+                }
+                // Structural repetition matching is disabled: normal reasoning routinely lists
+                // parallel items (buttons, steps, features, cases) which falsely trigger fuzzy pattern matchers.
+                // Exact repetition detection robustly catches true attractor loops.
+            } else {
+                // Content generation phase:
+                // Only inspect content tokens (NEVER cross back into reasoning scratchpad!).
+                // In code/HTML/CSS generation, structural repetitions (buttons, rows, list items) are NORMAL.
+                // Exact token loops require substantial cycle count and at least 48 tokens.
+                int n_content = content_tokens_generated;
+                for (int L = 1; L <= 512; L++) {
+                    int min_cycles = (L == 1) ? 40 :
+                                     ((L == 2) ? 24 :
+                                     ((L <= 4) ? 16 :
+                                     ((L <= 8) ? 10 :
+                                     ((L <= 16) ? 6 :
+                                     ((L <= 32) ? 4 :
+                                     ((L <= 64) ? 4 : 3))))));
+                    if (min_cycles * L > n_content) continue;
+                    if (min_cycles * L < 48) continue; // Content safety floor: at least 48 identical repeated tokens
+                    bool match = true;
+                    const int* p_last = output_ids.data() + (n_out - L);
+                    for (int c = 1; c < min_cycles; c++) {
+                        const int* p_prev = output_ids.data() + (n_out - (c + 1) * L);
+                        for (int i = 0; i < L; i++) {
+                            if (p_last[i] != p_prev[i]) {
+                                match = false;
+                                break;
+                            }
+                        }
+                        if (!match) break;
+                    }
+                    if (match) {
+                        loop_len = L;
+                        break;
+                    }
+                }
+            }
+
+            if (loop_len > 0) {
+                if (in_think_block) {
+                    LOG_WARN("[Anti-Loop] Repetition loop detected during reasoning (cycle length %d). Forcing </think> and starting content.", loop_len);
+                    in_think_block = false;
+                    think_block_ended = true;
+                    if (content_start_history_idx < 0) {
+                        content_start_history_idx = (int)history.size();
+                    }
+                    track_current_token_ = false;
+                    if (think_end_id >= 0) {
+                        forward_token(think_end_id, position);
+                        if (qwen_draft_.loaded_) {
+                            qwen_draft_.forward_token_async(think_end_id, position, main_stream_);
+                        }
+                        position++;
+                        output_ids.push_back(think_end_id);
+                        history.push_back(think_end_id);
+                    }
+                    if (on_token) {
+                        on_token("", false); // Signal end of reasoning to stream consumer
+                    }
+                    std::vector<int> transition_tokens = tokenizer_.encode("\n\n");
+                    for (int tok_id : transition_tokens) {
+                        track_current_token_ = false;
+                        forward_token(tok_id, position);
+                        if (qwen_draft_.loaded_) {
+                            qwen_draft_.forward_token_async(tok_id, position, main_stream_);
+                        }
+                        position++;
+                        output_ids.push_back(tok_id);
+                        history.push_back(tok_id);
+                        content_tokens_generated++;
+                        std::string tok_str = tokenizer_.decode({tok_id});
+                        generated_text += tok_str;
+                        if (on_token) {
+                            on_token(tok_str, false);
+                        }
+                    }
+                    // Mask think tokens in logits so content generation cannot immediately re-open a think block
+                    float neg_inf = -1e9f;
+                    if (think_start_id >= 0) {
+                        CUDA_CHECK(cudaMemcpyAsync(buf_logits_.f32() + think_start_id, &neg_inf, sizeof(float), cudaMemcpyHostToDevice, main_stream_));
+                    }
+                    if (think_end_id >= 0) {
+                        CUDA_CHECK(cudaMemcpyAsync(buf_logits_.f32() + think_end_id, &neg_inf, sizeof(float), cudaMemcpyHostToDevice, main_stream_));
+                    }
+                    argmax_cache_valid_ = false;
+                    next_token = -1;
+                    continue;
+                } else {
+                    LOG_WARN("[Anti-Loop] Repetition loop detected during content generation (cycle length %d). Halting generation cleanly.", loop_len);
+                    // If inside an unclosed code block, cleanly close it before halting
+                    size_t code_blocks = 0;
+                    size_t pos = 0;
+                    while ((pos = generated_text.find("```", pos)) != std::string::npos) {
+                        code_blocks++;
+                        pos += 3;
+                    }
+                    if (code_blocks % 2 != 0) {
+                        if (on_token) on_token("\n```\n", false);
+                        generated_text += "\n```\n";
+                    }
+                    finish_reason = "stop";
+                    break;
+                }
+            }
+
             // Graceful sentence boundary transition when thinking budget is reached
             if (in_think_block && max_thinking_tokens > 0 && thinking_tokens_generated >= max_thinking_tokens) {
-                int grace_limit = max_thinking_tokens + 255;
+                int grace_limit = max_thinking_tokens + (std::min)(24, (std::max)(4, max_thinking_tokens / 8));
                 bool is_clean_boundary = false;
                 if (!last_think_token_str.empty()) {
-                    char last_char = last_think_token_str.back();
-                    if (last_char == '\n' || last_char == '.' || last_char == ':') {
-                        is_clean_boundary = true;
+                    for (char c : last_think_token_str) {
+                        if (c == '\n' || c == '.' || c == ':' || c == '?' || c == '!') {
+                            is_clean_boundary = true;
+                            break;
+                        }
                     }
                 }
                 if (is_clean_boundary || thinking_tokens_generated >= grace_limit) {
@@ -2874,6 +3075,43 @@ public:
                     }
                     argmax_cache_valid_ = false;
                 }
+                if (!in_think_block || think_block_ended) {
+                    float neg_inf = -1e9f;
+                    if (think_start_id >= 0) {
+                        CUDA_CHECK(cudaMemcpyAsync(buf_logits_.f32() + think_start_id, &neg_inf, sizeof(float), cudaMemcpyHostToDevice, main_stream_));
+                    }
+                    if (think_end_id >= 0) {
+                        CUDA_CHECK(cudaMemcpyAsync(buf_logits_.f32() + think_end_id, &neg_inf, sizeof(float), cudaMemcpyHostToDevice, main_stream_));
+                    }
+                    argmax_cache_valid_ = false;
+                }
+                int min_thinking_tokens = std::min(48, max_thinking_tokens > 0 ? max_thinking_tokens : 48);
+                if (in_think_block && !think_block_ended && thinking_tokens_generated < min_thinking_tokens) {
+                    float neg_inf = -1e9f;
+                    if (think_end_id >= 0) {
+                        CUDA_CHECK(cudaMemcpyAsync(buf_logits_.f32() + think_end_id, &neg_inf, sizeof(float), cudaMemcpyHostToDevice, main_stream_));
+                    }
+                    if (cfg_.eos_token_id >= 0) {
+                        CUDA_CHECK(cudaMemcpyAsync(buf_logits_.f32() + cfg_.eos_token_id, &neg_inf, sizeof(float), cudaMemcpyHostToDevice, main_stream_));
+                    }
+                    if (eos2_id >= 0) {
+                        CUDA_CHECK(cudaMemcpyAsync(buf_logits_.f32() + eos2_id, &neg_inf, sizeof(float), cudaMemcpyHostToDevice, main_stream_));
+                    }
+                    if (im_end_id >= 0) {
+                        CUDA_CHECK(cudaMemcpyAsync(buf_logits_.f32() + im_end_id, &neg_inf, sizeof(float), cudaMemcpyHostToDevice, main_stream_));
+                    }
+                    argmax_cache_valid_ = false;
+                }
+                // Suppress refusal opening tokens at the start of content generation
+                if (content_tokens_generated == 0 && think_block_ended) {
+                    float neg_inf = -1e9f;
+                    for (int r_tok : refusal_start_tokens) {
+                        if (r_tok >= 0) {
+                            CUDA_CHECK(cudaMemcpyAsync(buf_logits_.f32() + r_tok, &neg_inf, sizeof(float), cudaMemcpyHostToDevice, main_stream_));
+                        }
+                    }
+                    argmax_cache_valid_ = false;
+                }
                 next_token = sample_token(temperature, history, content_tokens_generated, in_think_block,
                                           top_k, top_p, min_p, content_start_history_idx);
             }
@@ -2897,6 +3135,34 @@ public:
                     output_ids.push_back(think_end_id);
                     history.push_back(think_end_id);
                 }
+                if (on_token) {
+                    on_token("", false); // Signal end of reasoning to stream consumer
+                }
+                std::vector<int> transition_tokens = tokenizer_.encode("\n\n");
+                for (int tok_id : transition_tokens) {
+                    track_current_token_ = false;
+                    forward_token(tok_id, position);
+                    if (qwen_draft_.loaded_) {
+                        qwen_draft_.forward_token_async(tok_id, position, main_stream_);
+                    }
+                    position++;
+                    output_ids.push_back(tok_id);
+                    history.push_back(tok_id);
+                    content_tokens_generated++;
+                    std::string tok_str = tokenizer_.decode({tok_id});
+                    generated_text += tok_str;
+                    if (on_token) {
+                        on_token(tok_str, false);
+                    }
+                }
+                float neg_inf = -1e9f;
+                if (think_start_id >= 0) {
+                    CUDA_CHECK(cudaMemcpyAsync(buf_logits_.f32() + think_start_id, &neg_inf, sizeof(float), cudaMemcpyHostToDevice, main_stream_));
+                }
+                if (think_end_id >= 0) {
+                    CUDA_CHECK(cudaMemcpyAsync(buf_logits_.f32() + think_end_id, &neg_inf, sizeof(float), cudaMemcpyHostToDevice, main_stream_));
+                }
+                argmax_cache_valid_ = false;
                 next_token = -1;
                 continue;
             }
@@ -2911,8 +3177,8 @@ public:
                 break;
             }
 
-            if (!enable_thinking && (next_token == think_start_id || next_token == think_end_id)) {
-                if (content_tokens_generated > 0) {
+            if ((!in_think_block || think_block_ended || !enable_thinking) && (next_token == think_start_id || next_token == think_end_id)) {
+                if (!enable_thinking && content_tokens_generated > 0) {
                     LOG_WARN("Stop on think token in non-thinking mode: token=%d at step %d (content: %d)",
                              next_token, t, content_tokens_generated);
                     finish_reason = "stop";
@@ -2920,12 +3186,13 @@ public:
                 }
                 float neg_inf = -1e9f;
                 CUDA_CHECK(cudaMemcpyAsync(buf_logits_.f32() + next_token, &neg_inf, sizeof(float), cudaMemcpyHostToDevice, main_stream_));
+                argmax_cache_valid_ = false;
                 next_token = -1;
                 continue;
             }
 
             // 2. Speculative Decoding Verification Loop (MTP Self-Drafter + PLD + 2B Neural Drafter fallback)
-            bool allow_draft = (cfg_.architecture == ModelArch::QWEN) && enable_spec_ && (draft_streak >= 0) && !in_think_block &&
+            bool allow_draft = (cfg_.architecture == ModelArch::QWEN || cfg_.is_nemotron()) && enable_spec_ && (draft_streak >= 0) && !in_think_block &&
                                (content_tokens_generated + 4 < max_tokens) && !g_stop_requested.load();
 
             if (allow_draft) {
@@ -3022,10 +3289,19 @@ public:
                                                    buf_logits_batch_.f32() + (size_t)vres.last_accepted_node * cfg_.vocab_size,
                                                    cfg_.vocab_size * sizeof(float),
                                                    cudaMemcpyDeviceToDevice, main_stream_));
+                        if (!in_think_block || think_block_ended) {
+                            float neg_inf = -1e9f;
+                            if (think_start_id >= 0) {
+                                CUDA_CHECK(cudaMemcpyAsync(buf_logits_.f32() + think_start_id, &neg_inf, sizeof(float), cudaMemcpyHostToDevice, main_stream_));
+                            }
+                            if (think_end_id >= 0) {
+                                CUDA_CHECK(cudaMemcpyAsync(buf_logits_.f32() + think_end_id, &neg_inf, sizeof(float), cudaMemcpyHostToDevice, main_stream_));
+                            }
+                        }
                         CUDA_CHECK(cudaStreamSynchronize(main_stream_));
                         argmax_cache_valid_ = false;
                         next_token = sample_token(temperature, history, content_tokens_generated, in_think_block,
-                                                  top_k, top_p, min_p);
+                                                  top_k, top_p, min_p, content_start_history_idx);
                     }
 
                     int advanced = 1 + vres.accepted_count;
@@ -3063,14 +3339,20 @@ public:
                 }
 
                 // Priority 2: Prompt-Lookup Drafting (only as fallback when MTP is not loaded / disabled)
-                if (cfg_.architecture == ModelArch::QWEN && !is_mtp && (!enable_mtp_ || !mtp_drafter_.loaded_) && enable_pld_ && !history.empty()) {
-                    int max_pld = std::min(pld_draft_tokens_, 2);
-                    std::vector<int> pld_cands = PromptLookupDrafter::draft(history, max_pld, 6, 6);
+                if ((cfg_.architecture == ModelArch::QWEN || cfg_.is_nemotron()) && !is_mtp && (!enable_mtp_ || !mtp_drafter_.loaded_) && enable_pld_ && !history.empty()) {
+                    int max_pld = cfg_.is_nemotron() ? 3 : std::min(pld_draft_tokens_, 3);
+                    int pld_min_ngram = cfg_.is_nemotron() ? 2 : 1;
+                    std::vector<int> pld_cands = PromptLookupDrafter::draft(history, max_pld, 4, pld_min_ngram);
                     if (!pld_cands.empty()) {
                         for (int tok : pld_cands) {
+                            if ((!in_think_block || think_block_ended) && (tok == think_start_id || tok == think_end_id)) {
+                                break;
+                            }
                             cand_tokens.push_back(tok);
                         }
-                        is_pld = true;
+                        if (cand_tokens.size() > 1) {
+                            is_pld = true;
+                        }
                     }
                 }
 
@@ -3081,11 +3363,16 @@ public:
                 }
 
                 int M = (int)cand_tokens.size();
-                if (cfg_.architecture == ModelArch::QWEN && M >= 2) {
+                if ((cfg_.architecture == ModelArch::QWEN || cfg_.is_nemotron()) && M >= 2) {
                     auto tv0 = std::chrono::steady_clock::now();
-                    forward_token_batch_qwen(cand_tokens.data(), position, M);
+                    if (cfg_.is_nemotron()) {
+                        forward_token_batch_nemotron(cand_tokens.data(), position, M);
+                    } else {
+                        forward_token_batch_qwen(cand_tokens.data(), position, M);
+                    }
 
                     int num_verify = M - 1;
+                    apply_repetition_penalty_to_batch(buf_logits_batch_.f32(), M, history, in_think_block, content_start_history_idx);
                     // Verify candidate positions simultaneously in ONE GPU pass (computing all M predictions)
                     argmax_f32_batch_cuda(buf_argmax_out_batch_.i32(), buf_logits_batch_.f32(), cfg_.vocab_size, M, main_stream_);
 
@@ -3116,9 +3403,10 @@ public:
                                      pred_k == draft_cand ? "MATCH" : "MISS");
                         }
 
+                        bool allow_think_tok = in_think_block && !think_block_ended;
                         if (pred_k == draft_cand &&
                             pred_k != cfg_.eos_token_id && (eos2_id < 0 || pred_k != eos2_id) &&
-                            (enable_thinking || (pred_k != think_start_id && pred_k != think_end_id))) {
+                            (allow_think_tok || (pred_k != think_start_id && pred_k != think_end_id))) {
                             accepted++;
                             if (!emit_token_cpu(draft_cand, t)) {
                                 finish_reason = "stop";
@@ -3165,6 +3453,15 @@ public:
                                                        buf_logits_batch_.f32() + (size_t)(M - 1) * cfg_.vocab_size,
                                                        cfg_.vocab_size * sizeof(float),
                                                        cudaMemcpyDeviceToDevice, main_stream_));
+                            if (!in_think_block || think_block_ended) {
+                                float neg_inf = -1e9f;
+                                if (think_start_id >= 0) {
+                                    CUDA_CHECK(cudaMemcpyAsync(buf_logits_.f32() + think_start_id, &neg_inf, sizeof(float), cudaMemcpyHostToDevice, main_stream_));
+                                }
+                                if (think_end_id >= 0) {
+                                    CUDA_CHECK(cudaMemcpyAsync(buf_logits_.f32() + think_end_id, &neg_inf, sizeof(float), cudaMemcpyHostToDevice, main_stream_));
+                                }
+                            }
                             CUDA_CHECK(cudaStreamSynchronize(main_stream_));
                             argmax_cache_valid_ = false;
                             next_token = sample_token(temperature, history, content_tokens_generated, in_think_block,
@@ -3205,7 +3502,7 @@ public:
                         decode_step_idx_ += (accepted + 1);
 
                         if (accepted == 0) {
-                            draft_streak = is_mtp ? 0 : -8;
+                            draft_streak = (is_mtp || cfg_.is_nemotron() || is_pld) ? 0 : -8;
                         } else {
                             draft_streak = std::min(draft_streak + accepted, 6);
                         }
@@ -3220,7 +3517,7 @@ public:
                     position++;
                     decode_step_idx_++;
                     next_token = -1;
-                    draft_streak = -2;
+                    draft_streak = (cfg_.is_nemotron() || enable_pld_) ? 0 : -2;
                     continue;
                 }
             }
@@ -3258,10 +3555,20 @@ public:
         std::vector<int> reasoning_ids;
         std::vector<int> content_ids;
         bool is_in_think = (enable_thinking && !had_multimodal);
+        bool think_already_ended = false;
         for (int id : output_ids) {
-            if (think_start_id >= 0 && id == think_start_id) { is_in_think = true; continue; }
-            if (think_end_id >= 0 && id == think_end_id) { is_in_think = false; continue; }
-            if (is_in_think) {
+            if (think_start_id >= 0 && id == think_start_id) {
+                if (!think_already_ended) {
+                    is_in_think = true;
+                }
+                continue;
+            }
+            if (think_end_id >= 0 && id == think_end_id) {
+                is_in_think = false;
+                think_already_ended = true;
+                continue;
+            }
+            if (is_in_think && !think_already_ended) {
                 reasoning_ids.push_back(id);
             } else {
                 content_ids.push_back(id);
@@ -3373,7 +3680,7 @@ public:
             if (!loaded) {
                 LOG_ERROR("[Vision Delegate] Failed to load on-demand vision delegate engine!");
                 if (evicted) {
-                    expert_loader_.restore_l1_from_host(expert_freq_counts_);
+                    expert_loader_.restore_l1_from_host(get_loader_freq_counts());
                     refresh_resident_pointers();
                 }
                 return "";
@@ -3389,7 +3696,7 @@ public:
 
             // Restore Nemotron L1 expert cache if it was evicted
             if (evicted) {
-                expert_loader_.restore_l1_from_host(expert_freq_counts_);
+                expert_loader_.restore_l1_from_host(get_loader_freq_counts());
                 refresh_resident_pointers();
             }
 
@@ -3531,7 +3838,17 @@ private:
             }
             auto& info = tensor_map[name];
             std::string dtype = info.value("dtype", "");
-            if (dtype != "int4" && dtype != "int3" && dtype != "fp4" && dtype != "nvfp4") {
+            std::string scale_name = name + "_scale";
+            if (!tensor_map.contains(scale_name)) {
+                size_t w_pos = name.rfind(".weight");
+                if (w_pos != std::string::npos) {
+                    scale_name = name.substr(0, w_pos) + ".weight_scale";
+                }
+            }
+            bool has_separate_scale = tensor_map.contains(scale_name);
+
+            if (dtype != "int4" && dtype != "int3" && dtype != "fp4" && dtype != "nvfp4" &&
+                !(dtype == "U8" && has_separate_scale)) {
                 return false;
             }
             int64_t offset = info["offset"].get<int64_t>();
@@ -3553,19 +3870,22 @@ private:
                 gpu_s.dtype = info.value("scale_dtype", (dtype == "fp4" || dtype == "nvfp4") ? "F8_E4M3" : "bfloat16");
                 gpu_s.alloc(scale_nbytes);
                 CUDA_CHECK(cudaMemcpy(gpu_s.data, (char*)mapped + scale_offset, scale_nbytes, cudaMemcpyHostToDevice));
-            } else {
-                std::string scale_name = name + "_scale";
-                if (!tensor_map.contains(scale_name)) {
-                    size_t w_pos = name.rfind(".weight");
-                    if (w_pos != std::string::npos) {
-                        scale_name = name.substr(0, w_pos) + ".weight_scale";
-                    }
-                }
-                if (tensor_map.contains(scale_name)) {
-                    load_tensor(gpu_s, scale_name);
-                }
+            } else if (has_separate_scale) {
+                load_tensor(gpu_s, scale_name);
             }
             return true;
+        };
+
+        auto read_scalar_f32 = [&](const std::string& name, float default_val = 1.0f) -> float {
+            if (!tensor_map.contains(name)) return default_val;
+            auto& info = tensor_map[name];
+            if (info.contains("scalar_scale")) return info["scalar_scale"].get<float>();
+            if (info.contains("scale_2")) return info["scale_2"].get<float>();
+            if (info.value("nbytes", 0) == 4) {
+                int64_t offset = info["offset"].get<int64_t>();
+                return *(const float*)((const char*)mapped + offset);
+            }
+            return default_val;
         };
 
         auto load_layer_weight = [&](GPUTensor& gpu_w, GPUTensor& gpu_s, const std::string& name) -> bool {
@@ -3775,18 +4095,18 @@ private:
                     load_tensor(lw.conv1d_bias, prefix + ".mixer.conv1d.bias");
                     load_tensor(lw.dt_bias, prefix + ".mixer.dt_bias");
 
-                    // Projections (FP8 or BF16)
+                    // Projections (NVFP4, FP8, or BF16)
                     load_layer_weight(lw.w_in_qkv, lw.w_in_qkv_scale, prefix + ".mixer.in_proj.weight");
                     load_layer_weight(lw.linear_out_proj, lw.linear_out_proj_scale, prefix + ".mixer.out_proj.weight");
 
                     std::string in_proj_name = prefix + ".mixer.in_proj.weight";
-                    if (tensor_map.contains(in_proj_name) && tensor_map[in_proj_name].contains("scalar_scale")) {
-                        lw.w_in_qkv_scale_val = tensor_map[in_proj_name]["scalar_scale"].get<float>();
-                    }
+                    lw.w_in_qkv_scale_val = read_scalar_f32(prefix + ".mixer.in_proj.weight_scale_2",
+                                                            read_scalar_f32(prefix + ".mixer.in_proj.weight_scale",
+                                                                            read_scalar_f32(in_proj_name, 1.0f)));
                     std::string out_proj_name = prefix + ".mixer.out_proj.weight";
-                    if (tensor_map.contains(out_proj_name) && tensor_map[out_proj_name].contains("scalar_scale")) {
-                        lw.linear_out_proj_scale_val = tensor_map[out_proj_name]["scalar_scale"].get<float>();
-                    }
+                    lw.linear_out_proj_scale_val = read_scalar_f32(prefix + ".mixer.out_proj.weight_scale_2",
+                                                                   read_scalar_f32(prefix + ".mixer.out_proj.weight_scale",
+                                                                                   read_scalar_f32(out_proj_name, 1.0f)));
                 } else if (ltype == 0) {
                     // GQA Attention layer
                     lw.is_linear_attn = false;
@@ -3831,27 +4151,25 @@ private:
                     load_layer_weight(lw.shared_w1_w, lw.shared_w1_s, prefix + ".mixer.shared_experts.up_proj.weight");
                     load_layer_weight(lw.shared_w2_w, lw.shared_w2_s, prefix + ".mixer.shared_experts.down_proj.weight");
 
-                    std::string shared_up_name = prefix + ".mixer.shared_experts.up_proj.weight";
-                    if (tensor_map.contains(shared_up_name) && tensor_map[shared_up_name].contains("scale_2")) {
-                        lw.shared_w1_s2 = tensor_map[shared_up_name]["scale_2"].get<float>();
-                    }
-                    std::string shared_down_name = prefix + ".mixer.shared_experts.down_proj.weight";
-                    if (tensor_map.contains(shared_down_name) && tensor_map[shared_down_name].contains("scale_2")) {
-                        lw.shared_w2_s2 = tensor_map[shared_down_name]["scale_2"].get<float>();
+                    lw.shared_w1_s2 = read_scalar_f32(prefix + ".mixer.shared_experts.up_proj.weight_scale_2",
+                                                      read_scalar_f32(prefix + ".mixer.shared_experts.up_proj.weight", 1.0f));
+                    lw.shared_w2_s2 = read_scalar_f32(prefix + ".mixer.shared_experts.down_proj.weight_scale_2",
+                                                      read_scalar_f32(prefix + ".mixer.shared_experts.down_proj.weight", 1.0f));
+
+                    if (l == 1) {
+                        LOG_INFO("Nemotron Layer 1 shared experts: up_w=%p up_s=%p (s2=%f), down_w=%p down_s=%p (s2=%f)",
+                                 lw.shared_w1_w.data, lw.shared_w1_s.data, lw.shared_w1_s2,
+                                 lw.shared_w2_w.data, lw.shared_w2_s.data, lw.shared_w2_s2);
                     }
 
                     // LatentMoE Projections (Nemotron Bolt)
                     if (cfg_.is_nemotron_bolt() || tensor_map.contains(prefix + ".mixer.fc1_latent_proj.weight")) {
                         load_layer_weight(lw.fc1_latent_proj, lw.fc1_latent_proj_scale, prefix + ".mixer.fc1_latent_proj.weight");
                         load_layer_weight(lw.fc2_latent_proj, lw.fc2_latent_proj_scale, prefix + ".mixer.fc2_latent_proj.weight");
-                        std::string fc1_name = prefix + ".mixer.fc1_latent_proj.weight";
-                        if (tensor_map.contains(fc1_name) && tensor_map[fc1_name].contains("scalar_scale")) {
-                            lw.fc1_scale_val = tensor_map[fc1_name]["scalar_scale"].get<float>();
-                        }
-                        std::string fc2_name = prefix + ".mixer.fc2_latent_proj.weight";
-                        if (tensor_map.contains(fc2_name) && tensor_map[fc2_name].contains("scalar_scale")) {
-                            lw.fc2_scale_val = tensor_map[fc2_name]["scalar_scale"].get<float>();
-                        }
+                        lw.fc1_scale_val = read_scalar_f32(prefix + ".mixer.fc1_latent_proj.weight_scale",
+                                                           read_scalar_f32(prefix + ".mixer.fc1_latent_proj.weight", 1.0f));
+                        lw.fc2_scale_val = read_scalar_f32(prefix + ".mixer.fc2_latent_proj.weight_scale",
+                                                           read_scalar_f32(prefix + ".mixer.fc2_latent_proj.weight", 1.0f));
                     }
                 }
 
@@ -4003,9 +4321,10 @@ private:
             if (n_linear > 0) {
                 size_t ssm_heads = cfg_.ssm_dt_rank > 0 ? cfg_.ssm_dt_rank : (cfg_.is_nemotron_bolt() ? 128 : (cfg_.is_nemotron() ? 64 : 48));
                 size_t ssm_d = cfg_.ssm_d_state > 0 ? cfg_.ssm_d_state : 128;
-                size_t ssm_bytes_per_layer = ssm_heads * ssm_d * ssm_d * (cfg_.is_nemotron() ? sizeof(float) : sizeof(__nv_bfloat16));
+                size_t ssm_head_dim = cfg_.is_nemotron() ? 64 : ssm_d;
+                size_t ssm_bytes_per_layer = ssm_heads * ssm_head_dim * ssm_d * (cfg_.is_nemotron() ? sizeof(float) : sizeof(__nv_bfloat16));
                 size_t conv_dim = cfg_.ssm_d_conv > 0 ? cfg_.ssm_d_conv : 4;
-                size_t conv_channels = cfg_.is_nemotron_bolt() ? 10248 : (cfg_.is_nemotron() ? 6144 : 10240);
+                size_t conv_channels = cfg_.is_nemotron_bolt() ? 10240 : (cfg_.is_nemotron() ? 6144 : 10240);
                 size_t conv_bytes_per_layer = conv_channels * conv_dim * sizeof(__nv_bfloat16);
                 target_ssm_pool_.alloc(n_linear * ssm_bytes_per_layer);
                 target_conv_pool_.alloc(n_linear * conv_bytes_per_layer);
@@ -4015,6 +4334,8 @@ private:
                 int num_slots;
                 if (enable_tree_mtp_ && enable_mtp_) {
                     num_slots = gpu_caps_.is_vram_constrained ? std::min(8, tree_nodes_ + 1) : 8;
+                } else if (cfg_.is_nemotron()) {
+                    num_slots = 3; // Slots 0, 1, 2 for speculative verification up to M=4
                 } else if (mtp_k_ == 1 || (mtp_k_ == 0 && gpu_caps_.is_vram_constrained)) {
                     num_slots = 1;
                 } else if (mtp_k_ > 1) {
@@ -4117,7 +4438,7 @@ private:
         });
         size_t max_q_dim = std::max({
             (size_t)n_heads * head_dim_val,
-            (size_t)18568,
+            (size_t)18560,
             (size_t)12288,
             (size_t)dim
         });
@@ -4157,7 +4478,7 @@ private:
         buf_topk_idx_.alloc(max_k_val * sizeof(int32_t));
         buf_linear_a_.alloc(64 * sizeof(__nv_bfloat16));
         buf_linear_b_.alloc(64 * sizeof(__nv_bfloat16));
-        size_t conv_channels = cfg_.is_nemotron_bolt() ? 10248 : (cfg_.is_nemotron() ? 6144 : 10240);
+        size_t conv_channels = cfg_.is_nemotron_bolt() ? 10240 : (cfg_.is_nemotron() ? 6144 : 10240);
         size_t temp_channels = cfg_.is_nemotron_bolt() ? 8192 : 4096;
         buf_mamba_conv_.alloc(conv_channels * sizeof(__nv_bfloat16));
         buf_mamba_temp_.alloc(temp_channels * sizeof(float));
@@ -4182,13 +4503,13 @@ private:
         buf_input_pos_batch_.alloc(max_batch_m * sizeof(int32_t));
         buf_hidden_batch_.alloc(max_batch_m * dim * sizeof(__nv_bfloat16));
         buf_hidden2_batch_.alloc(max_batch_m * dim * sizeof(__nv_bfloat16));
-        int max_act_k = (int)std::max({(size_t)dim, (size_t)max_inter, (size_t)18568, (size_t)10304, (size_t)10240, (size_t)6144});
+        int max_act_k = (int)std::max({(size_t)dim, (size_t)max_inter, (size_t)18560, (size_t)10304, (size_t)10240, (size_t)6144});
         int max_act_m = 1024;
         buf_activation_fp4_.alloc((size_t)max_act_m * (max_act_k / 2));
         buf_activation_scale_.alloc((size_t)max_act_m * (max_act_k / 32));
         buf_activation_fp8_.alloc((size_t)max_act_m * max_act_k);
         buf_activation_fp8_side_.alloc((size_t)max_act_m * max_act_k);
-        buf_q_batch_.alloc(max_batch_m * std::max({(size_t)18568, (size_t)10304, (size_t)10240, (size_t)(2 * n_heads * head_dim_val)}) * sizeof(__nv_bfloat16));
+        buf_q_batch_.alloc(max_batch_m * std::max({(size_t)18560, (size_t)10304, (size_t)10240, (size_t)(2 * n_heads * head_dim_val)}) * sizeof(__nv_bfloat16));
         buf_gate_batch_.alloc(max_batch_m * max_inter * sizeof(__nv_bfloat16));
         buf_up_batch_.alloc(max_batch_m * max_inter * sizeof(__nv_bfloat16));
         buf_attn_out_batch_.alloc(max_batch_m * std::max((size_t)8192, (size_t)n_heads * head_dim_val) * sizeof(__nv_bfloat16));
@@ -4225,7 +4546,10 @@ private:
         buf_all_expert_ptrs_.alloc((size_t)n_moe_layers * max_routed_exp * sizeof(void*));
         buf_mamba_conv_batch_.alloc((size_t)max_batch_m * conv_channels * sizeof(__nv_bfloat16));
         buf_mamba_temp_batch_.alloc((size_t)max_batch_m * temp_channels * sizeof(float));
-        if (cfg_.is_nemotron()) {
+        if (cfg_.is_nemotron_bolt()) {
+            size_t exp_block_sz = 2953216;
+            buf_dram_moe_scratch_.alloc(64 * exp_block_sz);
+        } else if (cfg_.is_nemotron()) {
             size_t exp_block_sz = expert_loader_.expert_block_size() > 0 ? expert_loader_.expert_block_size() : 5898240;
             buf_dram_moe_scratch_.alloc((size_t)NUM_DRAM_MOE_BUFFERS * max_routed_exp * exp_block_sz);
         }
@@ -4286,8 +4610,19 @@ private:
             gemv_bf16_out_bf16_cuda(C, B, A, N, K, stream);
             return;
         }
+        if (alpha == 1.0f && beta == 0.0f && (K % 8 == 0)) {
+            for (int m = 0; m < M; m += 32) {
+                int cur_m = std::min(32, M - m);
+                gemv_bf16_out_bf16_batch_cuda(C + (size_t)m * N, B, A + (size_t)m * K, N, K, cur_m, stream);
+            }
+            return;
+        }
         if (handle == cublas_handle_ && stream != main_stream_) cublasSetStream(handle, stream);
-        CUBLAS_CHECK(cublasGemmEx(
+        cudaError_t pre_err = cudaGetLastError();
+        if (pre_err != cudaSuccess) {
+            LOG_ERROR("gemm_bf16 pre-launch CUDA error: %s (%d)", cudaGetErrorString(pre_err), (int)pre_err);
+        }
+        cublasStatus_t stat_code = cublasGemmEx(
             handle,
             CUBLAS_OP_T,    // B transposed (K x N -> N x K)
             CUBLAS_OP_N,    // A not transposed
@@ -4298,7 +4633,11 @@ private:
             &beta,
             C, CUDA_R_16BF, N,    // ldc = N
             CUBLAS_COMPUTE_32F,
-            CUBLAS_GEMM_DEFAULT_TENSOR_OP));
+            CUBLAS_GEMM_DEFAULT);
+        if (stat_code != CUBLAS_STATUS_SUCCESS) {
+            LOG_ERROR("gemm_bf16 failed: stat=%d M=%d N=%d K=%d A=%p B=%p C=%p", (int)stat_code, M, N, K, (const void*)A, (const void*)B, (void*)C);
+            CUBLAS_CHECK(stat_code);
+        }
         if (handle == cublas_handle_ && stream != main_stream_) cublasSetStream(handle, main_stream_);
     }
 
@@ -4312,6 +4651,13 @@ private:
             gemv_bf16_cuda(C, B, A, N, K, main_stream_);
             return;
         }
+        if (alpha == 1.0f && beta == 0.0f && (K % 8 == 0)) {
+            for (int m = 0; m < M; m += 32) {
+                int cur_m = std::min(32, M - m);
+                gemv_bf16_batch_cuda(C + (size_t)m * N, B, A + (size_t)m * K, N, K, cur_m, main_stream_);
+            }
+            return;
+        }
         CUBLAS_CHECK(cublasGemmEx(
             cublas_handle_,
             CUBLAS_OP_T,    // B transposed (K x N -> N x K)
@@ -4323,7 +4669,7 @@ private:
             &beta,
             C, CUDA_R_32F, N,     // ldc = N
             CUBLAS_COMPUTE_32F,
-            CUBLAS_GEMM_DEFAULT_TENSOR_OP));
+            CUBLAS_GEMM_DEFAULT));
     }
 
     void gemm_fp8_scalar_scale_cublaslt(
@@ -4605,7 +4951,7 @@ private:
                 &beta,
                 C + n_start, CUDA_R_16BF, N,
                 CUBLAS_COMPUTE_32F,
-                CUBLAS_GEMM_DEFAULT_TENSOR_OP));
+                CUBLAS_GEMM_DEFAULT));
             CUDA_CHECK(cudaEventRecord(gemm_done_event_[stream_idx][buf_idx], stream));
         }
 
@@ -4797,7 +5143,7 @@ private:
                 &beta,
                 C + n_start, CUDA_R_16BF, N,
                 CUBLAS_COMPUTE_32F,
-                CUBLAS_GEMM_DEFAULT_TENSOR_OP));
+                CUBLAS_GEMM_DEFAULT));
             CUDA_CHECK(cudaEventRecord(gemm_done_event_[stream_idx][buf_idx], stream));
         }
 
@@ -4968,6 +5314,43 @@ private:
         return sample_from_logits_ptr(buf_logits_.f32(), temperature, history, step, is_reasoning, top_k, top_p, min_p, content_start_idx);
     }
 
+    void apply_repetition_penalty_to_batch(float* logits_batch, int M, const std::vector<int>& history, bool is_reasoning = true, int content_start_idx = 0) {
+        float eff_penalty = current_rep_penalty_;
+        if (eff_penalty <= 1.0f && cfg_.is_nemotron()) {
+            eff_penalty = 1.05f;
+        }
+        if (eff_penalty <= 1.0f || history.empty()) return;
+        static int32_t* d_rep_hist = nullptr;
+        static const int MAX_REP_HIST = 2048;
+        if (!d_rep_hist) {
+            CUDA_CHECK(cudaMalloc(&d_rep_hist, MAX_REP_HIST * sizeof(int32_t)));
+        }
+        int hist_len = (int)history.size();
+        int start_idx = is_reasoning ? 0 : std::max(0, content_start_idx);
+        int available = std::max(0, hist_len - start_idx);
+        int n_penalize = std::min(available, MAX_REP_HIST);
+        if (n_penalize > 0) {
+            thread_local std::vector<int32_t> unique_tokens;
+            unique_tokens.clear();
+            thread_local std::unordered_set<int32_t> seen;
+            seen.clear();
+            const int* src_ptr = history.data() + (hist_len - n_penalize);
+            for (int i = 0; i < n_penalize; i++) {
+                int32_t tok = src_ptr[i];
+                if (tok >= 0 && seen.insert(tok).second) {
+                    unique_tokens.push_back(tok);
+                }
+            }
+            int n_unique = (int)unique_tokens.size();
+            if (n_unique > 0) {
+                CUDA_CHECK(cudaMemcpyAsync(d_rep_hist, unique_tokens.data(), n_unique * sizeof(int32_t), cudaMemcpyHostToDevice, main_stream_));
+                for (int m = 0; m < M; m++) {
+                    apply_repetition_penalty_cuda(logits_batch + (size_t)m * cfg_.vocab_size, d_rep_hist, n_unique, eff_penalty, main_stream_);
+                }
+            }
+        }
+    }
+
     int sample_from_logits_ptr(float* logits_ptr, float temperature, const std::vector<int>& history, int step = 0, bool is_reasoning = true,
                                int top_k = 1024, float top_p = 0.95f, float min_p = 0.0f, int content_start_idx = 0) {
         int vocab = cfg_.vocab_size;
@@ -4976,36 +5359,13 @@ private:
             CUDA_CHECK(cudaMallocHost(&h_sample_pin, sizeof(int32_t)));
         }
 
-        if (current_rep_penalty_ > 1.0f && !history.empty()) {
-            static int32_t* d_rep_hist = nullptr;
-            static const int MAX_REP_HIST = 256;
-            if (!d_rep_hist) {
-                CUDA_CHECK(cudaMalloc(&d_rep_hist, MAX_REP_HIST * sizeof(int32_t)));
-            }
-            int hist_len = (int)history.size();
-            // In content mode, only penalize tokens from content_start_idx onward so that reasoning is not suppressed
-            int start_idx = is_reasoning ? 0 : std::max(0, content_start_idx);
-            int available = std::max(0, hist_len - start_idx);
-            int n_penalize = std::min(available, MAX_REP_HIST);
-            if (n_penalize > 0) {
-                thread_local std::vector<int32_t> unique_tokens;
-                unique_tokens.clear();
-                thread_local std::unordered_set<int32_t> seen;
-                seen.clear();
-                const int* src_ptr = history.data() + (hist_len - n_penalize);
-                for (int i = 0; i < n_penalize; i++) {
-                    int32_t tok = src_ptr[i];
-                    if (tok >= 0 && seen.insert(tok).second) {
-                        unique_tokens.push_back(tok);
-                    }
-                }
-                int n_unique = (int)unique_tokens.size();
-                if (n_unique > 0) {
-                    CUDA_CHECK(cudaMemcpyAsync(d_rep_hist, unique_tokens.data(), n_unique * sizeof(int32_t), cudaMemcpyHostToDevice, main_stream_));
-                    apply_repetition_penalty_cuda(logits_ptr, d_rep_hist, n_unique, current_rep_penalty_, main_stream_);
-                    argmax_cache_valid_ = false;
-                }
-            }
+        apply_repetition_penalty_to_batch(logits_ptr, 1, history, is_reasoning, content_start_idx);
+        float eff_penalty = current_rep_penalty_;
+        if (eff_penalty <= 1.0f && cfg_.is_nemotron()) {
+            eff_penalty = 1.05f;
+        }
+        if (eff_penalty > 1.0f) {
+            argmax_cache_valid_ = false;
         }
 
         if (temperature <= 0.0f) {
@@ -5207,6 +5567,22 @@ public:
     }
 
     std::mutex expert_profile_mutex_;
+
+    std::vector<uint32_t> get_loader_freq_counts() const {
+        if (expert_freq_counts_.empty()) return {};
+        if ((int)expert_freq_counts_.size() == cfg_.num_hidden_layers * cfg_.n_routed_experts && cfg_.is_nemotron()) {
+            std::vector<uint32_t> sub;
+            sub.reserve(40 * cfg_.n_routed_experts);
+            for (int l = 0; l < cfg_.num_hidden_layers; l++) {
+                if (l < (int)cfg_.layer_types.size() && cfg_.layer_types[l] == 2) {
+                    const uint32_t* src = &expert_freq_counts_[(size_t)l * cfg_.n_routed_experts];
+                    sub.insert(sub.end(), src, src + cfg_.n_routed_experts);
+                }
+            }
+            return sub;
+        }
+        return expert_freq_counts_;
+    }
 
     void sync_expert_freq_from_gpu() {
         if (track_expert_freq_ && d_expert_counts_.data && !expert_freq_counts_.empty()) {
@@ -5586,6 +5962,7 @@ public:
     }
 
     void save_expert_freq(const std::string& path) {
+        sync_expert_freq_from_gpu();
         if (expert_freq_counts_.empty()) return;
         std::ofstream out(path, std::ios::binary);
         if (!out.is_open()) {

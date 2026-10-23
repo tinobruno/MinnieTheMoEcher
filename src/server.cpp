@@ -157,17 +157,18 @@ void rebuild_system_prefix(
 {
     std::lock_guard<std::mutex> lock(g_engine_mutex);
 
-    json resolved_tools = active_tools;
-    if (!resolved_tools.empty()) {
-        resolved_tools = resolve_canonical_tools(resolved_tools);
-    }
+    json resolved_tools = (g_enable_tools && !active_tools.empty()) ? resolve_canonical_tools(active_tools) : json::array();
 
     std::string full_prompt_text;
     if (!custom_full_prompt.empty()) {
         full_prompt_text = custom_full_prompt;
     } else {
         bool is_qwen = (engine.cfg_.architecture == ModelArch::QWEN || engine.cfg_.architecture == ModelArch::NEMOTRON_35);
-        full_prompt_text = base_prompt + build_dynamic_tools_prompt(resolved_tools, is_qwen);
+        if (g_enable_tools && !resolved_tools.empty()) {
+            full_prompt_text = base_prompt + build_dynamic_tools_prompt(resolved_tools, is_qwen);
+        } else {
+            full_prompt_text = base_prompt;
+        }
     }
 
     // Idempotency guard: if the system prompt and tools have not changed and snapshot is valid, skip redundant rebuild
@@ -248,6 +249,9 @@ static std::vector<int> build_continuation_prompt(
                 auto u_enc = tok.encode("user\n<tool_response>\n" + content + "\n</tool_response>");
                 result.insert(result.end(), u_enc.begin(), u_enc.end());
             } else {
+                if (engine.cfg_.is_nemotron() && enable_thinking && reasoning_effort != "none") {
+                    content += "\n\n{reasoning effort: efficient}";
+                }
                 auto u_enc = tok.encode("user\n" + content);
                 result.insert(result.end(), u_enc.begin(), u_enc.end());
             }
@@ -336,20 +340,16 @@ static bool check_and_build_continuation(
     }
 
     size_t prev_len = last_conv_messages.size();
-    // Check if the previous messages match in role
+    // Check if ALL previous messages match strictly in role AND content
     for (size_t i = 0; i < prev_len; i++) {
         std::string cur_role = current_messages[i].value("role", "");
         std::string last_role = last_conv_messages[i].value("role", "");
         if (cur_role != last_role) {
             return false;
         }
-    }
-
-    // Check if previous assistant message matches
-    if (prev_len > 0) {
-        std::string cur_asst = get_message_content_string(current_messages[prev_len - 1]);
-        std::string last_asst = get_message_content_string(last_conv_messages[prev_len - 1]);
-        if (!cur_asst.empty() && !last_asst.empty() && cur_asst != last_asst) {
+        std::string cur_content = get_message_content_string(current_messages[i]);
+        std::string last_content = get_message_content_string(last_conv_messages[i]);
+        if (cur_content != last_content) {
             return false;
         }
     }
@@ -440,6 +440,81 @@ static json prune_messages_to_fit(
     LOG_INFO("[Context] Pruning finished: final prompt length %zu / %d",
              test_prompt.size(), max_allowed_tokens);
     return pruned;
+}
+
+// Returns the length of the longest prefix of str that contains only complete, valid UTF-8 sequences.
+// If str ends with an incomplete multi-byte sequence, that trailing partial sequence is excluded.
+inline size_t valid_utf8_prefix_len(const std::string& str) {
+    size_t i = 0;
+    size_t len = str.size();
+    size_t last_valid = 0;
+    while (i < len) {
+        unsigned char c = (unsigned char)str[i];
+        if (c < 0x80) {
+            i += 1;
+            last_valid = i;
+        } else if ((c & 0xE0) == 0xC0) {
+            if (c < 0xC2) {
+                i += 1;
+                last_valid = i;
+            } else if (i + 1 < len) {
+                unsigned char c1 = (unsigned char)str[i + 1];
+                if ((c1 & 0xC0) == 0x80) {
+                    i += 2;
+                    last_valid = i;
+                } else {
+                    i += 1;
+                    last_valid = i;
+                }
+            } else {
+                break;
+            }
+        } else if ((c & 0xF0) == 0xE0) {
+            if (i + 2 < len) {
+                unsigned char c1 = (unsigned char)str[i + 1];
+                unsigned char c2 = (unsigned char)str[i + 2];
+                if ((c1 & 0xC0) == 0x80 && (c2 & 0xC0) == 0x80) {
+                    i += 3;
+                    last_valid = i;
+                } else {
+                    i += 1;
+                    last_valid = i;
+                }
+            } else if (i + 1 < len) {
+                unsigned char c1 = (unsigned char)str[i + 1];
+                if ((c1 & 0xC0) != 0x80) {
+                    i += 1;
+                    last_valid = i;
+                } else {
+                    break;
+                }
+            } else {
+                break;
+            }
+        } else if ((c & 0xF8) == 0xF0) {
+            if (c > 0xF4) {
+                i += 1;
+                last_valid = i;
+            } else if (i + 3 < len) {
+                unsigned char c1 = (unsigned char)str[i + 1];
+                unsigned char c2 = (unsigned char)str[i + 2];
+                unsigned char c3 = (unsigned char)str[i + 3];
+                if ((c1 & 0xC0) == 0x80 && (c2 & 0xC0) == 0x80 && (c3 & 0xC0) == 0x80) {
+                    i += 4;
+                    last_valid = i;
+                } else {
+                    i += 1;
+                    last_valid = i;
+                }
+            } else {
+                break;
+            }
+        } else {
+            i += 1;
+            last_valid = i;
+        }
+    }
+    return last_valid;
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -768,6 +843,19 @@ private:
     }
 };
 
+static bool is_conversational_greeting(const std::string& text) {
+    std::string trimmed = text;
+    while (!trimmed.empty() && (isspace((unsigned char)trimmed.front()) || ispunct((unsigned char)trimmed.front()))) trimmed.erase(0, 1);
+    while (!trimmed.empty() && (isspace((unsigned char)trimmed.back()) || ispunct((unsigned char)trimmed.back()))) trimmed.pop_back();
+    std::string lower;
+    for (char c : trimmed) lower += (char)tolower((unsigned char)c);
+    return (lower == "hello" || lower == "hi" || lower == "hey" || lower == "greetings" ||
+            lower == "good morning" || lower == "good afternoon" || lower == "good evening" ||
+            lower == "howdy" || lower == "yo" || lower == "sup" ||
+            lower == "who are you" || lower == "what is your name" || lower == "how are you" ||
+            lower == "help" || lower == "test");
+}
+
 void run_server(MoecherEngine& engine, int port, int default_thinking_budget, int proxy_port, bool enable_forward_proxy, bool enable_system_proxy) {
     load_server_config("server_config.json");
     httplib::Server svr;
@@ -850,24 +938,26 @@ void run_server(MoecherEngine& engine, int port, int default_thinking_budget, in
 
     svr.Post("/api/kv/reset", [&engine](const httplib::Request&, httplib::Response& res) {
         res.set_header("Access-Control-Allow-Origin", "*");
+        bool restored = false;
         {
             std::lock_guard<std::mutex> lock(g_engine_mutex);
             s_last_conv_messages.clear();
-        }
-        engine.turn_kv_snapshot_.valid = false;
-        if (engine.system_kv_snapshot_.valid) {
-            engine.restore_system_kv();
-            LOG_INFO("[KV RESET] Restored pinned System KV snapshot of %zu tokens (ready for fresh conversation with 0ms prefill).",
-                     engine.system_kv_snapshot_.tokens.size());
-        } else {
-            engine.reset_all_kv_caches();
-            engine.cached_tokens_.clear();
-            LOG_INFO("[KV RESET] Reset all KV caches to empty.");
+            engine.turn_kv_snapshot_.valid = false;
+            if (engine.system_kv_snapshot_.valid) {
+                engine.restore_system_kv();
+                restored = true;
+                LOG_INFO("[KV RESET] Restored pinned System KV snapshot of %zu tokens (ready for fresh conversation with 0ms prefill).",
+                         engine.system_kv_snapshot_.tokens.size());
+            } else {
+                engine.reset_all_kv_caches();
+                engine.cached_tokens_.clear();
+                LOG_INFO("[KV RESET] Reset all KV caches to empty.");
+            }
         }
         json body = {
             {"status", "ok"},
             {"message", "KV cache reset successfully"},
-            {"system_snapshot_restored", engine.system_kv_snapshot_.valid},
+            {"system_snapshot_restored", restored},
             {"cached_tokens", engine.cached_tokens_.size()}
         };
         res.set_content(body.dump(), "application/json");
@@ -875,20 +965,22 @@ void run_server(MoecherEngine& engine, int port, int default_thinking_budget, in
 
     svr.Get("/api/kv/reset", [&engine](const httplib::Request&, httplib::Response& res) {
         res.set_header("Access-Control-Allow-Origin", "*");
+        bool restored = false;
         {
             std::lock_guard<std::mutex> lock(g_engine_mutex);
             s_last_conv_messages.clear();
-        }
-        engine.turn_kv_snapshot_.valid = false;
-        if (engine.system_kv_snapshot_.valid) {
-            engine.restore_system_kv();
-        } else {
-            engine.reset_all_kv_caches();
-            engine.cached_tokens_.clear();
+            engine.turn_kv_snapshot_.valid = false;
+            if (engine.system_kv_snapshot_.valid) {
+                engine.restore_system_kv();
+                restored = true;
+            } else {
+                engine.reset_all_kv_caches();
+                engine.cached_tokens_.clear();
+            }
         }
         json body = {
             {"status", "ok"},
-            {"system_snapshot_restored", engine.system_kv_snapshot_.valid},
+            {"system_snapshot_restored", restored},
             {"cached_tokens", engine.cached_tokens_.size()}
         };
         res.set_content(body.dump(), "application/json");
@@ -907,9 +999,11 @@ void run_server(MoecherEngine& engine, int port, int default_thinking_budget, in
         json body = {
             {"status", "ok"},
             {"server_instance_id", g_server_instance_id},
+            {"tools_enabled", g_enable_tools},
             {"base_prompt", g_base_system_prompt},
             {"system_prompt", g_current_system_prompt},
-            {"active_tools", g_current_active_tools},
+            {"active_tools", g_enable_tools ? g_current_active_tools : json::array()},
+            {"repetition_penalty", g_server_config.repetition_penalty > 1.0f ? g_server_config.repetition_penalty : 1.05f},
             {"tokens_count", engine.system_kv_snapshot_.valid ? engine.system_kv_snapshot_.tokens.size() : 0}
         };
         res.set_content(body.dump(), "application/json");
@@ -954,7 +1048,10 @@ void run_server(MoecherEngine& engine, int port, int default_thinking_budget, in
             if (patch.contains("active_tools") || patch.contains("tools") || patch.contains("system_prompt") || patch.contains("base_prompt")) {
                 std::string base_prompt = patch.value("base_prompt", g_base_system_prompt);
                 std::string custom_full_prompt = patch.value("system_prompt", "");
-                json tools = patch.contains("active_tools") ? patch["active_tools"] : (patch.contains("tools") ? patch["tools"] : g_current_active_tools);
+                json tools = json::array();
+                if (g_enable_tools) {
+                    tools = patch.contains("active_tools") ? patch["active_tools"] : (patch.contains("tools") ? patch["tools"] : g_current_active_tools);
+                }
                 rebuild_system_prefix(engine, base_prompt, tools, custom_full_prompt);
             }
 
@@ -965,6 +1062,7 @@ void run_server(MoecherEngine& engine, int port, int default_thinking_budget, in
             }
             body["status"] = "ok";
             body["server_instance_id"] = g_server_instance_id;
+            body["tools_enabled"] = g_enable_tools;
             res.set_content(body.dump(), "application/json");
         } catch (const std::exception& e) {
             json err = {{"status", "error"}, {"message", e.what()}};
@@ -985,9 +1083,11 @@ void run_server(MoecherEngine& engine, int port, int default_thinking_budget, in
         json body = {
             {"status", "ok"},
             {"server_instance_id", g_server_instance_id},
+            {"tools_enabled", g_enable_tools},
             {"base_prompt", g_base_system_prompt},
             {"system_prompt", g_current_system_prompt},
-            {"active_tools", g_current_active_tools},
+            {"active_tools", g_enable_tools ? g_current_active_tools : json::array()},
+            {"repetition_penalty", g_server_config.repetition_penalty > 1.0f ? g_server_config.repetition_penalty : 1.05f},
             {"tokens_count", engine.system_kv_snapshot_.valid ? engine.system_kv_snapshot_.tokens.size() : 0}
         };
         res.set_content(body.dump(), "application/json");
@@ -1000,32 +1100,35 @@ void run_server(MoecherEngine& engine, int port, int default_thinking_budget, in
             std::string base_prompt = j.value("base_prompt", g_base_system_prompt);
             std::string custom_full_prompt = j.value("system_prompt", j.value("custom_system_prompt", ""));
 
-            json active_tools = g_current_active_tools;
-            if (j.contains("tools")) {
-                active_tools = j["tools"];
-                if (active_tools.is_array() || active_tools.is_string()) {
-                    active_tools = resolve_canonical_tools(active_tools);
-                    // Retain discovered MCP tools unless caller explicitly passed an empty array []
-                    if (!j["tools"].is_array() || !j["tools"].empty()) {
-                        json mcp_tools = moecher::mcp::MCPManager::instance().get_openai_tools_schema();
-                        for (const auto& mt : mcp_tools) {
-                            active_tools.push_back(mt);
+            json active_tools = json::array();
+            if (g_enable_tools) {
+                active_tools = g_current_active_tools;
+                if (j.contains("tools")) {
+                    active_tools = j["tools"];
+                    if (active_tools.is_array() || active_tools.is_string()) {
+                        active_tools = resolve_canonical_tools(active_tools);
+                        // Retain discovered MCP tools unless caller explicitly passed an empty array []
+                        if (!j["tools"].is_array() || !j["tools"].empty()) {
+                            json mcp_tools = moecher::mcp::MCPManager::instance().get_openai_tools_schema();
+                            for (const auto& mt : mcp_tools) {
+                                active_tools.push_back(mt);
+                            }
                         }
                     }
-                }
-                bool has_yt = false;
-                if (active_tools.is_array()) {
-                    for (const auto& item : active_tools) {
-                        if (item.is_string() && item.get<std::string>() == "youtube_search") has_yt = true;
-                        else if (item.is_object() && item.contains("function") && item["function"].value("name", "") == "youtube_search") has_yt = true;
+                    bool has_yt = false;
+                    if (active_tools.is_array()) {
+                        for (const auto& item : active_tools) {
+                            if (item.is_string() && item.get<std::string>() == "youtube_search") has_yt = true;
+                            else if (item.is_object() && item.contains("function") && item["function"].value("name", "") == "youtube_search") has_yt = true;
+                        }
                     }
+                    moecher::tooling::g_fast_media_search = has_yt;
                 }
-                moecher::tooling::g_fast_media_search = has_yt;
             }
 
             rebuild_system_prefix(engine, base_prompt, active_tools, custom_full_prompt);
 
-            {
+            if (g_enable_tools) {
                 std::lock_guard<std::mutex> lock(g_server_config_mutex);
                 if (active_tools.is_array()) {
                     g_server_config.active_tools.clear();
@@ -1041,9 +1144,11 @@ void run_server(MoecherEngine& engine, int port, int default_thinking_budget, in
             json body = {
                 {"status", "ok"},
                 {"server_instance_id", g_server_instance_id},
+                {"tools_enabled", g_enable_tools},
                 {"base_prompt", g_base_system_prompt},
                 {"system_prompt", g_current_system_prompt},
-                {"active_tools", g_current_active_tools},
+                {"active_tools", g_enable_tools ? g_current_active_tools : json::array()},
+                {"repetition_penalty", g_server_config.repetition_penalty > 1.0f ? g_server_config.repetition_penalty : 1.05f},
                 {"tokens_count", engine.system_kv_snapshot_.valid ? engine.system_kv_snapshot_.tokens.size() : 0}
             };
             res.set_content(body.dump(), "application/json");
@@ -1411,7 +1516,10 @@ void run_server(MoecherEngine& engine, int port, int default_thinking_budget, in
             int top_k = request.value("top_k", 1024);
             int max_tokens = request.value("max_tokens", 20000);
             bool stream = request.value("stream", false);
-            float repetition_penalty = request.value("repetition_penalty", 1.0f);
+            float repetition_penalty = request.value("repetition_penalty", engine.cfg_.is_nemotron() ? 1.05f : 1.0f);
+            if (repetition_penalty <= 1.0f && engine.cfg_.is_nemotron()) {
+                repetition_penalty = 1.05f;
+            }
             std::string reasoning_effort = request.value("reasoning_effort", "high");
             bool enable_thinking = true;
             int max_thinking_tokens = default_thinking_budget;
@@ -1716,8 +1824,8 @@ void run_server(MoecherEngine& engine, int port, int default_thinking_budget, in
                             {"usage", usage_obj},
                             {"zero_decode_bypass", zdb_obj}
                         };
-                        std::string sse = "data: " + chunk1.dump() + "\n\n" +
-                                          "data: " + chunk2.dump() + "\n\n" +
+                        std::string sse = "data: " + chunk1.dump(-1, ' ', false, json::error_handler_t::replace) + "\n\n" +
+                                          "data: " + chunk2.dump(-1, ' ', false, json::error_handler_t::replace) + "\n\n" +
                                           "data: [DONE]\n\n";
                         res.set_content(sse, "text/event-stream");
                         return;
@@ -1770,7 +1878,7 @@ void run_server(MoecherEngine& engine, int port, int default_thinking_budget, in
                     sse.append("\",\"choices\":[{\"index\":0,\"delta\":{\"");
                     sse.append(field_name);
                     sse.append("\":");
-                    sse.append(json(text).dump());
+                    sse.append(json(text).dump(-1, ' ', false, json::error_handler_t::replace));
                     sse.append("},\"finish_reason\":null}]}\n\n");
                     return sink.write(sse.data(), sse.size()) && !g_stop_requested.load();
                 };
@@ -1799,7 +1907,10 @@ void run_server(MoecherEngine& engine, int port, int default_thinking_budget, in
                             }}}
                         };
                         std::string sse = "data: " + initial_chunk.dump(-1, ' ', false, json::error_handler_t::replace) + "\n\n";
-                        sink.write(sse.data(), sse.size());
+                        if (!sink.write(sse.data(), sse.size())) {
+                            LOG_INFO("Client disconnected before initial chunk could be delivered; aborting.");
+                            return false;
+                        }
 
                         json current_messages = messages;
                         int max_tool_rounds = (do_server_exec && !tools.empty() && g_enable_tools) ? req_max_tool_rounds : 1;
@@ -1811,17 +1922,32 @@ void run_server(MoecherEngine& engine, int port, int default_thinking_budget, in
                         if (max_allowed_prompt < 1024) max_allowed_prompt = engine.cfg_.max_seq_len - 256;
 
                         for (int round = 0; round < max_tool_rounds; round++) {
+                            bool conv_has_image = false;
+                            for (const auto& m : current_messages) {
+                                if (message_has_image(m)) { conv_has_image = true; break; }
+                            }
+                            bool is_greeting = false;
+                            if (!engine.cfg_.is_nemotron() && !current_messages.empty()) {
+                                const auto& last_m = current_messages.back();
+                                if (last_m.value("role", "") == "user" && last_m.contains("content") && last_m["content"].is_string()) {
+                                    is_greeting = is_conversational_greeting(last_m["content"].get<std::string>());
+                                }
+                            }
+                            bool req_thinking = enable_thinking && !conv_has_image && !is_greeting;
+                            int req_thinking_tokens = req_thinking ? max_thinking_tokens : 0;
+                            bool eff_bypass_prefix_cache = bypass_prefix_cache || had_image_originally;
+
                             std::vector<int> prompt;
                             bool is_continuation = false;
                             if (round == 0) {
-                                is_continuation = check_and_build_continuation(engine, current_messages, s_last_conv_messages, enable_thinking, reasoning_effort, prompt, had_image_originally);
+                                is_continuation = check_and_build_continuation(engine, current_messages, s_last_conv_messages, req_thinking, reasoning_effort, prompt, had_image_originally);
                                 if (is_continuation && prompt.size() > (size_t)max_allowed_prompt) {
                                     LOG_WARN("[Context] Continuation prompt length (%zu) exceeds context budget (%d). Forcing sliding-window pruning.",
                                              prompt.size(), max_allowed_prompt);
                                     is_continuation = false;
                                 }
                             } else if (round > 0 && !round_new_tool_msgs.empty()) {
-                                prompt = build_continuation_prompt(engine, round_new_tool_msgs, enable_thinking, reasoning_effort);
+                                prompt = build_continuation_prompt(engine, round_new_tool_msgs, req_thinking, reasoning_effort);
                                 is_continuation = true;
                                 if (prompt.size() > (size_t)max_allowed_prompt) {
                                     LOG_WARN("[Context] Tool continuation length (%zu) exceeds context budget (%d). Forcing sliding-window pruning.",
@@ -1833,8 +1959,8 @@ void run_server(MoecherEngine& engine, int port, int default_thinking_budget, in
                             MultimodalPrompt mm_prompt;
                             const __nv_bfloat16* d_vis_out = nullptr;
                             if (!is_continuation) {
-                                current_messages = prune_messages_to_fit(current_messages, engine.tokenizer_, max_allowed_prompt, enable_thinking, reasoning_effort, tools, engine.cfg_.is_nemotron());
-                                mm_prompt = apply_chat_template_multimodal(current_messages, engine.tokenizer_, enable_thinking, reasoning_effort, tools, engine.has_vision(), engine.cfg_.is_nemotron());
+                                current_messages = prune_messages_to_fit(current_messages, engine.tokenizer_, max_allowed_prompt, req_thinking, reasoning_effort, tools, engine.cfg_.is_nemotron());
+                                mm_prompt = apply_chat_template_multimodal(current_messages, engine.tokenizer_, req_thinking, reasoning_effort, tools, engine.has_vision(), engine.cfg_.is_nemotron());
                                 prompt = mm_prompt.prompt;
                                 if (engine.has_vision() && !mm_prompt.image_b64.empty() && mm_prompt.visual_start_pos >= 0) {
                                     if (engine.ensure_vision_loaded()) {
@@ -1865,13 +1991,30 @@ void run_server(MoecherEngine& engine, int port, int default_thinking_budget, in
                             content_filter.on_status = status_cb;
                             reasoning_filter.on_status = status_cb;
 
-                            bool conv_has_image = false;
-                            for (const auto& m : current_messages) {
-                                if (message_has_image(m)) { conv_has_image = true; break; }
-                            }
-                            bool req_thinking = enable_thinking && !conv_has_image;
-                            int req_thinking_tokens = req_thinking ? max_thinking_tokens : 0;
-                            bool eff_bypass_prefix_cache = bypass_prefix_cache || had_image_originally;
+                            std::string utf8_reasoning_buf;
+                            std::string utf8_content_buf;
+
+                            auto emit_buffered_reasoning = [&](const std::string& chunk, bool flush_all = false) -> bool {
+                                utf8_reasoning_buf += chunk;
+                                size_t valid_len = flush_all ? utf8_reasoning_buf.size() : valid_utf8_prefix_len(utf8_reasoning_buf);
+                                if (valid_len > 0) {
+                                    std::string to_send = utf8_reasoning_buf.substr(0, valid_len);
+                                    utf8_reasoning_buf.erase(0, valid_len);
+                                    return send_sse_delta(sink, req_id, model_id, created_time_str, "reasoning_content", to_send);
+                                }
+                                return true;
+                            };
+
+                            auto emit_buffered_content = [&](const std::string& chunk, bool flush_all = false) -> bool {
+                                utf8_content_buf += chunk;
+                                size_t valid_len = flush_all ? utf8_content_buf.size() : valid_utf8_prefix_len(utf8_content_buf);
+                                if (valid_len > 0) {
+                                    std::string to_send = utf8_content_buf.substr(0, valid_len);
+                                    utf8_content_buf.erase(0, valid_len);
+                                    return send_sse_delta(sink, req_id, model_id, created_time_str, "content", to_send);
+                                }
+                                return true;
+                            };
 
                             engine.generate(prompt, max_tokens, temperature, [&](const std::string& text, bool is_reasoning) -> bool {
                                 if (g_stop_requested.load()) return false;
@@ -1881,19 +2024,19 @@ void run_server(MoecherEngine& engine, int port, int default_thinking_budget, in
                                     round_reasoning += text;
                                     if (g_enable_tools && !tools.empty()) {
                                         return reasoning_filter.feed(text, [&](const std::string& safe_text) -> bool {
-                                            return send_sse_delta(sink, req_id, model_id, created_time_str, "reasoning_content", safe_text);
+                                            return emit_buffered_reasoning(safe_text);
                                         });
                                     } else {
-                                        return send_sse_delta(sink, req_id, model_id, created_time_str, "reasoning_content", text);
+                                        return emit_buffered_reasoning(text);
                                     }
                                 } else {
                                     round_content += text;
                                     if (g_enable_tools && !tools.empty()) {
                                         return content_filter.feed(text, [&](const std::string& safe_text) -> bool {
-                                            return send_sse_delta(sink, req_id, model_id, created_time_str, "content", safe_text);
+                                            return emit_buffered_content(safe_text);
                                         });
                                     } else {
-                                        return send_sse_delta(sink, req_id, model_id, created_time_str, "content", text);
+                                        return emit_buffered_content(text);
                                     }
                                 }
                             }, repetition_penalty, req_thinking, req_thinking_tokens, top_p, min_p, top_k,
@@ -1904,15 +2047,18 @@ void run_server(MoecherEngine& engine, int port, int default_thinking_budget, in
                             }
 
                             final_finish_reason = engine.last_finish_reason_.empty() ? "stop" : engine.last_finish_reason_;
+                            last_completed_content = round_content;
 
                             if (g_enable_tools && !tools.empty()) {
                                 reasoning_filter.flush_remaining([&](const std::string& safe_text) -> bool {
-                                    return send_sse_delta(sink, req_id, model_id, created_time_str, "reasoning_content", safe_text);
+                                    return emit_buffered_reasoning(safe_text);
                                 });
                                 content_filter.flush_remaining([&](const std::string& safe_text) -> bool {
-                                    return send_sse_delta(sink, req_id, model_id, created_time_str, "content", safe_text);
+                                    return emit_buffered_content(safe_text);
                                 });
                             }
+                            emit_buffered_reasoning("", true);
+                            emit_buffered_content("", true);
 
                             if (!g_enable_tools || tools.empty()) {
                                 break;
@@ -1921,17 +2067,6 @@ void run_server(MoecherEngine& engine, int port, int default_thinking_budget, in
                             std::string clean_content;
                             std::vector<moecher::tooling::ToolCall> round_tool_calls;
                             moecher::tooling::extract_tool_calls(round_content, clean_content, round_tool_calls);
-
-                            if (!round_reasoning.empty()) {
-                                std::string clean_reasoning;
-                                std::vector<moecher::tooling::ToolCall> reasoning_calls;
-                                moecher::tooling::extract_tool_calls(round_reasoning, clean_reasoning, reasoning_calls);
-                                if (round_tool_calls.empty() && !reasoning_calls.empty()) {
-                                    LOG_INFO("Extracted %zu tool call(s) from reasoning stream", reasoning_calls.size());
-                                    round_tool_calls = reasoning_calls;
-                                }
-                                round_reasoning = clean_reasoning;
-                            }
 
                             if (round_tool_calls.empty()) {
                                 last_completed_content = clean_content;
@@ -1973,7 +2108,7 @@ void run_server(MoecherEngine& engine, int port, int default_thinking_budget, in
                                 }
                             }
                             if (!unstreamed_intro.empty()) {
-                                std::string field_name = enable_thinking ? "reasoning_content" : "content";
+                                std::string field_name = req_thinking ? "reasoning_content" : "content";
                                 json intro_chunk = {
                                     {"id", req_id},
                                     {"object", "chat.completion.chunk"},
@@ -2031,7 +2166,7 @@ void run_server(MoecherEngine& engine, int port, int default_thinking_budget, in
                             assistant_msg["tool_calls"] = tc_json_arr;
                             current_messages.push_back(assistant_msg);
 
-                            std::string tool_delta_field = enable_thinking ? "reasoning_content" : "content";
+                            std::string tool_delta_field = req_thinking ? "reasoning_content" : "content";
 
                             auto is_path_authorized = [&](const std::string& p) -> bool {
                                 if (!require_external_authorization && !workspace_boundary_enforced) return true;
@@ -2678,11 +2813,26 @@ void run_server(MoecherEngine& engine, int port, int default_thinking_budget, in
                 if (max_allowed_prompt < 1024) max_allowed_prompt = engine.cfg_.max_seq_len - 256;
 
                 for (int round = 0; round < max_tool_rounds; round++) {
+                    bool conv_has_image = false;
+                    for (const auto& m : current_messages) {
+                        if (message_has_image(m)) { conv_has_image = true; break; }
+                    }
+                    bool is_greeting = false;
+                    if (!engine.cfg_.is_nemotron() && !current_messages.empty()) {
+                        const auto& last_m = current_messages.back();
+                        if (last_m.value("role", "") == "user" && last_m.contains("content") && last_m["content"].is_string()) {
+                            is_greeting = is_conversational_greeting(last_m["content"].get<std::string>());
+                        }
+                    }
+                    bool req_thinking = enable_thinking && !conv_has_image && !is_greeting;
+                    int req_thinking_tokens = req_thinking ? max_thinking_tokens : 0;
+                    bool eff_bypass_prefix_cache = bypass_prefix_cache || had_image_originally;
+
                     std::vector<int> prompt;
                     bool is_continuation = false;
                     if (round == 0) {
                         std::lock_guard<std::mutex> lock(g_engine_mutex);
-                        is_continuation = check_and_build_continuation(engine, current_messages, s_last_conv_messages, enable_thinking, reasoning_effort, prompt, had_image_originally);
+                        is_continuation = check_and_build_continuation(engine, current_messages, s_last_conv_messages, req_thinking, reasoning_effort, prompt, had_image_originally);
                         if (is_continuation && prompt.size() > (size_t)max_allowed_prompt) {
                             LOG_WARN("[Context] Continuation prompt length (%zu) exceeds context budget (%d). Forcing sliding-window pruning.",
                                      prompt.size(), max_allowed_prompt);
@@ -2690,7 +2840,7 @@ void run_server(MoecherEngine& engine, int port, int default_thinking_budget, in
                         }
                     } else if (round > 0 && !round_new_tool_msgs.empty()) {
                         std::lock_guard<std::mutex> lock(g_engine_mutex);
-                        prompt = build_continuation_prompt(engine, round_new_tool_msgs, enable_thinking, reasoning_effort);
+                        prompt = build_continuation_prompt(engine, round_new_tool_msgs, req_thinking, reasoning_effort);
                         is_continuation = true;
                         if (prompt.size() > (size_t)max_allowed_prompt) {
                             LOG_WARN("[Context] Tool continuation length (%zu) exceeds context budget (%d). Forcing sliding-window pruning.",
@@ -2702,8 +2852,8 @@ void run_server(MoecherEngine& engine, int port, int default_thinking_budget, in
                     MultimodalPrompt mm_prompt;
                     const __nv_bfloat16* d_vis_out = nullptr;
                     if (!is_continuation) {
-                        current_messages = prune_messages_to_fit(current_messages, engine.tokenizer_, max_allowed_prompt, enable_thinking, reasoning_effort, tools, engine.cfg_.is_nemotron());
-                        mm_prompt = apply_chat_template_multimodal(current_messages, engine.tokenizer_, enable_thinking, reasoning_effort, tools, engine.has_vision(), engine.cfg_.is_nemotron());
+                        current_messages = prune_messages_to_fit(current_messages, engine.tokenizer_, max_allowed_prompt, req_thinking, reasoning_effort, tools, engine.cfg_.is_nemotron());
+                        mm_prompt = apply_chat_template_multimodal(current_messages, engine.tokenizer_, req_thinking, reasoning_effort, tools, engine.has_vision(), engine.cfg_.is_nemotron());
                         prompt = mm_prompt.prompt;
                         if (engine.has_vision() && !mm_prompt.image_b64.empty() && mm_prompt.visual_start_pos >= 0) {
                             if (engine.ensure_vision_loaded()) {
@@ -2726,13 +2876,6 @@ void run_server(MoecherEngine& engine, int port, int default_thinking_budget, in
                     std::string response_text;
                     {
                         std::lock_guard<std::mutex> lock(g_engine_mutex);
-                        bool conv_has_image = false;
-                        for (const auto& m : current_messages) {
-                            if (message_has_image(m)) { conv_has_image = true; break; }
-                        }
-                        bool req_thinking = enable_thinking && !conv_has_image;
-                        int req_thinking_tokens = req_thinking ? max_thinking_tokens : 0;
-                        bool eff_bypass_prefix_cache = bypass_prefix_cache || had_image_originally;
                         response_text = engine.generate(prompt, max_tokens, temperature, nullptr, repetition_penalty, req_thinking, req_thinking_tokens, top_p, min_p, top_k,
                                                         d_vis_out, mm_prompt.visual_start_pos, mm_prompt.visual_num_tokens, eff_bypass_prefix_cache);
                         finish_reason = engine.last_finish_reason_;

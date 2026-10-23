@@ -9,7 +9,7 @@ if exist "C:\Users\tino\Downloads\ComfyUI_windows_portable_nvidia\ComfyUI_window
 )
 
 echo ===============================================================================
-echo   Downloading & Preparing NVIDIA Nemotron 3.5 Bolt (74B-A9B NVFP4)
+echo   Downloading ^& Preparing NVIDIA Nemotron 3.5 Bolt (74B-A9B NVFP4)
 echo   Python: %PYTHON_BIN%
 echo ===============================================================================
 

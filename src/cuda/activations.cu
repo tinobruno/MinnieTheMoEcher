@@ -5375,10 +5375,12 @@ __device__ __constant__ static const uint64_t c_iq2xxs_grid[256] = {
     0x2b2b082b08080808ULL, 0x2b2b190808192b08ULL, 0x2b2b2b0819190808ULL, 0x2b2b2b1908081908ULL,
 };
 
+template<typename TOut = __nv_bfloat16, bool Relu2 = false, bool Residual = false, bool Scaled = false>
 __global__ void gemv_iq2_xxs_kernel(
-    __nv_bfloat16* __restrict__ out,
+    TOut* __restrict__ out,
     const __nv_bfloat16* __restrict__ vec,
     const block_iq2_xxs* __restrict__ weight,
+    float alpha,
     int N, int K)
 {
     int row = blockIdx.x * blockDim.y + threadIdx.y;
@@ -5432,7 +5434,26 @@ __global__ void gemv_iq2_xxs_kernel(
     }
 
     if (lane == 0) {
-        out[row] = __float2bfloat16(sum);
+        if constexpr (Scaled) {
+            sum *= alpha;
+        }
+        if constexpr (Relu2) {
+            sum = (sum > 0.0f) ? (sum * sum) : 0.0f;
+        }
+        if constexpr (Residual) {
+            if constexpr (std::is_same_v<TOut, __nv_bfloat16>) {
+                float cur = __bfloat162float(out[row]);
+                out[row] = __float2bfloat16(cur + sum);
+            } else {
+                out[row] = (TOut)(out[row] + sum);
+            }
+        } else {
+            if constexpr (std::is_same_v<TOut, __nv_bfloat16>) {
+                out[row] = __float2bfloat16(sum);
+            } else {
+                out[row] = (TOut)sum;
+            }
+        }
     }
 }
 
@@ -5445,7 +5466,131 @@ void gemv_iq2_xxs_cuda(
 {
     dim3 threads(32, 8);
     dim3 blocks((N + 7) / 8);
-    gemv_iq2_xxs_kernel<<<blocks, threads, 0, stream>>>(out, vec, weight, N, K);
+    gemv_iq2_xxs_kernel<__nv_bfloat16, false, false, false><<<blocks, threads, 0, stream>>>(out, vec, weight, 1.0f, N, K);
+}
+
+void gemv_iq2_xxs_relu2_cuda(
+    __nv_bfloat16* out,
+    const __nv_bfloat16* vec,
+    const block_iq2_xxs* weight,
+    int N, int K,
+    cudaStream_t stream)
+{
+    dim3 threads(32, 8);
+    dim3 blocks((N + 7) / 8);
+    gemv_iq2_xxs_kernel<__nv_bfloat16, true, false, false><<<blocks, threads, 0, stream>>>(out, vec, weight, 1.0f, N, K);
+}
+
+void gemv_iq2_xxs_residual_cuda(
+    __nv_bfloat16* inout,
+    const __nv_bfloat16* vec,
+    const block_iq2_xxs* weight,
+    int N, int K,
+    cudaStream_t stream)
+{
+    dim3 threads(32, 8);
+    dim3 blocks((N + 7) / 8);
+    gemv_iq2_xxs_kernel<__nv_bfloat16, false, true, false><<<blocks, threads, 0, stream>>>(inout, vec, weight, 1.0f, N, K);
+}
+
+void gemv_iq2_xxs_scaled_residual_cuda(
+    __nv_bfloat16* inout,
+    const __nv_bfloat16* vec,
+    const block_iq2_xxs* weight,
+    float alpha,
+    int N, int K,
+    cudaStream_t stream)
+{
+    dim3 threads(32, 8);
+    dim3 blocks((N + 7) / 8);
+    gemv_iq2_xxs_kernel<__nv_bfloat16, false, true, true><<<blocks, threads, 0, stream>>>(inout, vec, weight, alpha, N, K);
+}
+
+// ── Q8_0 GGML Quantization Kernel ───────────────────────────────────────────
+template<typename TOut, bool Residual = false>
+__global__ void gemv_q8_0_kernel(
+    TOut* __restrict__ out,
+    const __nv_bfloat16* __restrict__ vec,
+    const block_q8_0* __restrict__ weight,
+    int N, int K)
+{
+    int row = blockIdx.x * blockDim.y + threadIdx.y;
+    if (row >= N) return;
+
+    int lane = threadIdx.x;
+    int n_blocks = K / 32;
+    const block_q8_0* row_w = weight + row * n_blocks;
+
+    float acc = 0.0f;
+    for (int b = lane; b < n_blocks; b += 32) {
+        const block_q8_0* blk = &row_w[b];
+        float d = __half2float(blk->d);
+        const int8_t* qs = blk->qs;
+        const __nv_bfloat16* v = vec + b * 32;
+
+        #pragma unroll 8
+        for (int i = 0; i < 32; i++) {
+            acc += (float)qs[i] * __bfloat162float(v[i]) * d;
+        }
+    }
+
+    #pragma unroll
+    for (int offset = 16; offset > 0; offset /= 2) {
+        acc += __shfl_down_sync(0xFFFFFFFF, acc, offset);
+    }
+
+    if (lane == 0) {
+        if constexpr (Residual) {
+            if constexpr (std::is_same_v<TOut, __nv_bfloat16>) {
+                float cur = __bfloat162float(out[row]);
+                out[row] = __float2bfloat16(cur + acc);
+            } else {
+                out[row] = (TOut)(out[row] + acc);
+            }
+        } else {
+            if constexpr (std::is_same_v<TOut, __nv_bfloat16>) {
+                out[row] = __float2bfloat16(acc);
+            } else {
+                out[row] = (TOut)acc;
+            }
+        }
+    }
+}
+
+void gemv_q8_0_cuda(
+    __nv_bfloat16* out,
+    const __nv_bfloat16* vec,
+    const block_q8_0* weight,
+    int N, int K,
+    cudaStream_t stream)
+{
+    dim3 threads(32, 8);
+    dim3 blocks((N + 7) / 8);
+    gemv_q8_0_kernel<__nv_bfloat16, false><<<blocks, threads, 0, stream>>>(out, vec, weight, N, K);
+}
+
+void gemv_q8_0_residual_cuda(
+    __nv_bfloat16* inout,
+    const __nv_bfloat16* vec,
+    const block_q8_0* weight,
+    int N, int K,
+    cudaStream_t stream)
+{
+    dim3 threads(32, 8);
+    dim3 blocks((N + 7) / 8);
+    gemv_q8_0_kernel<__nv_bfloat16, true><<<blocks, threads, 0, stream>>>(inout, vec, weight, N, K);
+}
+
+void gemv_q8_0_f32_cuda(
+    float* out,
+    const __nv_bfloat16* vec,
+    const block_q8_0* weight,
+    int N, int K,
+    cudaStream_t stream)
+{
+    dim3 threads(32, 8);
+    dim3 blocks((N + 7) / 8);
+    gemv_q8_0_kernel<float, false><<<blocks, threads, 0, stream>>>(out, vec, weight, N, K);
 }
 
 __global__ void iq2_xxs_dequant_kernel(
@@ -9769,11 +9914,12 @@ void sample_multinomial_f32_cuda(
 
 // ── GPU-Native MoE Expert Activation Frequency Counter (CUDA Graph Compatible) ──
 __global__ void accumulate_expert_freq_kernel(
-    uint32_t* __restrict__ expert_counts,  // [n_layers * n_experts]
+    uint32_t* __restrict__ expert_counts,  // [n_layers * stride]
     int32_t* __restrict__ step_topk,       // [n_layers * top_k]
     const int32_t* __restrict__ topk_idx,  // [top_k]
     const int32_t* __restrict__ track_flag,// [1] device flag (1=track, 0=skip)
     int layer_id,
+    int stride,
     int n_experts,
     int top_k)
 {
@@ -9785,7 +9931,7 @@ __global__ void accumulate_expert_freq_kernel(
         }
         if (track_flag != nullptr && *track_flag == 0) return;
         if (eid >= 0 && eid < n_experts) {
-            atomicAdd(&expert_counts[(size_t)layer_id * n_experts + eid], 1);
+            atomicAdd(&expert_counts[(size_t)layer_id * stride + eid], 1);
         }
     }
 }
@@ -9796,12 +9942,50 @@ void accumulate_expert_freq_cuda(
     const int32_t* topk_idx,
     const int32_t* track_flag,
     int layer_id,
+    int stride,
     int n_experts,
     int top_k,
     cudaStream_t stream)
 {
     accumulate_expert_freq_kernel<<<1, 32, 0, stream>>>(
-        expert_counts, step_topk, topk_idx, track_flag, layer_id, n_experts, top_k);
+        expert_counts, step_topk, topk_idx, track_flag, layer_id, stride, n_experts, top_k);
+}
+
+__global__ void accumulate_expert_freq_batch_kernel(
+    uint32_t* __restrict__ expert_counts,  // [n_layers * stride]
+    const int32_t* __restrict__ topk_idx,  // [M * top_k]
+    int M,
+    int layer_id,
+    int stride,
+    int n_experts,
+    int top_k)
+{
+    int m = blockIdx.x * blockDim.x + threadIdx.x;
+    if (m < M) {
+        for (int k = 0; k < top_k; k++) {
+            int eid = topk_idx[(size_t)m * top_k + k];
+            if (eid >= 0 && eid < n_experts) {
+                atomicAdd(&expert_counts[(size_t)layer_id * stride + eid], 1);
+            }
+        }
+    }
+}
+
+void accumulate_expert_freq_batch_cuda(
+    uint32_t* expert_counts,
+    const int32_t* topk_idx,
+    int M,
+    int layer_id,
+    int stride,
+    int n_experts,
+    int top_k,
+    cudaStream_t stream)
+{
+    if (!expert_counts || !topk_idx || M <= 0) return;
+    int threads = 128;
+    int blocks = (M + threads - 1) / threads;
+    accumulate_expert_freq_batch_kernel<<<blocks, threads, 0, stream>>>(
+        expert_counts, topk_idx, M, layer_id, stride, n_experts, top_k);
 }
 
 // ── Increment Int32 Scalar on Device (CUDA Graph Compatible) ────────────────────
@@ -12422,7 +12606,7 @@ void deltanet_linear_attention_tree_cuda(
 //  NVIDIA Nemotron 3.5 Lightning: NVFP4, Squared ReLU, Scalar FP8, Mamba-2
 // ════════════════════════════════════════════════════════════════════════════════
 
-template<typename TOut, bool Residual = false, bool Scaled = false>
+template<typename TOut, bool Residual = false, bool Scaled = false, bool ReLU2 = false>
 __global__ void gemv_nvfp4_block16_kernel(
     TOut* __restrict__ out,
     const __nv_bfloat16* __restrict__ vec,
@@ -12466,6 +12650,9 @@ __global__ void gemv_nvfp4_block16_kernel(
         if constexpr (Scaled) {
             acc *= alpha;
         }
+        if constexpr (ReLU2) {
+            acc = (acc > 0.0f) ? (acc * acc) : 0.0f;
+        }
         if constexpr (Residual) {
             if constexpr (std::is_same_v<TOut, __nv_bfloat16>) {
                 float cur = __bfloat162float(out[row]);
@@ -12494,7 +12681,22 @@ void gemv_nvfp4_cuda(
 {
     dim3 threads(32, 4);
     dim3 blocks((N + 3) / 4);
-    gemv_nvfp4_block16_kernel<__nv_bfloat16, false, false><<<blocks, threads, 0, stream>>>(
+    gemv_nvfp4_block16_kernel<__nv_bfloat16, false, false, false><<<blocks, threads, 0, stream>>>(
+        out, vec, weight, scale_fp8, scale_2, 1.0f, N, K);
+}
+
+void gemv_nvfp4_relu2_cuda(
+    __nv_bfloat16* out,
+    const __nv_bfloat16* vec,
+    const uint8_t* weight,
+    const uint8_t* scale_fp8,
+    float scale_2,
+    int N, int K,
+    cudaStream_t stream)
+{
+    dim3 threads(32, 4);
+    dim3 blocks((N + 3) / 4);
+    gemv_nvfp4_block16_kernel<__nv_bfloat16, false, false, true><<<blocks, threads, 0, stream>>>(
         out, vec, weight, scale_fp8, scale_2, 1.0f, N, K);
 }
 
@@ -12805,7 +13007,10 @@ __global__ void mamba2_nemotron_conv_batch_kernel(
     const __nv_bfloat16* __restrict__ conv1d_w,
     const __nv_bfloat16* __restrict__ conv1d_b,
     __nv_bfloat16* __restrict__ conv_state,
-    int channels, int in_proj_stride, int in_proj_offset, int M)
+    int channels, int in_proj_stride, int in_proj_offset, int M,
+    __nv_bfloat16* __restrict__ conv_state_slot0 = nullptr,
+    __nv_bfloat16* __restrict__ conv_state_slot1 = nullptr,
+    __nv_bfloat16* __restrict__ conv_state_slot2 = nullptr)
 {
     int c = blockIdx.x * blockDim.x + threadIdx.x;
     if (c >= channels) return;
@@ -12834,6 +13039,28 @@ __global__ void mamba2_nemotron_conv_batch_kernel(
         float val = s0 * w0 + s1 * w1 + s2 * w2 + s3 * w3 + b;
         float silu_val = val / (1.0f + __expf(-val));
         conv_out_batch[(size_t)m * channels + c] = __float2bfloat16(silu_val);
+
+        if (m == 0 && conv_state_slot0) {
+            __nv_bfloat16* cs0 = conv_state_slot0 + c * 4;
+            cs0[0] = __float2bfloat16(s0);
+            cs0[1] = __float2bfloat16(s1);
+            cs0[2] = __float2bfloat16(s2);
+            cs0[3] = __float2bfloat16(s3);
+        }
+        if (m == 1 && conv_state_slot1) {
+            __nv_bfloat16* cs1 = conv_state_slot1 + c * 4;
+            cs1[0] = __float2bfloat16(s0);
+            cs1[1] = __float2bfloat16(s1);
+            cs1[2] = __float2bfloat16(s2);
+            cs1[3] = __float2bfloat16(s3);
+        }
+        if (m == 2 && conv_state_slot2) {
+            __nv_bfloat16* cs2 = conv_state_slot2 + c * 4;
+            cs2[0] = __float2bfloat16(s0);
+            cs2[1] = __float2bfloat16(s1);
+            cs2[2] = __float2bfloat16(s2);
+            cs2[3] = __float2bfloat16(s3);
+        }
     }
 
     cs[0] = __float2bfloat16(s0);
@@ -12850,7 +13077,10 @@ __global__ void mamba2_nemotron_ssm_step_batch_kernel(
     const __nv_bfloat16* __restrict__ D,
     const __nv_bfloat16* __restrict__ dt_bias,
     float* __restrict__ ssm_state,
-    int num_heads, int intermediate_size, int conv_channels, int in_proj_stride, int dt_offset, int M)
+    int num_heads, int intermediate_size, int conv_channels, int in_proj_stride, int dt_offset, int M,
+    float* __restrict__ ssm_state_slot0 = nullptr,
+    float* __restrict__ ssm_state_slot1 = nullptr,
+    float* __restrict__ ssm_state_slot2 = nullptr)
 {
     int h = blockIdx.x;
     if (h >= num_heads) return;
@@ -12904,6 +13134,28 @@ __global__ void mamba2_nemotron_ssm_step_batch_kernel(
             float s = r_state[n] * dA + (x_dt * s_B[n]);
             r_state[n] = s;
             y_p += s * s_C[n];
+        }
+
+        if (m == 0 && ssm_state_slot0) {
+            float* s0_row = ssm_state_slot0 + (size_t)(h * 64 + p) * 128;
+            #pragma unroll
+            for (int n = 0; n < 128; n++) {
+                s0_row[n] = r_state[n];
+            }
+        }
+        if (m == 1 && ssm_state_slot1) {
+            float* s1_row = ssm_state_slot1 + (size_t)(h * 64 + p) * 128;
+            #pragma unroll
+            for (int n = 0; n < 128; n++) {
+                s1_row[n] = r_state[n];
+            }
+        }
+        if (m == 2 && ssm_state_slot2) {
+            float* s2_row = ssm_state_slot2 + (size_t)(h * 64 + p) * 128;
+            #pragma unroll
+            for (int n = 0; n < 128; n++) {
+                s2_row[n] = r_state[n];
+            }
         }
 
         float z_p = __bfloat162float(in_proj[h * 64 + p]);
@@ -12984,21 +13236,29 @@ void mamba2_nemotron_step_batch_cuda(
     float rms_norm_eps,
     cudaStream_t stream,
     int num_heads,
-    int head_dim)
+    int head_dim,
+    __nv_bfloat16* conv_state_slot0,
+    float* ssm_state_slot0,
+    __nv_bfloat16* conv_state_slot1,
+    float* ssm_state_slot1,
+    __nv_bfloat16* conv_state_slot2,
+    float* ssm_state_slot2)
 {
     int intermediate_size = num_heads * head_dim;
     int conv_channels = intermediate_size + 2048; // 2 * 8 * 128
-    int in_proj_stride = intermediate_size + conv_channels + num_heads; // 10304 or 18568
+    int in_proj_stride = intermediate_size + conv_channels + num_heads; // 10304 or 18560
     int dt_offset = intermediate_size + conv_channels;
     int group_size = intermediate_size / 8;
 
     int conv_blocks = (conv_channels + 255) / 256;
     mamba2_nemotron_conv_batch_kernel<<<conv_blocks, 256, 0, stream>>>(
-        conv_buf_batch, in_proj_batch, conv1d_w, conv1d_b, conv_state, conv_channels, in_proj_stride, intermediate_size, M);
+        conv_buf_batch, in_proj_batch, conv1d_w, conv1d_b, conv_state, conv_channels, in_proj_stride, intermediate_size, M,
+        conv_state_slot0, conv_state_slot1, conv_state_slot2);
 
     mamba2_nemotron_ssm_step_batch_kernel<<<num_heads, 64, 0, stream>>>(
         temp_out_batch, conv_buf_batch, in_proj_batch, A_log, D, dt_bias, ssm_state,
-        num_heads, intermediate_size, conv_channels, in_proj_stride, dt_offset, M);
+        num_heads, intermediate_size, conv_channels, in_proj_stride, dt_offset, M,
+        ssm_state_slot0, ssm_state_slot1, ssm_state_slot2);
 
     dim3 grid_norm(8, M);
     mamba2_nemotron_group_norm_batch_kernel<<<grid_norm, 256, 0, stream>>>(

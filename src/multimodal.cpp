@@ -135,9 +135,12 @@ MultimodalPrompt apply_chat_template_multimodal(
         bool has_system = (!messages.empty() && messages[0].value("role", "") == "system");
         if (!has_system) {
             std::string sys_prompt = "";
-            if (has_tools) {
+            if (is_nemotron) {
+                std::string base = g_base_system_prompt.empty() ? "You are a helpful assistant." : g_base_system_prompt;
+                sys_prompt = has_tools ? (base + tools_system_prompt) : base;
+            } else if (has_tools) {
                 sys_prompt = tools_system_prompt;
-            } else if (!is_nemotron && enable_thinking) {
+            } else if (enable_thinking) {
                 sys_prompt = "You are a helpful assistant";
             }
             if (!sys_prompt.empty()) {
@@ -149,6 +152,13 @@ MultimodalPrompt apply_chat_template_multimodal(
                 result.insert(result.end(), nl_enc.begin(), nl_enc.end());
             }
         }
+        int last_user_idx = -1;
+        for (int i = 0; i < (int)messages.size(); i++) {
+            if (messages[i].value("role", "") == "user") {
+                last_user_idx = i;
+            }
+        }
+
         for (size_t i = 0; i < messages.size(); i++) {
             std::string role = messages[i].value("role", "user");
             std::string content_str = "";
@@ -234,6 +244,11 @@ MultimodalPrompt apply_chat_template_multimodal(
             }
 
             std::string body = content_str;
+            if (is_nemotron && role == "user" && (int)i == last_user_idx) {
+                if (enable_thinking && (reasoning_effort == "efficient" || reasoning_effort == "medium" || reasoning_effort == "low")) {
+                    body += "\n\n{reasoning effort: efficient}";
+                }
+            }
             if (model_has_vision && !extracted_image_b64.empty() && role == "user") {
                 std::string trimmed = body;
                 while (!trimmed.empty() && (trimmed.front() == ' ' || trimmed.front() == '\n' || trimmed.front() == '\r' || trimmed.front() == '\t')) trimmed.erase(trimmed.begin());
@@ -252,23 +267,14 @@ MultimodalPrompt apply_chat_template_multimodal(
                 }
             }
             if (role == "assistant") {
-                if (is_nemotron) {
-                    if (messages[i].contains("reasoning_content") && messages[i]["reasoning_content"].is_string()) {
-                        std::string r_content = messages[i]["reasoning_content"].get<std::string>();
-                        if (!r_content.empty()) {
-                            body = "<think>\n" + r_content + "</think>" + body;
-                        } else {
-                            body = "<think></think>" + body;
-                        }
-                    } else {
-                        body = "<think></think>" + body;
+                if (messages[i].contains("reasoning_content") && messages[i]["reasoning_content"].is_string()) {
+                    std::string r_content = messages[i]["reasoning_content"].get<std::string>();
+                    if (!r_content.empty()) {
+                        body = "<think>\n" + r_content + "\n</think>\n" + body;
                     }
-                } else {
-                    if (messages[i].contains("reasoning_content") && messages[i]["reasoning_content"].is_string()) {
-                        std::string r_content = messages[i]["reasoning_content"].get<std::string>();
-                        if (!r_content.empty()) {
-                            body = "<think>\n" + r_content + "\n</think>\n" + body;
-                        }
+                } else if (is_nemotron) {
+                    if (body.find("<think>") == std::string::npos && body.find("</think>") == std::string::npos) {
+                        body = "<think></think>" + body;
                     }
                 }
                 if (messages[i].contains("tool_calls") && messages[i]["tool_calls"].is_array()) {
@@ -469,11 +475,7 @@ MultimodalPrompt apply_chat_template_multimodal(
                     auto r_enc = tok.encode(r_content);
                     result.insert(result.end(), r_enc.begin(), r_enc.end());
                     result.push_back(THINK_END);
-                } else {
-                    result.push_back(THINK_END);
                 }
-            } else {
-                result.push_back(THINK_END);
             }
             std::string body = content;
             if (messages[i].contains("tool_calls") && messages[i]["tool_calls"].is_array()) {

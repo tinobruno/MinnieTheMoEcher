@@ -4,7 +4,7 @@
 
 param (
     [Parameter(Mandatory=$true)]
-    [ValidateSet("qwen", "qwen_13g", "deepseek", "deepseek_q4", "nemotron", "both")]
+    [ValidateSet("qwen", "qwen_13g", "deepseek", "deepseek_q4", "nemotron", "nemotron_bolt", "both")]
     [string]$Model,
 
     [string]$DestDir = "",
@@ -30,6 +30,23 @@ if (-not $DestDir -or $DestDir.Trim() -eq "") {
 $DestDir = [System.IO.Path]::GetFullPath($DestDir)
 
 $ModelConfigs = @{
+    "nemotron_bolt" = @{
+        "Repo"  = "$Username/moecher-nemotron-3.5-bolt-nvfp4"
+        "Dir"   = (Join-Path $DestDir "nemotron_3.5_bolt")
+        "Files" = @(
+            "moecher_manifest_16gb.json",
+            "moecher_manifest_24gb.json",
+            "tokenizer.json",
+            "tokenizer_config.json",
+            "chat_template.jinja",
+            "expert_scales.bin",
+            "expert_freq.bin",
+            "expert_profile.json",
+            "attention_dense_layers.bin",
+            "expert_weights.bin.001",
+            "expert_weights.bin.002"
+        )
+    }
     "nemotron" = @{
         "Repo"  = "$Username/moecher-nemotron-3.5-lightning-vision"
         "Dir"   = (Join-Path $DestDir "nemotron_3.5_lightning")
@@ -147,7 +164,24 @@ foreach ($t in $targets) {
         Download-HuggingFaceFile -RepoId $cfg.Repo -FileName $f -TargetFolder $cfg.Dir
     }
 
-    # Automatically install multimodal vision delegate by default for Nemotron
+    # Automatically assemble split expert_weights.bin for Nemotron Bolt
+    if ($t -eq "nemotron_bolt") {
+        $p1 = Join-Path $cfg.Dir "expert_weights.bin.001"
+        $p2 = Join-Path $cfg.Dir "expert_weights.bin.002"
+        $target = Join-Path $cfg.Dir "expert_weights.bin"
+        if ((Test-Path $p1) -and (Test-Path $p2)) {
+            Write-Host "================================================================" -ForegroundColor Cyan
+            Write-Host "  Assembling expert_weights.bin from split parts..." -ForegroundColor Cyan
+            Write-Host "================================================================" -ForegroundColor Cyan
+            cmd.exe /c "copy /b `"$p1`"+`"$p2`" `"$target`""
+            if ($LASTEXITCODE -eq 0 -and (Test-Path $target)) {
+                Remove-Item $p1, $p2 -Force
+                Write-Host "  [DONE] expert_weights.bin successfully assembled ($([math]::Round((Get-Item $target).Length / 1GB, 2)) GB)." -ForegroundColor Green
+            } else {
+                Write-Error "Failed to assemble expert_weights.bin from parts"
+            }
+        }
+    }
     if ($t -eq "nemotron") {
         $delDir = Join-Path $DestDir "frankenstin\vision"
         $delRepo = "$Username/frankenstin-vision-delegate"

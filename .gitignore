@@ -47,6 +47,12 @@ cookie_jar.json
 !DINO_*.html
 !WHITE_PAPER_*.html
 !DEVELOPER_GUIDE.html
+!linkedin_article.html
+!kai_style_video.html
+neural_audio/
+neural_scenes/
+scene_clips/
+voice_clips/
 scratch_*
 check_gpu.py
 test_*
