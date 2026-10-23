@@ -1,0 +1,510 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>Nemotron 3.5 Bolt 74B: Thank You NVIDIA! (1080p Video Showcase)</title>
+  <link rel="preconnect" href="https://fonts.googleapis.com">
+  <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+  <link href="https://fonts.googleapis.com/css2?family=Outfit:wght@300;400;600;700;800;900&family=JetBrains+Mono:wght@400;600;800&display=swap" rel="stylesheet">
+  <style>
+    :root {
+      --bg: #06080e;
+      --card-bg: rgba(18, 24, 40, 0.85);
+      --nv-green: #76b900;
+      --cyan: #00f0ff;
+      --purple: #9d4edd;
+      --crimson: #ff3366;
+      --gold: #ffb703;
+      --text: #f8fafc;
+      --muted: #94a3b8;
+      --border: rgba(255, 255, 255, 0.12);
+      --font-display: 'Outfit', sans-serif;
+      --font-mono: 'JetBrains Mono', monospace;
+    }
+
+    * {
+      box-sizing: border-box;
+      margin: 0;
+      padding: 0;
+    }
+
+    body {
+      background: var(--bg);
+      color: var(--text);
+      font-family: var(--font-display);
+      display: flex;
+      flex-direction: column;
+      align-items: center;
+      min-height: 100vh;
+      padding: 1.5rem;
+      background-image: 
+        radial-gradient(circle at 10% 15%, rgba(118, 185, 0, 0.08) 0%, transparent 50%),
+        radial-gradient(circle at 85% 85%, rgba(0, 240, 255, 0.08) 0%, transparent 50%);
+    }
+
+    header {
+      width: 100%;
+      max-width: 1120px;
+      display: flex;
+      justify-content: space-between;
+      align-items: center;
+      margin-bottom: 1.5rem;
+      padding-bottom: 1rem;
+      border-bottom: 1px solid var(--border);
+    }
+
+    .brand {
+      display: flex;
+      align-items: center;
+      gap: 0.75rem;
+    }
+
+    .badge-icon {
+      width: 38px;
+      height: 38px;
+      border-radius: 10px;
+      background: linear-gradient(135deg, var(--nv-green), #4d8000);
+      display: flex;
+      align-items: center;
+      justify-content: center;
+      font-weight: 900;
+      color: #fff;
+      font-size: 1.2rem;
+    }
+
+    .brand-title {
+      font-size: 1.2rem;
+      font-weight: 800;
+      letter-spacing: -0.02em;
+    }
+
+    .brand-sub {
+      font-size: 0.75rem;
+      color: var(--nv-green);
+      font-family: var(--font-mono);
+      text-transform: uppercase;
+    }
+
+    .nav-links {
+      display: flex;
+      gap: 0.75rem;
+    }
+
+    .btn {
+      display: inline-flex;
+      align-items: center;
+      gap: 0.5rem;
+      padding: 0.6rem 1.2rem;
+      border-radius: 8px;
+      font-size: 0.85rem;
+      font-weight: 700;
+      text-decoration: none;
+      cursor: pointer;
+      transition: all 0.2s ease;
+      border: 1px solid transparent;
+      font-family: var(--font-display);
+    }
+
+    .btn-nv {
+      background: linear-gradient(135deg, var(--nv-green), #4d8000);
+      color: #030800;
+      box-shadow: 0 4px 16px rgba(118, 185, 0, 0.25);
+    }
+
+    .btn-nv:hover {
+      box-shadow: 0 6px 24px rgba(118, 185, 0, 0.45);
+      transform: translateY(-1px);
+    }
+
+    .btn-secondary {
+      background: rgba(255, 255, 255, 0.08);
+      color: #fff;
+      border-color: var(--border);
+    }
+
+    .btn-secondary:hover {
+      background: rgba(255, 255, 255, 0.15);
+    }
+
+    /* Video Player Viewport */
+    .player-container {
+      width: 100%;
+      max-width: 1120px;
+      background: #000;
+      border-radius: 16px;
+      overflow: hidden;
+      border: 1px solid rgba(118, 185, 0, 0.3);
+      box-shadow: 0 24px 60px rgba(0, 0, 0, 0.9), 0 0 40px rgba(118, 185, 0, 0.15);
+      position: relative;
+    }
+
+    video {
+      width: 100%;
+      aspect-ratio: 16 / 9;
+      display: block;
+      background: #07080c;
+    }
+
+    /* Tabs Bar */
+    .tabs-bar {
+      display: flex;
+      background: rgba(12, 16, 26, 0.95);
+      padding: 0.5rem 1rem;
+      border-bottom: 1px solid var(--border);
+      gap: 0.5rem;
+    }
+
+    .tab-btn {
+      background: transparent;
+      border: none;
+      color: var(--muted);
+      font-family: var(--font-display);
+      font-weight: 700;
+      font-size: 0.85rem;
+      padding: 0.5rem 1rem;
+      border-radius: 6px;
+      cursor: pointer;
+      transition: all 0.2s ease;
+      display: flex;
+      align-items: center;
+      gap: 0.4rem;
+    }
+
+    .tab-btn.active {
+      background: rgba(118, 185, 0, 0.18);
+      color: var(--nv-green);
+    }
+
+    .tab-btn:hover:not(.active) {
+      color: #fff;
+      background: rgba(255, 255, 255, 0.05);
+    }
+
+    /* Slides Carousel View */
+    .slides-view {
+      display: none;
+      padding: 1.5rem;
+      background: #07080c;
+    }
+
+    .slides-view.active {
+      display: block;
+    }
+
+    .carousel-main {
+      width: 100%;
+      aspect-ratio: 16 / 9;
+      border-radius: 12px;
+      overflow: hidden;
+      border: 1px solid var(--border);
+      position: relative;
+    }
+
+    .carousel-main img {
+      width: 100%;
+      height: 100%;
+      object-fit: contain;
+      background: #07080e;
+    }
+
+    .carousel-thumbs {
+      display: grid;
+      grid-template-columns: repeat(5, 1fr);
+      gap: 1rem;
+      margin-top: 1rem;
+    }
+
+    .thumb {
+      aspect-ratio: 16 / 9;
+      border-radius: 8px;
+      overflow: hidden;
+      border: 2px solid transparent;
+      cursor: pointer;
+      opacity: 0.6;
+      transition: all 0.2s ease;
+    }
+
+    .thumb.active {
+      border-color: var(--nv-green);
+      opacity: 1;
+      box-shadow: 0 0 15px rgba(118, 185, 0, 0.4);
+    }
+
+    .thumb:hover {
+      opacity: 0.9;
+    }
+
+    .thumb img {
+      width: 100%;
+      height: 100%;
+      object-fit: cover;
+    }
+
+    /* Video Details & Meta */
+    .details-grid {
+      width: 100%;
+      max-width: 1120px;
+      margin-top: 1.5rem;
+      display: grid;
+      grid-template-columns: 2fr 1fr;
+      gap: 1.5rem;
+    }
+
+    @media (max-width: 900px) {
+      .details-grid {
+        grid-template-columns: 1fr;
+      }
+    }
+
+    .detail-card {
+      background: var(--card-bg);
+      border: 1px solid var(--border);
+      border-radius: 12px;
+      padding: 1.5rem;
+    }
+
+    .card-title {
+      font-size: 1.1rem;
+      font-weight: 800;
+      color: #fff;
+      margin-bottom: 0.75rem;
+      display: flex;
+      align-items: center;
+      gap: 0.5rem;
+    }
+
+    .chapter-list {
+      list-style: none;
+      display: flex;
+      flex-direction: column;
+      gap: 0.6rem;
+      margin-top: 0.75rem;
+    }
+
+    .chapter-item {
+      display: flex;
+      justify-content: space-between;
+      padding: 0.5rem 0.75rem;
+      background: rgba(255, 255, 255, 0.03);
+      border-radius: 6px;
+      font-size: 0.88rem;
+      cursor: pointer;
+      transition: all 0.2s ease;
+    }
+
+    .chapter-item:hover {
+      background: rgba(118, 185, 0, 0.1);
+      color: var(--nv-green);
+    }
+
+    .timestamp {
+      font-family: var(--font-mono);
+      color: var(--nv-green);
+      font-weight: 700;
+      font-size: 0.8rem;
+    }
+
+    .stat-row {
+      display: flex;
+      justify-content: space-between;
+      padding: 0.6rem 0;
+      border-bottom: 1px solid rgba(255, 255, 255, 0.06);
+      font-size: 0.85rem;
+    }
+
+    .stat-row:last-child {
+      border-bottom: none;
+    }
+
+    .stat-name {
+      color: var(--muted);
+    }
+
+    .stat-val {
+      font-family: var(--font-mono);
+      font-weight: 700;
+      color: #fff;
+    }
+
+    .val-highlight {
+      color: var(--nv-green);
+    }
+  </style>
+</head>
+<body>
+
+  <header>
+    <div class="brand">
+      <div class="badge-icon">N</div>
+      <div>
+        <div class="brand-title">Thank You NVIDIA! Nemotron 3.5 Bolt</div>
+        <div class="brand-sub">Minnie vs. llama.cpp Benchmark Showcase</div>
+      </div>
+    </div>
+    <div class="nav-links">
+      <a href="nemotron_bolt_article.html" class="btn btn-secondary">
+        📄 View LinkedIn Article
+      </a>
+      <a href="nemotron_bolt_video.mp4" download="nemotron_bolt_video.mp4" class="btn btn-nv">
+        ⬇ Download MP4 Video (1080p)
+      </a>
+    </div>
+  </header>
+
+  <!-- Player Container -->
+  <div class="player-container">
+    <div class="tabs-bar">
+      <button class="tab-btn active" id="tabVideo" onclick="switchTab('video')">
+        🎬 1080p Neural Video Player
+      </button>
+      <button class="tab-btn" id="tabSlides" onclick="switchTab('slides')">
+        🖼 High-Res Slide Deck (5 Chapters)
+      </button>
+    </div>
+
+    <!-- Video Tab -->
+    <div id="videoContainer">
+      <video id="mainVideo" controls autoplay loop playsinline>
+        <source src="nemotron_bolt_video.mp4" type="video/mp4">
+        Your browser does not support HTML5 video.
+      </video>
+    </div>
+
+    <!-- Slides Tab -->
+    <div class="slides-view" id="slidesContainer">
+      <div class="carousel-main">
+        <img id="activeSlideImg" src="bolt_video_frames/slide_01.png" alt="Slide Preview">
+      </div>
+      <div class="carousel-thumbs">
+        <div class="thumb active" onclick="selectSlide(1)">
+          <img src="bolt_video_frames/slide_01.png" alt="Slide 1">
+        </div>
+        <div class="thumb" onclick="selectSlide(2)">
+          <img src="bolt_video_frames/slide_02.png" alt="Slide 2">
+        </div>
+        <div class="thumb" onclick="selectSlide(3)">
+          <img src="bolt_video_frames/slide_03.png" alt="Slide 3">
+        </div>
+        <div class="thumb" onclick="selectSlide(4)">
+          <img src="bolt_video_frames/slide_04.png" alt="Slide 4">
+        </div>
+        <div class="thumb" onclick="selectSlide(5)">
+          <img src="bolt_video_frames/slide_05.png" alt="Slide 5">
+        </div>
+      </div>
+    </div>
+  </div>
+
+  <!-- Video Details & Telemetry -->
+  <div class="details-grid">
+    <div class="detail-card">
+      <div class="card-title">
+        <span>📑 Video Chapters & Breakdown</span>
+      </div>
+      <p style="font-size: 0.88rem; color: var(--muted); margin-bottom: 0.75rem;">
+        Click any chapter to jump directly in the video or switch to the corresponding slide.
+      </p>
+      <ul class="chapter-list">
+        <li class="chapter-item" onclick="jumpTo(0, 1)">
+          <span><strong>CH 1:</strong> Thank You NVIDIA! 70B MoE on a $400 GPU</span>
+          <span class="timestamp">00:00</span>
+        </li>
+        <li class="chapter-item" onclick="jumpTo(27, 2)">
+          <span><strong>CH 2:</strong> The Nemotron 3.5 Bolt Architecture (Mamba-2 + LatentMoE)</span>
+          <span class="timestamp">00:27</span>
+        </li>
+        <li class="chapter-item" onclick="jumpTo(55, 3)">
+          <span><strong>CH 3:</strong> Head-to-Head Benchmark Showdown vs. llama.cpp</span>
+          <span class="timestamp">00:55</span>
+        </li>
+        <li class="chapter-item" onclick="jumpTo(86, 4)">
+          <span><strong>CH 4:</strong> Why Minnie Runs 3.86× Faster (Double-Buffered DMA)</span>
+          <span class="timestamp">01:26</span>
+        </li>
+        <li class="chapter-item" onclick="jumpTo(114, 5)">
+          <span><strong>CH 5:</strong> Next Steps: Apple Silicon Metal Port Roadmap</span>
+          <span class="timestamp">01:54</span>
+        </li>
+      </ul>
+    </div>
+
+    <div class="detail-card">
+      <div class="card-title">
+        <span>⚙ Test Rig Hardware Specs</span>
+      </div>
+      <div class="stat-row">
+        <span class="stat-name">GPU</span>
+        <span class="stat-val">NVIDIA RTX 5060 Ti 16GB</span>
+      </div>
+      <div class="stat-row">
+        <span class="stat-name">System RAM</span>
+        <span class="stat-val">32GB DDR5-5600</span>
+      </div>
+      <div class="stat-row">
+        <span class="stat-name">Model</span>
+        <span class="stat-val">Nemotron 3.5 Bolt (24GB)</span>
+      </div>
+      <div class="stat-row">
+        <span class="stat-name">Minnie Decode</span>
+        <span class="stat-val val-highlight">13.51 tok/s</span>
+      </div>
+      <div class="stat-row">
+        <span class="stat-name">llama.cpp Cache</span>
+        <span class="stat-val" style="color: var(--crimson);">3.50 tok/s</span>
+      </div>
+      <div class="stat-row">
+        <span class="stat-name">Speedup vs Cache</span>
+        <span class="stat-val val-highlight">3.86× Faster</span>
+      </div>
+      <div class="stat-row">
+        <span class="stat-name">CPU Compute Load</span>
+        <span class="stat-val val-highlight">0% (Pure GPU)</span>
+      </div>
+    </div>
+  </div>
+
+  <script>
+    const video = document.getElementById('mainVideo');
+    const thumbs = document.querySelectorAll('.thumb');
+    const slideImg = document.getElementById('activeSlideImg');
+
+    function switchTab(tab) {
+      const tabVideo = document.getElementById('tabVideo');
+      const tabSlides = document.getElementById('tabSlides');
+      const videoBox = document.getElementById('videoContainer');
+      const slidesBox = document.getElementById('slidesContainer');
+
+      if (tab === 'video') {
+        tabVideo.classList.add('active');
+        tabSlides.classList.remove('active');
+        videoBox.style.display = 'block';
+        slidesBox.classList.remove('active');
+      } else {
+        tabSlides.classList.add('active');
+        tabVideo.classList.remove('active');
+        videoBox.style.display = 'none';
+        slidesBox.classList.add('active');
+      }
+    }
+
+    function selectSlide(idx) {
+      thumbs.forEach((t, i) => {
+        if (i === idx - 1) {
+          t.classList.add('active');
+        } else {
+          t.classList.remove('active');
+        }
+      });
+      slideImg.src = `bolt_video_frames/slide_0${idx}.png`;
+    }
+
+    function jumpTo(timeSec, slideIdx) {
+      switchTab('video');
+      video.currentTime = timeSec;
+      video.play();
+      selectSlide(slideIdx);
+    }
+  </script>
+</body>
+</html>

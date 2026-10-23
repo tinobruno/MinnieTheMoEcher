@@ -49,8 +49,12 @@ cookie_jar.json
 !DEVELOPER_GUIDE.html
 !linkedin_article.html
 !kai_style_video.html
+!nemotron_bolt_article.html
+!nemotron_bolt_video.html
 neural_audio/
 neural_scenes/
+bolt_neural_audio/
+bolt_neural_scenes/
 scene_clips/
 voice_clips/
 scratch_*
