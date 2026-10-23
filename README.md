@@ -476,4 +476,4 @@ print(f"Route to: {router.decision} in {router.total_ms:.1f}ms")
 
 ## License
 
-Apache 2.0
+GNU Affero General Public License v3.0 (AGPL-3.0). See [LICENSE.txt](LICENSE.txt) for the full license text.
