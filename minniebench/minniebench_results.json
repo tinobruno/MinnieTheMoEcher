@@ -1,0 +1,165 @@
+[
+  {
+    "model_name": "Qwen 3.8 27B Vision 13G",
+    "model_id": "qwen3.8-27B-Vision-13G",
+    "architecture": "DeltaNet Linear Attention + MTP Speculative Decoding",
+    "status": "SUCCESS",
+    "load_time_s": 70.24,
+    "vram_delta_mb": 14302.0,
+    "peak_vram_mb": 14987.0,
+    "power_draw_w": 57.29,
+    "tests": [
+      {
+        "test_name": "Direct Chat (No Thinking)",
+        "result": {
+          "success": true,
+          "elapsed_s": 32.829,
+          "prompt_tokens": 27,
+          "completion_tokens": 67,
+          "tok_per_sec": 2.04,
+          "content_preview": "A mutex is a binary locking mechanism that ensures only one thread can access a resource at a time, typically requiring"
+        }
+      },
+      {
+        "test_name": "Code Synthesis",
+        "result": {
+          "success": true,
+          "elapsed_s": 55.725,
+          "prompt_tokens": 32,
+          "completion_tokens": 120,
+          "tok_per_sec": 2.15,
+          "content_preview": "```python def fibonacci(n: int) -> int:     \"\"\"     Calculate the nth Fibonacci number iteratively.          The Fibonac"
+        }
+      },
+      {
+        "test_name": "Step-by-Step Reasoning (Thinking)",
+        "result": {
+          "success": false,
+          "error": "timed out"
+        }
+      }
+    ]
+  },
+  {
+    "model_name": "Nemotron 3.5 Bolt (24GB Profile)",
+    "model_id": "nvidia/NVIDIA-Nemotron-3.5-Bolt-74B-A9B-24GB",
+    "architecture": "Hybrid Mamba-2 SSM + GQA Attention + Sparse MoE (NVFP4)",
+    "status": "SUCCESS",
+    "load_time_s": 97.47,
+    "vram_delta_mb": 14173.0,
+    "peak_vram_mb": 15121.0,
+    "power_draw_w": 79.37,
+    "tests": [
+      {
+        "test_name": "Direct Chat (No Thinking)",
+        "result": {
+          "success": true,
+          "elapsed_s": 16.391,
+          "prompt_tokens": 53,
+          "completion_tokens": 50,
+          "tok_per_sec": 3.05,
+          "content_preview": "A mutex is a mutual exclusion lock that allows only one thread to access a resource at a time, ensuring data integrity."
+        }
+      },
+      {
+        "test_name": "Code Synthesis",
+        "result": {
+          "success": true,
+          "elapsed_s": 18.456,
+          "prompt_tokens": 59,
+          "completion_tokens": 120,
+          "tok_per_sec": 6.5,
+          "content_preview": "```python def fibonacci(n: int) -> int:     \"\"\"     Calculate the nth Fibonacci number iteratively.      The sequence is"
+        }
+      },
+      {
+        "test_name": "Step-by-Step Reasoning (Thinking)",
+        "result": {
+          "success": true,
+          "elapsed_s": 56.661,
+          "prompt_tokens": 77,
+          "completion_tokens": 439,
+          "tok_per_sec": 7.75,
+          "content_preview": "Let's solve this step by step.  **Step 1: Define variables** - Let **x** = the cost of the ball - Then the bat costs **x"
+        }
+      }
+    ]
+  },
+  {
+    "model_name": "Nemotron 3.5 Lightning (30B-A3B)",
+    "manifest": "E:\\dev\\MinnieTheMoEcher\\models\\nemotron_3.5_lightning\\moecher_manifest.json",
+    "status": "FAILED_TO_LOAD",
+    "error": "Process terminated prematurely with exit code 1",
+    "load_time_s": 120.32
+  },
+  {
+    "model_name": "Nemotron 3.5 Bolt (16GB Profile)",
+    "model_id": "nvidia/NVIDIA-Nemotron-3.5-Bolt-74B-A9B-NVFP4",
+    "architecture": "Hybrid Mamba-2 SSM + GQA Attention + Sparse MoE (NVFP4)",
+    "status": "SUCCESS",
+    "load_time_s": 51.95,
+    "vram_delta_mb": 14730.0,
+    "peak_vram_mb": 15202.0,
+    "power_draw_w": 43.61,
+    "tests": [
+      {
+        "test_name": "Direct Chat (No Thinking)",
+        "result": {
+          "success": true,
+          "elapsed_s": 46.43,
+          "prompt_tokens": 53,
+          "completion_tokens": 46,
+          "tok_per_sec": 0.99,
+          "content_preview": "A mutex is a mutual exclusion lock that allows only one thread to access a resource at a time. A semaphore is a counter"
+        }
+      },
+      {
+        "test_name": "Code Synthesis",
+        "result": {
+          "success": false,
+          "error": "timed out"
+        }
+      },
+      {
+        "test_name": "Step-by-Step Reasoning (Thinking)",
+        "result": {
+          "success": false,
+          "error": "HTTP Error 429: Too Many Requests"
+        }
+      }
+    ]
+  },
+  {
+    "model_name": "DeepSeek V4-Flash (IQ2)",
+    "model_id": "deepseek-v4-flash",
+    "architecture": "Sparse MoE (11,008 Experts) + MLA Latent Attention",
+    "status": "SUCCESS",
+    "load_time_s": 87.78,
+    "vram_delta_mb": 11863.0,
+    "peak_vram_mb": 12534.0,
+    "power_draw_w": 23.36,
+    "tests": [
+      {
+        "test_name": "Direct Chat (No Thinking)",
+        "result": {
+          "success": false,
+          "error": "timed out"
+        }
+      },
+      {
+        "test_name": "Code Synthesis",
+        "result": {
+          "success": false,
+          "error": "HTTP Error 429: Too Many Requests"
+        }
+      },
+      {
+        "test_name": "Step-by-Step Reasoning (Thinking)",
+        "result": {
+          "success": false,
+          "error": "HTTP Error 429: Too Many Requests"
+        }
+      }
+    ]
+  }
+]
