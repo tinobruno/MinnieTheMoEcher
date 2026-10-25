@@ -171,6 +171,19 @@ void rebuild_system_prefix(
         }
     }
 
+    // If no system prompt and no active tools are configured, clear snapshot
+    if (full_prompt_text.empty() && resolved_tools.empty()) {
+        engine.reset_all_kv_caches();
+        engine.system_kv_snapshot_.valid = false;
+        engine.turn_kv_snapshot_.valid = false;
+        s_last_conv_messages.clear();
+        g_base_system_prompt.clear();
+        g_current_system_prompt.clear();
+        g_current_active_tools.clear();
+        LOG_INFO("No system prompt or active tools configured; System KV Cache snapshot cleared.");
+        return;
+    }
+
     // Idempotency guard: if the system prompt and tools have not changed and snapshot is valid, skip redundant rebuild
     if (engine.system_kv_snapshot_.valid &&
         g_base_system_prompt == base_prompt &&
@@ -313,7 +326,6 @@ static std::vector<int> build_continuation_prompt(
         if (enable_thinking) {
             result.push_back(THINK_BEGIN);
         } else {
-            result.push_back(THINK_BEGIN);
             result.push_back(THINK_END);
         }
     }
@@ -1516,13 +1528,28 @@ void run_server(MoecherEngine& engine, int port, int default_thinking_budget, in
             auto& messages = request["messages"];
             float temperature = request.value("temperature", 1.0f);
             float top_p = request.value("top_p", 0.95f);
-            float min_p = request.value("min_p", 0.05f);
+            float min_p = request.value("min_p", engine.cfg_.is_deepseek() ? 0.0f : 0.05f);
             int top_k = request.value("top_k", 1024);
             int max_tokens = request.value("max_tokens", 20000);
             bool stream = request.value("stream", false);
-            float repetition_penalty = request.value("repetition_penalty", engine.cfg_.is_nemotron() ? 1.05f : 1.0f);
-            if (repetition_penalty <= 1.0f && engine.cfg_.is_nemotron()) {
-                repetition_penalty = 1.05f;
+            float repetition_penalty = request.value("repetition_penalty",
+                engine.cfg_.default_repetition_penalty > 1.0f ? engine.cfg_.default_repetition_penalty :
+                (engine.cfg_.is_nemotron() ? 1.05f : 1.0f));
+            float presence_penalty = request.value("presence_penalty", 0.0f);
+            float frequency_penalty = request.value("frequency_penalty", 0.0f);
+            if (repetition_penalty <= 1.0f && (presence_penalty > 0.0f || frequency_penalty > 0.0f)) {
+                repetition_penalty = 1.0f + std::max(presence_penalty, frequency_penalty) * 0.1f;
+            }
+            if (engine.cfg_.is_deepseek() && messages.is_array() && !messages.empty() && messages[0].value("role", "") == "system") {
+                std::string sys_txt = messages[0].value("content", "");
+                size_t d_pos = sys_txt.find("\nCurrent date:");
+                if (d_pos != std::string::npos) {
+                    sys_txt = sys_txt.substr(0, d_pos);
+                    messages[0]["content"] = sys_txt;
+                }
+                if (sys_txt.empty() || sys_txt == "You are a helpful assistant." || sys_txt == "You are a helpful assistant") {
+                    messages.erase(0);
+                }
             }
             std::string reasoning_effort = request.value("reasoning_effort", "high");
             bool enable_thinking = true;
@@ -1594,14 +1621,25 @@ void run_server(MoecherEngine& engine, int port, int default_thinking_budget, in
                 max_thinking_tokens = 0;
             }
 
-            if (request.contains("thinking") && request["thinking"].is_object()) {
-                if (request["thinking"].contains("type") && request["thinking"]["type"] == "disabled") {
-                    enable_thinking = false;
-                    max_thinking_tokens = 0;
+            if (request.contains("thinking")) {
+                if (request["thinking"].is_boolean()) {
+                    enable_thinking = request["thinking"].get<bool>();
+                    if (!enable_thinking) max_thinking_tokens = 0;
+                } else if (request["thinking"].is_object()) {
+                    if (request["thinking"].contains("type") && request["thinking"]["type"] == "disabled") {
+                        enable_thinking = false;
+                        max_thinking_tokens = 0;
+                    }
+                    if (enable_thinking && request["thinking"].contains("budget_tokens") && request["thinking"]["budget_tokens"].is_number_integer()) {
+                        max_thinking_tokens = request["thinking"]["budget_tokens"].get<int>();
+                        if (max_thinking_tokens <= 0) enable_thinking = false;
+                    }
                 }
-                if (enable_thinking && request["thinking"].contains("budget_tokens") && request["thinking"]["budget_tokens"].is_number_integer()) {
-                    max_thinking_tokens = request["thinking"]["budget_tokens"].get<int>();
-                    if (max_thinking_tokens <= 0) enable_thinking = false;
+            }
+            if (request.contains("chat_template_kwargs") && request["chat_template_kwargs"].is_object()) {
+                if (request["chat_template_kwargs"].contains("thinking") && request["chat_template_kwargs"]["thinking"].is_boolean()) {
+                    enable_thinking = request["chat_template_kwargs"]["thinking"].get<bool>();
+                    if (!enable_thinking) max_thinking_tokens = 0;
                 }
             }
             if (enable_thinking && request.contains("max_thinking_tokens") && request["max_thinking_tokens"].is_number_integer()) {
@@ -1611,6 +1649,10 @@ void run_server(MoecherEngine& engine, int port, int default_thinking_budget, in
             if (enable_thinking && request.contains("thinking_budget") && request["thinking_budget"].is_number_integer()) {
                 max_thinking_tokens = request["thinking_budget"].get<int>();
                 if (max_thinking_tokens <= 0) enable_thinking = false;
+            }
+
+            if (repetition_penalty <= 1.0f && engine.cfg_.is_nemotron()) {
+                repetition_penalty = 1.05f;
             }
 
             bool req_has_image = false;
@@ -1735,6 +1777,8 @@ void run_server(MoecherEngine& engine, int port, int default_thinking_budget, in
                 bypass_prefix_cache = request["no_cache"].get<bool>();
             } else if (request.contains("bypass_cache") && request["bypass_cache"].is_boolean()) {
                 bypass_prefix_cache = request["bypass_cache"].get<bool>();
+            } else if (request.contains("bypass_prefix_cache") && request["bypass_prefix_cache"].is_boolean()) {
+                bypass_prefix_cache = request["bypass_prefix_cache"].get<bool>();
             }
 
             LOG_INFO("Reasoning effort: %s, Thinking: %s, Thinking budget: %d, Tools: %zu, Server-Exec: %s (client_tool_exec: %s, headless: %s), Max-Tool-Rounds: %d, Timeout: %dms, Bypass-Cache: %s",
@@ -2879,6 +2923,11 @@ void run_server(MoecherEngine& engine, int port, int default_thinking_budget, in
                     }
                     LOG_INFO("PROMPT [round %d] (len=%zu, continuation=%s, visual=%s)",
                              round + 1, prompt.size(), is_continuation ? "true" : "false", (d_vis_out != nullptr) ? "active" : "none");
+                    std::string decoded_p = engine.tokenizer_.decode(prompt);
+                    LOG_INFO("PROMPT text: \"%s\"", decoded_p.c_str());
+                    std::string ids_str = "";
+                    for (size_t pi = 0; pi < std::min((size_t)30, prompt.size()); pi++) ids_str += std::to_string(prompt[pi]) + " ";
+                    LOG_INFO("PROMPT first tokens: %s", ids_str.c_str());
 
                     std::string response_text;
                     {

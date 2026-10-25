@@ -3325,7 +3325,7 @@ function buildOptimizedMessagesPayload() {
     if (window.serverToolsDisabled) {
         let baseSys = sysPrompt || defaultBaseSys;
         let fullSys = baseSys;
-        if (!fullSys.includes('Current date:')) {
+        if (!fullSys.includes('Current date:') && (!currentModelId || !currentModelId.includes('deepseek'))) {
             fullSys += `\nCurrent date: ${dateStr}`;
         }
         messagesToSend.push({ role: 'system', content: fullSys });
@@ -3372,7 +3372,7 @@ function buildOptimizedMessagesPayload() {
                 "   - Attachments (stems, leaves, handles, spouts) must penetrate 5-10% deep into parent meshes to prevent floating seams or gaps.";
         }
         let fullSys = baseSys;
-        if (!fullSys.includes('Current date:')) {
+        if (!fullSys.includes('Current date:') && (!currentModelId || !currentModelId.includes('deepseek'))) {
             fullSys += `\nCurrent date: ${dateStr}`;
         }
         messagesToSend.push({ role: 'system', content: fullSys });

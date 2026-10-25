@@ -267,7 +267,8 @@ int main(int argc, char** argv) {
         std::vector<int> prompt = apply_chat_template(messages, engine.tokenizer_, test_thinking, "high", json(), engine.cfg_.is_nemotron());
         LOG_INFO("Running test generation for prompt: '%s' (%zu prompt tokens, temp=%.2f, max_tokens=%d, thinking=%d)...",
                  prompt_str.c_str(), prompt.size(), test_temp, test_max_tokens, test_thinking ? 1 : 0);
-        std::string result = engine.generate(prompt, test_max_tokens, test_temp, nullptr, 1.0f, test_thinking, default_thinking_budget, 0.95f, 0.0f, 1024);
+        float rep_pen = engine.cfg_.default_repetition_penalty > 1.0f ? engine.cfg_.default_repetition_penalty : 1.0f;
+        std::string result = engine.generate(prompt, test_max_tokens, test_temp, nullptr, rep_pen, test_thinking, default_thinking_budget, 0.95f, 0.0f, 1024);
         printf("\n\n--- Output ---\n%s\n--------------\n", result.c_str());
         return 0;
     }
@@ -303,7 +304,11 @@ int main(int argc, char** argv) {
     std::strftime(date_buf, sizeof(date_buf), "%A, %B %d, %Y", &tm_now);
 
     if (!g_enable_tools && !g_server_exec) {
-        g_base_system_prompt = "You are a helpful assistant.\nCurrent date: " + std::string(date_buf);
+        if (!engine.cfg_.is_deepseek()) {
+            g_base_system_prompt = "You are a helpful assistant.\nCurrent date: " + std::string(date_buf);
+        } else {
+            g_base_system_prompt = "";
+        }
     }
 
     // Pre-warm default system prompt and tooling into KV Cache for 0ms initial prefill latency

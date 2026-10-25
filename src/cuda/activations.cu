@@ -7480,6 +7480,7 @@ void mla_attention_fused_cuda(
     cudaStream_t stream)
 {
     int n_threads = 256;
+    if (max_cache_len > 4096) max_cache_len = 4096;
     size_t smem_bytes = max_cache_len * sizeof(float);
     if (smem_bytes > 49152) {
         init_mla_dynamic_shared_memory();
@@ -7490,6 +7491,10 @@ void mla_attention_fused_cuda(
         d_position, d_comp_count, freq_table,
         max_cache_len, head_dim, rope_dim, scale, q_norm_eps,
         comp_mask, window);
+    cudaError_t err = cudaGetLastError();
+    if (err != cudaSuccess) {
+        printf("[ERROR] mla_attention_fused_kernel launch failed: %s\n", cudaGetErrorString(err));
+    }
 }
 
 // ════════════════════════════════════════════════════════════════════════════════
@@ -7530,7 +7535,9 @@ __global__ void compressor_device_step_kernel(
     // 1. Copy attention projection to state slot & add APE bias
     for (int i = threadIdx.x; i < proj_dim; i += blockDim.x) {
         comp_kv_state[(size_t)state_idx * proj_dim + i] = proj_kv[i];
-        comp_score_state[(size_t)state_idx * proj_dim + i] = proj_gate[i] + comp_ape[(size_t)pos_mod * proj_dim + i];
+        float gate_val = (proj_gate != nullptr) ? proj_gate[i] : 0.0f;
+        float ape_val = (comp_ape != nullptr) ? comp_ape[(size_t)pos_mod * proj_dim + i] : 0.0f;
+        comp_score_state[(size_t)state_idx * proj_dim + i] = gate_val + ape_val;
     }
 
     // 2. If ratio == 4, copy indexer projection to state slot & add APE bias
@@ -7538,7 +7545,9 @@ __global__ void compressor_device_step_kernel(
         int idx_proj_dim = 256;
         for (int i = threadIdx.x; i < idx_proj_dim; i += blockDim.x) {
             idx_kv_state[(size_t)state_idx * idx_proj_dim + i] = idx_proj_kv[i];
-            idx_score_state[(size_t)state_idx * idx_proj_dim + i] = idx_proj_gate[i] + idx_ape[(size_t)pos_mod * idx_proj_dim + i];
+            float idx_gate_val = (idx_proj_gate != nullptr) ? idx_proj_gate[i] : 0.0f;
+            float idx_ape_val = (idx_ape != nullptr) ? idx_ape[(size_t)pos_mod * idx_proj_dim + i] : 0.0f;
+            idx_score_state[(size_t)state_idx * idx_proj_dim + i] = idx_gate_val + idx_ape_val;
         }
     }
     __syncthreads();

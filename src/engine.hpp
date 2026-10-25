@@ -509,6 +509,7 @@ public:
     GPUTensor buf_linear_a_;     // [48] BF16 for Qwen 3.8 DeltaNet decay A
     GPUTensor buf_linear_b_;     // [48] BF16 for Qwen 3.8 DeltaNet decay B
     GPUTensor buf_input_ids_;    // [MAX_SEQ_LEN] I32
+    int debug_cold_routed_token_ = 0;
 
     // Batched working buffers for Multi-Token Speculative Decoding (M=4..8)
     GPUTensor buf_input_tokens_batch_; // [8] I32
@@ -2614,6 +2615,7 @@ public:
 
         if (!can_reuse_prefix || prefix_len == 0) {
             reset_all_kv_caches();
+            cached_tokens_.clear();
             prefix_len = 0;
         } else {
             LOG_INFO("Reusing KV Cache prefix of %zu tokens (skipping prefill 0..%zu, evaluating %zu..%zu)",
@@ -2866,7 +2868,7 @@ public:
             }
 
             std::string token_text = tokenizer_.decode({next_token});
-            int min_thinking_tokens = std::min(48, max_thinking_tokens > 0 ? max_thinking_tokens : 48);
+            int min_thinking_tokens = cfg_.is_nemotron() ? std::min(48, max_thinking_tokens > 0 ? max_thinking_tokens : 48) : 1;
             if (in_think_block && thinking_tokens_generated >= min_thinking_tokens && (token_text.find("</think>") != std::string::npos || (token_buffer + token_text).find("</think>") != std::string::npos)) {
                 in_think_block = false;
                 think_block_ended = true;
@@ -2951,15 +2953,13 @@ public:
                 // table dividers, equations, or code planning, require a robust minimum number of cycles
                 // and a substantial total repeated token span (at least 40+ tokens).
                 for (int L = 1; L <= 512; L++) {
-                    int min_cycles = (L == 1) ? 40 :
-                                     ((L == 2) ? 24 :
-                                     ((L <= 4) ? 16 :
-                                     ((L <= 8) ? 10 :
-                                     ((L <= 16) ? 6 :
-                                     ((L <= 32) ? 4 :
-                                     ((L <= 64) ? 4 : 3))))));
+                    int min_cycles = (L == 1) ? 8 :
+                                     ((L == 2) ? 5 :
+                                     ((L <= 4) ? 4 :
+                                     ((L <= 8) ? 3 :
+                                     ((L <= 16) ? 3 : 2))));
                     if (min_cycles * L > n_out) continue;
-                    if (min_cycles * L < 40) continue; // Safety floor: never trip on less than 40 repeated tokens
+                    if (min_cycles * L < 8) continue; // Safety floor: at least 8 repeated tokens
                     bool match = true;
                     const int* p_last = output_ids.data() + (n_out - L);
                     for (int c = 1; c < min_cycles; c++) {
@@ -2984,18 +2984,15 @@ public:
                 // Content generation phase:
                 // Only inspect content tokens (NEVER cross back into reasoning scratchpad!).
                 // In code/HTML/CSS generation, structural repetitions (buttons, rows, list items) are NORMAL.
-                // Exact token loops require substantial cycle count and at least 48 tokens.
                 int n_content = content_tokens_generated;
                 for (int L = 1; L <= 512; L++) {
-                    int min_cycles = (L == 1) ? 40 :
-                                     ((L == 2) ? 24 :
-                                     ((L <= 4) ? 16 :
-                                     ((L <= 8) ? 10 :
-                                     ((L <= 16) ? 6 :
-                                     ((L <= 32) ? 4 :
-                                     ((L <= 64) ? 4 : 3))))));
+                    int min_cycles = (L == 1) ? 16 :
+                                     ((L == 2) ? 8 :
+                                     ((L <= 4) ? 4 :
+                                     ((L <= 8) ? 3 :
+                                     ((L <= 16) ? 3 : 2))));
                     if (min_cycles * L > n_content) continue;
-                    if (min_cycles * L < 48) continue; // Content safety floor: at least 48 identical repeated tokens
+                    if (min_cycles * L < 16) continue; // Content safety floor: at least 16 identical repeated tokens
                     bool match = true;
                     const int* p_last = output_ids.data() + (n_out - L);
                     for (int c = 1; c < min_cycles; c++) {
@@ -3160,12 +3157,9 @@ public:
                     }
                     argmax_cache_valid_ = false;
                 }
-                int min_thinking_tokens = std::min(48, max_thinking_tokens > 0 ? max_thinking_tokens : 48);
-                if (in_think_block && !think_block_ended && thinking_tokens_generated < min_thinking_tokens) {
+                // While inside think block, ALWAYS mask EOS and stop tokens (thinking only ends via </think> or budget)
+                if (in_think_block && !think_block_ended) {
                     float neg_inf = -1e9f;
-                    if (think_end_id >= 0) {
-                        CUDA_CHECK(cudaMemcpyAsync(buf_logits_.f32() + think_end_id, &neg_inf, sizeof(float), cudaMemcpyHostToDevice, main_stream_));
-                    }
                     if (cfg_.eos_token_id >= 0) {
                         CUDA_CHECK(cudaMemcpyAsync(buf_logits_.f32() + cfg_.eos_token_id, &neg_inf, sizeof(float), cudaMemcpyHostToDevice, main_stream_));
                     }
@@ -3175,11 +3169,24 @@ public:
                     if (im_end_id >= 0) {
                         CUDA_CHECK(cudaMemcpyAsync(buf_logits_.f32() + im_end_id, &neg_inf, sizeof(float), cudaMemcpyHostToDevice, main_stream_));
                     }
+                    int min_thinking_tokens = cfg_.is_nemotron() ? std::min(48, max_thinking_tokens > 0 ? max_thinking_tokens : 48) : 1;
+                    if (thinking_tokens_generated < min_thinking_tokens && think_end_id >= 0) {
+                        CUDA_CHECK(cudaMemcpyAsync(buf_logits_.f32() + think_end_id, &neg_inf, sizeof(float), cudaMemcpyHostToDevice, main_stream_));
+                    }
                     argmax_cache_valid_ = false;
                 }
-                // Suppress refusal opening tokens at the start of content generation
-                if (content_tokens_generated == 0 && think_block_ended) {
+                // Suppress refusal and premature stop at the start of content generation
+                if (content_tokens_generated < 16 && think_block_ended && enable_thinking) {
                     float neg_inf = -1e9f;
+                    if (cfg_.eos_token_id >= 0) {
+                        CUDA_CHECK(cudaMemcpyAsync(buf_logits_.f32() + cfg_.eos_token_id, &neg_inf, sizeof(float), cudaMemcpyHostToDevice, main_stream_));
+                    }
+                    if (eos2_id >= 0) {
+                        CUDA_CHECK(cudaMemcpyAsync(buf_logits_.f32() + eos2_id, &neg_inf, sizeof(float), cudaMemcpyHostToDevice, main_stream_));
+                    }
+                    if (im_end_id >= 0) {
+                        CUDA_CHECK(cudaMemcpyAsync(buf_logits_.f32() + im_end_id, &neg_inf, sizeof(float), cudaMemcpyHostToDevice, main_stream_));
+                    }
                     for (int r_tok : refusal_start_tokens) {
                         if (r_tok >= 0) {
                             CUDA_CHECK(cudaMemcpyAsync(buf_logits_.f32() + r_tok, &neg_inf, sizeof(float), cudaMemcpyHostToDevice, main_stream_));
@@ -3187,7 +3194,7 @@ public:
                     }
                     argmax_cache_valid_ = false;
                 }
-                next_token = sample_token(temperature, history, content_tokens_generated, in_think_block,
+                next_token = sample_token(temperature, history, t, in_think_block,
                                           top_k, top_p, min_p, content_start_history_idx);
             }
             
@@ -4286,8 +4293,7 @@ private:
 
             // Compressor weights (for layers with compress_ratio > 0)
             int ratio = cfg_.layer_compress_ratio(l);
-            if (ratio > 0) {
-                load_tensor(lw.comp_wkv, prefix + ".attn.compressor.wkv.weight");
+            if (ratio > 0 && load_tensor(lw.comp_wkv, prefix + ".attn.compressor.wkv.weight")) {
                 load_tensor(lw.comp_wgate, prefix + ".attn.compressor.wgate.weight");
                 load_tensor(lw.comp_ape, prefix + ".attn.compressor.ape");
                 load_tensor(lw.comp_norm, prefix + ".attn.compressor.norm.weight");
@@ -5334,19 +5340,24 @@ private:
         auto& lw = layers_[layer_id];
         int ratio = cfg_.layer_compress_ratio(layer_id);
         if (ratio <= 0) return;
+        if (!lw.comp_wkv.data) return;
 
         int dim = cfg_.hidden_size;
         int head_dim_val = cfg_.head_dim;
         int rope_dim = cfg_.qk_rope_head_dim;
         bool overlap = (ratio == 4);
         int coff = overlap ? 2 : 1;
-        int proj_dim = coff * head_dim_val; // 1024 for CSA
+        int proj_dim = coff * head_dim_val; // 512 for ratio=2 and ratio=1
 
         // 1. Attention Compressor Projections: [proj_dim] = wkv @ hidden, wgate @ hidden
         gemv_bf16_cuda(buf_comp_proj_.f32(), lw.comp_wkv.bf16(),
                        tok_hidden, proj_dim, dim, main_stream_);
-        gemv_bf16_cuda(buf_comp_out_.f32(), lw.comp_wgate.bf16(),
-                       tok_hidden, proj_dim, dim, main_stream_);
+        const float* comp_gate_ptr = nullptr;
+        if (lw.comp_wgate.data) {
+            gemv_bf16_cuda(buf_comp_out_.f32(), lw.comp_wgate.bf16(),
+                           tok_hidden, proj_dim, dim, main_stream_);
+            comp_gate_ptr = buf_comp_out_.f32();
+        }
 
         // 2. Indexer Compressor Projections: [256] = indexer_comp_wkv @ hidden, indexer_comp_wgate @ hidden
         const float* idx_proj_kv = nullptr;
@@ -5366,10 +5377,10 @@ private:
             d_pos,
             lw.d_comp_kv_count.i32(),
             buf_comp_proj_.f32(),
-            buf_comp_out_.f32(),
+            comp_gate_ptr,
             lw.comp_kv_state.f32(),
             lw.comp_score_state.f32(),
-            lw.comp_ape.f32(),
+            lw.comp_ape.data ? lw.comp_ape.f32() : nullptr,
             lw.comp_norm.bf16(),
             lw.comp_kv_cache.bf16(),
             rope_freqs_compressed_.f32(),
@@ -5381,7 +5392,7 @@ private:
             idx_proj_gate,
             lw.indexer_comp_kv_state.f32(),
             lw.indexer_comp_score_state.f32(),
-            lw.indexer_comp_ape.f32(),
+            lw.indexer_comp_ape.data ? lw.indexer_comp_ape.f32() : nullptr,
             lw.indexer_comp_norm.bf16(),
             lw.indexer_comp_kv_cache.bf16(),
             (cfg_.max_seq_len / ratio + 2),
@@ -5417,13 +5428,14 @@ private:
         if (eff_penalty <= 1.0f || history.empty()) return;
         static int32_t* d_rep_hist = nullptr;
         static const int MAX_REP_HIST = 2048;
+        int rep_window = cfg_.is_deepseek() ? 64 : MAX_REP_HIST;
         if (!d_rep_hist) {
             CUDA_CHECK(cudaMalloc(&d_rep_hist, MAX_REP_HIST * sizeof(int32_t)));
         }
         int hist_len = (int)history.size();
         int start_idx = is_reasoning ? 0 : std::max(0, content_start_idx);
         int available = std::max(0, hist_len - start_idx);
-        int n_penalize = std::min(available, MAX_REP_HIST);
+        int n_penalize = std::min(available, rep_window);
         if (n_penalize > 0) {
             thread_local std::vector<int32_t> unique_tokens;
             unique_tokens.clear();
@@ -5470,20 +5482,118 @@ private:
             argmax_cache_valid_ = false;
             CUDA_CHECK(cudaMemcpyAsync(h_sample_pin, buf_argmax_out_.i32(), sizeof(int32_t), cudaMemcpyDeviceToHost, main_stream_));
             CUDA_CHECK(cudaStreamSynchronize(main_stream_));
-            return *h_sample_pin;
+            int chosen = *h_sample_pin;
+            float top_logit = 0.0f;
+            CUDA_CHECK(cudaMemcpyAsync(&top_logit, logits_ptr + chosen, sizeof(float), cudaMemcpyDeviceToHost, main_stream_));
+            CUDA_CHECK(cudaStreamSynchronize(main_stream_));
+            if (step < 70 || step % 10 == 0) {
+                LOG_INFO("[STEP %3d] tok=%6d ('%s') logit=%.2f cold_experts=%d",
+                         step, chosen, tokenizer_.decode({chosen}).c_str(), top_logit, debug_cold_routed_token_);
+            }
+            debug_cold_routed_token_ = 0;
+            return chosen;
         }
 
-        std::uniform_real_distribution<float> dist(0.0f, 1.0f);
-        float r = dist(rng_);
-        float eff_min_p = (min_p > 0.0f) ? min_p : 0.05f;
-#if defined(__APPLE__)
-        sample_multinomial_f32_cuda(buf_argmax_out_.i32(), logits_ptr, vocab, temperature, r, eff_min_p, main_stream_, top_k, top_p);
-#else
-        sample_multinomial_f32_cuda(buf_argmax_out_.i32(), logits_ptr, vocab, temperature, r, eff_min_p, main_stream_);
-#endif
-        CUDA_CHECK(cudaMemcpyAsync(h_sample_pin, buf_argmax_out_.i32(), sizeof(int32_t), cudaMemcpyDeviceToHost, main_stream_));
+        static float* h_logits_pin = nullptr;
+        if (!h_logits_pin) {
+            CUDA_CHECK(cudaMallocHost(&h_logits_pin, 131072 * sizeof(float)));
+        }
+        CUDA_CHECK(cudaMemcpyAsync(h_logits_pin, logits_ptr, vocab * sizeof(float), cudaMemcpyDeviceToHost, main_stream_));
         CUDA_CHECK(cudaStreamSynchronize(main_stream_));
-        return *h_sample_pin;
+
+        int eff_top_k = (top_k > 0 && top_k <= 128) ? top_k : 40;
+        float eff_top_p = (top_p > 0.0f && top_p <= 1.0f) ? top_p : 0.95f;
+        float eff_min_p = (min_p > 0.0f) ? min_p : 0.05f;
+
+        std::uniform_real_distribution<float> dist(0.0f, 1.0f);
+        float rand_val = dist(rng_);
+
+        // Robust Top-K + Top-P + Min-P heap sampler (matches Apple Metal & standard LLM samplers)
+        struct Candidate {
+            float logit;
+            int idx;
+            bool operator>(const Candidate& o) const { return logit > o.logit; }
+            bool operator<(const Candidate& o) const { return logit < o.logit; }
+        };
+
+        thread_local std::vector<Candidate> heap;
+        heap.clear();
+        heap.reserve(eff_top_k);
+
+        for (int i = 0; i < vocab; i++) {
+            float val = h_logits_pin[i];
+            if (val < -1e8f || std::isnan(val)) continue;
+            if ((int)heap.size() < eff_top_k) {
+                heap.push_back({val, i});
+                if ((int)heap.size() == eff_top_k) {
+                    std::make_heap(heap.begin(), heap.end(), std::greater<Candidate>());
+                }
+            } else if (val > heap.front().logit) {
+                std::pop_heap(heap.begin(), heap.end(), std::greater<Candidate>());
+                heap.back() = {val, i};
+                std::push_heap(heap.begin(), heap.end(), std::greater<Candidate>());
+            }
+        }
+
+        int chosen = 0;
+        if (heap.empty()) {
+            chosen = 0;
+        } else {
+            std::sort(heap.begin(), heap.end(), [](const Candidate& a, const Candidate& b) {
+                return a.logit > b.logit;
+            });
+
+            float max_l = heap[0].logit;
+            float inv_t = 1.0f / std::max(temperature, 1e-4f);
+
+            thread_local std::vector<float> probs;
+            probs.resize(heap.size());
+            float sum_exp = 0.0f;
+            for (size_t i = 0; i < heap.size(); i++) {
+                float e = std::exp((heap[i].logit - max_l) * inv_t);
+                if (eff_min_p > 0.0f && e < eff_min_p) {
+                    e = 0.0f;
+                }
+                probs[i] = e;
+                sum_exp += e;
+            }
+
+            if (sum_exp <= 0.0f) {
+                chosen = heap[0].idx;
+            } else {
+                if (eff_top_p > 0.0f && eff_top_p < 1.0f) {
+                    float cutoff = eff_top_p * sum_exp;
+                    float running = 0.0f;
+                    size_t last_valid = 0;
+                    for (size_t i = 0; i < probs.size(); i++) {
+                        running += probs[i];
+                        last_valid = i;
+                        if (running >= cutoff) break;
+                    }
+                    sum_exp = running;
+                    probs.resize(last_valid + 1);
+                    heap.resize(last_valid + 1);
+                }
+
+                float target = rand_val * sum_exp;
+                float cum = 0.0f;
+                chosen = heap[0].idx;
+                for (size_t i = 0; i < probs.size(); i++) {
+                    cum += probs[i];
+                    if (cum >= target) {
+                        chosen = heap[i].idx;
+                        break;
+                    }
+                }
+            }
+        }
+        float top_logit = h_logits_pin[chosen];
+        if (step < 70 || step % 10 == 0) {
+            LOG_INFO("[STEP %3d] tok=%6d ('%s') logit=%.2f cold_experts=%d",
+                     step, chosen, tokenizer_.decode({chosen}).c_str(), top_logit, debug_cold_routed_token_);
+        }
+        debug_cold_routed_token_ = 0;
+        return chosen;
     }
 
 public:

@@ -9,10 +9,7 @@ using json = nlohmann::json;
 
 namespace moecher::multimodal {
 
-static const std::string DEEPSEEK_V4_REASONING_EFFORT_MAX_PREFIX =
-    "Reasoning Effort: Absolute maximum with no shortcuts permitted.\n"
-    "You MUST be very thorough in your thinking and comprehensively decompose the problem to resolve the root cause, rigorously stress-testing your logic against all potential paths, edge cases, and adversarial scenarios.\n"
-    "Explicitly write out your entire deliberation process, documenting every intermediate step, considered alternative, and rejected hypothesis to ensure absolutely no assumption is left unchecked.\n\n";
+
 
 std::string get_message_content_string(const json& msg) {
     if (!msg.is_object() || !msg.contains("content")) return "";
@@ -332,6 +329,10 @@ MultimodalPrompt apply_chat_template_multimodal(
     if (EOS < 0) EOS = tok.get_token_id("<｜end\xe2\x96\x81of\xe2\x96\x81sentence｜>");
     if (EOS < 1) EOS = 1;
 
+    int SYSTEM = tok.get_token_id("<｜System｜>");
+    if (SYSTEM < 0) SYSTEM = tok.get_token_id("<｜System\xe2\x96\x81｜>");
+    if (SYSTEM < 0) SYSTEM = 128799;
+
     int USER = tok.get_token_id("<｜User｜>");
     if (USER < 0) USER = 128803;
 
@@ -344,24 +345,63 @@ MultimodalPrompt apply_chat_template_multimodal(
     int THINK_END = tok.get_token_id("</think>");
     if (THINK_END < 0) THINK_END = 128822;
 
+    bool has_image = false;
+    for (const auto& msg : messages) {
+        if (message_has_image(msg)) {
+            has_image = true;
+            break;
+        }
+    }
+    bool actual_thinking = enable_thinking && !has_image;
+
+    int budget = 75;
+    std::string effort_lower = reasoning_effort;
+    for (char& c : effort_lower) c = (char)std::tolower((unsigned char)c);
+    if (effort_lower == "low") {
+        budget = 50;
+    } else if (effort_lower == "high" || effort_lower.empty()) {
+        budget = 75;
+    } else if (effort_lower == "max") {
+        budget = 100;
+    } else {
+        try {
+            int parsed = std::stoi(reasoning_effort);
+            if (parsed >= 1 && parsed <= 100) {
+                budget = parsed;
+            }
+        } catch (...) {}
+    }
+
+    std::string reasoning_effort_prompt = "";
+    if (actual_thinking) {
+        reasoning_effort_prompt = "Reasoning Effort: " + std::to_string(budget) +
+            " (range 1-100, the higher the value, the more thorough the reasoning)\n\n";
+    }
+
     std::vector<int> result;
     result.push_back(BOS);
 
-    if (enable_thinking && reasoning_effort == "max") {
-        auto prefix_enc = tok.encode(DEEPSEEK_V4_REASONING_EFFORT_MAX_PREFIX);
-        result.insert(result.end(), prefix_enc.begin(), prefix_enc.end());
+    bool has_system = (!messages.empty() && messages[0].value("role", "") == "system");
+    std::string default_sys = "";
+    if (has_tools) {
+        default_sys = g_base_system_prompt + tools_system_prompt;
+    } else if (!g_base_system_prompt.empty()) {
+        default_sys = g_base_system_prompt;
     }
 
-    bool has_system = (!messages.empty() && messages[0].value("role", "") == "system");
-    if (!has_system) {
-        std::string default_sys = "";
-        if (has_tools) {
-            default_sys = g_base_system_prompt + tools_system_prompt;
-        } else {
-            default_sys = g_base_system_prompt;
+    // Lead conversation with <｜System｜> if thinking mode is active OR first message is system OR default_sys is non-empty
+    if (actual_thinking || has_system || !default_sys.empty()) {
+        result.push_back(SYSTEM);
+        std::string leading_sys = reasoning_effort_prompt;
+        if (has_system) {
+            std::string content = messages[0].contains("content") ? get_message_content_string(messages[0]) : "";
+            std::string sys_body = update_system_prompt_with_tools(content, tools_system_prompt, has_tools);
+            leading_sys += sys_body;
+        } else if (!default_sys.empty()) {
+            leading_sys += default_sys;
         }
-        if (!default_sys.empty()) {
-            auto enc = tok.encode(default_sys);
+        if (!leading_sys.empty()) {
+            auto enc = tok.encode(leading_sys);
             result.insert(result.end(), enc.begin(), enc.end());
         }
     }
@@ -415,12 +455,15 @@ MultimodalPrompt apply_chat_template_multimodal(
         }
 
         if (role == "system") {
-            std::string sys_body = content;
-            if (i == 0) {
-                sys_body = update_system_prompt_with_tools(content, tools_system_prompt, has_tools);
+            if (i > 0) {
+                // Mid-conversation system message
+                result.push_back(SYSTEM);
+                std::string sys_body = content;
+                if (!sys_body.empty() && sys_body.back() != '\n') sys_body += "\n";
+                auto enc = tok.encode(sys_body);
+                result.insert(result.end(), enc.begin(), enc.end());
             }
-            auto enc = tok.encode(sys_body);
-            result.insert(result.end(), enc.begin(), enc.end());
+            // Note: i == 0 was already handled above in the leading <｜System｜> block!
         } else if (role == "user") {
             result.push_back(USER);
             if (model_has_vision && !extracted_image_b64.empty()) {
@@ -475,7 +518,11 @@ MultimodalPrompt apply_chat_template_multimodal(
                     auto r_enc = tok.encode(r_content);
                     result.insert(result.end(), r_enc.begin(), r_enc.end());
                     result.push_back(THINK_END);
+                } else if (!actual_thinking) {
+                    result.push_back(THINK_END);
                 }
+            } else if (!actual_thinking) {
+                result.push_back(THINK_END);
             }
             std::string body = content;
             if (messages[i].contains("tool_calls") && messages[i]["tool_calls"].is_array()) {
@@ -489,23 +536,19 @@ MultimodalPrompt apply_chat_template_multimodal(
             }
             auto enc = tok.encode(body);
             result.insert(result.end(), enc.begin(), enc.end());
-            result.push_back(EOS); // <｜end▁of▁sentence｜>
+            result.push_back(EOS); // <｜end of sentence｜>
         }
     }
 
     // Add assistant prompt for generation
     if (!messages.empty()) {
         std::string last_role = messages.back().value("role", "user");
-        if (last_role == "user" || last_role == "tool" || last_role == "function") {
+        if (last_role == "user" || last_role == "tool" || last_role == "function" || (last_role == "system" && messages.size() > 1)) {
             result.push_back(ASSISTANT);
-            bool actual_thinking = enable_thinking && out.image_b64.empty();
             if (actual_thinking) {
                 result.push_back(THINK_BEGIN);
             } else {
-                result.push_back(THINK_BEGIN);
                 result.push_back(THINK_END);
-                auto nl = tok.encode("\n");
-                result.insert(result.end(), nl.begin(), nl.end());
             }
         }
     }

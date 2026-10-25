@@ -306,6 +306,18 @@ struct ModelConfig {
         if (j.contains("compress_ratios") && j["compress_ratios"].is_array()) {
             compress_ratios = j["compress_ratios"].get<std::vector<int>>();
         }
+        if (compress_ratios.empty() && is_deepseek_v41()) {
+            compress_ratios = {
+                0, 0, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2,
+                1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1,
+                0, 0, 0
+            };
+            compress_rope_theta = 160000.0f;
+            rope_factor = 16.0f;
+            rope_beta_fast = 32;
+            rope_beta_slow = 1;
+            original_seq_len = 65536;
+        }
         // Compute max compressed entries: max_seq_len / min_ratio (critical for DeepSeek MLA compressed KV cache)
         max_compressed_entries = 0;
         for (int r : compress_ratios) {
@@ -320,7 +332,7 @@ struct ModelConfig {
         get(default_thinking_budget, "default_thinking_budget");
 
         if (default_temperature < 0.0f) {
-            default_temperature = is_nemotron() ? 0.6f : 0.7f;
+            default_temperature = is_nemotron() ? 0.6f : (is_deepseek() ? 0.6f : 0.7f);
         }
         if (default_repetition_penalty < 0.0f) {
             default_repetition_penalty = is_nemotron() ? 1.05f : 1.00f;
@@ -335,11 +347,11 @@ struct ModelConfig {
             if (moe_shared_expert_intermediate_size == 3712 || moe_shared_expert_intermediate_size <= 0) {
                 moe_shared_expert_intermediate_size = moe_intermediate_size;
             }
-            if (window_size <= 128) {
-                window_size = 4096;
+            if (window_size <= 0) {
+                window_size = 128;
             }
-            if (sliding_window <= 128) {
-                sliding_window = 4096;
+            if (sliding_window <= 0) {
+                sliding_window = 128;
             }
         }
     }

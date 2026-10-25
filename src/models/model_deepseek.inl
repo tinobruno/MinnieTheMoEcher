@@ -242,7 +242,7 @@
             buf_q_.bf16(), lw.kv_cache.bf16(), lw.comp_kv_cache.bf16(), lw.attn_sink.f32(),
             buf_attn_out_.bf16(), buf_input_pos_.i32(), lw.d_comp_kv_count.i32(),
             layer_rope_freqs, max_combined, head_dim_val, rope_dim, scale,
-            cfg_.rms_norm_eps, comp_mask_ptr, window, main_stream_
+            0.0f, comp_mask_ptr, window, main_stream_
         );
 
         // ── Output projection (grouped low-rank MLA) ─────────────────────
@@ -973,7 +973,7 @@
                     const __nv_bfloat16* tok_q = prefill_bufs_.buf_q.bf16() + (size_t)m * (n_heads * head_dim_val);
                     __nv_bfloat16* tok_attn_out = prefill_bufs_.buf_attn_out.bf16() + (size_t)m * (n_heads * head_dim_val);
 
-                    // 1. RoPE and store KV into ring-buffer
+                    // 1. Store KV into ring-buffer (rotated latent value vectors)
                     rope_device_pos_cuda(tok_kv, 1, head_dim_val, rope_dim,
                                          d_pos, layer_rope_freqs, false, main_stream_);
                     store_kv_device_pos_cuda(lw.kv_cache.bf16(), tok_kv,
@@ -1027,7 +1027,7 @@
                         tok_q, lw.kv_cache.bf16(), lw.comp_kv_cache.bf16(), lw.attn_sink.f32(),
                         tok_attn_out, d_pos, lw.d_comp_kv_count.i32(),
                         layer_rope_freqs, max_combined, head_dim_val, rope_dim, scale,
-                        cfg_.rms_norm_eps, comp_mask_ptr, window, main_stream_);
+                        0.0f, comp_mask_ptr, window, main_stream_);
                 }
 
                 // ── Output projection (wo_a and wo_b) ──

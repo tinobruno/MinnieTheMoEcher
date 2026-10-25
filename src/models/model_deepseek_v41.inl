@@ -82,8 +82,11 @@
         int rope_dim = cfg_.qk_rope_head_dim > 0 ? cfg_.qk_rope_head_dim : 64;
         int window = cfg_.sliding_window > 0 ? cfg_.sliding_window : (cfg_.window_size > 0 ? cfg_.window_size : 4096);
 
-        // RoPE frequencies
-        float* layer_rope_freqs = rope_freqs_.f32();
+        // Select per-layer RoPE frequencies based on compress_ratio (matches DeepSeek V4.1 reference architecture)
+        bool is_compressed = (layer_id < (int)cfg_.compress_ratios.size() &&
+                              cfg_.compress_ratios[layer_id] > 0);
+        float* layer_rope_freqs = is_compressed ? rope_freqs_compressed_.f32()
+                                                : rope_freqs_.f32();
 
         // ── KV Compression Projection on side_stream_ (CED dual-mode) ────────
         CUDA_CHECK(cudaStreamWaitEvent(side_stream_, main_event_, 0));
@@ -151,13 +154,26 @@
         // Wait for KV projection completion on side_stream_
         CUDA_CHECK(cudaStreamWaitEvent(main_stream_, side_event_, 0));
 
+        // ── Device-Driven KV Compressor (for kv_source_layers 2, 8, 14, 20) ──
+        if (lw.comp_wkv.data) {
+            forward_compressor(layer_id);
+        }
+
         // ── Single-Pass Mega-mHC Multi-Head Context Attention ────────────────
         float qk_scale = 1.0f / sqrtf((float)head_dim_val);
-        int max_combined = window + cfg_.max_compressed_entries;
-        if (max_combined < 1) max_combined = 128;
+        int max_combined = 4096;
+
+        const __nv_bfloat16* p_comp_kv = nullptr;
+        const int32_t* p_d_comp_count = nullptr;
+        if (is_compressed) {
+            int src_layer = (layer_id >= 20) ? 20 : ((layer_id >= 14) ? 14 : ((layer_id >= 8) ? 8 : 2));
+            p_comp_kv = layers_[src_layer].comp_kv_cache.bf16();
+            p_d_comp_count = layers_[src_layer].d_comp_kv_count.i32();
+        }
+
         mla_attention_fused_cuda(
-            buf_q_.bf16(), lw.kv_cache.bf16(), lw.comp_kv_cache.bf16(), lw.attn_sink.f32(),
-            buf_attn_out_.bf16(), buf_input_pos_.i32(), lw.d_comp_kv_count.i32(),
+            buf_q_.bf16(), lw.kv_cache.bf16(), p_comp_kv, lw.attn_sink.f32(),
+            buf_attn_out_.bf16(), buf_input_pos_.i32(), p_d_comp_count,
             layer_rope_freqs, max_combined, head_dim_val, rope_dim, qk_scale,
             0.0f, nullptr, window, main_stream_
         );
@@ -268,6 +284,7 @@
                     continue;
                 } else {
                     is_cold_expert[k] = true;
+                    debug_cold_routed_token_++;
                     // Cold Expert: Check L2 Host DRAM Cache
                     void* dram_src = expert_loader_.get_flat_dram_ptr(layer_id, eid);
                     if (!dram_src) dram_src = expert_loader_.try_get_dram_expert_ptr(layer_id, eid);
@@ -283,6 +300,9 @@
                     if (dram_src && vram_slot) {
                         CUDA_CHECK(cudaMemcpyAsync(vram_slot, dram_src, expert_loader_.cold_block_size(), cudaMemcpyHostToDevice, main_stream_));
                         exp_ptrs[k] = vram_slot;
+                    } else {
+                        LOG_ERROR("Step %d L%d: Cold expert %d FAILED to load! (dram_src=%p, vram_slot=%p)",
+                                  decode_step_idx_, layer_id, eid, dram_src, vram_slot);
                     }
                 }
             } else {
@@ -316,6 +336,8 @@
         for (int k = 0; k < top_k; k++) {
             if (exp_ptrs[k]) {
                 execute_expert_swiglu(exp_ptrs[k], 1.0f, k, buf_hidden_.bf16(), is_cold_expert[k]);
+            } else {
+                CUDA_CHECK(cudaMemsetAsync(buf_down_.bf16() + (size_t)k * dim, 0, dim * sizeof(__nv_bfloat16), main_stream_));
             }
         }
 
