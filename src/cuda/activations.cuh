@@ -864,6 +864,16 @@ void moe_route_top6_from_bf16_cuda(
     int n_experts, int top_k, float routed_scaling_factor,
     cudaStream_t stream = 0);
 
+// ── DeepSeek-V4.1-Flash Top-6 Gating with Softmax temperature scaling & SqrtSoftplus ──
+void deepseek_v41_gating_top6_cuda(
+    int32_t* topk_ids,
+    float* topk_weights,
+    const __nv_bfloat16* scores_bf16,
+    const float* gate_bias,
+    int n_experts, int top_k, float routed_scaling_factor,
+    float temperature = 1.0f,
+    cudaStream_t stream = 0);
+
 inline void moe_route_topk_from_bf16_cuda(
     int32_t* topk_ids,
     float* topk_weights,

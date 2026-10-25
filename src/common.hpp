@@ -54,18 +54,27 @@ static constexpr int PAGE_SIZE = 4096;
 static constexpr int MAX_SEQ_LEN = 65536;
 static constexpr const char* MOECHER_VERSION = moecher::VERSION;
 
+// ── DeepSeek-V4.1-Flash Architectural Constants ─────────────────────────────────
+static constexpr int DEEPSEEK_V41_HIDDEN_DIM = 5120;
+static constexpr int DEEPSEEK_V41_LAYERS = 40;
+static constexpr int DEEPSEEK_V41_EXPERTS = 384;
+static constexpr int DEEPSEEK_V41_ACTIVE_EXPERTS = 6;
+static constexpr int DEEPSEEK_V41_SHARED_EXPERTS = 1;
+static constexpr int DEEPSEEK_V41_MOE_INTERMEDIATE = 2304;
+
 // ════════════════════════════════════════════════════════════════════════════════
 //  Model Config (from manifest)
 // ════════════════════════════════════════════════════════════════════════════════
 
-enum class ModelArch { DEEPSEEK_V4, QWEN, QWEN2, NEMOTRON_35 };
+enum class ModelArch { DEEPSEEK_V4, DEEPSEEK_V41, QWEN, QWEN2, NEMOTRON_35 };
 
 struct ModelConfig {
     ModelArch architecture = ModelArch::DEEPSEEK_V4;
     bool is_qwen() const { return architecture == ModelArch::QWEN || architecture == ModelArch::QWEN2; }
     bool is_nemotron() const { return architecture == ModelArch::NEMOTRON_35; }
     bool is_nemotron_bolt() const { return is_nemotron() && (moe_latent_size > 0 || num_hidden_layers > 60); }
-    bool is_deepseek() const { return architecture == ModelArch::DEEPSEEK_V4; }
+    bool is_deepseek() const { return architecture == ModelArch::DEEPSEEK_V4 || architecture == ModelArch::DEEPSEEK_V41; }
+    bool is_deepseek_v41() const { return architecture == ModelArch::DEEPSEEK_V41; }
     std::string model_name = "";
     std::string model_id = "";
     int vocab_size = 129280;
@@ -193,6 +202,10 @@ struct ModelConfig {
                 arch_str == "nemotron" || arch_str == "nemotron_35" || arch_str == "nemotron_h" ||
                 arch_str == "nemotron_h_puzzle" || arch_str == "nemotron_h_omni" || arch_str == "nemotron_bolt") {
                 architecture = ModelArch::NEMOTRON_35;
+            } else if (model_id.find("deepseek_v41") != std::string::npos || model_id.find("deepseek-v4.1") != std::string::npos ||
+                       model_name.find("DeepSeek V4.1") != std::string::npos || model_name.find("DeepSeek-V4.1") != std::string::npos ||
+                       arch_str == "deepseek_v41" || arch_str == "deepseek-v4.1" || arch_str == "deepseek_v4.1" || arch_str == "DeepseekV41ForCausalLM") {
+                architecture = ModelArch::DEEPSEEK_V41;
             } else if (model_id.find("qwen3") != std::string::npos || model_name.find("Qwen 3") != std::string::npos || arch_str == "qwen3") {
                 architecture = ModelArch::QWEN;
             } else if (arch_str == "qwen2" || arch_str == "qwen2.5") {

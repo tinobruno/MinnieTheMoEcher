@@ -43,6 +43,9 @@ public:
 
     std::string get_model_id() const {
         if (!cfg_.model_id.empty()) return cfg_.model_id;
+        if (cfg_.is_deepseek_v41()) {
+            return "deepseek-v4.1-flash";
+        }
         if (cfg_.architecture == ModelArch::QWEN2) {
             return "qwen2.5-vl-3b";
         }
@@ -63,6 +66,9 @@ public:
 
     std::string get_model_display_name() const {
         if (!cfg_.model_name.empty()) return cfg_.model_name;
+        if (cfg_.is_deepseek_v41()) {
+            return "DeepSeek V4.1-Flash";
+        }
         if (cfg_.architecture == ModelArch::QWEN2) {
             return "Qwen 2.5 VL 3B";
         }
@@ -5345,6 +5351,8 @@ private:
 #include "models/model_nemotron.inl"
 
 #include "models/model_deepseek.inl"
+
+#include "models/model_deepseek_v41.inl"
 
     // ── Sample from logits ──────────────────────────────────────────────────
 

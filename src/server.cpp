@@ -1242,11 +1242,13 @@ void run_server(MoecherEngine& engine, int port, int default_thinking_budget, in
         std::string display_name = engine.get_model_display_name();
         std::string arch_desc = engine.cfg_.is_nemotron()
             ? "Hybrid Mamba-2 SSM + GQA Attention + Sparse MoE (NVFP4)"
-            : ((engine.cfg_.architecture == ModelArch::QWEN)
-                ? "DeltaNet Linear Attention + MTP Speculative Decoding"
-                : (model_id.find("coder") != std::string::npos
-                    ? "MoE Coder (64 Experts)"
-                    : "Sparse MoE (11,008 Experts) + MLA Latent Attention"));
+            : (engine.cfg_.is_deepseek_v41()
+                ? "Sparse MoE (15,360 Experts) + Single-Pass Mega-mHC (NVFP4)"
+                : ((engine.cfg_.architecture == ModelArch::QWEN)
+                    ? "DeltaNet Linear Attention + MTP Speculative Decoding"
+                    : (model_id.find("coder") != std::string::npos
+                        ? "MoE Coder (64 Experts)"
+                        : "Sparse MoE (11,008 Experts) + MLA Latent Attention")));
         json sys_res = get_system_resource_telemetry();
         json rec_sampling = {
             {"temperature", engine.cfg_.default_temperature},
@@ -1282,11 +1284,13 @@ void run_server(MoecherEngine& engine, int port, int default_thinking_budget, in
         std::string display_name = engine.get_model_display_name();
         std::string arch_desc = engine.cfg_.is_nemotron()
             ? "Hybrid Mamba-2 SSM + GQA Attention + Sparse MoE (NVFP4)"
-            : ((engine.cfg_.architecture == ModelArch::QWEN)
-                ? "DeltaNet Linear Attention + MTP Speculative Decoding"
-                : (model_id.find("coder") != std::string::npos
-                    ? "MoE Coder (64 Experts)"
-                    : "Sparse MoE (11,008 Experts) + MLA Latent Attention"));
+            : (engine.cfg_.is_deepseek_v41()
+                ? "Sparse MoE (15,360 Experts) + Single-Pass Mega-mHC (NVFP4)"
+                : ((engine.cfg_.architecture == ModelArch::QWEN)
+                    ? "DeltaNet Linear Attention + MTP Speculative Decoding"
+                    : (model_id.find("coder") != std::string::npos
+                        ? "MoE Coder (64 Experts)"
+                        : "Sparse MoE (11,008 Experts) + MLA Latent Attention")));
         json sys_res = get_system_resource_telemetry();
         json rec_sampling = {
             {"temperature", engine.cfg_.default_temperature},

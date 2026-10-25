@@ -6503,6 +6503,86 @@ void moe_route_top6_from_bf16_cuda(
         topk_ids, topk_weights, scores_bf16, gate_bias, n_experts, top_k, routed_scaling_factor);
 }
 
+// ════════════════════════════════════════════════════════════════════════════════
+//  DeepSeek-V4.1-Flash Top-6 SqrtSoftplus Router with Temperature Scaling (384 Experts)
+// ════════════════════════════════════════════════════════════════════════════════
+
+__global__ void deepseek_v41_gating_top6_kernel(
+    int32_t* __restrict__ topk_ids,
+    float* __restrict__ topk_weights,
+    const __nv_bfloat16* __restrict__ scores_bf16,
+    const float* __restrict__ gate_bias,
+    int n_experts, int top_k, float routed_scaling_factor,
+    float temperature)
+{
+    __shared__ float s_scores[512];
+    __shared__ float s_probs[512];
+    __shared__ int   s_indices[512];
+
+    int tid = threadIdx.x;
+    float inv_temp = (temperature > 1e-5f) ? (1.0f / temperature) : 1.0f;
+
+    for (int i = tid; i < n_experts; i += blockDim.x) {
+        float raw = __bfloat162float(scores_bf16[i]) * inv_temp;
+        if (gate_bias) raw += gate_bias[i];
+        
+        // DeepSeek-V4.1 SqrtSoftplus scoring: sqrt(log(1 + exp(x)))
+        float sp = (raw > 20.0f) ? raw : logf(1.0f + expf(raw));
+        float score = sqrtf(fmaxf(0.0f, sp));
+
+        s_scores[i] = score;
+        s_probs[i] = score;
+        s_indices[i] = i;
+    }
+    for (int i = n_experts + tid; i < 512; i += blockDim.x) {
+        s_scores[i] = -1e38f;
+        s_probs[i] = 0.0f;
+        s_indices[i] = -1;
+    }
+    __syncthreads();
+
+    if (tid == 0) {
+        for (int i = 0; i < top_k; i++) {
+            int max_idx = i;
+            float max_val = s_scores[i];
+            for (int j = i + 1; j < n_experts; j++) {
+                if (s_scores[j] > max_val) {
+                    max_val = s_scores[j];
+                    max_idx = j;
+                }
+            }
+            float tmp_s = s_scores[i]; s_scores[i] = s_scores[max_idx]; s_scores[max_idx] = tmp_s;
+            float tmp_p = s_probs[i];  s_probs[i]  = s_probs[max_idx];  s_probs[max_idx]  = tmp_p;
+            int   tmp_id = s_indices[i]; s_indices[i] = s_indices[max_idx]; s_indices[max_idx] = tmp_id;
+        }
+
+        float weight_sum = 0.0f;
+        for (int k = 0; k < top_k; k++) {
+            weight_sum += s_probs[k];
+        }
+        if (weight_sum < 1e-6f) weight_sum = 1e-6f;
+
+        for (int k = 0; k < top_k; k++) {
+            topk_ids[k] = s_indices[k];
+            topk_weights[k] = (s_probs[k] / weight_sum) * routed_scaling_factor;
+        }
+    }
+}
+
+void deepseek_v41_gating_top6_cuda(
+    int32_t* topk_ids,
+    float* topk_weights,
+    const __nv_bfloat16* scores_bf16,
+    const float* gate_bias,
+    int n_experts, int top_k, float routed_scaling_factor,
+    float temperature,
+    cudaStream_t stream)
+{
+    int threads = (n_experts > 256) ? 512 : 256;
+    deepseek_v41_gating_top6_kernel<<<1, threads, 0, stream>>>(
+        topk_ids, topk_weights, scores_bf16, gate_bias, n_experts, top_k, routed_scaling_factor, temperature);
+}
+
 __global__ void moe_route_top6_kernel(
     int32_t* __restrict__ topk_ids,
     float* __restrict__ topk_weights,

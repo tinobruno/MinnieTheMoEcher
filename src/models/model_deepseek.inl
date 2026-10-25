@@ -9,6 +9,10 @@
             forward_layer_nemotron(layer_id, token_id, position);
             return;
         }
+        if (cfg_.is_deepseek_v41()) {
+            forward_layer_deepseek_v41(layer_id, token_id, position);
+            return;
+        }
 
         auto& lw = layers_[layer_id];
         int dim = cfg_.hidden_size;
