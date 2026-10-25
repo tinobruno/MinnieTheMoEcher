@@ -49,8 +49,8 @@ def wait_for_download():
             last_count = count
 
         if count >= EXPECTED_SHARDS:
-            # Check if any .incomplete or lock files exist
-            incompletes = [f for f in os.listdir(RAW_DIR) if f.endswith(".incomplete")]
+            # Check if any .incomplete or lock files exist across raw dir and .cache
+            incompletes = [os.path.join(r, f) for r, d, fs in os.walk(RAW_DIR) for f in fs if f.endswith(".incomplete")]
             if not incompletes and size_gb > 460:
                 print(f"\n[DOWNLOAD COMPLETE] All {count} shards downloaded successfully ({size_gb:.2f} GB)!", flush=True)
                 break
