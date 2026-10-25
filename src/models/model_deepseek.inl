@@ -696,16 +696,16 @@
 
     // ── Execute a single expert SwiGLU ──────────────────────────────────────
 
-    void execute_expert_swiglu(void* expert_block, float routing_weight, int k, const __nv_bfloat16* in_vec = nullptr) {
-        int dim = cfg_.hidden_size;
-        int moe_inter = cfg_.moe_intermediate_size;
+    void execute_expert_swiglu(void* expert_block, float routing_weight, int k, const __nv_bfloat16* in_vec = nullptr, bool is_cold_iq2 = false) {
+        int dim = cfg_.hidden_size > 0 ? cfg_.hidden_size : DEEPSEEK_V41_HIDDEN_DIM;
+        int moe_inter = cfg_.moe_intermediate_size > 0 ? cfg_.moe_intermediate_size : DEEPSEEK_V41_MOE_INTERMEDIATE;
         const __nv_bfloat16* in_hidden = in_vec ? in_vec : buf_hidden_.bf16();
 
+        uint8_t* block = (uint8_t*)expert_block;
         auto& w1_info = expert_parts_["w1.weight"];
         auto& w3_info = expert_parts_["w3.weight"];
         auto& w2_info = expert_parts_["w2.weight"];
 
-        uint8_t* block = (uint8_t*)expert_block;
         uint8_t* w1_data = block + w1_info.offset_in_block;
         uint8_t* w3_data = block + w3_info.offset_in_block;
         uint8_t* w2_data = block + w2_info.offset_in_block;
@@ -715,7 +715,14 @@
         __nv_bfloat16* my_up   = buf_up_.bf16()   + k * moe_inter;
         __nv_bfloat16* my_down = buf_down_.bf16() + k * dim;
 
-        if (cfg_.expert_dtype == "iq2_xxs") {
+        if (cfg_.expert_dtype == "iq2_xxs" || is_cold_iq2) {
+            if (is_cold_iq2) {
+                size_t w1_sz = (size_t)moe_inter * (dim / 256) * sizeof(block_iq2_xxs);
+                size_t w3_sz = (size_t)moe_inter * (dim / 256) * sizeof(block_iq2_xxs);
+                w1_data = block;
+                w3_data = block + w1_sz;
+                w2_data = block + w1_sz + w3_sz;
+            }
             gemv_iq2_xxs_swiglu_fused_cuda(my_gate, in_hidden,
                                            (const block_iq2_xxs*)w1_data,
                                            (const block_iq2_xxs*)w3_data,

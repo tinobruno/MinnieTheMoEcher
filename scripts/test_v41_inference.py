@@ -28,8 +28,14 @@ def main():
     print("  Caching: L1 VRAM (46GB) <-> L2 DRAM (Auto Max) <-> L3 Direct I/O NVMe")
     print("=" * 70, flush=True)
 
-    if not MANIFEST.exists():
-        print(f"[ERROR] Manifest not found at {MANIFEST}")
+    manifest_to_use = MANIFEST
+    mixed_manifest = Path("F:/Moecher/models/deepseek_v41_nvfp4/moecher_manifest_mixed.json")
+    if ("--mixed" in sys.argv or not MANIFEST.exists()) and mixed_manifest.exists():
+        manifest_to_use = mixed_manifest
+        print(f"  [Mode] Using Approach A Mixed Quantization Manifest: {manifest_to_use}")
+
+    if not manifest_to_use.exists():
+        print(f"[ERROR] Manifest not found at {manifest_to_use}")
         sys.exit(1)
     if not EXE_PATH.exists():
         print(f"[ERROR] Engine binary not found at {EXE_PATH}")
@@ -41,8 +47,7 @@ def main():
 
     server_cmd = [
         str(EXE_PATH),
-        "-m", str(MANIFEST),
-        "--cache-gb", "46",
+        "-m", str(manifest_to_use),
         "--mtp-k", "4",
         "--port", str(SERVER_PORT),
         "-q"

@@ -111,6 +111,27 @@ public:
         return expert_type_map_gpu_.u8();
     }
 
+    bool is_mixed() const { return is_mixed_; }
+    bool is_hot(int layer_id, int expert_id) const {
+        if (!is_mixed_) return false;
+        int64_t idx = (int64_t)layer_id * n_experts_ + expert_id;
+        if (idx >= 0 && idx < (int64_t)expert_type_map_host_.size()) {
+            return expert_type_map_host_[idx] == 1;
+        }
+        return false;
+    }
+
+    inline void* get_hot_vram_ptr(int layer_id, int expert_id) const {
+        int64_t key = (int64_t)layer_id * n_experts_ + expert_id;
+        if (key >= 0 && key < (int64_t)flat_vram_ptrs_.size()) {
+            return flat_vram_ptrs_[key];
+        }
+        return nullptr;
+    }
+
+    int cold_block_size() const { return cold_block_size_; }
+    int hot_block_size() const { return hot_block_size_; }
+
     int n_pinned_layers() const {
         return 0;
     }
@@ -260,15 +281,17 @@ public:
             dslot.is_ready.store(false, std::memory_order_release);
             dram_key_to_slot_[key] = evict_dram;
 
-            int64_t file_offset = (int64_t)key * expert_block_size_;
+            int64_t file_offset = is_mixed_ ? ((int64_t)key * cold_block_size_) : ((int64_t)key * expert_block_size_);
+            size_t cur_block_size = is_mixed_ ? cold_block_size_ : expert_block_size_;
             cold_disk_reads_++;
             void* dst_ptr = dslot.gpu_data;
 
             // Release lock before I/O so other threads can reserve slots and do I/O concurrently!
             lock.unlock();
 
-            // Unbuffered Direct I/O (NVMe DMA) into pinned memory when in direct mode; mmap only in buffered mode
-            if (expert_file_.is_open() && !use_buffered_io_) {
+            if (is_mixed_) {
+                expert_file_cold_.pread_exact(dst_ptr, cur_block_size, file_offset);
+            } else if (expert_file_.is_open() && !use_buffered_io_) {
                 expert_file_.pread_exact(dst_ptr, expert_block_size_, file_offset);
             } else if (expert_mmap_.is_open() && (size_t)(file_offset + expert_block_size_) <= expert_mmap_.size()) {
                 std::memcpy(dst_ptr, (const char*)expert_mmap_.data() + file_offset, expert_block_size_);
@@ -288,9 +311,14 @@ public:
             int stage_idx = staging_idx_;
             staging_idx_ = (staging_idx_ + 1) % NUM_STAGING_BUFFERS;
             auto& stage = staging_ring_[stage_idx];
-            int64_t file_offset = (int64_t)key * expert_block_size_;
+            int64_t file_offset = is_mixed_ ? ((int64_t)key * cold_block_size_) : ((int64_t)key * expert_block_size_);
+            size_t cur_block_size = is_mixed_ ? cold_block_size_ : expert_block_size_;
             cold_disk_reads_++;
-            expert_file_.pread_exact(stage.ptr, expert_block_size_, file_offset);
+            if (is_mixed_) {
+                expert_file_cold_.pread_exact(stage.ptr, cur_block_size, file_offset);
+            } else {
+                expert_file_.pread_exact(stage.ptr, expert_block_size_, file_offset);
+            }
             return stage.ptr;
         }
     }
@@ -510,8 +538,10 @@ public:
                     const std::string& hot_bin_path, int hot_block_size,
                     const std::string& map_file_path,
                     int n_layers, int n_experts,
+                    size_t dram_budget_bytes = 0,
                     bool use_buffered_io = false) {
         is_mixed_ = true;
+        use_buffered_io_ = use_buffered_io;
         cold_block_size_ = cold_block_size;
         hot_block_size_ = hot_block_size;
         expert_block_size_ = cold_block_size; // For fallback compatibility
@@ -555,12 +585,15 @@ public:
         size_t cold_bytes = (size_t)total_cold * cold_block_size;
         size_t total_bytes = hot_bytes + cold_bytes;
 
+        size_t free_vram = 0, total_vram = 0;
+        cudaMemGetInfo(&free_vram, &total_vram);
+
         LOG_INFO("══════════════════════════════════════════════════════════════════════");
-        LOG_INFO("ExpertLoader: Initializing Mixed Quantization MoE (100%% VRAM Resident)");
+        LOG_INFO("ExpertLoader: Initializing Mixed Quantization MoE (Approach A)");
         LOG_INFO("  Total Experts : %d (%d layers x %d)", total_experts, n_layers, n_experts);
-        LOG_INFO("  Hot Experts   : %d (%.2f GB) in 2:4 Sparse NVFP4", total_hot, (double)hot_bytes / (1024.0 * 1024.0 * 1024.0));
+        LOG_INFO("  Hot Experts   : %d (%.2f GB) in NVFP4", total_hot, (double)hot_bytes / (1024.0 * 1024.0 * 1024.0));
         LOG_INFO("  Cold Experts  : %d (%.2f GB) in IQ2_XXS + Q2_K", total_cold, (double)cold_bytes / (1024.0 * 1024.0 * 1024.0));
-        LOG_INFO("  Total MoE VRAM: %.2f GB", (double)total_bytes / (1024.0 * 1024.0 * 1024.0));
+        LOG_INFO("  Free VRAM     : %.2f GB / Total VRAM: %.2f GB", (double)free_vram / (1024.0 * 1024.0 * 1024.0), (double)total_vram / (1024.0 * 1024.0 * 1024.0));
         LOG_INFO("══════════════════════════════════════════════════════════════════════");
 
         // Copy map to GPU
@@ -568,26 +601,125 @@ public:
         CUDA_CHECK(cudaMemcpy(expert_type_map_gpu_.data, expert_type_map_host_.data(),
                               total_experts, cudaMemcpyHostToDevice));
 
-        // Allocate VRAM pools
-        CUDA_CHECK(cudaMalloc(&hot_pool_gpu_, hot_bytes));
-        CUDA_CHECK(cudaMalloc(&cold_pool_gpu_, cold_bytes));
-
-        // All resident capacity: 100% of all experts in VRAM
-        cache_capacity_ = total_experts;
-
         flat_vram_ptrs_.assign(total_experts, nullptr);
         flat_vram_ptrs_gpu_.alloc((size_t)total_experts * sizeof(void*));
 
-        int cur_hot = 0;
-        int cur_cold = 0;
-        for (int i = 0; i < total_experts; i++) {
-            if (expert_type_map_host_[i] == 1) {
-                flat_vram_ptrs_[i] = (char*)hot_pool_gpu_ + (size_t)cur_hot * hot_block_size;
-                cur_hot++;
-            } else {
-                flat_vram_ptrs_[i] = (char*)cold_pool_gpu_ + (size_t)cur_cold * cold_block_size;
-                cur_cold++;
+        if (total_bytes <= free_vram - 4ULL * 1024 * 1024 * 1024) {
+            // All experts fit in VRAM!
+            LOG_INFO("ExpertLoader: 100%% VRAM Resident mode active (all %d experts)", total_experts);
+            CUDA_CHECK(cudaMalloc(&hot_pool_gpu_, hot_bytes));
+            CUDA_CHECK(cudaMalloc(&cold_pool_gpu_, cold_bytes));
+            cache_capacity_ = total_experts;
+
+            int cur_hot = 0;
+            int cur_cold = 0;
+            for (int i = 0; i < total_experts; i++) {
+                if (expert_type_map_host_[i] == 1) {
+                    flat_vram_ptrs_[i] = (char*)hot_pool_gpu_ + (size_t)cur_hot * hot_block_size;
+                    cur_hot++;
+                } else {
+                    flat_vram_ptrs_[i] = (char*)cold_pool_gpu_ + (size_t)cur_cold * cold_block_size;
+                    cur_cold++;
+                }
             }
+        } else {
+            // Hierarchical Mixed Mode (Hot: VRAM, Cold: DRAM + SSD)
+            LOG_INFO("ExpertLoader: Hierarchical Mixed mode (Hot in VRAM, Cold in DRAM/SSD)");
+            CUDA_CHECK(cudaMalloc(&hot_pool_gpu_, hot_bytes));
+            cold_pool_gpu_ = nullptr;
+            cache_capacity_ = total_hot;
+
+            int cur_hot = 0;
+            for (int i = 0; i < total_experts; i++) {
+                if (expert_type_map_host_[i] == 1) {
+                    flat_vram_ptrs_[i] = (char*)hot_pool_gpu_ + (size_t)cur_hot * hot_block_size;
+                    cur_hot++;
+                } else {
+                    flat_vram_ptrs_[i] = nullptr;
+                }
+            }
+
+            // Allocate L2 DRAM cache for cold experts
+            dram_cache_capacity_ = (int)(dram_budget_bytes / cold_block_size);
+            if (dram_cache_capacity_ > 0) {
+                dram_static_capacity_ = (dram_cache_capacity_ > 2000) ? 1000 : (dram_cache_capacity_ / 4);
+                dram_dynamic_capacity_ = dram_cache_capacity_ - dram_static_capacity_;
+                LOG_INFO("Expert L2 cache: %d cold slots (%.1f GB) [Static: %d, Dynamic: %d]",
+                         dram_cache_capacity_,
+                         (double)dram_cache_capacity_ * cold_block_size / (1024.0 * 1024.0 * 1024.0),
+                         dram_static_capacity_, dram_dynamic_capacity_);
+
+                size_t total_dram_bytes = (size_t)dram_cache_capacity_ * cold_block_size;
+                size_t try_bytes = total_dram_bytes;
+                cudaError_t err = cudaErrorMemoryAllocation;
+                while (try_bytes >= (size_t)cold_block_size) {
+                    err = cudaMallocHost(&dram_cache_pool_, try_bytes);
+                    if (err == cudaSuccess) break;
+                    cudaGetLastError();
+                    if (try_bytes <= 512ULL * 1024 * 1024) break;
+                    try_bytes -= 512ULL * 1024 * 1024;
+                }
+                if (err == cudaSuccess) {
+                    total_dram_bytes = try_bytes;
+                    dram_cache_capacity_ = (int)(total_dram_bytes / cold_block_size);
+                    dram_static_capacity_ = (dram_cache_capacity_ > 2000) ? 1000 : (dram_cache_capacity_ / 4);
+                    dram_dynamic_capacity_ = dram_cache_capacity_ - dram_static_capacity_;
+                    dram_is_pinned_ = true;
+                    LOG_INFO("Allocated %.1f GB PINNED DRAM cache with cudaMallocHost (%d cold slots)",
+                             (double)total_dram_bytes / (1024.0 * 1024.0 * 1024.0), dram_cache_capacity_);
+                } else {
+#if defined(_WIN32) || defined(_WIN64)
+                    dram_cache_pool_ = VirtualAlloc(NULL, total_dram_bytes, MEM_COMMIT | MEM_RESERVE, PAGE_READWRITE);
+#else
+                    dram_cache_pool_ = aligned_alloc(4096, total_dram_bytes);
+#endif
+                    if (dram_cache_pool_) {
+                        cudaError_t reg_err = cudaHostRegister(dram_cache_pool_, total_dram_bytes, cudaHostRegisterDefault);
+                        if (reg_err != cudaSuccess) {
+                            cudaGetLastError();
+                            dram_is_pinned_ = false;
+                            LOG_INFO("Allocated %.1f GB DRAM cache in physical RAM",
+                                     (double)total_dram_bytes / (1024.0 * 1024.0 * 1024.0));
+                        } else {
+                            dram_is_pinned_ = true;
+                            LOG_INFO("Pinned %.1f GB DRAM cache into physical RAM with cudaHostRegister",
+                                     (double)total_dram_bytes / (1024.0 * 1024.0 * 1024.0));
+                        }
+                    } else {
+                        LOG_ERROR("System RAM allocation also failed. Disabling L2 DRAM cache.");
+                        dram_cache_capacity_ = 0;
+                    }
+                }
+
+                if (dram_cache_capacity_ > 0 && dram_cache_pool_) {
+                    dram_cache_slots_.resize(dram_cache_capacity_);
+                    for (int i = 0; i < dram_cache_capacity_; i++) {
+                        dram_cache_slots_[i].slot_index = i;
+                        dram_cache_slots_[i].gpu_data = (char*)dram_cache_pool_ + (size_t)i * cold_block_size;
+                    }
+                }
+            }
+
+            // Initialize staging ring buffer for cold direct I/O
+            staging_ring_.resize(NUM_STAGING_BUFFERS);
+            for (auto& s : staging_ring_) {
+                cudaError_t err = cudaMallocHost(&s.ptr, cold_block_size);
+                if (err == cudaSuccess) {
+                    s.is_pinned = true;
+                } else {
+                    cudaGetLastError();
+                    s.is_pinned = false;
+#if defined(_WIN32) || defined(_WIN64)
+                    s.ptr = VirtualAlloc(NULL, cold_block_size, MEM_COMMIT | MEM_RESERVE, PAGE_READWRITE);
+#else
+                    s.ptr = aligned_alloc(4096, cold_block_size);
+#endif
+                }
+                CUDA_CHECK(cudaEventCreateWithFlags(&s.event, cudaEventDisableTiming));
+            }
+
+            flat_dram_ptrs_.assign((size_t)total_experts, nullptr);
+            flat_dram_slots_.assign((size_t)total_experts, -1);
         }
 
         return true;
@@ -1289,62 +1421,57 @@ public:
 
     bool preload_all_mixed(int n_threads = 16) {
         int total = n_layers_ * n_experts_;
-        LOG_INFO("Preloading %d mixed experts into VRAM (Hot: NVFP4, Cold: IQ2_XXS)...", total);
-
         auto start = std::chrono::steady_clock::now();
-        std::atomic<int> loaded{0};
 
+        std::vector<int> hot_indices;
+        std::vector<int> cold_indices;
+        for (int i = 0; i < total; i++) {
+            if (expert_type_map_host_[i] == 1) hot_indices.push_back(i);
+            else cold_indices.push_back(i);
+        }
+
+        int num_hot = (int)hot_indices.size();
+        LOG_INFO("Preloading %d Hot experts into VRAM (NVFP4)...", num_hot);
+
+        std::atomic<int> loaded_hot{0};
         std::vector<std::thread> workers;
-        int chunk_size = (total + n_threads - 1) / n_threads;
+        int chunk_size = (num_hot + n_threads - 1) / n_threads;
 
         for (int t = 0; t < n_threads; t++) {
             int start_idx = t * chunk_size;
-            int end_idx = std::min(start_idx + chunk_size, total);
+            int end_idx = std::min(start_idx + chunk_size, num_hot);
             if (start_idx >= end_idx) continue;
 
-            workers.emplace_back([this, start_idx, end_idx, &loaded, total]() {
-                size_t max_block = std::max(hot_block_size_, cold_block_size_);
+            workers.emplace_back([this, start_idx, end_idx, &loaded_hot, num_hot, &hot_indices]() {
                 void* stage_ptr = nullptr;
                 bool is_pinned = true;
-                if (cudaMallocHost(&stage_ptr, max_block) != cudaSuccess) {
+                if (cudaMallocHost(&stage_ptr, hot_block_size_) != cudaSuccess) {
                     cudaGetLastError();
                     is_pinned = false;
 #if defined(_WIN32) || defined(_WIN64)
-                    stage_ptr = VirtualAlloc(NULL, max_block, MEM_COMMIT | MEM_RESERVE, PAGE_READWRITE);
+                    stage_ptr = VirtualAlloc(NULL, hot_block_size_, MEM_COMMIT | MEM_RESERVE, PAGE_READWRITE);
 #else
-                    stage_ptr = aligned_alloc(4096, max_block);
+                    stage_ptr = aligned_alloc(4096, hot_block_size_);
 #endif
                 }
                 cudaStream_t stream = nullptr;
                 CUDA_CHECK(cudaStreamCreate(&stream));
 
-                for (int i = start_idx; i < end_idx; i++) {
-                    uint8_t is_hot = expert_type_map_host_[i];
+                for (int idx = start_idx; idx < end_idx; idx++) {
+                    int i = hot_indices[idx];
                     void* dst = flat_vram_ptrs_[i];
-
-                    if (is_hot) {
-                        int64_t file_offset = (int64_t)i * hot_block_size_;
-                        int64_t bytes = expert_file_hot_.pread_exact(stage_ptr, hot_block_size_, file_offset);
-                        if (bytes == hot_block_size_) {
-                            CUDA_CHECK(cudaMemcpyAsync(dst, stage_ptr, hot_block_size_, cudaMemcpyHostToDevice, stream));
-                            CUDA_CHECK(cudaStreamSynchronize(stream));
-                        } else {
-                            LOG_ERROR("Failed reading hot expert %d at offset %lld (got %lld)", i, (long long)file_offset, (long long)bytes);
-                        }
+                    int64_t file_offset = (int64_t)i * hot_block_size_;
+                    int64_t bytes = expert_file_hot_.pread_exact(stage_ptr, hot_block_size_, file_offset);
+                    if (bytes == hot_block_size_) {
+                        CUDA_CHECK(cudaMemcpyAsync(dst, stage_ptr, hot_block_size_, cudaMemcpyHostToDevice, stream));
+                        CUDA_CHECK(cudaStreamSynchronize(stream));
                     } else {
-                        int64_t file_offset = (int64_t)i * cold_block_size_;
-                        int64_t bytes = expert_file_cold_.pread_exact(stage_ptr, cold_block_size_, file_offset);
-                        if (bytes == cold_block_size_) {
-                            CUDA_CHECK(cudaMemcpyAsync(dst, stage_ptr, cold_block_size_, cudaMemcpyHostToDevice, stream));
-                            CUDA_CHECK(cudaStreamSynchronize(stream));
-                        } else {
-                            LOG_ERROR("Failed reading cold expert %d at offset %lld (got %lld)", i, (long long)file_offset, (long long)bytes);
-                        }
+                        LOG_ERROR("Failed reading hot expert %d at offset %lld (got %lld)", i, (long long)file_offset, (long long)bytes);
                     }
 
-                    int done = ++loaded;
-                    if (done % 1000 == 0 || done == total) {
-                        LOG_INFO("  Preloaded %d/%d mixed experts into VRAM...", done, total);
+                    int done = ++loaded_hot;
+                    if (done % 500 == 0 || done == num_hot) {
+                        LOG_INFO("  Preloaded %d/%d Hot experts into VRAM...", done, num_hot);
                     }
                 }
                 CUDA_CHECK(cudaStreamDestroy(stream));
@@ -1364,13 +1491,124 @@ public:
         for (auto& w : workers) {
             w.join();
         }
+        workers.clear();
+
+        // 2. Cold experts preloading
+        if (cold_pool_gpu_) {
+            // 100% VRAM resident cold pool
+            int num_cold = (int)cold_indices.size();
+            LOG_INFO("Preloading %d Cold experts into VRAM (IQ2_XXS)...", num_cold);
+            std::atomic<int> loaded_cold{0};
+            int cold_chunk = (num_cold + n_threads - 1) / n_threads;
+
+            for (int t = 0; t < n_threads; t++) {
+                int start_idx = t * cold_chunk;
+                int end_idx = std::min(start_idx + cold_chunk, num_cold);
+                if (start_idx >= end_idx) continue;
+
+                workers.emplace_back([this, start_idx, end_idx, &loaded_cold, num_cold, &cold_indices]() {
+                    void* stage_ptr = nullptr;
+                    bool is_pinned = true;
+                    if (cudaMallocHost(&stage_ptr, cold_block_size_) != cudaSuccess) {
+                        cudaGetLastError();
+                        is_pinned = false;
+#if defined(_WIN32) || defined(_WIN64)
+                        stage_ptr = VirtualAlloc(NULL, cold_block_size_, MEM_COMMIT | MEM_RESERVE, PAGE_READWRITE);
+#else
+                        stage_ptr = aligned_alloc(4096, cold_block_size_);
+#endif
+                    }
+                    cudaStream_t stream = nullptr;
+                    CUDA_CHECK(cudaStreamCreate(&stream));
+
+                    for (int idx = start_idx; idx < end_idx; idx++) {
+                        int i = cold_indices[idx];
+                        void* dst = flat_vram_ptrs_[i];
+                        int64_t file_offset = (int64_t)i * cold_block_size_;
+                        int64_t bytes = expert_file_cold_.pread_exact(stage_ptr, cold_block_size_, file_offset);
+                        if (bytes == cold_block_size_) {
+                            CUDA_CHECK(cudaMemcpyAsync(dst, stage_ptr, cold_block_size_, cudaMemcpyHostToDevice, stream));
+                            CUDA_CHECK(cudaStreamSynchronize(stream));
+                        } else {
+                            LOG_ERROR("Failed reading cold expert %d at offset %lld (got %lld)", i, (long long)file_offset, (long long)bytes);
+                        }
+                        int done = ++loaded_cold;
+                        if (done % 500 == 0 || done == num_cold) {
+                            LOG_INFO("  Preloaded %d/%d Cold experts into VRAM...", done, num_cold);
+                        }
+                    }
+                    CUDA_CHECK(cudaStreamDestroy(stream));
+                    if (stage_ptr) {
+                        if (is_pinned) cudaFreeHost(stage_ptr);
+                        else {
+#if defined(_WIN32) || defined(_WIN64)
+                            VirtualFree(stage_ptr, 0, MEM_RELEASE);
+#else
+                            free(stage_ptr);
+#endif
+                        }
+                    }
+                });
+            }
+            for (auto& w : workers) w.join();
+            workers.clear();
+        } else if (dram_cache_capacity_ > 0) {
+            // Hierarchical Mode: Preload cold experts into L2 Host DRAM!
+            int num_dram = std::min((int)cold_indices.size(), dram_cache_capacity_);
+            LOG_INFO("Preloading %d/%zu Cold experts into DRAM L2 cache (IQ2_XXS)...", num_dram, cold_indices.size());
+            std::atomic<int> loaded_cold{0};
+            int cold_chunk = (num_dram + n_threads - 1) / n_threads;
+
+            for (int t = 0; t < n_threads; t++) {
+                int start_i = t * cold_chunk;
+                int end_i = std::min(start_i + cold_chunk, num_dram);
+                if (start_i >= end_i) continue;
+
+                workers.emplace_back([this, start_i, end_i, &loaded_cold, num_dram, &cold_indices]() {
+                    for (int s = start_i; s < end_i; s++) {
+                        int glob_idx = cold_indices[s];
+                        int l = glob_idx / n_experts_;
+                        int e = glob_idx % n_experts_;
+                        int64_t file_offset = (int64_t)glob_idx * cold_block_size_;
+                        void* dst = dram_cache_slots_[s].gpu_data;
+                        int64_t bytes = expert_file_cold_.pread_exact(dst, cold_block_size_, file_offset);
+                        if (bytes == cold_block_size_) {
+                            dram_cache_slots_[s].layer_id = l;
+                            dram_cache_slots_[s].expert_id = e;
+                            dram_cache_slots_[s].last_used = 1;
+                            dram_cache_slots_[s].is_ready.store(true, std::memory_order_release);
+                        } else {
+                            LOG_ERROR("Failed reading cold expert %d into DRAM at offset %lld (got %lld)", glob_idx, (long long)file_offset, (long long)bytes);
+                        }
+                        int done = ++loaded_cold;
+                        if (done % 500 == 0 || done == num_dram) {
+                            LOG_INFO("  Preloaded %d/%d Cold experts into DRAM...", done, num_dram);
+                        }
+                    }
+                });
+            }
+            for (auto& w : workers) w.join();
+            workers.clear();
+
+            for (int s = 0; s < num_dram; s++) {
+                if (dram_cache_slots_[s].layer_id >= 0) {
+                    int64_t key = (int64_t)dram_cache_slots_[s].layer_id * n_experts_ + dram_cache_slots_[s].expert_id;
+                    dram_key_to_slot_[key] = s;
+                    if (key >= 0 && key < (int64_t)flat_dram_ptrs_.size()) {
+                        flat_dram_ptrs_[key] = dram_cache_slots_[s].gpu_data;
+                        flat_dram_slots_[key] = s;
+                    }
+                }
+            }
+        }
 
         // Copy flat pointer table to GPU for GPU-native kernel execution
         CUDA_CHECK(cudaMemcpy(flat_vram_ptrs_gpu_.data, flat_vram_ptrs_.data(),
                               flat_vram_ptrs_.size() * sizeof(void*), cudaMemcpyHostToDevice));
 
         auto elapsed = std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now() - start).count();
-        LOG_INFO("Preload completed: 100%% VRAM Resident (11008 experts) in %.2f seconds", elapsed / 1000.0);
+        LOG_INFO("Mixed MoE Preload completed in %.2f seconds (Hot: %d in VRAM, Cold: %d in DRAM)",
+                 elapsed / 1000.0, num_hot, (cold_pool_gpu_ ? (total - num_hot) : std::min((int)(total - num_hot), dram_cache_capacity_)));
         return true;
     }
 

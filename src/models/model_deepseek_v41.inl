@@ -253,41 +253,69 @@
         CUDA_CHECK(cudaEventSynchronize(dma_event_));
 
         void* exp_ptrs[6] = {nullptr};
+        bool is_cold_expert[6] = {false};
         size_t exp_block_sz = expert_loader_.expert_block_size() > 0 ? (size_t)expert_loader_.expert_block_size() : (size_t)18800640;
 
         for (int k = 0; k < top_k; k++) {
             int eid = topk_ids_host_[k];
             if (eid < 0 || eid >= n_experts) continue;
 
-            // Tier 1: Check L1 VRAM Cache (Zero-latency hit)
-            void* p_l1 = expert_loader_.try_get_expert_cached(layer_id, eid);
-            if (p_l1) {
-                exp_ptrs[k] = p_l1;
-                continue;
-            }
+            if (expert_loader_.is_mixed()) {
+                if (expert_loader_.is_hot(layer_id, eid)) {
+                    // Hot Expert: 100% VRAM Resident (Zero-latency hit)
+                    exp_ptrs[k] = expert_loader_.get_hot_vram_ptr(layer_id, eid);
+                    is_cold_expert[k] = false;
+                    continue;
+                } else {
+                    is_cold_expert[k] = true;
+                    // Cold Expert: Check L2 Host DRAM Cache
+                    void* dram_src = expert_loader_.get_flat_dram_ptr(layer_id, eid);
+                    if (!dram_src) dram_src = expert_loader_.try_get_dram_expert_ptr(layer_id, eid);
 
-            // Tier 2: Check L2 Host DRAM Cache (Microsecond PCIe DMA)
-            void* dram_src = expert_loader_.get_flat_dram_ptr(layer_id, eid);
-            if (!dram_src) dram_src = expert_loader_.try_get_dram_expert_ptr(layer_id, eid);
+                    // Tier 3: Fetch Cold Expert from NVMe SSD (Direct I/O)
+                    if (!dram_src) {
+                        int64_t key = (int64_t)layer_id * n_experts + eid;
+                        dram_src = expert_loader_.fetch_cold_expert_from_disk(layer_id, eid, key);
+                    }
 
-            // Tier 3: Fetch Cold Expert from NVMe SSD (Direct I/O)
-            if (!dram_src) {
-                int64_t key = (int64_t)layer_id * n_experts + eid;
-                dram_src = expert_loader_.fetch_cold_expert_from_disk(layer_id, eid, key);
-            }
+                    // DMA Transfer from DRAM -> VRAM Streaming Slot (only 9.95 MB!)
+                    void* vram_slot = streaming_slots_gpu_[0][k];
+                    if (dram_src && vram_slot) {
+                        CUDA_CHECK(cudaMemcpyAsync(vram_slot, dram_src, expert_loader_.cold_block_size(), cudaMemcpyHostToDevice, main_stream_));
+                        exp_ptrs[k] = vram_slot;
+                    }
+                }
+            } else {
+                // Tier 1: Check L1 VRAM Cache (Zero-latency hit)
+                void* p_l1 = expert_loader_.try_get_expert_cached(layer_id, eid);
+                if (p_l1) {
+                    exp_ptrs[k] = p_l1;
+                    continue;
+                }
 
-            // DMA Transfer from DRAM -> VRAM Streaming Slot
-            void* vram_slot = streaming_slots_gpu_[0][k];
-            if (dram_src && vram_slot) {
-                CUDA_CHECK(cudaMemcpyAsync(vram_slot, dram_src, exp_block_sz, cudaMemcpyHostToDevice, main_stream_));
-                exp_ptrs[k] = vram_slot;
+                // Tier 2: Check L2 Host DRAM Cache (Microsecond PCIe DMA)
+                void* dram_src = expert_loader_.get_flat_dram_ptr(layer_id, eid);
+                if (!dram_src) dram_src = expert_loader_.try_get_dram_expert_ptr(layer_id, eid);
+
+                // Tier 3: Fetch Cold Expert from NVMe SSD (Direct I/O)
+                if (!dram_src) {
+                    int64_t key = (int64_t)layer_id * n_experts + eid;
+                    dram_src = expert_loader_.fetch_cold_expert_from_disk(layer_id, eid, key);
+                }
+
+                // DMA Transfer from DRAM -> VRAM Streaming Slot
+                void* vram_slot = streaming_slots_gpu_[0][k];
+                if (dram_src && vram_slot) {
+                    CUDA_CHECK(cudaMemcpyAsync(vram_slot, dram_src, exp_block_sz, cudaMemcpyHostToDevice, main_stream_));
+                    exp_ptrs[k] = vram_slot;
+                }
             }
         }
 
         // ── 6. Compute 6 Routed Experts with Native SwiGLU ─────────────────────
         for (int k = 0; k < top_k; k++) {
             if (exp_ptrs[k]) {
-                execute_expert_swiglu(exp_ptrs[k], 1.0f, k, buf_hidden_.bf16());
+                execute_expert_swiglu(exp_ptrs[k], 1.0f, k, buf_hidden_.bf16(), is_cold_expert[k]);
             }
         }
 

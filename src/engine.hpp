@@ -1230,8 +1230,20 @@ public:
                                            hot_path, hot_block_size,
                                            map_path,
                                            expert_n_layers, expert_n_experts,
+                                           dram_cache_budget,
                                            buffered_io)) {
                 return false;
+            }
+
+            // Allocate streaming slots in VRAM if not all resident in VRAM
+            if (!expert_loader_.all_resident()) {
+                size_t max_block = std::max((size_t)expert_loader_.expert_block_size(),
+                                            (size_t)expert_loader_.cold_block_size());
+                for (int b = 0; b < 2; b++) {
+                    for (int k = 0; k < 32; k++) {
+                        CUDA_CHECK(cudaMalloc(&streaming_slots_gpu_[b][k], max_block));
+                    }
+                }
             }
 
             expert_loader_.preload_all_mixed(16);
