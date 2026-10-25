@@ -120,6 +120,14 @@ public:
     }
 
     int expert_block_size() const { return expert_block_size_; }
+    bool dram_is_pinned() const { return dram_is_pinned_; }
+    inline void* get_flat_dram_ptr(int layer_id, int expert_id) const {
+        int64_t key = (int64_t)layer_id * n_experts_ + expert_id;
+        if (key >= 0 && key < (int64_t)flat_dram_ptrs_.size()) {
+            return flat_dram_ptrs_[key];
+        }
+        return nullptr;
+    }
 
     inline void* try_get_dram_expert_ptr(int layer_id, int expert_id) {
         int64_t key = (int64_t)layer_id * n_experts_ + expert_id;
@@ -396,9 +404,24 @@ public:
                      (double)dram_cache_capacity_ * block_size / (1024.0 * 1024.0 * 1024.0),
                      dram_static_capacity_, dram_dynamic_capacity_);
             size_t total_dram_bytes = (size_t)dram_cache_capacity_ * block_size;
-            cudaError_t err = cudaMallocHost(&dram_cache_pool_, total_dram_bytes);
-            if (err != cudaSuccess) {
-                cudaGetLastError(); // Clear error state
+            size_t try_bytes = total_dram_bytes;
+            cudaError_t err = cudaErrorMemoryAllocation;
+            while (try_bytes >= 6ULL * 1024 * 1024 * 1024) {
+                err = cudaMallocHost(&dram_cache_pool_, try_bytes);
+                if (err == cudaSuccess) break;
+                cudaGetLastError();
+                if (try_bytes <= 512ULL * 1024 * 1024) break;
+                try_bytes -= 512ULL * 1024 * 1024;
+            }
+            if (err == cudaSuccess) {
+                total_dram_bytes = try_bytes;
+                dram_cache_capacity_ = (int)(total_dram_bytes / block_size);
+                dram_static_capacity_ = (dram_cache_capacity_ > 2000) ? 1000 : (dram_cache_capacity_ / 4);
+                dram_dynamic_capacity_ = dram_cache_capacity_ - dram_static_capacity_;
+                dram_is_pinned_ = true;
+                LOG_INFO("Allocated %.1f GB PINNED DRAM cache with cudaMallocHost (%d slots)",
+                         (double)total_dram_bytes / (1024.0 * 1024.0 * 1024.0), dram_cache_capacity_);
+            } else {
 #if defined(_WIN32) || defined(_WIN64)
                 dram_cache_pool_ = VirtualAlloc(NULL, total_dram_bytes, MEM_COMMIT | MEM_RESERVE, PAGE_READWRITE);
 #else
@@ -409,7 +432,7 @@ public:
                     if (reg_err != cudaSuccess) {
                         cudaGetLastError();
                         dram_is_pinned_ = false;
-                        LOG_WARN("cudaHostRegister could not pin %.1f GB DRAM cache. Using pinned staging buffers for async DMA.",
+                        LOG_INFO("Allocated %.1f GB DRAM cache in physical RAM",
                                  (double)total_dram_bytes / (1024.0 * 1024.0 * 1024.0));
                     } else {
                         dram_is_pinned_ = true;
@@ -420,10 +443,6 @@ public:
                     LOG_ERROR("System RAM allocation also failed. Disabling L2 DRAM cache.");
                     dram_cache_capacity_ = 0;
                 }
-            } else {
-                dram_is_pinned_ = true;
-                LOG_INFO("Allocated %.1f GB pinned DRAM cache with cudaMallocHost",
-                         (double)total_dram_bytes / (1024.0 * 1024.0 * 1024.0));
             }
             if (dram_cache_capacity_ > 0 && dram_cache_pool_) {
                 dram_cache_slots_.resize(dram_cache_capacity_);

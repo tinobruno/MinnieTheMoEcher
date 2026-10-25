@@ -5593,6 +5593,95 @@ void gemv_q8_0_f32_cuda(
     gemv_q8_0_kernel<float, false><<<blocks, threads, 0, stream>>>(out, vec, weight, N, K);
 }
 
+template <bool Residual>
+__global__ void gemm_q8_0_batch_kernel(
+    __nv_bfloat16* __restrict__ out,
+    const __nv_bfloat16* __restrict__ vec,
+    const block_q8_0* __restrict__ weight,
+    int M, int N, int K)
+{
+    int row = blockIdx.x * blockDim.y + threadIdx.y;
+    int m_base = blockIdx.y * 8;
+    if (row >= N || m_base >= M) return;
+
+    int lane = threadIdx.x;
+    int n_blocks = K / 32;
+    const block_q8_0* row_w = weight + (size_t)row * n_blocks;
+
+    int active_m = min(8, M - m_base);
+    const __nv_bfloat16* token_vecs[8];
+    #pragma unroll
+    for (int i = 0; i < 8; i++) {
+        token_vecs[i] = (i < active_m) ? (vec + (size_t)(m_base + i) * K) : nullptr;
+    }
+
+    float acc[8] = {0.0f};
+
+    for (int b = lane; b < n_blocks; b += 32) {
+        const block_q8_0* blk = &row_w[b];
+        float d = __half2float(blk->d);
+        const int8_t* qs = blk->qs;
+
+        #pragma unroll 8
+        for (int i = 0; i < 32; i++) {
+            float w = (float)qs[i] * d;
+            int col_idx = b * 32 + i;
+            #pragma unroll
+            for (int t = 0; t < 8; t++) {
+                if (t < active_m) {
+                    acc[t] = __fmaf_rn(w, __bfloat162float(token_vecs[t][col_idx]), acc[t]);
+                }
+            }
+        }
+    }
+
+    #pragma unroll
+    for (int offset = 16; offset > 0; offset /= 2) {
+        #pragma unroll
+        for (int t = 0; t < 8; t++) {
+            acc[t] += __shfl_down_sync(0xFFFFFFFF, acc[t], offset);
+        }
+    }
+
+    if (lane == 0) {
+        #pragma unroll
+        for (int t = 0; t < 8; t++) {
+            if (t >= active_m) break;
+            int m = m_base + t;
+            if constexpr (Residual) {
+                float cur = __bfloat162float(out[(size_t)m * N + row]);
+                out[(size_t)m * N + row] = __float2bfloat16(cur + acc[t]);
+            } else {
+                out[(size_t)m * N + row] = __float2bfloat16(acc[t]);
+            }
+        }
+    }
+}
+
+void gemm_q8_0_batch_cuda(
+    __nv_bfloat16* out,
+    const __nv_bfloat16* vec,
+    const block_q8_0* weight,
+    int M, int N, int K,
+    cudaStream_t stream)
+{
+    dim3 threads(32, 4);
+    dim3 blocks((N + 3) / 4, (M + 7) / 8);
+    gemm_q8_0_batch_kernel<false><<<blocks, threads, 0, stream>>>(out, vec, weight, M, N, K);
+}
+
+void gemm_q8_0_residual_batch_cuda(
+    __nv_bfloat16* inout,
+    const __nv_bfloat16* vec,
+    const block_q8_0* weight,
+    int M, int N, int K,
+    cudaStream_t stream)
+{
+    dim3 threads(32, 4);
+    dim3 blocks((N + 3) / 4, (M + 7) / 8);
+    gemm_q8_0_batch_kernel<true><<<blocks, threads, 0, stream>>>(inout, vec, weight, M, N, K);
+}
+
 __global__ void iq2_xxs_dequant_kernel(
     __nv_bfloat16* __restrict__ out,
     const block_iq2_xxs* __restrict__ weight,
@@ -13577,7 +13666,8 @@ __global__ void moe_nemotron_down_scaled_residual_batch_kernel(
     const float* __restrict__ expert_scales,
     int M, int N, int K,
     int top_k = 6,
-    int n_experts = 128)
+    int n_experts = 128,
+    int down_offset_padding = 0)
 {
     int row = blockIdx.x * blockDim.y + threadIdx.y;
     int m = blockIdx.y;
@@ -13602,7 +13692,7 @@ __global__ void moe_nemotron_down_scaled_residual_batch_kernel(
         if (!ptr) continue;
 
         const uint8_t* exp_ptr = (const uint8_t*)ptr;
-        const uint8_t* down_w = exp_ptr + up_w_bytes + up_s_bytes;
+        const uint8_t* down_w = exp_ptr + up_w_bytes + up_s_bytes + down_offset_padding;
         const uint8_t* down_s = down_w + down_w_bytes;
         float scale_2 = expert_scales ? expert_scales[eid * 2 + 1] : 1.0f;
 
@@ -13847,7 +13937,8 @@ __global__ void moe_nemotron_binned_down_scaled_residual_batch_kernel(
     const float* expert_scales,
     int M, int N, int K,
     int top_k = 6,
-    int n_experts = 128)
+    int n_experts = 128,
+    int down_offset_padding = 0)
 {
     int r = blockIdx.x * blockDim.y + threadIdx.y;
     int row0 = r * 2;
@@ -13868,7 +13959,7 @@ __global__ void moe_nemotron_binned_down_scaled_residual_batch_kernel(
     size_t down_w_bytes = (size_t)N * (K / 2);
 
     const uint8_t* exp_ptr = (const uint8_t*)expert_ptrs[eid];
-    const uint8_t* down_w = exp_ptr + up_w_bytes + up_s_bytes;
+    const uint8_t* down_w = exp_ptr + up_w_bytes + up_s_bytes + down_offset_padding;
     const uint8_t* down_s = down_w + down_w_bytes;
     float scale_2 = expert_scales ? expert_scales[eid * 2 + 1] : 1.0f;
 
@@ -14037,20 +14128,490 @@ void moe_nemotron_down_scaled_residual_batch_cuda(
     int M, int N, int K,
     cudaStream_t stream,
     int top_k,
-    int n_experts)
+    int n_experts,
+    int down_offset_padding)
 {
     if (M > 1 && expert_offsets != nullptr) {
         dim3 threads(32, 4);
         dim3 blocks(((N / 2) + 3) / 4, n_experts);
         moe_nemotron_binned_down_scaled_residual_batch_kernel<<<blocks, threads, 0, stream>>>(
             hidden_out, gate_in, topk_weights, expert_offsets, expert_token_indices, expert_token_slots,
-            expert_ptrs, expert_scales, M, N, K, top_k, n_experts);
+            expert_ptrs, expert_scales, M, N, K, top_k, n_experts, down_offset_padding);
     } else {
         dim3 threads(32, 4);
         dim3 blocks((N + 3) / 4, M);
         moe_nemotron_down_scaled_residual_batch_kernel<<<blocks, threads, 0, stream>>>(
-            hidden_out, gate_in, topk_ids, topk_weights, expert_ptrs, expert_scales, M, N, K, top_k, n_experts);
+            hidden_out, gate_in, topk_ids, topk_weights, expert_ptrs, expert_scales, M, N, K, top_k, n_experts, down_offset_padding);
     }
 }
+
+// ════════════════════════════════════════════════════════════════════════════════
+// BATCHED IQ2_XXS GEMM & MOE ROUTING KERNELS (Nemotron Bolt 24GB Support)
+// ════════════════════════════════════════════════════════════════════════════════
+
+template<bool Relu2, bool Residual>
+__global__ void gemm_iq2_xxs_batch_kernel(
+    __nv_bfloat16* __restrict__ out,
+    const __nv_bfloat16* __restrict__ vec,
+    const block_iq2_xxs* __restrict__ weight,
+    int M, int N, int K)
+{
+    __shared__ uint64_t s_grid[256];
+    __shared__ uint8_t s_signs[128];
+
+    int tid = threadIdx.y * 32 + threadIdx.x;
+    if (tid < 128) {
+        s_signs[tid] = c_ksigns_iq2xs[tid];
+    }
+    s_grid[tid] = c_iq2xxs_grid[tid];
+    if (blockDim.y * 32 < 256) {
+        s_grid[tid + 128] = c_iq2xxs_grid[tid + 128];
+    }
+    __syncthreads();
+
+    int row = blockIdx.x * blockDim.y + threadIdx.y;
+    int m_base = blockIdx.y * 8;
+
+    if (row >= N || m_base >= M) return;
+
+    int lane = threadIdx.x;
+    int n_blocks = K / 256;
+    const block_iq2_xxs* row_w = weight + (size_t)row * n_blocks;
+
+    int active_m = min(8, M - m_base);
+    const __nv_bfloat16* token_vecs[8];
+    #pragma unroll
+    for (int i = 0; i < 8; i++) {
+        token_vecs[i] = (i < active_m) ? (vec + (size_t)(m_base + i) * K) : nullptr;
+    }
+
+    int l = lane / 8;
+    int j = lane % 8;
+    uint8_t kmask = 1 << j;
+
+    float sums[8] = {0.0f};
+
+    for (int b = 0; b < n_blocks; b++) {
+        const block_iq2_xxs* blk = &row_w[b];
+        float d = __half2float(blk->d);
+        const uint16_t* qs = blk->qs;
+
+        #pragma unroll 4
+        for (int ib32 = 0; ib32 < 8; ib32++) {
+            uint32_t q0 = qs[ib32 * 4 + 0];
+            uint32_t q1 = qs[ib32 * 4 + 1];
+            uint32_t q2 = qs[ib32 * 4 + 2];
+            uint32_t q3 = qs[ib32 * 4 + 3];
+
+            uint32_t aux0 = q0 | (q1 << 16);
+            uint32_t aux1 = q2 | (q3 << 16);
+            float db = d * (0.5f + (aux1 >> 28)) * 0.25f;
+
+            uint8_t grid_idx = (aux0 >> (8 * l)) & 0xFF;
+            uint8_t sign_idx = (aux1 >> (7 * l)) & 0x7F;
+
+            uint64_t grid_val = s_grid[grid_idx];
+            uint8_t sign_val = s_signs[sign_idx];
+
+            uint8_t byte_val = (grid_val >> (8 * j)) & 0xFF;
+            float sign_mult = (sign_val & kmask) ? -1.0f : 1.0f;
+            float w = db * (float)byte_val * sign_mult;
+
+            int col_idx = (b << 8) + (ib32 << 5) + lane;
+            #pragma unroll
+            for (int i = 0; i < 8; i++) {
+                if (i < active_m) {
+                    float a = __bfloat162float(token_vecs[i][col_idx]);
+                    sums[i] = __fmaf_rn(w, a, sums[i]);
+                }
+            }
+        }
+    }
+
+    #pragma unroll
+    for (int offset = 16; offset > 0; offset /= 2) {
+        #pragma unroll
+        for (int i = 0; i < 8; i++) {
+            sums[i] += __shfl_down_sync(0xffffffff, sums[i], offset);
+        }
+    }
+
+    if (lane == 0) {
+        #pragma unroll
+        for (int i = 0; i < 8; i++) {
+            if (i >= active_m) break;
+            int m = m_base + i;
+            float sum = sums[i];
+            if constexpr (Relu2) {
+                sum = (sum > 0.0f) ? (sum * sum) : 0.0f;
+                out[(size_t)m * N + row] = __float2bfloat16(sum);
+            } else if constexpr (Residual) {
+                float cur = __bfloat162float(out[(size_t)m * N + row]);
+                out[(size_t)m * N + row] = __float2bfloat16(cur + sum);
+            } else {
+                out[(size_t)m * N + row] = __float2bfloat16(sum);
+            }
+        }
+    }
+}
+
+void gemm_iq2_xxs_relu2_batch_cuda(
+    __nv_bfloat16* out,
+    const __nv_bfloat16* vec,
+    const block_iq2_xxs* weight,
+    int M, int N, int K,
+    cudaStream_t stream)
+{
+    dim3 threads(32, 4);
+    dim3 blocks((N + 3) / 4, (M + 7) / 8);
+    gemm_iq2_xxs_batch_kernel<true, false><<<blocks, threads, 0, stream>>>(out, vec, weight, M, N, K);
+}
+
+void gemm_iq2_xxs_residual_batch_cuda(
+    __nv_bfloat16* inout,
+    const __nv_bfloat16* vec,
+    const block_iq2_xxs* weight,
+    int M, int N, int K,
+    cudaStream_t stream)
+{
+    dim3 threads(32, 4);
+    dim3 blocks((N + 3) / 4, (M + 7) / 8);
+    gemm_iq2_xxs_batch_kernel<false, true><<<blocks, threads, 0, stream>>>(inout, vec, weight, M, N, K);
+}
+
+__launch_bounds__(128)
+__global__ void moe_iq2_xxs_binned_up_relu2_batch_kernel(
+    __nv_bfloat16* __restrict__ gate_out,
+    const __nv_bfloat16* __restrict__ hidden_in,
+    const int32_t* __restrict__ expert_offsets,
+    const int32_t* __restrict__ expert_token_indices,
+    const int32_t* __restrict__ expert_token_slots,
+    const void* const* __restrict__ expert_ptrs,
+    const float* expert_scales,
+    int M, int N, int K,
+    int top_k,
+    int n_experts)
+{
+    __shared__ uint64_t s_grid[256];
+    __shared__ uint8_t s_signs[128];
+
+    int tid = threadIdx.y * 32 + threadIdx.x;
+    if (tid < 128) {
+        s_signs[tid] = c_ksigns_iq2xs[tid];
+    }
+    s_grid[tid] = c_iq2xxs_grid[tid];
+    if (blockDim.y * 32 < 256) {
+        s_grid[tid + 128] = c_iq2xxs_grid[tid + 128];
+    }
+    __syncthreads();
+
+    int row = blockIdx.x * blockDim.y + threadIdx.y;
+    int eid = blockIdx.y;
+
+    if (row >= N || eid >= n_experts) return;
+
+    int start_idx = expert_offsets[eid];
+    int end_idx = expert_offsets[eid + 1];
+    int num_toks = end_idx - start_idx;
+
+    if (num_toks <= 0) return;
+    if (!expert_ptrs || !expert_ptrs[eid]) return;
+
+    const block_iq2_xxs* up_w = (const block_iq2_xxs*)expert_ptrs[eid];
+    float scale_2 = expert_scales ? expert_scales[eid * 2 + 0] : 1.0f;
+
+    int lane = threadIdx.x;
+    int n_blocks = K / 256;
+    const block_iq2_xxs* row_w = up_w + (size_t)row * n_blocks;
+
+    int l = lane / 8;
+    int j = lane % 8;
+    uint8_t kmask = 1 << j;
+
+    for (int t_base = 0; t_base < num_toks; t_base += 8) {
+        int active_t = min(8, num_toks - t_base);
+        const __nv_bfloat16* vecs[8];
+        #pragma unroll
+        for (int i = 0; i < 8; i++) {
+            if (i < active_t) {
+                int m = expert_token_indices[start_idx + t_base + i];
+                vecs[i] = hidden_in + (size_t)m * K;
+            } else {
+                vecs[i] = nullptr;
+            }
+        }
+
+        float acc[8] = {0.0f};
+
+        for (int b = 0; b < n_blocks; b++) {
+            const block_iq2_xxs* blk = &row_w[b];
+            float d = __half2float(blk->d);
+            const uint16_t* qs = blk->qs;
+
+            #pragma unroll 4
+            for (int ib32 = 0; ib32 < 8; ib32++) {
+                uint32_t q0 = qs[ib32 * 4 + 0];
+                uint32_t q1 = qs[ib32 * 4 + 1];
+                uint32_t q2 = qs[ib32 * 4 + 2];
+                uint32_t q3 = qs[ib32 * 4 + 3];
+
+                uint32_t aux0 = q0 | (q1 << 16);
+                uint32_t aux1 = q2 | (q3 << 16);
+                float db = d * (0.5f + (aux1 >> 28)) * 0.25f;
+
+                uint8_t grid_idx = (aux0 >> (8 * l)) & 0xFF;
+                uint8_t sign_idx = (aux1 >> (7 * l)) & 0x7F;
+
+                uint64_t grid_val = s_grid[grid_idx];
+                uint8_t sign_val = s_signs[sign_idx];
+
+                uint8_t byte_val = (grid_val >> (8 * j)) & 0xFF;
+                float sign_mult = (sign_val & kmask) ? -1.0f : 1.0f;
+                float w = db * (float)byte_val * sign_mult;
+
+                int col_idx = (b << 8) + (ib32 << 5) + lane;
+                #pragma unroll
+                for (int t = 0; t < 8; t++) {
+                    if (t < active_t) {
+                        float a = __bfloat162float(vecs[t][col_idx]);
+                        acc[t] = __fmaf_rn(w, a, acc[t]);
+                    }
+                }
+            }
+        }
+
+        #pragma unroll
+        for (int offset = 16; offset > 0; offset /= 2) {
+            #pragma unroll
+            for (int t = 0; t < 8; t++) {
+                acc[t] += __shfl_down_sync(0xFFFFFFFF, acc[t], offset);
+            }
+        }
+
+        if (lane == 0) {
+            #pragma unroll
+            for (int t = 0; t < 8; t++) {
+                if (t >= active_t) break;
+                int m = expert_token_indices[start_idx + t_base + t];
+                int k = expert_token_slots[start_idx + t_base + t];
+                float r = acc[t] * scale_2;
+                float r2 = (r > 0.0f) ? (r * r) : 0.0f;
+                gate_out[((size_t)m * top_k + k) * N + row] = __float2bfloat16(r2);
+            }
+        }
+    }
+}
+
+void moe_iq2_xxs_binned_up_relu2_batch_cuda(
+    __nv_bfloat16* gate_out,
+    const __nv_bfloat16* hidden_in,
+    const int32_t* expert_offsets,
+    const int32_t* expert_token_indices,
+    const int32_t* expert_token_slots,
+    const void* const* expert_ptrs,
+    const float* expert_scales,
+    int M, int N, int K,
+    cudaStream_t stream,
+    int top_k,
+    int n_experts)
+{
+    dim3 threads(32, 4);
+    dim3 blocks((N + 3) / 4, n_experts);
+    moe_iq2_xxs_binned_up_relu2_batch_kernel<<<blocks, threads, 0, stream>>>(
+        gate_out, hidden_in, expert_offsets, expert_token_indices, expert_token_slots,
+        expert_ptrs, expert_scales, M, N, K, top_k, n_experts);
+}
+
+__launch_bounds__(128)
+__global__ void moe_iq2_xxs_binned_down_scaled_residual_batch_kernel(
+    __nv_bfloat16* __restrict__ hidden_out,
+    const __nv_bfloat16* __restrict__ gate_in,
+    const float* __restrict__ topk_weights,
+    const int32_t* __restrict__ expert_offsets,
+    const int32_t* __restrict__ expert_token_indices,
+    const int32_t* __restrict__ expert_token_slots,
+    const void* const* __restrict__ expert_ptrs,
+    const float* expert_scales,
+    int M, int N, int K,
+    int top_k,
+    int n_experts,
+    size_t down_offset_bytes)
+{
+    __shared__ uint64_t s_grid[256];
+    __shared__ uint8_t s_signs[128];
+
+    int tid = threadIdx.y * 32 + threadIdx.x;
+    if (tid < 128) {
+        s_signs[tid] = c_ksigns_iq2xs[tid];
+    }
+    s_grid[tid] = c_iq2xxs_grid[tid];
+    if (blockDim.y * 32 < 256) {
+        s_grid[tid + 128] = c_iq2xxs_grid[tid + 128];
+    }
+    __syncthreads();
+
+    int r = blockIdx.x * blockDim.y + threadIdx.y;
+    int row0 = r * 2;
+    int row1 = row0 + 1;
+    int eid = blockIdx.y;
+
+    if (row0 >= N || eid >= n_experts) return;
+
+    int start_idx = expert_offsets[eid];
+    int end_idx = expert_offsets[eid + 1];
+    int num_toks = end_idx - start_idx;
+
+    if (num_toks <= 0) return;
+    if (!expert_ptrs || !expert_ptrs[eid]) return;
+
+    const block_iq2_xxs* down_w = (const block_iq2_xxs*)((const uint8_t*)expert_ptrs[eid] + down_offset_bytes);
+    float scale_2 = expert_scales ? expert_scales[eid * 2 + 1] : 1.0f;
+
+    int lane = threadIdx.x;
+    int n_blocks = K / 256;
+    const block_iq2_xxs* row0_w = down_w + (size_t)row0 * n_blocks;
+    const block_iq2_xxs* row1_w = down_w + (size_t)row1 * n_blocks;
+
+    int l = lane / 8;
+    int j = lane % 8;
+    uint8_t kmask = 1 << j;
+
+    for (int t_base = 0; t_base < num_toks; t_base += 8) {
+        int active_t = min(8, num_toks - t_base);
+        const __nv_bfloat16* vecs[8];
+        float scaled_weights[8];
+        int tok_m[8];
+
+        #pragma unroll
+        for (int i = 0; i < 8; i++) {
+            if (i < active_t) {
+                int m = expert_token_indices[start_idx + t_base + i];
+                int k = expert_token_slots[start_idx + t_base + i];
+                tok_m[i] = m;
+                float w = topk_weights ? topk_weights[m * top_k + k] : 1.0f;
+                scaled_weights[i] = w * scale_2;
+                vecs[i] = gate_in + ((size_t)m * top_k + k) * K;
+            } else {
+                scaled_weights[i] = 0.0f;
+                tok_m[i] = 0;
+                vecs[i] = nullptr;
+            }
+        }
+
+        float acc0[8] = {0.0f};
+        float acc1[8] = {0.0f};
+
+        for (int b = 0; b < n_blocks; b++) {
+            const block_iq2_xxs* blk0 = &row0_w[b];
+            float d0 = __half2float(blk0->d);
+            const uint16_t* qs0 = blk0->qs;
+
+            const block_iq2_xxs* blk1 = &row1_w[b];
+            float d1 = __half2float(blk1->d);
+            const uint16_t* qs1 = blk1->qs;
+
+            #pragma unroll 4
+            for (int ib32 = 0; ib32 < 8; ib32++) {
+                uint32_t q0_0 = qs0[ib32 * 4 + 0];
+                uint32_t q1_0 = qs0[ib32 * 4 + 1];
+                uint32_t q2_0 = qs0[ib32 * 4 + 2];
+                uint32_t q3_0 = qs0[ib32 * 4 + 3];
+
+                uint32_t aux0_0 = q0_0 | (q1_0 << 16);
+                uint32_t aux1_0 = q2_0 | (q3_0 << 16);
+                float db0 = d0 * (0.5f + (aux1_0 >> 28)) * 0.25f;
+
+                uint8_t grid_idx0 = (aux0_0 >> (8 * l)) & 0xFF;
+                uint8_t sign_idx0 = (aux1_0 >> (7 * l)) & 0x7F;
+
+                uint64_t grid_val0 = s_grid[grid_idx0];
+                uint8_t sign_val0 = s_signs[sign_idx0];
+
+                uint8_t byte_val0 = (grid_val0 >> (8 * j)) & 0xFF;
+                float sign_mult0 = (sign_val0 & kmask) ? -1.0f : 1.0f;
+                float w0 = db0 * (float)byte_val0 * sign_mult0;
+
+                uint32_t q0_1 = qs1[ib32 * 4 + 0];
+                uint32_t q1_1 = qs1[ib32 * 4 + 1];
+                uint32_t q2_1 = qs1[ib32 * 4 + 2];
+                uint32_t q3_1 = qs1[ib32 * 4 + 3];
+
+                uint32_t aux0_1 = q0_1 | (q1_1 << 16);
+                uint32_t aux1_1 = q2_1 | (q3_1 << 16);
+                float db1 = d1 * (0.5f + (aux1_1 >> 28)) * 0.25f;
+
+                uint8_t grid_idx1 = (aux0_1 >> (8 * l)) & 0xFF;
+                uint8_t sign_idx1 = (aux1_1 >> (7 * l)) & 0x7F;
+
+                uint64_t grid_val1 = s_grid[grid_idx1];
+                uint8_t sign_val1 = s_signs[sign_idx1];
+
+                uint8_t byte_val1 = (grid_val1 >> (8 * j)) & 0xFF;
+                float sign_mult1 = (sign_val1 & kmask) ? -1.0f : 1.0f;
+                float w1 = db1 * (float)byte_val1 * sign_mult1;
+
+                int col_idx = (b << 8) + (ib32 << 5) + lane;
+                #pragma unroll
+                for (int t = 0; t < 8; t++) {
+                    if (t < active_t) {
+                        float a = __bfloat162float(vecs[t][col_idx]);
+                        acc0[t] = __fmaf_rn(w0, a, acc0[t]);
+                        acc1[t] = __fmaf_rn(w1, a, acc1[t]);
+                    }
+                }
+            }
+        }
+
+        #pragma unroll
+        for (int offset = 16; offset > 0; offset /= 2) {
+            #pragma unroll
+            for (int t = 0; t < 8; t++) {
+                acc0[t] += __shfl_down_sync(0xFFFFFFFF, acc0[t], offset);
+                acc1[t] += __shfl_down_sync(0xFFFFFFFF, acc1[t], offset);
+            }
+        }
+
+        if (lane == 0) {
+            #pragma unroll
+            for (int t = 0; t < 8; t++) {
+                if (t >= active_t) break;
+                float sw = scaled_weights[t];
+                if (sw != 0.0f) {
+                    float val0 = acc0[t] * sw;
+                    float val1 = acc1[t] * sw;
+                    if (row1 < N) {
+                        __nv_bfloat162 v2 = __floats2bfloat162_rn(val0, val1);
+                        atomicAdd((__nv_bfloat162*)&hidden_out[(size_t)tok_m[t] * N + row0], v2);
+                    } else {
+                        atomicAdd((__nv_bfloat16*)&hidden_out[(size_t)tok_m[t] * N + row0], __float2bfloat16(val0));
+                    }
+                }
+            }
+        }
+    }
+}
+
+void moe_iq2_xxs_binned_down_scaled_residual_batch_cuda(
+    __nv_bfloat16* hidden_out,
+    const __nv_bfloat16* gate_in,
+    const float* topk_weights,
+    const int32_t* expert_offsets,
+    const int32_t* expert_token_indices,
+    const int32_t* expert_token_slots,
+    const void* const* expert_ptrs,
+    const float* expert_scales,
+    int M, int N, int K,
+    cudaStream_t stream,
+    int top_k,
+    int n_experts,
+    size_t down_offset_bytes)
+{
+    dim3 threads(32, 4);
+    dim3 blocks(((N / 2) + 3) / 4, n_experts);
+    moe_iq2_xxs_binned_down_scaled_residual_batch_kernel<<<blocks, threads, 0, stream>>>(
+        hidden_out, gate_in, topk_weights, expert_offsets, expert_token_indices, expert_token_slots,
+        expert_ptrs, expert_scales, M, N, K, top_k, n_experts, down_offset_bytes);
+}
+
 
 

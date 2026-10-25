@@ -4,38 +4,89 @@
     "model_id": "qwen3.8-27B-Vision-13G",
     "architecture": "DeltaNet Linear Attention + MTP Speculative Decoding",
     "status": "SUCCESS",
-    "load_time_s": 70.24,
-    "vram_delta_mb": 14302.0,
-    "peak_vram_mb": 14987.0,
-    "power_draw_w": 57.29,
+    "load_time_s": 51.37,
+    "vram_delta_mb": 14512.0,
+    "peak_vram_mb": 15316.0,
+    "power_draw_w": 166.65,
     "tests": [
       {
         "test_name": "Direct Chat (No Thinking)",
         "result": {
           "success": true,
-          "elapsed_s": 32.829,
+          "elapsed_s": 2.489,
           "prompt_tokens": 27,
-          "completion_tokens": 67,
-          "tok_per_sec": 2.04,
-          "content_preview": "A mutex is a binary locking mechanism that ensures only one thread can access a resource at a time, typically requiring"
+          "completion_tokens": 64,
+          "total_tokens": 91,
+          "prefill_tps": 72.37,
+          "decode_tps": 31.88,
+          "total_tps": 36.56,
+          "tok_per_sec": 36.56,
+          "delivery_tps": 25.72,
+          "content_preview": "A mutex is a binary lock that ensures only one thread can access a resource at a time, typically requiring the same thre"
         }
       },
       {
         "test_name": "Code Synthesis",
         "result": {
           "success": true,
-          "elapsed_s": 55.725,
+          "elapsed_s": 4.139,
           "prompt_tokens": 32,
           "completion_tokens": 120,
-          "tok_per_sec": 2.15,
+          "total_tokens": 152,
+          "prefill_tps": 72.61,
+          "decode_tps": 32.91,
+          "total_tps": 36.72,
+          "tok_per_sec": 36.72,
+          "delivery_tps": 28.99,
           "content_preview": "```python def fibonacci(n: int) -> int:     \"\"\"     Calculate the nth Fibonacci number iteratively.          The Fibonac"
         }
       },
       {
         "test_name": "Step-by-Step Reasoning (Thinking)",
         "result": {
-          "success": false,
-          "error": "timed out"
+          "success": true,
+          "elapsed_s": 25.875,
+          "prompt_tokens": 60,
+          "completion_tokens": 537,
+          "total_tokens": 597,
+          "prefill_tps": 57.76,
+          "decode_tps": 21.69,
+          "total_tps": 23.07,
+          "tok_per_sec": 23.07,
+          "delivery_tps": 20.75,
+          "content_preview": "The user is asking the classic bat and ball riddle. Let me work through this carefully.  The problem: A bat and a ball c"
+        }
+      },
+      {
+        "test_name": "Explanatory Thinking (SSD vs RAM)",
+        "result": {
+          "success": true,
+          "elapsed_s": 18.416,
+          "prompt_tokens": 32,
+          "completion_tokens": 399,
+          "total_tokens": 431,
+          "prefill_tps": 46.47,
+          "decode_tps": 22.26,
+          "total_tps": 23.4,
+          "tok_per_sec": 23.4,
+          "delivery_tps": 21.67,
+          "content_preview": "The user is asking me to explain the difference between SSD and RAM in simple terms. This is a straightforward computer"
+        }
+      },
+      {
+        "test_name": "Long Document Analysis (~512 tok Prefill)",
+        "result": {
+          "success": true,
+          "elapsed_s": 3.642,
+          "prompt_tokens": 413,
+          "completion_tokens": 80,
+          "total_tokens": 493,
+          "prefill_tps": 669.6,
+          "decode_tps": 27.23,
+          "total_tps": 135.38,
+          "tok_per_sec": 135.38,
+          "delivery_tps": 21.97,
+          "content_preview": "Based on the text provided, here are the key mechanisms:  *   **Safety and Consistency:** Raft ensures safety through lo"
         }
       }
     ]
@@ -45,30 +96,40 @@
     "model_id": "nvidia/NVIDIA-Nemotron-3.5-Bolt-74B-A9B-24GB",
     "architecture": "Hybrid Mamba-2 SSM + GQA Attention + Sparse MoE (NVFP4)",
     "status": "SUCCESS",
-    "load_time_s": 97.47,
-    "vram_delta_mb": 14173.0,
-    "peak_vram_mb": 15121.0,
-    "power_draw_w": 79.37,
+    "load_time_s": 42.15,
+    "vram_delta_mb": 14866.0,
+    "peak_vram_mb": 15160.0,
+    "power_draw_w": 86.9,
     "tests": [
       {
         "test_name": "Direct Chat (No Thinking)",
         "result": {
           "success": true,
-          "elapsed_s": 16.391,
+          "elapsed_s": 8.674,
           "prompt_tokens": 53,
           "completion_tokens": 50,
-          "tok_per_sec": 3.05,
-          "content_preview": "A mutex is a mutual exclusion lock that allows only one thread to access a resource at a time, ensuring data integrity."
+          "total_tokens": 103,
+          "prefill_tps": 14.02,
+          "decode_tps": 8.52,
+          "total_tps": 11.87,
+          "tok_per_sec": 11.87,
+          "delivery_tps": 5.76,
+          "content_preview": "A mutex is a mutual exclusion lock that allows only one thread to access a resource at a time, ensuring exclusive owners"
         }
       },
       {
         "test_name": "Code Synthesis",
         "result": {
           "success": true,
-          "elapsed_s": 18.456,
+          "elapsed_s": 14.216,
           "prompt_tokens": 59,
           "completion_tokens": 120,
-          "tok_per_sec": 6.5,
+          "total_tokens": 179,
+          "prefill_tps": 17.17,
+          "decode_tps": 10.06,
+          "total_tps": 12.59,
+          "tok_per_sec": 12.59,
+          "delivery_tps": 8.44,
           "content_preview": "```python def fibonacci(n: int) -> int:     \"\"\"     Calculate the nth Fibonacci number iteratively.      The sequence is"
         }
       },
@@ -76,55 +137,196 @@
         "test_name": "Step-by-Step Reasoning (Thinking)",
         "result": {
           "success": true,
-          "elapsed_s": 56.661,
+          "elapsed_s": 40.749,
           "prompt_tokens": 77,
-          "completion_tokens": 439,
-          "tok_per_sec": 7.75,
-          "content_preview": "Let's solve this step by step.  **Step 1: Define variables** - Let **x** = the cost of the ball - Then the bat costs **x"
+          "completion_tokens": 506,
+          "total_tokens": 583,
+          "prefill_tps": 31.6,
+          "decode_tps": 13.0,
+          "total_tps": 14.31,
+          "tok_per_sec": 14.31,
+          "delivery_tps": 12.42,
+          "content_preview": "The user is asking me to solve the classic \"bat and ball\" problem.  Problem statement: - A bat and a ball cost $1.10 in"
+        }
+      },
+      {
+        "test_name": "Explanatory Thinking (SSD vs RAM)",
+        "result": {
+          "success": true,
+          "elapsed_s": 47.288,
+          "prompt_tokens": 49,
+          "completion_tokens": 759,
+          "total_tokens": 808,
+          "prefill_tps": 29.75,
+          "decode_tps": 16.34,
+          "total_tps": 17.09,
+          "tok_per_sec": 17.09,
+          "delivery_tps": 16.05,
+          "content_preview": "The user wants an explanation of the difference between SSD (Solid State Drive) and RAM (Random Access Memory) in simple"
+        }
+      },
+      {
+        "test_name": "Long Document Analysis (~512 tok Prefill)",
+        "result": {
+          "success": true,
+          "elapsed_s": 12.048,
+          "prompt_tokens": 440,
+          "completion_tokens": 80,
+          "total_tokens": 520,
+          "prefill_tps": 79.58,
+          "decode_tps": 11.94,
+          "total_tps": 43.16,
+          "tok_per_sec": 43.16,
+          "delivery_tps": 6.64,
+          "content_preview": "* **Safety and Consensus:** Raft ensures safety through leader election, log matching invariants, and state machine comm"
         }
       }
     ]
   },
   {
     "model_name": "Nemotron 3.5 Lightning (30B-A3B)",
-    "manifest": "E:\\dev\\MinnieTheMoEcher\\models\\nemotron_3.5_lightning\\moecher_manifest.json",
-    "status": "FAILED_TO_LOAD",
-    "error": "Process terminated prematurely with exit code 1",
-    "load_time_s": 120.32
-  },
-  {
-    "model_name": "Nemotron 3.5 Bolt (16GB Profile)",
-    "model_id": "nvidia/NVIDIA-Nemotron-3.5-Bolt-74B-A9B-NVFP4",
+    "model_id": "nvidia/NVIDIA-Nemotron-3.5-Lightning-30B-A3B-NVFP4",
     "architecture": "Hybrid Mamba-2 SSM + GQA Attention + Sparse MoE (NVFP4)",
     "status": "SUCCESS",
-    "load_time_s": 51.95,
-    "vram_delta_mb": 14730.0,
-    "peak_vram_mb": 15202.0,
-    "power_draw_w": 43.61,
+    "load_time_s": 87.31,
+    "vram_delta_mb": 12261.0,
+    "peak_vram_mb": 12654.0,
+    "power_draw_w": 65.9,
     "tests": [
       {
         "test_name": "Direct Chat (No Thinking)",
         "result": {
           "success": true,
-          "elapsed_s": 46.43,
+          "elapsed_s": 3.013,
           "prompt_tokens": 53,
-          "completion_tokens": 46,
-          "tok_per_sec": 0.99,
-          "content_preview": "A mutex is a mutual exclusion lock that allows only one thread to access a resource at a time. A semaphore is a counter"
+          "completion_tokens": 39,
+          "total_tokens": 92,
+          "prefill_tps": 31.15,
+          "decode_tps": 18.6,
+          "total_tps": 30.54,
+          "tok_per_sec": 30.54,
+          "delivery_tps": 12.94,
+          "content_preview": "A mutex is a lock that ensures only one thread can access a resource at a time, while a semaphore is a signaling mechani"
         }
       },
       {
         "test_name": "Code Synthesis",
         "result": {
-          "success": false,
-          "error": "timed out"
+          "success": true,
+          "elapsed_s": 7.027,
+          "prompt_tokens": 59,
+          "completion_tokens": 120,
+          "total_tokens": 179,
+          "prefill_tps": 51.11,
+          "decode_tps": 18.9,
+          "total_tps": 25.47,
+          "tok_per_sec": 25.47,
+          "delivery_tps": 17.08,
+          "content_preview": "Here is a clean Python function to calculate the nth Fibonacci number iteratively, complete with type hints and a docstr"
+        }
+      },
+      {
+        "test_name": "Step-by-Step Reasoning (Thinking)",
+        "result": {
+          "success": true,
+          "elapsed_s": 20.459,
+          "prompt_tokens": 77,
+          "completion_tokens": 401,
+          "total_tokens": 478,
+          "prefill_tps": 56.05,
+          "decode_tps": 20.53,
+          "total_tps": 23.36,
+          "tok_per_sec": 23.36,
+          "delivery_tps": 19.6,
+          "content_preview": "Here we have a classic puzzle: \"A bat and a ball cost $1.10 in total. The bat costs $1.00 more than the ball. How much d"
+        }
+      },
+      {
+        "test_name": "Explanatory Thinking (SSD vs RAM)",
+        "result": {
+          "success": true,
+          "elapsed_s": 36.687,
+          "prompt_tokens": 49,
+          "completion_tokens": 776,
+          "total_tokens": 825,
+          "prefill_tps": 43.23,
+          "decode_tps": 21.48,
+          "total_tps": 22.49,
+          "tok_per_sec": 22.49,
+          "delivery_tps": 21.15,
+          "content_preview": "Here's a thinking process:  1.  **Analyze User Input:**    - User asks: \"Explain the difference between SSD and RAM in s"
+        }
+      },
+      {
+        "test_name": "Long Document Analysis (~512 tok Prefill)",
+        "result": {
+          "success": true,
+          "elapsed_s": 5.897,
+          "prompt_tokens": 440,
+          "completion_tokens": 80,
+          "total_tokens": 520,
+          "prefill_tps": 269.08,
+          "decode_tps": 18.52,
+          "total_tps": 88.18,
+          "tok_per_sec": 88.18,
+          "delivery_tps": 13.57,
+          "content_preview": "- **Safety via Invariants**: Raft ensures safety through log matching invariants (consistent entries across replicas), l"
+        }
+      }
+    ]
+  },
+  {
+    "model_name": "Nemotron 3.5 Bolt 74B (Full NVFP4 / 68GB)",
+    "model_id": "nvidia/NVIDIA-Nemotron-3.5-Bolt-74B-A9B-NVFP4-Full",
+    "architecture": "Hybrid Mamba-2 SSM + GQA Attention + Sparse MoE (NVFP4)",
+    "status": "SUCCESS",
+    "load_time_s": 75.69,
+    "vram_delta_mb": 14937.0,
+    "peak_vram_mb": 324.0,
+    "power_draw_w": 18.6,
+    "tests": [
+      {
+        "test_name": "Direct Chat (No Thinking)",
+        "result": {
+          "success": true,
+          "elapsed_s": 131.308,
+          "prompt_tokens": 53,
+          "completion_tokens": 80,
+          "decode_tps": 0.71,
+          "tok_per_sec": 0.61,
+          "prefill_tps": 1.43,
+          "content_preview": "$: 10:34:28.567 The user is asking for a specific piece of information from the provided text. I need to find the value",
+          "total_tokens": 133,
+          "total_tps": 1.01
+        }
+      },
+      {
+        "test_name": "Code Synthesis",
+        "result": {
+          "success": true,
+          "elapsed_s": 130.408,
+          "prompt_tokens": 59,
+          "completion_tokens": 120,
+          "decode_tps": 1.06,
+          "tok_per_sec": 0.92,
+          "prefill_tps": 1.92,
+          "content_preview": "\ufffd The text is a series of random characters and symbols, not forming coherent words or sentences. It appears to be corru",
+          "total_tokens": 179,
+          "total_tps": 1.37
         }
       },
       {
         "test_name": "Step-by-Step Reasoning (Thinking)",
         "result": {
           "success": false,
-          "error": "HTTP Error 429: Too Many Requests"
+          "error": "timed out"
+        }
+      },
+      {
+        "test_name": "Long Document Analysis (~512 tok Prefill)",
+        "result": {
+          "success": false,
+          "error": "<urlopen error [WinError 10061] No connection could be made because the target machine actively refused it>"
         }
       }
     ]
@@ -134,32 +336,89 @@
     "model_id": "deepseek-v4-flash",
     "architecture": "Sparse MoE (11,008 Experts) + MLA Latent Attention",
     "status": "SUCCESS",
-    "load_time_s": 87.78,
-    "vram_delta_mb": 11863.0,
-    "peak_vram_mb": 12534.0,
-    "power_draw_w": 23.36,
+    "load_time_s": 147.38,
+    "vram_delta_mb": 11842.0,
+    "peak_vram_mb": 12230.0,
+    "power_draw_w": 27.61,
     "tests": [
       {
         "test_name": "Direct Chat (No Thinking)",
         "result": {
-          "success": false,
-          "error": "timed out"
+          "success": true,
+          "elapsed_s": 292.117,
+          "prompt_tokens": 40,
+          "completion_tokens": 80,
+          "total_tokens": 120,
+          "prefill_tps": 0.31,
+          "decode_tps": 0.36,
+          "total_tps": 0.41,
+          "tok_per_sec": 0.41,
+          "delivery_tps": 0.27,
+          "content_preview": "1.  The user wants a concise explanation of the difference between mutex and semaphore, in two sentences. 2.  Need to be"
         }
       },
       {
         "test_name": "Code Synthesis",
         "result": {
-          "success": false,
-          "error": "HTTP Error 429: Too Many Requests"
+          "success": true,
+          "elapsed_s": 439.465,
+          "prompt_tokens": 44,
+          "completion_tokens": 120,
+          "total_tokens": 164,
+          "prefill_tps": 0.32,
+          "decode_tps": 0.33,
+          "total_tps": 0.37,
+          "tok_per_sec": 0.37,
+          "delivery_tps": 0.27,
+          "content_preview": "We need to write a Python function to calculate the nth Fibonacci number iteratively, with type hints and docstring. The"
         }
       },
       {
         "test_name": "Step-by-Step Reasoning (Thinking)",
         "result": {
+          "success": true,
+          "elapsed_s": 402.858,
+          "prompt_tokens": 60,
+          "completion_tokens": 353,
+          "total_tokens": 413,
+          "prefill_tps": 0.73,
+          "decode_tps": 1.02,
+          "total_tps": 1.03,
+          "tok_per_sec": 1.03,
+          "delivery_tps": 0.88,
+          "content_preview": "We need answer. Need respond to user. User asks: \"A bat and a ball cost $1.10 in total. The bat costs $1.00 more than th"
+        }
+      },
+      {
+        "test_name": "Explanatory Thinking (SSD vs RAM)",
+        "result": {
+          "success": true,
+          "elapsed_s": 349.212,
+          "prompt_tokens": 33,
+          "completion_tokens": 342,
+          "total_tokens": 375,
+          "prefill_tps": 1.0,
+          "decode_tps": 1.02,
+          "total_tps": 1.07,
+          "tok_per_sec": 1.07,
+          "delivery_tps": 0.98,
+          "content_preview": "1. **Analyze the user's request**: The user wants an explanation of the difference between SSD and RAM in simple terms."
+        }
+      },
+      {
+        "test_name": "Long Document Analysis (~512 tok Prefill)",
+        "result": {
           "success": false,
-          "error": "HTTP Error 429: Too Many Requests"
+          "error": "timed out"
         }
       }
     ]
+  },
+  {
+    "model_name": "Nemotron 3.5 Bolt 74B (Full NVFP4 / 68GB)",
+    "manifest": "E:\\dev\\MinnieTheMoEcher\\models\\nemotron_3.5_bolt\\moecher_manifest_16gb.json",
+    "status": "FAILED_TO_LOAD",
+    "error": "Process terminated prematurely with exit code 1",
+    "load_time_s": 240.65
   }
 ]
