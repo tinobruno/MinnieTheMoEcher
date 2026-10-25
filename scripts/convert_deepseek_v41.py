@@ -106,109 +106,123 @@ def convert_deepseek_v41(raw_dir: Path, out_dir: Path, dry_run: bool = False):
 
     # Extract dense backbone
     dense_bin_path = out_dir / "attention_dense_layers.bin"
-    print(f"\n[3/4] Packaging dense backbone layers into {dense_bin_path.name}...")
+    print(f"\n[3/4] Packaging dense backbone layers into {dense_bin_path.name}...", flush=True)
     dense_tensors_meta = {}
     dense_offset = 0
 
-    with open(dense_bin_path, "wb") as f_dense:
-        for t_name, meta in sorted(tensor_index.items()):
-            # Filter out routed expert weights (keep shared experts and router gates)
-            if ".ffn.experts." in t_name and ".shared_experts." not in t_name:
-                continue
+    open_handles = {}
+    try:
+        with open(dense_bin_path, "wb") as f_dense:
+            for t_name, meta in sorted(tensor_index.items()):
+                # Filter out routed expert weights (keep shared experts and router gates) and 189GB engram tables
+                if (".ffn.experts." in t_name and ".shared_experts." not in t_name) or ".engram." in t_name:
+                    continue
 
-            with open(meta["file"], "rb") as f_in:
+                fpath = meta["file"]
+                if fpath not in open_handles:
+                    open_handles[fpath] = open(fpath, "rb")
+                f_in = open_handles[fpath]
                 f_in.seek(meta["data_offset"])
                 data = f_in.read(meta["nbytes"])
 
-            f_dense.write(data)
-            dense_tensors_meta[t_name] = {
-                "offset": dense_offset,
-                "nbytes": meta["nbytes"],
-                "dtype": meta["dtype"],
-                "shape": meta["shape"]
-            }
-            dense_offset += len(data)
+                f_dense.write(data)
+                dense_tensors_meta[t_name] = {
+                    "offset": dense_offset,
+                    "nbytes": meta["nbytes"],
+                    "dtype": meta["dtype"],
+                    "shape": meta["shape"]
+                }
+                dense_offset += len(data)
 
-    print(f"      Dense backbone written: {dense_offset / (1024**3):.2f} GB")
+        print(f"      Dense backbone written: {dense_offset / (1024**3):.2f} GB", flush=True)
 
-    # Packaging MoE Routed Experts into Direct I/O Aligned Block Binary
-    expert_bin_path = out_dir / "expert.bin"
-    print(f"\n[4/4] Packing {num_layers * n_routed_experts} routed experts into Direct-I/O binary {expert_bin_path.name}...")
+        # Packaging MoE Routed Experts into Direct I/O Aligned Block Binary
+        expert_bin_path = out_dir / "expert.bin"
+        print(f"\n[4/4] Packing {num_layers * n_routed_experts} routed experts into Direct-I/O binary {expert_bin_path.name}...", flush=True)
 
-    part_order = [
-        "w1.weight", "w1.scale",
-        "w3.weight", "w3.scale",
-        "w2.weight", "w2.scale"
-    ]
+        part_order = [
+            "w1.weight", "w1.scale",
+            "w3.weight", "w3.scale",
+            "w2.weight", "w2.scale"
+        ]
 
-    # Resolve expert part dimensions and offsets from layer 0 expert 0
-    sample_expert_prefix = "layers.0.ffn.experts.0"
-    expert_parts = {}
-    cur_block_offset = 0
-    for part in part_order:
-        key = f"{sample_expert_prefix}.{part}"
-        if key not in tensor_index:
-            key = f"model.{key}"
-        if key in tensor_index:
-            meta = tensor_index[key]
-            expert_parts[part] = {
-                "offset_in_block": cur_block_offset,
-                "nbytes": meta["nbytes"],
-                "dtype": meta["dtype"],
-                "shape": meta["shape"]
-            }
-            cur_block_offset += meta["nbytes"]
-        else:
-            # Fallback estimation for FP4 / E8M0 if index not yet scanned
-            if part in ["w1.weight", "w3.weight"]:
-                nbytes = moe_inter * (hidden_size // 2)
-                dtype = "I8"
-                shape = [moe_inter, hidden_size // 2]
-            elif part == "w2.weight":
-                nbytes = hidden_size * (moe_inter // 2)
-                dtype = "I8"
-                shape = [hidden_size, moe_inter // 2]
-            elif part in ["w1.scale", "w3.scale"]:
-                nbytes = moe_inter * (hidden_size // 32)
-                dtype = "F8_E8M0"
-                shape = [moe_inter, hidden_size // 32]
-            else: # w2.scale
-                nbytes = hidden_size * (moe_inter // 32)
-                dtype = "F8_E8M0"
-                shape = [hidden_size, moe_inter // 32]
-            expert_parts[part] = {
-                "offset_in_block": cur_block_offset,
-                "nbytes": nbytes,
-                "dtype": dtype,
-                "shape": shape
-            }
-            cur_block_offset += nbytes
+        # Resolve expert part dimensions and offsets from layer 0 expert 0
+        sample_expert_prefix = "layers.0.ffn.experts.0"
+        expert_parts = {}
+        cur_block_offset = 0
+        for part in part_order:
+            key = f"{sample_expert_prefix}.{part}"
+            if key not in tensor_index:
+                key = f"model.{key}"
+            if key in tensor_index:
+                meta = tensor_index[key]
+                expert_parts[part] = {
+                    "offset_in_block": cur_block_offset,
+                    "nbytes": meta["nbytes"],
+                    "dtype": meta["dtype"],
+                    "shape": meta["shape"]
+                }
+                cur_block_offset += meta["nbytes"]
+            else:
+                # Fallback estimation for FP4 / E8M0 if index not yet scanned
+                if part in ["w1.weight", "w3.weight"]:
+                    nbytes = moe_inter * (hidden_size // 2)
+                    dtype = "I8"
+                    shape = [moe_inter, hidden_size // 2]
+                elif part == "w2.weight":
+                    nbytes = hidden_size * (moe_inter // 2)
+                    dtype = "I8"
+                    shape = [hidden_size, moe_inter // 2]
+                elif part in ["w1.scale", "w3.scale"]:
+                    nbytes = moe_inter * (hidden_size // 32)
+                    dtype = "F8_E8M0"
+                    shape = [moe_inter, hidden_size // 32]
+                else: # w2.scale
+                    nbytes = hidden_size * (moe_inter // 32)
+                    dtype = "F8_E8M0"
+                    shape = [hidden_size, moe_inter // 32]
+                expert_parts[part] = {
+                    "offset_in_block": cur_block_offset,
+                    "nbytes": nbytes,
+                    "dtype": dtype,
+                    "shape": shape
+                }
+                cur_block_offset += nbytes
 
-    expert_block_size = align_up(cur_block_offset, PAGE_SIZE)
-    print(f"      Expert Block Size: {expert_block_size} bytes ({expert_block_size / (1024*1024):.2f} MB, 4KB page aligned)")
-    for part, pinfo in expert_parts.items():
-        print(f"        {part:10s} -> offset: {pinfo['offset_in_block']:8d} | nbytes: {pinfo['nbytes']:8d} | dtype: {pinfo['dtype']}")
+        expert_block_size = align_up(cur_block_offset, PAGE_SIZE)
+        print(f"      Expert Block Size: {expert_block_size} bytes ({expert_block_size / (1024*1024):.2f} MB, 4KB page aligned)", flush=True)
+        for part, pinfo in expert_parts.items():
+            print(f"        {part:10s} -> offset: {pinfo['offset_in_block']:8d} | nbytes: {pinfo['nbytes']:8d} | dtype: {pinfo['dtype']}", flush=True)
 
-    with open(expert_bin_path, "wb") as f_exp:
-        for l in range(num_layers):
-            for e in range(n_routed_experts):
-                block = bytearray(expert_block_size)
-                for part in part_order:
-                    pinfo = expert_parts[part]
-                    name = f"layers.{l}.ffn.experts.{e}.{part}"
-                    target_key = name if name in tensor_index else f"model.{name}"
-                    if target_key in tensor_index:
-                        t_meta = tensor_index[target_key]
-                        with open(t_meta["file"], "rb") as f_in:
+        with open(expert_bin_path, "wb") as f_exp:
+            for l in range(num_layers):
+                for e in range(n_routed_experts):
+                    block = bytearray(expert_block_size)
+                    for part in part_order:
+                        pinfo = expert_parts[part]
+                        name = f"layers.{l}.ffn.experts.{e}.{part}"
+                        target_key = name if name in tensor_index else f"model.{name}"
+                        if target_key in tensor_index:
+                            t_meta = tensor_index[target_key]
+                            fpath = t_meta["file"]
+                            if fpath not in open_handles:
+                                open_handles[fpath] = open(fpath, "rb")
+                            f_in = open_handles[fpath]
                             f_in.seek(t_meta["data_offset"])
                             p_data = f_in.read(t_meta["nbytes"])
-                        off = pinfo["offset_in_block"]
-                        block[off:off + len(p_data)] = p_data
+                            off = pinfo["offset_in_block"]
+                            block[off:off + len(p_data)] = p_data
 
-                f_exp.write(block)
+                    f_exp.write(block)
 
-            if (l + 1) % 5 == 0 or l == num_layers - 1:
-                print(f"      Processed {l + 1}/{num_layers} layers ({((l + 1) * n_routed_experts)} experts)...", flush=True)
+                if (l + 1) % 5 == 0 or l == num_layers - 1:
+                    print(f"      Processed {l + 1}/{num_layers} layers ({((l + 1) * n_routed_experts)} experts)...", flush=True)
+    finally:
+        for fh in open_handles.values():
+            try:
+                fh.close()
+            except Exception:
+                pass
 
     expert_file_size = os.path.getsize(expert_bin_path)
     print(f"      Expert binary complete: {expert_file_size / (1024**3):.2f} GB")
