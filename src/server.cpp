@@ -1534,7 +1534,7 @@ void run_server(MoecherEngine& engine, int port, int default_thinking_budget, in
             bool stream = request.value("stream", false);
             float repetition_penalty = request.value("repetition_penalty",
                 engine.cfg_.default_repetition_penalty > 1.0f ? engine.cfg_.default_repetition_penalty :
-                (engine.cfg_.is_nemotron() ? 1.05f : 1.0f));
+                ((engine.cfg_.is_nemotron() || engine.cfg_.is_deepseek_v41()) ? 1.05f : 1.0f));
             float presence_penalty = request.value("presence_penalty", 0.0f);
             float frequency_penalty = request.value("frequency_penalty", 0.0f);
             if (repetition_penalty <= 1.0f && (presence_penalty > 0.0f || frequency_penalty > 0.0f)) {
@@ -1651,7 +1651,7 @@ void run_server(MoecherEngine& engine, int port, int default_thinking_budget, in
                 if (max_thinking_tokens <= 0) enable_thinking = false;
             }
 
-            if (repetition_penalty <= 1.0f && engine.cfg_.is_nemotron()) {
+            if (repetition_penalty <= 1.0f && (engine.cfg_.is_nemotron() || engine.cfg_.is_deepseek_v41())) {
                 repetition_penalty = 1.05f;
             }
 

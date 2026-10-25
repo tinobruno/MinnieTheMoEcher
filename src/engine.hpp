@@ -587,6 +587,7 @@ public:
     int32_t* h_single_flag_ = nullptr;
     int32_t* h_prefill_tok_ = nullptr;
     int32_t* h_prefill_pos_ = nullptr;
+    int32_t* h_topk_batch_ = nullptr;
     size_t h_prefill_cap_ = 0;
 
     void ensure_prefill_host_capacity(size_t n) {
@@ -720,6 +721,10 @@ public:
         if (h_prefill_pos_) {
             cudaFreeHost(h_prefill_pos_);
             h_prefill_pos_ = nullptr;
+        }
+        if (h_topk_batch_) {
+            cudaFreeHost(h_topk_batch_);
+            h_topk_batch_ = nullptr;
         }
         if (h_single_tok_) {
             cudaFreeHost(h_single_tok_);
@@ -2781,6 +2786,11 @@ public:
         std::string finish_reason = "length";
 
         // Set per-request repetition penalty
+        if (repetition_penalty <= 1.0f && cfg_.default_repetition_penalty > 1.0f) {
+            repetition_penalty = cfg_.default_repetition_penalty;
+        } else if (repetition_penalty <= 1.0f && (cfg_.is_nemotron() || cfg_.is_deepseek_v41())) {
+            repetition_penalty = 1.05f;
+        }
         current_rep_penalty_ = repetition_penalty;
 
         int content_tokens_generated = 0;
@@ -2947,19 +2957,16 @@ public:
             // N-Gram Repetition Loop Detector & Breaker (breaks attractor loops in reasoning & content)
             int loop_len = 0;
             int n_out = (int)output_ids.size();
+            int matched_min_cycles = 2;
             if (in_think_block) {
                 // Reasoning phase: detect exact token repetition loops.
-                // To avoid false positives on legitimate formatting, markdown lists, bullet points,
-                // table dividers, equations, or code planning, require a robust minimum number of cycles
-                // and a substantial total repeated token span (at least 40+ tokens).
                 for (int L = 1; L <= 512; L++) {
-                    int min_cycles = (L == 1) ? 8 :
-                                     ((L == 2) ? 5 :
-                                     ((L <= 4) ? 4 :
-                                     ((L <= 8) ? 3 :
-                                     ((L <= 16) ? 3 : 2))));
+                    int min_cycles = (L == 1) ? 4 :
+                                     ((L == 2) ? 3 :
+                                     ((L <= 4) ? 3 :
+                                     ((L <= 8) ? 3 : 2)));
                     if (min_cycles * L > n_out) continue;
-                    if (min_cycles * L < 8) continue; // Safety floor: at least 8 repeated tokens
+                    if (min_cycles * L < 4) continue; // Safety floor: at least 4 repeated tokens
                     bool match = true;
                     const int* p_last = output_ids.data() + (n_out - L);
                     for (int c = 1; c < min_cycles; c++) {
@@ -2974,25 +2981,20 @@ public:
                     }
                     if (match) {
                         loop_len = L;
+                        matched_min_cycles = min_cycles;
                         break;
                     }
                 }
-                // Structural repetition matching is disabled: normal reasoning routinely lists
-                // parallel items (buttons, steps, features, cases) which falsely trigger fuzzy pattern matchers.
-                // Exact repetition detection robustly catches true attractor loops.
             } else {
                 // Content generation phase:
-                // Only inspect content tokens (NEVER cross back into reasoning scratchpad!).
-                // In code/HTML/CSS generation, structural repetitions (buttons, rows, list items) are NORMAL.
                 int n_content = content_tokens_generated;
                 for (int L = 1; L <= 512; L++) {
-                    int min_cycles = (L == 1) ? 16 :
-                                     ((L == 2) ? 8 :
-                                     ((L <= 4) ? 4 :
-                                     ((L <= 8) ? 3 :
-                                     ((L <= 16) ? 3 : 2))));
+                    int min_cycles = (L == 1) ? 4 :
+                                     ((L == 2) ? 3 :
+                                     ((L <= 4) ? 3 :
+                                     ((L <= 8) ? 3 : 2)));
                     if (min_cycles * L > n_content) continue;
-                    if (min_cycles * L < 16) continue; // Content safety floor: at least 16 identical repeated tokens
+                    if (min_cycles * L < 4) continue; // Content safety floor: at least 4 repeated tokens
                     bool match = true;
                     const int* p_last = output_ids.data() + (n_out - L);
                     for (int c = 1; c < min_cycles; c++) {
@@ -3007,6 +3009,7 @@ public:
                     }
                     if (match) {
                         loop_len = L;
+                        matched_min_cycles = min_cycles;
                         break;
                     }
                 }
@@ -3015,6 +3018,14 @@ public:
             if (loop_len > 0) {
                 if (in_think_block) {
                     LOG_WARN("[Anti-Loop] Repetition loop detected during reasoning (cycle length %d). Forcing </think> and starting content.", loop_len);
+                    // Roll back duplicate cycles from history & output_ids so the KV cache attractor is mitigated
+                    int prune_tokens = (matched_min_cycles - 1) * loop_len;
+                    while (prune_tokens > 0 && !output_ids.empty() && !history.empty()) {
+                        output_ids.pop_back();
+                        history.pop_back();
+                        position--;
+                        prune_tokens--;
+                    }
                     in_think_block = false;
                     think_block_ended = true;
                     if (content_start_history_idx < 0) {
@@ -3063,6 +3074,20 @@ public:
                     continue;
                 } else {
                     LOG_WARN("[Anti-Loop] Repetition loop detected during content generation (cycle length %d). Halting generation cleanly.", loop_len);
+                    // Roll back duplicate cycles from generated_text and history
+                    int prune_tokens = (matched_min_cycles - 1) * loop_len;
+                    while (prune_tokens > 0 && !output_ids.empty() && !history.empty()) {
+                        int last_tok = output_ids.back();
+                        output_ids.pop_back();
+                        history.pop_back();
+                        position--;
+                        content_tokens_generated--;
+                        std::string s = tokenizer_.decode({last_tok});
+                        if (generated_text.size() >= s.size() && generated_text.substr(generated_text.size() - s.size()) == s) {
+                            generated_text.resize(generated_text.size() - s.size());
+                        }
+                        prune_tokens--;
+                    }
                     // If inside an unclosed code block, cleanly close it before halting
                     size_t code_blocks = 0;
                     size_t pos = 0;
@@ -5422,7 +5447,7 @@ private:
 
     void apply_repetition_penalty_to_batch(float* logits_batch, int M, const std::vector<int>& history, bool is_reasoning = true, int content_start_idx = 0) {
         float eff_penalty = current_rep_penalty_;
-        if (eff_penalty <= 1.0f && cfg_.is_nemotron()) {
+        if (eff_penalty <= 1.0f && (cfg_.is_nemotron() || cfg_.is_deepseek_v41())) {
             eff_penalty = 1.05f;
         }
         if (eff_penalty <= 1.0f || history.empty()) return;
@@ -5468,7 +5493,7 @@ private:
 
         apply_repetition_penalty_to_batch(logits_ptr, 1, history, is_reasoning, content_start_idx);
         float eff_penalty = current_rep_penalty_;
-        if (eff_penalty <= 1.0f && cfg_.is_nemotron()) {
+        if (eff_penalty <= 1.0f && (cfg_.is_nemotron() || cfg_.is_deepseek_v41())) {
             eff_penalty = 1.05f;
         }
         if (eff_penalty > 1.0f) {
