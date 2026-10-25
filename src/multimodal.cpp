@@ -507,7 +507,7 @@ MultimodalPrompt apply_chat_template_multimodal(
             result.insert(result.end(), enc.begin(), enc.end());
         } else if (role == "tool" || role == "function") {
             result.push_back(USER);
-            auto enc = tok.encode("<tool_response>\n" + content + "\n</tool_response>");
+            auto enc = tok.encode("<tool_result>\n" + content + "\n</tool_result>");
             result.insert(result.end(), enc.begin(), enc.end());
         } else if (role == "assistant") {
             result.push_back(ASSISTANT);
@@ -518,10 +518,10 @@ MultimodalPrompt apply_chat_template_multimodal(
                     auto r_enc = tok.encode(r_content);
                     result.insert(result.end(), r_enc.begin(), r_enc.end());
                     result.push_back(THINK_END);
-                } else if (!actual_thinking) {
+                } else {
                     result.push_back(THINK_END);
                 }
-            } else if (!actual_thinking) {
+            } else {
                 result.push_back(THINK_END);
             }
             std::string body = content;

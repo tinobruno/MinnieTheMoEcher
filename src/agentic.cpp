@@ -958,22 +958,45 @@ std::string build_dynamic_tools_prompt(const json& resolved_tools, bool is_qwen)
         }
     }
 
-    std::string prompt =
-        "\n\n# Tools\n\n"
-        "You may call one or more functions to assist with the user query.\n"
-        "You are provided with function signatures within <tools></tools> XML tags:\n"
-        "<tools>\n";
-    for (const auto& item : resolved_tools) {
-        prompt += item.dump() + "\n";
-    }
-    prompt += "</tools>\n\n";
-
+    std::string prompt = "";
     if (is_qwen) {
+        prompt +=
+            "\n\n# Tools\n\n"
+            "You may call one or more functions to assist with the user query.\n"
+            "You are provided with function signatures within <tools></tools> XML tags:\n"
+            "<tools>\n";
+        for (const auto& item : resolved_tools) {
+            prompt += item.dump() + "\n";
+        }
+        prompt += "</tools>\n\n";
         prompt +=
             "For each function call, return a json object with function name and arguments within <tool_call></tool_call> XML tags:\n"
             "<tool_call>\n"
             "{\"name\": \"<function-name>\", \"arguments\": <args-json-object>}\n"
             "</tool_call>\n\n";
+    } else {
+        // DeepSeek-V4.1 DSML format matching official encoding.py
+        prompt +=
+            "\n\n## Tools\n\n"
+            "You have access to a set of tools to help answer the user's question. You can invoke tools by writing a \"<｜DSML｜ calls>\" block like the following:\n\n"
+            "<｜DSML｜ calls>\n"
+            "<｜DSML｜ invoke name=\"$TOOL_NAME\">\n"
+            "<｜DSML｜ parameter name=\"$PARAMETER_NAME\" string=\"true|false\">$PARAMETER_VALUE</｜DSML｜ parameter>\n"
+            "...\n"
+            "</｜DSML｜ invoke>\n"
+            "<｜DSML｜ invoke name=\"$TOOL_NAME2\">\n"
+            "...\n"
+            "</｜DSML｜ invoke>\n"
+            "</｜DSML｜ calls>\n\n"
+            "String parameters should be specified as is and set `string=\"true\"`. For all other types (numbers, booleans, arrays, objects), pass the value in JSON format and set `string=\"false\"`.\n\n"
+            "If thinking_mode is enabled (triggered by <think>), you MUST output your complete reasoning inside <think>...</think> BEFORE any tool calls or final response.\n\n"
+            "Otherwise, output directly after </think> with tool calls or final response.\n\n"
+            "### Available Tool Schemas\n\n";
+        for (const auto& item : resolved_tools) {
+            prompt += item.dump() + "\n";
+        }
+        prompt +=
+            "\nYou MUST strictly follow the above defined tool name and parameter schemas to invoke tool calls.\n\n";
     }
 
     if (has_yt) {
