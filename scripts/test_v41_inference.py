@@ -25,7 +25,7 @@ def main():
     print("=" * 70)
     print("  DeepSeek-V4.1-Flash Native C++/CUDA Engine Verification Test")
     print("  Hardware: NVIDIA RTX PRO 6000 (96GB VRAM, 64GB Host RAM, NVMe SSD)")
-    print("  Caching: L1 VRAM (46GB) <-> L2 DRAM (32GB) <-> L3 Direct I/O NVMe")
+    print("  Caching: L1 VRAM (46GB) <-> L2 DRAM (Auto Max) <-> L3 Direct I/O NVMe")
     print("=" * 70, flush=True)
 
     if not MANIFEST.exists():
@@ -43,7 +43,7 @@ def main():
         str(EXE_PATH),
         "-m", str(MANIFEST),
         "--cache-gb", "46",
-        "--dram-cache-gb", "32",
+        "--mtp-k", "4",
         "--port", str(SERVER_PORT),
         "-q"
     ]

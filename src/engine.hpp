@@ -995,6 +995,12 @@ public:
                  (int)gpu_caps_.is_ampere, (int)gpu_caps_.is_ada_or_newer,
                  (int)gpu_caps_.is_blackwell_or_newer, (int)gpu_caps_.supports_fp8,
                  (int)gpu_caps_.supports_fp4, (int)gpu_caps_.is_vram_constrained);
+        if (mtp_k_ <= 0) {
+            mtp_k_ = gpu_caps_.is_vram_constrained ? 1 : 4;
+            default_mtp_k_ = mtp_k_;
+            LOG_INFO("MTP draft depth auto-configured: mtp_k=%d (VRAM-Constrained=%d)",
+                     mtp_k_, (int)gpu_caps_.is_vram_constrained);
+        }
         // Check if model requires NVIDIA Blackwell FP4 (NVFP4)
         bool model_requires_fp4 = false;
         if (manifest.contains("target_vram_profile")) {
@@ -1140,32 +1146,49 @@ public:
         }
         
         size_t dram_cache_budget = (size_t)(dram_cache_gb * 1024.0 * 1024.0 * 1024.0);
-        if (cfg_.is_nemotron() && dram_cache_budget == 0) {
+        if (dram_cache_budget == 0) {
             size_t avail = 0;
+            size_t total_phys = 0;
 #if defined(_WIN32)
             MEMORYSTATUSEX memInfo;
             memInfo.dwLength = sizeof(MEMORYSTATUSEX);
             if (GlobalMemoryStatusEx(&memInfo)) {
                 avail = memInfo.ullAvailPhys;
+                total_phys = memInfo.ullTotalPhys;
             }
 #elif defined(_SC_AVPHYS_PAGES) && defined(_SC_PAGE_SIZE)
             size_t pages = sysconf(_SC_AVPHYS_PAGES);
             size_t page_size = sysconf(_SC_PAGE_SIZE);
             avail = pages * page_size;
+#if defined(_SC_PHYS_PAGES)
+            total_phys = (size_t)sysconf(_SC_PHYS_PAGES) * page_size;
+#endif
 #endif
             if (avail > 4ULL * 1024 * 1024 * 1024) {
-                if (cfg_.is_nemotron_bolt()) {
-                    size_t safe_avail = avail > 4ULL * 1024 * 1024 * 1024 ? (avail - 4ULL * 1024 * 1024 * 1024) : 0;
-                    size_t remaining_experts_bytes = (size_t)(expert_n_layers * expert_n_experts - 4978) * expert_block_size;
-                    if (safe_avail > remaining_experts_bytes) safe_avail = remaining_experts_bytes;
-                    dram_cache_budget = safe_avail;
+                // Reserve safe headroom for Windows OS, background tasks, display driver, and paging
+                size_t os_reserve = 8ULL * 1024 * 1024 * 1024;
+                if (total_phys > 0) {
+                    os_reserve = std::max((size_t)(8ULL * 1024 * 1024 * 1024), (size_t)(total_phys * 0.15));
+                }
+                size_t safe_avail = (avail > os_reserve) ? (avail - os_reserve) : 0;
+                size_t unresident_bytes = (total_experts_bytes > cache_budget) ? (total_experts_bytes - cache_budget) : 0;
+
+                if (cfg_.is_nemotron() && !cfg_.is_nemotron_bolt()) {
+                    dram_cache_budget = (size_t)12 * 128 * expert_block_size;
+                    LOG_INFO("[Memory] Auto-allocated %.1f GB DRAM L2 cache for Nemotron: 100%% of all 2,944 experts resident in memory (zero SSD disk reads)!",
+                             (double)dram_cache_budget / (1024.0 * 1024.0 * 1024.0));
+                } else if (cfg_.is_nemotron_bolt()) {
+                    size_t bolt_remaining = (size_t)(expert_n_layers * expert_n_experts - 4978) * expert_block_size;
+                    dram_cache_budget = std::min(safe_avail, bolt_remaining);
                     LOG_INFO("[Memory] Auto-allocated %.1f GB DRAM L2 cache for Nemotron Bolt (out of %.1f GB available physical RAM)",
                              (double)dram_cache_budget / (1024.0 * 1024.0 * 1024.0),
                              (double)avail / (1024.0 * 1024.0 * 1024.0));
                 } else {
-                    dram_cache_budget = (size_t)12 * 128 * expert_block_size;
-                    LOG_INFO("[Memory] Auto-allocated %.1f GB DRAM L2 cache for Nemotron: 100%% of all 2,944 experts resident in memory (zero SSD disk reads)!",
-                             (double)dram_cache_budget / (1024.0 * 1024.0 * 1024.0));
+                    dram_cache_budget = std::min(safe_avail, unresident_bytes);
+                    LOG_INFO("[Memory] Auto-allocated maximum available DRAM L2 cache: %.1f GB (out of %.1f GB free RAM, reserving %.1f GB for OS/driver)",
+                             (double)dram_cache_budget / (1024.0 * 1024.0 * 1024.0),
+                             (double)avail / (1024.0 * 1024.0 * 1024.0),
+                             (double)os_reserve / (1024.0 * 1024.0 * 1024.0));
                 }
             }
         }

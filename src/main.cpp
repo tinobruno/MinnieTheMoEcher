@@ -62,7 +62,7 @@ int main(int argc, char** argv) {
     std::string batched_prefill_mode = "auto";
     int prefill_chunk_size = 512;
     int max_seq_len_override = 0;
-    int mtp_k = 0;
+    int mtp_k = 4;
     bool enable_vision = true;
 
     for (int i = 1; i < argc; i++) {

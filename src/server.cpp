@@ -1575,7 +1575,8 @@ void run_server(MoecherEngine& engine, int port, int default_thinking_budget, in
                 engine.enable_mtp_ = request["mtp"].get<bool>();
             }
             if (request.contains("mtp_k") && request["mtp_k"].is_number_integer()) {
-                engine.mtp_k_ = std::clamp(request["mtp_k"].get<int>(), 0, 8);
+                int req_k = request["mtp_k"].get<int>();
+                engine.mtp_k_ = (req_k > 0) ? std::clamp(req_k, 1, 8) : engine.default_mtp_k_;
             }
             if (request.contains("tree_mtp") && request["tree_mtp"].is_boolean()) {
                 engine.enable_tree_mtp_ = request["tree_mtp"].get<bool>();

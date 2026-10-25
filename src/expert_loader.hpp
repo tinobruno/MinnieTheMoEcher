@@ -44,6 +44,7 @@ public:
     int n_experts_ = 0;
     moecher::platform::DirectFileHandle expert_file_;
     moecher::platform::MemoryMappedFile expert_mmap_;
+    bool use_buffered_io_ = false;
     std::atomic<uint64_t> cold_disk_reads_{0};
     bool permanent_l2_resident_ = false;
     std::atomic<uint32_t> current_request_epoch_{1};
@@ -266,8 +267,10 @@ public:
             // Release lock before I/O so other threads can reserve slots and do I/O concurrently!
             lock.unlock();
 
-            // Direct asynchronous NVMe hardware DMA or memory-mapped read into pinned DRAM buffer without OS page faults
-            if (expert_mmap_.is_open() && (size_t)(file_offset + expert_block_size_) <= expert_mmap_.size()) {
+            // Unbuffered Direct I/O (NVMe DMA) into pinned memory when in direct mode; mmap only in buffered mode
+            if (expert_file_.is_open() && !use_buffered_io_) {
+                expert_file_.pread_exact(dst_ptr, expert_block_size_, file_offset);
+            } else if (expert_mmap_.is_open() && (size_t)(file_offset + expert_block_size_) <= expert_mmap_.size()) {
                 std::memcpy(dst_ptr, (const char*)expert_mmap_.data() + file_offset, expert_block_size_);
             } else {
                 expert_file_.pread_exact(dst_ptr, expert_block_size_, file_offset);
@@ -365,6 +368,7 @@ public:
         n_layers_ = n_layers;
         n_experts_ = n_experts;
 
+        use_buffered_io_ = use_buffered_io;
         bool use_direct = !use_buffered_io;
         if (!expert_file_.open_read(expert_bin_path, use_direct)) {
             LOG_ERROR("Cannot open expert bin: %s", expert_bin_path.c_str());
@@ -372,14 +376,13 @@ public:
         }
         if (use_buffered_io) {
             LOG_INFO("Expert I/O: BUFFERED mode (OS file cache enabled — recommended for offloading)");
+            // Open memory-mapped view of expert file only in buffered mode!
+            if (expert_mmap_.open_read(expert_bin_path)) {
+                LOG_INFO("Expert MMap: Memory-mapped entire expert file (%.2f GB) for 0-latency OS page-cached streaming",
+                         (double)expert_mmap_.size() / (1024.0 * 1024.0 * 1024.0));
+            }
         } else {
-            LOG_INFO("Expert I/O: DIRECT mode (FILE_FLAG_NO_BUFFERING / O_DIRECT)");
-        }
-
-        // Open memory-mapped view of expert file for zero-disk-latency fallback
-        if (expert_mmap_.open_read(expert_bin_path)) {
-            LOG_INFO("Expert MMap: Memory-mapped entire expert file (%.2f GB) for 0-latency OS page-cached streaming",
-                     (double)expert_mmap_.size() / (1024.0 * 1024.0 * 1024.0));
+            LOG_INFO("Expert I/O: DIRECT mode (FILE_FLAG_NO_BUFFERING / O_DIRECT NVMe DMA)");
         }
 
         cache_capacity_ = (int)(cache_budget_bytes / block_size);
@@ -406,7 +409,7 @@ public:
             size_t total_dram_bytes = (size_t)dram_cache_capacity_ * block_size;
             size_t try_bytes = total_dram_bytes;
             cudaError_t err = cudaErrorMemoryAllocation;
-            while (try_bytes >= 6ULL * 1024 * 1024 * 1024) {
+            while (try_bytes >= (size_t)block_size) {
                 err = cudaMallocHost(&dram_cache_pool_, try_bytes);
                 if (err == cudaSuccess) break;
                 cudaGetLastError();
@@ -1174,7 +1177,9 @@ public:
                     int64_t file_offset = (int64_t)global_idx * expert_block_size_;
 
                     int64_t bytes_read = 0;
-                    if (expert_mmap_.is_open() && (size_t)(file_offset + expert_block_size_) <= expert_mmap_.size()) {
+                    if (expert_file_.is_open() && !use_buffered_io_) {
+                        bytes_read = expert_file_.pread_exact(stage_ptr, expert_block_size_, file_offset);
+                    } else if (expert_mmap_.is_open() && (size_t)(file_offset + expert_block_size_) <= expert_mmap_.size()) {
                         std::memcpy(stage_ptr, (const char*)expert_mmap_.data() + file_offset, expert_block_size_);
                         bytes_read = expert_block_size_;
                     } else {
@@ -1240,7 +1245,9 @@ public:
                         int64_t file_offset = (int64_t)expert_global_idx * expert_block_size_;
                         void* dst = dram_cache_slots_[i].gpu_data;
                         int64_t bytes_read = 0;
-                        if (expert_mmap_.is_open() && (size_t)(file_offset + expert_block_size_) <= expert_mmap_.size()) {
+                        if (expert_file_.is_open() && !use_buffered_io_) {
+                            bytes_read = expert_file_.pread_exact(dst, expert_block_size_, file_offset);
+                        } else if (expert_mmap_.is_open() && (size_t)(file_offset + expert_block_size_) <= expert_mmap_.size()) {
                             std::memcpy(dst, (const char*)expert_mmap_.data() + file_offset, expert_block_size_);
                             bytes_read = expert_block_size_;
                         } else {
