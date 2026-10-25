@@ -79,9 +79,10 @@ def test_inference():
     print("  [PIPELINE STEP 3] Launching Moecher Server & Verifying Inference")
     print("=" * 70, flush=True)
 
+    exe_path = Path(__file__).resolve().parent.parent / "moecher.exe"
     manifest_file = OUT_DIR / "moecher_manifest.json"
     server_cmd = [
-        "moecher.exe",
+        str(exe_path),
         "-m", str(manifest_file),
         "--cache-gb", "46",
         "--dram-cache-gb", "32",
@@ -95,11 +96,11 @@ def test_inference():
     url = f"http://127.0.0.1:{SERVER_PORT}/v1/models"
     print("Waiting for server startup...")
     up = False
-    for _ in range(60):
+    for _ in range(90):
         time.sleep(2)
         try:
             req = urllib.request.Request(url)
-            with urllib.request.urlopen(req, timeout=2) as resp:
+            with urllib.request.urlopen(req, timeout=3) as resp:
                 if resp.status == 200:
                     up = True
                     break
@@ -125,7 +126,7 @@ def test_inference():
     req = urllib.request.Request(chat_url, data=payload, headers={"Content-Type": "application/json"})
     t_start = time.time()
     try:
-        with urllib.request.urlopen(req, timeout=30) as resp:
+        with urllib.request.urlopen(req, timeout=120) as resp:
             data = json.loads(resp.read().decode("utf-8"))
             elapsed = time.time() - t_start
             reply = data["choices"][0]["message"]["content"]
