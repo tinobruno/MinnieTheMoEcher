@@ -144,18 +144,21 @@ def convert_deepseek_v41(raw_dir: Path, out_dir: Path, dry_run: bool = False):
     with open(expert_bin_path, "wb") as f_exp:
         for l in range(num_layers):
             for e in range(n_routed_experts):
-                w1_name = f"model.layers.{l}.ffn.experts.{e}.gate_proj.weight"
-                w3_name = f"model.layers.{l}.ffn.experts.{e}.up_proj.weight"
-                w2_name = f"model.layers.{l}.ffn.experts.{e}.down_proj.weight"
-                w1_scale = f"model.layers.{l}.ffn.experts.{e}.gate_proj.weight_scale"
-                w3_scale = f"model.layers.{l}.ffn.experts.{e}.up_proj.weight_scale"
-                w2_scale = f"model.layers.{l}.ffn.experts.{e}.down_proj.weight_scale"
+                names = [
+                    f"layers.{l}.ffn.experts.{e}.w1.weight",
+                    f"layers.{l}.ffn.experts.{e}.w3.weight",
+                    f"layers.{l}.ffn.experts.{e}.w2.weight",
+                    f"layers.{l}.ffn.experts.{e}.w1.scale",
+                    f"layers.{l}.ffn.experts.{e}.w3.scale",
+                    f"layers.{l}.ffn.experts.{e}.w2.scale"
+                ]
 
                 block = bytearray(expert_block_size)
                 cur_off = 0
-                for name in [w1_name, w3_name, w2_name, w1_scale, w3_scale, w2_scale]:
-                    if name in tensor_index:
-                        t_meta = tensor_index[name]
+                for name in names:
+                    target_key = name if name in tensor_index else f"model.{name}"
+                    if target_key in tensor_index:
+                        t_meta = tensor_index[target_key]
                         with open(t_meta["file"], "rb") as f_in:
                             f_in.seek(t_meta["data_offset"])
                             p_data = f_in.read(t_meta["nbytes"])
