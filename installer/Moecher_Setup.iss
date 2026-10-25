@@ -43,6 +43,7 @@ Name: "dl_qwen_13g"; Description: "Download Qwen 3.8 27B Vision - 16GB GPU Mode 
 Name: "dl_qwen"; Description: "Download Qwen 3.8 27B INT4 with MTP Speculative Decoding (~19.1 GB) from Hugging Face"; Types: custom
 Name: "dl_deepseek"; Description: "Download DeepSeek V4 Flash IQ2 - Standard (~81.4 GB) from Hugging Face"; Types: custom
 Name: "dl_deepseek_q4"; Description: "Download DeepSeek V4 Flash Q4 - 8GB GPU Mode (~78.8 GB) from Hugging Face"; Types: custom
+Name: "dl_deepseek_v41"; Description: "Download DeepSeek V4.1-Flash (552B/14B Active) NVFP4 (~280 GB) - 96GB Blackwell/Ada"; Types: custom
 
 [Tasks]
 Name: "desktopicon"; Description: "{cm:CreateDesktopIcon}"; GroupDescription: "{cm:AdditionalIcons}"; Flags: unchecked
@@ -61,6 +62,7 @@ Source: "..\installer\start_qwen_13g_server.bat"; DestDir: "{app}"; Flags: ignor
 Source: "..\installer\start_qwen_server.bat"; DestDir: "{app}"; Flags: ignoreversion; Components: core
 Source: "..\installer\start_deepseek_server.bat"; DestDir: "{app}"; Flags: ignoreversion; Components: core
 Source: "..\installer\start_deepseek_q4_server.bat"; DestDir: "{app}"; Flags: ignoreversion; Components: core
+Source: "..\installer\start_deepseek_v41_server.bat"; DestDir: "{app}"; Flags: ignoreversion; Components: core
 Source: "..\installer\test_qwen.bat"; DestDir: "{app}"; Flags: ignoreversion; Components: core
 Source: "..\installer\download_model.ps1"; DestDir: "{app}"; Flags: ignoreversion; Components: core
 Source: "..\graphics\moecher.ico"; DestDir: "{app}"; Flags: ignoreversion; Components: core
@@ -73,6 +75,7 @@ Name: "{group}\Moecher (Nemotron 3.5 Bolt 24GB Resident)"; Filename: "{app}\star
 Name: "{group}\Moecher (Nemotron 3.5 Lightning NVFP4)"; Filename: "{app}\start_nemotron_server.bat"; WorkingDir: "{app}"; IconFilename: "{app}\moecher.ico"
 Name: "{group}\Moecher (Qwen 3.8 27B Vision 13G)"; Filename: "{app}\start_qwen_13g_server.bat"; WorkingDir: "{app}"; IconFilename: "{app}\moecher.ico"
 Name: "{group}\Moecher (Qwen 3.8 27B)"; Filename: "{app}\start_qwen_server.bat"; WorkingDir: "{app}"; IconFilename: "{app}\moecher.ico"
+Name: "{group}\Moecher (DeepSeek V4.1 Flash 96GB Workstation)"; Filename: "{app}\start_deepseek_v41_server.bat"; WorkingDir: "{app}"; IconFilename: "{app}\moecher.ico"
 Name: "{group}\Moecher (DeepSeek V4 Flash Standard)"; Filename: "{app}\start_deepseek_server.bat"; WorkingDir: "{app}"; IconFilename: "{app}\moecher.ico"
 Name: "{group}\Moecher (DeepSeek V4 Flash 8GB GPU)"; Filename: "{app}\start_deepseek_q4_server.bat"; WorkingDir: "{app}"; IconFilename: "{app}\moecher.ico"
 Name: "{group}\Test API"; Filename: "{app}\test_qwen.bat"; WorkingDir: "{app}"
@@ -84,6 +87,7 @@ Name: "{autodesktop}\Moecher (Nemotron 3.5 Bolt 24GB)"; Filename: "{app}\start_n
 Name: "{autodesktop}\Moecher (Nemotron 3.5 Lightning NVFP4)"; Filename: "{app}\start_nemotron_server.bat"; WorkingDir: "{app}"; IconFilename: "{app}\moecher.ico"; Tasks: desktopicon
 Name: "{autodesktop}\Moecher (Qwen 3.8 27B Vision 13G)"; Filename: "{app}\start_qwen_13g_server.bat"; WorkingDir: "{app}"; IconFilename: "{app}\moecher.ico"; Tasks: desktopicon
 Name: "{autodesktop}\Moecher (Qwen 3.8 27B)"; Filename: "{app}\start_qwen_server.bat"; WorkingDir: "{app}"; IconFilename: "{app}\moecher.ico"; Tasks: desktopicon
+Name: "{autodesktop}\Moecher (DeepSeek V4.1 Flash 96GB)"; Filename: "{app}\start_deepseek_v41_server.bat"; WorkingDir: "{app}"; IconFilename: "{app}\moecher.ico"; Tasks: desktopicon
 Name: "{autodesktop}\Moecher (DeepSeek V4 Flash Standard)"; Filename: "{app}\start_deepseek_server.bat"; WorkingDir: "{app}"; IconFilename: "{app}\moecher.ico"; Tasks: desktopicon
 Name: "{autodesktop}\Moecher (DeepSeek V4 Flash 8GB GPU)"; Filename: "{app}\start_deepseek_q4_server.bat"; WorkingDir: "{app}"; IconFilename: "{app}\moecher.ico"; Tasks: desktopicon
 
