@@ -1895,7 +1895,9 @@ public:
         }
 
         // 4. Head HC: reduce [hc, dim] -> [dim]
-        hc_head_reduce();
+        if (!cfg_.is_deepseek_v41()) {
+            hc_head_reduce();
+        }
 
         // 5. Final norm
         rms_norm_cuda(buf_hidden_.bf16(), buf_hidden_.bf16(),

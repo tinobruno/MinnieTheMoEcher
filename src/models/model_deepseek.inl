@@ -1197,7 +1197,9 @@
                                            prefill_bufs_.buf_hc_state.bf16() + (size_t)(M - 1) * (hc * dim),
                                            hc * dim * sizeof(__nv_bfloat16),
                                            cudaMemcpyDeviceToDevice, main_stream_));
-                hc_head_reduce();
+                if (!cfg_.is_deepseek_v41()) {
+                    hc_head_reduce();
+                }
                 rms_norm_cuda(buf_hidden_.bf16(), buf_hidden_.bf16(),
                               norm_weight_.bf16(), dim, cfg_.rms_norm_eps, main_stream_);
                 compute_logits();
