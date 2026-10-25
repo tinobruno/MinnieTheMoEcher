@@ -206,6 +206,7 @@ struct ModelConfig {
                        model_name.find("DeepSeek V4.1") != std::string::npos || model_name.find("DeepSeek-V4.1") != std::string::npos ||
                        arch_str == "deepseek_v41" || arch_str == "deepseek-v4.1" || arch_str == "deepseek_v4.1" || arch_str == "DeepseekV41ForCausalLM") {
                 architecture = ModelArch::DEEPSEEK_V41;
+                n_hash_layers = 0;
             } else if (model_id.find("qwen3") != std::string::npos || model_name.find("Qwen 3") != std::string::npos || arch_str == "qwen3") {
                 architecture = ModelArch::QWEN;
             } else if (arch_str == "qwen2" || arch_str == "qwen2.5") {

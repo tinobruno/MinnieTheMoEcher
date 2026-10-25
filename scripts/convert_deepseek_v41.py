@@ -135,35 +135,75 @@ def convert_deepseek_v41(raw_dir: Path, out_dir: Path, dry_run: bool = False):
     expert_bin_path = out_dir / "expert.bin"
     print(f"\n[4/4] Packing {num_layers * n_routed_experts} routed experts into Direct-I/O binary {expert_bin_path.name}...")
 
-    # Calculate aligned block size per expert (gate + up + down + scales)
-    # NVFP4 4-bit representation: 0.5 bytes per element + FP8 block scales
-    raw_expert_bytes = (moe_inter * hidden_size // 2) * 3 + (moe_inter * hidden_size // 32) * 3
-    expert_block_size = align_up(raw_expert_bytes, PAGE_SIZE)
+    part_order = [
+        "w1.weight", "w1.scale",
+        "w3.weight", "w3.scale",
+        "w2.weight", "w2.scale"
+    ]
+
+    # Resolve expert part dimensions and offsets from layer 0 expert 0
+    sample_expert_prefix = "layers.0.ffn.experts.0"
+    expert_parts = {}
+    cur_block_offset = 0
+    for part in part_order:
+        key = f"{sample_expert_prefix}.{part}"
+        if key not in tensor_index:
+            key = f"model.{key}"
+        if key in tensor_index:
+            meta = tensor_index[key]
+            expert_parts[part] = {
+                "offset_in_block": cur_block_offset,
+                "nbytes": meta["nbytes"],
+                "dtype": meta["dtype"],
+                "shape": meta["shape"]
+            }
+            cur_block_offset += meta["nbytes"]
+        else:
+            # Fallback estimation for FP4 / E8M0 if index not yet scanned
+            if part in ["w1.weight", "w3.weight"]:
+                nbytes = moe_inter * (hidden_size // 2)
+                dtype = "I8"
+                shape = [moe_inter, hidden_size // 2]
+            elif part == "w2.weight":
+                nbytes = hidden_size * (moe_inter // 2)
+                dtype = "I8"
+                shape = [hidden_size, moe_inter // 2]
+            elif part in ["w1.scale", "w3.scale"]:
+                nbytes = moe_inter * (hidden_size // 32)
+                dtype = "F8_E8M0"
+                shape = [moe_inter, hidden_size // 32]
+            else: # w2.scale
+                nbytes = hidden_size * (moe_inter // 32)
+                dtype = "F8_E8M0"
+                shape = [hidden_size, moe_inter // 32]
+            expert_parts[part] = {
+                "offset_in_block": cur_block_offset,
+                "nbytes": nbytes,
+                "dtype": dtype,
+                "shape": shape
+            }
+            cur_block_offset += nbytes
+
+    expert_block_size = align_up(cur_block_offset, PAGE_SIZE)
     print(f"      Expert Block Size: {expert_block_size} bytes ({expert_block_size / (1024*1024):.2f} MB, 4KB page aligned)")
+    for part, pinfo in expert_parts.items():
+        print(f"        {part:10s} -> offset: {pinfo['offset_in_block']:8d} | nbytes: {pinfo['nbytes']:8d} | dtype: {pinfo['dtype']}")
 
     with open(expert_bin_path, "wb") as f_exp:
         for l in range(num_layers):
             for e in range(n_routed_experts):
-                names = [
-                    f"layers.{l}.ffn.experts.{e}.w1.weight",
-                    f"layers.{l}.ffn.experts.{e}.w3.weight",
-                    f"layers.{l}.ffn.experts.{e}.w2.weight",
-                    f"layers.{l}.ffn.experts.{e}.w1.scale",
-                    f"layers.{l}.ffn.experts.{e}.w3.scale",
-                    f"layers.{l}.ffn.experts.{e}.w2.scale"
-                ]
-
                 block = bytearray(expert_block_size)
-                cur_off = 0
-                for name in names:
+                for part in part_order:
+                    pinfo = expert_parts[part]
+                    name = f"layers.{l}.ffn.experts.{e}.{part}"
                     target_key = name if name in tensor_index else f"model.{name}"
                     if target_key in tensor_index:
                         t_meta = tensor_index[target_key]
                         with open(t_meta["file"], "rb") as f_in:
                             f_in.seek(t_meta["data_offset"])
                             p_data = f_in.read(t_meta["nbytes"])
-                        block[cur_off:cur_off + len(p_data)] = p_data
-                        cur_off += len(p_data)
+                        off = pinfo["offset_in_block"]
+                        block[off:off + len(p_data)] = p_data
 
                 f_exp.write(block)
 
@@ -173,7 +213,7 @@ def convert_deepseek_v41(raw_dir: Path, out_dir: Path, dry_run: bool = False):
     expert_file_size = os.path.getsize(expert_bin_path)
     print(f"      Expert binary complete: {expert_file_size / (1024**3):.2f} GB")
 
-    # Generate Manifest
+    # Generate Manifest conforming to MinnieTheMoEcher engine schema
     manifest_path = out_dir / "moecher_manifest.json"
     manifest = {
         "model_config": {
@@ -195,6 +235,7 @@ def convert_deepseek_v41(raw_dir: Path, out_dir: Path, dry_run: bool = False):
             "n_routed_experts": n_routed_experts,
             "num_experts_per_tok": top_k,
             "n_shared_experts": n_shared_experts,
+            "n_hash_layers": 0,
             "routed_scaling_factor": 1.5,
             "swiglu_limit": 10.0,
             "scoring_func": "sqrtsoftplus",
@@ -202,18 +243,29 @@ def convert_deepseek_v41(raw_dir: Path, out_dir: Path, dry_run: bool = False):
             "max_seq_len": 65536,
             "window_size": 128
         },
-        "expert_bins": {
-            "path": "expert.bin",
+        "tokenizer": {
+            "bos_token_id": 0,
+            "eos_token_id": 1,
+            "user_token": "<|User|>",
+            "assistant_token": "<|Assistant|>",
+            "tokenizer_json": "tokenizer.json"
+        },
+        "dense_bin": "attention_dense_layers.bin",
+        "expert_bin": "expert.bin",
+        "expert_layout": {
             "block_size": expert_block_size,
             "n_layers": num_layers,
-            "n_experts": n_routed_experts
+            "n_experts": n_routed_experts,
+            "part_order": part_order,
+            "parts": expert_parts,
+            "layer_prefixes": [f"layers.{i}" for i in range(num_layers)]
         },
         "cache_recommendation": {
             "l1_vram_gb": 46.0,
             "l2_dram_gb": 32.0,
             "l3_storage": "direct_io"
         },
-        "tensors": dense_tensors_meta
+        "dense_tensors": dense_tensors_meta
     }
 
     with open(manifest_path, "w", encoding="utf-8") as f_man:
