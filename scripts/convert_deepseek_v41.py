@@ -245,7 +245,7 @@ def convert_deepseek_v41(raw_dir: Path, out_dir: Path, dry_run: bool = False):
             "o_lora_rank": o_lora_rank,
             "o_groups": o_groups,
             "moe_intermediate_size": moe_inter,
-            "moe_shared_expert_intermediate_size": 3712,
+            "moe_shared_expert_intermediate_size": moe_inter,
             "n_routed_experts": n_routed_experts,
             "num_experts_per_tok": top_k,
             "n_shared_experts": n_shared_experts,
@@ -255,7 +255,8 @@ def convert_deepseek_v41(raw_dir: Path, out_dir: Path, dry_run: bool = False):
             "scoring_func": "sqrtsoftplus",
             "expert_dtype": "fp4",
             "max_seq_len": 65536,
-            "window_size": 128
+            "window_size": 4096,
+            "sliding_window": 4096
         },
         "tokenizer": {
             "bos_token_id": 0,

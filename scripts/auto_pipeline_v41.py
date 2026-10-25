@@ -15,6 +15,11 @@ import urllib.error
 import subprocess
 from pathlib import Path
 
+if hasattr(sys.stdout, 'reconfigure'):
+    sys.stdout.reconfigure(encoding='utf-8', errors='replace')
+if hasattr(sys.stderr, 'reconfigure'):
+    sys.stderr.reconfigure(encoding='utf-8', errors='replace')
+
 RAW_DIR = Path("F:/models/deepseek_v41_raw")
 OUT_DIR = Path("F:/Moecher/models/deepseek_v41_nvfp4")
 EXPECTED_SHARDS = 48

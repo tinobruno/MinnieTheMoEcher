@@ -331,6 +331,17 @@ struct ModelConfig {
         if (default_thinking_budget < 0) {
             default_thinking_budget = 4096;
         }
+        if (is_deepseek_v41()) {
+            if (moe_shared_expert_intermediate_size == 3712 || moe_shared_expert_intermediate_size <= 0) {
+                moe_shared_expert_intermediate_size = moe_intermediate_size;
+            }
+            if (window_size <= 128) {
+                window_size = 4096;
+            }
+            if (sliding_window <= 128) {
+                sliding_window = 4096;
+            }
+        }
     }
 };
 

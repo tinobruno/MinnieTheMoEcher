@@ -11,21 +11,21 @@ if %errorlevel% neq 0 (
     exit /b 1
 )
 
-set "CUDA_PATH=C:\Program Files\NVIDIA GPU Computing Toolkit\CUDA\v13.1"
-set "PATH=C:\Program Files\NVIDIA GPU Computing Toolkit\CUDA\v13.1\bin;C:\Program Files\Microsoft Visual Studio\18\Community\Common7\IDE\CommonExtensions\Microsoft\CMake\Ninja;C:\ComfyUI\.venv\Scripts;%PATH%"
+set "CUDA_PATH=C:\Program Files\NVIDIA GPU Computing Toolkit\CUDA\v13.3"
+set "PATH=C:\Program Files\Microsoft Visual Studio\18\Community\Common7\IDE\CommonExtensions\Microsoft\CMake\CMake\bin;C:\Program Files\Microsoft Visual Studio\18\Community\Common7\IDE\CommonExtensions\Microsoft\CMake\Ninja;C:\Program Files\NVIDIA GPU Computing Toolkit\CUDA\v13.3\bin;%PATH%"
 
 echo [INFO] Embedding Web UI assets into binary...
-"C:\ComfyUI\.venv\Scripts\python.exe" scripts\embed_web.py
+python scripts\embed_web.py
 if %errorlevel% neq 0 (
     echo [ERROR] Failed to embed web assets!
     exit /b 1
 )
 
-rem if exist build rmdir /s /q build
+if exist build\CMakeCache.txt del /q build\CMakeCache.txt
 
 cmake -B build -G Ninja ^
     -DCMAKE_BUILD_TYPE=Release ^
-    -DCMAKE_CUDA_COMPILER="C:/Program Files/NVIDIA GPU Computing Toolkit/CUDA/v13.1/bin/nvcc.exe" ^
+    -DCMAKE_CUDA_COMPILER="C:/Program Files/NVIDIA GPU Computing Toolkit/CUDA/v13.3/bin/nvcc.exe" ^
     -DCMAKE_CUDA_ARCHITECTURES="86;89;90;120a"
 if %errorlevel% neq 0 (
     echo [ERROR] CMake configuration failed!

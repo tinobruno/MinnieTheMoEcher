@@ -696,9 +696,10 @@
 
     // ── Execute a single expert SwiGLU ──────────────────────────────────────
 
-    void execute_expert_swiglu(void* expert_block, float routing_weight, int k) {
+    void execute_expert_swiglu(void* expert_block, float routing_weight, int k, const __nv_bfloat16* in_vec = nullptr) {
         int dim = cfg_.hidden_size;
         int moe_inter = cfg_.moe_intermediate_size;
+        const __nv_bfloat16* in_hidden = in_vec ? in_vec : buf_hidden_.bf16();
 
         auto& w1_info = expert_parts_["w1.weight"];
         auto& w3_info = expert_parts_["w3.weight"];
@@ -715,7 +716,7 @@
         __nv_bfloat16* my_down = buf_down_.bf16() + k * dim;
 
         if (cfg_.expert_dtype == "iq2_xxs") {
-            gemv_iq2_xxs_swiglu_fused_cuda(my_gate, buf_hidden_.bf16(),
+            gemv_iq2_xxs_swiglu_fused_cuda(my_gate, in_hidden,
                                            (const block_iq2_xxs*)w1_data,
                                            (const block_iq2_xxs*)w3_data,
                                            moe_inter, dim, cfg_.swiglu_limit, stream);
@@ -728,8 +729,8 @@
             uint8_t* w3_scale = block + w3s_info.offset_in_block;
             uint8_t* w2_scale = block + w2s_info.offset_in_block;
             int block_size = 256; 
-            gemm_int2_dequant(my_gate, 1, moe_inter, dim, buf_hidden_.bf16(), w1_data, (__nv_bfloat16*)w1_scale, block_size, stream);
-            gemm_int2_dequant(my_up,   1, moe_inter, dim, buf_hidden_.bf16(), w3_data, (__nv_bfloat16*)w3_scale, block_size, stream);
+            gemm_int2_dequant(my_gate, 1, moe_inter, dim, in_hidden, w1_data, (__nv_bfloat16*)w1_scale, block_size, stream);
+            gemm_int2_dequant(my_up,   1, moe_inter, dim, in_hidden, w3_data, (__nv_bfloat16*)w3_scale, block_size, stream);
             silu_mul_cuda(my_gate, my_gate, my_up, moe_inter, cfg_.swiglu_limit, stream);
             gemm_int2_dequant(my_down, 1, dim, moe_inter, my_gate, w2_data, (__nv_bfloat16*)w2_scale, block_size, stream);
         } else if (cfg_.expert_dtype == "sparse_nvfp4") {
@@ -748,7 +749,7 @@
             uint8_t* w2_scale = block + w2s_info.offset_in_block;
 
             gemv_sparse_nvfp4_swiglu_fused_cuda(
-                my_gate, buf_hidden_.bf16(),
+                my_gate, in_hidden,
                 w1_data, w1_meta, w1_scale,
                 w3_data, w3_meta, w3_scale,
                 moe_inter, dim, cfg_.swiglu_limit, stream);
@@ -766,8 +767,8 @@
             uint8_t* w2_scale = block + w2s_info.offset_in_block;
             int w1_scale_cols = w1s_info.shape.size() > 1 ? w1s_info.shape[1] : 1;
             int w2_scale_cols = w2s_info.shape.size() > 1 ? w2s_info.shape[1] : 1;
-            gemm_fp4_dequant(my_gate, 1, moe_inter, dim, buf_hidden_.bf16(), w1_data, w1_scale, w1_scale_cols, stream);
-            gemm_fp4_dequant(my_up,   1, moe_inter, dim, buf_hidden_.bf16(), w3_data, w3_scale, w1_scale_cols, stream);
+            gemm_fp4_dequant(my_gate, 1, moe_inter, dim, in_hidden, w1_data, w1_scale, w1_scale_cols, stream);
+            gemm_fp4_dequant(my_up,   1, moe_inter, dim, in_hidden, w3_data, w3_scale, w1_scale_cols, stream);
             silu_mul_cuda(my_gate, my_gate, my_up, moe_inter, cfg_.swiglu_limit, stream);
             gemm_fp4_dequant(my_down, 1, dim, moe_inter, my_gate, w2_data, w2_scale, w2_scale_cols, stream);
         }

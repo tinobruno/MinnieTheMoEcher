@@ -2031,6 +2031,7 @@ void run_server(MoecherEngine& engine, int port, int default_thinking_budget, in
                                             return emit_buffered_reasoning(safe_text);
                                         });
                                     } else {
+                                        reasoning_filter.streamed_clean_text += text;
                                         return emit_buffered_reasoning(text);
                                     }
                                 } else {
@@ -2040,6 +2041,7 @@ void run_server(MoecherEngine& engine, int port, int default_thinking_budget, in
                                             return emit_buffered_content(safe_text);
                                         });
                                     } else {
+                                        content_filter.streamed_clean_text += text;
                                         return emit_buffered_content(text);
                                     }
                                 }

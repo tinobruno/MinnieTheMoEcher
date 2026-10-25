@@ -606,6 +606,7 @@ public:
     GPUTensor buf_hc_comb_;      // [hc_mult*hc_mult] F32
     GPUTensor buf_hc_mixes_;     // [(2+hc)*hc] F32
     GPUTensor buf_hc_input_;     // [hc_mult*hidden_size] F32 — flattened HC state
+    GPUTensor buf_hc_pre_mix_;   // [hc_mult] F32 — sequential pre_mix for DeepSeek-V4.1
 
     // Compressor working buffers
     GPUTensor buf_comp_proj_;    // F32 working buffer for compressor projections
@@ -1420,7 +1421,7 @@ public:
                            manifest.contains("visual_config") ||
                            manifest.contains("vision_bin") ||
                            (manifest.contains("dense_tensors") && manifest["dense_tensors"].contains("model.visual.patch_embed.proj.weight"));
-        if (enable_vision_ && !has_vision_delegate() && (cfg_.is_qwen() || cfg_.architecture == ModelArch::DEEPSEEK_V4) && vision_flag) {
+        if (enable_vision_ && !has_vision_delegate() && (cfg_.is_qwen() || cfg_.is_deepseek()) && vision_flag) {
             if (manifest.contains("dense_tensors") && manifest["dense_tensors"].contains("model.visual.patch_embed.proj.weight")) {
                 std::string dense_path = manifest.value("dense_bin", "");
                 std::string dense_full = dense_path.empty() ? "" : (base_dir / dense_path).string();
@@ -1873,6 +1874,11 @@ public:
                                                embed_weight_.bf16(), buf_input_token_.i32(), dim, hc, main_stream_);
         }
 
+        if (cfg_.is_deepseek_v41()) {
+            static const float id_mix[4] = {1.0f, 0.0f, 0.0f, 0.0f};
+            CUDA_CHECK(cudaMemcpyAsync(buf_hc_pre_mix_.f32(), id_mix, hc * sizeof(float), cudaMemcpyHostToDevice, main_stream_));
+        }
+
         // Override with vision tower embedding for image tokens
         if (active_visual_embeddings_ && position >= visual_embed_start_pos_ && position < visual_embed_start_pos_ + visual_embed_num_tokens_) {
             int v_idx = position - visual_embed_start_pos_;
@@ -1895,7 +1901,9 @@ public:
         }
 
         // 4. Head HC: reduce [hc, dim] -> [dim]
-        if (!cfg_.is_deepseek_v41()) {
+        if (cfg_.is_deepseek_v41()) {
+            hc_pre_weighted_add_cuda(buf_hidden_.bf16(), buf_hc_state_.bf16(), buf_hc_pre_mix_.f32(), dim, hc, main_stream_);
+        } else {
             hc_head_reduce();
         }
 
@@ -2177,7 +2185,7 @@ public:
             prefill_prompt_batched_nemotron(prefix_tokens, 0, /*compute_last_logits=*/false);
         } else {
             // ModelArch::DEEPSEEK_V4
-            if (!cfg_.is_nemotron() && enable_batched_prefill_ && prefix_tokens.size() > 1) {
+            if (!cfg_.is_nemotron() && !cfg_.is_deepseek_v41() && enable_batched_prefill_ && prefix_tokens.size() > 1) {
                 prefill_prompt_batched_deepseek(prefix_tokens);
             } else {
                 for (size_t i = 0; i < prefix_tokens.size(); i++) {
@@ -2251,7 +2259,7 @@ public:
         }
 
         bool can_reuse_prefix = (prefix_len > 0);
-        if ((cfg_.architecture == ModelArch::DEEPSEEK_V4 || cfg_.is_nemotron()) && prefix_len < cached_tokens_.size()) {
+        if ((cfg_.is_deepseek() || cfg_.is_nemotron()) && prefix_len < cached_tokens_.size()) {
             can_reuse_prefix = false;
             prefix_len = 0;
         }
@@ -2359,7 +2367,7 @@ public:
             } else {
                 // ModelArch::DEEPSEEK_V4
                 size_t remaining = (prompt.size() > prefix_len) ? (prompt.size() - prefix_len) : 0;
-                if (!cfg_.is_nemotron() && enable_batched_prefill_ && remaining > 1) {
+                if (!cfg_.is_nemotron() && !cfg_.is_deepseek_v41() && enable_batched_prefill_ && remaining > 1) {
                     prefill_prompt_batched_deepseek(prompt, (int)prefix_len);
                 } else {
                     for (size_t i = prefix_len; i < prompt.size(); i++) {
@@ -2503,7 +2511,7 @@ public:
         if (active_visual_embeddings_) {
             can_reuse_prefix = false;
             prefix_len = 0;
-        } else if ((cfg_.architecture == ModelArch::DEEPSEEK_V4 || cfg_.is_nemotron()) && prefix_len < cached_tokens_.size()) {
+        } else if ((cfg_.is_deepseek() || cfg_.is_nemotron()) && prefix_len < cached_tokens_.size()) {
             can_reuse_prefix = false;
             prefix_len = 0;
         }
@@ -2638,7 +2646,7 @@ public:
             } else {
                 // ModelArch::DEEPSEEK_V4
                 size_t remaining = (prompt.size() > prefix_len) ? (prompt.size() - prefix_len) : 0;
-                if (!cfg_.is_nemotron() && enable_batched_prefill_ && remaining > 1) {
+                if (!cfg_.is_nemotron() && !cfg_.is_deepseek_v41() && enable_batched_prefill_ && remaining > 1) {
                     prefill_prompt_batched_deepseek(prompt, (int)prefix_len);
                 } else {
                     for (size_t i = prefix_len; i < prompt.size(); i++) {
@@ -4533,6 +4541,7 @@ private:
         buf_hc_comb_.alloc(hc * hc * sizeof(float));
         buf_hc_mixes_.alloc((2 + hc) * hc * sizeof(float));
         buf_hc_input_.alloc((size_t)hc * dim * sizeof(float));
+        buf_hc_pre_mix_.alloc(hc * sizeof(float));
         buf_active_expert_ptrs_.alloc(32 * sizeof(void*));
 
         // Speculative decoding and parallel prefill batch buffers (M=1024 capacity, hardware Tensor Core prefill)

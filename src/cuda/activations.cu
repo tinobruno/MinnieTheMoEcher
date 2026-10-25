@@ -1503,9 +1503,16 @@ __global__ void gemv_fp8_kernel(
     int tid = threadIdx.y * 32 + threadIdx.x;
     if (tid < 256) s_fp8_lut[tid] = fp8_e4m3_to_float_v2(tid);
 
+    int total_chunks = K / 16;
+
     // Pipeline prologue: prefetch first 512 elements (1024 bytes) of vec into s_vec[0]
     if (tid < 64) {
-        cp_async_16_bytes((uint4*)s_vec[0] + tid, (const uint4*)vec + tid);
+        int v_idx = tid * 8;
+        if (v_idx + 8 <= K) {
+            cp_async_16_bytes((uint4*)s_vec[0] + tid, (const uint4*)vec + tid);
+        } else {
+            reinterpret_cast<uint4*>(s_vec[0])[tid] = make_uint4(0, 0, 0, 0);
+        }
     }
     cp_async_commit_group();
     cp_async_wait_all();
@@ -1521,60 +1528,67 @@ __global__ void gemv_fp8_kernel(
 
     const uint4* w_vec16 = reinterpret_cast<const uint4*>(&weight[(size_t)row * K]);
 
-    int n_tiles = K / 512;
+    int n_tiles = (K + 511) / 512;
     for (int t = 0; t < n_tiles; t++) {
         int curr_stage = t & 1;
         int next_stage = (t + 1) & 1;
 
         // Asynchronously prefetch next 512 elements of input vector
         if (t + 1 < n_tiles && tid < 64) {
-            cp_async_16_bytes((uint4*)s_vec[next_stage] + tid,
-                              (const uint4*)(vec + ((t + 1) << 9)) + tid);
+            int next_v_idx = ((t + 1) << 9) + tid * 8;
+            if (next_v_idx + 8 <= K) {
+                cp_async_16_bytes((uint4*)s_vec[next_stage] + tid,
+                                  (const uint4*)(vec + ((t + 1) << 9)) + tid);
+            } else {
+                reinterpret_cast<uint4*>(s_vec[next_stage])[tid] = make_uint4(0, 0, 0, 0);
+            }
             cp_async_commit_group();
         }
 
         int chunk = (t << 5) + lane;
-        int logical_col = chunk * 16;
-        int bc = logical_col / block_size;
-        float s_val = e8m0_to_float_v2(scale[br * scale_cols + bc]);
+        if (chunk < total_chunks) {
+            int logical_col = chunk * 16;
+            int bc = logical_col / block_size;
+            float s_val = e8m0_to_float_v2(scale[br * scale_cols + bc]);
 
-        uint4 w16 = w_vec16[chunk];
-        const uint4* s_a_vec4 = reinterpret_cast<const uint4*>(s_vec[curr_stage]);
-        uint4 a8_0 = s_a_vec4[(lane << 1)];
-        uint4 a8_1 = s_a_vec4[(lane << 1) + 1];
+            uint4 w16 = w_vec16[chunk];
+            const uint4* s_a_vec4 = reinterpret_cast<const uint4*>(s_vec[curr_stage]);
+            uint4 a8_0 = s_a_vec4[(lane << 1)];
+            uint4 a8_1 = s_a_vec4[(lane << 1) + 1];
 
-        float2 f0 = to_float2_bf162(*reinterpret_cast<const __nv_bfloat162*>(&a8_0.x));
-        float2 f1 = to_float2_bf162(*reinterpret_cast<const __nv_bfloat162*>(&a8_0.y));
-        float2 f2 = to_float2_bf162(*reinterpret_cast<const __nv_bfloat162*>(&a8_0.z));
-        float2 f3 = to_float2_bf162(*reinterpret_cast<const __nv_bfloat162*>(&a8_0.w));
+            float2 f0 = to_float2_bf162(*reinterpret_cast<const __nv_bfloat162*>(&a8_0.x));
+            float2 f1 = to_float2_bf162(*reinterpret_cast<const __nv_bfloat162*>(&a8_0.y));
+            float2 f2 = to_float2_bf162(*reinterpret_cast<const __nv_bfloat162*>(&a8_0.z));
+            float2 f3 = to_float2_bf162(*reinterpret_cast<const __nv_bfloat162*>(&a8_0.w));
 
-        float2 f4 = to_float2_bf162(*reinterpret_cast<const __nv_bfloat162*>(&a8_1.x));
-        float2 f5 = to_float2_bf162(*reinterpret_cast<const __nv_bfloat162*>(&a8_1.y));
-        float2 f6 = to_float2_bf162(*reinterpret_cast<const __nv_bfloat162*>(&a8_1.z));
-        float2 f7 = to_float2_bf162(*reinterpret_cast<const __nv_bfloat162*>(&a8_1.w));
+            float2 f4 = to_float2_bf162(*reinterpret_cast<const __nv_bfloat162*>(&a8_1.x));
+            float2 f5 = to_float2_bf162(*reinterpret_cast<const __nv_bfloat162*>(&a8_1.y));
+            float2 f6 = to_float2_bf162(*reinterpret_cast<const __nv_bfloat162*>(&a8_1.z));
+            float2 f7 = to_float2_bf162(*reinterpret_cast<const __nv_bfloat162*>(&a8_1.w));
 
-        float chunk_sum = 0.0f;
-        chunk_sum += s_fp8_lut[(w16.x) & 0xFF] * f0.x;
-        chunk_sum += s_fp8_lut[(w16.x >> 8) & 0xFF] * f0.y;
-        chunk_sum += s_fp8_lut[(w16.x >> 16) & 0xFF] * f1.x;
-        chunk_sum += s_fp8_lut[(w16.x >> 24) & 0xFF] * f1.y;
+            float chunk_sum = 0.0f;
+            chunk_sum += s_fp8_lut[(w16.x) & 0xFF] * f0.x;
+            chunk_sum += s_fp8_lut[(w16.x >> 8) & 0xFF] * f0.y;
+            chunk_sum += s_fp8_lut[(w16.x >> 16) & 0xFF] * f1.x;
+            chunk_sum += s_fp8_lut[(w16.x >> 24) & 0xFF] * f1.y;
 
-        chunk_sum += s_fp8_lut[(w16.y) & 0xFF] * f2.x;
-        chunk_sum += s_fp8_lut[(w16.y >> 8) & 0xFF] * f2.y;
-        chunk_sum += s_fp8_lut[(w16.y >> 16) & 0xFF] * f3.x;
-        chunk_sum += s_fp8_lut[(w16.y >> 24) & 0xFF] * f3.y;
+            chunk_sum += s_fp8_lut[(w16.y) & 0xFF] * f2.x;
+            chunk_sum += s_fp8_lut[(w16.y >> 8) & 0xFF] * f2.y;
+            chunk_sum += s_fp8_lut[(w16.y >> 16) & 0xFF] * f3.x;
+            chunk_sum += s_fp8_lut[(w16.y >> 24) & 0xFF] * f3.y;
 
-        chunk_sum += s_fp8_lut[(w16.z) & 0xFF] * f4.x;
-        chunk_sum += s_fp8_lut[(w16.z >> 8) & 0xFF] * f4.y;
-        chunk_sum += s_fp8_lut[(w16.z >> 16) & 0xFF] * f5.x;
-        chunk_sum += s_fp8_lut[(w16.z >> 24) & 0xFF] * f5.y;
+            chunk_sum += s_fp8_lut[(w16.z) & 0xFF] * f4.x;
+            chunk_sum += s_fp8_lut[(w16.z >> 8) & 0xFF] * f4.y;
+            chunk_sum += s_fp8_lut[(w16.z >> 16) & 0xFF] * f5.x;
+            chunk_sum += s_fp8_lut[(w16.z >> 24) & 0xFF] * f5.y;
 
-        chunk_sum += s_fp8_lut[(w16.w) & 0xFF] * f6.x;
-        chunk_sum += s_fp8_lut[(w16.w >> 8) & 0xFF] * f6.y;
-        chunk_sum += s_fp8_lut[(w16.w >> 16) & 0xFF] * f7.x;
-        chunk_sum += s_fp8_lut[(w16.w >> 24) & 0xFF] * f7.y;
+            chunk_sum += s_fp8_lut[(w16.w) & 0xFF] * f6.x;
+            chunk_sum += s_fp8_lut[(w16.w >> 8) & 0xFF] * f6.y;
+            chunk_sum += s_fp8_lut[(w16.w >> 16) & 0xFF] * f7.x;
+            chunk_sum += s_fp8_lut[(w16.w >> 24) & 0xFF] * f7.y;
 
-        sum += chunk_sum * s_val;
+            sum += chunk_sum * s_val;
+        }
 
         if (t + 1 < n_tiles) {
             cp_async_wait_all();
@@ -5939,12 +5953,14 @@ __global__ void hc_pre_weighted_add_norm_kernel(
     const __nv_bfloat16* s2 = hc_state + 2 * dim;
     const __nv_bfloat16* s3 = hc_state + 3 * dim;
 
-    float reg_y[4];
-    int idx[4];
+    const int MAX_K = 8;
+    float reg_y[MAX_K];
+    int idx[MAX_K];
     float sum_sq = 0.0f;
+    int num_k = (dim + blockDim.x - 1) / blockDim.x;
+    if (num_k > MAX_K) num_k = MAX_K;
 
-    #pragma unroll
-    for (int k = 0; k < 4; k++) {
+    for (int k = 0; k < num_k; k++) {
         int i = tid + k * blockDim.x;
         idx[k] = i;
         if (i < dim) {
@@ -5980,8 +5996,7 @@ __global__ void hc_pre_weighted_add_norm_kernel(
 
     float rsqrt_val = rsqrtf(sdata[0] / (float)dim + eps);
 
-    #pragma unroll
-    for (int k = 0; k < 4; k++) {
+    for (int k = 0; k < num_k; k++) {
         int i = idx[k];
         if (i < dim) {
             float w = __bfloat162float(norm_weight[i]);
@@ -6524,13 +6539,15 @@ __global__ void deepseek_v41_gating_top6_kernel(
 
     for (int i = tid; i < n_experts; i += blockDim.x) {
         float raw = __bfloat162float(scores_bf16[i]) * inv_temp;
-        if (gate_bias) raw += gate_bias[i];
         
         // DeepSeek-V4.1 SqrtSoftplus scoring: sqrt(log(1 + exp(x)))
         float sp = (raw > 20.0f) ? raw : logf(1.0f + expf(raw));
         float score = sqrtf(fmaxf(0.0f, sp));
 
-        s_scores[i] = score;
+        float sel_score = score;
+        if (gate_bias) sel_score += gate_bias[i];
+
+        s_scores[i] = sel_score;
         s_probs[i] = score;
         s_indices[i] = i;
     }
@@ -7208,6 +7225,9 @@ __global__ void mla_attention_fused_kernel(
     __shared__ float s_out[512];
     __shared__ float s_red[32];
 
+    int lane = tid & 31;
+    int warp = tid >> 5;
+
     // ── Step 1: Load raw Q & compute unweighted RMSNorm in shared memory ──────
     float local_sum_sq = 0.0f;
     for (int d = tid; d < head_dim; d += n_threads) {
@@ -7215,31 +7235,32 @@ __global__ void mla_attention_fused_kernel(
         s_q[d] = val;
         local_sum_sq += val * val;
     }
-
-    // Warp-level sum reduction for RMSNorm
-    float warp_sum_sq = local_sum_sq;
-    #pragma unroll
-    for (int offset = 16; offset > 0; offset /= 2) {
-        warp_sum_sq += __shfl_down_sync(0xffffffff, warp_sum_sq, offset);
-    }
-    int lane = tid & 31;
-    int warp = tid >> 5;
-    if (lane == 0) s_red[warp] = warp_sum_sq;
     __syncthreads();
 
-    float block_sum_sq = (tid < (n_threads >> 5)) ? s_red[tid] : 0.0f;
-    #pragma unroll
-    for (int offset = 16; offset > 0; offset /= 2) {
-        block_sum_sq += __shfl_down_sync(0xffffffff, block_sum_sq, offset);
-    }
-    if (tid == 0) s_red[0] = rsqrtf(block_sum_sq / (float)head_dim + q_norm_eps);
-    __syncthreads();
+    if (q_norm_eps > 0.0f) {
+        // Warp-level sum reduction for RMSNorm
+        float warp_sum_sq = local_sum_sq;
+        #pragma unroll
+        for (int offset = 16; offset > 0; offset /= 2) {
+            warp_sum_sq += __shfl_down_sync(0xffffffff, warp_sum_sq, offset);
+        }
+        if (lane == 0) s_red[warp] = warp_sum_sq;
+        __syncthreads();
 
-    float rsqrt_val = s_red[0];
-    for (int d = tid; d < head_dim; d += n_threads) {
-        s_q[d] *= rsqrt_val;
+        float block_sum_sq = (tid < (n_threads >> 5)) ? s_red[tid] : 0.0f;
+        #pragma unroll
+        for (int offset = 16; offset > 0; offset /= 2) {
+            block_sum_sq += __shfl_down_sync(0xffffffff, block_sum_sq, offset);
+        }
+        if (tid == 0) s_red[0] = rsqrtf(block_sum_sq / (float)head_dim + q_norm_eps);
+        __syncthreads();
+
+        float rsqrt_val = s_red[0];
+        for (int d = tid; d < head_dim; d += n_threads) {
+            s_q[d] *= rsqrt_val;
+        }
+        __syncthreads();
     }
-    __syncthreads();
 
     // ── Step 2: Apply forward RoPE rotation directly in s_q ───────────────────
     int pos = (d_position != nullptr) ? *d_position : 0;
