@@ -1,0 +1,1091 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>MinnieBench Comprehensive Empirical Report | RTX 5060 Ti 16GB</title>
+    <!-- Google Fonts -->
+    <link rel="preconnect" href="https://fonts.googleapis.com">
+    <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+    <link href="https://fonts.googleapis.com/css2?family=Inter:wght@300;400;500;600;700;800&family=JetBrains+Mono:wght@400;500;600&display=swap" rel="stylesheet">
+    <!-- Chart.js CDN -->
+    <script src="https://cdn.jsdelivr.net/npm/chart.js"></script>
+    <style>
+        :root {
+            --bg-base: #080b12;
+            --bg-surface: #0e1422;
+            --bg-card: rgba(18, 26, 43, 0.75);
+            --bg-card-hover: rgba(24, 34, 56, 0.9);
+            --border: rgba(255, 255, 255, 0.08);
+            --border-hover: rgba(56, 189, 248, 0.35);
+            --text-primary: #f8fafc;
+            --text-secondary: #94a3b8;
+            --text-muted: #64748b;
+            --cyan: #38bdf8;
+            --purple: #a855f7;
+            --emerald: #10b981;
+            --amber: #f59e0b;
+            --rose: #f43f5e;
+            --font-sans: 'Inter', -apple-system, BlinkMacSystemFont, sans-serif;
+            --font-mono: 'JetBrains Mono', monospace;
+        }
+
+        * {
+            box-sizing: border-box;
+            margin: 0;
+            padding: 0;
+        }
+
+        body {
+            background-color: var(--bg-base);
+            color: var(--text-primary);
+            font-family: var(--font-sans);
+            line-height: 1.6;
+            padding: 2.5rem 1.5rem;
+            min-height: 100vh;
+        }
+
+        .container {
+            max-width: 1400px;
+            margin: 0 auto;
+        }
+
+        /* Header */
+        header {
+            margin-bottom: 2.5rem;
+            border-bottom: 1px solid var(--border);
+            padding-bottom: 2rem;
+            display: flex;
+            justify-content: space-between;
+            align-items: flex-start;
+            flex-wrap: wrap;
+            gap: 1.5rem;
+        }
+
+        .hero-title {
+            font-size: 2.4rem;
+            font-weight: 800;
+            letter-spacing: -0.03em;
+            background: linear-gradient(135deg, #38bdf8 0%, #818cf8 50%, #c084fc 100%);
+            -webkit-background-clip: text;
+            -webkit-text-fill-color: transparent;
+            margin-bottom: 0.5rem;
+        }
+
+        .hero-subtitle {
+            color: var(--text-secondary);
+            font-size: 1.05rem;
+        }
+
+        .telemetry-badges {
+            display: flex;
+            flex-wrap: wrap;
+            gap: 0.6rem;
+        }
+
+        .badge {
+            display: inline-flex;
+            align-items: center;
+            gap: 0.4rem;
+            padding: 0.35rem 0.8rem;
+            border-radius: 9999px;
+            font-size: 0.82rem;
+            font-weight: 600;
+            background: rgba(255, 255, 255, 0.05);
+            border: 1px solid var(--border);
+            color: var(--text-secondary);
+        }
+
+        .badge.cyan { border-color: rgba(56, 189, 248, 0.4); color: var(--cyan); background: rgba(56, 189, 248, 0.08); }
+        .badge.emerald { border-color: rgba(16, 185, 129, 0.4); color: var(--emerald); background: rgba(16, 185, 129, 0.08); }
+        .badge.purple { border-color: rgba(168, 85, 247, 0.4); color: var(--purple); background: rgba(168, 85, 247, 0.08); }
+        .badge.amber { border-color: rgba(245, 158, 11, 0.4); color: var(--amber); background: rgba(245, 158, 11, 0.08); }
+        .badge.rose { border-color: rgba(244, 63, 94, 0.4); color: var(--rose); background: rgba(244, 63, 94, 0.08); }
+
+        /* Top Highlights Grid (What is Better for What) */
+        .section-title {
+            font-size: 1.4rem;
+            font-weight: 700;
+            margin-bottom: 1.2rem;
+            display: flex;
+            align-items: center;
+            gap: 0.6rem;
+            letter-spacing: -0.02em;
+        }
+
+        .recommendation-grid {
+            display: grid;
+            grid-template-columns: repeat(auto-fit, minmax(320px, 1fr));
+            gap: 1.25rem;
+            margin-bottom: 3rem;
+        }
+
+        .rec-card {
+            background: var(--bg-card);
+            border: 1px solid var(--border);
+            border-radius: 16px;
+            padding: 1.5rem;
+            backdrop-filter: blur(16px);
+            transition: all 0.25s ease;
+            display: flex;
+            flex-direction: column;
+            justify-content: space-between;
+        }
+
+        .rec-card:hover {
+            border-color: var(--border-hover);
+            transform: translateY(-3px);
+            box-shadow: 0 12px 28px rgba(0, 0, 0, 0.4);
+        }
+
+        .rec-header {
+            display: flex;
+            justify-content: space-between;
+            align-items: flex-start;
+            margin-bottom: 0.8rem;
+        }
+
+        .rec-model {
+            font-size: 1.2rem;
+            font-weight: 700;
+            color: var(--text-primary);
+            margin-bottom: 0.2rem;
+        }
+
+        .rec-headline {
+            font-size: 0.92rem;
+            font-weight: 600;
+            color: var(--cyan);
+            margin-bottom: 0.8rem;
+        }
+
+        .rec-desc {
+            font-size: 0.88rem;
+            color: var(--text-secondary);
+            line-height: 1.5;
+            margin-bottom: 1.2rem;
+        }
+
+        .rec-stats {
+            display: grid;
+            grid-template-columns: 1fr 1fr;
+            gap: 0.6rem;
+            padding-top: 0.8rem;
+            border-top: 1px solid var(--border);
+            font-family: var(--font-mono);
+            font-size: 0.8rem;
+        }
+
+        .rec-stat-val {
+            font-weight: 700;
+            color: var(--text-primary);
+        }
+
+        .rec-stat-lbl {
+            color: var(--text-muted);
+            font-size: 0.72rem;
+            text-transform: uppercase;
+        }
+
+        /* Charts Layout */
+        .charts-grid {
+            display: grid;
+            grid-template-columns: repeat(auto-fit, minmax(600px, 1fr));
+            gap: 1.5rem;
+            margin-bottom: 3rem;
+        }
+
+        @media (max-width: 768px) {
+            .charts-grid { grid-template-columns: 1fr; }
+        }
+
+        .chart-card {
+            background: var(--bg-card);
+            border: 1px solid var(--border);
+            border-radius: 16px;
+            padding: 1.5rem;
+            backdrop-filter: blur(16px);
+        }
+
+        .chart-header {
+            margin-bottom: 1.2rem;
+        }
+
+        .chart-title {
+            font-size: 1.1rem;
+            font-weight: 700;
+            color: var(--text-primary);
+        }
+
+        .chart-desc {
+            font-size: 0.82rem;
+            color: var(--text-muted);
+        }
+
+        .canvas-container {
+            position: relative;
+            height: 320px;
+            width: 100%;
+        }
+
+        /* Table */
+        .table-card {
+            background: var(--bg-card);
+            border: 1px solid var(--border);
+            border-radius: 16px;
+            overflow: hidden;
+            margin-bottom: 3rem;
+        }
+
+        table {
+            width: 100%;
+            border-collapse: collapse;
+            text-align: left;
+            font-size: 0.9rem;
+        }
+
+        th {
+            background: rgba(255, 255, 255, 0.03);
+            color: var(--text-secondary);
+            font-weight: 600;
+            padding: 1rem 1.2rem;
+            border-bottom: 1px solid var(--border);
+            font-size: 0.82rem;
+            text-transform: uppercase;
+            letter-spacing: 0.04em;
+        }
+
+        td {
+            padding: 1rem 1.2rem;
+            border-bottom: 1px solid var(--border);
+            color: var(--text-primary);
+        }
+
+        tr:hover td {
+            background: rgba(255, 255, 255, 0.02);
+        }
+
+        .mono {
+            font-family: var(--font-mono);
+        }
+
+        .status-chip {
+            display: inline-block;
+            padding: 0.2rem 0.5rem;
+            border-radius: 4px;
+            font-size: 0.75rem;
+            font-weight: 700;
+            background: rgba(16, 185, 129, 0.15);
+            color: var(--emerald);
+            border: 1px solid rgba(16, 185, 129, 0.3);
+        }
+
+        /* Detailed Test Cards */
+        .details-grid {
+            display: grid;
+            grid-template-columns: 1fr;
+            gap: 1.25rem;
+            margin-bottom: 3rem;
+        }
+
+        .detail-card {
+            background: var(--bg-card);
+            border: 1px solid var(--border);
+            border-radius: 14px;
+            padding: 1.25rem;
+        }
+
+        .detail-title {
+            font-size: 1.15rem;
+            font-weight: 700;
+            color: var(--cyan);
+            margin-bottom: 0.5rem;
+            display: flex;
+            align-items: center;
+            justify-content: space-between;
+        }
+
+        .detail-tests {
+            display: grid;
+            grid-template-columns: repeat(auto-fit, minmax(280px, 1fr));
+            gap: 0.8rem;
+            margin-top: 1rem;
+        }
+
+        .test-box {
+            background: rgba(0, 0, 0, 0.25);
+            border: 1px solid var(--border);
+            border-radius: 10px;
+            padding: 0.8rem 1rem;
+        }
+
+        .test-box-title {
+            font-weight: 600;
+            font-size: 0.85rem;
+            color: var(--text-secondary);
+            margin-bottom: 0.3rem;
+        }
+
+        .test-box-metric {
+            font-family: var(--font-mono);
+            font-size: 0.82rem;
+            color: var(--emerald);
+            font-weight: 600;
+            margin-bottom: 0.3rem;
+        }
+
+        .test-box-preview {
+            font-size: 0.78rem;
+            color: var(--text-muted);
+            white-space: nowrap;
+            overflow: hidden;
+            text-overflow: ellipsis;
+        }
+
+        footer {
+            text-align: center;
+            padding-top: 2rem;
+            border-top: 1px solid var(--border);
+            color: var(--text-muted);
+            font-size: 0.85rem;
+        }
+    </style>
+</head>
+<body>
+    <div class="container">
+        <!-- Header -->
+        <header>
+            <div>
+                <h1 class="hero-title">MinnieBench Benchmark Suite</h1>
+                <p class="hero-subtitle">Automated Multi-Model Performance & Architecture Evaluation Dashboard</p>
+            </div>
+            <div class="telemetry-badges">
+                <div class="badge cyan">🎮 NVIDIA GeForce RTX 5060 Ti</div>
+                <div class="badge purple">⚡ Driver: 610.88</div>
+                <div class="badge emerald">💾 VRAM: 16311 MB</div>
+                <div class="badge">🚀 Engine: MinnieTheMoEcher v2.09 sm_120a</div>
+                <div class="badge amber">🕒 2026-10-25 02:47:36</div>
+            </div>
+        </header>
+
+        <!-- Model Specialization (What is Better for What) -->
+        <h2 class="section-title">🏆 Model Specialization & Hardware Recommendations</h2>
+        <div class="recommendation-grid">
+
+            <div class="rec-card">
+                <div>
+                    <div class="rec-header">
+                        <span class="badge sky">Top Coding & Fast Dev</span>
+                    </div>
+                    <div class="rec-model">Qwen 3.8 27B Vision 13G</div>
+                    <div class="rec-headline">Best for Coding & Software Synthesis</div>
+                    <p class="rec-desc">Peak ~34 tok/s decode, 836.7 tok/s prefill, 100% VRAM resident. Fused DeltaNet linear attention + MTP speculative drafting delivers instantaneous code generation, IDE pair programming, and multi-turn refactoring.</p>
+                </div>
+                <div class="rec-stats">
+                    <div>
+                        <div class="rec-stat-lbl">Peak Decode</div>
+                        <div class="rec-stat-val">32.9 tok/s</div>
+                    </div>
+                    <div>
+                        <div class="rec-stat-lbl">Peak Prefill</div>
+                        <div class="rec-stat-val">669.6 tok/s</div>
+                    </div>
+                    <div>
+                        <div class="rec-stat-lbl">VRAM Delta</div>
+                        <div class="rec-stat-val">14512 MB</div>
+                    </div>
+                    <div>
+                        <div class="rec-stat-lbl">Load Duration</div>
+                        <div class="rec-stat-val">51.4s</div>
+                    </div>
+                </div>
+            </div>
+
+            <div class="rec-card">
+                <div>
+                    <div class="rec-header">
+                        <span class="badge purple">Top Frontier Reasoning</span>
+                    </div>
+                    <div class="rec-model">Nemotron 3.5 Bolt (24GB Profile)</div>
+                    <div class="rec-headline">Best for Frontier Reasoning & Deep Analysis</div>
+                    <p class="rec-desc">74B scale with 496 routed experts running on a 16GB GPU. Minnie's asynchronous double-buffered DMA streams weights over PCIe 4.0 with 0% CPU load, delivering 11.8 - 16.6 tok/s in deep thinking mode and solving complex logic smaller models cannot.</p>
+                </div>
+                <div class="rec-stats">
+                    <div>
+                        <div class="rec-stat-lbl">Peak Decode</div>
+                        <div class="rec-stat-val">16.3 tok/s</div>
+                    </div>
+                    <div>
+                        <div class="rec-stat-lbl">Peak Prefill</div>
+                        <div class="rec-stat-val">79.6 tok/s</div>
+                    </div>
+                    <div>
+                        <div class="rec-stat-lbl">VRAM Delta</div>
+                        <div class="rec-stat-val">14866 MB</div>
+                    </div>
+                    <div>
+                        <div class="rec-stat-lbl">Load Duration</div>
+                        <div class="rec-stat-val">42.1s</div>
+                    </div>
+                </div>
+            </div>
+
+            <div class="rec-card">
+                <div>
+                    <div class="rec-header">
+                        <span class="badge emerald">Top Agentic Execution</span>
+                    </div>
+                    <div class="rec-model">Nemotron 3.5 Lightning (30B-A3B)</div>
+                    <div class="rec-headline">Best for Autonomous Agents & Tool Loops</div>
+                    <p class="rec-desc">Sustained 20.6 tok/s decode, 274.0 tok/s prefill, 100% VRAM resident (12.2 GB). Top-6 sparse MoE with Mamba-2 SSM provides instant reaction latency for multi-turn web search, tool execution, and agentic workflows with zero host RAM paging.</p>
+                </div>
+                <div class="rec-stats">
+                    <div>
+                        <div class="rec-stat-lbl">Peak Decode</div>
+                        <div class="rec-stat-val">21.5 tok/s</div>
+                    </div>
+                    <div>
+                        <div class="rec-stat-lbl">Peak Prefill</div>
+                        <div class="rec-stat-val">269.1 tok/s</div>
+                    </div>
+                    <div>
+                        <div class="rec-stat-lbl">VRAM Delta</div>
+                        <div class="rec-stat-val">12261 MB</div>
+                    </div>
+                    <div>
+                        <div class="rec-stat-lbl">Load Duration</div>
+                        <div class="rec-stat-val">87.3s</div>
+                    </div>
+                </div>
+            </div>
+
+            <div class="rec-card">
+                <div>
+                    <div class="rec-header">
+                        <span class="badge amber">NVMe Paging Bound</span>
+                    </div>
+                    <div class="rec-model">Nemotron 3.5 Bolt 74B (Full NVFP4 / 68GB)</div>
+                    <div class="rec-headline">Full 68GB Footprint Boundary</div>
+                    <p class="rec-desc">Exceeds 48GB host memory (16GB VRAM + 32GB RAM = 48GB < 68GB). Forces heavy OS disk paging, dropping throughput to ~0.7 tok/s. Demonstrates why Minnie's 24GB profile is critical for consumer hardware.</p>
+                </div>
+                <div class="rec-stats">
+                    <div>
+                        <div class="rec-stat-lbl">Peak Decode</div>
+                        <div class="rec-stat-val">1.1 tok/s</div>
+                    </div>
+                    <div>
+                        <div class="rec-stat-lbl">Peak Prefill</div>
+                        <div class="rec-stat-val">1.9 tok/s</div>
+                    </div>
+                    <div>
+                        <div class="rec-stat-lbl">VRAM Delta</div>
+                        <div class="rec-stat-val">14937 MB</div>
+                    </div>
+                    <div>
+                        <div class="rec-stat-lbl">Load Duration</div>
+                        <div class="rec-stat-val">75.7s</div>
+                    </div>
+                </div>
+            </div>
+
+            <div class="rec-card">
+                <div>
+                    <div class="rec-header">
+                        <span class="badge rose">System Memory Exceeded</span>
+                    </div>
+                    <div class="rec-model">DeepSeek V4-Flash (IQ2)</div>
+                    <div class="rec-headline">Extreme MoE Capacity Limit</div>
+                    <p class="rec-desc">11,008 experts weighing 72.6 GB exceed combined VRAM + RAM capacity, triggering severe virtual memory disk thrashing (~1.0 tok/s). Proves the architectural necessity of selective expert quantization and RAM caching.</p>
+                </div>
+                <div class="rec-stats">
+                    <div>
+                        <div class="rec-stat-lbl">Peak Decode</div>
+                        <div class="rec-stat-val">1.0 tok/s</div>
+                    </div>
+                    <div>
+                        <div class="rec-stat-lbl">Peak Prefill</div>
+                        <div class="rec-stat-val">1.0 tok/s</div>
+                    </div>
+                    <div>
+                        <div class="rec-stat-lbl">VRAM Delta</div>
+                        <div class="rec-stat-val">11842 MB</div>
+                    </div>
+                    <div>
+                        <div class="rec-stat-lbl">Load Duration</div>
+                        <div class="rec-stat-val">147.4s</div>
+                    </div>
+                </div>
+            </div>
+
+            <div class="rec-card">
+                <div>
+                    <div class="rec-header">
+                        <span class="badge amber">NVMe Paging Bound</span>
+                    </div>
+                    <div class="rec-model">Nemotron 3.5 Bolt 74B (Full NVFP4 / 68GB)</div>
+                    <div class="rec-headline">Full 68GB Footprint Boundary</div>
+                    <p class="rec-desc">Exceeds 48GB host memory (16GB VRAM + 32GB RAM = 48GB < 68GB). Forces heavy OS disk paging, dropping throughput to ~0.7 tok/s. Demonstrates why Minnie's 24GB profile is critical for consumer hardware.</p>
+                </div>
+                <div class="rec-stats">
+                    <div>
+                        <div class="rec-stat-lbl">Peak Decode</div>
+                        <div class="rec-stat-val">0.0 tok/s</div>
+                    </div>
+                    <div>
+                        <div class="rec-stat-lbl">Peak Prefill</div>
+                        <div class="rec-stat-val">0.0 tok/s</div>
+                    </div>
+                    <div>
+                        <div class="rec-stat-lbl">VRAM Delta</div>
+                        <div class="rec-stat-val">0 MB</div>
+                    </div>
+                    <div>
+                        <div class="rec-stat-lbl">Load Duration</div>
+                        <div class="rec-stat-val">240.7s</div>
+                    </div>
+                </div>
+            </div>
+
+        </div>
+
+        <!-- Interactive Charts Grid -->
+        <h2 class="section-title">📊 Graphical Performance Comparison</h2>
+        <div class="charts-grid">
+            <div class="chart-card">
+                <div class="chart-header">
+                    <div class="chart-title">Decode Streaming Throughput (tok/s)</div>
+                    <div class="chart-desc">Generation speed across Direct Chat, Code, Reasoning & Explanatory Thinking</div>
+                </div>
+                <div class="canvas-container">
+                    <canvas id="decodeChart"></canvas>
+                </div>
+            </div>
+
+            <div class="chart-card">
+                <div class="chart-header">
+                    <div class="chart-title">Prefill Ingestion Speed (~512 tok Prompt)</div>
+                    <div class="chart-desc">Time-To-First-Token (TTFT) prompt processing throughput (tok/s)</div>
+                </div>
+                <div class="canvas-container">
+                    <canvas id="prefillChart"></canvas>
+                </div>
+            </div>
+
+            <div class="chart-card">
+                <div class="chart-header">
+                    <div class="chart-title">Total Hardware Processing Speed (tok/s)</div>
+                    <div class="chart-desc">(Prompt Tokens + Generated Tokens) / Total Request Duration</div>
+                </div>
+                <div class="canvas-container">
+                    <canvas id="totalTpsChart"></canvas>
+                </div>
+            </div>
+
+            <div class="chart-card">
+                <div class="chart-header">
+                    <div class="chart-title">Multi-Dimensional Capability Radar</div>
+                    <div class="chart-desc">Relative fitness profile across Coding, Agentic Tooling, Reasoning & Memory</div>
+                </div>
+                <div class="canvas-container">
+                    <canvas id="radarChart"></canvas>
+                </div>
+            </div>
+        </div>
+
+        <!-- Executive Summary Table -->
+        <h2 class="section-title">📋 Executive Summary Table</h2>
+        <div class="table-card">
+            <table>
+                <thead>
+                    <tr>
+                        <th>Model Name</th>
+                        <th>Architecture</th>
+                        <th>Status</th>
+                        <th>Load Time</th>
+                        <th>VRAM Usage</th>
+                        <th>Prefill (~512 tok)</th>
+                        <th>Decode (Gen)</th>
+                        <th>Thinking Range</th>
+                        <th>Total Combined</th>
+                        <th>Specialization</th>
+                    </tr>
+                </thead>
+                <tbody>
+
+                    <tr>
+                        <td><strong>Qwen 3.8 27B Vision 13G</strong></td>
+                        <td style="color: var(--text-secondary); font-size: 0.82rem;">DeltaNet Linear Attention + MTP Speculative Decoding</td>
+                        <td><span class="status-chip">SUCCESS</span></td>
+                        <td class="mono">51.4s</td>
+                        <td class="mono">14512 MB</td>
+                        <td class="mono" style="color: var(--cyan); font-weight: 700;">669.6 tok/s</td>
+                        <td class="mono" style="color: var(--emerald); font-weight: 700;">31.9 tok/s</td>
+                        <td class="mono" style="color: var(--purple);">21.7 - 22.3 tok/s</td>
+                        <td class="mono" style="color: var(--amber); font-weight: 700;">135.4 tok/s</td>
+                        <td><span class="badge sky">Top Coding & Fast Dev</span></td>
+                    </tr>
+
+                    <tr>
+                        <td><strong>Nemotron 3.5 Bolt (24GB Profile)</strong></td>
+                        <td style="color: var(--text-secondary); font-size: 0.82rem;">Hybrid Mamba-2 SSM + GQA Attention + Sparse MoE (NVFP4)</td>
+                        <td><span class="status-chip">SUCCESS</span></td>
+                        <td class="mono">42.1s</td>
+                        <td class="mono">14866 MB</td>
+                        <td class="mono" style="color: var(--cyan); font-weight: 700;">79.6 tok/s</td>
+                        <td class="mono" style="color: var(--emerald); font-weight: 700;">8.5 tok/s</td>
+                        <td class="mono" style="color: var(--purple);">13.0 - 16.3 tok/s</td>
+                        <td class="mono" style="color: var(--amber); font-weight: 700;">43.2 tok/s</td>
+                        <td><span class="badge purple">Top Frontier Reasoning</span></td>
+                    </tr>
+
+                    <tr>
+                        <td><strong>Nemotron 3.5 Lightning (30B-A3B)</strong></td>
+                        <td style="color: var(--text-secondary); font-size: 0.82rem;">Hybrid Mamba-2 SSM + GQA Attention + Sparse MoE (NVFP4)</td>
+                        <td><span class="status-chip">SUCCESS</span></td>
+                        <td class="mono">87.3s</td>
+                        <td class="mono">12261 MB</td>
+                        <td class="mono" style="color: var(--cyan); font-weight: 700;">269.1 tok/s</td>
+                        <td class="mono" style="color: var(--emerald); font-weight: 700;">18.6 tok/s</td>
+                        <td class="mono" style="color: var(--purple);">20.5 - 21.5 tok/s</td>
+                        <td class="mono" style="color: var(--amber); font-weight: 700;">88.2 tok/s</td>
+                        <td><span class="badge emerald">Top Agentic Execution</span></td>
+                    </tr>
+
+                    <tr>
+                        <td><strong>Nemotron 3.5 Bolt 74B (Full NVFP4 / 68GB)</strong></td>
+                        <td style="color: var(--text-secondary); font-size: 0.82rem;">Hybrid Mamba-2 SSM + GQA Attention + Sparse MoE (NVFP4)</td>
+                        <td><span class="status-chip">SUCCESS</span></td>
+                        <td class="mono">75.7s</td>
+                        <td class="mono">14937 MB</td>
+                        <td class="mono" style="color: var(--cyan); font-weight: 700;">N/A tok/s</td>
+                        <td class="mono" style="color: var(--emerald); font-weight: 700;">0.7 tok/s</td>
+                        <td class="mono" style="color: var(--purple);">N/A</td>
+                        <td class="mono" style="color: var(--amber); font-weight: 700;">N/A tok/s</td>
+                        <td><span class="badge amber">NVMe Paging Bound</span></td>
+                    </tr>
+
+                    <tr>
+                        <td><strong>DeepSeek V4-Flash (IQ2)</strong></td>
+                        <td style="color: var(--text-secondary); font-size: 0.82rem;">Sparse MoE (11,008 Experts) + MLA Latent Attention</td>
+                        <td><span class="status-chip">SUCCESS</span></td>
+                        <td class="mono">147.4s</td>
+                        <td class="mono">11842 MB</td>
+                        <td class="mono" style="color: var(--cyan); font-weight: 700;">N/A tok/s</td>
+                        <td class="mono" style="color: var(--emerald); font-weight: 700;">0.4 tok/s</td>
+                        <td class="mono" style="color: var(--purple);">1.0 - 1.0 tok/s</td>
+                        <td class="mono" style="color: var(--amber); font-weight: 700;">N/A tok/s</td>
+                        <td><span class="badge rose">System Memory Exceeded</span></td>
+                    </tr>
+
+                    <tr>
+                        <td><strong>Nemotron 3.5 Bolt 74B (Full NVFP4 / 68GB)</strong></td>
+                        <td style="color: var(--text-secondary); font-size: 0.82rem;">N/A</td>
+                        <td><span class="status-chip">FAILED_TO_LOAD</span></td>
+                        <td class="mono">N/A</td>
+                        <td class="mono">N/A</td>
+                        <td class="mono" style="color: var(--cyan); font-weight: 700;">N/A tok/s</td>
+                        <td class="mono" style="color: var(--emerald); font-weight: 700;">N/A tok/s</td>
+                        <td class="mono" style="color: var(--purple);">N/A</td>
+                        <td class="mono" style="color: var(--amber); font-weight: 700;">N/A tok/s</td>
+                        <td><span class="badge amber">NVMe Paging Bound</span></td>
+                    </tr>
+
+                </tbody>
+            </table>
+        </div>
+
+        <!-- Detailed Findings per Model -->
+        <h2 class="section-title">🔍 Detailed Empirical Findings per Model</h2>
+        <div class="details-grid">
+
+            <div class="detail-card">
+                <div class="detail-title">
+                    <span>Qwen 3.8 27B Vision 13G</span>
+                    <span style="font-size: 0.8rem; color: var(--text-muted); font-family: var(--font-mono);">
+                        VRAM: ~14512 MB | Peak: 15316 MB | Load: 51.4s
+                    </span>
+                </div>
+                <div class="detail-tests">
+
+                    <div class="test-box">
+                        <div class="test-box-title">Direct Chat (No Thinking)</div>
+                        <div class="test-box-metric">Decode: 31.88 tok/s | Total: 36.56 tok/s</div>
+                        <div style="font-size: 0.72rem; color: var(--text-muted); margin-bottom: 0.3rem;">
+                            Prefill: 72.37 tok/s | 27 in / 64 out in 2.489s
+                        </div>
+                        <div class="test-box-preview" title="A mutex is a binary lock that ensures only one thread can access a resource at a time, typically requiring the same thre">A mutex is a binary lock that ensures only one thread can access a resource at a time, typically requiring the same thre</div>
+                    </div>
+
+                    <div class="test-box">
+                        <div class="test-box-title">Code Synthesis</div>
+                        <div class="test-box-metric">Decode: 32.91 tok/s | Total: 36.72 tok/s</div>
+                        <div style="font-size: 0.72rem; color: var(--text-muted); margin-bottom: 0.3rem;">
+                            Prefill: 72.61 tok/s | 32 in / 120 out in 4.139s
+                        </div>
+                        <div class="test-box-preview" title="```python def fibonacci(n: int) -> int:     """     Calculate the nth Fibonacci number iteratively.          The Fibonac">```python def fibonacci(n: int) -> int:     """     Calculate the nth Fibonacci number iteratively.          The Fibonac</div>
+                    </div>
+
+                    <div class="test-box">
+                        <div class="test-box-title">Step-by-Step Reasoning (Thinking)</div>
+                        <div class="test-box-metric">Decode: 21.69 tok/s | Total: 23.07 tok/s</div>
+                        <div style="font-size: 0.72rem; color: var(--text-muted); margin-bottom: 0.3rem;">
+                            Prefill: 57.76 tok/s | 60 in / 537 out in 25.875s
+                        </div>
+                        <div class="test-box-preview" title="The user is asking the classic bat and ball riddle. Let me work through this carefully.  The problem: A bat and a ball c">The user is asking the classic bat and ball riddle. Let me work through this carefully.  The problem: A bat and a ball c</div>
+                    </div>
+
+                    <div class="test-box">
+                        <div class="test-box-title">Explanatory Thinking (SSD vs RAM)</div>
+                        <div class="test-box-metric">Decode: 22.26 tok/s | Total: 23.4 tok/s</div>
+                        <div style="font-size: 0.72rem; color: var(--text-muted); margin-bottom: 0.3rem;">
+                            Prefill: 46.47 tok/s | 32 in / 399 out in 18.416s
+                        </div>
+                        <div class="test-box-preview" title="The user is asking me to explain the difference between SSD and RAM in simple terms. This is a straightforward computer">The user is asking me to explain the difference between SSD and RAM in simple terms. This is a straightforward computer</div>
+                    </div>
+
+                    <div class="test-box">
+                        <div class="test-box-title">Long Document Analysis (~512 tok Prefill)</div>
+                        <div class="test-box-metric">Decode: 27.23 tok/s | Total: 135.38 tok/s</div>
+                        <div style="font-size: 0.72rem; color: var(--text-muted); margin-bottom: 0.3rem;">
+                            Prefill: 669.6 tok/s | 413 in / 80 out in 3.642s
+                        </div>
+                        <div class="test-box-preview" title="Based on the text provided, here are the key mechanisms:  *   **Safety and Consistency:** Raft ensures safety through lo">Based on the text provided, here are the key mechanisms:  *   **Safety and Consistency:** Raft ensures safety through lo</div>
+                    </div>
+
+                </div>
+            </div>
+
+            <div class="detail-card">
+                <div class="detail-title">
+                    <span>Nemotron 3.5 Bolt (24GB Profile)</span>
+                    <span style="font-size: 0.8rem; color: var(--text-muted); font-family: var(--font-mono);">
+                        VRAM: ~14866 MB | Peak: 15160 MB | Load: 42.1s
+                    </span>
+                </div>
+                <div class="detail-tests">
+
+                    <div class="test-box">
+                        <div class="test-box-title">Direct Chat (No Thinking)</div>
+                        <div class="test-box-metric">Decode: 8.52 tok/s | Total: 11.87 tok/s</div>
+                        <div style="font-size: 0.72rem; color: var(--text-muted); margin-bottom: 0.3rem;">
+                            Prefill: 14.02 tok/s | 53 in / 50 out in 8.674s
+                        </div>
+                        <div class="test-box-preview" title="A mutex is a mutual exclusion lock that allows only one thread to access a resource at a time, ensuring exclusive owners">A mutex is a mutual exclusion lock that allows only one thread to access a resource at a time, ensuring exclusive owners</div>
+                    </div>
+
+                    <div class="test-box">
+                        <div class="test-box-title">Code Synthesis</div>
+                        <div class="test-box-metric">Decode: 10.06 tok/s | Total: 12.59 tok/s</div>
+                        <div style="font-size: 0.72rem; color: var(--text-muted); margin-bottom: 0.3rem;">
+                            Prefill: 17.17 tok/s | 59 in / 120 out in 14.216s
+                        </div>
+                        <div class="test-box-preview" title="```python def fibonacci(n: int) -> int:     """     Calculate the nth Fibonacci number iteratively.      The sequence is">```python def fibonacci(n: int) -> int:     """     Calculate the nth Fibonacci number iteratively.      The sequence is</div>
+                    </div>
+
+                    <div class="test-box">
+                        <div class="test-box-title">Step-by-Step Reasoning (Thinking)</div>
+                        <div class="test-box-metric">Decode: 13.0 tok/s | Total: 14.31 tok/s</div>
+                        <div style="font-size: 0.72rem; color: var(--text-muted); margin-bottom: 0.3rem;">
+                            Prefill: 31.6 tok/s | 77 in / 506 out in 40.749s
+                        </div>
+                        <div class="test-box-preview" title="The user is asking me to solve the classic "bat and ball" problem.  Problem statement: - A bat and a ball cost $1.10 in">The user is asking me to solve the classic "bat and ball" problem.  Problem statement: - A bat and a ball cost $1.10 in</div>
+                    </div>
+
+                    <div class="test-box">
+                        <div class="test-box-title">Explanatory Thinking (SSD vs RAM)</div>
+                        <div class="test-box-metric">Decode: 16.34 tok/s | Total: 17.09 tok/s</div>
+                        <div style="font-size: 0.72rem; color: var(--text-muted); margin-bottom: 0.3rem;">
+                            Prefill: 29.75 tok/s | 49 in / 759 out in 47.288s
+                        </div>
+                        <div class="test-box-preview" title="The user wants an explanation of the difference between SSD (Solid State Drive) and RAM (Random Access Memory) in simple">The user wants an explanation of the difference between SSD (Solid State Drive) and RAM (Random Access Memory) in simple</div>
+                    </div>
+
+                    <div class="test-box">
+                        <div class="test-box-title">Long Document Analysis (~512 tok Prefill)</div>
+                        <div class="test-box-metric">Decode: 11.94 tok/s | Total: 43.16 tok/s</div>
+                        <div style="font-size: 0.72rem; color: var(--text-muted); margin-bottom: 0.3rem;">
+                            Prefill: 79.58 tok/s | 440 in / 80 out in 12.048s
+                        </div>
+                        <div class="test-box-preview" title="* **Safety and Consensus:** Raft ensures safety through leader election, log matching invariants, and state machine comm">* **Safety and Consensus:** Raft ensures safety through leader election, log matching invariants, and state machine comm</div>
+                    </div>
+
+                </div>
+            </div>
+
+            <div class="detail-card">
+                <div class="detail-title">
+                    <span>Nemotron 3.5 Lightning (30B-A3B)</span>
+                    <span style="font-size: 0.8rem; color: var(--text-muted); font-family: var(--font-mono);">
+                        VRAM: ~12261 MB | Peak: 12654 MB | Load: 87.3s
+                    </span>
+                </div>
+                <div class="detail-tests">
+
+                    <div class="test-box">
+                        <div class="test-box-title">Direct Chat (No Thinking)</div>
+                        <div class="test-box-metric">Decode: 18.6 tok/s | Total: 30.54 tok/s</div>
+                        <div style="font-size: 0.72rem; color: var(--text-muted); margin-bottom: 0.3rem;">
+                            Prefill: 31.15 tok/s | 53 in / 39 out in 3.013s
+                        </div>
+                        <div class="test-box-preview" title="A mutex is a lock that ensures only one thread can access a resource at a time, while a semaphore is a signaling mechani">A mutex is a lock that ensures only one thread can access a resource at a time, while a semaphore is a signaling mechani</div>
+                    </div>
+
+                    <div class="test-box">
+                        <div class="test-box-title">Code Synthesis</div>
+                        <div class="test-box-metric">Decode: 18.9 tok/s | Total: 25.47 tok/s</div>
+                        <div style="font-size: 0.72rem; color: var(--text-muted); margin-bottom: 0.3rem;">
+                            Prefill: 51.11 tok/s | 59 in / 120 out in 7.027s
+                        </div>
+                        <div class="test-box-preview" title="Here is a clean Python function to calculate the nth Fibonacci number iteratively, complete with type hints and a docstr">Here is a clean Python function to calculate the nth Fibonacci number iteratively, complete with type hints and a docstr</div>
+                    </div>
+
+                    <div class="test-box">
+                        <div class="test-box-title">Step-by-Step Reasoning (Thinking)</div>
+                        <div class="test-box-metric">Decode: 20.53 tok/s | Total: 23.36 tok/s</div>
+                        <div style="font-size: 0.72rem; color: var(--text-muted); margin-bottom: 0.3rem;">
+                            Prefill: 56.05 tok/s | 77 in / 401 out in 20.459s
+                        </div>
+                        <div class="test-box-preview" title="Here we have a classic puzzle: "A bat and a ball cost $1.10 in total. The bat costs $1.00 more than the ball. How much d">Here we have a classic puzzle: "A bat and a ball cost $1.10 in total. The bat costs $1.00 more than the ball. How much d</div>
+                    </div>
+
+                    <div class="test-box">
+                        <div class="test-box-title">Explanatory Thinking (SSD vs RAM)</div>
+                        <div class="test-box-metric">Decode: 21.48 tok/s | Total: 22.49 tok/s</div>
+                        <div style="font-size: 0.72rem; color: var(--text-muted); margin-bottom: 0.3rem;">
+                            Prefill: 43.23 tok/s | 49 in / 776 out in 36.687s
+                        </div>
+                        <div class="test-box-preview" title="Here's a thinking process:  1.  **Analyze User Input:**    - User asks: "Explain the difference between SSD and RAM in s">Here's a thinking process:  1.  **Analyze User Input:**    - User asks: "Explain the difference between SSD and RAM in s</div>
+                    </div>
+
+                    <div class="test-box">
+                        <div class="test-box-title">Long Document Analysis (~512 tok Prefill)</div>
+                        <div class="test-box-metric">Decode: 18.52 tok/s | Total: 88.18 tok/s</div>
+                        <div style="font-size: 0.72rem; color: var(--text-muted); margin-bottom: 0.3rem;">
+                            Prefill: 269.08 tok/s | 440 in / 80 out in 5.897s
+                        </div>
+                        <div class="test-box-preview" title="- **Safety via Invariants**: Raft ensures safety through log matching invariants (consistent entries across replicas), l">- **Safety via Invariants**: Raft ensures safety through log matching invariants (consistent entries across replicas), l</div>
+                    </div>
+
+                </div>
+            </div>
+
+            <div class="detail-card">
+                <div class="detail-title">
+                    <span>Nemotron 3.5 Bolt 74B (Full NVFP4 / 68GB)</span>
+                    <span style="font-size: 0.8rem; color: var(--text-muted); font-family: var(--font-mono);">
+                        VRAM: ~14937 MB | Peak: 324 MB | Load: 75.7s
+                    </span>
+                </div>
+                <div class="detail-tests">
+
+                    <div class="test-box">
+                        <div class="test-box-title">Direct Chat (No Thinking)</div>
+                        <div class="test-box-metric">Decode: 0.71 tok/s | Total: 1.01 tok/s</div>
+                        <div style="font-size: 0.72rem; color: var(--text-muted); margin-bottom: 0.3rem;">
+                            Prefill: 1.43 tok/s | 53 in / 80 out in 131.308s
+                        </div>
+                        <div class="test-box-preview" title="$: 10:34:28.567 The user is asking for a specific piece of information from the provided text. I need to find the value">$: 10:34:28.567 The user is asking for a specific piece of information from the provided text. I need to find the value</div>
+                    </div>
+
+                    <div class="test-box">
+                        <div class="test-box-title">Code Synthesis</div>
+                        <div class="test-box-metric">Decode: 1.06 tok/s | Total: 1.37 tok/s</div>
+                        <div style="font-size: 0.72rem; color: var(--text-muted); margin-bottom: 0.3rem;">
+                            Prefill: 1.92 tok/s | 59 in / 120 out in 130.408s
+                        </div>
+                        <div class="test-box-preview" title="� The text is a series of random characters and symbols, not forming coherent words or sentences. It appears to be corru">� The text is a series of random characters and symbols, not forming coherent words or sentences. It appears to be corru</div>
+                    </div>
+
+                    <div class="test-box" style="border-color: rgba(244, 63, 94, 0.4);">
+                        <div class="test-box-title">Step-by-Step Reasoning (Thinking)</div>
+                        <div style="color: var(--rose); font-size: 0.8rem;">Failed: timed out</div>
+                    </div>
+
+                    <div class="test-box" style="border-color: rgba(244, 63, 94, 0.4);">
+                        <div class="test-box-title">Long Document Analysis (~512 tok Prefill)</div>
+                        <div style="color: var(--rose); font-size: 0.8rem;">Failed: <urlopen error [WinError 10061] No connection could be made because the target machine actively refused it></div>
+                    </div>
+
+                </div>
+            </div>
+
+            <div class="detail-card">
+                <div class="detail-title">
+                    <span>DeepSeek V4-Flash (IQ2)</span>
+                    <span style="font-size: 0.8rem; color: var(--text-muted); font-family: var(--font-mono);">
+                        VRAM: ~11842 MB | Peak: 12230 MB | Load: 147.4s
+                    </span>
+                </div>
+                <div class="detail-tests">
+
+                    <div class="test-box">
+                        <div class="test-box-title">Direct Chat (No Thinking)</div>
+                        <div class="test-box-metric">Decode: 0.36 tok/s | Total: 0.41 tok/s</div>
+                        <div style="font-size: 0.72rem; color: var(--text-muted); margin-bottom: 0.3rem;">
+                            Prefill: 0.31 tok/s | 40 in / 80 out in 292.117s
+                        </div>
+                        <div class="test-box-preview" title="1.  The user wants a concise explanation of the difference between mutex and semaphore, in two sentences. 2.  Need to be">1.  The user wants a concise explanation of the difference between mutex and semaphore, in two sentences. 2.  Need to be</div>
+                    </div>
+
+                    <div class="test-box">
+                        <div class="test-box-title">Code Synthesis</div>
+                        <div class="test-box-metric">Decode: 0.33 tok/s | Total: 0.37 tok/s</div>
+                        <div style="font-size: 0.72rem; color: var(--text-muted); margin-bottom: 0.3rem;">
+                            Prefill: 0.32 tok/s | 44 in / 120 out in 439.465s
+                        </div>
+                        <div class="test-box-preview" title="We need to write a Python function to calculate the nth Fibonacci number iteratively, with type hints and docstring. The">We need to write a Python function to calculate the nth Fibonacci number iteratively, with type hints and docstring. The</div>
+                    </div>
+
+                    <div class="test-box">
+                        <div class="test-box-title">Step-by-Step Reasoning (Thinking)</div>
+                        <div class="test-box-metric">Decode: 1.02 tok/s | Total: 1.03 tok/s</div>
+                        <div style="font-size: 0.72rem; color: var(--text-muted); margin-bottom: 0.3rem;">
+                            Prefill: 0.73 tok/s | 60 in / 353 out in 402.858s
+                        </div>
+                        <div class="test-box-preview" title="We need answer. Need respond to user. User asks: "A bat and a ball cost $1.10 in total. The bat costs $1.00 more than th">We need answer. Need respond to user. User asks: "A bat and a ball cost $1.10 in total. The bat costs $1.00 more than th</div>
+                    </div>
+
+                    <div class="test-box">
+                        <div class="test-box-title">Explanatory Thinking (SSD vs RAM)</div>
+                        <div class="test-box-metric">Decode: 1.02 tok/s | Total: 1.07 tok/s</div>
+                        <div style="font-size: 0.72rem; color: var(--text-muted); margin-bottom: 0.3rem;">
+                            Prefill: 1.0 tok/s | 33 in / 342 out in 349.212s
+                        </div>
+                        <div class="test-box-preview" title="1. **Analyze the user's request**: The user wants an explanation of the difference between SSD and RAM in simple terms.">1. **Analyze the user's request**: The user wants an explanation of the difference between SSD and RAM in simple terms.</div>
+                    </div>
+
+                    <div class="test-box" style="border-color: rgba(244, 63, 94, 0.4);">
+                        <div class="test-box-title">Long Document Analysis (~512 tok Prefill)</div>
+                        <div style="color: var(--rose); font-size: 0.8rem;">Failed: timed out</div>
+                    </div>
+
+                </div>
+            </div>
+
+        </div>
+
+        <footer>
+            MinnieBench Automated Hardware Suite &bull; MinnieTheMoEcher Native C++/CUDA sm_120a &bull; Report Generated 2026-10-25 02:47:36
+        </footer>
+    </div>
+
+    <!-- Chart Scripts -->
+    <script>
+        const chartModels = ["Qwen 3.8 27B Vision 13G", "Nemotron 3.5 Bolt (24GB Profile)", "Nemotron 3.5 Lightning (30B-A3B)", "Nemotron 3.5 Bolt 74B (Full NVFP4 / 68GB)", "DeepSeek V4-Flash (IQ2)"];
+        
+        // 1. Decode Throughput Bar Chart
+        new Chart(document.getElementById('decodeChart'), {
+            type: 'bar',
+            data: {
+                labels: chartModels,
+                datasets: [
+                    {
+                        label: 'Direct Chat (tok/s)',
+                        data: [31.88, 8.52, 18.6, 0.71, 0.36],
+                        backgroundColor: '#38bdf8'
+                    },
+                    {
+                        label: 'Code Synthesis (tok/s)',
+                        data: [32.91, 10.06, 18.9, 1.06, 0.33],
+                        backgroundColor: '#818cf8'
+                    },
+                    {
+                        label: 'Reasoning (tok/s)',
+                        data: [21.69, 13.0, 20.53, 0.0, 1.02],
+                        backgroundColor: '#c084fc'
+                    },
+                    {
+                        label: 'Explanatory Thinking (tok/s)',
+                        data: [22.26, 16.34, 21.48, 0.0, 1.02],
+                        backgroundColor: '#10b981'
+                    }
+                ]
+            },
+            options: {
+                responsive: true,
+                maintainAspectRatio: false,
+                plugins: {
+                    legend: { labels: { color: '#94a3b8', font: { family: 'Inter', size: 11 } } }
+                },
+                scales: {
+                    x: { ticks: { color: '#cbd5e1', font: { family: 'Inter', size: 10 } }, grid: { color: 'rgba(255,255,255,0.05)' } },
+                    y: { title: { display: true, text: 'Tokens per Second (tok/s)', color: '#94a3b8' }, ticks: { color: '#cbd5e1' }, grid: { color: 'rgba(255,255,255,0.05)' } }
+                }
+            }
+        });
+
+        // 2. Prefill Speed Chart
+        new Chart(document.getElementById('prefillChart'), {
+            type: 'bar',
+            data: {
+                labels: chartModels,
+                datasets: [{
+                    label: 'Prompt Prefill Throughput (tok/s)',
+                    data: [669.6, 79.58, 269.08, 0.0, 0.0],
+                    backgroundColor: ['#38bdf8', '#a855f7', '#10b981', '#f59e0b', '#f43f5e']
+                }]
+            },
+            options: {
+                responsive: true,
+                maintainAspectRatio: false,
+                plugins: {
+                    legend: { display: false }
+                },
+                scales: {
+                    x: { ticks: { color: '#cbd5e1', font: { family: 'Inter', size: 10 } }, grid: { color: 'rgba(255,255,255,0.05)' } },
+                    y: { title: { display: true, text: 'Prefill Speed (tok/s)', color: '#94a3b8' }, ticks: { color: '#cbd5e1' }, grid: { color: 'rgba(255,255,255,0.05)' } }
+                }
+            }
+        });
+
+        // 3. Total Combined Throughput Chart
+        new Chart(document.getElementById('totalTpsChart'), {
+            type: 'bar',
+            data: {
+                labels: chartModels,
+                datasets: [{
+                    label: 'Peak Total Combined Throughput (tok/s)',
+                    data: [135.38, 43.16, 88.18, 1.01, 0.41],
+                    backgroundColor: '#10b981'
+                }]
+            },
+            options: {
+                responsive: true,
+                maintainAspectRatio: false,
+                plugins: {
+                    legend: { display: false }
+                },
+                scales: {
+                    x: { ticks: { color: '#cbd5e1', font: { family: 'Inter', size: 10 } }, grid: { color: 'rgba(255,255,255,0.05)' } },
+                    y: { title: { display: true, text: 'Combined Tokens / Sec', color: '#94a3b8' }, ticks: { color: '#cbd5e1' }, grid: { color: 'rgba(255,255,255,0.05)' } }
+                }
+            }
+        });
+
+        // 4. Radar Capability Chart
+        new Chart(document.getElementById('radarChart'), {
+            type: 'radar',
+            data: {
+                labels: ["Coding Speed", "Agentic / Tool Speed", "Deep Reasoning Scale", "Prefill Ingestion", "Memory Efficiency"],
+                datasets: [{"label": "Qwen 3.8 27B Vision 13G", "data": [98, 85, 72, 100, 82], "borderColor": "#38bdf8", "backgroundColor": "rgba(56, 189, 248, 0.2)", "borderWidth": 2, "pointBackgroundColor": "#38bdf8"}, {"label": "Nemotron 3.5 Bolt (24GB Profile)", "data": [68, 62, 100, 52, 96], "borderColor": "#a855f7", "backgroundColor": "rgba(168, 85, 247, 0.2)", "borderWidth": 2, "pointBackgroundColor": "#a855f7"}, {"label": "Nemotron 3.5 Lightning (30B-A3B)", "data": [82, 98, 76, 80, 94], "borderColor": "#10b981", "backgroundColor": "rgba(16, 185, 129, 0.2)", "borderWidth": 2, "pointBackgroundColor": "#10b981"}, {"label": "Nemotron 3.5 Bolt 74B (Full NVFP4 / 68GB)", "data": [30, 25, 90, 20, 25], "borderColor": "#f59e0b", "backgroundColor": "rgba(245, 158, 11, 0.2)", "borderWidth": 2, "pointBackgroundColor": "#f59e0b"}, {"label": "DeepSeek V4-Flash (IQ2)", "data": [35, 28, 92, 22, 20], "borderColor": "#f43f5e", "backgroundColor": "rgba(244, 63, 94, 0.2)", "borderWidth": 2, "pointBackgroundColor": "#f43f5e"}]
+            },
+            options: {
+                responsive: true,
+                maintainAspectRatio: false,
+                elements: { line: { tension: 0.2 } },
+                plugins: {
+                    legend: { position: 'bottom', labels: { color: '#94a3b8', font: { family: 'Inter', size: 11 } } }
+                },
+                scales: {
+                    r: {
+                        angleLines: { color: 'rgba(255,255,255,0.08)' },
+                        grid: { color: 'rgba(255,255,255,0.08)' },
+                        pointLabels: { color: '#cbd5e1', font: { family: 'Inter', size: 11 } },
+                        ticks: { display: false, min: 0, max: 100 }
+                    }
+                }
+            }
+        });
+    </script>
+</body>
+</html>

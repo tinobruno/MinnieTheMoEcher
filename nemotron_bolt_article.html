@@ -1,0 +1,724 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>LinkedIn: Thank You NVIDIA! Nemotron 3.5 Bolt 74B on RTX 5060 Ti</title>
+  <link rel="preconnect" href="https://fonts.googleapis.com">
+  <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+  <link href="https://fonts.googleapis.com/css2?family=Inter:wght@300;400;500;600;700;800&family=JetBrains+Mono:wght@400;500;700&display=swap" rel="stylesheet">
+  <style>
+    :root {
+      --bg-primary: #06080e;
+      --bg-secondary: #0f1320;
+      --bg-card: rgba(18, 24, 40, 0.8);
+      --border-color: rgba(255, 255, 255, 0.1);
+      --nv-green: #76b900;
+      --accent-cyan: #00f0ff;
+      --accent-purple: #9d4edd;
+      --accent-gold: #ffb703;
+      --accent-red: #ff3366;
+      --text-main: #f0f3f8;
+      --text-muted: #8e9bb0;
+      --font-sans: 'Inter', -apple-system, BlinkMacSystemFont, sans-serif;
+      --font-mono: 'JetBrains Mono', monospace;
+    }
+
+    * {
+      box-sizing: border-box;
+      margin: 0;
+      padding: 0;
+    }
+
+    body {
+      background-color: var(--bg-primary);
+      color: var(--text-main);
+      font-family: var(--font-sans);
+      min-height: 100vh;
+      display: flex;
+      flex-direction: column;
+      line-height: 1.6;
+      background-image: 
+        radial-gradient(circle at 10% 20%, rgba(118, 185, 0, 0.08) 0%, transparent 40%),
+        radial-gradient(circle at 90% 80%, rgba(0, 240, 255, 0.08) 0%, transparent 45%);
+    }
+
+    header {
+      border-bottom: 1px solid var(--border-color);
+      background: rgba(6, 8, 14, 0.85);
+      backdrop-filter: blur(16px);
+      position: sticky;
+      top: 0;
+      z-index: 100;
+      padding: 1rem 2rem;
+      display: flex;
+      justify-content: space-between;
+      align-items: center;
+    }
+
+    .brand {
+      display: flex;
+      align-items: center;
+      gap: 0.75rem;
+    }
+
+    .badge-icon {
+      width: 36px;
+      height: 36px;
+      border-radius: 8px;
+      background: linear-gradient(135deg, var(--nv-green), #4d8000);
+      display: flex;
+      align-items: center;
+      justify-content: center;
+      font-weight: 900;
+      color: #fff;
+      font-size: 1.1rem;
+    }
+
+    .brand-title {
+      font-size: 1.15rem;
+      font-weight: 700;
+      letter-spacing: -0.02em;
+    }
+
+    .brand-subtitle {
+      font-size: 0.75rem;
+      color: var(--nv-green);
+      text-transform: uppercase;
+      letter-spacing: 0.05em;
+      font-family: var(--font-mono);
+    }
+
+    .nav-actions {
+      display: flex;
+      gap: 0.75rem;
+      align-items: center;
+    }
+
+    .btn {
+      display: inline-flex;
+      align-items: center;
+      gap: 0.5rem;
+      padding: 0.6rem 1.1rem;
+      border-radius: 8px;
+      font-size: 0.85rem;
+      font-weight: 600;
+      cursor: pointer;
+      transition: all 0.2s ease;
+      border: 1px solid transparent;
+      text-decoration: none;
+    }
+
+    .btn-nv {
+      background: linear-gradient(135deg, var(--nv-green), #4d8000);
+      color: #030800;
+      font-weight: 700;
+      box-shadow: 0 4px 16px rgba(118, 185, 0, 0.25);
+    }
+
+    .btn-nv:hover {
+      box-shadow: 0 6px 24px rgba(118, 185, 0, 0.45);
+      transform: translateY(-1px);
+    }
+
+    .btn-secondary {
+      background: rgba(255, 255, 255, 0.06);
+      color: var(--text-main);
+      border-color: var(--border-color);
+    }
+
+    .btn-secondary:hover {
+      background: rgba(255, 255, 255, 0.12);
+      border-color: rgba(255, 255, 255, 0.25);
+    }
+
+    .btn-video {
+      background: linear-gradient(135deg, #00f0ff, #0077b6);
+      color: #030812;
+      font-weight: 700;
+    }
+
+    .btn-video:hover {
+      box-shadow: 0 6px 20px rgba(0, 240, 255, 0.35);
+      transform: translateY(-1px);
+    }
+
+    main {
+      max-width: 1320px;
+      margin: 2rem auto;
+      padding: 0 1.5rem;
+      display: grid;
+      grid-template-columns: 1fr 480px;
+      gap: 2rem;
+      align-items: start;
+    }
+
+    @media (max-width: 1080px) {
+      main {
+        grid-template-columns: 1fr;
+      }
+    }
+
+    .article-container {
+      background: var(--bg-card);
+      border: 1px solid var(--border-color);
+      border-radius: 16px;
+      padding: 2rem;
+      backdrop-filter: blur(12px);
+    }
+
+    .toolbar {
+      display: flex;
+      flex-wrap: wrap;
+      justify-content: space-between;
+      align-items: center;
+      gap: 1rem;
+      margin-bottom: 1.5rem;
+      padding-bottom: 1.25rem;
+      border-bottom: 1px solid var(--border-color);
+    }
+
+    .toolbar-title {
+      font-size: 1.1rem;
+      font-weight: 700;
+      display: flex;
+      align-items: center;
+      gap: 0.5rem;
+    }
+
+    .copy-group {
+      display: flex;
+      gap: 0.5rem;
+      flex-wrap: wrap;
+    }
+
+    .copy-notification {
+      display: inline-block;
+      font-size: 0.8rem;
+      color: var(--nv-green);
+      font-weight: 700;
+      opacity: 0;
+      transition: opacity 0.3s ease;
+    }
+
+    .copy-notification.show {
+      opacity: 1;
+    }
+
+    .article-body {
+      font-size: 0.98rem;
+      color: #e2e8f0;
+      white-space: pre-wrap;
+      line-height: 1.75;
+      font-family: var(--font-sans);
+    }
+
+    /* Comparison Bar Chart Infographic */
+    .infographic-card {
+      margin-top: 1.75rem;
+      background: rgba(11, 15, 26, 0.9);
+      border: 1px solid rgba(118, 185, 0, 0.25);
+      border-radius: 12px;
+      padding: 1.5rem;
+    }
+
+    .infographic-title {
+      font-size: 0.95rem;
+      font-weight: 700;
+      color: var(--nv-green);
+      margin-bottom: 1rem;
+      display: flex;
+      justify-content: space-between;
+      align-items: center;
+    }
+
+    .chart-bar-group {
+      margin-bottom: 1rem;
+    }
+
+    .chart-label {
+      display: flex;
+      justify-content: space-between;
+      font-size: 0.82rem;
+      margin-bottom: 0.3rem;
+      color: #cbd5e1;
+    }
+
+    .bar-track {
+      height: 20px;
+      background: rgba(255, 255, 255, 0.05);
+      border-radius: 10px;
+      overflow: hidden;
+      display: flex;
+    }
+
+    .bar-fill {
+      height: 100%;
+      border-radius: 10px;
+      transition: width 1s cubic-bezier(0.16, 1, 0.3, 1);
+    }
+
+    .bar-minnie {
+      background: linear-gradient(90deg, var(--nv-green), var(--accent-cyan));
+      box-shadow: 0 0 14px rgba(118, 185, 0, 0.4);
+    }
+
+    .bar-llama-moe {
+      background: linear-gradient(90deg, #ff3366, #ff758c);
+    }
+
+    .bar-llama-cpu {
+      background: linear-gradient(90deg, #ffb703, #fb8500);
+    }
+
+    /* LinkedIn Feed Preview Mockup */
+    .preview-column {
+      position: sticky;
+      top: 6rem;
+    }
+
+    .linkedin-mockup {
+      background: #1b1f23;
+      border: 1px solid #30363d;
+      border-radius: 12px;
+      box-shadow: 0 12px 36px rgba(0, 0, 0, 0.5);
+      overflow: hidden;
+    }
+
+    .linkedin-header {
+      padding: 1rem;
+      display: flex;
+      gap: 0.75rem;
+      align-items: center;
+      border-bottom: 1px solid #282e33;
+    }
+
+    .avatar {
+      width: 48px;
+      height: 48px;
+      border-radius: 50%;
+      background: linear-gradient(135deg, var(--nv-green), #0077b6);
+      display: flex;
+      align-items: center;
+      justify-content: center;
+      font-weight: bold;
+      color: #fff;
+      font-size: 1.2rem;
+    }
+
+    .user-info h4 {
+      font-size: 0.95rem;
+      font-weight: 600;
+      color: #fff;
+    }
+
+    .user-info p {
+      font-size: 0.75rem;
+      color: #8c98a4;
+    }
+
+    .linkedin-content {
+      padding: 1.25rem;
+      font-size: 0.92rem;
+      line-height: 1.55;
+      color: #e6edf3;
+      max-height: 520px;
+      overflow-y: auto;
+      white-space: pre-wrap;
+    }
+
+    .linkedin-media-card {
+      margin-top: 1rem;
+      border: 1px solid #30363d;
+      border-radius: 8px;
+      background: #0d1117;
+      padding: 1rem;
+    }
+
+    .benchmark-table-mini {
+      width: 100%;
+      border-collapse: collapse;
+      font-size: 0.8rem;
+      font-family: var(--font-mono);
+      margin-top: 0.5rem;
+    }
+
+    .benchmark-table-mini th {
+      text-align: left;
+      padding: 0.4rem;
+      color: #8c98a4;
+      border-bottom: 1px solid #21262d;
+    }
+
+    .benchmark-table-mini td {
+      padding: 0.4rem;
+      border-bottom: 1px solid #161b22;
+    }
+
+    .highlight-minnie {
+      color: var(--nv-green);
+      font-weight: 700;
+    }
+
+    .linkedin-footer {
+      padding: 0.75rem 1rem;
+      border-top: 1px solid #282e33;
+      display: flex;
+      justify-content: space-around;
+      color: #8c98a4;
+      font-size: 0.85rem;
+      font-weight: 500;
+    }
+
+    .linkedin-footer span {
+      display: flex;
+      align-items: center;
+      gap: 0.4rem;
+      cursor: pointer;
+    }
+
+    .linkedin-footer span:hover {
+      color: #58a6ff;
+    }
+
+    .toast {
+      position: fixed;
+      bottom: 2rem;
+      right: 2rem;
+      background: var(--nv-green);
+      color: #030800;
+      padding: 0.75rem 1.5rem;
+      border-radius: 8px;
+      font-weight: 700;
+      box-shadow: 0 8px 24px rgba(0, 0, 0, 0.5);
+      transform: translateY(100px);
+      opacity: 0;
+      transition: all 0.3s cubic-bezier(0.16, 1, 0.3, 1);
+      z-index: 1000;
+    }
+
+    .toast.show {
+      transform: translateY(0);
+      opacity: 1;
+    }
+  </style>
+</head>
+<body>
+
+  <header>
+    <div class="brand">
+      <div class="badge-icon">N</div>
+      <div>
+        <div class="brand-title">MinnieTheMoEcher</div>
+        <div class="brand-subtitle">NVIDIA Nemotron 3.5 Bolt Feature Article</div>
+      </div>
+    </div>
+    <div class="nav-actions">
+      <a href="graphics/nemotron_bolt_linkedin_cover.jpg" download="nemotron_bolt_linkedin_cover.jpg" class="btn btn-secondary">
+        🖼 Cover Image (16:9)
+      </a>
+      <a href="nemotron_bolt_video.html" class="btn btn-video" target="_blank">
+        <svg width="16" height="16" fill="currentColor" viewBox="0 0 24 24"><path d="M8 5v14l11-7z"/></svg>
+        Watch 1080p Voiced Video
+      </a>
+      <button class="btn btn-secondary" onclick="copyMarkdown()">
+        Copy Markdown
+      </button>
+      <button class="btn btn-nv" onclick="copyLinkedInPost()">
+        <svg width="16" height="16" fill="currentColor" viewBox="0 0 24 24"><path d="M19 3a2 2 0 0 1 2 2v14a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2h14m-.5 15.5v-5.3a3.26 3.26 0 0 0-3.26-3.26c-.85 0-1.84.52-2.28 1.3v-1.11h-2.79v8.37h2.79v-4.93c0-.77.62-1.4 1.39-1.4a1.4 1.4 0 0 1 1.4 1.4v4.93h2.75M6.88 8.56a1.68 1.68 0 0 0 1.68-1.68c0-.93-.75-1.69-1.68-1.69a1.69 1.69 0 0 0-1.69 1.69c0 .93.76 1.68 1.69 1.68m1.39 9.94v-8.37H5.5v8.37h2.77z"/></svg>
+        Copy 1-Click for LinkedIn
+      </button>
+    </div>
+  </header>
+
+  <main>
+    <!-- Left Column: Formatted Article -->
+    <div class="article-container">
+      <div class="toolbar">
+        <div class="toolbar-title">
+          <span>📄 Publication Post Draft</span>
+          <span class="copy-notification" id="copyNotice">✓ Copied to clipboard!</span>
+        </div>
+        <div class="copy-group">
+          <button class="btn btn-secondary" onclick="copyPlainText()">Plain Text</button>
+          <button class="btn btn-secondary" onclick="copyMarkdown()">Markdown</button>
+          <button class="btn btn-nv" onclick="copyLinkedInPost()">⚡ Copy 1-Click for LinkedIn</button>
+        </div>
+      </div>
+
+      <div style="margin-bottom: 1.5rem; border-radius: 12px; overflow: hidden; border: 1px solid var(--border-color); box-shadow: 0 8px 24px rgba(0,0,0,0.4);">
+        <img src="graphics/nemotron_bolt_linkedin_cover.jpg" alt="Nemotron 3.5 Bolt Cover Image" style="width: 100%; height: auto; display: block;">
+      </div>
+
+      <div class="article-body" id="articleText">Thank you, NVIDIA! 💚
+
+For years, running a true 70-billion parameter model on an entry-level consumer GPU felt like science fiction. If you owned a sub-$400 card (like an RTX 5060 Ti 16GB), you were practically barred from running frontier-tier open models locally.
+
+NVIDIA changed the game with the open release of the 24GB Nemotron 3.5 Bolt (74B Total / 9B Active).
+
+By pairing linear Mamba-2 State Space Model (SSM) layers with a massive 496-expert LatentMoE router, NVIDIA created an architectural masterpiece that makes massive model inference possible on consumer silicon.
+
+Naturally, we put this to the test on this exact machine—and engineered a bare-metal CUDA execution pipeline that unlocks full performance.
+
+Here is what we discovered, how it compares to llama.cpp, and why architectural pipelining makes all the difference.
+
+━━━━━━━━━━━━━━━━━━━━━
+💥 The Benchmark Showdown
+Hardware: NVIDIA GeForce RTX 5060 Ti 16GB + 32GB DDR5 RAM
+Model: NVIDIA-Nemotron-3.5-Bolt-74B-A9B-24GB (40 MoE Layers, 19,840 Total Experts)
+Prompt: "Explain the difference between SSD and RAM in simple terms."
+━━━━━━━━━━━━━━━━━━━━━
+
+1️⃣ llama.cpp Full Offload (-ngl 88):
+Result: < 1.0 tok/s. WDDM 3.x shared memory paging causes constant PCIe thrashing. The GPU stalled, dropping to 9% utilization at 20 Watts.
+
+2️⃣ llama.cpp New MoE Cache (--moe-cache-mib 6000):
+Result: 1.7 tok/s prefill | 3.5 tok/s decode.
+Why did it stall? Nemotron Bolt features 496 experts per layer = 19,840 total experts. A 6GB cache holds only ~22% of them. On every single miss, llama.cpp halts execution (cudaStreamWaitEvent), causing up to 48 sequential waits per token!
+
+3️⃣ llama.cpp Partial CPU Fallback (-ngl 48):
+Result: 5.6 tok/s prefill | 6.9 tok/s decode.
+Faster than the cache, but maxes out 100% of all CPU cores via AVX-512/AVX2 on system memory.
+
+4️⃣ MinnieTheMoEcher (Our Bare-Metal CUDA Engine):
+Result: 21.54 tok/s prefill | 13.51 tok/s decode | 0% CPU Load!
+
+📊 The Scorecard:
+• Decode Speed: 13.51 tok/s vs 3.50 tok/s (3.86× faster than llama.cpp's MoE cache)
+• Prefill Speed: 21.54 tok/s vs 1.70 tok/s (12.6× faster)
+• Hardware Efficiency: 100% GPU Tensor Cores, zero CPU core burn.
+
+━━━━━━━━━━━━━━━━━━━━━
+🔍 Why Minnie Goes 3.86× Faster
+━━━━━━━━━━━━━━━━━━━━━
+
+The bottleneck on consumer cards with fine-grained MoEs isn't raw compute—it is PCIe serialization stalls.
+
+Minnie achieves 13.5 tok/s through two core architectural innovations:
+✅ Asynchronous Double-Buffered DMA: While Layer N is executing Mamba-2 SSM and Attention on the Tensor Cores, Layer N+1's required experts are pre-streamed in parallel over dedicated copy streams. The PCIe transfer latency is completely masked behind computation.
+✅ Pinned Host DRAM L2 Tier: Weights reside in non-pageable physical RAM via VirtualAlloc, completely eliminating Windows WDDM driver paging faults.
+
+━━━━━━━━━━━━━━━━━━━━━
+🍏 The Next Frontier: Apple Silicon Metal Port
+━━━━━━━━━━━━━━━━━━━━━
+
+So what's next on our roadmap?
+
+We are already bringing Nemotron 3.5 Bolt to Apple Silicon (macOS) with native Apple Metal 3.1+ and our Hardware MPP Tiled Matrix Engine.
+
+Because Apple Silicon uses a Unified Memory Architecture (UMA) where CPU and GPU share the same physical memory pool (up to 128GB+ on M-Series Max and Ultra):
+• There is ZERO PCIe bus bottleneck.
+• MoE expert routing is 100% zero-copy.
+• On-the-fly SRAM tile dequantization will run seamlessly.
+
+Mac users will soon be able to run Nemotron 3.5 Bolt with zero memory transfers whatsoever.
+
+Huge congratulations to NVIDIA's model architecture team for creating an MoE model that truly democratizes local AI.
+
+What are your thoughts on hybrid SSM-MoE architectures? Have you tested Nemotron Bolt on your setup? Let's discuss in the comments! 👇
+
+#NVIDIA #AI #MachineLearning #Nemotron #CUDA #LLM #OpenSource #DeepLearning #Hardware #AppleSilicon #TechInnovation</div>
+
+      <!-- Infographic Comparison -->
+      <div class="infographic-card">
+        <div class="infographic-title">
+          <span>DECODE SPEED ON RTX 5060 Ti 16GB (TOK/S)</span>
+          <span style="font-family: var(--font-mono); font-size: 0.8rem; color: #8e9bb0;">Nemotron 3.5 Bolt 74B</span>
+        </div>
+
+        <div class="chart-bar-group">
+          <div class="chart-label">
+            <span><strong>MinnieTheMoEcher</strong> (Double-Buffered DMA)</span>
+            <span style="color: var(--nv-green); font-weight: 700;">13.51 tok/s (100% GPU • 0% CPU)</span>
+          </div>
+          <div class="bar-track">
+            <div class="bar-fill bar-minnie" style="width: 100%;"></div>
+          </div>
+        </div>
+
+        <div class="chart-bar-group">
+          <div class="chart-label">
+            <span><strong>llama.cpp</strong> -ngl 48 (Partial CPU Offload)</span>
+            <span>6.90 tok/s (100% CPU Load)</span>
+          </div>
+          <div class="bar-track">
+            <div class="bar-fill bar-llama-cpu" style="width: 51.1%;"></div>
+          </div>
+        </div>
+
+        <div class="chart-bar-group">
+          <div class="chart-label">
+            <span><strong>llama.cpp</strong> --moe-cache-mib 6000 (SLRU Cache)</span>
+            <span style="color: var(--accent-red);">3.50 tok/s (PCIe Wait-on-Miss)</span>
+          </div>
+          <div class="bar-track">
+            <div class="bar-fill bar-llama-moe" style="width: 25.9%;"></div>
+          </div>
+        </div>
+
+        <div class="chart-bar-group">
+          <div class="chart-label">
+            <span><strong>llama.cpp</strong> -ngl 88 (WDDM Paging Thrash)</span>
+            <span style="color: #64748b;">< 1.00 tok/s (Paging Freeze)</span>
+          </div>
+          <div class="bar-track">
+            <div class="bar-fill" style="background: #334155; width: 6%;"></div>
+          </div>
+        </div>
+      </div>
+    </div>
+
+    <!-- Right Column: LinkedIn Post Feed Preview -->
+    <div class="preview-column">
+      <div class="linkedin-mockup">
+        <div class="linkedin-header">
+          <div class="avatar">TB</div>
+          <div class="user-info">
+            <h4>Tino Bruno</h4>
+            <p>AI Architect & High-Performance Compute Engineer • 1st</p>
+            <p style="font-size: 0.7rem; color: #64748b;">Just now • 🌐</p>
+          </div>
+        </div>
+        <div class="linkedin-content" id="linkedinPreview">
+Thank you, NVIDIA! 💚
+
+For years, running a true 70-billion parameter model on an entry-level consumer GPU felt like science fiction. If you owned a sub-$400 card (like an RTX 5060 Ti 16GB), you were practically barred from running frontier-tier open models locally.
+
+NVIDIA changed the game with the open release of the 24GB Nemotron 3.5 Bolt (74B Total / 9B Active)...
+        </div>
+
+        <div style="border-top: 1px solid #282e33; overflow: hidden;">
+          <img src="graphics/nemotron_bolt_linkedin_cover.jpg" alt="Nemotron 3.5 Bolt Cover Preview" style="width: 100%; display: block; object-fit: cover;">
+        </div>
+
+        <div class="linkedin-media-card">
+          <div style="font-size: 0.8rem; font-weight: 700; color: var(--nv-green); margin-bottom: 0.5rem;">
+            📊 EMPIRICAL BENCHMARK SUMMARY
+          </div>
+          <table class="benchmark-table-mini">
+            <thead>
+              <tr>
+                <th>Engine / Mode</th>
+                <th>Prefill</th>
+                <th>Decode</th>
+                <th>CPU</th>
+              </tr>
+            </thead>
+            <tbody>
+              <tr class="highlight-minnie">
+                <td>MinnieTheMoEcher</td>
+                <td>21.5 t/s</td>
+                <td>13.5 t/s</td>
+                <td>0%</td>
+              </tr>
+              <tr>
+                <td>llama.cpp (CPU)</td>
+                <td>5.6 t/s</td>
+                <td>6.9 t/s</td>
+                <td>100%</td>
+              </tr>
+              <tr>
+                <td>llama.cpp (MoE Cache)</td>
+                <td>1.7 t/s</td>
+                <td>3.5 t/s</td>
+                <td>Wait</td>
+              </tr>
+              <tr>
+                <td>llama.cpp (WDDM 88)</td>
+                <td>Stall</td>
+                <td>&lt;1 t/s</td>
+                <td>Thrash</td>
+              </tr>
+            </tbody>
+          </table>
+          <div style="margin-top: 0.6rem; font-size: 0.72rem; color: #8c98a4;">
+            Hardware: RTX 5060 Ti 16GB + 32GB DDR5 • Model: Nemotron 3.5 Bolt 74B
+          </div>
+        </div>
+
+        <div class="linkedin-footer">
+          <span>👍 Like</span>
+          <span>💬 Comment</span>
+          <span>🔄 Repost</span>
+          <span>📤 Send</span>
+        </div>
+      </div>
+    </div>
+  </main>
+
+  <div class="toast" id="toast">Copied to clipboard! Ready to paste into LinkedIn.</div>
+
+  <script>
+    const fullArticle = document.getElementById('articleText').innerText;
+
+    // Synchronize preview
+    document.getElementById('linkedinPreview').innerText = fullArticle;
+
+    function showToast(msg) {
+      const toast = document.getElementById('toast');
+      toast.innerText = msg;
+      toast.classList.add('show');
+      const notice = document.getElementById('copyNotice');
+      notice.classList.add('show');
+      setTimeout(() => {
+        toast.classList.remove('show');
+        notice.classList.remove('show');
+      }, 3000);
+    }
+
+    // Convert standard text with markdown emphasis into Unicode bold for seamless LinkedIn display
+    function toUnicodeBold(str) {
+      const boldMap = {
+        'A':'𝗔','B':'𝗕','C':'𝗖','D':'𝗗','E':'𝗘','F':'𝗙','G':'𝗚','H':'𝗛','I':'𝗜','J':'𝗝','K':'𝗞','L':'𝗟','M':'𝗠',
+        'N':'𝗡','O':'𝗢','P':'𝗣','Q':'𝗤','R':'𝗥','S':'𝗦','T':'𝗧','U':'𝗨','V':'𝗩','W':'𝗪','X':'𝗫','Y':'𝗬','Z':'𝗭',
+        'a':'𝗮','b':'𝗯','c':'𝗰','d':'𝗱','e':'𝗲','f':'𝗳','g':'𝗴','h':'𝗵','i':'𝗶','j':'𝗷','k':'𝗸','l':'𝗹','m':'𝗺',
+        'n':'𝗻','o':'𝗼','p':'𝗽','q':'𝗾','r':'𝗿','s':'𝘀','t':'𝘁','u':'𝘂','v':'𝘃','w':'𝘄','x':'𝘅','y':'𝘆','z':'𝘇',
+        '0':'𝟬','1':'𝟭','2':'𝟮','3':'𝟯','4':'𝟰','5':'𝟱','6':'𝟲','7':'𝟳','8':'𝟴','9':'𝟵'
+      };
+      return str.split('').map(c => boldMap[c] || c).join('');
+    }
+
+    function formatForLinkedIn(raw) {
+      let formatted = raw;
+      formatted = formatted.replace(/\*([^*]+)\*/g, (m, p1) => toUnicodeBold(p1));
+      return formatted;
+    }
+
+    function copyLinkedInPost() {
+      const text = formatForLinkedIn(fullArticle);
+      navigator.clipboard.writeText(text).then(() => {
+        showToast("✓ LinkedIn formatted text copied!");
+      }).catch(err => {
+        fallbackCopy(text);
+      });
+    }
+
+    function copyMarkdown() {
+      navigator.clipboard.writeText(fullArticle).then(() => {
+        showToast("✓ Markdown copied!");
+      }).catch(err => {
+        fallbackCopy(fullArticle);
+      });
+    }
+
+    function copyPlainText() {
+      const plain = fullArticle.replace(/[*_#]/g, '');
+      navigator.clipboard.writeText(plain).then(() => {
+        showToast("✓ Plain text copied!");
+      }).catch(err => {
+        fallbackCopy(plain);
+      });
+    }
+
+    function fallbackCopy(text) {
+      const ta = document.createElement('textarea');
+      ta.value = text;
+      document.body.appendChild(ta);
+      ta.select();
+      document.execCommand('copy');
+      document.body.removeChild(ta);
+      showToast("✓ Copied to clipboard!");
+    }
+  </script>
+</body>
+</html>

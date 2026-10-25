@@ -510,6 +510,20 @@ void gemv_q8_0_f32_cuda(
     int rows, int cols,
     cudaStream_t stream = 0);
 
+void gemm_q8_0_batch_cuda(
+    __nv_bfloat16* out,
+    const __nv_bfloat16* vec,
+    const block_q8_0* weight,
+    int M, int N, int K,
+    cudaStream_t stream = 0);
+
+void gemm_q8_0_residual_batch_cuda(
+    __nv_bfloat16* inout,
+    const __nv_bfloat16* vec,
+    const block_q8_0* weight,
+    int M, int N, int K,
+    cudaStream_t stream = 0);
+
 // ── Q2_K quantization ─────────────────────────────────────────────────────────
 #define QK_K 256
 
@@ -1643,5 +1657,48 @@ void moe_nemotron_down_scaled_residual_batch_cuda(
     int M, int N, int K,
     cudaStream_t stream = 0,
     int top_k = 6,
-    int n_experts = 128);
+    int n_experts = 128,
+    int down_offset_padding = 0);
+
+void gemm_iq2_xxs_relu2_batch_cuda(
+    __nv_bfloat16* out,
+    const __nv_bfloat16* vec,
+    const block_iq2_xxs* weight,
+    int M, int N, int K,
+    cudaStream_t stream = 0);
+
+void gemm_iq2_xxs_residual_batch_cuda(
+    __nv_bfloat16* inout,
+    const __nv_bfloat16* vec,
+    const block_iq2_xxs* weight,
+    int M, int N, int K,
+    cudaStream_t stream = 0);
+
+void moe_iq2_xxs_binned_up_relu2_batch_cuda(
+    __nv_bfloat16* gate_out,
+    const __nv_bfloat16* hidden_in,
+    const int32_t* expert_offsets,
+    const int32_t* expert_token_indices,
+    const int32_t* expert_token_slots,
+    const void* const* expert_ptrs,
+    const float* expert_scales,
+    int M, int N, int K,
+    cudaStream_t stream = 0,
+    int top_k = 9,
+    int n_experts = 496);
+
+void moe_iq2_xxs_binned_down_scaled_residual_batch_cuda(
+    __nv_bfloat16* hidden_out,
+    const __nv_bfloat16* gate_in,
+    const float* topk_weights,
+    const int32_t* expert_offsets,
+    const int32_t* expert_token_indices,
+    const int32_t* expert_token_slots,
+    const void* const* expert_ptrs,
+    const float* expert_scales,
+    int M, int N, int K,
+    cudaStream_t stream = 0,
+    int top_k = 9,
+    int n_experts = 496,
+    size_t down_offset_bytes = 675840);
 

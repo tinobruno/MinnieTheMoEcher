@@ -1,6 +1,8 @@
     // ── Forward one layer (Nemotron 3.5 Lightning Hybrid Mamba-2 SSM + MoE) ─
     inline static cudaEvent_t s_moe_sub_ev[6] = {nullptr};
     inline static bool s_moe_sub_init = false;
+    inline static cudaEvent_t s_dram_sub_ev[6] = {nullptr};
+    inline static bool s_dram_sub_init = false;
 
     void forward_layer_nemotron(int layer_id, int token_id, int position) {
         auto& lw = layers_[layer_id];
@@ -120,8 +122,8 @@
                 if (cfg_.layer_types[i] == 2) moe_layer_idx++;
             }
 
-            // 3a. Shared Expert (NVFP4 or IQ2_XXS, Squared ReLU, residual)
-            if (lw.shared_w1_w.data && lw.shared_w2_w.data) {
+            // 3a. Shared Expert (NVFP4 or IQ2_XXS, Squared ReLU, residual) for non-Bolt models
+            if (!cfg_.is_nemotron_bolt() && lw.shared_w1_w.data && lw.shared_w2_w.data) {
                 int shared_inter = cfg_.moe_shared_expert_intermediate_size > 0 ? cfg_.moe_shared_expert_intermediate_size : 3712;
                 if (lw.shared_w1_w.dtype == "iq2_xxs" || lw.shared_w1_w.dtype == "iq2") {
                     gemv_iq2_xxs_cuda(buf_gate_.bf16(), buf_hidden2_.bf16(),
@@ -172,12 +174,14 @@
                             main_stream_);
                     }
 
+                    // Early D2H dispatch: launch immediately so it runs concurrently with GPU compute
                     CUDA_CHECK(cudaMemcpyAsync(topk_ids_host_, buf_topk_idx_.i32(),
                                                top_k * sizeof(int32_t), cudaMemcpyDeviceToHost, main_stream_));
                     CUDA_CHECK(cudaMemcpyAsync(topk_weights_host_, buf_topk_vals_.f32(),
                                                top_k * sizeof(float), cudaMemcpyDeviceToHost, main_stream_));
+                    CUDA_CHECK(cudaEventRecord(dma_event_, main_stream_));
 
-                    // Latent Down-Projection: buf_hidden2_ [4096] -> buf_latent_down_ [1024] (overlapped with D2H!)
+                    // Latent Down-Projection: buf_hidden2_ [4096] -> buf_latent_down_ [1024]
                     if (lw.fc1_latent_proj.dtype == "fp8") {
                         gemv_fp8_scalar_scale_cuda(buf_latent_down_.bf16(), buf_hidden2_.bf16(),
                                                    (const uint8_t*)lw.fc1_latent_proj.data, lw.fc1_scale_val,
@@ -191,7 +195,26 @@
                                                 buf_hidden2_.bf16(), latent_dim, dim, main_stream_);
                     }
 
-                    CUDA_CHECK(cudaEventRecord(dma_event_, main_stream_));
+                    // Shared Expert for Bolt (5376 dim, runs on GPU concurrently while D2H travels to CPU)
+                    if (lw.shared_w1_w.data && lw.shared_w2_w.data) {
+                        int shared_inter = cfg_.moe_shared_expert_intermediate_size > 0 ? cfg_.moe_shared_expert_intermediate_size : 5376;
+                        if (lw.shared_w1_w.dtype == "iq2_xxs" || lw.shared_w1_w.dtype == "iq2") {
+                            gemv_iq2_xxs_relu2_cuda(buf_gate_.bf16(), buf_hidden2_.bf16(),
+                                                    (const block_iq2_xxs*)lw.shared_w1_w.data, shared_inter, dim, main_stream_);
+                            gemv_iq2_xxs_residual_cuda(buf_hidden_.bf16(), buf_gate_.bf16(),
+                                                       (const block_iq2_xxs*)lw.shared_w2_w.data, dim, shared_inter, main_stream_);
+                        } else {
+                            gemv_nvfp4_cuda(buf_gate_.bf16(), buf_hidden2_.bf16(),
+                                            (const uint8_t*)lw.shared_w1_w.data, (const uint8_t*)lw.shared_w1_s.data,
+                                            lw.shared_w1_s2, shared_inter, dim, main_stream_);
+                            relu2_cuda(buf_gate_.bf16(), buf_gate_.bf16(), shared_inter, main_stream_);
+                            gemv_nvfp4_residual_cuda(buf_hidden_.bf16(), buf_gate_.bf16(),
+                                                     (const uint8_t*)lw.shared_w2_w.data, (const uint8_t*)lw.shared_w2_s.data,
+                                                     lw.shared_w2_s2, dim, shared_inter, main_stream_);
+                        }
+                    }
+
+                    // Synchronize D2H copy (which already finished during Latent Down + Shared Expert!)
                     CUDA_CHECK(cudaEventSynchronize(dma_event_));
 
                     // Resolve pointers / DMA for all active top-k experts with static VRAM L1 residency
@@ -210,7 +233,8 @@
                         } else {
                             exp_ptrs[k] = streaming_slots_gpu_[stream_buf][k];
                             needs_dma[k] = true;
-                            void* p = expert_loader_.try_get_dram_expert_ptr(moe_layer_idx, eid);
+                            void* p = expert_loader_.get_flat_dram_ptr(moe_layer_idx, eid);
+                            if (!p) p = expert_loader_.try_get_dram_expert_ptr(moe_layer_idx, eid);
                             dram_srcs[k] = p;
                             if (!p) n_miss++;
                         }
@@ -361,20 +385,34 @@
 
                 // Batch resolve / pipeline DMA transfers for all top-k experts
                 void* exp_ptrs[16] = {nullptr};
+                size_t exp_block_sz = expert_loader_.expert_block_size() > 0 ? (size_t)expert_loader_.expert_block_size() : (size_t)5615616;
                 for (int k = 0; k < top_k; k++) {
                     int eid = topk_ids_host_[k];
                     if (eid < 0 || eid >= n_experts || topk_weights_host_[k] == 0.0f) continue;
                     exp_ptrs[k] = expert_loader_.try_get_expert_cached(moe_layer_idx, eid);
                     if (!exp_ptrs[k]) {
-                        void* dram_src = expert_loader_.get_dram_expert_ptr(moe_layer_idx, eid);
-                        void* scratch_gpu = (char*)buf_dram_moe_scratch_.data + (size_t)k * expert_loader_.expert_block_size();
-                        if (dram_src && scratch_gpu) {
-                            CUDA_CHECK(cudaMemcpyAsync(scratch_gpu, dram_src, expert_loader_.expert_block_size(),
+                        void* dram_src = expert_loader_.get_flat_dram_ptr(moe_layer_idx, eid);
+                        if (!dram_src) dram_src = expert_loader_.get_dram_expert_ptr(moe_layer_idx, eid);
+                        void* scratch_gpu = (char*)buf_dram_moe_scratch_.data + (size_t)k * exp_block_sz;
+                        void* src_to_dma = dram_src;
+                        if (!expert_loader_.dram_is_pinned() && pinned_host_moe_scratch_) {
+                            void* pinned_dst = (char*)pinned_host_moe_scratch_ + (size_t)k * exp_block_sz;
+                            if (dram_src && pinned_dst) {
+                                memcpy(pinned_dst, dram_src, exp_block_sz);
+                                src_to_dma = pinned_dst;
+                            }
+                        }
+                        if (src_to_dma && scratch_gpu) {
+                            CUDA_CHECK(cudaMemcpyAsync(scratch_gpu, src_to_dma, exp_block_sz,
                                                        cudaMemcpyHostToDevice, main_stream_));
                             exp_ptrs[k] = scratch_gpu;
                         }
                     }
                 }
+
+                size_t up_w_sz = (size_t)moe_inter * (dim / 2);
+                size_t up_s_sz = (size_t)moe_inter * (dim / 16);
+                size_t down_w_sz = (size_t)dim * (moe_inter / 2);
 
                 for (int k = 0; k < top_k; k++) {
                     int eid = topk_ids_host_[k];
@@ -384,15 +422,10 @@
                     void* exp_ptr = exp_ptrs[k];
                     if (!exp_ptr) continue;
 
-                    // Expert block layout:
-                    // up_proj.weight: offset 0 [moe_inter, dim/2] nvfp4
-                    // up_proj.weight_scale: offset 2494464 [moe_inter, dim/16] F8_E4M3
-                    // down_proj.weight: offset 2806288 [dim, moe_inter/2] nvfp4
-                    // down_proj.weight_scale: offset 5300752 [dim, moe_inter/16] F8_E4M3
                     const uint8_t* up_w = (const uint8_t*)exp_ptr;
-                    const uint8_t* up_s = (const uint8_t*)exp_ptr + 2494464;
-                    const uint8_t* down_w = (const uint8_t*)exp_ptr + 2806288;
-                    const uint8_t* down_s = (const uint8_t*)exp_ptr + 5300752;
+                    const uint8_t* up_s = (const uint8_t*)exp_ptr + up_w_sz;
+                    const uint8_t* down_w = (const uint8_t*)exp_ptr + up_w_sz + up_s_sz + 16;
+                    const uint8_t* down_s = down_w + down_w_sz;
 
                     float up_s2 = 1.0f;
                     float down_s2 = 1.0f;
@@ -560,24 +593,23 @@
             if (!s_moe_sub_init) {
                 s_moe_sub_init = true;
                 for (int i = 0; i < 6; i++) CUDA_CHECK(cudaEventCreate(&s_moe_sub_ev[i]));
+                for (int i = 0; i < 6; i++) CUDA_CHECK(cudaEventCreate(&s_dram_sub_ev[i]));
+                s_dram_sub_init = true;
             }
             if (layer_id == 1) CUDA_CHECK(cudaEventRecord(s_moe_sub_ev[0], main_stream_));
+            if (moe_layer_idx == 10) CUDA_CHECK(cudaEventRecord(s_dram_sub_ev[0], main_stream_));
 
-            // Shared Expert: Run synchronously on main_stream_ with direct residual accumulation
+            // Shared Expert for non-Bolt Nemotron: Run synchronously on main_stream_ with direct residual accumulation
             bool has_shared = (lw.shared_w1_w.data && lw.shared_w2_w.data);
-            if (has_shared) {
-                int shared_inter = cfg_.moe_shared_expert_intermediate_size > 0 ? cfg_.moe_shared_expert_intermediate_size : (cfg_.is_nemotron_bolt() ? 5376 : 3712);
+            if (has_shared && !cfg_.is_nemotron_bolt()) {
+                int shared_inter = cfg_.moe_shared_expert_intermediate_size > 0 ? cfg_.moe_shared_expert_intermediate_size : 3712;
                 if (lw.shared_w1_w.dtype == "iq2_xxs" || lw.shared_w1_w.dtype == "iq2") {
-                    for (int m = 0; m < M; m++) {
-                        gemv_iq2_xxs_relu2_cuda(buf_gate_batch_.bf16() + (size_t)m * shared_inter,
-                                                buf_hidden2_batch_.bf16() + (size_t)m * dim,
-                                                (const block_iq2_xxs*)lw.shared_w1_w.data,
-                                                shared_inter, dim, main_stream_);
-                        gemv_iq2_xxs_residual_cuda(buf_hidden_batch_.bf16() + (size_t)m * dim,
-                                                   buf_gate_batch_.bf16() + (size_t)m * shared_inter,
-                                                   (const block_iq2_xxs*)lw.shared_w2_w.data,
-                                                   dim, shared_inter, main_stream_);
-                    }
+                    gemm_iq2_xxs_relu2_batch_cuda(buf_gate_batch_.bf16(), buf_hidden2_batch_.bf16(),
+                                                  (const block_iq2_xxs*)lw.shared_w1_w.data,
+                                                  M, shared_inter, dim, main_stream_);
+                    gemm_iq2_xxs_residual_batch_cuda(buf_hidden_batch_.bf16(), buf_gate_batch_.bf16(),
+                                                     (const block_iq2_xxs*)lw.shared_w2_w.data,
+                                                     M, dim, shared_inter, main_stream_);
                 } else {
                     gemm_nvfp4_relu2_batch_cuda(buf_gate_batch_.bf16(), buf_hidden2_batch_.bf16(),
                                                 (const uint8_t*)lw.shared_w1_w.data, (const uint8_t*)lw.shared_w1_s.data,
@@ -587,8 +619,6 @@
                                                    lw.shared_w2_s2, M, dim, shared_inter, main_stream_);
                 }
             }
-
-            if (layer_id == 1) CUDA_CHECK(cudaEventRecord(s_moe_sub_ev[1], main_stream_));
 
             if (cfg_.is_nemotron_bolt()) {
                 // ── Nemotron Bolt Batched LatentMoE Forward Pass ─────────────────────
@@ -608,6 +638,17 @@
                         lw.gate_bias.data ? lw.gate_bias.f32() : nullptr,
                         M, n_experts, top_k, cfg_.routed_scaling_factor, main_stream_);
 
+                    // Bin tokens into expert bins for accelerated batched execution
+                    moe_bin_tokens_cuda(buf_moe_offsets_.i32(), buf_moe_token_indices_.i32(), buf_moe_token_slots_.i32(),
+                                        buf_topk_idx_batch_.i32(), M * top_k, top_k, n_experts, main_stream_);
+
+                    // Early D2H dispatch: Copy topk_ids to host concurrently while Latent Down-Projection computes on GPU
+                    if (!layer_fully_resident_[moe_layer_idx]) {
+                        CUDA_CHECK(cudaMemcpyAsync(topk_ids_batch_host_, buf_topk_idx_batch_.i32(),
+                                                   (size_t)M * top_k * sizeof(int32_t), cudaMemcpyDeviceToHost, main_stream_));
+                        CUDA_CHECK(cudaEventRecord(dma_event_, main_stream_));
+                    }
+
                     int stride = cfg_.n_routed_experts;
                     if (d_expert_counts_.data && track_expert_freq_) {
                         accumulate_expert_freq_batch_cuda(
@@ -621,24 +662,22 @@
                             main_stream_);
                     }
 
-                    // Overlap D2H top-k copy with Latent Down-Projection: launch D2H immediately!
-                    CUDA_CHECK(cudaMemcpyAsync(topk_ids_batch_host_, buf_topk_idx_batch_.i32(),
-                                               (size_t)M * top_k * sizeof(int32_t), cudaMemcpyDeviceToHost, main_stream_));
-                    CUDA_CHECK(cudaMemcpyAsync(topk_weights_batch_host_, buf_topk_vals_batch_.f32(),
-                                               (size_t)M * top_k * sizeof(float), cudaMemcpyDeviceToHost, main_stream_));
-                    CUDA_CHECK(cudaEventRecord(dma_event_, main_stream_));
-
-                    // Latent Down-Projection: buf_hidden2_batch_ [M, 4096] -> buf_latent_down_batch_ [M, 1024] (runs concurrently with D2H!)
+                    // Latent Down-Projection: buf_hidden2_batch_ [M, 4096] -> buf_latent_down_batch_ [M, 1024]
                     if (lw.fc1_latent_proj.dtype == "fp8") {
                         gemm_fp8_scalar_scale_cublaslt(buf_latent_down_batch_.bf16(), buf_hidden2_batch_.bf16(),
                                                        (const uint8_t*)lw.fc1_latent_proj.data, lw.fc1_scale_val,
                                                        M, latent_dim, dim, 0.0f, main_stream_);
                     } else if (lw.fc1_latent_proj.dtype == "q8_0" || lw.fc1_latent_proj.dtype == "Q8_0" || lw.fc1_latent_proj.dtype == "U8") {
-                        for (int m = 0; m < M; m++) {
-                            gemv_q8_0_cuda(buf_latent_down_batch_.bf16() + (size_t)m * latent_dim,
-                                           buf_hidden2_batch_.bf16() + (size_t)m * dim,
+                        if (M == 1) {
+                            gemv_q8_0_cuda(buf_latent_down_batch_.bf16(),
+                                           buf_hidden2_batch_.bf16(),
                                            (const block_q8_0*)lw.fc1_latent_proj.data,
                                            latent_dim, dim, main_stream_);
+                        } else {
+                            gemm_q8_0_batch_cuda(buf_latent_down_batch_.bf16(),
+                                                 buf_hidden2_batch_.bf16(),
+                                                 (const block_q8_0*)lw.fc1_latent_proj.data,
+                                                 M, latent_dim, dim, main_stream_);
                         }
                     } else {
                         gemm_bf16(buf_latent_down_batch_.bf16(), M, latent_dim, dim,
@@ -649,192 +688,174 @@
                     CUDA_CHECK(cudaMemsetAsync(buf_latent_accum_batch_.data, 0,
                                                (size_t)M * latent_dim * sizeof(__nv_bfloat16), main_stream_));
 
-                    // Wait for D2H top-k copy (which was running in parallel with down-projection)
-                    CUDA_CHECK(cudaEventSynchronize(dma_event_));
+                    // 1. Batched Up-Projection + Squared ReLU
+                    const void* const* layer_ptrs = nullptr;
+                    size_t down_w_off = expert_parts_.count("down_proj.weight") ? expert_parts_["down_proj.weight"].offset_in_block : (size_t)675840;
+                    size_t exp_block_sz = expert_loader_.expert_block_size() > 0 ? expert_loader_.expert_block_size() : 1351680;
 
-                    size_t max_moe_inter = cfg_.moe_intermediate_size > 0 ? (size_t)cfg_.moe_intermediate_size : 2560;
-                    size_t up_w_off = 0;
-                    size_t up_s_off = max_moe_inter * (latent_dim / 2);
-                    size_t up_s2_off = up_s_off + max_moe_inter * (latent_dim / 16);
-                    size_t down_w_off = up_s2_off + 16;
-                    size_t down_s_off = down_w_off + (size_t)latent_dim * (max_moe_inter / 2);
+                    if (layer_fully_resident_[moe_layer_idx]) {
+                        layer_ptrs = (const void* const*)buf_all_expert_ptrs_.data + (size_t)moe_layer_idx * stride_exp;
+                    } else {
+                        // Wait for early D2H copy dispatched concurrently during routing/latent-down
+                        CUDA_CHECK(cudaEventSynchronize(dma_event_));
 
-                    if (expert_parts_.count("up_proj.weight")) {
-                        up_w_off = expert_parts_["up_proj.weight"].offset_in_block;
-                    }
-                    if (expert_parts_.count("up_proj.weight_scale")) {
-                        up_s_off = expert_parts_["up_proj.weight_scale"].offset_in_block;
-                    }
-                    if (expert_parts_.count("down_proj.weight")) {
-                        down_w_off = expert_parts_["down_proj.weight"].offset_in_block;
-                    }
-                    if (expert_parts_.count("down_proj.weight_scale")) {
-                        down_s_off = expert_parts_["down_proj.weight_scale"].offset_in_block;
-                    }
-
-                    // Group tokens by active expert to transfer each expert's weights exactly once per layer
-                    static std::vector<std::vector<std::pair<int, float>>> s_expert_assignments;
-                    if ((int)s_expert_assignments.size() < n_experts) {
-                        s_expert_assignments.resize(n_experts);
-                    }
-                    for (int e = 0; e < n_experts; e++) {
-                        s_expert_assignments[e].clear();
-                    }
-                    std::vector<int> unique_experts;
-                    unique_experts.reserve(std::min(n_experts, M * top_k));
-
-                    for (int m = 0; m < M; m++) {
-                        const int32_t* m_topk_ids = topk_ids_batch_host_ + (size_t)m * top_k;
-                        const float* m_topk_weights = topk_weights_batch_host_ + (size_t)m * top_k;
-                        for (int k = 0; k < top_k; k++) {
-                            int eid = m_topk_ids[k];
-                            float weight = m_topk_weights[k];
-                            if (eid < 0 || eid >= n_experts || weight == 0.0f) continue;
-                            if (s_expert_assignments[eid].empty()) {
-                                unique_experts.push_back(eid);
-                            }
-                            s_expert_assignments[eid].push_back({m, weight});
+                        static std::vector<void*> s_layer_ptrs;
+                        if ((int)s_layer_ptrs.size() < n_experts) {
+                            s_layer_ptrs.resize(n_experts, nullptr);
                         }
-                    }
+                        std::fill(s_layer_ptrs.begin(), s_layer_ptrs.end(), nullptr);
 
-                    int n_unique = (int)unique_experts.size();
-                    size_t exp_block_sz = expert_loader_.expert_block_size();
+                        static std::vector<int> s_active_uncached;
+                        s_active_uncached.clear();
+                        static std::vector<bool> s_expert_seen;
+                        if ((int)s_expert_seen.size() < n_experts) s_expert_seen.resize(n_experts, false);
+                        std::fill(s_expert_seen.begin(), s_expert_seen.end(), false);
 
-                    std::vector<int> cached_experts;
-                    std::vector<int> uncached_experts;
-                    cached_experts.reserve(unique_experts.size());
-                    uncached_experts.reserve(unique_experts.size());
-                    for (int eid : unique_experts) {
-                        if (expert_loader_.try_get_expert_cached(moe_layer_idx, eid) != nullptr) {
-                            cached_experts.push_back(eid);
-                        } else {
-                            uncached_experts.push_back(eid);
-                        }
-                    }
-
-                    auto execute_prefill_expert = [&](int eid, const void* exp_ptr) {
-                        if (!exp_ptr) return;
-                        const uint8_t* up_w = (const uint8_t*)exp_ptr + up_w_off;
-                        const uint8_t* up_s = (const uint8_t*)exp_ptr + up_s_off;
-                        const uint8_t* down_w = (const uint8_t*)exp_ptr + down_w_off;
-                        const uint8_t* down_s = (const uint8_t*)exp_ptr + down_s_off;
-
-                        float up_s2 = 1.0f;
-                        float down_s2 = 1.0f;
-                        int stride_exp = std::max({cfg_.n_routed_experts, cfg_.max_n_routed_experts(), 128});
-                        size_t s_idx = ((size_t)moe_layer_idx * stride_exp + eid) * 2;
-                        if (s_idx + 1 < nemotron_expert_scales_.size()) {
-                            up_s2 = nemotron_expert_scales_[s_idx];
-                            down_s2 = nemotron_expert_scales_[s_idx + 1];
-                        }
-
-                        for (const auto& item : s_expert_assignments[eid]) {
-                            int m = item.first;
-                            float weight = item.second;
-                            const __nv_bfloat16* token_latent_in = buf_latent_down_batch_.bf16() + (size_t)m * latent_dim;
-                            __nv_bfloat16* token_latent_accum = buf_latent_accum_batch_.bf16() + (size_t)m * latent_dim;
-
-                            if (cfg_.expert_dtype == "iq2_xxs" || cfg_.expert_dtype == "iq2") {
-                                // 1. Fused Up-projection + Squared ReLU: [moe_inter, latent_dim]
-                                gemv_iq2_xxs_relu2_cuda(buf_gate_.bf16(), token_latent_in,
-                                                        (const block_iq2_xxs*)up_w, moe_inter, latent_dim, main_stream_);
-
-                                // 2. Fused Down-projection + Weight Scale + Residual Accumulation:
-                                gemv_iq2_xxs_scaled_residual_cuda(token_latent_accum, buf_gate_.bf16(),
-                                                                  (const block_iq2_xxs*)down_w, weight,
-                                                                  latent_dim, moe_inter, main_stream_);
+                        for (int i = 0; i < M * top_k; i++) {
+                            int eid = topk_ids_batch_host_[i];
+                            if (eid < 0 || eid >= n_experts || s_expert_seen[eid]) continue;
+                            s_expert_seen[eid] = true;
+                            void* p = expert_loader_.try_get_expert_cached(moe_layer_idx, eid);
+                            if (p) {
+                                s_layer_ptrs[eid] = p;
                             } else {
-                                // 1. Fused Up-projection + Squared ReLU: [moe_inter, latent_dim]
-                                gemv_nvfp4_relu2_cuda(buf_gate_.bf16(), token_latent_in,
-                                                      up_w, up_s, up_s2, moe_inter, latent_dim, main_stream_);
-
-                                // 2. Fused Down-projection + Weight Scale + Residual Accumulation:
-                                gemv_nvfp4_scaled_residual_cuda(token_latent_accum, buf_gate_.bf16(),
-                                                                down_w, down_s, down_s2, weight,
-                                                                latent_dim, moe_inter, main_stream_);
+                                s_active_uncached.push_back(eid);
                             }
                         }
-                    };
 
-                    // Multi-threaded concurrent fetch into pinned DRAM slots across up to 16 threads
-                    int n_uncached = (int)uncached_experts.size();
-                    int max_staging = std::min(n_uncached, 64);
-                    std::vector<void*> uncached_dram_ptrs(n_uncached, nullptr);
+                        int n_uncached = (int)s_active_uncached.size();
+                        int max_scratch_slots = 256;
 
-                    if (n_uncached > 0) {
-                        int n_miss = 0;
-                        for (int i = 0; i < n_uncached; i++) {
-                            void* p = expert_loader_.try_get_dram_expert_ptr(moe_layer_idx, uncached_experts[i]);
-                            uncached_dram_ptrs[i] = p;
-                            if (!p) n_miss++;
-                        }
-                        if (n_miss > 0) {
-                            int n_fetch_threads = std::min(16, n_miss);
-                            std::vector<std::future<void>> fetch_futures;
-                            int chunk = (n_uncached + n_fetch_threads - 1) / n_fetch_threads;
-                            for (int t = 0; t < n_fetch_threads; t++) {
-                                int s = t * chunk;
-                                int e = std::min(s + chunk, n_uncached);
-                                if (s >= e) continue;
-                                if (expert_pool_) {
-                                    fetch_futures.push_back(expert_pool_->enqueue([this, moe_layer_idx, &uncached_experts, &uncached_dram_ptrs, s, e]() {
-                                        for (int i = s; i < e; i++) {
-                                            if (!uncached_dram_ptrs[i]) {
-                                                uncached_dram_ptrs[i] = expert_loader_.get_dram_expert_ptr(moe_layer_idx, uncached_experts[i]);
+                        // 1. Parallel CPU copy to pinned host scratch buffer using expert_pool_
+                        int copy_count = std::min(n_uncached, max_scratch_slots);
+                        if (pinned_host_moe_scratch_ && copy_count > 0) {
+                            if (expert_pool_ && copy_count > 16) {
+                                int n_threads = std::min((int)expert_pool_->size(), 16);
+                                int chunk = (copy_count + n_threads - 1) / n_threads;
+                                std::vector<std::future<void>> futs;
+                                for (int t = 0; t < n_threads; t++) {
+                                    int s = t * chunk;
+                                    int e = std::min(s + chunk, copy_count);
+                                    if (s >= e) continue;
+                                    futs.push_back(expert_pool_->enqueue([this, moe_layer_idx, s, e, exp_block_sz]() {
+                                        for (int u = s; u < e; u++) {
+                                            int eid = s_active_uncached[u];
+                                            void* dram_src = expert_loader_.get_flat_dram_ptr(moe_layer_idx, eid);
+                                            if (!dram_src) dram_src = expert_loader_.get_dram_expert_ptr(moe_layer_idx, eid);
+                                            void* pinned_dst = (char*)pinned_host_moe_scratch_ + (size_t)u * exp_block_sz;
+                                            if (dram_src && pinned_dst) {
+                                                memcpy(pinned_dst, dram_src, exp_block_sz);
                                             }
                                         }
                                     }));
-                                } else {
-                                    for (int i = s; i < e; i++) {
-                                        if (!uncached_dram_ptrs[i]) {
-                                            uncached_dram_ptrs[i] = expert_loader_.get_dram_expert_ptr(moe_layer_idx, uncached_experts[i]);
-                                        }
+                                }
+                                for (auto& f : futs) f.wait();
+                                for (int u = 0; u < copy_count; u++) {
+                                    int eid = s_active_uncached[u];
+                                    s_layer_ptrs[eid] = (char*)buf_dram_moe_scratch_.data + (size_t)u * exp_block_sz;
+                                }
+                            } else {
+                                for (int u = 0; u < copy_count; u++) {
+                                    int eid = s_active_uncached[u];
+                                    void* dram_src = expert_loader_.get_flat_dram_ptr(moe_layer_idx, eid);
+                                    if (!dram_src) dram_src = expert_loader_.get_dram_expert_ptr(moe_layer_idx, eid);
+                                    void* pinned_dst = (char*)pinned_host_moe_scratch_ + (size_t)u * exp_block_sz;
+                                    void* scratch_gpu = (char*)buf_dram_moe_scratch_.data + (size_t)u * exp_block_sz;
+                                    if (dram_src && pinned_dst) {
+                                        memcpy(pinned_dst, dram_src, exp_block_sz);
                                     }
+                                    s_layer_ptrs[eid] = scratch_gpu;
                                 }
                             }
-                            for (auto& fut : fetch_futures) fut.wait();
+
+                            // 2. High-speed contiguous PCIe DMA burst (14 GB/s in ~14 ms)
+                            size_t dma_bytes = (size_t)copy_count * exp_block_sz;
+                            CUDA_CHECK(cudaMemcpyAsync(buf_dram_moe_scratch_.data, pinned_host_moe_scratch_,
+                                                       dma_bytes, cudaMemcpyHostToDevice, dma_stream_));
+                            CUDA_CHECK(cudaEventRecord(dma_event_, dma_stream_));
+                        }
+
+                        CUDA_CHECK(cudaMemcpyAsync(buf_layer_expert_ptrs_.data, s_layer_ptrs.data(),
+                                                   (size_t)n_experts * sizeof(void*), cudaMemcpyHostToDevice, main_stream_));
+                        layer_ptrs = (const void* const*)buf_layer_expert_ptrs_.data;
+                    }
+
+                    if (layer_id == 1) CUDA_CHECK(cudaEventRecord(s_moe_sub_ev[1], main_stream_));
+                    if (moe_layer_idx == 10) CUDA_CHECK(cudaEventRecord(s_dram_sub_ev[1], main_stream_));
+
+                    // Shared Expert: Runs concurrently on main_stream_ while DMA transfers active uncached experts on dma_stream_
+                    bool has_shared = (lw.shared_w1_w.data && lw.shared_w2_w.data);
+                    if (has_shared) {
+                        int shared_inter = cfg_.moe_shared_expert_intermediate_size > 0 ? cfg_.moe_shared_expert_intermediate_size : 5376;
+                        if (lw.shared_w1_w.dtype == "iq2_xxs" || lw.shared_w1_w.dtype == "iq2") {
+                            gemm_iq2_xxs_relu2_batch_cuda(buf_gate_batch_.bf16(), buf_hidden2_batch_.bf16(),
+                                                          (const block_iq2_xxs*)lw.shared_w1_w.data,
+                                                          M, shared_inter, dim, main_stream_);
+                            gemm_iq2_xxs_residual_batch_cuda(buf_hidden_batch_.bf16(), buf_gate_batch_.bf16(),
+                                                             (const block_iq2_xxs*)lw.shared_w2_w.data,
+                                                             M, dim, shared_inter, main_stream_);
                         }
                     }
 
-                    // Queue PCIe DMA transfers for uncached experts on dma_stream_ (up to 64 parallel transfers)
-                    for (int u = 0; u < max_staging; u++) {
-                        void* dram_src = uncached_dram_ptrs[u];
-                        void* scratch_gpu = (char*)buf_dram_moe_scratch_.data + (size_t)u * exp_block_sz;
-                        if (dram_src && scratch_gpu) {
-                            CUDA_CHECK(cudaMemcpyAsync(scratch_gpu, dram_src, exp_block_sz,
-                                                       cudaMemcpyHostToDevice, dma_stream_));
-                            CUDA_CHECK(cudaEventRecord(expert_events_[u], dma_stream_));
-                        }
+                    if (!layer_fully_resident_[moe_layer_idx]) {
+                        CUDA_CHECK(cudaStreamWaitEvent(main_stream_, dma_event_, 0));
                     }
+                    if (layer_id == 1) CUDA_CHECK(cudaEventRecord(s_moe_sub_ev[2], main_stream_));
+                    if (moe_layer_idx == 10) CUDA_CHECK(cudaEventRecord(s_dram_sub_ev[2], main_stream_));
 
-                    // Pass 1: Compute ALL resident L1 VRAM experts first (zero DMA wait!)
-                    for (int eid : cached_experts) {
-                        const void* cached = expert_loader_.try_get_expert_cached(moe_layer_idx, eid);
-                        if (cached) {
-                            execute_prefill_expert(eid, cached);
-                        }
-                    }
+                    if (cfg_.expert_dtype == "iq2_xxs" || cfg_.expert_dtype == "iq2") {
+                        moe_iq2_xxs_binned_up_relu2_batch_cuda(
+                            buf_moe_gate_batch_.bf16(),
+                            buf_latent_down_batch_.bf16(),
+                            buf_moe_offsets_.i32(),
+                            buf_moe_token_indices_.i32(),
+                            buf_moe_token_slots_.i32(),
+                            layer_ptrs,
+                            layer_scales,
+                            M, moe_inter, latent_dim, main_stream_, top_k, n_experts);
+                        if (layer_id == 1) CUDA_CHECK(cudaEventRecord(s_moe_sub_ev[3], main_stream_));
+                        if (moe_layer_idx == 10) CUDA_CHECK(cudaEventRecord(s_dram_sub_ev[3], main_stream_));
 
-                    // Pass 2: Compute uncached experts (waits for their individual DMA events)
-                    for (int u = 0; u < n_uncached; u++) {
-                        int slot = u % 64;
-                        if (u >= 64) {
-                            CUDA_CHECK(cudaStreamWaitEvent(dma_stream_, dma_event_, 0));
-                            void* dram_src = uncached_dram_ptrs[u];
-                            void* scratch_gpu = (char*)buf_dram_moe_scratch_.data + (size_t)slot * exp_block_sz;
-                            if (dram_src && scratch_gpu) {
-                                CUDA_CHECK(cudaMemcpyAsync(scratch_gpu, dram_src, exp_block_sz,
-                                                           cudaMemcpyHostToDevice, dma_stream_));
-                                CUDA_CHECK(cudaEventRecord(expert_events_[slot], dma_stream_));
-                            }
-                        }
+                        // 2. Batched Down-Projection + Top-k Scaled Residual Accumulation into buf_latent_accum_batch_
+                        moe_iq2_xxs_binned_down_scaled_residual_batch_cuda(
+                            buf_latent_accum_batch_.bf16(),
+                            buf_moe_gate_batch_.bf16(),
+                            buf_topk_vals_batch_.f32(),
+                            buf_moe_offsets_.i32(),
+                            buf_moe_token_indices_.i32(),
+                            buf_moe_token_slots_.i32(),
+                            layer_ptrs,
+                            layer_scales,
+                            M, latent_dim, moe_inter, main_stream_, top_k, n_experts,
+                            down_w_off);
+                        if (layer_id == 1) CUDA_CHECK(cudaEventRecord(s_moe_sub_ev[4], main_stream_));
+                        if (moe_layer_idx == 10) CUDA_CHECK(cudaEventRecord(s_dram_sub_ev[4], main_stream_));
+                    } else {
+                        moe_nemotron_up_relu2_batch_cuda(
+                            buf_moe_gate_batch_.bf16(),
+                            buf_latent_down_batch_.bf16(),
+                            buf_topk_idx_batch_.i32(),
+                            buf_moe_offsets_.i32(),
+                            buf_moe_token_indices_.i32(),
+                            buf_moe_token_slots_.i32(),
+                            layer_ptrs,
+                            layer_scales,
+                            M, moe_inter, latent_dim, main_stream_, top_k, n_experts);
+                        if (layer_id == 1) CUDA_CHECK(cudaEventRecord(s_moe_sub_ev[3], main_stream_));
 
-                        CUDA_CHECK(cudaStreamWaitEvent(main_stream_, expert_events_[slot], 0));
-                        void* scratch_gpu = (char*)buf_dram_moe_scratch_.data + (size_t)slot * exp_block_sz;
-                        execute_prefill_expert(uncached_experts[u], scratch_gpu);
-                        if (u >= 63) {
-                            CUDA_CHECK(cudaEventRecord(dma_event_, main_stream_));
-                        }
+                        moe_nemotron_down_scaled_residual_batch_cuda(
+                            buf_latent_accum_batch_.bf16(),
+                            buf_moe_gate_batch_.bf16(),
+                            buf_topk_idx_batch_.i32(),
+                            buf_topk_vals_batch_.f32(),
+                            buf_moe_offsets_.i32(),
+                            buf_moe_token_indices_.i32(),
+                            buf_moe_token_slots_.i32(),
+                            layer_ptrs,
+                            layer_scales,
+                            M, latent_dim, moe_inter, main_stream_, top_k, n_experts,
+                            /*down_offset_padding=*/16);
+                        if (layer_id == 1) CUDA_CHECK(cudaEventRecord(s_moe_sub_ev[4], main_stream_));
                     }
 
                     // 5. Latent Up-Projection: buf_latent_accum_batch_ [M, 1024] -> residual add into buf_hidden_batch_ [M, 4096]
@@ -843,17 +864,24 @@
                                                        (const uint8_t*)lw.fc2_latent_proj.data, lw.fc2_scale_val,
                                                        M, dim, latent_dim, 1.0f, main_stream_);
                     } else if (lw.fc2_latent_proj.dtype == "q8_0" || lw.fc2_latent_proj.dtype == "Q8_0" || lw.fc2_latent_proj.dtype == "U8") {
-                        for (int m = 0; m < M; m++) {
-                            gemv_q8_0_residual_cuda(buf_hidden_batch_.bf16() + (size_t)m * dim,
-                                                    buf_latent_accum_batch_.bf16() + (size_t)m * latent_dim,
+                        if (M == 1) {
+                            gemv_q8_0_residual_cuda(buf_hidden_batch_.bf16(),
+                                                    buf_latent_accum_batch_.bf16(),
                                                     (const block_q8_0*)lw.fc2_latent_proj.data,
                                                     dim, latent_dim, main_stream_);
+                        } else {
+                            gemm_q8_0_residual_batch_cuda(buf_hidden_batch_.bf16(),
+                                                          buf_latent_accum_batch_.bf16(),
+                                                          (const block_q8_0*)lw.fc2_latent_proj.data,
+                                                          M, dim, latent_dim, main_stream_);
                         }
                     } else {
                         gemm_bf16(buf_hidden2_batch_.bf16(), M, dim, latent_dim,
                                   buf_latent_accum_batch_.bf16(), lw.fc2_latent_proj.bf16());
                         vector_add_bf16_cuda(buf_hidden_batch_.bf16(), buf_hidden2_batch_.bf16(), M * dim, main_stream_);
                     }
+                    if (layer_id == 1) CUDA_CHECK(cudaEventRecord(s_moe_sub_ev[5], main_stream_));
+                    if (moe_layer_idx == 10) CUDA_CHECK(cudaEventRecord(s_dram_sub_ev[5], main_stream_));
                 }
                 return;
             }
@@ -873,85 +901,137 @@
                     lw.gate_bias.data ? lw.gate_bias.f32() : nullptr,
                     M, n_experts, top_k, cfg_.routed_scaling_factor, main_stream_);
 
+                if (!layer_fully_resident_[moe_layer_idx]) {
+                    CUDA_CHECK(cudaMemcpyAsync(topk_ids_batch_host_, buf_topk_idx_batch_.i32(),
+                                               (size_t)M * top_k * sizeof(int32_t), cudaMemcpyDeviceToHost, main_stream_));
+                    CUDA_CHECK(cudaEventRecord(dma_event_, main_stream_));
+                }
+
                 // Bin tokens into expert bins for accelerated batched execution
                 moe_bin_tokens_cuda(buf_moe_offsets_.i32(), buf_moe_token_indices_.i32(), buf_moe_token_slots_.i32(),
                                     buf_topk_idx_batch_.i32(), M * top_k, top_k, n_experts, main_stream_);
             }
 
-            if (layer_fully_resident_[moe_layer_idx]) {
-                // Staged Lookahead Prefetch: Stream one DRAM layer at a time during late VRAM MoE layers (7..10)
-                // so initial DRAM layers (11..14) arrive smoothly without saturating PCIe during prompt start.
-                if (dma_stream_ && moe_layer_idx >= (11 - NUM_DRAM_MOE_BUFFERS) && moe_layer_idx < 11) {
-                    int prefetch_layer = moe_layer_idx + NUM_DRAM_MOE_BUFFERS;
-                    int buf_idx = prefetch_layer - 11;
-                    prefetch_dram_layer_async(prefetch_layer, buf_idx);
+            if (layer_id == 1) CUDA_CHECK(cudaEventRecord(s_moe_sub_ev[1], main_stream_));
+
+            // Routed Experts (Top-6, Squared ReLU, scaled residual)
+            if (cfg_.n_routed_experts > 0 && lw.gate_w.data) {
+                const void* const* layer_ptrs = nullptr;
+                size_t exp_block_sz = expert_loader_.expert_block_size() > 0 ? (size_t)expert_loader_.expert_block_size() : (size_t)5615616;
+
+                if (layer_fully_resident_[moe_layer_idx]) {
+                    layer_ptrs = (const void* const*)buf_all_expert_ptrs_.data + (size_t)moe_layer_idx * stride_exp;
+                } else {
+                    CUDA_CHECK(cudaEventSynchronize(dma_event_));
+
+                    static std::vector<void*> s_lightning_layer_ptrs;
+                    if ((int)s_lightning_layer_ptrs.size() < n_experts) {
+                        s_lightning_layer_ptrs.resize(n_experts, nullptr);
+                    }
+                    std::fill(s_lightning_layer_ptrs.begin(), s_lightning_layer_ptrs.end(), nullptr);
+
+                    static std::vector<int> s_lightning_active_uncached;
+                    s_lightning_active_uncached.clear();
+                    static std::vector<bool> s_lightning_expert_seen;
+                    if ((int)s_lightning_expert_seen.size() < n_experts) s_lightning_expert_seen.resize(n_experts, false);
+                    std::fill(s_lightning_expert_seen.begin(), s_lightning_expert_seen.end(), false);
+
+                    for (int i = 0; i < M * top_k; i++) {
+                        int eid = topk_ids_batch_host_[i];
+                        if (eid < 0 || eid >= n_experts || s_lightning_expert_seen[eid]) continue;
+                        s_lightning_expert_seen[eid] = true;
+                        void* p = expert_loader_.try_get_expert_cached(moe_layer_idx, eid);
+                        if (p) {
+                            s_lightning_layer_ptrs[eid] = p;
+                        } else {
+                            s_lightning_active_uncached.push_back(eid);
+                        }
+                    }
+
+                    int n_uncached = (int)s_lightning_active_uncached.size();
+                    int max_scratch_slots = 128;
+                    int copy_count = std::min(n_uncached, max_scratch_slots);
+
+                    if (pinned_host_moe_scratch_ && copy_count > 0) {
+                        if (expert_pool_ && copy_count > 8) {
+                            int n_threads = std::min((int)expert_pool_->size(), 16);
+                            int chunk = (copy_count + n_threads - 1) / n_threads;
+                            std::vector<std::future<void>> futs;
+                            for (int t = 0; t < n_threads; t++) {
+                                int s = t * chunk;
+                                int e = std::min(s + chunk, copy_count);
+                                if (s >= e) continue;
+                                futs.push_back(expert_pool_->enqueue([this, moe_layer_idx, s, e, exp_block_sz]() {
+                                    for (int u = s; u < e; u++) {
+                                        int eid = s_lightning_active_uncached[u];
+                                        void* dram_src = expert_loader_.get_flat_dram_ptr(moe_layer_idx, eid);
+                                        if (!dram_src) dram_src = expert_loader_.get_dram_expert_ptr(moe_layer_idx, eid);
+                                        void* pinned_dst = (char*)pinned_host_moe_scratch_ + (size_t)u * exp_block_sz;
+                                        if (dram_src && pinned_dst) {
+                                            memcpy(pinned_dst, dram_src, exp_block_sz);
+                                        }
+                                    }
+                                }));
+                            }
+                            for (auto& f : futs) f.wait();
+                            for (int u = 0; u < copy_count; u++) {
+                                int eid = s_lightning_active_uncached[u];
+                                s_lightning_layer_ptrs[eid] = (char*)buf_dram_moe_scratch_.data + (size_t)u * exp_block_sz;
+                            }
+                        } else {
+                            for (int u = 0; u < copy_count; u++) {
+                                int eid = s_lightning_active_uncached[u];
+                                void* dram_src = expert_loader_.get_flat_dram_ptr(moe_layer_idx, eid);
+                                if (!dram_src) dram_src = expert_loader_.get_dram_expert_ptr(moe_layer_idx, eid);
+                                void* pinned_dst = (char*)pinned_host_moe_scratch_ + (size_t)u * exp_block_sz;
+                                void* scratch_gpu = (char*)buf_dram_moe_scratch_.data + (size_t)u * exp_block_sz;
+                                if (dram_src && pinned_dst) {
+                                    memcpy(pinned_dst, dram_src, exp_block_sz);
+                                }
+                                s_lightning_layer_ptrs[eid] = scratch_gpu;
+                            }
+                        }
+
+                        // High-speed contiguous PCIe DMA burst on dma_stream_
+                        size_t dma_bytes = (size_t)copy_count * exp_block_sz;
+                        CUDA_CHECK(cudaMemcpyAsync(buf_dram_moe_scratch_.data, pinned_host_moe_scratch_,
+                                                   dma_bytes, cudaMemcpyHostToDevice, dma_stream_));
+                        CUDA_CHECK(cudaEventRecord(dma_event_, dma_stream_));
+                    }
+
+                    CUDA_CHECK(cudaMemcpyAsync(buf_layer_expert_ptrs_.data, s_lightning_layer_ptrs.data(),
+                                               (size_t)n_experts * sizeof(void*), cudaMemcpyHostToDevice, main_stream_));
+                    layer_ptrs = (const void* const*)buf_layer_expert_ptrs_.data;
+
+                    if (copy_count > 0) {
+                        CUDA_CHECK(cudaStreamWaitEvent(main_stream_, dma_event_, 0));
+                    }
                 }
 
-                // Routed Experts (Top-6, Squared ReLU, scaled residual)
-                if (cfg_.n_routed_experts > 0 && lw.gate_w.data) {
-                    const void* const* layer_ptrs = (const void* const*)buf_all_expert_ptrs_.data + (size_t)moe_layer_idx * stride_exp;
+                if (layer_id == 1) CUDA_CHECK(cudaEventRecord(s_moe_sub_ev[2], main_stream_));
 
-                    moe_nemotron_up_relu2_batch_cuda(
-                        buf_moe_gate_batch_.bf16(), buf_hidden2_batch_.bf16(),
-                        buf_topk_idx_batch_.i32(),
-                        buf_moe_offsets_.i32(), buf_moe_token_indices_.i32(), buf_moe_token_slots_.i32(),
-                        layer_ptrs,
-                        layer_scales,
-                        M, moe_inter, dim, main_stream_, top_k, n_experts);
+                moe_nemotron_up_relu2_batch_cuda(
+                    buf_moe_gate_batch_.bf16(), buf_hidden2_batch_.bf16(),
+                    buf_topk_idx_batch_.i32(),
+                    buf_moe_offsets_.i32(), buf_moe_token_indices_.i32(), buf_moe_token_slots_.i32(),
+                    layer_ptrs,
+                    layer_scales,
+                    M, moe_inter, dim, main_stream_, top_k, n_experts);
 
-                    if (layer_id == 1) CUDA_CHECK(cudaEventRecord(s_moe_sub_ev[3], main_stream_));
+                if (layer_id == 1) CUDA_CHECK(cudaEventRecord(s_moe_sub_ev[3], main_stream_));
 
-                    moe_nemotron_down_scaled_residual_batch_cuda(
-                        buf_hidden_batch_.bf16(), buf_moe_gate_batch_.bf16(),
-                        buf_topk_idx_batch_.i32(), buf_topk_vals_batch_.f32(),
-                        buf_moe_offsets_.i32(), buf_moe_token_indices_.i32(), buf_moe_token_slots_.i32(),
-                        layer_ptrs,
-                        layer_scales,
-                        M, dim, moe_inter, main_stream_, top_k, n_experts);
+                moe_nemotron_down_scaled_residual_batch_cuda(
+                    buf_hidden_batch_.bf16(), buf_moe_gate_batch_.bf16(),
+                    buf_topk_idx_batch_.i32(), buf_topk_vals_batch_.f32(),
+                    buf_moe_offsets_.i32(), buf_moe_token_indices_.i32(), buf_moe_token_slots_.i32(),
+                    layer_ptrs,
+                    layer_scales,
+                    M, dim, moe_inter, main_stream_, top_k, n_experts,
+                    /*down_offset_padding=*/16);
 
-                    if (layer_id == 1) CUDA_CHECK(cudaEventRecord(s_moe_sub_ev[4], main_stream_));
-                }
-
-                if (layer_id == 1) CUDA_CHECK(cudaEventRecord(s_moe_sub_ev[5], main_stream_));
-                return;
+                if (layer_id == 1) CUDA_CHECK(cudaEventRecord(s_moe_sub_ev[4], main_stream_));
             }
-
-            // Path for DRAM layers (layers 11..22):
-            int buf_idx = (moe_layer_idx - 11) % NUM_DRAM_MOE_BUFFERS;
-
-            // Wait for prefetched layer in buf_idx (transferred asynchronously in background)
-            if (dma_stream_) {
-                CUDA_CHECK(cudaStreamWaitEvent(main_stream_, dma_ready_event_[buf_idx], 0));
-            }
-
-            const void* const* layer_ptrs = (const void* const*)buf_dram_expert_ptrs_gpu_[buf_idx].data;
-
-            // Launch Routed Up and Down on main_stream_
-            moe_nemotron_up_relu2_batch_cuda(
-                buf_moe_gate_batch_.bf16(), buf_hidden2_batch_.bf16(),
-                buf_topk_idx_batch_.i32(),
-                buf_moe_offsets_.i32(), buf_moe_token_indices_.i32(), buf_moe_token_slots_.i32(),
-                layer_ptrs,
-                layer_scales,
-                M, moe_inter, dim, main_stream_, top_k, n_experts);
-
-            moe_nemotron_down_scaled_residual_batch_cuda(
-                buf_hidden_batch_.bf16(), buf_moe_gate_batch_.bf16(),
-                buf_topk_idx_batch_.i32(), buf_topk_vals_batch_.f32(),
-                buf_moe_offsets_.i32(), buf_moe_token_indices_.i32(), buf_moe_token_slots_.i32(),
-                layer_ptrs,
-                layer_scales,
-                M, dim, moe_inter, main_stream_, top_k, n_experts);
-
-            // Signal compute done on buf_idx and trigger prefetch for next layer using this buffer (Lookahead = NUM_DRAM_MOE_BUFFERS)
-            if (dma_stream_) {
-                CUDA_CHECK(cudaEventRecord(compute_done_event_[buf_idx], main_stream_));
-                int next_layer = moe_layer_idx + NUM_DRAM_MOE_BUFFERS;
-                if (next_layer <= 22) {
-                    CUDA_CHECK(cudaStreamWaitEvent(dma_stream_, compute_done_event_[buf_idx], 0));
-                    prefetch_dram_layer_async(next_layer, buf_idx);
-                }
-            }
+            if (layer_id == 1) CUDA_CHECK(cudaEventRecord(s_moe_sub_ev[5], main_stream_));
             return;
         }
     }
@@ -1045,15 +1125,30 @@
             }
         }
 
-        if (s_moe_sub_init && !cfg_.is_nemotron_bolt()) {
-            float t_router = 0, t_shared = 0, t_up = 0, t_down = 0, t_end = 0;
-            cudaEventElapsedTime(&t_router, s_moe_sub_ev[0], s_moe_sub_ev[1]);
-            cudaEventElapsedTime(&t_shared, s_moe_sub_ev[1], s_moe_sub_ev[2]);
-            cudaEventElapsedTime(&t_up, s_moe_sub_ev[2], s_moe_sub_ev[3]);
-            cudaEventElapsedTime(&t_down, s_moe_sub_ev[3], s_moe_sub_ev[4]);
-            cudaEventElapsedTime(&t_end, s_moe_sub_ev[4], s_moe_sub_ev[5]);
-            LOG_INFO("  [MOE SUB-STEP Layer 1 M=%d] Router+Bin: %.2f ms | SharedExpert: %.2f ms | Up: %.2f ms | Down: %.2f ms | LayerEnd: %.2f ms | Sum: %.2f ms",
-                     M, t_router, t_shared, t_up, t_down, t_end, t_router + t_shared + t_up + t_down + t_end);
+        if (s_moe_sub_init) {
+            float t_p0 = 0, t_p1 = 0, t_p2 = 0, t_p3 = 0, t_p4 = 0;
+            cudaEventElapsedTime(&t_p0, s_moe_sub_ev[0], s_moe_sub_ev[1]);
+            cudaEventElapsedTime(&t_p1, s_moe_sub_ev[1], s_moe_sub_ev[2]);
+            cudaEventElapsedTime(&t_p2, s_moe_sub_ev[2], s_moe_sub_ev[3]);
+            cudaEventElapsedTime(&t_p3, s_moe_sub_ev[3], s_moe_sub_ev[4]);
+            cudaEventElapsedTime(&t_p4, s_moe_sub_ev[4], s_moe_sub_ev[5]);
+            if (cfg_.is_nemotron_bolt()) {
+                LOG_INFO("  [BOLT MOE SUB-STEP Layer 1 (VRAM) M=%d] Router+LatentDown: %.2f ms | Shared+DMA: %.2f ms | UpProj: %.2f ms | DownProj: %.2f ms | LatentUp: %.2f ms | Sum: %.2f ms",
+                         M, t_p0, t_p1, t_p2, t_p3, t_p4, t_p0 + t_p1 + t_p2 + t_p3 + t_p4);
+                if (s_dram_sub_init) {
+                    float d_p0 = 0, d_p1 = 0, d_p2 = 0, d_p3 = 0, d_p4 = 0;
+                    cudaEventElapsedTime(&d_p0, s_dram_sub_ev[0], s_dram_sub_ev[1]);
+                    cudaEventElapsedTime(&d_p1, s_dram_sub_ev[1], s_dram_sub_ev[2]);
+                    cudaEventElapsedTime(&d_p2, s_dram_sub_ev[2], s_dram_sub_ev[3]);
+                    cudaEventElapsedTime(&d_p3, s_dram_sub_ev[3], s_dram_sub_ev[4]);
+                    cudaEventElapsedTime(&d_p4, s_dram_sub_ev[4], s_dram_sub_ev[5]);
+                    LOG_INFO("  [BOLT MOE SUB-STEP Layer 10 (DRAM) M=%d] Discover+Copy: %.2f ms | Shared+DMA: %.2f ms | UpProj: %.2f ms | DownProj: %.2f ms | LatentUp: %.2f ms | Sum: %.2f ms",
+                             M, d_p0, d_p1, d_p2, d_p3, d_p4, d_p0 + d_p1 + d_p2 + d_p3 + d_p4);
+                }
+            } else {
+                LOG_INFO("  [MOE SUB-STEP Layer 1 M=%d] Router+Bin: %.2f ms | SharedExpert: %.2f ms | Up: %.2f ms | Down: %.2f ms | LayerEnd: %.2f ms | Sum: %.2f ms",
+                         M, t_p0, t_p1, t_p2, t_p3, t_p4, t_p0 + t_p1 + t_p2 + t_p3 + t_p4);
+            }
         }
 
         // Always copy the last token's hidden state into buf_hidden_ (for generation / continuation)
@@ -1065,7 +1160,16 @@
         if (compute_all_logits) {
             rms_norm_cuda_batched(buf_hidden_batch_.bf16(), buf_hidden_batch_.bf16(),
                                   norm_weight_.bf16(), M, dim, cfg_.rms_norm_eps, main_stream_);
-            if (head_weight_.dtype == "fp4") {
+            if (head_weight_.dtype == "nvfp4") {
+                for (int m = 0; m < M; m++) {
+                    gemv_nvfp4_f32_cuda(buf_logits_batch_.f32() + (size_t)m * cfg_.vocab_size,
+                                        buf_hidden_batch_.bf16() + (size_t)m * dim,
+                                        (const uint8_t*)head_weight_.data,
+                                        (const uint8_t*)head_weight_scale_.data,
+                                        head_weight_scale_2_,
+                                        cfg_.vocab_size, dim, main_stream_);
+                }
+            } else if (head_weight_.dtype == "fp4") {
                 quantize_bf16_to_fp4_e2m1_cuda(buf_activation_fp4_.u8(), buf_activation_scale_.u8(),
                                                buf_hidden_batch_.bf16(), M, dim, main_stream_);
                 gemm_fp4_f32_blackwell_tensorcore_cuda(buf_logits_batch_.f32(), buf_activation_fp4_.u8(), buf_activation_scale_.u8(),

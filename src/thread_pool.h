@@ -42,6 +42,8 @@ public:
         return res;
     }
 
+    size_t size() const { return workers.size(); }
+
     ~ThreadPool() {
         {
             std::unique_lock<std::mutex> lock(queue_mutex);
