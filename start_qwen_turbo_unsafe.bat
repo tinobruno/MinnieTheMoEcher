@@ -11,4 +11,4 @@ echo   - File Read ^& Write Operations:     ENABLED
 echo   - Max Tool Execution Rounds:        15
 echo   Web UI: http://localhost:8001
 ===============================================================================
-.\moecher.exe -m "E:\moecher\models\qwen3_8_turbo_vision_13g\moecher_manifest.json" --port 8001 --ctx 8192 --max-vram 14.0 --tools --allow-host-exec --allow-file-write --headless-browsing --max-tool-rounds 15
+.\moecher.exe -m "E:\moecher\models\qwen3_8_turbo_vision_13g\moecher_manifest.json" --port 8001 --ctx 8192 --max-vram 14.0 --no-mtp --tools --allow-host-exec --allow-file-write --headless-browsing --max-tool-rounds 15

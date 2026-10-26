@@ -412,6 +412,22 @@ struct GPUTensor {
         is_host = false;
         is_pinned = false;
     }
+    bool try_alloc(size_t bytes) {
+        if (data) free();
+#if !defined(__APPLE__)
+        cudaError_t err = cudaMalloc(&data, bytes);
+        if (err != cudaSuccess) {
+            cudaGetLastError();
+            data = nullptr;
+            size_bytes = 0;
+            return false;
+        }
+#endif
+        size_bytes = bytes;
+        is_host = false;
+        is_pinned = false;
+        return true;
+    }
     void alloc_host(size_t bytes) {
         if (data) free();
 #if !defined(__APPLE__)

@@ -4417,10 +4417,24 @@ private:
                 std::string draft_ids_path = mtp_model_dir + "/draft_vocab_ids.bin";
                 std::string draft_head_path = mtp_model_dir + "/draft_lm_head_int8_bf16.bin";
                 bool has_draft_head = (std::filesystem::exists(draft_ids_path) && std::filesystem::exists(draft_head_path));
-                if ((head_weight_.dtype == "int4" || head_weight_.dtype == "fp4") && !has_draft_head) {
+
+                size_t free_vram = 0, total_vram = 0;
+                cudaMemGetInfo(&free_vram, &total_vram);
+                size_t min_headroom_for_mtp = 1350ULL * 1024 * 1024; // Requires ~650MB MTP + ~700MB for engine working buffers & KV cache
+
+                if (free_vram < min_headroom_for_mtp) {
+                    LOG_WARN("[MTP] Constrained VRAM headroom (%.1f MB free, requires %.1f MB for MTP + working buffers). Auto-bypassing MTP to ensure base model and %d context fit safely without OOM.",
+                             (double)free_vram / (1024.0 * 1024.0),
+                             (double)min_headroom_for_mtp / (1024.0 * 1024.0),
+                             cfg_.max_seq_len);
+                    enable_mtp_ = false;
+                    default_enable_mtp_ = false;
+                } else if ((head_weight_.dtype == "int4" || head_weight_.dtype == "fp4") && !has_draft_head) {
                     LOG_WARN("MTP: Full lm_head is %s and no draft_lm_head_int8_bf16.bin found — skipping MTP", head_weight_.dtype.c_str());
+                    enable_mtp_ = false;
+                    default_enable_mtp_ = false;
                 } else {
-                    mtp_drafter_.load_mtp_weights(mapped, tensor_map, 
+                    if (!mtp_drafter_.load_mtp_weights(mapped, tensor_map, 
                                                   (embed_weight_.dtype == "int4" || embed_weight_.dtype == "fp4") ? nullptr : embed_weight_.bf16(),
                                                   (embed_weight_.dtype == "int4" || embed_weight_.dtype == "fp4") ? (uint8_t*)embed_weight_.data : nullptr,
                                                   embed_weight_scale_.data,
@@ -4428,7 +4442,11 @@ private:
                                                   embed_weight_.dtype == "fp4",
                                                   (head_weight_.dtype == "int4" || head_weight_.dtype == "fp4") ? nullptr : head_weight_.bf16(),
                                                   cfg_.vocab_size, mtp_model_dir, main_stream_,
-                                                  cfg_.max_seq_len);
+                                                  cfg_.max_seq_len)) {
+                        LOG_WARN("[MTP] MTP weight initialization failed or VRAM exhausted. Auto-falling back to non-MTP decoding.");
+                        enable_mtp_ = false;
+                        default_enable_mtp_ = false;
+                    }
                 }
             }
         } else if (!enable_mtp_) {
