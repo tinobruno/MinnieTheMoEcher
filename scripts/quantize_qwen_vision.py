@@ -182,6 +182,7 @@ def quantize_qwen_vision(
     dense_bin_in: Path = None,
     raw_hf_dir: Path = None,
     output_dir: Path = None,
+    draft_dir: Path = None,
     mlp_bits: int = 3,
     mlp_scheme: str = "all-3bit",
     visual_mode: str = "bf16",
@@ -394,6 +395,21 @@ def quantize_qwen_vision(
         if not st_files:
             raise FileNotFoundError(f"No safetensors found in {raw_hf_dir}")
 
+        # Parse config.json if present
+        raw_cfg = {}
+        if (raw_hf_dir / "config.json").exists():
+            with open(raw_hf_dir / "config.json", "r", encoding="utf-8") as f_cfg:
+                raw_cfg = json.load(f_cfg)
+        text_cfg = raw_cfg.get("text_config", raw_cfg)
+        vis_cfg = raw_cfg.get("vision_config", {})
+
+        # Check for draft vocabulary for MTP speculative drafting
+        draft_ids = None
+        if draft_dir and (draft_dir / "draft_vocab_ids.json").exists():
+            with open(draft_dir / "draft_vocab_ids.json", "r", encoding="utf-8") as f_d:
+                draft_ids = json.load(f_d)
+            print(f"  [Speculative Draft] Found draft vocabulary with {len(draft_ids)} tokens in {draft_dir}")
+
         tensor_index = {}
         for st_path in st_files:
             header, data_offset = read_safetensor_header(str(st_path))
@@ -424,6 +440,44 @@ def quantize_qwen_vision(
                 with open(meta["file"], "rb") as f_in:
                     f_in.seek(meta["data_offset"])
                     raw_data = f_in.read(nbytes)
+
+                # Extract MTP draft lm_head directly from unquantized BF16 weights
+                if ("lm_head" in t_name or t_name == "model.language_model.lm_head.weight") and draft_ids and len(shape) == 2:
+                    draft_size = len(draft_ids)
+                    hidden_size = shape[1]
+                    print(f"\n  [Speculative Draft] Extracting {draft_size} draft rows from raw unquantized {t_name}...")
+                    u16_all = np.frombuffer(raw_data, dtype=np.uint16).reshape(shape[0], hidden_size)
+                    draft_rows_bf16 = u16_all[draft_ids, :]
+
+                    # 1. Save BF16 draft lm head: [draft_size: u32] [hidden_size: u32] [data: uint16]
+                    bf16_draft_path = output_dir / "draft_lm_head_int8_bf16.bin"
+                    with open(bf16_draft_path, "wb") as f_d:
+                        f_d.write(struct.pack("<II", draft_size, hidden_size))
+                        f_d.write(draft_rows_bf16.tobytes())
+                    print(f"  [Speculative Draft] Wrote {bf16_draft_path.name} ({os.path.getsize(bf16_draft_path)/(1024**2):.2f} MB)")
+
+                    # 2. Save INT8 draft lm head
+                    blk = 128
+                    n_groups = (hidden_size + blk - 1) // blk
+                    draft_fp32 = ((draft_rows_bf16.astype(np.uint32) << 16).view(np.float32))
+                    draft_int8 = np.zeros((draft_size, hidden_size), dtype=np.int8)
+                    draft_scales = np.zeros((draft_size, n_groups), dtype=np.float32)
+                    for i_r in range(draft_size):
+                        for g in range(n_groups):
+                            st_c = g * blk
+                            en_c = min(st_c + blk, hidden_size)
+                            grp = draft_fp32[i_r, st_c:en_c]
+                            m_abs = np.max(np.abs(grp))
+                            sc = 1.0 if m_abs < 1e-10 else (m_abs / 127.0)
+                            draft_scales[i_r, g] = sc
+                            draft_int8[i_r, st_c:en_c] = np.clip(np.round(grp / sc), -127, 127).astype(np.int8)
+
+                    int8_draft_path = output_dir / "draft_lm_head_int8.bin"
+                    with open(int8_draft_path, "wb") as f_d:
+                        f_d.write(struct.pack("<IIII", draft_size, hidden_size, blk, n_groups))
+                        f_d.write(draft_int8.tobytes())
+                        f_d.write(draft_scales.tobytes())
+                    print(f"  [Speculative Draft] Wrote {int8_draft_path.name} ({os.path.getsize(int8_draft_path)/(1024**2):.2f} MB)\n")
 
                 is_2d = (len(shape) == 2 and shape[0] >= 512 and shape[1] >= 512 and shape[1] % block_size == 0)
                 is_visual = ("visual" in t_name)
@@ -495,32 +549,53 @@ def quantize_qwen_vision(
                     cur_size = dense_tensors_meta[t_name]["nbytes"] + dense_tensors_meta[t_name].get("scale_nbytes", 0)
                     print(f"[{idx+1}/{total_tensors}] {target_format.upper():5s}: {t_name} {shape} -> {cur_size / (1024**2):.2f} MB")
 
-        src_tok = raw_hf_dir / "tokenizer.json"
-        if src_tok.exists():
-            shutil.copy2(src_tok, output_dir / "tokenizer.json")
+        # Copy tokenizer, chat template, and auxiliary config files
+        for extra_name in ["tokenizer.json", "tokenizer_config.json", "chat_template.jinja", "vocab.json"]:
+            src_f = raw_hf_dir / extra_name
+            if src_f.exists():
+                shutil.copy2(src_f, output_dir / extra_name)
+                print(f"  [Copied] {extra_name} -> {output_dir / extra_name}")
+
+        # Copy draft vocabulary auxiliary files
+        if draft_dir and draft_dir.exists():
+            for extra_file in [
+                "draft_vocab_ids.bin",
+                "draft_vocab_ids.json",
+                "draft_vocab_ids_mapping.json",
+                "draft_vocab_ids_reverse.bin"
+            ]:
+                src_f = draft_dir / extra_file
+                if src_f.exists():
+                    shutil.copy2(src_f, output_dir / extra_file)
+                    print(f"  [Speculative Draft] Copied {extra_file} -> {output_dir / extra_file}")
     else:
         raise ValueError("Must provide either (--manifest-in and --dense-bin-in) or --input-dir")
 
     # Build and write final manifest
     cfg = base_manifest.get("model_config", {}) if 'base_manifest' in locals() else {}
+    if 'text_cfg' not in locals():
+        text_cfg = cfg
+    if 'vis_cfg' not in locals():
+        vis_cfg = base_manifest.get("visual_config", {}) if 'base_manifest' in locals() else {}
+
     manifest = {
         "model_config": {
-            "model_id": "qwen3.8-27B-Vision-13G",
-            "model_name": "Qwen 3.8 27B Vision (13G Mixed Quant)",
+            "model_id": "qwen3.8-27B-Turbo-Vision-13G",
+            "model_name": "Qwen 3.8 27B Turbo Vision (13G Mixed Quant)",
             "architecture": "qwen2",
             "has_vision": True,
-            "vocab_size": cfg.get("vocab_size", 248320),
-            "hidden_size": cfg.get("hidden_size", 5120),
-            "num_hidden_layers": cfg.get("num_hidden_layers", 64),
-            "num_attention_heads": cfg.get("num_attention_heads", 24),
-            "num_key_value_heads": cfg.get("num_key_value_heads", 4),
-            "head_dim": cfg.get("head_dim", 256),
-            "intermediate_size": cfg.get("intermediate_size", 17408),
-            "rms_norm_eps": cfg.get("rms_norm_eps", 1e-6),
-            "rope_theta": cfg.get("rope_theta", 10000000.0),
-            "max_seq_len": cfg.get("max_seq_len", 32768),
-            "original_seq_len": cfg.get("original_seq_len", 262144),
-            "eos_token_id": cfg.get("eos_token_id", 248046),
+            "vocab_size": text_cfg.get("vocab_size", 248320),
+            "hidden_size": text_cfg.get("hidden_size", 5120),
+            "num_hidden_layers": text_cfg.get("num_hidden_layers", 64),
+            "num_attention_heads": text_cfg.get("num_attention_heads", 24),
+            "num_key_value_heads": text_cfg.get("num_key_value_heads", 4),
+            "head_dim": text_cfg.get("head_dim", 256),
+            "intermediate_size": text_cfg.get("intermediate_size", 17408),
+            "rms_norm_eps": text_cfg.get("rms_norm_eps", 1e-6),
+            "rope_theta": text_cfg.get("rope_parameters", {}).get("rope_theta", text_cfg.get("rope_theta", 10000000.0)),
+            "max_seq_len": min(text_cfg.get("max_position_embeddings", 32768), 32768),
+            "original_seq_len": text_cfg.get("max_position_embeddings", 262144),
+            "eos_token_id": text_cfg.get("eos_token_id", 248046),
             "expert_dtype": "none",
             "n_routed_experts": 0,
             "num_experts_per_tok": 0,
@@ -528,11 +603,11 @@ def quantize_qwen_vision(
             "n_hash_layers": 0
         },
         "visual_config": {
-            "depth": 32,
-            "embed_dim": 1152,
-            "num_heads": 16,
-            "patch_size": 14,
-            "spatial_merge_size": 2
+            "depth": vis_cfg.get("depth", 27),
+            "embed_dim": vis_cfg.get("hidden_size", 1152),
+            "num_heads": vis_cfg.get("num_heads", 16),
+            "patch_size": vis_cfg.get("patch_size", 16),
+            "spatial_merge_size": vis_cfg.get("spatial_merge_size", 2)
         },
         "tokenizer": {
             "tokenizer_json": "tokenizer.json"
@@ -590,6 +665,8 @@ def main():
                         help="Leave embed_tokens in BF16 (adds +1.82 GB)")
     parser.add_argument("--no-head-quant", action="store_true",
                         help="Leave lm_head in BF16 (adds +1.82 GB)")
+    parser.add_argument("--draft-dir", type=Path, default=None,
+                        help="Directory containing draft vocabulary files (draft_vocab_ids.json, etc.)")
     parser.add_argument("--block-size", type=int, default=32,
                         help="Quantization block size (default: 32)")
 
@@ -638,6 +715,14 @@ def main():
                     dense_bin_in = parent_dir / cand_name
                     break
 
+    # Auto-resolve draft_dir if not specified
+    draft_dir = args.draft_dir
+    if not draft_dir:
+        for cand in [Path(r"E:\moecher\models\qwen3_8_27b_vision_13g"), Path(r"E:\Moecher\models\qwen3_8_27b_q4_20G"), Path("models/qwen3.8-27B-Vision-13G"), Path("models/qwen3_8_27b_q4")]:
+            if cand.exists() and (cand / "draft_vocab_ids.json").exists():
+                draft_dir = cand
+                break
+
     # Default fallback: check models/qwen3_8_27b_q4
     if not manifest_in and not raw_hf_dir:
         fallback_dir = Path("models/qwen3_8_27b_q4")
@@ -653,6 +738,7 @@ def main():
         dense_bin_in=dense_bin_in,
         raw_hf_dir=raw_hf_dir,
         output_dir=args.output_dir,
+        draft_dir=draft_dir,
         mlp_bits=args.mlp_bits,
         mlp_scheme=args.mlp_scheme,
         visual_mode=args.visual_mode,
