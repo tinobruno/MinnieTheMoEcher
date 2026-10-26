@@ -1004,22 +1004,30 @@ std::string build_dynamic_tools_prompt(const json& resolved_tools, bool is_qwen)
             "- When the user asks to play music, a song, or a video, invoke `youtube_search` directly. The video will automatically load and play in the user's preview panel with autoplay.\n";
     }
 
-    prompt +=
-        "## High-Fidelity Analytic 3D Modeling Instructions:\n"
-        "- When asked to create, model, or reconstruct in 3D (or reconstruct an object from an image), always output Three.js representation code defining `function createModel(scene, THREE, inputImage, helpers) { ... }` inside a ```javascript code block (never output a full HTML file), adding all meshes to `scene`.\n"
-        "- 1. SEMANTIC PART DECOMPOSITION: Never model an object as a single monolithic mesh. Deconstruct the object into its distinct structural and anatomical parts (e.g. for an apple: body, stem, leaf; for a teapot: vessel body, lid, knob, handle, spout; for vehicles/furniture: body, wheels, windows, panels). Model EVERY part as a separate named `THREE.Mesh` with its own geometry and material (or use `helpers.createPart(name, geometry, material, scene)`).\n"
-        "- 2. PART-SPECIFIC TEXTURES & COLORS (DO NOT NAIVELY APPLY THE ENTIRE PHOTO!):\n"
-        "  * NEVER blindly apply the entire input photo onto the whole model or primary mesh (which stretches background, shadows, and unrelated features across surfaces).\n"
-        "  * For parts requiring surface textures (skin, patterns, labels, dials, leaves): use `helpers.cropTexture(inputImage, uMin, vMin, uMax, vMax, options)` to crop clean sub-regions of the photo matching that part (normalized coordinates 0..1).\n"
-        "  * For uniform, solid, or metallic parts (stems, chrome handles, rims, bases): use `helpers.sampleColor(inputImage, u, v)` to sample realistic colors and set physically accurate PBR properties (`roughness`, `metalness`, `clearcoat`).\n"
-        "- 3. ACCURATE UV MAPPING:\n"
-        "  * For flat, curved, or extruded parts (leaves, labels, panels, wings): apply planar UVs using `helpers.applyPlanarUV(geometry, 'z')` so cropped sub-textures map cleanly without distortion.\n"
-        "  * For cylindrical or revolved parts: use cylindrical UVs (`helpers.applyCylindricalUV(geometry)` or standard Lathe UVs) with `wrapS: THREE.RepeatWrapping`.\n"
-        "  * For complex multi-sided parts: use `helpers.applyBoxUV(geometry)`.\n"
-        "- 4. WATERTIGHT GEOMETRY & SEAMLESS INTEGRATION:\n"
-        "  * Revolved profiles must start and end at x=0 (use `helpers.createWatertightLathe` or `helpers.createHollowVessel` for vessels with solid wall thickness).\n"
-        "  * Tubes, pipes, stems, and handles must have sealed end caps (use `helpers.createCappedTube`).\n"
-        "  * Attachments (stems, leaves, handles, spouts) must penetrate 5-10% deep into parent meshes to prevent floating seams or gaps.\n";
+    bool has_3d = false;
+    for (const auto& item : resolved_tools) {
+        std::string n = item.value("function", json::object()).value("name", "");
+        if (n == "create_3d_model" || n == "model_3d") { has_3d = true; break; }
+    }
+
+    if (has_3d) {
+        prompt +=
+            "## High-Fidelity Analytic 3D Modeling Instructions:\n"
+            "- When asked to create, model, or reconstruct in 3D (or reconstruct an object from an image), always output Three.js representation code defining `function createModel(scene, THREE, inputImage, helpers) { ... }` inside a ```javascript code block (never output a full HTML file), adding all meshes to `scene`.\n"
+            "- 1. SEMANTIC PART DECOMPOSITION: Never model an object as a single monolithic mesh. Deconstruct the object into its distinct structural and anatomical parts (e.g. for an apple: body, stem, leaf; for a teapot: vessel body, lid, knob, handle, spout; for vehicles/furniture: body, wheels, windows, panels). Model EVERY part as a separate named `THREE.Mesh` with its own geometry and material (or use `helpers.createPart(name, geometry, material, scene)`).\n"
+            "- 2. PART-SPECIFIC TEXTURES & COLORS (DO NOT NAIVELY APPLY THE ENTIRE PHOTO!):\n"
+            "  * NEVER blindly apply the entire input photo onto the whole model or primary mesh (which stretches background, shadows, and unrelated features across surfaces).\n"
+            "  * For parts requiring surface textures (skin, patterns, labels, dials, leaves): use `helpers.cropTexture(inputImage, uMin, vMin, uMax, vMax, options)` to crop clean sub-regions of the photo matching that part (normalized coordinates 0..1).\n"
+            "  * For uniform, solid, or metallic parts (stems, chrome handles, rims, bases): use `helpers.sampleColor(inputImage, u, v)` to sample realistic colors and set physically accurate PBR properties (`roughness`, `metalness`, `clearcoat`).\n"
+            "- 3. ACCURATE UV MAPPING:\n"
+            "  * For flat, curved, or extruded parts (leaves, labels, panels, wings): apply planar UVs using `helpers.applyPlanarUV(geometry, 'z')` so cropped sub-textures map cleanly without distortion.\n"
+            "  * For cylindrical or revolved parts: use cylindrical UVs (`helpers.applyCylindricalUV(geometry)` or standard Lathe UVs) with `wrapS: THREE.RepeatWrapping`.\n"
+            "  * For complex multi-sided parts: use `helpers.applyBoxUV(geometry)`.\n"
+            "- 4. WATERTIGHT GEOMETRY & SEAMLESS INTEGRATION:\n"
+            "  * Revolved profiles must start and end at x=0 (use `helpers.createWatertightLathe` or `helpers.createHollowVessel` for vessels with solid wall thickness).\n"
+            "  * Tubes, pipes, stems, and handles must have sealed end caps (use `helpers.createCappedTube`).\n"
+            "  * Attachments (stems, leaves, handles, spouts) must penetrate 5-10% deep into parent meshes to prevent floating seams or gaps.\n";
+    }
 
     return prompt;
 }

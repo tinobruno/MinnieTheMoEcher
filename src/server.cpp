@@ -1749,7 +1749,7 @@ void run_server(MoecherEngine& engine, int port, int default_thinking_budget, in
             if (request.contains("client_tool_execution") && request["client_tool_execution"].is_boolean()) {
                 client_tool_exec = request["client_tool_execution"].get<bool>();
             }
-            bool do_server_exec = g_server_exec && (!client_tool_exec || g_headless_browsing);
+            bool do_server_exec = g_server_exec && !client_tool_exec;
 
             int req_max_tool_rounds = g_max_tool_rounds;
             if (request.contains("max_tool_rounds") && request["max_tool_rounds"].is_number_integer()) {

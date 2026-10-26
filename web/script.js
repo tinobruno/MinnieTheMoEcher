@@ -4967,7 +4967,7 @@ async function sendMessage(options = {}) {
                         let cleanUserQuery = lastUserMsg.replace(/^(?:hello|hi|hey|please|can you|could you|tell me|do you know|cerca(?:\s+su\s+google|\s+online)?|search(?:\s+the\s+web|\s+online)?)\s+/i, "").trim();
                         const asksForDateOrEvent = /(?:which|what)\s+(?:date|race|circuit|event)\b|(?:specify|clarify|tell me)\s+(?:the\s+)?date/i.test(roundContent);
                         const userAskedTemporal = /(?:this morning|today|tonight|yesterday|this weekend|pole position|who won|latest|current)/i.test(lastUserMsg);
-                        const userExplicitSearch = /^(?:cerca\b|search\b|find\b|look up\b)/i.test(lastUserMsg);
+                        const userExplicitSearch = /^(?:cerca\s+(?:su\s+google|online|sul\s+web)|search\s+(?:the\s+web|google|online)|google\b)/i.test(lastUserMsg);
 
                         if ((isRealTimeRefusal || userExplicitSearch || (asksForDateOrEvent && userAskedTemporal)) && cleanUserQuery.length >= 3) {
                             console.log("[Agentic Auto-Tool] Triggering web_search for explicit query or temporal inquiry:", cleanUserQuery);
@@ -5298,14 +5298,22 @@ async function sendMessage(options = {}) {
         if ((!lastRoundContent || lastRoundContent.trim().length === 0) && turnToolCallsCount > 0) {
             console.log('[Turn Synthesis Guard] Formulating final answer for user...');
             try {
+                while (chatHistory.length > 0 && chatHistory[chatHistory.length - 1].role === 'assistant' && (!chatHistory[chatHistory.length - 1].content || chatHistory[chatHistory.length - 1].content.trim().length === 0)) {
+                    chatHistory.pop();
+                }
+                chatHistory.push({
+                    role: 'user',
+                    content: 'Please synthesize and provide your comprehensive findings and final answer based on all tool results above.'
+                });
                 const finalMessages = buildOptimizedMessagesPayload();
                 const finalPayload = {
-                    model: currentModelId || "deepseek-v4-flash",
+                    model: currentModelId || "qwen3.8-27B-Turbo-Vision-13G",
                     messages: finalMessages,
                     max_tokens: parseInt(tokensInput ? tokensInput.value : 20000, 10) || 20000,
                     temperature: parseFloat(tempSlider.value),
                     stream: true,
-                    enable_thinking: false,
+                    enable_thinking: isThinking,
+                    thinking_budget: 4096,
                     enable_spec: speculativeSettings.enableMtp,
                     enable_mtp: speculativeSettings.enableMtp,
                     mtp: speculativeSettings.enableMtp,

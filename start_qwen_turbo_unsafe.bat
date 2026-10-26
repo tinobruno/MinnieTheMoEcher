@@ -2,6 +2,8 @@
 setlocal
 chcp 65001 >nul
 cd /d "%~dp0"
+taskkill /F /IM moecher.exe >nul 2>&1
+timeout /t 1 /nobreak >nul
 echo ===============================================================================
 echo   Starting Moecher Server: Qwen 3.8 27B Turbo Vision (13G Mixed Quant)
 echo   MODE: FULL AGENTIC UNSAFE TOOLING ENABLED
