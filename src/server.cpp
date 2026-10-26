@@ -396,15 +396,49 @@ static json prune_messages_to_fit(
         return pruned;
     }
 
-    LOG_WARN("[Context] Prompt length (%zu) exceeds context budget (%d). Pruning older turns...",
+    LOG_WARN("[Context] Prompt length (%zu) exceeds context budget (%d). Pruning older turns / truncating bulky tool returns...",
              test_prompt.size(), max_allowed_tokens);
 
-    bool has_system = (pruned[0].value("role", "") == "system");
-    size_t min_idx = has_system ? 1 : 0;
+    // Identify pinned header messages that must NEVER be evicted:
+    // Pinned: System prompt (if present) AND the initial User instruction.
+    size_t preserve_count = 0;
+    if (pruned.size() > 0 && pruned[0].value("role", "") == "system") preserve_count++;
+    if (pruned.size() > preserve_count && pruned[preserve_count].value("role", "") == "user") preserve_count++;
 
-    // Prune oldest non-system messages
-    while (pruned.size() > min_idx + 2) {
-        pruned.erase(min_idx);
+    // Step 1: Truncate oversized individual messages first (especially huge tool/scraping responses).
+    // This often frees thousands of tokens without evicting any conversation turns.
+    while (test_prompt.size() > (size_t)max_allowed_tokens) {
+        size_t largest_idx = 0;
+        size_t largest_len = 0;
+        for (size_t i = preserve_count; i < pruned.size(); i++) {
+            std::string content = get_message_content_string(pruned[i]);
+            if (content.size() > largest_len) {
+                largest_len = content.size();
+                largest_idx = i;
+            }
+        }
+        if (largest_len < 1000) break; // Don't truncate reasonably-sized messages in Step 1
+
+        std::string content = get_message_content_string(pruned[largest_idx]);
+        size_t keep_len = (content.size() * 2) / 3;
+        std::string notice = "\n[... Tool content truncated to fit context window ...]\n";
+        if (keep_len > notice.size()) {
+            pruned[largest_idx]["content"] = content.substr(0, keep_len - notice.size()) + notice;
+        } else {
+            pruned[largest_idx]["content"] = notice;
+        }
+        test_prompt = apply_chat_template(pruned, tok, enable_thinking, reasoning_effort, tools, is_nemotron);
+    }
+
+    if (test_prompt.size() <= (size_t)max_allowed_tokens) {
+        LOG_INFO("[Context] Pruning complete via tool output truncation: retained %zu messages, prompt length %zu / %d",
+                 pruned.size(), test_prompt.size(), max_allowed_tokens);
+        return pruned;
+    }
+
+    // Step 2: Prune oldest intermediate turns between preserve_count and recent turns
+    while (pruned.size() > preserve_count + 2) {
+        pruned.erase(preserve_count);
         test_prompt = apply_chat_template(pruned, tok, enable_thinking, reasoning_effort, tools, is_nemotron);
         if (test_prompt.size() <= (size_t)max_allowed_tokens) {
             LOG_INFO("[Context] Pruning complete: retained %zu messages, prompt length %zu / %d",
@@ -413,18 +447,18 @@ static json prune_messages_to_fit(
         }
     }
 
-    // If still too long, truncate oversized individual messages (e.g. huge file reads)
+    // Step 3: If still too long, aggressively truncate remaining non-pinned messages down to 300 chars
     while (test_prompt.size() > (size_t)max_allowed_tokens) {
         size_t largest_idx = 0;
         size_t largest_len = 0;
-        for (size_t i = min_idx; i < pruned.size(); i++) {
+        for (size_t i = preserve_count; i < pruned.size(); i++) {
             std::string content = get_message_content_string(pruned[i]);
             if (content.size() > largest_len) {
                 largest_len = content.size();
                 largest_idx = i;
             }
         }
-        if (largest_len < 300) break; // Cannot truncate safely further
+        if (largest_len < 300) break;
 
         std::string content = get_message_content_string(pruned[largest_idx]);
         size_t keep_len = (content.size() * 3) / 4;

@@ -4591,7 +4591,7 @@ async function sendMessage(options = {}) {
             if (zdbSettings && zdbSettings.enabled) {
                 payload.tools = [];
             } else {
-                payload.tools = (round >= maxRounds || turnExecutedSearch || turnEncounteredToolIssue) ? [] : activeTools;
+                payload.tools = (round >= maxRounds) ? [] : activeTools;
             }
 
             let roundReasoning = "";
