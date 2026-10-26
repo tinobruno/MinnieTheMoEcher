@@ -222,6 +222,73 @@ if (repPenaltySlider && repPenaltyVal) {
     });
 }
 
+// Thinking & Reasoning Effort synchronization & localStorage persistence
+try {
+    const savedThinking = localStorage.getItem('moecher_thinking_enabled');
+    if (savedThinking !== null && thinkingEnabled) {
+        thinkingEnabled.checked = (savedThinking === 'true');
+    }
+    const savedEffort = localStorage.getItem('moecher_reasoning_effort');
+    if (savedEffort && reasoningEffort) {
+        reasoningEffort.value = savedEffort;
+    }
+    const savedBudget = localStorage.getItem('moecher_thinking_budget');
+    if (savedBudget && thinkingBudget) {
+        thinkingBudget.value = savedBudget;
+    }
+    // Initial sync
+    if (thinkingEnabled && reasoningEffort) {
+        if (!thinkingEnabled.checked && reasoningEffort.value !== 'none') {
+            reasoningEffort.dataset.prevEffort = reasoningEffort.value;
+            reasoningEffort.value = 'none';
+        } else if (reasoningEffort.value === 'none') {
+            thinkingEnabled.checked = false;
+        }
+    }
+} catch (e) {
+    console.warn('Could not load thinking settings from localStorage', e);
+}
+
+if (thinkingEnabled) {
+    thinkingEnabled.addEventListener('change', (e) => {
+        const checked = e.target.checked;
+        localStorage.setItem('moecher_thinking_enabled', String(checked));
+        if (!checked && reasoningEffort && reasoningEffort.value !== 'none') {
+            reasoningEffort.dataset.prevEffort = reasoningEffort.value;
+            reasoningEffort.value = 'none';
+            localStorage.setItem('moecher_reasoning_effort', 'none');
+        } else if (checked && reasoningEffort && reasoningEffort.value === 'none') {
+            const restored = reasoningEffort.dataset.prevEffort || 'high';
+            reasoningEffort.value = (restored !== 'none') ? restored : 'high';
+            localStorage.setItem('moecher_reasoning_effort', reasoningEffort.value);
+        }
+    });
+}
+
+if (reasoningEffort) {
+    reasoningEffort.addEventListener('change', (e) => {
+        const val = e.target.value;
+        localStorage.setItem('moecher_reasoning_effort', val);
+        if (val === 'none') {
+            if (thinkingEnabled && thinkingEnabled.checked) {
+                thinkingEnabled.checked = false;
+                localStorage.setItem('moecher_thinking_enabled', 'false');
+            }
+        } else {
+            if (thinkingEnabled && !thinkingEnabled.checked) {
+                thinkingEnabled.checked = true;
+                localStorage.setItem('moecher_thinking_enabled', 'true');
+            }
+        }
+    });
+}
+
+if (thinkingBudget) {
+    thinkingBudget.addEventListener('input', (e) => {
+        localStorage.setItem('moecher_thinking_budget', e.target.value);
+    });
+}
+
 chatInput.addEventListener('input', () => {
     chatInput.style.height = 'auto';
     chatInput.style.height = Math.min(chatInput.scrollHeight, 200) + 'px';
@@ -4441,7 +4508,9 @@ async function sendMessage(options = {}) {
     let mainContent = document.createElement('div');
     assistantMsgDiv.querySelector('.msg-content').appendChild(mainContent);
 
-    const baseThinking = attachedImg ? false : (thinkingEnabled ? thinkingEnabled.checked : true);
+    const isEffortNone = reasoningEffort ? (reasoningEffort.value === 'none') : false;
+    const isThinkingChecked = thinkingEnabled ? thinkingEnabled.checked : true;
+    const baseThinking = attachedImg ? false : (isThinkingChecked && !isEffortNone);
     // Voice prompt speed optimization: disable thinking on the fly for fast conversational responses
     const isVoiceBypassThinking = wasVoicePrompt && (typeof voiceSettings === 'undefined' || voiceSettings.disableThinkingForVoice !== false);
     const isThinking = isVoiceBypassThinking ? false : baseThinking;
@@ -4542,7 +4611,7 @@ async function sendMessage(options = {}) {
                     budget_tokens: budgetVal
                 },
                 max_thinking_tokens: budgetVal,
-                reasoning_effort: isThinking ? reasoningEffort.value : "none",
+                reasoning_effort: isThinking ? (reasoningEffort ? reasoningEffort.value : "high") : "none",
                 enable_spec: speculativeSettings.enableMtp,
                 enable_mtp: speculativeSettings.enableMtp,
                 mtp: speculativeSettings.enableMtp,
@@ -5306,6 +5375,9 @@ async function sendMessage(options = {}) {
                     temperature: parseFloat(tempSlider.value),
                     stream: true,
                     enable_thinking: false,
+                    thinking: { type: "disabled", budget_tokens: 0 },
+                    max_thinking_tokens: 0,
+                    reasoning_effort: "none",
                     enable_spec: speculativeSettings.enableMtp,
                     enable_mtp: speculativeSettings.enableMtp,
                     mtp: speculativeSettings.enableMtp,

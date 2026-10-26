@@ -332,7 +332,7 @@ MultimodalPrompt apply_chat_template_multimodal(
 
     int SYSTEM = tok.get_token_id("<｜System｜>");
     if (SYSTEM < 0) SYSTEM = tok.get_token_id("<｜System\xe2\x96\x81｜>");
-    if (SYSTEM < 0) SYSTEM = 128799;
+    if (SYSTEM < 0 && is_deepseek_v41) SYSTEM = 128799;
 
     int USER = tok.get_token_id("<｜User｜>");
     if (USER < 0) USER = 128803;
@@ -390,19 +390,27 @@ MultimodalPrompt apply_chat_template_multimodal(
         default_sys = g_base_system_prompt;
     }
 
-    // Lead conversation with <｜System｜> if (is_deepseek_v41 && actual_thinking) OR first message is system OR default_sys is non-empty
-    if ((is_deepseek_v41 && actual_thinking) || has_system || !default_sys.empty()) {
-        result.push_back(SYSTEM);
-        std::string leading_sys = reasoning_effort_prompt;
-        if (has_system) {
-            std::string content = messages[0].contains("content") ? get_message_content_string(messages[0]) : "";
-            std::string sys_body = update_system_prompt_with_tools(content, tools_system_prompt, has_tools);
-            leading_sys += sys_body;
-        } else if (!default_sys.empty()) {
-            leading_sys += default_sys;
+    if (is_deepseek_v41) {
+        // Lead conversation with <｜System｜> for V4.1
+        if (actual_thinking || has_system || !default_sys.empty()) {
+            if (SYSTEM >= 0) result.push_back(SYSTEM);
+            std::string leading_sys = reasoning_effort_prompt;
+            if (has_system) {
+                std::string content = messages[0].contains("content") ? get_message_content_string(messages[0]) : "";
+                std::string sys_body = update_system_prompt_with_tools(content, tools_system_prompt, has_tools);
+                leading_sys += sys_body;
+            } else if (!default_sys.empty()) {
+                leading_sys += default_sys;
+            }
+            if (!leading_sys.empty()) {
+                auto enc = tok.encode(leading_sys);
+                result.insert(result.end(), enc.begin(), enc.end());
+            }
         }
-        if (!leading_sys.empty()) {
-            auto enc = tok.encode(leading_sys);
+    } else {
+        // DeepSeek-V4 Flash: No <｜System｜> token
+        if (!has_system && !default_sys.empty()) {
+            auto enc = tok.encode(default_sys);
             result.insert(result.end(), enc.begin(), enc.end());
         }
     }
@@ -456,15 +464,25 @@ MultimodalPrompt apply_chat_template_multimodal(
         }
 
         if (role == "system") {
-            if (i > 0) {
-                // Mid-conversation system message
-                result.push_back(SYSTEM);
+            if (is_deepseek_v41) {
+                if (i > 0 && SYSTEM >= 0) {
+                    // Mid-conversation system message
+                    result.push_back(SYSTEM);
+                    std::string sys_body = content;
+                    if (!sys_body.empty() && sys_body.back() != '\n') sys_body += "\n";
+                    auto enc = tok.encode(sys_body);
+                    result.insert(result.end(), enc.begin(), enc.end());
+                }
+            } else {
                 std::string sys_body = content;
-                if (!sys_body.empty() && sys_body.back() != '\n') sys_body += "\n";
-                auto enc = tok.encode(sys_body);
-                result.insert(result.end(), enc.begin(), enc.end());
+                if (has_tools) {
+                    sys_body = update_system_prompt_with_tools(content, tools_system_prompt, true);
+                }
+                if (!sys_body.empty()) {
+                    auto enc = tok.encode(sys_body);
+                    result.insert(result.end(), enc.begin(), enc.end());
+                }
             }
-            // Note: i == 0 was already handled above in the leading <｜System｜> block!
         } else if (role == "user") {
             result.push_back(USER);
             if (model_has_vision && !extracted_image_b64.empty()) {
@@ -548,13 +566,8 @@ MultimodalPrompt apply_chat_template_multimodal(
             result.push_back(ASSISTANT);
             if (actual_thinking) {
                 result.push_back(THINK_BEGIN);
-            } else if (is_deepseek_v41) {
-                result.push_back(THINK_END);
             } else {
-                result.push_back(THINK_BEGIN);
                 result.push_back(THINK_END);
-                auto nl = tok.encode("\n");
-                result.insert(result.end(), nl.begin(), nl.end());
             }
         }
     }

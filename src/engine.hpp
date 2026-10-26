@@ -2957,16 +2957,19 @@ public:
             // N-Gram Repetition Loop Detector & Breaker (breaks attractor loops in reasoning & content)
             int loop_len = 0;
             int n_out = (int)output_ids.size();
-            int matched_min_cycles = 2;
             if (in_think_block) {
                 // Reasoning phase: detect exact token repetition loops.
+                // To avoid false positives on legitimate formatting, markdown lists, bullet points,
+                // table dividers, equations, or code planning, require a robust minimum number of cycles
+                // and a substantial total repeated token span (at least 40+ tokens).
                 for (int L = 1; L <= 512; L++) {
-                    int min_cycles = (L == 1) ? 4 :
-                                     ((L == 2) ? 3 :
-                                     ((L <= 4) ? 3 :
-                                     ((L <= 8) ? 3 : 2)));
+                    int min_cycles = (L == 1) ? 8 :
+                                     ((L == 2) ? 5 :
+                                     ((L <= 4) ? 4 :
+                                     ((L <= 8) ? 3 :
+                                     ((L <= 16) ? 3 : 2))));
                     if (min_cycles * L > n_out) continue;
-                    if (min_cycles * L < 4) continue; // Safety floor: at least 4 repeated tokens
+                    if (min_cycles * L < 8) continue; // Safety floor: at least 8 repeated tokens
                     bool match = true;
                     const int* p_last = output_ids.data() + (n_out - L);
                     for (int c = 1; c < min_cycles; c++) {
@@ -2981,20 +2984,25 @@ public:
                     }
                     if (match) {
                         loop_len = L;
-                        matched_min_cycles = min_cycles;
                         break;
                     }
                 }
+                // Structural repetition matching is disabled: normal reasoning routinely lists
+                // parallel items (buttons, steps, features, cases) which falsely trigger fuzzy pattern matchers.
+                // Exact repetition detection robustly catches true attractor loops.
             } else {
                 // Content generation phase:
+                // Only inspect content tokens (NEVER cross back into reasoning scratchpad!).
+                // In code/HTML/CSS generation, structural repetitions (buttons, rows, list items) are NORMAL.
                 int n_content = content_tokens_generated;
                 for (int L = 1; L <= 512; L++) {
-                    int min_cycles = (L == 1) ? 4 :
-                                     ((L == 2) ? 3 :
-                                     ((L <= 4) ? 3 :
-                                     ((L <= 8) ? 3 : 2)));
+                    int min_cycles = (L == 1) ? 16 :
+                                     ((L == 2) ? 8 :
+                                     ((L <= 4) ? 4 :
+                                     ((L <= 8) ? 3 :
+                                     ((L <= 16) ? 3 : 2))));
                     if (min_cycles * L > n_content) continue;
-                    if (min_cycles * L < 4) continue; // Content safety floor: at least 4 repeated tokens
+                    if (min_cycles * L < 16) continue; // Content safety floor: at least 16 identical repeated tokens
                     bool match = true;
                     const int* p_last = output_ids.data() + (n_out - L);
                     for (int c = 1; c < min_cycles; c++) {
@@ -3009,7 +3017,6 @@ public:
                     }
                     if (match) {
                         loop_len = L;
-                        matched_min_cycles = min_cycles;
                         break;
                     }
                 }
@@ -3018,14 +3025,6 @@ public:
             if (loop_len > 0) {
                 if (in_think_block) {
                     LOG_WARN("[Anti-Loop] Repetition loop detected during reasoning (cycle length %d). Forcing </think> and starting content.", loop_len);
-                    // Roll back duplicate cycles from history & output_ids so the KV cache attractor is mitigated
-                    int prune_tokens = (matched_min_cycles - 1) * loop_len;
-                    while (prune_tokens > 0 && !output_ids.empty() && !history.empty()) {
-                        output_ids.pop_back();
-                        history.pop_back();
-                        position--;
-                        prune_tokens--;
-                    }
                     in_think_block = false;
                     think_block_ended = true;
                     if (content_start_history_idx < 0) {
@@ -3074,20 +3073,6 @@ public:
                     continue;
                 } else {
                     LOG_WARN("[Anti-Loop] Repetition loop detected during content generation (cycle length %d). Halting generation cleanly.", loop_len);
-                    // Roll back duplicate cycles from generated_text and history
-                    int prune_tokens = (matched_min_cycles - 1) * loop_len;
-                    while (prune_tokens > 0 && !output_ids.empty() && !history.empty()) {
-                        int last_tok = output_ids.back();
-                        output_ids.pop_back();
-                        history.pop_back();
-                        position--;
-                        content_tokens_generated--;
-                        std::string s = tokenizer_.decode({last_tok});
-                        if (generated_text.size() >= s.size() && generated_text.substr(generated_text.size() - s.size()) == s) {
-                            generated_text.resize(generated_text.size() - s.size());
-                        }
-                        prune_tokens--;
-                    }
                     // If inside an unclosed code block, cleanly close it before halting
                     size_t code_blocks = 0;
                     size_t pos = 0;
@@ -5453,14 +5438,13 @@ private:
         if (eff_penalty <= 1.0f || history.empty()) return;
         static int32_t* d_rep_hist = nullptr;
         static const int MAX_REP_HIST = 2048;
-        int rep_window = cfg_.is_deepseek() ? 64 : MAX_REP_HIST;
         if (!d_rep_hist) {
             CUDA_CHECK(cudaMalloc(&d_rep_hist, MAX_REP_HIST * sizeof(int32_t)));
         }
         int hist_len = (int)history.size();
         int start_idx = is_reasoning ? 0 : std::max(0, content_start_idx);
         int available = std::max(0, hist_len - start_idx);
-        int n_penalize = std::min(available, rep_window);
+        int n_penalize = std::min(available, MAX_REP_HIST);
         if (n_penalize > 0) {
             thread_local std::vector<int32_t> unique_tokens;
             unique_tokens.clear();
@@ -5507,118 +5491,20 @@ private:
             argmax_cache_valid_ = false;
             CUDA_CHECK(cudaMemcpyAsync(h_sample_pin, buf_argmax_out_.i32(), sizeof(int32_t), cudaMemcpyDeviceToHost, main_stream_));
             CUDA_CHECK(cudaStreamSynchronize(main_stream_));
-            int chosen = *h_sample_pin;
-            float top_logit = 0.0f;
-            CUDA_CHECK(cudaMemcpyAsync(&top_logit, logits_ptr + chosen, sizeof(float), cudaMemcpyDeviceToHost, main_stream_));
-            CUDA_CHECK(cudaStreamSynchronize(main_stream_));
-            if (step < 70 || step % 10 == 0) {
-                LOG_INFO("[STEP %3d] tok=%6d ('%s') logit=%.2f cold_experts=%d",
-                         step, chosen, tokenizer_.decode({chosen}).c_str(), top_logit, debug_cold_routed_token_);
-            }
-            debug_cold_routed_token_ = 0;
-            return chosen;
+            return *h_sample_pin;
         }
-
-        static float* h_logits_pin = nullptr;
-        if (!h_logits_pin) {
-            CUDA_CHECK(cudaMallocHost(&h_logits_pin, 131072 * sizeof(float)));
-        }
-        CUDA_CHECK(cudaMemcpyAsync(h_logits_pin, logits_ptr, vocab * sizeof(float), cudaMemcpyDeviceToHost, main_stream_));
-        CUDA_CHECK(cudaStreamSynchronize(main_stream_));
-
-        int eff_top_k = (top_k > 0 && top_k <= 128) ? top_k : 40;
-        float eff_top_p = (top_p > 0.0f && top_p <= 1.0f) ? top_p : 0.95f;
-        float eff_min_p = (min_p > 0.0f) ? min_p : 0.05f;
 
         std::uniform_real_distribution<float> dist(0.0f, 1.0f);
-        float rand_val = dist(rng_);
-
-        // Robust Top-K + Top-P + Min-P heap sampler (matches Apple Metal & standard LLM samplers)
-        struct Candidate {
-            float logit;
-            int idx;
-            bool operator>(const Candidate& o) const { return logit > o.logit; }
-            bool operator<(const Candidate& o) const { return logit < o.logit; }
-        };
-
-        thread_local std::vector<Candidate> heap;
-        heap.clear();
-        heap.reserve(eff_top_k);
-
-        for (int i = 0; i < vocab; i++) {
-            float val = h_logits_pin[i];
-            if (val < -1e8f || std::isnan(val)) continue;
-            if ((int)heap.size() < eff_top_k) {
-                heap.push_back({val, i});
-                if ((int)heap.size() == eff_top_k) {
-                    std::make_heap(heap.begin(), heap.end(), std::greater<Candidate>());
-                }
-            } else if (val > heap.front().logit) {
-                std::pop_heap(heap.begin(), heap.end(), std::greater<Candidate>());
-                heap.back() = {val, i};
-                std::push_heap(heap.begin(), heap.end(), std::greater<Candidate>());
-            }
-        }
-
-        int chosen = 0;
-        if (heap.empty()) {
-            chosen = 0;
-        } else {
-            std::sort(heap.begin(), heap.end(), [](const Candidate& a, const Candidate& b) {
-                return a.logit > b.logit;
-            });
-
-            float max_l = heap[0].logit;
-            float inv_t = 1.0f / std::max(temperature, 1e-4f);
-
-            thread_local std::vector<float> probs;
-            probs.resize(heap.size());
-            float sum_exp = 0.0f;
-            for (size_t i = 0; i < heap.size(); i++) {
-                float e = std::exp((heap[i].logit - max_l) * inv_t);
-                if (eff_min_p > 0.0f && e < eff_min_p) {
-                    e = 0.0f;
-                }
-                probs[i] = e;
-                sum_exp += e;
-            }
-
-            if (sum_exp <= 0.0f) {
-                chosen = heap[0].idx;
-            } else {
-                if (eff_top_p > 0.0f && eff_top_p < 1.0f) {
-                    float cutoff = eff_top_p * sum_exp;
-                    float running = 0.0f;
-                    size_t last_valid = 0;
-                    for (size_t i = 0; i < probs.size(); i++) {
-                        running += probs[i];
-                        last_valid = i;
-                        if (running >= cutoff) break;
-                    }
-                    sum_exp = running;
-                    probs.resize(last_valid + 1);
-                    heap.resize(last_valid + 1);
-                }
-
-                float target = rand_val * sum_exp;
-                float cum = 0.0f;
-                chosen = heap[0].idx;
-                for (size_t i = 0; i < probs.size(); i++) {
-                    cum += probs[i];
-                    if (cum >= target) {
-                        chosen = heap[i].idx;
-                        break;
-                    }
-                }
-            }
-        }
-        float top_logit = h_logits_pin[chosen];
-        if (step < 70 || step % 10 == 0) {
-            LOG_INFO("[STEP %3d] tok=%6d ('%s') logit=%.2f cold_experts=%d",
-                     step, chosen, tokenizer_.decode({chosen}).c_str(), top_logit, debug_cold_routed_token_);
-        }
-        debug_cold_routed_token_ = 0;
-        return chosen;
+        float r = dist(rng_);
+        float eff_min_p = (min_p > 0.0f) ? min_p : 0.05f;
+#if defined(__APPLE__)
+        sample_multinomial_f32_cuda(buf_argmax_out_.i32(), logits_ptr, vocab, temperature, r, eff_min_p, main_stream_, top_k, top_p);
+#else
+        sample_multinomial_f32_cuda(buf_argmax_out_.i32(), logits_ptr, vocab, temperature, r, eff_min_p, main_stream_);
+#endif
+        CUDA_CHECK(cudaMemcpyAsync(h_sample_pin, buf_argmax_out_.i32(), sizeof(int32_t), cudaMemcpyDeviceToHost, main_stream_));
+        CUDA_CHECK(cudaStreamSynchronize(main_stream_));
+        return *h_sample_pin;
     }
 
 public:

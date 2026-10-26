@@ -1652,6 +1652,12 @@ void run_server(MoecherEngine& engine, int port, int default_thinking_budget, in
                 if (max_thinking_tokens <= 0) enable_thinking = false;
             }
 
+            if (reasoning_effort == "none" || !enable_thinking || max_thinking_tokens <= 0) {
+                enable_thinking = false;
+                max_thinking_tokens = 0;
+                reasoning_effort = "none";
+            }
+
             if (repetition_penalty <= 1.0f && (engine.cfg_.is_nemotron() || engine.cfg_.is_deepseek())) {
                 repetition_penalty = 1.05f;
             }
@@ -1735,8 +1741,10 @@ void run_server(MoecherEngine& engine, int port, int default_thinking_budget, in
                 tools = json();
             }
 
-            if (!enable_thinking) {
+            if (!enable_thinking || reasoning_effort == "none" || max_thinking_tokens <= 0) {
+                enable_thinking = false;
                 max_thinking_tokens = 0;
+                reasoning_effort = "none";
             }
 
             int execution_timeout_ms = 60000;
