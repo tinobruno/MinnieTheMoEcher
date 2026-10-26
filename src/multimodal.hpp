@@ -25,7 +25,8 @@ MultimodalPrompt apply_chat_template_multimodal(
     const std::string& reasoning_effort = "high",
     const nlohmann::json& tools = nlohmann::json(),
     bool model_has_vision = false,
-    bool is_nemotron = false
+    bool is_nemotron = false,
+    bool is_deepseek_v41 = false
 );
 
 std::vector<int> apply_chat_template(
@@ -34,7 +35,8 @@ std::vector<int> apply_chat_template(
     bool enable_thinking = true,
     const std::string& reasoning_effort = "high",
     const nlohmann::json& tools = nlohmann::json(),
-    bool is_nemotron = false
+    bool is_nemotron = false,
+    bool is_deepseek_v41 = false
 );
 
 } // namespace moecher::multimodal

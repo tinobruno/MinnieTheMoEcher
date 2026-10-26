@@ -2788,7 +2788,7 @@ public:
         // Set per-request repetition penalty
         if (repetition_penalty <= 1.0f && cfg_.default_repetition_penalty > 1.0f) {
             repetition_penalty = cfg_.default_repetition_penalty;
-        } else if (repetition_penalty <= 1.0f && (cfg_.is_nemotron() || cfg_.is_deepseek_v41())) {
+        } else if (repetition_penalty <= 1.0f && (cfg_.is_nemotron() || cfg_.is_deepseek())) {
             repetition_penalty = 1.05f;
         }
         current_rep_penalty_ = repetition_penalty;
@@ -5447,7 +5447,7 @@ private:
 
     void apply_repetition_penalty_to_batch(float* logits_batch, int M, const std::vector<int>& history, bool is_reasoning = true, int content_start_idx = 0) {
         float eff_penalty = current_rep_penalty_;
-        if (eff_penalty <= 1.0f && (cfg_.is_nemotron() || cfg_.is_deepseek_v41())) {
+        if (eff_penalty <= 1.0f && (cfg_.is_nemotron() || cfg_.is_deepseek())) {
             eff_penalty = 1.05f;
         }
         if (eff_penalty <= 1.0f || history.empty()) return;
@@ -5493,7 +5493,7 @@ private:
 
         apply_repetition_penalty_to_batch(logits_ptr, 1, history, is_reasoning, content_start_idx);
         float eff_penalty = current_rep_penalty_;
-        if (eff_penalty <= 1.0f && (cfg_.is_nemotron() || cfg_.is_deepseek_v41())) {
+        if (eff_penalty <= 1.0f && (cfg_.is_nemotron() || cfg_.is_deepseek())) {
             eff_penalty = 1.05f;
         }
         if (eff_penalty > 1.0f) {

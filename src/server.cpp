@@ -207,7 +207,7 @@ void rebuild_system_prefix(
         {{"role", "user"}, {"content", ""}}
     });
 
-    std::vector<int> prompt = apply_chat_template(default_messages, engine.tokenizer_, true, "high", resolved_tools, engine.cfg_.is_nemotron());
+    std::vector<int> prompt = apply_chat_template(default_messages, engine.tokenizer_, true, "high", resolved_tools, engine.cfg_.is_nemotron(), engine.cfg_.is_deepseek_v41());
 
     bool is_chatml = (engine.cfg_.architecture == ModelArch::QWEN || engine.cfg_.architecture == ModelArch::QWEN2 || engine.cfg_.architecture == ModelArch::NEMOTRON_35);
     int user_start = is_chatml
@@ -398,12 +398,13 @@ static json prune_messages_to_fit(
     bool enable_thinking,
     const std::string& reasoning_effort,
     const json& tools,
-    bool is_nemotron = false)
+    bool is_nemotron = false,
+    bool is_deepseek_v41 = false)
 {
     json pruned = messages;
     if (pruned.empty()) return pruned;
 
-    std::vector<int> test_prompt = apply_chat_template(pruned, tok, enable_thinking, reasoning_effort, tools, is_nemotron);
+    std::vector<int> test_prompt = apply_chat_template(pruned, tok, enable_thinking, reasoning_effort, tools, is_nemotron, is_deepseek_v41);
     if (test_prompt.size() <= (size_t)max_allowed_tokens) {
         return pruned;
     }
@@ -417,7 +418,7 @@ static json prune_messages_to_fit(
     // Prune oldest non-system messages
     while (pruned.size() > min_idx + 2) {
         pruned.erase(min_idx);
-        test_prompt = apply_chat_template(pruned, tok, enable_thinking, reasoning_effort, tools, is_nemotron);
+        test_prompt = apply_chat_template(pruned, tok, enable_thinking, reasoning_effort, tools, is_nemotron, is_deepseek_v41);
         if (test_prompt.size() <= (size_t)max_allowed_tokens) {
             LOG_INFO("[Context] Pruning complete: retained %zu messages, prompt length %zu / %d",
                      pruned.size(), test_prompt.size(), max_allowed_tokens);
@@ -446,7 +447,7 @@ static json prune_messages_to_fit(
         } else {
             pruned[largest_idx]["content"] = notice;
         }
-        test_prompt = apply_chat_template(pruned, tok, enable_thinking, reasoning_effort, tools, is_nemotron);
+        test_prompt = apply_chat_template(pruned, tok, enable_thinking, reasoning_effort, tools, is_nemotron, is_deepseek_v41);
     }
 
     LOG_INFO("[Context] Pruning finished: final prompt length %zu / %d",
@@ -1390,7 +1391,7 @@ void run_server(MoecherEngine& engine, int port, int default_thinking_budget, in
 
         std::vector<int> prompt;
         if (request.contains("messages") && request["messages"].is_array()) {
-            prompt = apply_chat_template(request["messages"], engine.tokenizer_, /*enable_thinking=*/false, /*reasoning_effort=*/"none", json(), engine.cfg_.is_nemotron());
+            prompt = apply_chat_template(request["messages"], engine.tokenizer_, /*enable_thinking=*/false, /*reasoning_effort=*/"none", json(), engine.cfg_.is_nemotron(), engine.cfg_.is_deepseek_v41());
         } else if (request.contains("prompt") && request["prompt"].is_string()) {
             prompt = engine.tokenizer_.encode(request["prompt"].get<std::string>());
         }
@@ -1534,7 +1535,7 @@ void run_server(MoecherEngine& engine, int port, int default_thinking_budget, in
             bool stream = request.value("stream", false);
             float repetition_penalty = request.value("repetition_penalty",
                 engine.cfg_.default_repetition_penalty > 1.0f ? engine.cfg_.default_repetition_penalty :
-                ((engine.cfg_.is_nemotron() || engine.cfg_.is_deepseek_v41()) ? 1.05f : 1.0f));
+                ((engine.cfg_.is_nemotron() || engine.cfg_.is_deepseek()) ? 1.05f : 1.0f));
             float presence_penalty = request.value("presence_penalty", 0.0f);
             float frequency_penalty = request.value("frequency_penalty", 0.0f);
             if (repetition_penalty <= 1.0f && (presence_penalty > 0.0f || frequency_penalty > 0.0f)) {
@@ -1651,7 +1652,7 @@ void run_server(MoecherEngine& engine, int port, int default_thinking_budget, in
                 if (max_thinking_tokens <= 0) enable_thinking = false;
             }
 
-            if (repetition_penalty <= 1.0f && (engine.cfg_.is_nemotron() || engine.cfg_.is_deepseek_v41())) {
+            if (repetition_penalty <= 1.0f && (engine.cfg_.is_nemotron() || engine.cfg_.is_deepseek())) {
                 repetition_penalty = 1.05f;
             }
 
@@ -1829,7 +1830,7 @@ void run_server(MoecherEngine& engine, int port, int default_thinking_budget, in
                 {
                     std::lock_guard<std::mutex> lock(g_engine_mutex);
                     // For ZDB in chat completions, apply chat template with thinking disabled for step-0 logit extraction
-                    auto mm_prompt = apply_chat_template_multimodal(messages, engine.tokenizer_, false, "none", json(), false, engine.cfg_.is_nemotron());
+                    auto mm_prompt = apply_chat_template_multimodal(messages, engine.tokenizer_, false, "none", json(), false, engine.cfg_.is_nemotron(), engine.cfg_.is_deepseek_v41());
                     std::vector<int> prompt = mm_prompt.prompt;
                     zdb_res = engine.execute_zero_decode_bypass(prompt, zdb_choices, temperature, zdb_format, bypass_prefix_cache, min_confidence, max_top1_gap);
                 }
@@ -2008,8 +2009,8 @@ void run_server(MoecherEngine& engine, int port, int default_thinking_budget, in
                             MultimodalPrompt mm_prompt;
                             const __nv_bfloat16* d_vis_out = nullptr;
                             if (!is_continuation) {
-                                current_messages = prune_messages_to_fit(current_messages, engine.tokenizer_, max_allowed_prompt, req_thinking, reasoning_effort, tools, engine.cfg_.is_nemotron());
-                                mm_prompt = apply_chat_template_multimodal(current_messages, engine.tokenizer_, req_thinking, reasoning_effort, tools, engine.has_vision(), engine.cfg_.is_nemotron());
+                                current_messages = prune_messages_to_fit(current_messages, engine.tokenizer_, max_allowed_prompt, req_thinking, reasoning_effort, tools, engine.cfg_.is_nemotron(), engine.cfg_.is_deepseek_v41());
+                                mm_prompt = apply_chat_template_multimodal(current_messages, engine.tokenizer_, req_thinking, reasoning_effort, tools, engine.has_vision(), engine.cfg_.is_nemotron(), engine.cfg_.is_deepseek_v41());
                                 prompt = mm_prompt.prompt;
                                 if (engine.has_vision() && !mm_prompt.image_b64.empty() && mm_prompt.visual_start_pos >= 0) {
                                     if (engine.ensure_vision_loaded()) {
@@ -2903,8 +2904,8 @@ void run_server(MoecherEngine& engine, int port, int default_thinking_budget, in
                     MultimodalPrompt mm_prompt;
                     const __nv_bfloat16* d_vis_out = nullptr;
                     if (!is_continuation) {
-                        current_messages = prune_messages_to_fit(current_messages, engine.tokenizer_, max_allowed_prompt, req_thinking, reasoning_effort, tools, engine.cfg_.is_nemotron());
-                        mm_prompt = apply_chat_template_multimodal(current_messages, engine.tokenizer_, req_thinking, reasoning_effort, tools, engine.has_vision(), engine.cfg_.is_nemotron());
+                        current_messages = prune_messages_to_fit(current_messages, engine.tokenizer_, max_allowed_prompt, req_thinking, reasoning_effort, tools, engine.cfg_.is_nemotron(), engine.cfg_.is_deepseek_v41());
+                        mm_prompt = apply_chat_template_multimodal(current_messages, engine.tokenizer_, req_thinking, reasoning_effort, tools, engine.has_vision(), engine.cfg_.is_nemotron(), engine.cfg_.is_deepseek_v41());
                         prompt = mm_prompt.prompt;
                         if (engine.has_vision() && !mm_prompt.image_b64.empty() && mm_prompt.visual_start_pos >= 0) {
                             if (engine.ensure_vision_loaded()) {

@@ -112,7 +112,8 @@ MultimodalPrompt apply_chat_template_multimodal(
     const std::string& reasoning_effort,
     const json& tools,
     bool model_has_vision,
-    bool is_nemotron)
+    bool is_nemotron,
+    bool is_deepseek_v41)
 {
     MultimodalPrompt out;
     json resolved_tools = tools;
@@ -373,7 +374,7 @@ MultimodalPrompt apply_chat_template_multimodal(
     }
 
     std::string reasoning_effort_prompt = "";
-    if (actual_thinking) {
+    if (actual_thinking && is_deepseek_v41) {
         reasoning_effort_prompt = "Reasoning Effort: " + std::to_string(budget) +
             " (range 1-100, the higher the value, the more thorough the reasoning)\n\n";
     }
@@ -389,8 +390,8 @@ MultimodalPrompt apply_chat_template_multimodal(
         default_sys = g_base_system_prompt;
     }
 
-    // Lead conversation with <｜System｜> if thinking mode is active OR first message is system OR default_sys is non-empty
-    if (actual_thinking || has_system || !default_sys.empty()) {
+    // Lead conversation with <｜System｜> if (is_deepseek_v41 && actual_thinking) OR first message is system OR default_sys is non-empty
+    if ((is_deepseek_v41 && actual_thinking) || has_system || !default_sys.empty()) {
         result.push_back(SYSTEM);
         std::string leading_sys = reasoning_effort_prompt;
         if (has_system) {
@@ -518,10 +519,10 @@ MultimodalPrompt apply_chat_template_multimodal(
                     auto r_enc = tok.encode(r_content);
                     result.insert(result.end(), r_enc.begin(), r_enc.end());
                     result.push_back(THINK_END);
-                } else {
+                } else if (is_deepseek_v41) {
                     result.push_back(THINK_END);
                 }
-            } else {
+            } else if (is_deepseek_v41) {
                 result.push_back(THINK_END);
             }
             std::string body = content;
@@ -547,8 +548,13 @@ MultimodalPrompt apply_chat_template_multimodal(
             result.push_back(ASSISTANT);
             if (actual_thinking) {
                 result.push_back(THINK_BEGIN);
-            } else {
+            } else if (is_deepseek_v41) {
                 result.push_back(THINK_END);
+            } else {
+                result.push_back(THINK_BEGIN);
+                result.push_back(THINK_END);
+                auto nl = tok.encode("\n");
+                result.insert(result.end(), nl.begin(), nl.end());
             }
         }
     }
@@ -563,9 +569,10 @@ std::vector<int> apply_chat_template(
     bool enable_thinking,
     const std::string& reasoning_effort,
     const json& tools,
-    bool is_nemotron)
+    bool is_nemotron,
+    bool is_deepseek_v41)
 {
-    return apply_chat_template_multimodal(messages, tok, enable_thinking, reasoning_effort, tools, false, is_nemotron).prompt;
+    return apply_chat_template_multimodal(messages, tok, enable_thinking, reasoning_effort, tools, false, is_nemotron, is_deepseek_v41).prompt;
 }
 
 } // namespace moecher::multimodal

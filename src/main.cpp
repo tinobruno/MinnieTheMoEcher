@@ -264,7 +264,7 @@ int main(int argc, char** argv) {
         json messages = json::array({
             {{"role", "user"}, {"content", prompt_str}}
         });
-        std::vector<int> prompt = apply_chat_template(messages, engine.tokenizer_, test_thinking, "high", json(), engine.cfg_.is_nemotron());
+        std::vector<int> prompt = apply_chat_template(messages, engine.tokenizer_, test_thinking, "high", json(), engine.cfg_.is_nemotron(), engine.cfg_.is_deepseek_v41());
         LOG_INFO("Running test generation for prompt: '%s' (%zu prompt tokens, temp=%.2f, max_tokens=%d, thinking=%d)...",
                  prompt_str.c_str(), prompt.size(), test_temp, test_max_tokens, test_thinking ? 1 : 0);
         float rep_pen = engine.cfg_.default_repetition_penalty > 1.0f ? engine.cfg_.default_repetition_penalty : 1.0f;

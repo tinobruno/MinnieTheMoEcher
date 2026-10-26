@@ -22,12 +22,12 @@ if not exist build (
 cmake --build build --config Release
 if %errorlevel% neq 0 exit /b 1
 
-if exist build\Release\moecher.exe (
-    copy /y build\Release\moecher.exe moecher.exe >nul
-    echo [INFO] Copied build\Release\moecher.exe to root folder.
-) else if exist build\moecher.exe (
+if exist build\moecher.exe (
     copy /y build\moecher.exe moecher.exe >nul
     echo [INFO] Copied build\moecher.exe to root folder.
+) else if exist build\Release\moecher.exe (
+    copy /y build\Release\moecher.exe moecher.exe >nul
+    echo [INFO] Copied build\Release\moecher.exe to root folder.
 )
 
 echo [SUCCESS] Fast build completed successfully!
