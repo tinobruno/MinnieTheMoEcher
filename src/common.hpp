@@ -309,7 +309,7 @@ struct ModelConfig {
             default_temperature = is_nemotron() ? 0.6f : 0.7f;
         }
         if (default_repetition_penalty < 0.0f) {
-            default_repetition_penalty = is_nemotron() ? 1.05f : 1.00f;
+            default_repetition_penalty = (is_nemotron() || architecture == ModelArch::QWEN) ? 1.05f : 1.05f;
         }
         if (default_reasoning_effort.empty()) {
             default_reasoning_effort = is_nemotron() ? "high" : "medium";

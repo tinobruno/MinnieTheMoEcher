@@ -3010,6 +3010,13 @@ public:
                     if (think_end_id >= 0) {
                         CUDA_CHECK(cudaMemcpyAsync(buf_logits_.f32() + think_end_id, &neg_inf, sizeof(float), cudaMemcpyHostToDevice, main_stream_));
                     }
+                    // Suppress looping tokens in logits so content generation cannot immediately echo the reasoning loop
+                    for (int i = 0; i < loop_len && (n_out - loop_len + i) < n_out; i++) {
+                        int r_tok = output_ids[n_out - loop_len + i];
+                        if (r_tok >= 0 && r_tok < cfg_.vocab_size) {
+                            CUDA_CHECK(cudaMemcpyAsync(buf_logits_.f32() + r_tok, &neg_inf, sizeof(float), cudaMemcpyHostToDevice, main_stream_));
+                        }
+                    }
                     argmax_cache_valid_ = false;
                     next_token = -1;
                     continue;
@@ -3365,7 +3372,7 @@ public:
                 // Priority 2: Prompt-Lookup Drafting (only as fallback when MTP is not loaded / disabled)
                 if ((cfg_.architecture == ModelArch::QWEN || cfg_.is_nemotron()) && !is_mtp && (!enable_mtp_ || !mtp_drafter_.loaded_) && enable_pld_ && !history.empty()) {
                     int max_pld = cfg_.is_nemotron() ? 3 : std::min(pld_draft_tokens_, 3);
-                    int pld_min_ngram = cfg_.is_nemotron() ? 2 : 1;
+                    int pld_min_ngram = 2;
                     std::vector<int> pld_cands = PromptLookupDrafter::draft(history, max_pld, 4, pld_min_ngram);
                     if (!pld_cands.empty()) {
                         for (int tok : pld_cands) {
@@ -5375,7 +5382,9 @@ private:
 
     void apply_repetition_penalty_to_batch(float* logits_batch, int M, const std::vector<int>& history, bool is_reasoning = true, int content_start_idx = 0) {
         float eff_penalty = current_rep_penalty_;
-        if (eff_penalty <= 1.0f && cfg_.is_nemotron()) {
+        if (eff_penalty <= 1.0f && cfg_.default_repetition_penalty > 1.0f) {
+            eff_penalty = cfg_.default_repetition_penalty;
+        } else if (eff_penalty <= 1.0f && (cfg_.is_nemotron() || cfg_.architecture == ModelArch::QWEN)) {
             eff_penalty = 1.05f;
         }
         if (eff_penalty <= 1.0f || history.empty()) return;
@@ -5385,7 +5394,8 @@ private:
             CUDA_CHECK(cudaMalloc(&d_rep_hist, MAX_REP_HIST * sizeof(int32_t)));
         }
         int hist_len = (int)history.size();
-        int start_idx = is_reasoning ? 0 : std::max(0, content_start_idx);
+        int min_content_lookback = std::max(0, content_start_idx - 256);
+        int start_idx = is_reasoning ? 0 : min_content_lookback;
         int available = std::max(0, hist_len - start_idx);
         int n_penalize = std::min(available, MAX_REP_HIST);
         if (n_penalize > 0) {
@@ -5420,7 +5430,9 @@ private:
 
         apply_repetition_penalty_to_batch(logits_ptr, 1, history, is_reasoning, content_start_idx);
         float eff_penalty = current_rep_penalty_;
-        if (eff_penalty <= 1.0f && cfg_.is_nemotron()) {
+        if (eff_penalty <= 1.0f && cfg_.default_repetition_penalty > 1.0f) {
+            eff_penalty = cfg_.default_repetition_penalty;
+        } else if (eff_penalty <= 1.0f && (cfg_.is_nemotron() || cfg_.architecture == ModelArch::QWEN)) {
             eff_penalty = 1.05f;
         }
         if (eff_penalty > 1.0f) {

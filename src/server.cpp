@@ -1550,9 +1550,10 @@ void run_server(MoecherEngine& engine, int port, int default_thinking_budget, in
             int top_k = request.value("top_k", 1024);
             int max_tokens = request.value("max_tokens", 20000);
             bool stream = request.value("stream", false);
-            float repetition_penalty = request.value("repetition_penalty", engine.cfg_.is_nemotron() ? 1.05f : 1.0f);
-            if (repetition_penalty <= 1.0f && engine.cfg_.is_nemotron()) {
-                repetition_penalty = 1.05f;
+            float default_rep = engine.cfg_.default_repetition_penalty > 1.0f ? engine.cfg_.default_repetition_penalty : 1.05f;
+            float repetition_penalty = request.value("repetition_penalty", default_rep);
+            if (repetition_penalty <= 1.0f) {
+                repetition_penalty = default_rep;
             }
             std::string reasoning_effort = request.value("reasoning_effort", "high");
             bool enable_thinking = true;

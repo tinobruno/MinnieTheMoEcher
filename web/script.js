@@ -3476,7 +3476,12 @@ function extractToolCallsFromContent(text) {
     function addCall(name, args) {
         if (!name || typeof name !== 'string') return;
         name = name.trim();
-        if (name === '<function>' || name === 'function') name = 'web_search';
+        if (name === '<function>' || name === 'function' || name === 'search' || name === 'google_search') name = 'web_search';
+        else if (name === 'fetch' || name === 'fetch_page' || name === 'browse' || name === 'curl' || name === 'get_url') name = 'fetch_url';
+        else if (name === 'bash' || name === 'sh' || name === 'shell' || name === 'cmd' || name === 'exec' || name === 'run_command') name = 'execute_command';
+        else if (name === 'read' || name === 'view_file' || name === 'cat') name = 'read_file';
+        else if (name === 'write' || name === 'create_file') name = 'write_file';
+        else if (name === 'edit' || name === 'modify_file') name = 'edit_file';
         // Only accept calls for tools that are currently active or valid MCP servers
         if (!activeTools.includes(name) && !name.startsWith('mcp__') && !name.startsWith('tinobruno-')) {
             return;
