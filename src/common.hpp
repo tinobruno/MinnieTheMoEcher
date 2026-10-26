@@ -170,6 +170,9 @@ struct ModelConfig {
 
     // Recommended / default inference parameters per model
     float default_temperature = -1.0f;
+    float default_top_p = -1.0f;
+    float default_min_p = -1.0f;
+    int default_top_k = -1;
     float default_repetition_penalty = -1.0f;
     std::string default_reasoning_effort = "";
     int default_thinking_budget = -1;
@@ -301,22 +304,12 @@ struct ModelConfig {
             }
         }
         get(default_temperature, "default_temperature");
+        get(default_top_p, "default_top_p");
+        get(default_min_p, "default_min_p");
+        get(default_top_k, "default_top_k");
         get(default_repetition_penalty, "default_repetition_penalty");
         get(default_reasoning_effort, "default_reasoning_effort");
         get(default_thinking_budget, "default_thinking_budget");
-
-        if (default_temperature < 0.0f) {
-            default_temperature = is_nemotron() ? 0.6f : 0.7f;
-        }
-        if (default_repetition_penalty < 0.0f) {
-            default_repetition_penalty = is_nemotron() ? 1.05f : 1.00f;
-        }
-        if (default_reasoning_effort.empty()) {
-            default_reasoning_effort = is_nemotron() ? "high" : "medium";
-        }
-        if (default_thinking_budget < 0) {
-            default_thinking_budget = 4096;
-        }
     }
 };
 

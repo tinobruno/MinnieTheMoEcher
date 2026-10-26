@@ -2928,6 +2928,7 @@ void run_server(MoecherEngine& engine, int port, int default_thinking_budget, in
 
                     if (round_tool_calls.empty()) {
                         final_response_text = clean_content;
+                        emitted_tool_calls.clear();
                         break;
                     }
 
