@@ -63,7 +63,7 @@ struct ServerConfigState {
     float zdb_max_top1_gap = 1.50f;
 
     float temperature = 0.6f;
-    float repetition_penalty = 1.10f;
+    float repetition_penalty = 1.00f;
     std::string reasoning_effort = "medium";
     int thinking_budget = 4096;
     bool thinking_enabled = true;
@@ -1037,7 +1037,7 @@ void run_server(MoecherEngine& engine, int port, int default_thinking_budget, in
             {"base_prompt", g_base_system_prompt},
             {"system_prompt", g_current_system_prompt},
             {"active_tools", g_enable_tools ? g_current_active_tools : json::array()},
-            {"repetition_penalty", g_server_config.repetition_penalty > 1.0f ? g_server_config.repetition_penalty : 1.05f},
+            {"repetition_penalty", g_server_config.repetition_penalty},
             {"tokens_count", engine.system_kv_snapshot_.valid ? engine.system_kv_snapshot_.tokens.size() : 0}
         };
         res.set_content(body.dump(), "application/json");
@@ -1121,7 +1121,7 @@ void run_server(MoecherEngine& engine, int port, int default_thinking_budget, in
             {"base_prompt", g_base_system_prompt},
             {"system_prompt", g_current_system_prompt},
             {"active_tools", g_enable_tools ? g_current_active_tools : json::array()},
-            {"repetition_penalty", g_server_config.repetition_penalty > 1.0f ? g_server_config.repetition_penalty : 1.05f},
+            {"repetition_penalty", g_server_config.repetition_penalty},
             {"tokens_count", engine.system_kv_snapshot_.valid ? engine.system_kv_snapshot_.tokens.size() : 0}
         };
         res.set_content(body.dump(), "application/json");
@@ -1182,7 +1182,7 @@ void run_server(MoecherEngine& engine, int port, int default_thinking_budget, in
                 {"base_prompt", g_base_system_prompt},
                 {"system_prompt", g_current_system_prompt},
                 {"active_tools", g_enable_tools ? g_current_active_tools : json::array()},
-                {"repetition_penalty", g_server_config.repetition_penalty > 1.0f ? g_server_config.repetition_penalty : 1.05f},
+                {"repetition_penalty", g_server_config.repetition_penalty},
                 {"tokens_count", engine.system_kv_snapshot_.valid ? engine.system_kv_snapshot_.tokens.size() : 0}
             };
             res.set_content(body.dump(), "application/json");
@@ -1550,11 +1550,8 @@ void run_server(MoecherEngine& engine, int port, int default_thinking_budget, in
             int top_k = request.value("top_k", 1024);
             int max_tokens = request.value("max_tokens", 20000);
             bool stream = request.value("stream", false);
-            float default_rep = engine.cfg_.default_repetition_penalty > 1.0f ? engine.cfg_.default_repetition_penalty : 1.05f;
+            float default_rep = engine.cfg_.default_repetition_penalty;
             float repetition_penalty = request.value("repetition_penalty", default_rep);
-            if (repetition_penalty <= 1.0f) {
-                repetition_penalty = default_rep;
-            }
             std::string reasoning_effort = request.value("reasoning_effort", "high");
             bool enable_thinking = true;
             int max_thinking_tokens = default_thinking_budget;

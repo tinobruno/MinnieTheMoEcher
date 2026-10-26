@@ -4539,7 +4539,7 @@ async function sendMessage(options = {}) {
                 messages: messagesToSend,
                 max_tokens: parseInt(tokensInput ? tokensInput.value : 20000, 10) || 20000,
                 temperature: parseFloat(tempSlider.value),
-                repetition_penalty: parseFloat(repPenaltySlider ? repPenaltySlider.value : 1.05),
+                repetition_penalty: parseFloat(repPenaltySlider ? repPenaltySlider.value : 1.0),
                 stream: true,
                 enable_thinking: isThinking,
                 thinking: {
