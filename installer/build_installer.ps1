@@ -80,13 +80,20 @@ $setupExe = "$DistDir\Moecher-Setup.exe"
 if (Test-Path $setupExe) {
     $setupItem = Get-Item $setupExe
     $setupMB = [math]::Round($setupItem.Length / 1MB, 2)
-    Copy-Item $setupExe "F:\moecher\Moecher-Setup.exe" -Force -ErrorAction SilentlyContinue
+    $mirrored = @()
+    if (Test-Path "F:\moecher") {
+        Copy-Item $setupExe "F:\moecher\Moecher-Setup.exe" -Force -ErrorAction SilentlyContinue
+        $mirrored += "F:\moecher\Moecher-Setup.exe"
+    }
     if (Test-Path "Y:\Moecher") {
         Copy-Item $setupExe "Y:\Moecher\Moecher-Setup.exe" -Force -ErrorAction SilentlyContinue
+        $mirrored += "Y:\Moecher\Moecher-Setup.exe"
     }
     Write-Host "================================================================" -ForegroundColor Green
     Write-Host "  Moecher Installer Created Successfully!" -ForegroundColor Green
     Write-Host "  Installer Path: $setupExe ($setupMB MB)" -ForegroundColor Green
-    Write-Host "  Mirrored to: F:\moecher\Moecher-Setup.exe and Y:\Moecher\Moecher-Setup.exe" -ForegroundColor Green
+    if ($mirrored.Count -gt 0) {
+        Write-Host "  Mirrored to: $($mirrored -join ', ')" -ForegroundColor Green
+    }
     Write-Host "================================================================" -ForegroundColor Green
 }

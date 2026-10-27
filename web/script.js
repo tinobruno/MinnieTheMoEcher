@@ -1604,6 +1604,15 @@ function updateAccountingUI() {
     document.querySelectorAll('.acct-preview-comp-code').forEach(el => {
         el.textContent = accountingSettings.companyCountry || 'BE';
     });
+
+    const cryptoCurrInput = document.getElementById('acct-crypto-default-currency');
+    if (cryptoCurrInput) cryptoCurrInput.value = localStorage.getItem('moecher_crypto_default_curr') || 'EUR';
+
+    const cryptoRateInput = document.getElementById('acct-crypto-default-tax-rate');
+    if (cryptoRateInput) cryptoRateInput.value = localStorage.getItem('moecher_crypto_default_rate') || '30';
+
+    const cryptoYearInput = document.getElementById('acct-crypto-default-year');
+    if (cryptoYearInput) cryptoYearInput.value = localStorage.getItem('moecher_crypto_default_year') || 'last_year';
 }
 
 function onAccountingSettingChange() {
@@ -1642,6 +1651,22 @@ function onAccountingSettingChange() {
     document.querySelectorAll('.acct-preview-comp-code').forEach(el => {
         el.textContent = accountingSettings.companyCountry || 'BE';
     });
+
+    const cryptoCurrInput = document.getElementById('acct-crypto-default-currency');
+    if (cryptoCurrInput) {
+        localStorage.setItem('moecher_crypto_default_curr', cryptoCurrInput.value);
+        cryptoTaxSettings.defaultCurrency = cryptoCurrInput.value;
+    }
+    const cryptoRateInput = document.getElementById('acct-crypto-default-tax-rate');
+    if (cryptoRateInput) {
+        localStorage.setItem('moecher_crypto_default_rate', cryptoRateInput.value);
+        cryptoTaxSettings.defaultTaxRate = parseFloat(cryptoRateInput.value) || 30;
+    }
+    const cryptoYearInput = document.getElementById('acct-crypto-default-year');
+    if (cryptoYearInput) {
+        localStorage.setItem('moecher_crypto_default_year', cryptoYearInput.value);
+        cryptoTaxSettings.defaultYear = cryptoYearInput.value;
+    }
 
     saveAccountingSettings(true);
 }
@@ -12159,5 +12184,1255 @@ document.addEventListener('DOMContentLoaded', () => {
     setupVisionDragAndDrop();
     ThreeStudio.init();
     initVoiceRecognitionUI();
+    initCryptoAccountingUI();
 });
+
+// ════════════════════════════════════════════════════════════════════════════════
+//  Crypto Income & Tax Accounting Module
+// ════════════════════════════════════════════════════════════════════════════════
+
+const DEFAULT_CRYPTO_TAX_SETTINGS = {
+    defaultCurrency: 'EUR',
+    defaultTaxRate: 30,
+    defaultYear: 'last_year',
+    customSolanaRpc: '',
+    etherscanApiKey: '',
+    savedWallets: []
+};
+
+let cryptoTaxSettings = { ...DEFAULT_CRYPTO_TAX_SETTINGS };
+
+let cryptoAccountingState = {
+    address: '',
+    detectedNetwork: 'unknown',
+    selectedNetwork: 'auto',
+    currency: 'EUR',
+    selectedYear: 'last_year',
+    taxRate: 30.0,
+    deductible: 0.0,
+    transactions: [],
+    yearlyStats: {},
+    isLoading: false,
+    searchQuery: '',
+    typeFilter: 'incoming'
+};
+
+let cryptoFxCache = {};
+
+// Fallback historical spot rates anchor table for offline/failsafe calculation
+const CRYPTO_FALLBACK_RATES = {
+    ETH: {
+        '2023-01': { USD: 1550, EUR: 1430 },
+        '2023-04': { USD: 1900, EUR: 1730 },
+        '2023-07': { USD: 1870, EUR: 1690 },
+        '2023-10': { USD: 1650, EUR: 1560 },
+        '2023-12': { USD: 2280, EUR: 2070 },
+        '2024-01': { USD: 2500, EUR: 2290 },
+        '2024-03': { USD: 3550, EUR: 3260 },
+        '2024-06': { USD: 3450, EUR: 3210 },
+        '2024-09': { USD: 2450, EUR: 2210 },
+        '2024-11': { USD: 3350, EUR: 3170 },
+        '2024-12': { USD: 3700, EUR: 3550 },
+        '2025-01': { USD: 3450, EUR: 3330 },
+        '2025-03': { USD: 2750, EUR: 2620 },
+        '2025-06': { USD: 2550, EUR: 2210 },
+        '2025-09': { USD: 2680, EUR: 2350 },
+        '2025-11': { USD: 2830, EUR: 2450 },
+        '2025-12': { USD: 2950, EUR: 2680 },
+        '2026-01': { USD: 3100, EUR: 2820 },
+        '2026-03': { USD: 2650, EUR: 2410 }
+    },
+    SOL: {
+        '2023-01': { USD: 22, EUR: 20 },
+        '2023-04': { USD: 21, EUR: 19 },
+        '2023-07': { USD: 25, EUR: 23 },
+        '2023-10': { USD: 32, EUR: 30 },
+        '2023-12': { USD: 101, EUR: 92 },
+        '2024-01': { USD: 98, EUR: 90 },
+        '2024-03': { USD: 185, EUR: 170 },
+        '2024-06': { USD: 145, EUR: 135 },
+        '2024-09': { USD: 135, EUR: 122 },
+        '2024-11': { USD: 240, EUR: 227 },
+        '2024-12': { USD: 220, EUR: 211 },
+        '2025-01': { USD: 205, EUR: 199 },
+        '2025-03': { USD: 165, EUR: 157 },
+        '2025-06': { USD: 152, EUR: 132 },
+        '2025-09': { USD: 145, EUR: 127 },
+        '2025-11': { USD: 133, EUR: 115 },
+        '2025-12': { USD: 142, EUR: 129 },
+        '2026-01': { USD: 155, EUR: 141 },
+        '2026-03': { USD: 118, EUR: 107 }
+    }
+};
+
+function getFallbackHistoricalRate(coin, currency, dateStr) {
+    const ym = (dateStr || '').substring(0, 7);
+    const coinTable = CRYPTO_FALLBACK_RATES[coin] || CRYPTO_FALLBACK_RATES.ETH;
+    if (coinTable[ym]) {
+        return coinTable[ym][currency] || coinTable[ym].USD;
+    }
+    const keys = Object.keys(coinTable).sort();
+    let closestKey = keys[0];
+    for (const k of keys) {
+        if (k <= ym) closestKey = k;
+    }
+    return coinTable[closestKey][currency] || coinTable[closestKey].USD;
+}
+
+function detectCryptoNetwork(address) {
+    if (!address || typeof address !== 'string') return 'unknown';
+    const clean = address.trim();
+    if (/^0x[0-9a-fA-F]{40}$/.test(clean)) return 'ethereum';
+    if (/^[1-9A-HJ-NP-Za-km-z]{32,44}$/.test(clean)) return 'solana';
+    return 'unknown';
+}
+
+function onCryptoAddressInput(val) {
+    cryptoAccountingState.address = (val || '').trim();
+    const detected = detectCryptoNetwork(cryptoAccountingState.address);
+    cryptoAccountingState.detectedNetwork = detected;
+
+    const pill = document.getElementById('crypto-detected-pill');
+    const netSelect = document.getElementById('crypto-network-select');
+
+    if (pill) {
+        pill.className = `crypto-detected-pill ${detected}`;
+        if (detected === 'solana') {
+            pill.textContent = 'Solana (Base58)';
+            if (netSelect && netSelect.value === 'auto') {
+                cryptoAccountingState.selectedNetwork = 'solana';
+            }
+        } else if (detected === 'ethereum') {
+            pill.textContent = 'Ethereum (0x)';
+            if (netSelect && netSelect.value === 'auto') {
+                cryptoAccountingState.selectedNetwork = 'ethereum';
+            }
+        } else {
+            pill.textContent = cryptoAccountingState.address ? 'Unrecognized' : 'Auto-Detecting';
+        }
+    }
+}
+
+async function pasteCryptoAddress() {
+    try {
+        const text = await navigator.clipboard.readText();
+        if (text) {
+            const input = document.getElementById('crypto-address-input');
+            if (input) {
+                input.value = text.trim();
+                onCryptoAddressInput(text.trim());
+            }
+        }
+    } catch (e) {
+        console.warn('Clipboard read failed:', e);
+        showToast('Unable to read clipboard. Please paste manually.', 'info');
+    }
+}
+
+function onCryptoNetworkChange() {
+    const sel = document.getElementById('crypto-network-select');
+    if (sel) {
+        cryptoAccountingState.selectedNetwork = sel.value;
+    }
+}
+
+function setCryptoCurrency(curr) {
+    cryptoAccountingState.currency = curr;
+    document.querySelectorAll('#crypto-currency-selector .crypto-segment-btn').forEach(btn => {
+        btn.classList.toggle('active', btn.getAttribute('data-currency') === curr);
+    });
+    const addon = document.getElementById('crypto-deductible-curr-addon');
+    if (addon) addon.textContent = curr === 'EUR' ? '€' : '$';
+
+    if (cryptoAccountingState.transactions.length > 0) {
+        calculateCryptoTaxes();
+    }
+}
+
+function onCryptoYearSelectChange() {
+    const sel = document.getElementById('crypto-year-select');
+    if (sel) {
+        cryptoAccountingState.selectedYear = sel.value;
+        if (cryptoAccountingState.transactions.length > 0) {
+            calculateCryptoTaxes();
+        }
+    }
+}
+
+function onCryptoTaxRateChange() {
+    const input = document.getElementById('crypto-tax-rate-input');
+    if (input) {
+        const val = parseFloat(input.value);
+        cryptoAccountingState.taxRate = isNaN(val) ? 30.0 : Math.max(0, Math.min(100, val));
+        if (cryptoAccountingState.transactions.length > 0) {
+            calculateCryptoTaxes();
+        }
+    }
+}
+
+function setQuickTaxRate(rate) {
+    const input = document.getElementById('crypto-tax-rate-input');
+    if (input) {
+        input.value = rate;
+        onCryptoTaxRateChange();
+    }
+}
+
+function onCryptoDeductibleChange() {
+    const input = document.getElementById('crypto-deductible-input');
+    if (input) {
+        const val = parseFloat(input.value);
+        cryptoAccountingState.deductible = isNaN(val) ? 0.0 : Math.max(0, val);
+        if (cryptoAccountingState.transactions.length > 0) {
+            calculateCryptoTaxes();
+        }
+    }
+}
+
+function toggleAdvancedCryptoSettings() {
+    const panel = document.getElementById('crypto-advanced-settings');
+    if (panel) {
+        panel.classList.toggle('hidden');
+    }
+}
+
+async function fetchWithProxyFallback(url, options = {}) {
+    try {
+        const ctrl = new AbortController();
+        const tid = setTimeout(() => ctrl.abort(), 9000);
+        const directResp = await fetch(url, { ...options, signal: ctrl.signal });
+        clearTimeout(tid);
+        if (directResp.ok) return directResp;
+    } catch (e) {
+        // Fall through to proxy
+    }
+    const proxyUrl = `/api/proxy?url=${encodeURIComponent(url)}`;
+    return await fetch(proxyUrl, options);
+}
+
+async function fetchHistoricalCryptoRate(coin, currency, dateStr) {
+    const safeCoin = (coin || 'ETH').toUpperCase();
+    if (safeCoin === 'USDC' || safeCoin === 'USDT' || safeCoin === 'DAI') {
+        if (currency === 'USD') return 1.0;
+        // For EUR, fetch EURUSDT rate
+        try {
+            const dt = new Date(`${dateStr}T00:00:00Z`);
+            const eurUrl = `https://api.binance.com/api/v3/klines?symbol=EURUSDT&interval=1d&startTime=${dt.getTime()}&limit=1`;
+            const eurResp = await fetchWithProxyFallback(eurUrl);
+            if (eurResp.ok) {
+                const eurData = await eurResp.json();
+                if (Array.isArray(eurData) && eurData.length > 0 && eurData[0][4]) {
+                    const eurUsd = parseFloat(eurData[0][4]);
+                    return eurUsd > 0 ? 1.0 / eurUsd : 0.92;
+                }
+            }
+        } catch (e) {}
+        return 0.92;
+    }
+
+    const cacheKey = `${safeCoin}_${currency}_${dateStr}`;
+    if (cryptoFxCache[cacheKey]) {
+        return cryptoFxCache[cacheKey];
+    }
+
+    try {
+        const storedCache = localStorage.getItem('moecher_crypto_fx_cache');
+        if (storedCache) {
+            const parsed = JSON.parse(storedCache);
+            if (parsed[cacheKey]) {
+                cryptoFxCache[cacheKey] = parsed[cacheKey];
+                return parsed[cacheKey];
+            }
+        }
+    } catch (e) {}
+
+    const dt = new Date(`${dateStr}T00:00:00Z`);
+    const dayStartMs = dt.getTime();
+    let rate = null;
+
+    // 1. Try Binance Daily Klines
+    try {
+        const symbol = `${safeCoin}USDT`;
+        const binanceUrl = `https://api.binance.com/api/v3/klines?symbol=${symbol}&interval=1d&startTime=${dayStartMs}&limit=1`;
+        const resp = await fetchWithProxyFallback(binanceUrl);
+        if (resp.ok) {
+            const data = await resp.json();
+            if (Array.isArray(data) && data.length > 0 && data[0][4]) {
+                const usdPrice = parseFloat(data[0][4]);
+                if (currency === 'USD') {
+                    rate = usdPrice;
+                } else if (currency === 'EUR') {
+                    const eurUrl = `https://api.binance.com/api/v3/klines?symbol=EURUSDT&interval=1d&startTime=${dayStartMs}&limit=1`;
+                    const eurResp = await fetchWithProxyFallback(eurUrl);
+                    if (eurResp.ok) {
+                        const eurData = await eurResp.json();
+                        if (Array.isArray(eurData) && eurData.length > 0 && eurData[0][4]) {
+                            const eurUsd = parseFloat(eurData[0][4]);
+                            rate = usdPrice / (eurUsd > 0 ? eurUsd : 1.08);
+                        }
+                    }
+                    if (rate === null) rate = usdPrice / 1.08;
+                }
+            }
+        }
+    } catch (e) {
+        console.warn(`Binance spot rate failed for ${safeCoin} on ${dateStr}:`, e);
+    }
+
+    // 2. Try CoinGecko History Fallback
+    if (rate === null || isNaN(rate)) {
+        try {
+            const coinId = safeCoin === 'ETH' ? 'ethereum' : 'solana';
+            const parts = dateStr.split('-');
+            const cgDate = `${parts[2]}-${parts[1]}-${parts[0]}`;
+            const cgUrl = `https://api.coingecko.com/api/v3/coins/${coinId}/history?date=${cgDate}`;
+            const cgResp = await fetchWithProxyFallback(cgUrl);
+            if (cgResp.ok) {
+                const cgData = await cgResp.json();
+                if (cgData && cgData.market_data && cgData.market_data.current_price) {
+                    const p = cgData.market_data.current_price[currency.toLowerCase()];
+                    if (p) rate = parseFloat(p);
+                }
+            }
+        } catch (e) {
+            console.warn(`CoinGecko history failed for ${safeCoin} on ${dateStr}:`, e);
+        }
+    }
+
+    // 3. Fallback Anchor Table
+    if (rate === null || isNaN(rate) || rate <= 0) {
+        rate = getFallbackHistoricalRate(safeCoin, currency, dateStr);
+    }
+
+    if (rate && !isNaN(rate)) {
+        cryptoFxCache[cacheKey] = rate;
+        try {
+            const stored = JSON.parse(localStorage.getItem('moecher_crypto_fx_cache') || '{}');
+            stored[cacheKey] = rate;
+            localStorage.setItem('moecher_crypto_fx_cache', JSON.stringify(stored));
+        } catch (e) {}
+    }
+
+    return rate || (safeCoin === 'ETH' ? 2500 : 140);
+}
+
+function updateCryptoProgress(message, pct) {
+    const banner = document.getElementById('crypto-progress-banner');
+    const msgEl = document.getElementById('crypto-progress-message');
+    const pctEl = document.getElementById('crypto-progress-pct');
+    const fillEl = document.getElementById('crypto-progress-fill');
+
+    if (banner) banner.classList.remove('hidden');
+    if (msgEl) msgEl.textContent = message;
+    if (pctEl) pctEl.textContent = `${pct}%`;
+    if (fillEl) fillEl.style.width = `${pct}%`;
+}
+
+function hideCryptoProgress() {
+    const banner = document.getElementById('crypto-progress-banner');
+    if (banner) banner.classList.add('hidden');
+}
+
+// ────────────────────────────────────────────────────────────────────────────────
+// Blockchain Fetchers
+// ────────────────────────────────────────────────────────────────────────────────
+
+async function fetchEthereumTransactions(address) {
+    updateCryptoProgress('Connecting to Blockscout / Ethereum Explorer...', 15);
+    const txs = [];
+    const lowerAddr = address.toLowerCase();
+
+    // 1. Fetch native ETH transactions
+    try {
+        const url = `https://eth.blockscout.com/api?module=account&action=txlist&address=${address}&startblock=0&endblock=99999999&sort=desc`;
+        const resp = await fetchWithProxyFallback(url);
+        if (resp.ok) {
+            const data = await resp.json();
+            if (data.status === '1' && Array.isArray(data.result)) {
+                for (const item of data.result) {
+                    const toAddr = (item.to || '').toLowerCase();
+                    const isSuccess = item.isError === '0';
+                    const rawVal = parseFloat(item.value || '0');
+                    if (isSuccess && toAddr === lowerAddr && rawVal > 0) {
+                        const amountEth = rawVal / 1e18;
+                        const ts = parseInt(item.timeStamp) * 1000;
+                        const dt = new Date(ts);
+                        const dateStr = dt.toISOString().split('T')[0];
+                        const dateTimeStr = dt.toISOString().replace('T', ' ').substring(0, 19);
+                        txs.push({
+                            id: item.hash,
+                            chain: 'Ethereum',
+                            coin: 'ETH',
+                            hash: item.hash,
+                            from: item.from,
+                            to: item.to,
+                            amount: amountEth,
+                            timestamp: ts,
+                            dateStr: dateStr,
+                            dateTimeStr: dateTimeStr,
+                            year: dt.getUTCFullYear().toString(),
+                            isIncoming: true,
+                            isSuccess: true,
+                            explorerUrl: `https://etherscan.io/tx/${item.hash}`
+                        });
+                    }
+                }
+            }
+        }
+    } catch (e) {
+        console.warn('Blockscout ETH txlist failed:', e);
+    }
+
+    updateCryptoProgress('Scanning ERC-20 token transfers (USDC, USDT, etc.)...', 45);
+
+    // 2. Fetch ERC-20 token transfers
+    try {
+        const tokenUrl = `https://eth.blockscout.com/api?module=account&action=tokentx&address=${address}&sort=desc`;
+        const resp2 = await fetchWithProxyFallback(tokenUrl);
+        if (resp2.ok) {
+            const data2 = await resp2.json();
+            if (data2.status === '1' && Array.isArray(data2.result)) {
+                for (const item of data2.result) {
+                    const toAddr = (item.to || '').toLowerCase();
+                    const rawVal = parseFloat(item.value || '0');
+                    const decimals = parseInt(item.tokenDecimal || '18');
+                    const symbol = (item.tokenSymbol || 'TOKEN').toUpperCase();
+                    if (toAddr === lowerAddr && rawVal > 0) {
+                        const tokenAmt = rawVal / Math.pow(10, decimals);
+                        const ts = parseInt(item.timeStamp) * 1000;
+                        const dt = new Date(ts);
+                        const dateStr = dt.toISOString().split('T')[0];
+                        const dateTimeStr = dt.toISOString().replace('T', ' ').substring(0, 19);
+                        txs.push({
+                            id: `${item.hash}_${symbol}`,
+                            chain: 'Ethereum',
+                            coin: symbol,
+                            hash: item.hash,
+                            from: item.from,
+                            to: item.to,
+                            amount: tokenAmt,
+                            timestamp: ts,
+                            dateStr: dateStr,
+                            dateTimeStr: dateTimeStr,
+                            year: dt.getUTCFullYear().toString(),
+                            isIncoming: true,
+                            isSuccess: true,
+                            explorerUrl: `https://etherscan.io/tx/${item.hash}`
+                        });
+                    }
+                }
+            }
+        }
+    } catch (e) {
+        console.warn('Blockscout ERC-20 tokentx failed:', e);
+    }
+
+    return txs;
+}
+
+async function fetchSolanaTransactions(address) {
+    updateCryptoProgress('Connecting to Solana JSON-RPC node...', 15);
+    const rpcUrl = cryptoTaxSettings.customSolanaRpc || 'https://api.mainnet-beta.solana.com';
+    const txs = [];
+
+    // 1. Get transaction signatures
+    let signatures = [];
+    try {
+        const payload = JSON.stringify({
+            jsonrpc: '2.0',
+            id: 1,
+            method: 'getSignaturesForAddress',
+            params: [address, { limit: 35 }]
+        });
+        const resp = await fetchWithProxyFallback(rpcUrl, {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: payload
+        });
+        if (resp.ok) {
+            const data = await resp.json();
+            if (Array.isArray(data.result)) {
+                signatures = data.result;
+            }
+        }
+    } catch (e) {
+        console.warn('Solana getSignaturesForAddress failed:', e);
+    }
+
+    if (signatures.length === 0) {
+        // Fallback endpoint
+        try {
+            const fallbackRpc = 'https://solana-rpc.publicnode.com';
+            const payload = JSON.stringify({
+                jsonrpc: '2.0',
+                id: 1,
+                method: 'getSignaturesForAddress',
+                params: [address, { limit: 35 }]
+            });
+            const resp = await fetchWithProxyFallback(fallbackRpc, {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/json' },
+                body: payload
+            });
+            if (resp.ok) {
+                const data = await resp.json();
+                if (Array.isArray(data.result)) {
+                    signatures = data.result;
+                }
+            }
+        } catch (e) {}
+    }
+
+    // 2. Fetch and parse transactions
+    const total = signatures.length;
+    for (let i = 0; i < total; i++) {
+        const sig = signatures[i];
+        const pct = Math.round(20 + ((i + 1) / total) * 50);
+        updateCryptoProgress(`Extracting Solana transaction ${i + 1} of ${total}...`, pct);
+
+        try {
+            const txPayload = JSON.stringify({
+                jsonrpc: '2.0',
+                id: 2,
+                method: 'getTransaction',
+                params: [sig.signature, { maxSupportedTransactionVersion: 1, encoding: 'jsonParsed' }]
+            });
+            const txResp = await fetchWithProxyFallback(rpcUrl, {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/json' },
+                body: txPayload
+            });
+
+            if (txResp.ok) {
+                const txData = await txResp.json();
+                const res = txData.result;
+                if (res && res.meta && res.meta.err === null) {
+                    const blockTime = res.blockTime || sig.blockTime;
+                    const ts = blockTime ? blockTime * 1000 : Date.now();
+                    const dt = new Date(ts);
+                    const dateStr = dt.toISOString().split('T')[0];
+                    const dateTimeStr = dt.toISOString().replace('T', ' ').substring(0, 19);
+
+                    // Find account in accountKeys
+                    const accountKeys = res.transaction?.message?.accountKeys || [];
+                    let targetIdx = -1;
+                    let senderAddr = 'Unknown Sender';
+
+                    for (let a = 0; a < accountKeys.length; a++) {
+                        const pub = typeof accountKeys[a] === 'string' ? accountKeys[a] : accountKeys[a]?.pubkey;
+                        if (pub === address) targetIdx = a;
+                    }
+
+                    if (accountKeys.length > 0) {
+                        const firstAcc = accountKeys[0];
+                        senderAddr = typeof firstAcc === 'string' ? firstAcc : firstAcc?.pubkey || 'Solana Signer';
+                    }
+
+                    if (targetIdx !== -1 && res.meta.preBalances && res.meta.postBalances) {
+                        const pre = res.meta.preBalances[targetIdx] || 0;
+                        const post = res.meta.postBalances[targetIdx] || 0;
+                        const diffLamports = post - pre;
+                        if (diffLamports > 0) {
+                            const amountSol = diffLamports / 1e9;
+                            txs.push({
+                                id: sig.signature,
+                                chain: 'Solana',
+                                coin: 'SOL',
+                                hash: sig.signature,
+                                from: senderAddr,
+                                to: address,
+                                amount: amountSol,
+                                timestamp: ts,
+                                dateStr: dateStr,
+                                dateTimeStr: dateTimeStr,
+                                year: dt.getUTCFullYear().toString(),
+                                isIncoming: true,
+                                isSuccess: true,
+                                explorerUrl: `https://solscan.io/tx/${sig.signature}`
+                            });
+                        }
+                    }
+                }
+            }
+        } catch (e) {
+            console.warn(`Solana tx ${sig.signature} parse failed:`, e);
+        }
+    }
+
+    return txs;
+}
+
+// ────────────────────────────────────────────────────────────────────────────────
+// Demo Sample Wallets
+// ────────────────────────────────────────────────────────────────────────────────
+
+function loadSampleCryptoWallet(network) {
+    const isSol = network === 'solana';
+    const addressInput = document.getElementById('crypto-address-input');
+    const netSelect = document.getElementById('crypto-network-select');
+
+    if (isSol) {
+        const sampleSolAddr = '7xKXtg2CW87d97TXJSDpbD5jBkheTqA83TZRuJosgAsU';
+        if (addressInput) addressInput.value = sampleSolAddr;
+        if (netSelect) netSelect.value = 'solana';
+        onCryptoAddressInput(sampleSolAddr);
+
+        // Prepopulate realistic multi-year Solana earnings ledger
+        cryptoAccountingState.transactions = [
+            { id: 'sol_tx_1', chain: 'Solana', coin: 'SOL', hash: '5K3W2Dq4YtN9pZv1m8LxCj7RoXeAbHfUsGeKqWpLt2Nm', from: 'Phantom Staking Validator', to: sampleSolAddr, amount: 8.50, timestamp: 1710244800000, dateStr: '2024-03-12', dateTimeStr: '2024-03-12 12:00:00', year: '2024', isIncoming: true, isSuccess: true, explorerUrl: 'https://solscan.io/tx/5K3W2Dq4YtN9pZv1m8LxCj7RoXeAbHfUsGeKqWpLt2Nm' },
+            { id: 'sol_tx_2', chain: 'Solana', coin: 'SOL', hash: '4F8x9M2qLw7kRt1nPz3vCj5SbGeAaHfKsGeRqWpMt1Nm', from: 'DePIN Edge Compute Client', to: sampleSolAddr, amount: 14.20, timestamp: 1718884800000, dateStr: '2024-06-20', dateTimeStr: '2024-06-20 12:00:00', year: '2024', isIncoming: true, isSuccess: true, explorerUrl: 'https://solscan.io/tx/4F8x9M2qLw7kRt1nPz3vCj5SbGeAaHfKsGeRqWpMt1Nm' },
+            { id: 'sol_tx_3', chain: 'Solana', coin: 'SOL', hash: '3B7v8K1pLx9mRt2nQz4wCj6TaHeBaGfJsFdPqWpNt3Lm', from: 'Solana AI Dev Bounty', to: sampleSolAddr, amount: 25.00, timestamp: 1726401600000, dateStr: '2024-09-15', dateTimeStr: '2024-09-15 12:00:00', year: '2024', isIncoming: true, isSuccess: true, explorerUrl: 'https://solscan.io/tx/3B7v8K1pLx9mRt2nQz4wCj6TaHeBaGfJsFdPqWpNt3Lm' },
+            { id: 'sol_tx_4', chain: 'Solana', coin: 'SOL', hash: '2A6u7J0oKw8lQs1mPz5vBj7S9GeAaFfIsEcPqVpMs4Km', from: 'Validator Node Staking Yield', to: sampleSolAddr, amount: 9.80, timestamp: 1732795200000, dateStr: '2024-11-28', dateTimeStr: '2024-11-28 12:00:00', year: '2024', isIncoming: true, isSuccess: true, explorerUrl: 'https://solscan.io/tx/2A6u7J0oKw8lQs1mPz5vBj7S9GeAaFfIsEcPqVpMs4Km' },
+            // 2025 (Last Year) Earnings
+            { id: 'sol_tx_5', chain: 'Solana', coin: 'SOL', hash: '9Z5t6I9nJv7kPr0lOy4uAi6R8FdZzEeHrDbOpUoMr5Jl', from: 'Consulting Retainer - Web3 Corp', to: sampleSolAddr, amount: 16.50, timestamp: 1736856000000, dateStr: '2025-01-14', dateTimeStr: '2025-01-14 12:00:00', year: '2025', isIncoming: true, isSuccess: true, explorerUrl: 'https://solscan.io/tx/9Z5t6I9nJv7kPr0lOy4uAi6R8FdZzEeHrDbOpUoMr5Jl' },
+            { id: 'sol_tx_6', chain: 'Solana', coin: 'SOL', hash: '8Y4s5H8mIu6jOq9kNx3tZh5Q7EcYyDdGqCaNoTnMq6Ik', from: 'Marinade Staking Pool Payout', to: sampleSolAddr, amount: 7.40, timestamp: 1739880000000, dateStr: '2025-02-18', dateTimeStr: '2025-02-18 12:00:00', year: '2025', isIncoming: true, isSuccess: true, explorerUrl: 'https://solscan.io/tx/8Y4s5H8mIu6jOq9kNx3tZh5Q7EcYyDdGqCaNoTnMq6Ik' },
+            { id: 'sol_tx_7', chain: 'Solana', coin: 'SOL', hash: '7X3r4G7lHt5iNp8jMw2sYg4P6DbXxCcFpBzMnSlLp7Hj', from: 'Smart Contract Audit Service', to: sampleSolAddr, amount: 22.00, timestamp: 1744286400000, dateStr: '2025-04-10', dateTimeStr: '2025-04-10 12:00:00', year: '2025', isIncoming: true, isSuccess: true, explorerUrl: 'https://solscan.io/tx/7X3r4G7lHt5iNp8jMw2sYg4P6DbXxCcFpBzMnSlLp7Hj' },
+            { id: 'sol_tx_8', chain: 'Solana', coin: 'SOL', hash: '6W2q3F6kGs4hMo7iLv1rXf3O5CaWwBbEoAyLmRkKo8Gi', from: 'Q2 Validator Commission', to: sampleSolAddr, amount: 11.25, timestamp: 1750008000000, dateStr: '2025-06-15', dateTimeStr: '2025-06-15 12:00:00', year: '2025', isIncoming: true, isSuccess: true, explorerUrl: 'https://solscan.io/tx/6W2q3F6kGs4hMo7iLv1rXf3O5CaWwBbEoAyLmRkKo8Gi' },
+            { id: 'sol_tx_9', chain: 'Solana', coin: 'SOL', hash: '5V1p2E5jFr3gLn6hKu0qWe2N4BzVvAaDnzXkQjJjn9Fh', from: 'AI Agent Backend Integration Fee', to: sampleSolAddr, amount: 18.00, timestamp: 1755710400000, dateStr: '2025-08-20', dateTimeStr: '2025-08-20 12:00:00', year: '2025', isIncoming: true, isSuccess: true, explorerUrl: 'https://solscan.io/tx/5V1p2E5jFr3gLn6hKu0qWe2N4BzVvAaDnzXkQjJjn9Fh' },
+            { id: 'sol_tx_10', chain: 'Solana', coin: 'SOL', hash: '4U0o1D4iEq2fKm5gJt9pVd1M3AyUu9zCmyWjPiIim0Eg', from: 'Q3 Staking Epoch Reward', to: sampleSolAddr, amount: 8.60, timestamp: 1759684800000, dateStr: '2025-10-05', dateTimeStr: '2025-10-05 12:00:00', year: '2025', isIncoming: true, isSuccess: true, explorerUrl: 'https://solscan.io/tx/4U0o1D4iEq2fKm5gJt9pVd1M3AyUu9zCmyWjPiIim0Eg' },
+            { id: 'sol_tx_11', chain: 'Solana', coin: 'SOL', hash: '3T9n0C3hDp1eJl4fIs8oUc0L2ZxTt8yBlxViOhHhl1Df', from: 'Freelance Frontend Dev Project', to: sampleSolAddr, amount: 20.50, timestamp: 1763668800000, dateStr: '2025-11-20', dateTimeStr: '2025-11-20 12:00:00', year: '2025', isIncoming: true, isSuccess: true, explorerUrl: 'https://solscan.io/tx/3T9n0C3hDp1eJl4fIs8oUc0L2ZxTt8yBlxViOhHhl1Df' },
+            { id: 'sol_tx_12', chain: 'Solana', coin: 'SOL', hash: '2S8m9B2gCo0dIk3eHr7nTb9K1YwSs7xAkxUhNgGgk2Ce', from: 'Year-End Staking Protocol Bonus', to: sampleSolAddr, amount: 15.00, timestamp: 1766088000000, dateStr: '2025-12-18', dateTimeStr: '2025-12-18 12:00:00', year: '2025', isIncoming: true, isSuccess: true, explorerUrl: 'https://solscan.io/tx/2S8m9B2gCo0dIk3eHr7nTb9K1YwSs7xAkxUhNgGgk2Ce' },
+            // 2026 (Current Year)
+            { id: 'sol_tx_13', chain: 'Solana', coin: 'SOL', hash: '1R7l8A1fBn9cHj2dGq6mSa8J0XvRr6wZjwTgMfFfj3Bd', from: 'January 2026 Developer Grant', to: sampleSolAddr, amount: 12.00, timestamp: 1769102400000, dateStr: '2026-01-22', dateTimeStr: '2026-01-22 12:00:00', year: '2026', isIncoming: true, isSuccess: true, explorerUrl: 'https://solscan.io/tx/1R7l8A1fBn9cHj2dGq6mSa8J0XvRr6wZjwTgMfFfj3Bd' },
+            { id: 'sol_tx_14', chain: 'Solana', coin: 'SOL', hash: '0Q6k790eAm8bGi1cFp5lRz7I9WuQq5vYivSfLeEei4Ac', from: 'AI Inference Verification Node', to: sampleSolAddr, amount: 8.75, timestamp: 1771099200000, dateStr: '2026-02-14', dateTimeStr: '2026-02-14 12:00:00', year: '2026', isIncoming: true, isSuccess: true, explorerUrl: 'https://solscan.io/tx/0Q6k790eAm8bGi1cFp5lRz7I9WuQq5vYivSfLeEei4Ac' }
+        ];
+    } else {
+        const sampleEthAddr = '0x71C83664B3a802E1b37B40454316715f3A32D656';
+        if (addressInput) addressInput.value = sampleEthAddr;
+        if (netSelect) netSelect.value = 'ethereum';
+        onCryptoAddressInput(sampleEthAddr);
+
+        cryptoAccountingState.transactions = [
+            { id: 'eth_tx_1', chain: 'Ethereum', coin: 'ETH', hash: '0x3a4b5c6d7e8f90123456789abcdef0123456789abcdef0123456789abcdef01', from: 'Lido Staking Rewards', to: sampleEthAddr, amount: 0.95, timestamp: 1711044800000, dateStr: '2024-03-21', dateTimeStr: '2024-03-21 12:00:00', year: '2024', isIncoming: true, isSuccess: true, explorerUrl: 'https://etherscan.io/tx/0x3a4b5c6d7e8f90123456789abcdef0123456789abcdef0123456789abcdef01' },
+            { id: 'eth_tx_2', chain: 'Ethereum', coin: 'ETH', hash: '0x4b5c6d7e8f90123456789abcdef0123456789abcdef0123456789abcdef012a', from: 'ConsenSys Consulting Retainer', to: sampleEthAddr, amount: 2.50, timestamp: 1718884800000, dateStr: '2024-06-20', dateTimeStr: '2024-06-20 12:00:00', year: '2024', isIncoming: true, isSuccess: true, explorerUrl: 'https://etherscan.io/tx/0x4b5c6d7e8f90123456789abcdef0123456789abcdef0123456789abcdef012a' },
+            { id: 'eth_tx_3', chain: 'Ethereum', coin: 'ETH', hash: '0x5c6d7e8f90123456789abcdef0123456789abcdef0123456789abcdef012a3b', from: 'Audit Milestone Compensation', to: sampleEthAddr, amount: 1.80, timestamp: 1732795200000, dateStr: '2024-11-28', dateTimeStr: '2024-11-28 12:00:00', year: '2024', isIncoming: true, isSuccess: true, explorerUrl: 'https://etherscan.io/tx/0x5c6d7e8f90123456789abcdef0123456789abcdef0123456789abcdef012a3b' },
+            // 2025 (Last Year)
+            { id: 'eth_tx_4', chain: 'Ethereum', coin: 'ETH', hash: '0x6d7e8f90123456789abcdef0123456789abcdef0123456789abcdef012a3b4c', from: 'Web3 Protocol Architecture Advisory', to: sampleEthAddr, amount: 2.10, timestamp: 1736942400000, dateStr: '2025-01-15', dateTimeStr: '2025-01-15 12:00:00', year: '2025', isIncoming: true, isSuccess: true, explorerUrl: 'https://etherscan.io/tx/0x6d7e8f90123456789abcdef0123456789abcdef0123456789abcdef012a3b4c' },
+            { id: 'eth_tx_5', chain: 'Ethereum', coin: 'ETH', hash: '0x7e8f90123456789abcdef0123456789abcdef0123456789abcdef012a3b4c5d', from: 'RocketPool Validator Commission', to: sampleEthAddr, amount: 0.85, timestamp: 1742472000000, dateStr: '2025-03-20', dateTimeStr: '2025-03-20 12:00:00', year: '2025', isIncoming: true, isSuccess: true, explorerUrl: 'https://etherscan.io/tx/0x7e8f90123456789abcdef0123456789abcdef0123456789abcdef012a3b4c5d' },
+            { id: 'eth_tx_6', chain: 'Ethereum', coin: 'ETH', hash: '0x8f90123456789abcdef0123456789abcdef0123456789abcdef012a3b4c5d6e', from: 'Smart Contract Security Review', to: sampleEthAddr, amount: 3.20, timestamp: 1750008000000, dateStr: '2025-06-15', dateTimeStr: '2025-06-15 12:00:00', year: '2025', isIncoming: true, isSuccess: true, explorerUrl: 'https://etherscan.io/tx/0x8f90123456789abcdef0123456789abcdef0123456789abcdef012a3b4c5d6e' },
+            { id: 'eth_tx_7', chain: 'Ethereum', coin: 'ETH', hash: '0x90123456789abcdef0123456789abcdef0123456789abcdef012a3b4c5d6e7f', from: 'Zero Knowledge Rollup Research Grant', to: sampleEthAddr, amount: 1.75, timestamp: 1758369600000, dateStr: '2025-09-20', dateTimeStr: '2025-09-20 12:00:00', year: '2025', isIncoming: true, isSuccess: true, explorerUrl: 'https://etherscan.io/tx/0x90123456789abcdef0123456789abcdef0123456789abcdef012a3b4c5d6e7f' },
+            { id: 'eth_tx_8', chain: 'Ethereum', coin: 'ETH', hash: '0xa123456789abcdef0123456789abcdef0123456789abcdef012a3b4c5d6e7f80', from: 'DeFi Liquidity Engineering Fee', to: sampleEthAddr, amount: 2.80, timestamp: 1763668800000, dateStr: '2025-11-20', dateTimeStr: '2025-11-20 12:00:00', year: '2025', isIncoming: true, isSuccess: true, explorerUrl: 'https://etherscan.io/tx/0xa123456789abcdef0123456789abcdef0123456789abcdef012a3b4c5d6e7f80' },
+            // 2026 (Current Year)
+            { id: 'eth_tx_9', chain: 'Ethereum', coin: 'ETH', hash: '0xb23456789abcdef0123456789abcdef0123456789abcdef012a3b4c5d6e7f8091', from: 'Q1 2026 Core Protocol Retainer', to: sampleEthAddr, amount: 1.50, timestamp: 1769102400000, dateStr: '2026-01-22', dateTimeStr: '2026-01-22 12:00:00', year: '2026', isIncoming: true, isSuccess: true, explorerUrl: 'https://etherscan.io/tx/0xb23456789abcdef0123456789abcdef0123456789abcdef012a3b4c5d6e7f8091' }
+        ];
+    }
+
+    calculateCryptoTaxes();
+    showToast(`Loaded ${network === 'solana' ? 'Solana' : 'Ethereum'} demo wallet (${cryptoAccountingState.transactions.length} earnings payments)`, 'success');
+}
+
+// ────────────────────────────────────────────────────────────────────────────────
+// Execution & Tax Calculation Engine
+// ────────────────────────────────────────────────────────────────────────────────
+
+async function runCryptoAccounting() {
+    const addr = (cryptoAccountingState.address || '').trim();
+    if (!addr) {
+        showToast('Please paste a Solana or Ethereum wallet address, or click a Sample button.', 'info');
+        return;
+    }
+
+    const calcBtn = document.getElementById('crypto-calc-btn');
+    const calcIcon = document.getElementById('crypto-calc-btn-icon');
+    const calcText = document.getElementById('crypto-calc-btn-text');
+
+    if (calcBtn) calcBtn.disabled = true;
+    if (calcIcon) calcIcon.textContent = 'autorenew';
+    if (calcText) calcText.textContent = 'Extracting Ledger...';
+
+    cryptoAccountingState.isLoading = true;
+
+    try {
+        let net = cryptoAccountingState.selectedNetwork;
+        if (net === 'auto') {
+            net = detectCryptoNetwork(addr);
+        }
+
+        let extractedTxs = [];
+        if (net === 'ethereum') {
+            extractedTxs = await fetchEthereumTransactions(addr);
+        } else if (net === 'solana') {
+            extractedTxs = await fetchSolanaTransactions(addr);
+        } else {
+            // Try detecting automatically based on length
+            if (addr.startsWith('0x')) {
+                extractedTxs = await fetchEthereumTransactions(addr);
+            } else {
+                extractedTxs = await fetchSolanaTransactions(addr);
+            }
+        }
+
+        if (extractedTxs.length === 0) {
+            updateCryptoProgress('No direct transactions found on RPC/explorer. Checking backup...', 90);
+            showToast('No incoming transactions found for this address on mainnet.', 'info');
+        } else {
+            cryptoAccountingState.transactions = extractedTxs;
+            await calculateCryptoTaxes();
+            showToast(`Extracted ${extractedTxs.length} incoming transactions successfully!`, 'success');
+        }
+    } catch (e) {
+        console.error('Error during crypto accounting calculation:', e);
+        showToast(`Extraction failed: ${e.message || 'Network error'}`, 'error');
+    } finally {
+        hideCryptoProgress();
+        cryptoAccountingState.isLoading = false;
+        if (calcBtn) calcBtn.disabled = false;
+        if (calcIcon) calcIcon.textContent = 'analytics';
+        if (calcText) calcText.textContent = 'Extract Transactions & Calculate Taxes';
+    }
+}
+
+async function calculateCryptoTaxes() {
+    const txs = cryptoAccountingState.transactions || [];
+    const currency = cryptoAccountingState.currency || 'EUR';
+    const taxRate = cryptoAccountingState.taxRate || 30.0;
+    const deductible = cryptoAccountingState.deductible || 0.0;
+    const currSymbol = currency === 'EUR' ? '€' : '$';
+
+    updateCryptoProgress('Converting amounts at historical spot exchange rates...', 75);
+
+    // 1. Fetch spot rates and compute individual fiat values
+    for (let i = 0; i < txs.length; i++) {
+        const tx = txs[i];
+        const spot = await fetchHistoricalCryptoRate(tx.coin, currency, tx.dateStr);
+        tx.spotRate = spot;
+        tx.fiatValue = tx.amount * spot;
+        tx.taxDue = tx.fiatValue * (taxRate / 100);
+    }
+
+    // 2. Aggregate yearly stats
+    const yearlyMap = {};
+    for (const tx of txs) {
+        const y = tx.year;
+        if (!yearlyMap[y]) {
+            yearlyMap[y] = { year: y, count: 0, cryptoTotal: 0, grossFiat: 0, taxOwed: 0 };
+        }
+        yearlyMap[y].count++;
+        yearlyMap[y].cryptoTotal += tx.amount;
+        yearlyMap[y].grossFiat += tx.fiatValue;
+    }
+
+    for (const y in yearlyMap) {
+        const taxableBase = Math.max(0, yearlyMap[y].grossFiat - deductible);
+        yearlyMap[y].taxOwed = taxableBase * (taxRate / 100);
+        yearlyMap[y].avgSpot = yearlyMap[y].cryptoTotal > 0 ? (yearlyMap[y].grossFiat / yearlyMap[y].cryptoTotal) : 0;
+    }
+
+    cryptoAccountingState.yearlyStats = yearlyMap;
+
+    // 3. Determine active year
+    const currentYear = new Date().getUTCFullYear();
+    const lastYear = (currentYear - 1).toString();
+    let activeYear = cryptoAccountingState.selectedYear;
+
+    if (activeYear === 'last_year') activeYear = lastYear;
+    else if (activeYear === 'current_year') activeYear = currentYear.toString();
+
+    // 4. Calculate active year totals
+    let activeGross = 0;
+    let activeCryptoTotal = 0;
+    let activeTxCount = 0;
+    let primaryCoin = txs[0]?.coin || 'SOL';
+
+    for (const tx of txs) {
+        if (activeYear === 'all' || tx.year === activeYear) {
+            activeGross += tx.fiatValue;
+            activeCryptoTotal += tx.amount;
+            activeTxCount++;
+            primaryCoin = tx.coin;
+        }
+    }
+
+    const activeTaxableBase = Math.max(0, activeGross - deductible);
+    const activeTaxOwed = activeTaxableBase * (taxRate / 100);
+    const activeNetRetained = activeGross - activeTaxOwed;
+    const activeAvgSpot = activeCryptoTotal > 0 ? (activeGross / activeCryptoTotal) : 0;
+
+    // 5. Update KPI Cards in DOM
+    const kpiGross = document.getElementById('kpi-gross-fiat');
+    const kpiTax = document.getElementById('kpi-tax-owed');
+    const kpiTaxSub = document.getElementById('kpi-tax-owed-sub');
+    const kpiCrypto = document.getElementById('kpi-crypto-total');
+    const kpiCryptoSub = document.getElementById('kpi-crypto-total-sub');
+    const kpiAvgSpot = document.getElementById('kpi-avg-spot');
+    const kpiNet = document.getElementById('kpi-net-retained');
+
+    if (kpiGross) kpiGross.textContent = `${currSymbol} ${activeGross.toLocaleString('en-US', { minimumFractionDigits: 2, maximumFractionDigits: 2 })}`;
+    if (kpiTax) kpiTax.textContent = `${currSymbol} ${activeTaxOwed.toLocaleString('en-US', { minimumFractionDigits: 2, maximumFractionDigits: 2 })}`;
+    if (kpiTaxSub) {
+        const yearLabel = activeYear === 'all' ? 'All Years' : `Tax Year ${activeYear}`;
+        kpiTaxSub.textContent = `At ${taxRate.toFixed(1)}% statutory rate (${yearLabel})`;
+    }
+    if (kpiCrypto) kpiCrypto.textContent = `${activeCryptoTotal.toLocaleString('en-US', { minimumFractionDigits: 4, maximumFractionDigits: 4 })} ${primaryCoin}`;
+    if (kpiCryptoSub) kpiCryptoSub.textContent = `${activeTxCount} incoming payments`;
+    if (kpiAvgSpot) kpiAvgSpot.textContent = `${currSymbol} ${activeAvgSpot.toLocaleString('en-US', { minimumFractionDigits: 2, maximumFractionDigits: 2 })} / ${primaryCoin}`;
+    if (kpiNet) kpiNet.textContent = `${currSymbol} ${activeNetRetained.toLocaleString('en-US', { minimumFractionDigits: 2, maximumFractionDigits: 2 })}`;
+
+    // 6. Render Year Tabs
+    renderYearTabs(yearlyMap, activeYear);
+
+    // 7. Render Ledger Table
+    renderLedgerTable(activeYear);
+
+    hideCryptoProgress();
+}
+
+function renderYearTabs(yearlyMap, activeYear) {
+    const tabsContainer = document.getElementById('crypto-year-tabs');
+    if (!tabsContainer) return;
+
+    const currentYear = new Date().getUTCFullYear();
+    const lastYear = (currentYear - 1).toString();
+    const currency = cryptoAccountingState.currency || 'EUR';
+    const sym = currency === 'EUR' ? '€' : '$';
+
+    const years = Object.keys(yearlyMap).sort().reverse();
+    let totalAllCount = 0;
+    let totalAllFiat = 0;
+    for (const y in yearlyMap) {
+        totalAllCount += yearlyMap[y].count;
+        totalAllFiat += yearlyMap[y].grossFiat;
+    }
+
+    let html = `
+        <button type="button" class="crypto-year-pill ${activeYear === 'all' ? 'active' : ''}" onclick="selectCryptoYearTab('all')">
+            <span>All Years</span>
+            <span class="crypto-pill-count">${totalAllCount}</span>
+        </button>
+    `;
+
+    for (const y of years) {
+        const isLastYear = y === lastYear;
+        const isCurrentYear = y === currentYear.toString();
+        const label = isLastYear ? `${y} (Last Year)` : isCurrentYear ? `${y} (Current)` : y;
+        const stat = yearlyMap[y];
+        const fiatFormatted = `${sym}${Math.round(stat.grossFiat).toLocaleString('en-US')}`;
+
+        html += `
+            <button type="button" class="crypto-year-pill ${activeYear === y ? 'active' : ''}" onclick="selectCryptoYearTab('${y}')" title="${stat.count} txs, Gross: ${fiatFormatted}">
+                <span>${label}</span>
+                <span class="crypto-pill-count">${stat.count}</span>
+            </button>
+        `;
+    }
+
+    tabsContainer.innerHTML = html;
+}
+
+function selectCryptoYearTab(yearVal) {
+    cryptoAccountingState.selectedYear = yearVal;
+    const yearSelect = document.getElementById('crypto-year-select');
+    if (yearSelect) {
+        if (yearVal === 'all') yearSelect.value = 'all';
+        else {
+            const currentYear = new Date().getUTCFullYear();
+            const lastYear = (currentYear - 1).toString();
+            if (yearVal === lastYear) yearSelect.value = 'last_year';
+            else if (yearVal === currentYear.toString()) yearSelect.value = 'current_year';
+            else yearSelect.value = yearVal;
+        }
+    }
+    calculateCryptoTaxes();
+}
+
+function filterCryptoLedger() {
+    const searchInput = document.getElementById('crypto-ledger-search');
+    const typeSelect = document.getElementById('crypto-type-filter');
+
+    cryptoAccountingState.searchQuery = (searchInput?.value || '').toLowerCase().trim();
+    cryptoAccountingState.typeFilter = typeSelect?.value || 'incoming';
+
+    const currentYear = new Date().getUTCFullYear();
+    const lastYear = (currentYear - 1).toString();
+    let activeYear = cryptoAccountingState.selectedYear;
+    if (activeYear === 'last_year') activeYear = lastYear;
+    else if (activeYear === 'current_year') activeYear = currentYear.toString();
+
+    renderLedgerTable(activeYear);
+}
+
+function renderLedgerTable(activeYear) {
+    const tbody = document.getElementById('crypto-ledger-tbody');
+    const tfoot = document.getElementById('crypto-ledger-tfoot');
+    if (!tbody) return;
+
+    const txs = cryptoAccountingState.transactions || [];
+    const query = cryptoAccountingState.searchQuery || '';
+    const currency = cryptoAccountingState.currency || 'EUR';
+    const sym = currency === 'EUR' ? '€' : '$';
+
+    const filtered = txs.filter(tx => {
+        // Year filter
+        if (activeYear !== 'all' && tx.year !== activeYear) return false;
+        // Search query
+        if (query) {
+            const matchHash = tx.hash.toLowerCase().includes(query);
+            const matchFrom = tx.from.toLowerCase().includes(query);
+            const matchDate = tx.dateTimeStr.toLowerCase().includes(query);
+            if (!matchHash && !matchFrom && !matchDate) return false;
+        }
+        return true;
+    });
+
+    if (filtered.length === 0) {
+        tbody.innerHTML = `
+            <tr class="crypto-empty-row">
+                <td colspan="10">
+                    <div class="crypto-empty-state">
+                        <span class="material-symbols-outlined">receipt_long</span>
+                        <p>No transactions found matching this filter.</p>
+                        <small>Try selecting a different year or clearing your search term.</small>
+                    </div>
+                </td>
+            </tr>
+        `;
+        if (tfoot) tfoot.classList.add('hidden');
+        return;
+    }
+
+    let totCrypto = 0;
+    let totFiat = 0;
+    let totTax = 0;
+
+    let rowsHtml = '';
+    filtered.forEach((tx, idx) => {
+        totCrypto += tx.amount;
+        totFiat += tx.fiatValue;
+        totTax += tx.taxDue;
+
+        const chainBadgeClass = tx.chain === 'Solana' ? 'sol' : 'eth';
+        const truncHash = tx.hash.length > 16 ? `${tx.hash.substring(0, 6)}...${tx.hash.substring(tx.hash.length - 4)}` : tx.hash;
+        const truncFrom = tx.from.length > 22 ? `${tx.from.substring(0, 10)}...${tx.from.substring(tx.from.length - 6)}` : tx.from;
+
+        rowsHtml += `
+            <tr>
+                <td style="color: #64748b; font-size: 11px;">${idx + 1}</td>
+                <td style="font-family: monospace; font-size: 11px; color: #cbd5e1;">${tx.dateTimeStr}</td>
+                <td><span class="crypto-badge ${chainBadgeClass}">${tx.chain}</span></td>
+                <td>
+                    <a href="${tx.explorerUrl}" target="_blank" rel="noopener noreferrer" class="crypto-hash-link" title="View on explorer: ${tx.hash}">
+                        <span>${truncHash}</span>
+                        <span class="material-symbols-outlined" style="font-size: 12px;">open_in_new</span>
+                    </a>
+                </td>
+                <td class="crypto-sender-addr" title="${tx.from}">${truncFrom}</td>
+                <td style="text-align: right;" class="crypto-amount-in">+${tx.amount.toFixed(4)} ${tx.coin}</td>
+                <td style="text-align: right;" class="crypto-spot-price">${sym} ${tx.spotRate.toLocaleString('en-US', { minimumFractionDigits: 2, maximumFractionDigits: 2 })}</td>
+                <td style="text-align: right;" class="crypto-fiat-val">${sym} ${tx.fiatValue.toLocaleString('en-US', { minimumFractionDigits: 2, maximumFractionDigits: 2 })}</td>
+                <td style="text-align: right;" class="crypto-tax-val">${sym} ${tx.taxDue.toLocaleString('en-US', { minimumFractionDigits: 2, maximumFractionDigits: 2 })}</td>
+                <td style="text-align: center;"><span class="crypto-status-pill confirmed">Received</span></td>
+            </tr>
+        `;
+    });
+
+    tbody.innerHTML = rowsHtml;
+
+    if (tfoot) {
+        tfoot.classList.remove('hidden');
+        const primaryCoin = filtered[0]?.coin || 'SOL';
+        const avgSpot = totCrypto > 0 ? totFiat / totCrypto : 0;
+
+        const tfCrypto = document.getElementById('tfoot-crypto-total');
+        const tfSpot = document.getElementById('tfoot-avg-spot');
+        const tfFiat = document.getElementById('tfoot-fiat-total');
+        const tfTax = document.getElementById('tfoot-tax-total');
+
+        if (tfCrypto) tfCrypto.textContent = `${totCrypto.toFixed(4)} ${primaryCoin}`;
+        if (tfSpot) tfSpot.textContent = `Avg: ${sym}${avgSpot.toFixed(2)}`;
+        if (tfFiat) tfFiat.textContent = `${sym} ${totFiat.toLocaleString('en-US', { minimumFractionDigits: 2, maximumFractionDigits: 2 })}`;
+        if (tfTax) tfTax.textContent = `${sym} ${totTax.toLocaleString('en-US', { minimumFractionDigits: 2, maximumFractionDigits: 2 })}`;
+    }
+}
+
+// ────────────────────────────────────────────────────────────────────────────────
+// Exports & Chat Integration
+// ────────────────────────────────────────────────────────────────────────────────
+
+function exportCryptoTaxCsv() {
+    const txs = cryptoAccountingState.transactions || [];
+    if (txs.length === 0) {
+        showToast('No transaction data to export.', 'info');
+        return;
+    }
+
+    const currency = cryptoAccountingState.currency || 'EUR';
+    const taxRate = cryptoAccountingState.taxRate || 30.0;
+    const currentYear = new Date().getUTCFullYear();
+    const lastYear = (currentYear - 1).toString();
+    let activeYear = cryptoAccountingState.selectedYear;
+    if (activeYear === 'last_year') activeYear = lastYear;
+    else if (activeYear === 'current_year') activeYear = currentYear.toString();
+
+    const filtered = txs.filter(tx => activeYear === 'all' || tx.year === activeYear);
+
+    const headers = [
+        'Index', 'Date_UTC', 'Blockchain', 'Tx_Hash', 'Sender_From', 'Token',
+        'Amount_Received', `Spot_FX_${currency}`, `Gross_Value_${currency}`,
+        'Tax_Rate_Pct', `Tax_Owed_${currency}`, 'Status', 'Explorer_URL'
+    ];
+
+    const escapeCsv = (val) => {
+        const s = String(val === undefined || val === null ? '' : val);
+        return `"${s.replace(/"/g, '""')}"`;
+    };
+
+    let csvContent = '\uFEFF' + headers.map(escapeCsv).join(',') + '\r\n';
+
+    filtered.forEach((tx, idx) => {
+        const row = [
+            idx + 1,
+            tx.dateTimeStr,
+            tx.chain,
+            tx.hash,
+            tx.from,
+            tx.coin,
+            tx.amount.toFixed(6),
+            tx.spotRate.toFixed(2),
+            tx.fiatValue.toFixed(2),
+            taxRate.toFixed(1),
+            tx.taxDue.toFixed(2),
+            'Received',
+            tx.explorerUrl
+        ];
+        csvContent += row.map(escapeCsv).join(',') + '\r\n';
+    });
+
+    const blob = new Blob([csvContent], { type: 'text/csv;charset=utf-8;' });
+    const url = URL.createObjectURL(blob);
+    const link = document.createElement('a');
+    link.href = url;
+    link.download = `Crypto_Tax_Ledger_${activeYear}_${currency}.csv`;
+    document.body.appendChild(link);
+    link.click();
+    document.body.removeChild(link);
+    URL.revokeObjectURL(url);
+
+    showToast(`Exported ${filtered.length} rows to CSV (${activeYear})`, 'success');
+}
+
+function exportCryptoTaxJson() {
+    const txs = cryptoAccountingState.transactions || [];
+    if (txs.length === 0) {
+        showToast('No transaction data to export.', 'info');
+        return;
+    }
+
+    const currency = cryptoAccountingState.currency || 'EUR';
+    const currentYear = new Date().getUTCFullYear();
+    const lastYear = (currentYear - 1).toString();
+    let activeYear = cryptoAccountingState.selectedYear;
+    if (activeYear === 'last_year') activeYear = lastYear;
+    else if (activeYear === 'current_year') activeYear = currentYear.toString();
+
+    const filtered = txs.filter(tx => activeYear === 'all' || tx.year === activeYear);
+
+    let totGross = 0;
+    let totCrypto = 0;
+    let totTax = 0;
+    filtered.forEach(t => {
+        totGross += t.fiatValue;
+        totCrypto += t.amount;
+        totTax += t.taxDue;
+    });
+
+    const payload = {
+        title: 'Moecher Crypto Earnings & Tax Accounting Audit Trail',
+        exportedAt: new Date().toISOString(),
+        walletAddress: cryptoAccountingState.address,
+        blockchain: cryptoAccountingState.selectedNetwork,
+        taxYear: activeYear,
+        fiatCurrency: currency,
+        statutoryTaxRatePct: cryptoAccountingState.taxRate,
+        deductibleExpenses: cryptoAccountingState.deductible,
+        summary: {
+            totalIncomingTransactions: filtered.length,
+            totalCryptoReceived: totCrypto,
+            grossCryptoEarningsFiat: totGross,
+            estimatedTaxOwedToState: totTax,
+            netRetainedAfterTax: totGross - totTax,
+            weightedAverageSpotRate: totCrypto > 0 ? totGross / totCrypto : 0
+        },
+        yearlyBreakdown: cryptoAccountingState.yearlyStats,
+        transactions: filtered
+    };
+
+    const blob = new Blob([JSON.stringify(payload, null, 2)], { type: 'application/json' });
+    const url = URL.createObjectURL(blob);
+    const link = document.createElement('a');
+    link.href = url;
+    link.download = `Crypto_Tax_Audit_${activeYear}.json`;
+    document.body.appendChild(link);
+    link.click();
+    document.body.removeChild(link);
+    URL.revokeObjectURL(url);
+
+    showToast(`Audit JSON exported successfully`, 'success');
+}
+
+function copyCryptoTaxSummary() {
+    const txs = cryptoAccountingState.transactions || [];
+    if (txs.length === 0) {
+        showToast('No transaction data to copy.', 'info');
+        return;
+    }
+
+    const currency = cryptoAccountingState.currency || 'EUR';
+    const sym = currency === 'EUR' ? '€' : '$';
+    const currentYear = new Date().getUTCFullYear();
+    const lastYear = (currentYear - 1).toString();
+    let activeYear = cryptoAccountingState.selectedYear;
+    if (activeYear === 'last_year') activeYear = lastYear;
+    else if (activeYear === 'current_year') activeYear = currentYear.toString();
+
+    const filtered = txs.filter(tx => activeYear === 'all' || tx.year === activeYear);
+    let totGross = 0;
+    let totCrypto = 0;
+    let totTax = 0;
+    filtered.forEach(t => {
+        totGross += t.fiatValue;
+        totCrypto += t.amount;
+        totTax += t.taxDue;
+    });
+    const avgSpot = totCrypto > 0 ? totGross / totCrypto : 0;
+    const netRetained = totGross - totTax;
+    const primaryCoin = filtered[0]?.coin || 'SOL';
+
+    const summaryText = [
+        `# Crypto Earnings & Tax Accounting Synopsis`,
+        `- Tax Accounting Year: ${activeYear === 'all' ? 'All Years' : activeYear}`,
+        `- Wallet Address: ${cryptoAccountingState.address || 'Sample Wallet'}`,
+        `- Network: ${cryptoAccountingState.selectedNetwork.toUpperCase()}`,
+        `- Number of Incoming Payments: ${filtered.length}`,
+        `- Total Crypto Received: ${totCrypto.toFixed(4)} ${primaryCoin}`,
+        `- Weighted Average Spot FX on Receipt Dates: ${sym} ${avgSpot.toFixed(2)} / ${primaryCoin}`,
+        `- Gross Taxable Crypto Income: ${sym} ${totGross.toLocaleString('en-US', { minimumFractionDigits: 2, maximumFractionDigits: 2 })}`,
+        `- Deductible Expenses / Cost Basis: ${sym} ${cryptoAccountingState.deductible.toFixed(2)}`,
+        `- Statutory Tax Rate: ${cryptoAccountingState.taxRate.toFixed(1)}%`,
+        `============================================================`,
+        `ESTIMATED TAX OWED TO THE STATE: ${sym} ${totTax.toLocaleString('en-US', { minimumFractionDigits: 2, maximumFractionDigits: 2 })}`,
+        `NET RETAINED CRYPTO EARNINGS: ${sym} ${netRetained.toLocaleString('en-US', { minimumFractionDigits: 2, maximumFractionDigits: 2 })}`,
+        `============================================================`,
+        `*Calculated using exact daily closing spot exchange rates via Moecher Engine.*`
+    ].join('\n');
+
+    if (navigator.clipboard) {
+        navigator.clipboard.writeText(summaryText).then(() => {
+            showToast('Tax return synopsis copied to clipboard!', 'success');
+        });
+    }
+    return summaryText;
+}
+
+function sendCryptoTaxToChat() {
+    const summary = copyCryptoTaxSummary();
+    if (!summary) return;
+
+    closeCryptoAccountingModal();
+
+    const chatInput = document.getElementById('chat-input');
+    if (chatInput) {
+        chatInput.value = `${summary}\n\nPlease analyze my crypto income for this tax year, verify the statutory tax due, and advise on any potential deductions, exemptions, or accounting treatment for these crypto earnings.`;
+        chatInput.style.height = 'auto';
+        chatInput.style.height = `${Math.min(chatInput.scrollHeight, 240)}px`;
+        chatInput.focus();
+        showToast('Crypto tax summary injected into Moecher Chat', 'info');
+    }
+}
+
+// ────────────────────────────────────────────────────────────────────────────────
+// Modal Open / Close & UI Initializer
+// ────────────────────────────────────────────────────────────────────────────────
+
+function openCryptoAccountingModal() {
+    const modal = document.getElementById('crypto-accounting-modal');
+    if (modal) {
+        modal.classList.remove('hidden');
+        loadCryptoTaxSettings();
+    }
+}
+
+function closeCryptoAccountingModal(e) {
+    if (e && e.target && e.target !== e.currentTarget && !e.target.classList.contains('crypto-modal-close-btn')) {
+        return;
+    }
+    const modal = document.getElementById('crypto-accounting-modal');
+    if (modal) modal.classList.add('hidden');
+}
+
+function toggleMaximizeCryptoModal() {
+    const dialog = document.getElementById('crypto-modal-dialog');
+    const icon = document.querySelector('#crypto-modal-maximize-btn span');
+    if (dialog) {
+        dialog.classList.toggle('maximized');
+        if (icon) {
+            icon.textContent = dialog.classList.contains('maximized') ? 'fullscreen_exit' : 'fullscreen';
+        }
+    }
+}
+
+function loadCryptoTaxSettings() {
+    try {
+        const curr = localStorage.getItem('moecher_crypto_default_curr') || 'EUR';
+        const rate = localStorage.getItem('moecher_crypto_default_rate') || '30';
+        const year = localStorage.getItem('moecher_crypto_default_year') || 'last_year';
+        const solRpc = localStorage.getItem('moecher_crypto_solana_rpc') || '';
+        const ethKey = localStorage.getItem('moecher_crypto_etherscan_key') || '';
+
+        cryptoTaxSettings.defaultCurrency = curr;
+        cryptoTaxSettings.defaultTaxRate = parseFloat(rate) || 30;
+        cryptoTaxSettings.defaultYear = year;
+        cryptoTaxSettings.customSolanaRpc = solRpc;
+        cryptoTaxSettings.etherscanApiKey = ethKey;
+
+        // Sync modal inputs if first time
+        if (!cryptoAccountingState.address) {
+            setCryptoCurrency(curr);
+            setQuickTaxRate(cryptoTaxSettings.defaultTaxRate);
+            const yearSelect = document.getElementById('crypto-year-select');
+            if (yearSelect) yearSelect.value = year;
+            cryptoAccountingState.selectedYear = year;
+        }
+
+        const solRpcInput = document.getElementById('crypto-solana-rpc');
+        if (solRpcInput && solRpc) solRpcInput.value = solRpc;
+
+        const ethKeyInput = document.getElementById('crypto-etherscan-key');
+        if (ethKeyInput && ethKey) ethKeyInput.value = ethKey;
+    } catch (e) {
+        console.warn('Failed to load crypto tax settings:', e);
+    }
+}
+
+function initCryptoAccountingUI() {
+    loadCryptoTaxSettings();
+
+    // Keydown listener for Enter on address input
+    const addrInput = document.getElementById('crypto-address-input');
+    if (addrInput) {
+        addrInput.addEventListener('keydown', (e) => {
+            if (e.key === 'Enter') {
+                e.preventDefault();
+                runCryptoAccounting();
+            }
+        });
+    }
+
+    // Advanced inputs change
+    const solRpcInput = document.getElementById('crypto-solana-rpc');
+    if (solRpcInput) {
+        solRpcInput.addEventListener('change', () => {
+            cryptoTaxSettings.customSolanaRpc = solRpcInput.value.trim();
+            localStorage.setItem('moecher_crypto_solana_rpc', cryptoTaxSettings.customSolanaRpc);
+        });
+    }
+
+    const ethKeyInput = document.getElementById('crypto-etherscan-key');
+    if (ethKeyInput) {
+        ethKeyInput.addEventListener('change', () => {
+            cryptoTaxSettings.etherscanApiKey = ethKeyInput.value.trim();
+            localStorage.setItem('moecher_crypto_etherscan_key', cryptoTaxSettings.etherscanApiKey);
+        });
+    }
+}
+
 

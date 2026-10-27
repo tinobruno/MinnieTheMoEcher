@@ -38,6 +38,10 @@
                     <span class="material-symbols-outlined">tune</span>
                     <span>Settings</span>
                 </button>
+                <button type="button" class="action-btn crypto-tax-nav-btn" onclick="openCryptoAccountingModal()" title="Crypto Income & Tax Accounting (Solana & Ethereum)">
+                    <span class="material-symbols-outlined" style="color: #f59e0b;">account_balance_wallet</span>
+                    <span>Crypto Taxes</span>
+                </button>
             </div>
 
             <details class="stats-section" open>
@@ -1788,6 +1792,48 @@
                             </div>
                         </div>
 
+                        <!-- Card: Crypto Tax Accounting Defaults -->
+                        <div class="agentic-card" style="border: 1px solid rgba(245, 158, 11, 0.4); background: linear-gradient(180deg, rgba(245, 158, 11, 0.05) 0%, rgba(15, 23, 42, 0.4) 100%);">
+                            <div class="agentic-card-header" style="justify-content: space-between; align-items: center;">
+                                <div style="display: flex; align-items: center; gap: 10px;">
+                                    <span class="material-symbols-outlined agentic-card-icon" style="color: #fbbf24; background: rgba(245, 158, 11, 0.15);">account_balance_wallet</span>
+                                    <div class="agentic-card-title-group">
+                                        <h4 style="color: #fef3c7;">Crypto Tax & Income Accounting Defaults</h4>
+                                        <p class="agentic-subtitle">Default parameters for Solana & Ethereum earnings conversions and annual tax calculations</p>
+                                    </div>
+                                </div>
+                                <button type="button" class="editor-btn" onclick="openCryptoAccountingModal()" style="background: rgba(245, 158, 11, 0.2); border-color: rgba(245, 158, 11, 0.5); color: #fde68a; font-weight: 600; padding: 6px 14px;">
+                                    <span class="material-symbols-outlined" style="font-size: 16px; vertical-align: middle;">open_in_new</span>
+                                    <span>Launch Calculator</span>
+                                </button>
+                            </div>
+
+                            <div style="display: grid; grid-template-columns: repeat(auto-fit, minmax(200px, 1fr)); gap: 12px; margin-top: 10px;">
+                                <div>
+                                    <label class="agentic-section-label" for="acct-crypto-default-currency" style="margin-bottom: 4px; display: block;">Default Fiat Currency</label>
+                                    <select id="acct-crypto-default-currency" class="agentic-text-field" style="width: 100%; height: 34px; padding: 4px 8px;" onchange="onAccountingSettingChange()">
+                                        <option value="EUR">EUR (€) - European Euro</option>
+                                        <option value="USD">USD ($) - US Dollar</option>
+                                    </select>
+                                    <div class="agentic-hint">Used for spot FX conversion at transaction timestamps.</div>
+                                </div>
+                                <div>
+                                    <label class="agentic-section-label" for="acct-crypto-default-tax-rate" style="margin-bottom: 4px; display: block;">Default Tax Rate (%)</label>
+                                    <input type="number" id="acct-crypto-default-tax-rate" class="agentic-text-field" style="width: 100%; height: 34px; padding: 4px 8px;" value="30" min="0" max="100" step="0.5" onchange="onAccountingSettingChange()">
+                                    <div class="agentic-hint">Standard flat tax / income tax rate (e.g. 30% PFU/flat tax).</div>
+                                </div>
+                                <div>
+                                    <label class="agentic-section-label" for="acct-crypto-default-year" style="margin-bottom: 4px; display: block;">Default Accounting Year</label>
+                                    <select id="acct-crypto-default-year" class="agentic-text-field" style="width: 100%; height: 34px; padding: 4px 8px;" onchange="onAccountingSettingChange()">
+                                        <option value="last_year" selected>Last Year (2025)</option>
+                                        <option value="current_year">Current Year (2026)</option>
+                                        <option value="all">All Years</option>
+                                    </select>
+                                    <div class="agentic-hint">Initial year selected when opening crypto ledger.</div>
+                                </div>
+                            </div>
+                        </div>
+
                         <!-- Card 5: Quick Presets & Control Bar -->
                         <div class="agentic-card" style="background: rgba(255,255,255,0.02);">
                             <div style="display: flex; align-items: center; justify-content: space-between; flex-wrap: wrap; gap: 10px;">
@@ -2228,6 +2274,312 @@
                     </button>
                 </div>
                 <pre id="pdf-modal-text-content" class="pdf-modal-text-content"></pre>
+            </div>
+        </div>
+    </div>
+
+    <!-- Crypto Income & Tax Accounting Modal -->
+    <div id="crypto-accounting-modal" class="crypto-modal-backdrop hidden" onclick="closeCryptoAccountingModal(event)">
+        <div class="crypto-modal-dialog" id="crypto-modal-dialog" onclick="event.stopPropagation()">
+            <!-- Modal Header -->
+            <div class="crypto-modal-header">
+                <div class="crypto-modal-title-row">
+                    <div class="crypto-modal-icon-wrap">
+                        <span class="material-symbols-outlined crypto-wallet-icon">account_balance_wallet</span>
+                    </div>
+                    <div class="crypto-modal-title-group">
+                        <div class="crypto-modal-title-headline">
+                            <h3>Crypto Income & Tax Accounting</h3>
+                            <div class="crypto-chain-tags">
+                                <span class="crypto-badge eth">Ethereum (ETH & ERC-20)</span>
+                                <span class="crypto-badge sol">Solana (SOL & SPL)</span>
+                                <span class="crypto-badge fx">Spot FX @ Tx Date</span>
+                            </div>
+                        </div>
+                        <p class="crypto-modal-subtitle">
+                            Extract incoming earnings, convert to EUR or USD at exact historical spot rates on receipt dates, and calculate total annual tax owed to the state.
+                        </p>
+                    </div>
+                </div>
+                <div class="crypto-modal-header-actions">
+                    <button type="button" class="crypto-tool-btn" id="crypto-modal-maximize-btn" onclick="toggleMaximizeCryptoModal()" title="Maximize / Restore Window">
+                        <span class="material-symbols-outlined">fullscreen</span>
+                    </button>
+                    <button type="button" class="crypto-modal-close-btn" onclick="closeCryptoAccountingModal()" title="Close">&times;</button>
+                </div>
+            </div>
+
+            <!-- Modal Body -->
+            <div class="crypto-modal-body">
+                <!-- Wallet Address & Control Card -->
+                <div class="crypto-card crypto-controls-card">
+                    <div class="crypto-input-grid">
+                        <!-- Address Bar -->
+                        <div class="crypto-address-bar-group">
+                            <label for="crypto-address-input" class="crypto-label">
+                                <span>Wallet Address</span>
+                                <span id="crypto-detected-pill" class="crypto-detected-pill unknown">Auto-Detecting</span>
+                            </label>
+                            <div class="crypto-address-input-wrap">
+                                <span class="material-symbols-outlined crypto-input-icon">key</span>
+                                <input type="text" id="crypto-address-input" class="crypto-text-input" 
+                                    placeholder="Paste Solana (base58 e.g. 7xKX...) or Ethereum (0x... 42-char) address..." 
+                                    autocomplete="off" spellcheck="false" oninput="onCryptoAddressInput(this.value)">
+                                <button type="button" class="crypto-paste-btn" onclick="pasteCryptoAddress()" title="Paste from clipboard">
+                                    <span class="material-symbols-outlined">content_paste</span>
+                                </button>
+                            </div>
+                        </div>
+
+                        <!-- Chain / Network Selection -->
+                        <div class="crypto-field-group">
+                            <label for="crypto-network-select" class="crypto-label">Blockchain Network</label>
+                            <select id="crypto-network-select" class="crypto-select" onchange="onCryptoNetworkChange()">
+                                <option value="auto">Auto-Detect Network</option>
+                                <option value="solana">Solana Mainnet (SOL)</option>
+                                <option value="ethereum">Ethereum Mainnet (ETH)</option>
+                            </select>
+                        </div>
+
+                        <!-- Target Fiat Currency -->
+                        <div class="crypto-field-group">
+                            <label class="crypto-label">Conversion Fiat Currency</label>
+                            <div class="crypto-segmented-group" id="crypto-currency-selector">
+                                <button type="button" class="crypto-segment-btn active" data-currency="EUR" onclick="setCryptoCurrency('EUR')">
+                                    <span class="crypto-symbol">€</span> EUR
+                                </button>
+                                <button type="button" class="crypto-segment-btn" data-currency="USD" onclick="setCryptoCurrency('USD')">
+                                    <span class="crypto-symbol">$</span> USD
+                                </button>
+                            </div>
+                        </div>
+
+                        <!-- Tax Year Selection -->
+                        <div class="crypto-field-group">
+                            <label for="crypto-year-select" class="crypto-label">Tax Accounting Year</label>
+                            <select id="crypto-year-select" class="crypto-select" onchange="onCryptoYearSelectChange()">
+                                <option value="last_year" selected>Last Year (2025)</option>
+                                <option value="current_year">Current Year (2026)</option>
+                                <option value="2025">Year 2025</option>
+                                <option value="2024">Year 2024</option>
+                                <option value="2023">Year 2023</option>
+                                <option value="all">All Years (Comprehensive)</option>
+                            </select>
+                        </div>
+
+                        <!-- Tax Rate Percentage -->
+                        <div class="crypto-field-group">
+                            <div class="crypto-label-row">
+                                <label for="crypto-tax-rate-input" class="crypto-label">Tax Rate (%)</label>
+                                <span class="crypto-tax-preset-row">
+                                    <button type="button" class="crypto-preset-pill" onclick="setQuickTaxRate(30)">30%</button>
+                                    <button type="button" class="crypto-preset-pill" onclick="setQuickTaxRate(25)">25%</button>
+                                    <button type="button" class="crypto-preset-pill" onclick="setQuickTaxRate(33)">33%</button>
+                                    <button type="button" class="crypto-preset-pill" onclick="setQuickTaxRate(0)">0%</button>
+                                </span>
+                            </div>
+                            <div class="crypto-number-input-wrap">
+                                <input type="number" id="crypto-tax-rate-input" class="crypto-number-input" value="30" min="0" max="100" step="0.5" oninput="onCryptoTaxRateChange()">
+                                <span class="crypto-unit-addon">%</span>
+                            </div>
+                        </div>
+
+                        <!-- Deductible Expenses / Cost Basis -->
+                        <div class="crypto-field-group">
+                            <label for="crypto-deductible-input" class="crypto-label">Deductible Expenses / Gas</label>
+                            <div class="crypto-number-input-wrap">
+                                <input type="number" id="crypto-deductible-input" class="crypto-number-input" value="0" min="0" step="10" oninput="onCryptoDeductibleChange()">
+                                <span class="crypto-unit-addon" id="crypto-deductible-curr-addon">€</span>
+                            </div>
+                        </div>
+                    </div>
+
+                    <!-- Action Buttons Bar -->
+                    <div class="crypto-actions-bar">
+                        <div class="crypto-primary-actions">
+                            <button type="button" id="crypto-calc-btn" class="crypto-btn-cta" onclick="runCryptoAccounting()">
+                                <span class="material-symbols-outlined" id="crypto-calc-btn-icon">analytics</span>
+                                <span id="crypto-calc-btn-text">Extract Transactions & Calculate Taxes</span>
+                            </button>
+                            <button type="button" class="crypto-btn-sample" onclick="loadSampleCryptoWallet('solana')" title="Load realistic sample Solana staking & earnings wallet">
+                                <span class="material-symbols-outlined">dataset</span>
+                                <span>Sample SOL Wallet</span>
+                            </button>
+                            <button type="button" class="crypto-btn-sample" onclick="loadSampleCryptoWallet('ethereum')" title="Load realistic sample Ethereum earnings wallet">
+                                <span class="material-symbols-outlined">dataset</span>
+                                <span>Sample ETH Wallet</span>
+                            </button>
+                        </div>
+                        <div class="crypto-secondary-actions">
+                            <button type="button" class="crypto-btn-text" onclick="toggleAdvancedCryptoSettings()" title="Custom RPC / Etherscan API key">
+                                <span class="material-symbols-outlined">tune</span>
+                                <span>RPC / API Settings</span>
+                            </button>
+                        </div>
+                    </div>
+
+                    <!-- Expandable Advanced RPC / API Settings -->
+                    <div id="crypto-advanced-settings" class="crypto-advanced-panel hidden">
+                        <div class="crypto-advanced-grid">
+                            <div>
+                                <label for="crypto-etherscan-key" class="crypto-label-sm">Etherscan API Key (Optional)</label>
+                                <input type="password" id="crypto-etherscan-key" class="crypto-text-input-sm" placeholder="Default: Free Blockscout Public API (No key required)">
+                            </div>
+                            <div>
+                                <label for="crypto-solana-rpc" class="crypto-label-sm">Custom Solana RPC Endpoint (Optional)</label>
+                                <input type="text" id="crypto-solana-rpc" class="crypto-text-input-sm" placeholder="https://api.mainnet-beta.solana.com">
+                            </div>
+                        </div>
+                    </div>
+                </div>
+
+                <!-- Status & Progress Banner -->
+                <div id="crypto-progress-banner" class="crypto-progress-banner hidden">
+                    <div class="crypto-progress-left">
+                        <div class="crypto-spinner" id="crypto-spinner"></div>
+                        <span id="crypto-progress-message">Connecting to blockchain...</span>
+                    </div>
+                    <div class="crypto-progress-right">
+                        <span id="crypto-progress-pct">0%</span>
+                        <div class="crypto-progress-track">
+                            <div class="crypto-progress-fill" id="crypto-progress-fill" style="width: 0%;"></div>
+                        </div>
+                    </div>
+                </div>
+
+                <!-- Executive Summary KPI Cards -->
+                <div class="crypto-kpi-grid" id="crypto-kpi-grid">
+                    <div class="crypto-kpi-card highlight-fiat">
+                        <div class="crypto-kpi-header">
+                            <span class="crypto-kpi-label">Gross Crypto Income</span>
+                            <span class="material-symbols-outlined crypto-kpi-icon">payments</span>
+                        </div>
+                        <div class="crypto-kpi-value" id="kpi-gross-fiat">€ 0.00</div>
+                        <div class="crypto-kpi-subtitle" id="kpi-gross-fiat-sub">Converted at spot rate on receipt dates</div>
+                    </div>
+
+                    <div class="crypto-kpi-card highlight-tax">
+                        <div class="crypto-kpi-header">
+                            <span class="crypto-kpi-label">Estimated Tax Owed to State</span>
+                            <span class="material-symbols-outlined crypto-kpi-icon">account_balance</span>
+                        </div>
+                        <div class="crypto-kpi-value tax-value" id="kpi-tax-owed">€ 0.00</div>
+                        <div class="crypto-kpi-subtitle" id="kpi-tax-owed-sub">At 30.0% tax rate on taxable base</div>
+                    </div>
+
+                    <div class="crypto-kpi-card">
+                        <div class="crypto-kpi-header">
+                            <span class="crypto-kpi-label">Total Crypto Received</span>
+                            <span class="material-symbols-outlined crypto-kpi-icon">toll</span>
+                        </div>
+                        <div class="crypto-kpi-value" id="kpi-crypto-total">0.0000 SOL</div>
+                        <div class="crypto-kpi-subtitle" id="kpi-crypto-total-sub">0 incoming transactions</div>
+                    </div>
+
+                    <div class="crypto-kpi-card">
+                        <div class="crypto-kpi-header">
+                            <span class="crypto-kpi-label">Weighted Average Spot FX</span>
+                            <span class="material-symbols-outlined crypto-kpi-icon">trending_up</span>
+                        </div>
+                        <div class="crypto-kpi-value" id="kpi-avg-spot">€ 0.00 / unit</div>
+                        <div class="crypto-kpi-subtitle" id="kpi-avg-spot-sub">Effective unit valuation upon receipt</div>
+                    </div>
+
+                    <div class="crypto-kpi-card highlight-net">
+                        <div class="crypto-kpi-header">
+                            <span class="crypto-kpi-label">Net Retained After Tax</span>
+                            <span class="material-symbols-outlined crypto-kpi-icon">savings</span>
+                        </div>
+                        <div class="crypto-kpi-value net-value" id="kpi-net-retained">€ 0.00</div>
+                        <div class="crypto-kpi-subtitle" id="kpi-net-retained-sub">After statutory tax deduction</div>
+                    </div>
+                </div>
+
+                <!-- Annual Breakdown Tabs & Comparison -->
+                <div class="crypto-breakdown-section">
+                    <div class="crypto-section-header">
+                        <div class="crypto-section-title-wrap">
+                            <span class="material-symbols-outlined" style="color: #38bdf8;">calendar_month</span>
+                            <h4>Annual Breakdown & Tax Year Filter</h4>
+                        </div>
+                        <div class="crypto-year-tabs" id="crypto-year-tabs">
+                            <!-- Injected dynamically: All Years, 2026, 2025, 2024 -->
+                        </div>
+                    </div>
+                </div>
+
+                <!-- Ledger Toolbar & Actions -->
+                <div class="crypto-ledger-toolbar">
+                    <div class="crypto-search-wrap">
+                        <span class="material-symbols-outlined">search</span>
+                        <input type="text" id="crypto-ledger-search" placeholder="Search by Tx Hash, Sender Address, or Date..." oninput="filterCryptoLedger()">
+                    </div>
+                    <div class="crypto-ledger-filters">
+                        <select id="crypto-type-filter" class="crypto-select-sm" onchange="filterCryptoLedger()">
+                            <option value="incoming" selected>Incoming Only (Earnings)</option>
+                            <option value="all">All Transactions</option>
+                        </select>
+                    </div>
+                    <div class="crypto-export-actions">
+                        <button type="button" class="crypto-tool-btn-export" onclick="exportCryptoTaxCsv()" title="Download Excel & Odoo-compatible CSV ledger">
+                            <span class="material-symbols-outlined">download</span>
+                            <span>Export CSV</span>
+                        </button>
+                        <button type="button" class="crypto-tool-btn-export" onclick="exportCryptoTaxJson()" title="Download complete JSON audit trail">
+                            <span class="material-symbols-outlined">code</span>
+                            <span>Export JSON</span>
+                        </button>
+                        <button type="button" class="crypto-tool-btn-export" onclick="copyCryptoTaxSummary()" title="Copy formatted tax return summary for tax authorities or accountant">
+                            <span class="material-symbols-outlined">content_copy</span>
+                            <span>Copy Tax Return Synopsis</span>
+                        </button>
+                        <button type="button" class="crypto-tool-btn-export primary" onclick="sendCryptoTaxToChat()" title="Send full tax report to Moecher AI chat for tax optimization discussion">
+                            <span class="material-symbols-outlined">chat_bubble</span>
+                            <span>Send to Moecher Chat</span>
+                        </button>
+                    </div>
+                </div>
+
+                <!-- Detailed Transactions Ledger Table -->
+                <div class="crypto-table-container">
+                    <table class="crypto-table" id="crypto-ledger-table">
+                        <thead>
+                            <tr>
+                                <th style="width: 45px;">#</th>
+                                <th style="width: 140px;">Date & Time (UTC)</th>
+                                <th style="width: 90px;">Chain</th>
+                                <th style="width: 130px;">Tx Hash</th>
+                                <th>From / Sender</th>
+                                <th style="text-align: right;">Amount Received</th>
+                                <th style="text-align: right;">Spot FX at Date</th>
+                                <th style="text-align: right;">Fiat Value</th>
+                                <th style="text-align: right;">Tax Due</th>
+                                <th style="width: 90px; text-align: center;">Status</th>
+                            </tr>
+                        </thead>
+                        <tbody id="crypto-ledger-tbody">
+                            <tr class="crypto-empty-row">
+                                <td colspan="10">
+                                    <div class="crypto-empty-state">
+                                        <span class="material-symbols-outlined">account_balance_wallet</span>
+                                        <p>No wallet loaded yet.</p>
+                                        <small>Paste an address above and click <b>Calculate Taxes</b>, or click <b>Sample SOL / ETH Wallet</b> to view a demo report.</small>
+                                    </div>
+                                </td>
+                            </tr>
+                        </tbody>
+                        <tfoot id="crypto-ledger-tfoot" class="hidden">
+                            <tr>
+                                <td colspan="5" style="font-weight: 600;">Total for Selected Filter</td>
+                                <td style="text-align: right; font-weight: 700;" id="tfoot-crypto-total">0.0000</td>
+                                <td style="text-align: right; color: #94a3b8;" id="tfoot-avg-spot">-</td>
+                                <td style="text-align: right; font-weight: 700; color: #38bdf8;" id="tfoot-fiat-total">€ 0.00</td>
+                                <td style="text-align: right; font-weight: 700; color: #f59e0b;" id="tfoot-tax-total">€ 0.00</td>
+                                <td></td>
+                            </tr>
+                        </tfoot>
+                    </table>
+                </div>
             </div>
         </div>
     </div>
