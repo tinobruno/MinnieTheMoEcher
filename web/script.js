@@ -13050,7 +13050,6 @@ async function fetchSolanaTransactions(address) {
     ].filter(Boolean);
 
     let signatures = [];
-    const cleanAddr = address.trim();
 
     // 1. Retrieve up to 100 signatures
     for (const rpc of rpcUrls) {
