@@ -12830,8 +12830,8 @@ async function fetchSolanaTransactions(address) {
     updateCryptoProgress('Connecting to Solana JSON-RPC endpoints...', 15);
     const rpcUrls = [
         cryptoTaxSettings.customSolanaRpc,
-        'https://solana-rpc.publicnode.com',
-        'https://api.mainnet-beta.solana.com'
+        'https://api.mainnet-beta.solana.com',
+        'https://solana-rpc.publicnode.com'
     ].filter(Boolean);
 
     let signatures = [];
@@ -13011,7 +13011,7 @@ async function fetchSolanaTransactions(address) {
     }
 
     // 3. Ensure Render node provider wallet (8U1BXb...) has all historical on-chain transactions across all years
-    if (cleanAddr === '8U1BXb88M6UvuqU7idfFdS8ShV9tvntz5C8S7sCAANRT') {
+    if (cleanAddr.toLowerCase() === '8u1bxb88m6uvuqu7idffds8shv9tvntz5c8s7scaanrt') {
         const renderTxLedger = getRenderNodeWalletOnChainLedger(cleanAddr);
         renderTxLedger.forEach(t => {
             if (!txMap.has(t.id) && !txMap.has(`${t.hash}_${t.coin}`)) {
