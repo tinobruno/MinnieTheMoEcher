@@ -31,5 +31,5 @@ echo Starting Moecher with DeepSeek V4 Flash Q4 on http://localhost:8000 ...
 echo [Press Ctrl+C to stop]
 echo.
 
-moecher.exe --manifest "%MANIFEST%" --port 8000 --max-vram 6 --dram-cache-gb 64 --budget 4096
+moecher.exe --manifest "%MANIFEST%" --port 8000 --max-vram 6 --dram-cache-gb 64 --budget 4096 --tools --allow-file-write
 pause

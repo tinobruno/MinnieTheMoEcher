@@ -160,6 +160,7 @@ void rebuild_system_prefix(
     json resolved_tools = active_tools;
     if (!resolved_tools.empty()) {
         resolved_tools = resolve_canonical_tools(resolved_tools);
+        g_enable_tools = true;
     }
 
     std::string full_prompt_text;
@@ -955,6 +956,9 @@ void run_server(MoecherEngine& engine, int port, int default_thinking_budget, in
                 std::string base_prompt = patch.value("base_prompt", g_base_system_prompt);
                 std::string custom_full_prompt = patch.value("system_prompt", "");
                 json tools = patch.contains("active_tools") ? patch["active_tools"] : (patch.contains("tools") ? patch["tools"] : g_current_active_tools);
+                if (tools.is_array() && !tools.empty()) {
+                    g_enable_tools = true;
+                }
                 rebuild_system_prefix(engine, base_prompt, tools, custom_full_prompt);
             }
 
@@ -1012,6 +1016,9 @@ void run_server(MoecherEngine& engine, int port, int default_thinking_budget, in
                             active_tools.push_back(mt);
                         }
                     }
+                }
+                if (active_tools.is_array()) {
+                    g_enable_tools = !active_tools.empty();
                 }
                 bool has_yt = false;
                 if (active_tools.is_array()) {
@@ -1417,7 +1424,8 @@ void run_server(MoecherEngine& engine, int port, int default_thinking_budget, in
             int max_thinking_tokens = default_thinking_budget;
 
             json tools = json::array();
-            if (g_enable_tools) {
+            bool allow_tools = g_enable_tools || request.contains("tools") || request.value("client_tool_execution", false);
+            if (allow_tools) {
                 if (request.contains("tools")) {
                     if (request["tools"].is_array()) {
                         tools = resolve_canonical_tools(request["tools"]);
@@ -1443,6 +1451,9 @@ void run_server(MoecherEngine& engine, int port, int default_thinking_budget, in
                     // Fallback to active tools configured via /api/system/configure
                     tools = g_current_active_tools;
                 }
+            }
+            if (!tools.empty()) {
+                g_enable_tools = true;
             }
 
             if (request.contains("enable_thinking") && request["enable_thinking"].is_boolean()) {
@@ -1802,7 +1813,7 @@ void run_server(MoecherEngine& engine, int port, int default_thinking_budget, in
                         sink.write(sse.data(), sse.size());
 
                         json current_messages = messages;
-                        int max_tool_rounds = (do_server_exec && !tools.empty() && g_enable_tools) ? req_max_tool_rounds : 1;
+                        int max_tool_rounds = (do_server_exec && !tools.empty()) ? req_max_tool_rounds : 1;
                         std::string final_finish_reason = "stop";
                         std::string last_completed_content;
                         std::vector<json> round_new_tool_msgs;
@@ -1879,7 +1890,7 @@ void run_server(MoecherEngine& engine, int port, int default_thinking_budget, in
 
                                 if (is_reasoning) {
                                     round_reasoning += text;
-                                    if (g_enable_tools && !tools.empty()) {
+                                    if (!tools.empty()) {
                                         return reasoning_filter.feed(text, [&](const std::string& safe_text) -> bool {
                                             return send_sse_delta(sink, req_id, model_id, created_time_str, "reasoning_content", safe_text);
                                         });
@@ -1888,7 +1899,7 @@ void run_server(MoecherEngine& engine, int port, int default_thinking_budget, in
                                     }
                                 } else {
                                     round_content += text;
-                                    if (g_enable_tools && !tools.empty()) {
+                                    if (!tools.empty()) {
                                         return content_filter.feed(text, [&](const std::string& safe_text) -> bool {
                                             return send_sse_delta(sink, req_id, model_id, created_time_str, "content", safe_text);
                                         });
@@ -1905,7 +1916,7 @@ void run_server(MoecherEngine& engine, int port, int default_thinking_budget, in
 
                             final_finish_reason = engine.last_finish_reason_.empty() ? "stop" : engine.last_finish_reason_;
 
-                            if (g_enable_tools && !tools.empty()) {
+                            if (!tools.empty()) {
                                 reasoning_filter.flush_remaining([&](const std::string& safe_text) -> bool {
                                     return send_sse_delta(sink, req_id, model_id, created_time_str, "reasoning_content", safe_text);
                                 });
@@ -1914,7 +1925,7 @@ void run_server(MoecherEngine& engine, int port, int default_thinking_budget, in
                                 });
                             }
 
-                            if (!g_enable_tools || tools.empty()) {
+                            if (tools.empty()) {
                                 break;
                             }
 
@@ -2672,7 +2683,7 @@ void run_server(MoecherEngine& engine, int port, int default_thinking_budget, in
                 std::string finish_reason = "stop";
                 std::vector<json> round_new_tool_msgs;
 
-                int max_tool_rounds = (do_server_exec && !tools.empty() && g_enable_tools) ? req_max_tool_rounds : 1;
+                int max_tool_rounds = (do_server_exec && !tools.empty()) ? req_max_tool_rounds : 1;
 
                 int max_allowed_prompt = engine.cfg_.max_seq_len - max_tokens;
                 if (max_allowed_prompt < 1024) max_allowed_prompt = engine.cfg_.max_seq_len - 256;
@@ -2742,7 +2753,7 @@ void run_server(MoecherEngine& engine, int port, int default_thinking_budget, in
                         }
                     }
 
-                    if (!g_enable_tools || tools.empty()) {
+                    if (tools.empty()) {
                         final_response_text = response_text;
                         break;
                     }

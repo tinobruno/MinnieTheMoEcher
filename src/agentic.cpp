@@ -1182,12 +1182,13 @@ void register_agentic_routes(httplib::Server& svr) {
         json resp_data = json::object();
         std::string output;
 
-        if (!g_enable_tools) {
+        if (!g_enable_tools && g_current_active_tools.empty()) {
             resp_data["success"] = false;
             resp_data["output"] = "Error: Tool execution is disabled on this server.";
             res.set_content(resp_data.dump(), "application/json");
             return;
         }
+        g_enable_tools = true;
 
         if (tool_name.rfind("mcp__", 0) != 0 && tool_name.rfind("tinobruno-", 0) != 0) {
             bool is_active = false;

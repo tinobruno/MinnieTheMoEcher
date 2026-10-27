@@ -57,7 +57,7 @@ echo [INFO] Open your browser at http://localhost:8001 to access the Web UI.
 echo.
 
 :: Default launch configuration (22 GB VRAM for 3090/4090, 48 GB DRAM cache)
-moecher.exe --manifest "%MANIFEST%" --max-vram 22 --dram-cache-gb 48 --port 8001 --quiet
+moecher.exe --manifest "%MANIFEST%" --max-vram 22 --dram-cache-gb 48 --port 8001 --tools --allow-file-write --quiet
 
 if %ERRORLEVEL% NEQ 0 (
     echo.
