@@ -2341,6 +2341,19 @@
                             </select>
                         </div>
 
+                        <!-- Target Asset / Token Selection -->
+                        <div class="crypto-field-group">
+                            <label for="crypto-asset-select" class="crypto-label">Target Asset / Token</label>
+                            <select id="crypto-asset-select" class="crypto-select" onchange="onCryptoAssetSelectChange()">
+                                <option value="all">All Assets (Auto-Detect)</option>
+                                <option value="RENDER" selected>RENDER (Render Network - Solana)</option>
+                                <option value="SOL">SOL (Native Solana)</option>
+                                <option value="ETH">ETH (Native Ethereum)</option>
+                                <option value="USDC">USDC (USD Coin)</option>
+                                <option value="USDT">USDT (Tether USD)</option>
+                            </select>
+                        </div>
+
                         <!-- Target Fiat Currency -->
                         <div class="crypto-field-group">
                             <label class="crypto-label">Conversion Fiat Currency</label>
@@ -2408,6 +2421,10 @@
                             <button type="button" class="crypto-btn-sample" onclick="loadSampleCryptoWallet('ethereum')" title="Load realistic sample Ethereum earnings wallet">
                                 <span class="material-symbols-outlined">dataset</span>
                                 <span>Sample ETH Wallet</span>
+                            </button>
+                            <button type="button" class="crypto-btn-sample" onclick="loadSampleCryptoWallet('render')" title="Load Render Network Node Provider Wallet (8U1BXb...)">
+                                <span class="material-symbols-outlined">developer_board</span>
+                                <span>Render Node Wallet</span>
                             </button>
                             <button type="button" class="crypto-btn-sample" onclick="triggerCryptoFileImport()" title="Import transactions from CSV or JSON file (Etherscan, Solscan, Koinly, Phantom, etc.)">
                                 <span class="material-symbols-outlined">upload_file</span>

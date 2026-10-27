@@ -6006,6 +6006,12 @@ iframe#preview-iframe {
     border: 1px solid rgba(56, 189, 248, 0.3);
 }
 
+.crypto-badge.render {
+    background: rgba(239, 68, 68, 0.18);
+    color: #fca5a5;
+    border: 1px solid rgba(239, 68, 68, 0.4);
+}
+
 .crypto-modal-subtitle {
     margin: 0;
     font-size: 0.8rem;
