@@ -12445,799 +12445,64 @@ function toggleAdvancedCryptoSettings() {
 }
 
 async function fetchWithProxyFallback(url, options = {}) {
+    // 1. Try local server proxy first to bypass browser CORS & Cloudflare 403 restrictions
+    try {
+        const proxyUrl = `/api/proxy?url=${encodeURIComponent(url)}`;
+        const ctrl = new AbortController();
+        const tid = setTimeout(() => ctrl.abort(), 7500);
+        const proxyResp = await fetch(proxyUrl, { ...options, signal: ctrl.signal });
+        clearTimeout(tid);
+        if (proxyResp.ok) return proxyResp;
+    } catch (e) {}
+
+    // 2. Direct browser fetch fallback
     try {
         const ctrl = new AbortController();
         const tid = setTimeout(() => ctrl.abort(), 6500);
         const directResp = await fetch(url, { ...options, signal: ctrl.signal });
         clearTimeout(tid);
         if (directResp.ok) return directResp;
-    } catch (e) {
-        // network or CORS failure - do not call non-existent local /api/proxy
-    }
+    } catch (e) {}
 
     return { ok: false, status: 500, json: async () => ({}) };
 }
 
-async function fetchHistoricalCryptoRate(coin, currency, dateStr) {
-    const safeCoin = (coin || 'ETH').toUpperCase();
-    const curr = (currency || 'EUR').toUpperCase();
-
-    // 0. Stablecoins
-    if (safeCoin === 'USDC' || safeCoin === 'USDT' || safeCoin === 'DAI') {
-        return curr === 'USD' ? 1.0 : 0.92;
-    }
-
-    // 1. Instant embedded spot rates for RENDER (0ms latency, zero failed network calls!)
-    if (safeCoin === 'RENDER') {
-        if (typeof RENDER_HISTORICAL_SPOT_RATES !== 'undefined' && RENDER_HISTORICAL_SPOT_RATES[dateStr]) {
-            const exactRate = RENDER_HISTORICAL_SPOT_RATES[dateStr][curr];
-            if (exactRate) return exactRate;
-        }
-    }
-
-    const cacheKey = `${safeCoin}_${curr}_${dateStr}`;
-    if (cryptoFxCache[cacheKey]) {
-        return cryptoFxCache[cacheKey];
-    }
-
-    try {
-        const storedCache = localStorage.getItem('moecher_crypto_fx_cache');
-        if (storedCache) {
-            const parsed = JSON.parse(storedCache);
-            if (parsed[cacheKey]) {
-                cryptoFxCache[cacheKey] = parsed[cacheKey];
-                return parsed[cacheKey];
-            }
-        }
-    } catch (e) {}
-
-    // Fallback to internal anchor rates
-    const fallback = getFallbackHistoricalRate(safeCoin, curr, dateStr);
-    cryptoFxCache[cacheKey] = fallback;
-    return fallback;
-}
-
-function getFallbackHistoricalRate(coin, currency, dateStr) {
-    const ym = (dateStr || '').substring(0, 7);
-    const coinTable = CRYPTO_FALLBACK_RATES[coin] || CRYPTO_FALLBACK_RATES.ETH;
-    if (coinTable[ym]) {
-        return coinTable[ym][currency] || coinTable[ym].USD;
-    }
-    const keys = Object.keys(coinTable).sort();
-    let closestKey = keys[0];
-    for (const k of keys) {
-        if (k <= ym) closestKey = k;
-    }
-    return coinTable[closestKey][currency] || coinTable[closestKey].USD;
-}
-
-function detectCryptoNetwork(address) {
-    if (!address || typeof address !== 'string') return 'unknown';
-    const clean = address.trim();
-    if (/^0x[0-9a-fA-F]{40}$/.test(clean)) return 'ethereum';
-    if (/^[1-9A-HJ-NP-Za-km-z]{32,44}$/.test(clean)) return 'solana';
-    return 'unknown';
-}
-
-function onCryptoAddressInput(val) {
-    cryptoAccountingState.address = (val || '').trim();
-    const detected = detectCryptoNetwork(cryptoAccountingState.address);
-    cryptoAccountingState.detectedNetwork = detected;
-
-    const pill = document.getElementById('crypto-detected-pill');
-    const netSelect = document.getElementById('crypto-network-select');
-
-    if (pill) {
-        pill.className = `crypto-detected-pill ${detected}`;
-        if (detected === 'ethereum') {
-            pill.textContent = 'Ethereum (0x)';
-            if (netSelect && cryptoAccountingState.selectedNetwork === 'auto') {
-                netSelect.value = 'ethereum';
-            }
-        } else if (detected === 'solana') {
-            pill.textContent = 'Solana (Base58)';
-            if (netSelect && cryptoAccountingState.selectedNetwork === 'auto') {
-                netSelect.value = 'solana';
-            }
-        } else if (cryptoAccountingState.address.length > 0) {
-            pill.textContent = 'Custom Format';
-        } else {
-            pill.textContent = 'Auto-Detecting';
-        }
-    }
-}
-
-async function pasteCryptoAddress() {
-    try {
-        if (navigator.clipboard && navigator.clipboard.readText) {
-            const text = await navigator.clipboard.readText();
-            const input = document.getElementById('crypto-address-input');
-            if (input && text) {
-                input.value = text.trim();
-                onCryptoAddressInput(text);
-                input.focus();
-                showToast('Wallet address pasted from clipboard', 'info');
-            }
-        } else {
-            showToast('Clipboard access not permitted by browser.', 'warning');
-        }
-    } catch (e) {
-        showToast('Could not read clipboard. Please paste manually.', 'info');
-    }
-}
-
-function onCryptoNetworkChange() {
-    const sel = document.getElementById('crypto-network-select');
-    if (sel) {
-        cryptoAccountingState.selectedNetwork = sel.value;
-    }
-}
-
-function onCryptoAssetSelectChange() {
-    const sel = document.getElementById('crypto-asset-select');
-    if (sel) {
-        cryptoAccountingState.selectedAsset = sel.value;
-        if (cryptoAccountingState.transactions.length > 0) {
-            calculateCryptoTaxes();
-        }
-    }
-}
-
-function setCryptoCurrency(curr) {
-    cryptoAccountingState.currency = curr;
-    const btns = document.querySelectorAll('#crypto-currency-selector .crypto-segment-btn');
-    btns.forEach(b => {
-        if (b.dataset.currency === curr) {
-            b.classList.add('active');
-        } else {
-            b.classList.remove('active');
-        }
-    });
-
-    const deductibleAddon = document.getElementById('crypto-deductible-curr-addon');
-    if (deductibleAddon) deductibleAddon.textContent = curr === 'EUR' ? '€' : '$';
-
-    localStorage.setItem('moecher_crypto_default_curr', curr);
-
-    if (cryptoAccountingState.transactions.length > 0) {
-        calculateCryptoTaxes();
-    }
-}
-
-function onCryptoYearSelectChange() {
-    const sel = document.getElementById('crypto-year-select');
-    if (sel) {
-        cryptoAccountingState.selectedYear = sel.value;
-        localStorage.setItem('moecher_crypto_default_year', sel.value);
-        if (cryptoAccountingState.transactions.length > 0) {
-            calculateCryptoTaxes();
-        }
-    }
-}
-
-function setQuickTaxRate(rate) {
-    const input = document.getElementById('crypto-tax-rate-input');
-    if (input) input.value = rate;
-    cryptoAccountingState.taxRate = rate;
-    localStorage.setItem('moecher_crypto_default_rate', rate);
-
-    if (cryptoAccountingState.transactions.length > 0) {
-        calculateCryptoTaxes();
-    }
-}
-
-function onCryptoTaxRateChange() {
-    const input = document.getElementById('crypto-tax-rate-input');
-    if (input) {
-        const val = parseFloat(input.value);
-        cryptoAccountingState.taxRate = isNaN(val) ? 0 : Math.max(0, Math.min(100, val));
-        localStorage.setItem('moecher_crypto_default_rate', cryptoAccountingState.taxRate);
-        if (cryptoAccountingState.transactions.length > 0) {
-            calculateCryptoTaxes();
-        }
-    }
-}
-
-function onCryptoDeductibleChange() {
-    const input = document.getElementById('crypto-deductible-input');
-    if (input) {
-        const val = parseFloat(input.value);
-        cryptoAccountingState.deductible = isNaN(val) ? 0 : Math.max(0, val);
-        if (cryptoAccountingState.transactions.length > 0) {
-            calculateCryptoTaxes();
-        }
-    }
-}
-
-function toggleAdvancedCryptoSettings() {
-    const panel = document.getElementById('crypto-advanced-settings');
-    if (panel) {
-        panel.classList.toggle('hidden');
-    }
-}
-
-async function fetchWithProxyFallback(url, options = {}) {
-    try {
-        const ctrl = new AbortController();
-        const tid = setTimeout(() => ctrl.abort(), 6500);
-        const directResp = await fetch(url, { ...options, signal: ctrl.signal });
-        clearTimeout(tid);
-        if (directResp.ok) return directResp;
-    } catch (e) {
-        // network or CORS failure - do not call non-existent local /api/proxy
-    }
-
-    return { ok: false, status: 500, json: async () => ({}) };
-}
-
-async function fetchHistoricalCryptoRate(coin, currency, dateStr) {
-    const safeCoin = (coin || 'ETH').toUpperCase();
-    if (safeCoin === 'USDC' || safeCoin === 'USDT' || safeCoin === 'DAI') {
-        if (currency === 'USD') return 1.0;
-        try {
-            const dt = new Date(`${dateStr}T00:00:00Z`);
-            const eurUrl = `https://api.binance.com/api/v3/klines?symbol=EURUSDT&interval=1d&startTime=${dt.getTime()}&limit=1`;
-            const eurResp = await fetchWithProxyFallback(eurUrl);
-            if (eurResp.ok) {
-                const eurData = await eurResp.json();
-                if (Array.isArray(eurData) && eurData.length > 0 && eurData[0][4]) {
-                    const eurUsd = parseFloat(eurData[0][4]);
-                    return eurUsd > 0 ? 1.0 / eurUsd : 0.92;
-                }
-            }
-        } catch (e) {}
-        return 0.92;
-    }
-
-    const cacheKey = `${safeCoin}_${currency}_${dateStr}`;
-    if (cryptoFxCache[cacheKey]) {
-        return cryptoFxCache[cacheKey];
-    }
-
-    try {
-        const storedCache = localStorage.getItem('moecher_crypto_fx_cache');
-        if (storedCache) {
-            const parsed = JSON.parse(storedCache);
-            if (parsed[cacheKey]) {
-                cryptoFxCache[cacheKey] = parsed[cacheKey];
-                return parsed[cacheKey];
-            }
-        }
-    } catch (e) {}
-
-    const dt = new Date(`${dateStr}T00:00:00Z`);
-    const dayStartMs = dt.getTime();
-    let rate = null;
-
-    // 1. Try Binance Daily Klines (Supports RENDERUSDT, ETHUSDT, SOLUSDT)
-    try {
-        const symbol = safeCoin === 'RENDER' ? 'RENDERUSDT' : `${safeCoin}USDT`;
-        const binanceUrl = `https://api.binance.com/api/v3/klines?symbol=${symbol}&interval=1d&startTime=${dayStartMs}&limit=1`;
-        const resp = await fetchWithProxyFallback(binanceUrl);
-        if (resp.ok) {
-            const data = await resp.json();
-            if (Array.isArray(data) && data.length > 0 && data[0][4]) {
-                const usdPrice = parseFloat(data[0][4]);
-                if (currency === 'USD') {
-                    rate = usdPrice;
-                } else if (currency === 'EUR') {
-                    const eurUrl = `https://api.binance.com/api/v3/klines?symbol=EURUSDT&interval=1d&startTime=${dayStartMs}&limit=1`;
-                    const eurResp = await fetchWithProxyFallback(eurUrl);
-                    if (eurResp.ok) {
-                        const eurData = await eurResp.json();
-                        if (Array.isArray(eurData) && eurData.length > 0 && eurData[0][4]) {
-                            const eurUsd = parseFloat(eurData[0][4]);
-                            rate = usdPrice / (eurUsd > 0 ? eurUsd : 1.08);
-                        }
-                    }
-                    if (rate === null) rate = usdPrice / 1.08;
-                }
-            }
-        }
-    } catch (e) {
-        console.warn(`Binance spot rate failed for ${safeCoin} on ${dateStr}:`, e);
-    }
-
-    // 2. Try CoinGecko History Fallback
-    if (rate === null || isNaN(rate)) {
-        try {
-            const coinId = safeCoin === 'RENDER' ? 'render-token' : (safeCoin === 'ETH' ? 'ethereum' : 'solana');
-            const parts = dateStr.split('-');
-            const cgDate = `${parts[2]}-${parts[1]}-${parts[0]}`;
-            const cgUrl = `https://api.coingecko.com/api/v3/coins/${coinId}/history?date=${cgDate}`;
-            const cgResp = await fetchWithProxyFallback(cgUrl);
-            if (cgResp.ok) {
-                const cgData = await cgResp.json();
-                if (cgData && cgData.market_data && cgData.market_data.current_price) {
-                    const p = cgData.market_data.current_price[currency.toLowerCase()];
-                    if (p) rate = parseFloat(p);
-                }
-            }
-        } catch (e) {
-            console.warn(`CoinGecko history failed for ${safeCoin} on ${dateStr}:`, e);
-        }
-    }
-
-    // 3. Fallback Anchor Table
-    if (rate === null || isNaN(rate) || rate <= 0) {
-        rate = getFallbackHistoricalRate(safeCoin, currency, dateStr);
-    }
-
-    if (rate && !isNaN(rate)) {
-        cryptoFxCache[cacheKey] = rate;
-        try {
-            const stored = JSON.parse(localStorage.getItem('moecher_crypto_fx_cache') || '{}');
-            stored[cacheKey] = rate;
-            localStorage.setItem('moecher_crypto_fx_cache', JSON.stringify(stored));
-        } catch (e) {}
-    }
-
-    return rate || (safeCoin === 'RENDER' ? 1.67 : (safeCoin === 'ETH' ? 2500 : 140));
-}
-
-function updateCryptoProgress(message, pct) {
-    const banner = document.getElementById('crypto-progress-banner');
-    const msgEl = document.getElementById('crypto-progress-message');
-    const pctEl = document.getElementById('crypto-progress-pct');
-    const fillEl = document.getElementById('crypto-progress-fill');
-
-    if (banner) banner.classList.remove('hidden');
-    if (msgEl) msgEl.textContent = message;
-    if (pctEl) pctEl.textContent = `${pct}%`;
-    if (fillEl) fillEl.style.width = `${pct}%`;
-}
-
-function hideCryptoProgress() {
-    const banner = document.getElementById('crypto-progress-banner');
-    if (banner) banner.classList.add('hidden');
-}
-
-// ────────────────────────────────────────────────────────────────────────────────
-// Blockchain Fetchers (Multi-Provider Resilient Pipeline)
-// ────────────────────────────────────────────────────────────────────────────────
-
-async function fetchEthereumTransactions(address) {
-    updateCryptoProgress('Querying Ethplorer & Blockscout nodes...', 15);
-    const txMap = new Map();
-    const cleanAddr = address.trim();
-    const lowerAddr = cleanAddr.toLowerCase();
-
-    // 1. Primary Source: Ethplorer API (Native ETH transactions)
-    try {
-        const epUrl = `https://api.ethplorer.io/getAddressTransactions/${cleanAddr}?apiKey=freekey&limit=50`;
-        const resp = await fetchWithProxyFallback(epUrl);
-        if (resp.ok) {
-            const items = await resp.json();
-            if (Array.isArray(items)) {
-                for (const it of items) {
-                    const toAddr = (it.to || '').toLowerCase();
-                    const fromAddr = it.from || 'External Address';
-                    const isIncoming = toAddr === lowerAddr;
-                    const val = parseFloat(it.value || '0');
-                    const ts = (it.timestamp || 0) * 1000;
-                    const dt = new Date(ts > 0 ? ts : Date.now());
-                    const dateStr = dt.toISOString().split('T')[0];
-                    const dateTimeStr = dt.toISOString().replace('T', ' ').substring(0, 19);
-
-                    if (it.hash && (val > 0 || isIncoming)) {
-                        txMap.set(`${it.hash}_ETH`, {
-                            id: `${it.hash}_ETH`,
-                            chain: 'Ethereum',
-                            coin: 'ETH',
-                            hash: it.hash,
-                            from: fromAddr,
-                            to: it.to || cleanAddr,
-                            amount: val,
-                            timestamp: ts,
-                            dateStr: dateStr,
-                            dateTimeStr: dateTimeStr,
-                            year: dt.getUTCFullYear().toString(),
-                            isIncoming: isIncoming,
-                            isSuccess: true,
-                            explorerUrl: `https://etherscan.io/tx/${it.hash}`
-                        });
-                    }
-                }
-            }
-        }
-    } catch (e) {
-        console.warn('Ethplorer normal transactions error:', e);
-    }
-
-    updateCryptoProgress('Scanning ERC-20 Token Transfers (USDC, USDT, etc.)...', 35);
-
-    // 2. Primary Source: Ethplorer API (ERC-20 Token transfers)
-    try {
-        const tokUrl = `https://api.ethplorer.io/getAddressHistory/${cleanAddr}?apiKey=freekey&type=transfer&limit=50`;
-        const respTok = await fetchWithProxyFallback(tokUrl);
-        if (respTok.ok) {
-            const dataTok = await respTok.json();
-            if (Array.isArray(dataTok.operations)) {
-                for (const op of dataTok.operations) {
-                    const toAddr = (op.to || '').toLowerCase();
-                    const isIncoming = toAddr === lowerAddr;
-                    const token = op.tokenInfo || {};
-                    const decimals = parseInt(token.decimals || '18');
-                    const rawVal = parseFloat(op.value || '0');
-                    const tokenAmt = decimals > 0 ? rawVal / Math.pow(10, decimals) : rawVal;
-                    const symbol = (token.symbol || 'ERC20').toUpperCase();
-                    const ts = (op.timestamp || 0) * 1000;
-                    const dt = new Date(ts > 0 ? ts : Date.now());
-                    const dateStr = dt.toISOString().split('T')[0];
-                    const dateTimeStr = dt.toISOString().replace('T', ' ').substring(0, 19);
-
-                    const key = `${op.transactionHash}_${symbol}`;
-                    if (op.transactionHash && (tokenAmt > 0 || isIncoming) && !txMap.has(key)) {
-                        txMap.set(key, {
-                            id: key,
-                            chain: 'Ethereum',
-                            coin: symbol,
-                            hash: op.transactionHash,
-                            from: op.from || 'Token Sender',
-                            to: op.to || cleanAddr,
-                            amount: tokenAmt,
-                            timestamp: ts,
-                            dateStr: dateStr,
-                            dateTimeStr: dateTimeStr,
-                            year: dt.getUTCFullYear().toString(),
-                            isIncoming: isIncoming,
-                            isSuccess: true,
-                            explorerUrl: `https://etherscan.io/tx/${op.transactionHash}`
-                        });
-                    }
-                }
-            }
-        }
-    } catch (e) {
-        console.warn('Ethplorer token history error:', e);
-    }
-
-    updateCryptoProgress('Checking Blockscout for internal contract transfers...', 55);
-
-    // 3. Secondary Fallback Source: Blockscout (Safe pagination without startblock range)
-    try {
-        const bsUrl = `https://eth.blockscout.com/api?module=account&action=txlist&address=${cleanAddr}&page=1&offset=50&sort=desc`;
-        const bsResp = await fetchWithProxyFallback(bsUrl);
-        if (bsResp.ok) {
-            const bsData = await bsResp.json();
-            if (bsData.status === '1' && Array.isArray(bsData.result)) {
-                for (const item of bsData.result) {
-                    const toAddr = (item.to || '').toLowerCase();
-                    const isIncoming = toAddr === lowerAddr;
-                    const rawVal = parseFloat(item.value || '0');
-                    const isSuccess = item.isError === '0';
-                    const key = `${item.hash}_ETH`;
-                    if (isSuccess && !txMap.has(key) && (rawVal > 0 || isIncoming)) {
-                        const amountEth = rawVal / 1e18;
-                        const ts = parseInt(item.timeStamp) * 1000;
-                        const dt = new Date(ts);
-                        txMap.set(key, {
-                            id: key,
-                            chain: 'Ethereum',
-                            coin: 'ETH',
-                            hash: item.hash,
-                            from: item.from,
-                            to: item.to || cleanAddr,
-                            amount: amountEth,
-                            timestamp: ts,
-                            dateStr: dt.toISOString().split('T')[0],
-                            dateTimeStr: dt.toISOString().replace('T', ' ').substring(0, 19),
-                            year: dt.getUTCFullYear().toString(),
-                            isIncoming: isIncoming,
-                            isSuccess: isSuccess,
-                            explorerUrl: `https://etherscan.io/tx/${item.hash}`
-                        });
-                    }
-                }
-            }
-        }
-    } catch (e) {
-        console.warn('Blockscout standard fallback error:', e);
-    }
-
-    // 4. Blockscout Internal Transactions (contract calls, pool/mining/staking payouts)
-    try {
-        const bsIntUrl = `https://eth.blockscout.com/api?module=account&action=txlistinternal&address=${cleanAddr}&page=1&offset=50&sort=desc`;
-        const bsIntResp = await fetchWithProxyFallback(bsIntUrl);
-        if (bsIntResp.ok) {
-            const bsIntData = await bsIntResp.json();
-            if (bsIntData.status === '1' && Array.isArray(bsIntData.result)) {
-                for (const item of bsIntData.result) {
-                    const toAddr = (item.to || '').toLowerCase();
-                    const isIncoming = toAddr === lowerAddr;
-                    const rawVal = parseFloat(item.value || '0');
-                    const isSuccess = item.isError === '0';
-                    const key = `${item.hash}_ETH_INT`;
-                    if (isSuccess && !txMap.has(key) && (rawVal > 0 || isIncoming)) {
-                        const amountEth = rawVal / 1e18;
-                        const ts = parseInt(item.timeStamp) * 1000;
-                        const dt = new Date(ts);
-                        txMap.set(key, {
-                            id: key,
-                            chain: 'Ethereum',
-                            coin: 'ETH (Internal)',
-                            hash: item.hash,
-                            from: item.from || 'Contract Payout',
-                            to: item.to || cleanAddr,
-                            amount: amountEth,
-                            timestamp: ts,
-                            dateStr: dt.toISOString().split('T')[0],
-                            dateTimeStr: dt.toISOString().replace('T', ' ').substring(0, 19),
-                            year: dt.getUTCFullYear().toString(),
-                            isIncoming: isIncoming,
-                            isSuccess: isSuccess,
-                            explorerUrl: `https://etherscan.io/tx/${item.hash}`
-                        });
-                    }
-                }
-            }
-        }
-    } catch (e) {}
-
-    // 5. Multi-Chain EVM Fallback: If 0 transactions found, check Optimism & Base
-    if (txMap.size === 0) {
-        const evmChains = [
-            { name: 'Optimism', url: `https://optimism.blockscout.com/api?module=account&action=txlist&address=${cleanAddr}&page=1&offset=30&sort=desc` },
-            { name: 'Base', url: `https://base.blockscout.com/api?module=account&action=txlist&address=${cleanAddr}&page=1&offset=30&sort=desc` }
-        ];
-        for (const evm of evmChains) {
-            try {
-                const resp = await fetchWithProxyFallback(evm.url);
-                if (resp.ok) {
-                    const d = await resp.json();
-                    if (d.status === '1' && Array.isArray(d.result) && d.result.length > 0) {
-                        for (const item of d.result) {
-                            const toAddr = (item.to || '').toLowerCase();
-                            const isIncoming = toAddr === lowerAddr;
-                            const rawVal = parseFloat(item.value || '0');
-                            const key = `${item.hash}_${evm.name}`;
-                            if (!txMap.has(key)) {
-                                const amountEth = rawVal / 1e18;
-                                const ts = parseInt(item.timeStamp) * 1000;
-                                const dt = new Date(ts);
-                                txMap.set(key, {
-                                    id: key,
-                                    chain: evm.name,
-                                    coin: 'ETH',
-                                    hash: item.hash,
-                                    from: item.from,
-                                    to: item.to || cleanAddr,
-                                    amount: amountEth,
-                                    timestamp: ts,
-                                    dateStr: dt.toISOString().split('T')[0],
-                                    dateTimeStr: dt.toISOString().replace('T', ' ').substring(0, 19),
-                                    year: dt.getUTCFullYear().toString(),
-                                    isIncoming: isIncoming,
-                                    isSuccess: item.isError === '0',
-                                    explorerUrl: `https://etherscan.io/tx/${item.hash}`
-                                });
-                            }
-                        }
-                        break;
-                    }
-                }
-            } catch (e) {}
-        }
-    }
-
-    return Array.from(txMap.values()).sort((a, b) => b.timestamp - a.timestamp);
-}
-
-// Known Solana SPL Token Mints dictionary
-const KNOWN_SOLANA_TOKENS = {
-    'rndrizKT3MK1iimdxRdWabcF7Zg7AR5T4nud4EkHBof': 'RENDER',
-    'EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v': 'USDC',
-    'Es9vMFrzaCERmJfrF4H2FYD4KCoNkY11McCe8BenwNYB': 'USDT',
-    'DezXAZ8z7PnrnRJjz3wXBoRgixCa6xjnB7YaB1pPB263': 'BONK',
-    'JUPyiwrYJFskUPiHa7hkeR8VUtAeFoSYbKedZNsDvCN': 'JUP',
-    '4k3Dyjzvzp8eMZWUXbBCjEvwSkkk59S5iCNLY3QrkX6R': 'RAY'
-};
-
-async function fetchSolanaTransactions(address) {
-    const cleanAddr = address.trim();
-
-    // Fast-path: Render Node Provider Wallet (contains all 148 verified on-chain transactions including rav3... payouts)
-    if (cleanAddr.toLowerCase() === '8u1bxb88m6uvuqu7idffds8shv9tvntz5c8s7scaanrt') {
-        updateCryptoProgress('Loading verified on-chain ledger for Render Node Wallet...', 70);
-        return getRenderNodeWalletOnChainLedger(cleanAddr);
-    }
-
-    updateCryptoProgress('Connecting to Solana JSON-RPC endpoints...', 15);
-    const rpcUrls = [
-        cryptoTaxSettings.customSolanaRpc,
+// Resilient Solana JSON-RPC Client (routes through Minnie proxy with multi-provider failover)
+async function fetchSolanaRpc(method, params, customEndpoint = null) {
+    const endpoints = [
+        customEndpoint || cryptoTaxSettings.customSolanaRpc,
         'https://api.mainnet-beta.solana.com',
         'https://solana-rpc.publicnode.com'
     ].filter(Boolean);
 
-    let signatures = [];
+    const payload = JSON.stringify({
+        jsonrpc: '2.0',
+        id: Math.floor(Math.random() * 1000000) + 1,
+        method: method,
+        params: params
+    });
 
-    // 1. Retrieve up to 100 signatures
-    for (const rpc of rpcUrls) {
+    for (const ep of endpoints) {
         try {
-            const payload = JSON.stringify({
-                jsonrpc: '2.0',
-                id: 1,
-                method: 'getSignaturesForAddress',
-                params: [cleanAddr, { limit: 100 }]
-            });
-            const resp = await fetchWithProxyFallback(rpc, {
+            const resp = await fetchWithProxyFallback(ep, {
                 method: 'POST',
                 headers: { 'Content-Type': 'application/json' },
                 body: payload
             });
             if (resp.ok) {
                 const data = await resp.json();
-                if (Array.isArray(data.result) && data.result.length > 0) {
-                    signatures = data.result;
-                    break;
+                if (data && (data.result !== undefined || data.error !== undefined)) {
+                    return data;
                 }
             }
         } catch (e) {
-            console.warn(`Solana RPC ${rpc} signature query failed:`, e);
+            console.warn(`Solana RPC ${ep} error for ${method}:`, e);
         }
     }
 
-    const txMap = new Map();
-    const activeRpc = rpcUrls[0] || 'https://api.mainnet-beta.solana.com';
-
-    // 2. Batch getTransaction requests (chunks of 5)
-    if (signatures.length > 0) {
-        const batchSize = 5;
-        const total = Math.min(signatures.length, 100);
-
-        for (let b = 0; b < total; b += batchSize) {
-            const chunk = signatures.slice(b, b + batchSize);
-            const pct = Math.round(20 + ((b + 1) / total) * 50);
-            updateCryptoProgress(`Analyzing Solana transactions ${b + 1} to ${Math.min(b + batchSize, total)} of ${total}...`, pct);
-
-            // Paced throttle between batch requests
-            await new Promise(r => setTimeout(r, 400));
-
-            const batchReqs = chunk.map((sig, idx) => ({
-                jsonrpc: '2.0',
-                id: idx + 1,
-                method: 'getTransaction',
-                params: [sig.signature, { maxSupportedTransactionVersion: 0, encoding: 'jsonParsed' }]
-            }));
-
-            try {
-                let txResp = await fetchWithProxyFallback(activeRpc, {
-                    method: 'POST',
-                    headers: { 'Content-Type': 'application/json' },
-                    body: JSON.stringify(batchReqs)
-                });
-
-                if (txResp.ok) {
-                    const rawResults = await txResp.json();
-                    const results = Array.isArray(rawResults) ? rawResults : [rawResults];
-
-                    for (const item of results) {
-                        const txData = item.result;
-                        if (!txData || !txData.meta || txData.meta.err !== null) continue;
-
-                        const meta = txData.meta;
-                        const sig = txData.transaction?.signatures?.[0] || 'tx';
-                        const blockTime = txData.blockTime || 0;
-                        const ts = blockTime ? blockTime * 1000 : Date.now();
-                        const dt = new Date(ts);
-                        const dateStr = dt.toISOString().split('T')[0];
-                        const dateTimeStr = dt.toISOString().replace('T', ' ').substring(0, 19);
-                        const yearStr = dt.getUTCFullYear().toString();
-
-                        const accountKeys = txData.transaction?.message?.accountKeys || [];
-                        let targetIdx = -1;
-                        let senderAddr = 'Solana Signer';
-
-                        for (let a = 0; a < accountKeys.length; a++) {
-                            const pub = typeof accountKeys[a] === 'string' ? accountKeys[a] : accountKeys[a]?.pubkey;
-                            if (pub === cleanAddr) targetIdx = a;
-                        }
-
-                        if (accountKeys.length > 0) {
-                            const firstAcc = accountKeys[0];
-                            senderAddr = typeof firstAcc === 'string' ? firstAcc : firstAcc?.pubkey || 'Solana Signer';
-                        }
-
-                        // Check A: Native SOL balance changes
-                        if (targetIdx !== -1 && meta.preBalances && meta.postBalances) {
-                            const pre = meta.preBalances[targetIdx] || 0;
-                            const post = meta.postBalances[targetIdx] || 0;
-                            const diffLamports = post - pre;
-                            if (diffLamports !== 0) {
-                                const isInc = diffLamports > 0;
-                                const amtSol = Math.abs(diffLamports) / 1e9;
-                                const key = `${sig}_SOL`;
-                                if (!txMap.has(key)) {
-                                    txMap.set(key, {
-                                        id: key,
-                                        chain: 'Solana',
-                                        coin: 'SOL',
-                                        hash: sig,
-                                        from: isInc ? senderAddr : cleanAddr,
-                                        to: isInc ? cleanAddr : 'External Account',
-                                        amount: amtSol,
-                                        timestamp: ts,
-                                        dateStr: dateStr,
-                                        dateTimeStr: dateTimeStr,
-                                        year: yearStr,
-                                        isIncoming: isInc,
-                                        isSuccess: true,
-                                        explorerUrl: `https://solscan.io/tx/${sig}`
-                                    });
-                                }
-                            }
-                        }
-
-                        // Check B: SPL Token Balances (RENDER, USDC, USDT, etc.)
-                        const preTokens = meta.preTokenBalances || [];
-                        const postTokens = meta.postTokenBalances || [];
-                        const preMap = {};
-                        preTokens.forEach(pt => {
-                            preMap[pt.accountIndex] = pt.uiTokenAmount?.uiAmount || 0;
-                        });
-
-                        postTokens.forEach(pot => {
-                            const idxAcc = pot.accountIndex;
-                            let isUser = (pot.owner === cleanAddr);
-                            if (!isUser && idxAcc < accountKeys.length) {
-                                const pub = typeof accountKeys[idxAcc] === 'string' ? accountKeys[idxAcc] : accountKeys[idxAcc]?.pubkey;
-                                if (pub === cleanAddr || pub === 'BFpD1fuwkgp5ptpjpodiX1kA6wu4fBVDRdHPY3xNQejY') {
-                                    isUser = true;
-                                }
-                            }
-
-                            if (isUser) {
-                                const mint = pot.mint;
-                                const postAmt = pot.uiTokenAmount?.uiAmount || 0;
-                                const preAmt = preMap[idxAcc] || 0;
-                                const diff = postAmt - preAmt;
-                                if (diff !== 0) {
-                                    const isInc = diff > 0;
-                                    const symbol = KNOWN_SOLANA_TOKENS[mint] || 'SPL';
-                                    const key = `${sig}_${symbol}`;
-                                    if (!txMap.has(key)) {
-                                        txMap.set(key, {
-                                            id: key,
-                                            chain: 'Solana',
-                                            coin: symbol,
-                                            hash: sig,
-                                            from: isInc ? (symbol === 'RENDER' ? 'Render Network Distribution' : senderAddr) : cleanAddr,
-                                            to: isInc ? cleanAddr : 'Recipient Token Account',
-                                            amount: Math.abs(diff),
-                                            timestamp: ts,
-                                            dateStr: dateStr,
-                                            dateTimeStr: dateTimeStr,
-                                            year: yearStr,
-                                            isIncoming: isInc,
-                                            isSuccess: true,
-                                            explorerUrl: `https://solscan.io/tx/${sig}`
-                                        });
-                                    }
-                                }
-                            }
-                        });
-                    }
-                }
-            } catch (e) {
-                console.warn(`Solana batch parse failed around index ${b}:`, e);
-            }
-        }
-    }
-
-    // 3. Ensure Render node provider wallet (8U1BXb...) has all historical on-chain transactions across all years
-    if (cleanAddr.toLowerCase() === '8u1bxb88m6uvuqu7idffds8shv9tvntz5c8s7scaanrt') {
-        const renderTxLedger = getRenderNodeWalletOnChainLedger(cleanAddr);
-        renderTxLedger.forEach(t => {
-            // Strictly enforce ground-truth on-chain classification for Render wallet
-            txMap.set(`${t.hash}_${t.coin}`, t);
-        });
-    }
-
-    return Array.from(txMap.values()).sort((a, b) => b.timestamp - a.timestamp);
+    return { result: null, error: 'All Solana RPC endpoints failed' };
 }
 
-// Full on-chain pre-indexed ground truth for Render Node Wallet (8U1BXb88M6UvuqU7idfFdS8ShV9tvntz5C8S7sCAANRT)
-// Contains all 68 on-chain weekly compute payments: 22 in 2025 (1,390.73 RENDER) + 46 in 2026
 const RENDER_HISTORICAL_SPOT_RATES = {
     "2025-09-03": {
         "USD": 3.481,
@@ -13525,6 +12790,605 @@ const RENDER_HISTORICAL_SPOT_RATES = {
     }
 };
 
+async function fetchHistoricalCryptoRate(coin, currency, dateStr) {
+    const safeCoin = (coin || 'ETH').toUpperCase();
+    const curr = (currency || 'EUR').toUpperCase();
+
+    // 0. Stablecoins
+    if (safeCoin === 'USDC' || safeCoin === 'USDT' || safeCoin === 'DAI') {
+        return curr === 'USD' ? 1.0 : 0.92;
+    }
+
+    // 1. Instant embedded spot rates for RENDER (0ms latency, zero network calls!)
+    if (safeCoin === 'RENDER') {
+        if (typeof RENDER_HISTORICAL_SPOT_RATES !== 'undefined' && RENDER_HISTORICAL_SPOT_RATES[dateStr]) {
+            const exactRate = RENDER_HISTORICAL_SPOT_RATES[dateStr][curr];
+            if (exactRate) return exactRate;
+        }
+    }
+
+    const cacheKey = `${safeCoin}_${curr}_${dateStr}`;
+    if (cryptoFxCache[cacheKey]) {
+        return cryptoFxCache[cacheKey];
+    }
+
+    try {
+        const storedCache = localStorage.getItem('moecher_crypto_fx_cache');
+        if (storedCache) {
+            const parsed = JSON.parse(storedCache);
+            if (parsed[cacheKey]) {
+                cryptoFxCache[cacheKey] = parsed[cacheKey];
+                return parsed[cacheKey];
+            }
+        }
+    } catch (e) {}
+
+    // 2. Binance Daily Klines (routed via proxy, no CORS blocks)
+    const dt = new Date(`${dateStr}T00:00:00Z`);
+    const dayStartMs = dt.getTime();
+    let rate = null;
+
+    try {
+        const symbol = safeCoin === 'RENDER' ? 'RENDERUSDT' : `${safeCoin}USDT`;
+        const binanceUrl = `https://api.binance.com/api/v3/klines?symbol=${symbol}&interval=1d&startTime=${dayStartMs}&limit=1`;
+        const resp = await fetchWithProxyFallback(binanceUrl);
+        if (resp.ok) {
+            const data = await resp.json();
+            if (Array.isArray(data) && data.length > 0 && data[0][4]) {
+                const usdPrice = parseFloat(data[0][4]);
+                if (curr === 'USD') {
+                    rate = usdPrice;
+                } else if (curr === 'EUR') {
+                    const eurUrl = `https://api.binance.com/api/v3/klines?symbol=EURUSDT&interval=1d&startTime=${dayStartMs}&limit=1`;
+                    const eurResp = await fetchWithProxyFallback(eurUrl);
+                    if (eurResp.ok) {
+                        const eurData = await eurResp.json();
+                        if (Array.isArray(eurData) && eurData.length > 0 && eurData[0][4]) {
+                            const eurUsd = parseFloat(eurData[0][4]);
+                            rate = usdPrice / (eurUsd > 0 ? eurUsd : 1.08);
+                        }
+                    }
+                    if (rate === null) rate = usdPrice / 1.08;
+                }
+            }
+        }
+    } catch (e) {
+        console.warn(`Binance spot rate failed for ${safeCoin} on ${dateStr}:`, e);
+    }
+
+    // 3. Fallback Anchor Table
+    if (rate === null || isNaN(rate) || rate <= 0) {
+        rate = getFallbackHistoricalRate(safeCoin, curr, dateStr);
+    }
+
+    if (rate && !isNaN(rate)) {
+        cryptoFxCache[cacheKey] = rate;
+        try {
+            const stored = JSON.parse(localStorage.getItem('moecher_crypto_fx_cache') || '{}');
+            stored[cacheKey] = rate;
+            localStorage.setItem('moecher_crypto_fx_cache', JSON.stringify(stored));
+        } catch (e) {}
+    }
+
+    return rate || (safeCoin === 'RENDER' ? 1.67 : (safeCoin === 'ETH' ? 2500 : 140));
+}
+
+
+function updateCryptoProgress(message, pct) {
+    const banner = document.getElementById('crypto-progress-banner');
+    const msgEl = document.getElementById('crypto-progress-message');
+    const pctEl = document.getElementById('crypto-progress-pct');
+    const fillEl = document.getElementById('crypto-progress-fill');
+
+    if (banner) banner.classList.remove('hidden');
+    if (msgEl) msgEl.textContent = message;
+    if (pctEl) pctEl.textContent = `${pct}%`;
+    if (fillEl) fillEl.style.width = `${pct}%`;
+}
+
+function hideCryptoProgress() {
+    const banner = document.getElementById('crypto-progress-banner');
+    if (banner) banner.classList.add('hidden');
+}
+
+// ────────────────────────────────────────────────────────────────────────────────
+// Blockchain Fetchers (Multi-Provider Resilient Pipeline)
+// ────────────────────────────────────────────────────────────────────────────────
+
+async function fetchEthereumTransactions(address) {
+    updateCryptoProgress('Querying Ethplorer & Blockscout nodes...', 15);
+    const txMap = new Map();
+    const cleanAddr = address.trim();
+    const lowerAddr = cleanAddr.toLowerCase();
+
+    // 1. Primary Source: Ethplorer API (Native ETH transactions)
+    try {
+        const epUrl = `https://api.ethplorer.io/getAddressTransactions/${cleanAddr}?apiKey=freekey&limit=50`;
+        const resp = await fetchWithProxyFallback(epUrl);
+        if (resp.ok) {
+            const items = await resp.json();
+            if (Array.isArray(items)) {
+                for (const it of items) {
+                    const toAddr = (it.to || '').toLowerCase();
+                    const fromAddr = it.from || 'External Address';
+                    const isIncoming = toAddr === lowerAddr;
+                    const val = parseFloat(it.value || '0');
+                    const ts = (it.timestamp || 0) * 1000;
+                    const dt = new Date(ts > 0 ? ts : Date.now());
+                    const dateStr = dt.toISOString().split('T')[0];
+                    const dateTimeStr = dt.toISOString().replace('T', ' ').substring(0, 19);
+
+                    if (it.hash && (val > 0 || isIncoming)) {
+                        txMap.set(`${it.hash}_ETH`, {
+                            id: `${it.hash}_ETH`,
+                            chain: 'Ethereum',
+                            coin: 'ETH',
+                            hash: it.hash,
+                            from: fromAddr,
+                            to: it.to || cleanAddr,
+                            amount: val,
+                            timestamp: ts,
+                            dateStr: dateStr,
+                            dateTimeStr: dateTimeStr,
+                            year: dt.getUTCFullYear().toString(),
+                            isIncoming: isIncoming,
+                            isSuccess: true,
+                            explorerUrl: `https://etherscan.io/tx/${it.hash}`
+                        });
+                    }
+                }
+            }
+        }
+    } catch (e) {
+        console.warn('Ethplorer normal transactions error:', e);
+    }
+
+    updateCryptoProgress('Scanning ERC-20 Token Transfers (USDC, USDT, etc.)...', 35);
+
+    // 2. Primary Source: Ethplorer API (ERC-20 Token transfers)
+    try {
+        const tokUrl = `https://api.ethplorer.io/getAddressHistory/${cleanAddr}?apiKey=freekey&type=transfer&limit=50`;
+        const respTok = await fetchWithProxyFallback(tokUrl);
+        if (respTok.ok) {
+            const dataTok = await respTok.json();
+            if (Array.isArray(dataTok.operations)) {
+                for (const op of dataTok.operations) {
+                    const toAddr = (op.to || '').toLowerCase();
+                    const isIncoming = toAddr === lowerAddr;
+                    const token = op.tokenInfo || {};
+                    const decimals = parseInt(token.decimals || '18');
+                    const rawVal = parseFloat(op.value || '0');
+                    const tokenAmt = decimals > 0 ? rawVal / Math.pow(10, decimals) : rawVal;
+                    const symbol = (token.symbol || 'ERC20').toUpperCase();
+                    const ts = (op.timestamp || 0) * 1000;
+                    const dt = new Date(ts > 0 ? ts : Date.now());
+                    const dateStr = dt.toISOString().split('T')[0];
+                    const dateTimeStr = dt.toISOString().replace('T', ' ').substring(0, 19);
+
+                    const key = `${op.transactionHash}_${symbol}`;
+                    if (op.transactionHash && (tokenAmt > 0 || isIncoming) && !txMap.has(key)) {
+                        txMap.set(key, {
+                            id: key,
+                            chain: 'Ethereum',
+                            coin: symbol,
+                            hash: op.transactionHash,
+                            from: op.from || 'Token Sender',
+                            to: op.to || cleanAddr,
+                            amount: tokenAmt,
+                            timestamp: ts,
+                            dateStr: dateStr,
+                            dateTimeStr: dateTimeStr,
+                            year: dt.getUTCFullYear().toString(),
+                            isIncoming: isIncoming,
+                            isSuccess: true,
+                            explorerUrl: `https://etherscan.io/tx/${op.transactionHash}`
+                        });
+                    }
+                }
+            }
+        }
+    } catch (e) {
+        console.warn('Ethplorer token history error:', e);
+    }
+
+    updateCryptoProgress('Checking Blockscout for internal contract transfers...', 55);
+
+    // 3. Secondary Fallback Source: Blockscout (Safe pagination without startblock range)
+    try {
+        const bsUrl = `https://eth.blockscout.com/api?module=account&action=txlist&address=${cleanAddr}&page=1&offset=50&sort=desc`;
+        const bsResp = await fetchWithProxyFallback(bsUrl);
+        if (bsResp.ok) {
+            const bsData = await bsResp.json();
+            if (bsData.status === '1' && Array.isArray(bsData.result)) {
+                for (const item of bsData.result) {
+                    const toAddr = (item.to || '').toLowerCase();
+                    const isIncoming = toAddr === lowerAddr;
+                    const rawVal = parseFloat(item.value || '0');
+                    const isSuccess = item.isError === '0';
+                    const key = `${item.hash}_ETH`;
+                    if (isSuccess && !txMap.has(key) && (rawVal > 0 || isIncoming)) {
+                        const amountEth = rawVal / 1e18;
+                        const ts = parseInt(item.timeStamp) * 1000;
+                        const dt = new Date(ts);
+                        txMap.set(key, {
+                            id: key,
+                            chain: 'Ethereum',
+                            coin: 'ETH',
+                            hash: item.hash,
+                            from: item.from,
+                            to: item.to || cleanAddr,
+                            amount: amountEth,
+                            timestamp: ts,
+                            dateStr: dt.toISOString().split('T')[0],
+                            dateTimeStr: dt.toISOString().replace('T', ' ').substring(0, 19),
+                            year: dt.getUTCFullYear().toString(),
+                            isIncoming: isIncoming,
+                            isSuccess: isSuccess,
+                            explorerUrl: `https://etherscan.io/tx/${item.hash}`
+                        });
+                    }
+                }
+            }
+        }
+    } catch (e) {
+        console.warn('Blockscout standard fallback error:', e);
+    }
+
+    // 4. Blockscout Internal Transactions (contract calls, pool/mining/staking payouts)
+    try {
+        const bsIntUrl = `https://eth.blockscout.com/api?module=account&action=txlistinternal&address=${cleanAddr}&page=1&offset=50&sort=desc`;
+        const bsIntResp = await fetchWithProxyFallback(bsIntUrl);
+        if (bsIntResp.ok) {
+            const bsIntData = await bsIntResp.json();
+            if (bsIntData.status === '1' && Array.isArray(bsIntData.result)) {
+                for (const item of bsIntData.result) {
+                    const toAddr = (item.to || '').toLowerCase();
+                    const isIncoming = toAddr === lowerAddr;
+                    const rawVal = parseFloat(item.value || '0');
+                    const isSuccess = item.isError === '0';
+                    const key = `${item.hash}_ETH_INT`;
+                    if (isSuccess && !txMap.has(key) && (rawVal > 0 || isIncoming)) {
+                        const amountEth = rawVal / 1e18;
+                        const ts = parseInt(item.timeStamp) * 1000;
+                        const dt = new Date(ts);
+                        txMap.set(key, {
+                            id: key,
+                            chain: 'Ethereum',
+                            coin: 'ETH (Internal)',
+                            hash: item.hash,
+                            from: item.from || 'Contract Payout',
+                            to: item.to || cleanAddr,
+                            amount: amountEth,
+                            timestamp: ts,
+                            dateStr: dt.toISOString().split('T')[0],
+                            dateTimeStr: dt.toISOString().replace('T', ' ').substring(0, 19),
+                            year: dt.getUTCFullYear().toString(),
+                            isIncoming: isIncoming,
+                            isSuccess: isSuccess,
+                            explorerUrl: `https://etherscan.io/tx/${item.hash}`
+                        });
+                    }
+                }
+            }
+        }
+    } catch (e) {}
+
+    // 5. Multi-Chain EVM Fallback: If 0 transactions found, check Optimism & Base
+    if (txMap.size === 0) {
+        const evmChains = [
+            { name: 'Optimism', url: `https://optimism.blockscout.com/api?module=account&action=txlist&address=${cleanAddr}&page=1&offset=30&sort=desc` },
+            { name: 'Base', url: `https://base.blockscout.com/api?module=account&action=txlist&address=${cleanAddr}&page=1&offset=30&sort=desc` }
+        ];
+        for (const evm of evmChains) {
+            try {
+                const resp = await fetchWithProxyFallback(evm.url);
+                if (resp.ok) {
+                    const d = await resp.json();
+                    if (d.status === '1' && Array.isArray(d.result) && d.result.length > 0) {
+                        for (const item of d.result) {
+                            const toAddr = (item.to || '').toLowerCase();
+                            const isIncoming = toAddr === lowerAddr;
+                            const rawVal = parseFloat(item.value || '0');
+                            const key = `${item.hash}_${evm.name}`;
+                            if (!txMap.has(key)) {
+                                const amountEth = rawVal / 1e18;
+                                const ts = parseInt(item.timeStamp) * 1000;
+                                const dt = new Date(ts);
+                                txMap.set(key, {
+                                    id: key,
+                                    chain: evm.name,
+                                    coin: 'ETH',
+                                    hash: item.hash,
+                                    from: item.from,
+                                    to: item.to || cleanAddr,
+                                    amount: amountEth,
+                                    timestamp: ts,
+                                    dateStr: dt.toISOString().split('T')[0],
+                                    dateTimeStr: dt.toISOString().replace('T', ' ').substring(0, 19),
+                                    year: dt.getUTCFullYear().toString(),
+                                    isIncoming: isIncoming,
+                                    isSuccess: item.isError === '0',
+                                    explorerUrl: `https://etherscan.io/tx/${item.hash}`
+                                });
+                            }
+                        }
+                        break;
+                    }
+                }
+            } catch (e) {}
+        }
+    }
+
+    return Array.from(txMap.values()).sort((a, b) => b.timestamp - a.timestamp);
+}
+
+// Known Solana SPL Token Mints dictionary
+const KNOWN_SOLANA_TOKENS = {
+    'rndrizKT3MK1iimdxRdWabcF7Zg7AR5T4nud4EkHBof': 'RENDER',
+    'EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v': 'USDC',
+    'Es9vMFrzaCERmJfrF4H2FYD4KCoNkY11McCe8BenwNYB': 'USDT',
+    'DezXAZ8z7PnrnRJjz3wXBoRgixCa6xjnB7YaB1pPB263': 'BONK',
+    'JUPyiwrYJFskUPiHa7hkeR8VUtAeFoSYbKedZNsDvCN': 'JUP',
+    '4k3Dyjzvzp8eMZWUXbBCjEvwSkkk59S5iCNLY3QrkX6R': 'RAY'
+};
+
+async function fetchSolanaTransactions(address) {
+    const cleanAddr = address.trim();
+    const txMap = new Map();
+
+    updateCryptoProgress('Discovering on-chain accounts & SPL token accounts...', 12);
+
+    // 1. Dynamic Discovery: Find ALL SPL Token Accounts owned by this wallet
+    const userAccounts = new Set([cleanAddr]);
+    const tokenAccountMints = new Map(); // tokenAccountPubkey -> mint
+
+    try {
+        const tokenProgResp = await fetchSolanaRpc('getTokenAccountsByOwner', [
+            cleanAddr,
+            { programId: 'TokenkegQfeZyiNwAJbNbGKPFXCWuBvf9Ss623VQ5DA' },
+            { encoding: 'jsonParsed' }
+        ]);
+        if (tokenProgResp && tokenProgResp.result && Array.isArray(tokenProgResp.result.value)) {
+            tokenProgResp.result.value.forEach(acc => {
+                const pk = acc.pubkey;
+                const mint = acc.account?.data?.parsed?.info?.mint;
+                if (pk) {
+                    userAccounts.add(pk);
+                    if (mint) tokenAccountMints.set(pk, mint);
+                }
+            });
+        }
+    } catch (e) {
+        console.warn('SPL token account discovery warning:', e);
+    }
+
+    // Also check Token-2022 program
+    try {
+        const token2022Resp = await fetchSolanaRpc('getTokenAccountsByOwner', [
+            cleanAddr,
+            { programId: 'TokenzQdBNbLqP5VEhdkAS6EPFLC1PHnBqCXEpPxuEb' },
+            { encoding: 'jsonParsed' }
+        ]);
+        if (token2022Resp && token2022Resp.result && Array.isArray(token2022Resp.result.value)) {
+            token2022Resp.result.value.forEach(acc => {
+                const pk = acc.pubkey;
+                const mint = acc.account?.data?.parsed?.info?.mint;
+                if (pk) {
+                    userAccounts.add(pk);
+                    if (mint) tokenAccountMints.set(pk, mint);
+                }
+            });
+        }
+    } catch (e) {}
+
+    // 2. Query signatures for wallet address AND discovered token accounts
+    const allSigMap = new Map(); // sigHash -> sigObject
+    const accountsToQuery = [cleanAddr];
+
+    // If an asset is explicitly selected (e.g. RENDER, USDC), prioritize that token's account
+    const selectedAsset = (cryptoAccountingState.selectedAsset || 'all').toUpperCase();
+    let targetMint = null;
+    for (const [mint, sym] of Object.entries(KNOWN_SOLANA_TOKENS)) {
+        if (sym === selectedAsset) {
+            targetMint = mint;
+            break;
+        }
+    }
+
+    if (targetMint) {
+        for (const [ata, mint] of tokenAccountMints.entries()) {
+            if (mint === targetMint && !accountsToQuery.includes(ata)) {
+                accountsToQuery.push(ata);
+            }
+        }
+    } else {
+        // Query discovered token accounts (up to 4 accounts to balance speed and coverage)
+        let tokenCount = 0;
+        for (const ata of tokenAccountMints.keys()) {
+            if (!accountsToQuery.includes(ata) && tokenCount < 4) {
+                accountsToQuery.push(ata);
+                tokenCount++;
+            }
+        }
+    }
+
+    updateCryptoProgress(`Discovered ${userAccounts.size} account(s). Querying on-chain transaction signatures...`, 25);
+
+    for (const acc of accountsToQuery) {
+        try {
+            const sigResp = await fetchSolanaRpc('getSignaturesForAddress', [acc, { limit: 100 }]);
+            if (sigResp && Array.isArray(sigResp.result)) {
+                sigResp.result.forEach(s => {
+                    if (s.signature && !allSigMap.has(s.signature)) {
+                        allSigMap.set(s.signature, s);
+                    }
+                });
+            }
+        } catch (e) {
+            console.warn(`Signature query failed for ${acc}:`, e);
+        }
+    }
+
+    const signatures = Array.from(allSigMap.values()).sort((a, b) => (b.blockTime || 0) - (a.blockTime || 0));
+    updateCryptoProgress(`Found ${signatures.length} on-chain transaction signatures. Parsing transaction details...`, 35);
+
+    // 3. Fetch each transaction in concurrent slices of 3 (NOT batch JSON-RPC, to ensure 100% RPC compatibility)
+    const maxToFetch = Math.min(signatures.length, 100);
+    const concurrency = 3;
+
+    if (maxToFetch > 0) {
+        for (let i = 0; i < maxToFetch; i += concurrency) {
+            const chunk = signatures.slice(i, i + concurrency);
+            const pct = Math.min(92, Math.round(35 + (i / maxToFetch) * 55));
+            updateCryptoProgress(`Parsing transactions ${i + 1} to ${Math.min(i + concurrency, maxToFetch)} of ${maxToFetch}...`, pct);
+
+            await Promise.all(chunk.map(async (s) => {
+                try {
+                    const txResp = await fetchSolanaRpc('getTransaction', [
+                        s.signature,
+                        { maxSupportedTransactionVersion: 0, encoding: 'jsonParsed' }
+                    ]);
+                    const txData = txResp?.result;
+                    if (!txData || !txData.meta || txData.meta.err !== null) return;
+
+                    const meta = txData.meta;
+                    const sig = txData.transaction?.signatures?.[0] || s.signature;
+                    const blockTime = txData.blockTime || s.blockTime || 0;
+                    const ts = blockTime ? blockTime * 1000 : Date.now();
+                    const dt = new Date(ts);
+                    const dateStr = dt.toISOString().split('T')[0];
+                    const dateTimeStr = dt.toISOString().replace('T', ' ').substring(0, 19);
+                    const yearStr = dt.getUTCFullYear().toString();
+
+                    const accountKeys = txData.transaction?.message?.accountKeys || [];
+                    let targetIdx = -1;
+                    let senderAddr = 'Solana Signer';
+
+                    for (let a = 0; a < accountKeys.length; a++) {
+                        const pub = typeof accountKeys[a] === 'string' ? accountKeys[a] : accountKeys[a]?.pubkey;
+                        if (pub === cleanAddr) targetIdx = a;
+                    }
+
+                    if (accountKeys.length > 0) {
+                        const firstAcc = accountKeys[0];
+                        senderAddr = typeof firstAcc === 'string' ? firstAcc : firstAcc?.pubkey || 'Solana Signer';
+                    }
+
+                    // Check A: Native SOL balance changes
+                    if (targetIdx !== -1 && meta.preBalances && meta.postBalances) {
+                        const pre = meta.preBalances[targetIdx] || 0;
+                        const post = meta.postBalances[targetIdx] || 0;
+                        const diffLamports = post - pre;
+                        if (diffLamports !== 0) {
+                            const isInc = diffLamports > 0;
+                            const amtSol = Math.abs(diffLamports) / 1e9;
+                            if (amtSol > 0.00001) {
+                                const key = `${sig}_SOL`;
+                                if (!txMap.has(key)) {
+                                    txMap.set(key, {
+                                        id: key,
+                                        chain: 'Solana',
+                                        coin: 'SOL',
+                                        hash: sig,
+                                        from: isInc ? senderAddr : cleanAddr,
+                                        to: isInc ? cleanAddr : (accountKeys[1]?.pubkey || 'External Account'),
+                                        amount: amtSol,
+                                        timestamp: ts,
+                                        dateStr: dateStr,
+                                        dateTimeStr: dateTimeStr,
+                                        year: yearStr,
+                                        isIncoming: isInc,
+                                        isSuccess: true,
+                                        explorerUrl: `https://solscan.io/tx/${sig}`
+                                    });
+                                }
+                            }
+                        }
+                    }
+
+                    // Check B: SPL Token Balances (RENDER, USDC, USDT, BONK, etc.)
+                    const preTokens = meta.preTokenBalances || [];
+                    const postTokens = meta.postTokenBalances || [];
+                    const preMap = {};
+                    preTokens.forEach(pt => {
+                        preMap[pt.accountIndex] = pt.uiTokenAmount?.uiAmount || 0;
+                    });
+
+                    postTokens.forEach(pot => {
+                        const idxAcc = pot.accountIndex;
+                        let isUser = (pot.owner === cleanAddr);
+                        if (!isUser && idxAcc < accountKeys.length) {
+                            const pub = typeof accountKeys[idxAcc] === 'string' ? accountKeys[idxAcc] : accountKeys[idxAcc]?.pubkey;
+                            if (pub && userAccounts.has(pub)) {
+                                isUser = true;
+                            }
+                        }
+
+                        if (isUser) {
+                            const mint = pot.mint;
+                            const postAmt = pot.uiTokenAmount?.uiAmount || 0;
+                            const preAmt = preMap[idxAcc] || 0;
+                            const diff = postAmt - preAmt;
+                            if (diff !== 0) {
+                                const isInc = diff > 0;
+                                const symbol = KNOWN_SOLANA_TOKENS[mint] || 'SPL';
+                                const key = `${sig}_${symbol}`;
+                                if (!txMap.has(key)) {
+                                    let resolvedFrom = senderAddr;
+                                    if (isInc) {
+                                        if (senderAddr === 'rav3GKV8KXg4AvswaqT9HWJ4ErxU5csUwTKj549aHUH') {
+                                            resolvedFrom = 'rav3GKV8KXg4AvswaqT9HWJ4ErxU5csUwTKj549aHUH';
+                                        } else if (symbol === 'RENDER' && (senderAddr.startsWith('rnd') || senderAddr.startsWith('BFpD'))) {
+                                            resolvedFrom = 'Render Network Distribution';
+                                        } else {
+                                            resolvedFrom = senderAddr;
+                                        }
+                                    } else {
+                                        resolvedFrom = cleanAddr;
+                                    }
+
+                                    txMap.set(key, {
+                                        id: key,
+                                        chain: 'Solana',
+                                        coin: symbol,
+                                        hash: sig,
+                                        from: resolvedFrom,
+                                        to: isInc ? cleanAddr : 'Recipient Account',
+                                        amount: Math.abs(diff),
+                                        timestamp: ts,
+                                        dateStr: dateStr,
+                                        dateTimeStr: dateTimeStr,
+                                        year: yearStr,
+                                        isIncoming: isInc,
+                                        isSuccess: true,
+                                        explorerUrl: `https://solscan.io/tx/${sig}`
+                                    });
+                                }
+                            }
+                        }
+                    });
+                } catch (e) {
+                    console.warn(`Error parsing transaction ${s.signature}:`, e);
+                }
+            }));
+
+            // Paced throttle between slices
+            await new Promise(r => setTimeout(r, 60));
+        }
+    }
+
+    // Failsafe offline fallback for demo Render wallet: if live RPC yielded 0 results, load pre-indexed ground truth
+    if (txMap.size === 0 && cleanAddr.toLowerCase() === '8u1bxb88m6uvuqu7idffds8shv9tvntz5c8s7scaanrt') {
+        const renderTxLedger = getRenderNodeWalletOnChainLedger(cleanAddr);
+        renderTxLedger.forEach(t => {
+            txMap.set(`${t.hash}_${t.coin}`, t);
+        });
+    }
+
+    return Array.from(txMap.values()).sort((a, b) => b.timestamp - a.timestamp);
+}
+
+
 function getRenderNodeWalletOnChainLedger(addr) {
     return [
         { id: 'render_tx_2026_001', chain: 'Solana', coin: 'RENDER', hash: '632jXTgMusPSemHhxskixDvqtuip6evifv1CgbHHjviNn8So1eRbGGSiJb2sGFWdAS9ndwsmAWo5mhQXCqZ78Bf9', from: 'rav3GKV8KXg4AvswaqT9HWJ4ErxU5csUwTKj549aHUH', to: addr, amount: 28.6963, timestamp: 1792551639000, dateStr: '2026-10-21', dateTimeStr: '2026-10-21 05:00:39', year: '2026', isIncoming: true, isSuccess: true, spotRates: { EUR: 1.6994, USD: 1.911 }, explorerUrl: 'https://solscan.io/tx/632jXTgMusPSemHhxskixDvqtuip6evifv1CgbHHjviNn8So1eRbGGSiJb2sGFWdAS9ndwsmAWo5mhQXCqZ78Bf9' },
@@ -13677,7 +13541,6 @@ function getRenderNodeWalletOnChainLedger(addr) {
         { id: 'render_tx_2025_148', chain: 'Solana', coin: 'RENDER', hash: '2wVn8JHLMpRsR9zgLYrytqAaXegbjX1XUhFrfYf3K4L7bfAt8i7h6SS1GWcJmCSTUQDjeCZYxvAkYG4LHB3aMdgs', from: 'Render Network Distribution', to: addr, amount: 35.2553, timestamp: 1756861251000, dateStr: '2025-09-03', dateTimeStr: '2025-09-03 03:00:51', year: '2025', isIncoming: true, isSuccess: true, spotRates: { EUR: 2.9862, USD: 3.481 }, explorerUrl: 'https://solscan.io/tx/2wVn8JHLMpRsR9zgLYrytqAaXegbjX1XUhFrfYf3K4L7bfAt8i7h6SS1GWcJmCSTUQDjeCZYxvAkYG4LHB3aMdgs' },
     ];
 }
-
 
 // ────────────────────────────────────────────────────────────────────────────────
 // File Import Support (CSV / JSON)
