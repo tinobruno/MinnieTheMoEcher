@@ -12188,7 +12188,7 @@ document.addEventListener('DOMContentLoaded', () => {
 });
 
 // ════════════════════════════════════════════════════════════════════════════════
-//  Crypto Income & Tax Accounting Module
+//  Crypto Income & Tax Accounting Module (Enhanced Multi-Provider Edition)
 // ════════════════════════════════════════════════════════════════════════════════
 
 const DEFAULT_CRYPTO_TAX_SETTINGS = {
@@ -12297,35 +12297,40 @@ function onCryptoAddressInput(val) {
 
     if (pill) {
         pill.className = `crypto-detected-pill ${detected}`;
-        if (detected === 'solana') {
-            pill.textContent = 'Solana (Base58)';
-            if (netSelect && netSelect.value === 'auto') {
-                cryptoAccountingState.selectedNetwork = 'solana';
-            }
-        } else if (detected === 'ethereum') {
+        if (detected === 'ethereum') {
             pill.textContent = 'Ethereum (0x)';
-            if (netSelect && netSelect.value === 'auto') {
-                cryptoAccountingState.selectedNetwork = 'ethereum';
+            if (netSelect && cryptoAccountingState.selectedNetwork === 'auto') {
+                netSelect.value = 'ethereum';
             }
+        } else if (detected === 'solana') {
+            pill.textContent = 'Solana (Base58)';
+            if (netSelect && cryptoAccountingState.selectedNetwork === 'auto') {
+                netSelect.value = 'solana';
+            }
+        } else if (cryptoAccountingState.address.length > 0) {
+            pill.textContent = 'Custom Format';
         } else {
-            pill.textContent = cryptoAccountingState.address ? 'Unrecognized' : 'Auto-Detecting';
+            pill.textContent = 'Auto-Detecting';
         }
     }
 }
 
 async function pasteCryptoAddress() {
     try {
-        const text = await navigator.clipboard.readText();
-        if (text) {
+        if (navigator.clipboard && navigator.clipboard.readText) {
+            const text = await navigator.clipboard.readText();
             const input = document.getElementById('crypto-address-input');
-            if (input) {
+            if (input && text) {
                 input.value = text.trim();
-                onCryptoAddressInput(text.trim());
+                onCryptoAddressInput(text);
+                input.focus();
+                showToast('Wallet address pasted from clipboard', 'info');
             }
+        } else {
+            showToast('Clipboard access not permitted by browser.', 'warning');
         }
     } catch (e) {
-        console.warn('Clipboard read failed:', e);
-        showToast('Unable to read clipboard. Please paste manually.', 'info');
+        showToast('Could not read clipboard. Please paste manually.', 'info');
     }
 }
 
@@ -12338,11 +12343,19 @@ function onCryptoNetworkChange() {
 
 function setCryptoCurrency(curr) {
     cryptoAccountingState.currency = curr;
-    document.querySelectorAll('#crypto-currency-selector .crypto-segment-btn').forEach(btn => {
-        btn.classList.toggle('active', btn.getAttribute('data-currency') === curr);
+    const btns = document.querySelectorAll('#crypto-currency-selector .crypto-segment-btn');
+    btns.forEach(b => {
+        if (b.dataset.currency === curr) {
+            b.classList.add('active');
+        } else {
+            b.classList.remove('active');
+        }
     });
-    const addon = document.getElementById('crypto-deductible-curr-addon');
-    if (addon) addon.textContent = curr === 'EUR' ? '€' : '$';
+
+    const deductibleAddon = document.getElementById('crypto-deductible-curr-addon');
+    if (deductibleAddon) deductibleAddon.textContent = curr === 'EUR' ? '€' : '$';
+
+    localStorage.setItem('moecher_crypto_default_curr', curr);
 
     if (cryptoAccountingState.transactions.length > 0) {
         calculateCryptoTaxes();
@@ -12359,22 +12372,26 @@ function onCryptoYearSelectChange() {
     }
 }
 
+function setQuickTaxRate(rate) {
+    const input = document.getElementById('crypto-tax-rate-input');
+    if (input) input.value = rate;
+    cryptoAccountingState.taxRate = rate;
+    localStorage.setItem('moecher_crypto_default_rate', rate);
+
+    if (cryptoAccountingState.transactions.length > 0) {
+        calculateCryptoTaxes();
+    }
+}
+
 function onCryptoTaxRateChange() {
     const input = document.getElementById('crypto-tax-rate-input');
     if (input) {
         const val = parseFloat(input.value);
-        cryptoAccountingState.taxRate = isNaN(val) ? 30.0 : Math.max(0, Math.min(100, val));
+        cryptoAccountingState.taxRate = isNaN(val) ? 0 : Math.max(0, Math.min(100, val));
+        localStorage.setItem('moecher_crypto_default_rate', cryptoAccountingState.taxRate);
         if (cryptoAccountingState.transactions.length > 0) {
             calculateCryptoTaxes();
         }
-    }
-}
-
-function setQuickTaxRate(rate) {
-    const input = document.getElementById('crypto-tax-rate-input');
-    if (input) {
-        input.value = rate;
-        onCryptoTaxRateChange();
     }
 }
 
@@ -12382,7 +12399,7 @@ function onCryptoDeductibleChange() {
     const input = document.getElementById('crypto-deductible-input');
     if (input) {
         const val = parseFloat(input.value);
-        cryptoAccountingState.deductible = isNaN(val) ? 0.0 : Math.max(0, val);
+        cryptoAccountingState.deductible = isNaN(val) ? 0 : Math.max(0, val);
         if (cryptoAccountingState.transactions.length > 0) {
             calculateCryptoTaxes();
         }
@@ -12399,22 +12416,27 @@ function toggleAdvancedCryptoSettings() {
 async function fetchWithProxyFallback(url, options = {}) {
     try {
         const ctrl = new AbortController();
-        const tid = setTimeout(() => ctrl.abort(), 9000);
+        const tid = setTimeout(() => ctrl.abort(), 6500);
         const directResp = await fetch(url, { ...options, signal: ctrl.signal });
         clearTimeout(tid);
         if (directResp.ok) return directResp;
     } catch (e) {
-        // Fall through to proxy
+        // network or CORS failure
     }
-    const proxyUrl = `/api/proxy?url=${encodeURIComponent(url)}`;
-    return await fetch(proxyUrl, options);
+
+    try {
+        const proxyUrl = `/api/proxy?url=${encodeURIComponent(url)}`;
+        const proxyResp = await fetch(proxyUrl, options);
+        if (proxyResp.ok) return proxyResp;
+    } catch (e) {}
+
+    return { ok: false, status: 500, json: async () => ({}) };
 }
 
 async function fetchHistoricalCryptoRate(coin, currency, dateStr) {
     const safeCoin = (coin || 'ETH').toUpperCase();
     if (safeCoin === 'USDC' || safeCoin === 'USDT' || safeCoin === 'DAI') {
         if (currency === 'USD') return 1.0;
-        // For EUR, fetch EURUSDT rate
         try {
             const dt = new Date(`${dateStr}T00:00:00Z`);
             const eurUrl = `https://api.binance.com/api/v3/klines?symbol=EURUSDT&interval=1d&startTime=${dt.getTime()}&limit=1`;
@@ -12534,89 +12556,138 @@ function hideCryptoProgress() {
 }
 
 // ────────────────────────────────────────────────────────────────────────────────
-// Blockchain Fetchers
+// Blockchain Fetchers (Multi-Provider Resilient Pipeline)
 // ────────────────────────────────────────────────────────────────────────────────
 
 async function fetchEthereumTransactions(address) {
-    updateCryptoProgress('Connecting to Blockscout / Ethereum Explorer...', 15);
-    const txs = [];
-    const lowerAddr = address.toLowerCase();
+    updateCryptoProgress('Querying Ethplorer & Blockscout nodes...', 15);
+    const txMap = new Map();
+    const cleanAddr = address.trim();
+    const lowerAddr = cleanAddr.toLowerCase();
 
-    // 1. Fetch native ETH transactions
+    // 1. Primary Source: Ethplorer API (Native ETH transactions)
     try {
-        const url = `https://eth.blockscout.com/api?module=account&action=txlist&address=${address}&startblock=0&endblock=99999999&sort=desc`;
-        const resp = await fetchWithProxyFallback(url);
+        const epUrl = `https://api.ethplorer.io/getAddressTransactions/${cleanAddr}?apiKey=freekey&limit=50`;
+        const resp = await fetchWithProxyFallback(epUrl);
         if (resp.ok) {
-            const data = await resp.json();
-            if (data.status === '1' && Array.isArray(data.result)) {
-                for (const item of data.result) {
-                    const toAddr = (item.to || '').toLowerCase();
-                    const isSuccess = item.isError === '0';
-                    const rawVal = parseFloat(item.value || '0');
-                    if (isSuccess && toAddr === lowerAddr && rawVal > 0) {
-                        const amountEth = rawVal / 1e18;
-                        const ts = parseInt(item.timeStamp) * 1000;
-                        const dt = new Date(ts);
-                        const dateStr = dt.toISOString().split('T')[0];
-                        const dateTimeStr = dt.toISOString().replace('T', ' ').substring(0, 19);
-                        txs.push({
-                            id: item.hash,
+            const items = await resp.json();
+            if (Array.isArray(items)) {
+                for (const it of items) {
+                    const toAddr = (it.to || '').toLowerCase();
+                    const fromAddr = it.from || 'External Address';
+                    const isIncoming = toAddr === lowerAddr;
+                    const val = parseFloat(it.value || '0');
+                    const ts = (it.timestamp || 0) * 1000;
+                    const dt = new Date(ts > 0 ? ts : Date.now());
+                    const dateStr = dt.toISOString().split('T')[0];
+                    const dateTimeStr = dt.toISOString().replace('T', ' ').substring(0, 19);
+
+                    if (it.hash && (val > 0 || isIncoming)) {
+                        txMap.set(`${it.hash}_ETH`, {
+                            id: `${it.hash}_ETH`,
                             chain: 'Ethereum',
                             coin: 'ETH',
-                            hash: item.hash,
-                            from: item.from,
-                            to: item.to,
-                            amount: amountEth,
+                            hash: it.hash,
+                            from: fromAddr,
+                            to: it.to || cleanAddr,
+                            amount: val,
                             timestamp: ts,
                             dateStr: dateStr,
                             dateTimeStr: dateTimeStr,
                             year: dt.getUTCFullYear().toString(),
-                            isIncoming: true,
+                            isIncoming: isIncoming,
                             isSuccess: true,
-                            explorerUrl: `https://etherscan.io/tx/${item.hash}`
+                            explorerUrl: `https://etherscan.io/tx/${it.hash}`
                         });
                     }
                 }
             }
         }
     } catch (e) {
-        console.warn('Blockscout ETH txlist failed:', e);
+        console.warn('Ethplorer normal transactions error:', e);
     }
 
-    updateCryptoProgress('Scanning ERC-20 token transfers (USDC, USDT, etc.)...', 45);
+    updateCryptoProgress('Scanning ERC-20 Token Transfers (USDC, USDT, etc.)...', 35);
 
-    // 2. Fetch ERC-20 token transfers
+    // 2. Primary Source: Ethplorer API (ERC-20 Token transfers)
     try {
-        const tokenUrl = `https://eth.blockscout.com/api?module=account&action=tokentx&address=${address}&sort=desc`;
-        const resp2 = await fetchWithProxyFallback(tokenUrl);
-        if (resp2.ok) {
-            const data2 = await resp2.json();
-            if (data2.status === '1' && Array.isArray(data2.result)) {
-                for (const item of data2.result) {
-                    const toAddr = (item.to || '').toLowerCase();
-                    const rawVal = parseFloat(item.value || '0');
-                    const decimals = parseInt(item.tokenDecimal || '18');
-                    const symbol = (item.tokenSymbol || 'TOKEN').toUpperCase();
-                    if (toAddr === lowerAddr && rawVal > 0) {
-                        const tokenAmt = rawVal / Math.pow(10, decimals);
-                        const ts = parseInt(item.timeStamp) * 1000;
-                        const dt = new Date(ts);
-                        const dateStr = dt.toISOString().split('T')[0];
-                        const dateTimeStr = dt.toISOString().replace('T', ' ').substring(0, 19);
-                        txs.push({
-                            id: `${item.hash}_${symbol}`,
+        const tokUrl = `https://api.ethplorer.io/getAddressHistory/${cleanAddr}?apiKey=freekey&type=transfer&limit=50`;
+        const respTok = await fetchWithProxyFallback(tokUrl);
+        if (respTok.ok) {
+            const dataTok = await respTok.json();
+            if (Array.isArray(dataTok.operations)) {
+                for (const op of dataTok.operations) {
+                    const toAddr = (op.to || '').toLowerCase();
+                    const isIncoming = toAddr === lowerAddr;
+                    const token = op.tokenInfo || {};
+                    const decimals = parseInt(token.decimals || '18');
+                    const rawVal = parseFloat(op.value || '0');
+                    const tokenAmt = decimals > 0 ? rawVal / Math.pow(10, decimals) : rawVal;
+                    const symbol = (token.symbol || 'ERC20').toUpperCase();
+                    const ts = (op.timestamp || 0) * 1000;
+                    const dt = new Date(ts > 0 ? ts : Date.now());
+                    const dateStr = dt.toISOString().split('T')[0];
+                    const dateTimeStr = dt.toISOString().replace('T', ' ').substring(0, 19);
+
+                    const key = `${op.transactionHash}_${symbol}`;
+                    if (op.transactionHash && (tokenAmt > 0 || isIncoming) && !txMap.has(key)) {
+                        txMap.set(key, {
+                            id: key,
                             chain: 'Ethereum',
                             coin: symbol,
-                            hash: item.hash,
-                            from: item.from,
-                            to: item.to,
+                            hash: op.transactionHash,
+                            from: op.from || 'Token Sender',
+                            to: op.to || cleanAddr,
                             amount: tokenAmt,
                             timestamp: ts,
                             dateStr: dateStr,
                             dateTimeStr: dateTimeStr,
                             year: dt.getUTCFullYear().toString(),
-                            isIncoming: true,
+                            isIncoming: isIncoming,
                             isSuccess: true,
+                            explorerUrl: `https://etherscan.io/tx/${op.transactionHash}`
+                        });
+                    }
+                }
+            }
+        }
+    } catch (e) {
+        console.warn('Ethplorer token history error:', e);
+    }
+
+    updateCryptoProgress('Checking Blockscout for internal contract transfers...', 55);
+
+    // 3. Secondary Fallback Source: Blockscout (Safe pagination without startblock range)
+    try {
+        const bsUrl = `https://eth.blockscout.com/api?module=account&action=txlist&address=${cleanAddr}&page=1&offset=50&sort=desc`;
+        const bsResp = await fetchWithProxyFallback(bsUrl);
+        if (bsResp.ok) {
+            const bsData = await bsResp.json();
+            if (bsData.status === '1' && Array.isArray(bsData.result)) {
+                for (const item of bsData.result) {
+                    const toAddr = (item.to || '').toLowerCase();
+                    const isIncoming = toAddr === lowerAddr;
+                    const rawVal = parseFloat(item.value || '0');
+                    const isSuccess = item.isError === '0';
+                    const key = `${item.hash}_ETH`;
+                    if (isSuccess && !txMap.has(key) && (rawVal > 0 || isIncoming)) {
+                        const amountEth = rawVal / 1e18;
+                        const ts = parseInt(item.timeStamp) * 1000;
+                        const dt = new Date(ts);
+                        txMap.set(key, {
+                            id: key,
+                            chain: 'Ethereum',
+                            coin: 'ETH',
+                            hash: item.hash,
+                            from: item.from,
+                            to: item.to || cleanAddr,
+                            amount: amountEth,
+                            timestamp: ts,
+                            dateStr: dt.toISOString().split('T')[0],
+                            dateTimeStr: dt.toISOString().replace('T', ' ').substring(0, 19),
+                            year: dt.getUTCFullYear().toString(),
+                            isIncoming: isIncoming,
+                            isSuccess: isSuccess,
                             explorerUrl: `https://etherscan.io/tx/${item.hash}`
                         });
                     }
@@ -12624,71 +12695,150 @@ async function fetchEthereumTransactions(address) {
             }
         }
     } catch (e) {
-        console.warn('Blockscout ERC-20 tokentx failed:', e);
+        console.warn('Blockscout standard fallback error:', e);
     }
 
-    return txs;
+    // 4. Blockscout Internal Transactions (contract calls, pool/mining/staking payouts)
+    try {
+        const bsIntUrl = `https://eth.blockscout.com/api?module=account&action=txlistinternal&address=${cleanAddr}&page=1&offset=50&sort=desc`;
+        const bsIntResp = await fetchWithProxyFallback(bsIntUrl);
+        if (bsIntResp.ok) {
+            const bsIntData = await bsIntResp.json();
+            if (bsIntData.status === '1' && Array.isArray(bsIntData.result)) {
+                for (const item of bsIntData.result) {
+                    const toAddr = (item.to || '').toLowerCase();
+                    const isIncoming = toAddr === lowerAddr;
+                    const rawVal = parseFloat(item.value || '0');
+                    const isSuccess = item.isError === '0';
+                    const key = `${item.hash}_ETH_INT`;
+                    if (isSuccess && !txMap.has(key) && (rawVal > 0 || isIncoming)) {
+                        const amountEth = rawVal / 1e18;
+                        const ts = parseInt(item.timeStamp) * 1000;
+                        const dt = new Date(ts);
+                        txMap.set(key, {
+                            id: key,
+                            chain: 'Ethereum',
+                            coin: 'ETH (Internal)',
+                            hash: item.hash,
+                            from: item.from || 'Contract Payout',
+                            to: item.to || cleanAddr,
+                            amount: amountEth,
+                            timestamp: ts,
+                            dateStr: dt.toISOString().split('T')[0],
+                            dateTimeStr: dt.toISOString().replace('T', ' ').substring(0, 19),
+                            year: dt.getUTCFullYear().toString(),
+                            isIncoming: isIncoming,
+                            isSuccess: isSuccess,
+                            explorerUrl: `https://etherscan.io/tx/${item.hash}`
+                        });
+                    }
+                }
+            }
+        }
+    } catch (e) {}
+
+    // 5. Multi-Chain EVM Fallback: If 0 transactions found, check Optimism & Base
+    if (txMap.size === 0) {
+        const evmChains = [
+            { name: 'Optimism', url: `https://optimism.blockscout.com/api?module=account&action=txlist&address=${cleanAddr}&page=1&offset=30&sort=desc` },
+            { name: 'Base', url: `https://base.blockscout.com/api?module=account&action=txlist&address=${cleanAddr}&page=1&offset=30&sort=desc` }
+        ];
+        for (const evm of evmChains) {
+            try {
+                const resp = await fetchWithProxyFallback(evm.url);
+                if (resp.ok) {
+                    const d = await resp.json();
+                    if (d.status === '1' && Array.isArray(d.result) && d.result.length > 0) {
+                        for (const item of d.result) {
+                            const toAddr = (item.to || '').toLowerCase();
+                            const isIncoming = toAddr === lowerAddr;
+                            const rawVal = parseFloat(item.value || '0');
+                            const key = `${item.hash}_${evm.name}`;
+                            if (!txMap.has(key)) {
+                                const amountEth = rawVal / 1e18;
+                                const ts = parseInt(item.timeStamp) * 1000;
+                                const dt = new Date(ts);
+                                txMap.set(key, {
+                                    id: key,
+                                    chain: evm.name,
+                                    coin: 'ETH',
+                                    hash: item.hash,
+                                    from: item.from,
+                                    to: item.to || cleanAddr,
+                                    amount: amountEth,
+                                    timestamp: ts,
+                                    dateStr: dt.toISOString().split('T')[0],
+                                    dateTimeStr: dt.toISOString().replace('T', ' ').substring(0, 19),
+                                    year: dt.getUTCFullYear().toString(),
+                                    isIncoming: isIncoming,
+                                    isSuccess: item.isError === '0',
+                                    explorerUrl: `https://etherscan.io/tx/${item.hash}`
+                                });
+                            }
+                        }
+                        break;
+                    }
+                }
+            } catch (e) {}
+        }
+    }
+
+    return Array.from(txMap.values()).sort((a, b) => b.timestamp - a.timestamp);
 }
 
 async function fetchSolanaTransactions(address) {
-    updateCryptoProgress('Connecting to Solana JSON-RPC node...', 15);
-    const rpcUrl = cryptoTaxSettings.customSolanaRpc || 'https://api.mainnet-beta.solana.com';
-    const txs = [];
+    updateCryptoProgress('Connecting to Solana JSON-RPC endpoints...', 15);
+    const rpcUrls = [
+        cryptoTaxSettings.customSolanaRpc,
+        'https://solana-rpc.publicnode.com',
+        'https://api.mainnet-beta.solana.com'
+    ].filter(Boolean);
 
-    // 1. Get transaction signatures
     let signatures = [];
-    try {
-        const payload = JSON.stringify({
-            jsonrpc: '2.0',
-            id: 1,
-            method: 'getSignaturesForAddress',
-            params: [address, { limit: 35 }]
-        });
-        const resp = await fetchWithProxyFallback(rpcUrl, {
-            method: 'POST',
-            headers: { 'Content-Type': 'application/json' },
-            body: payload
-        });
-        if (resp.ok) {
-            const data = await resp.json();
-            if (Array.isArray(data.result)) {
-                signatures = data.result;
-            }
-        }
-    } catch (e) {
-        console.warn('Solana getSignaturesForAddress failed:', e);
-    }
+    const cleanAddr = address.trim();
 
-    if (signatures.length === 0) {
-        // Fallback endpoint
+    // 1. Retrieve up to 80 signatures
+    for (const rpc of rpcUrls) {
         try {
-            const fallbackRpc = 'https://solana-rpc.publicnode.com';
             const payload = JSON.stringify({
                 jsonrpc: '2.0',
                 id: 1,
                 method: 'getSignaturesForAddress',
-                params: [address, { limit: 35 }]
+                params: [cleanAddr, { limit: 80 }]
             });
-            const resp = await fetchWithProxyFallback(fallbackRpc, {
+            const resp = await fetchWithProxyFallback(rpc, {
                 method: 'POST',
                 headers: { 'Content-Type': 'application/json' },
                 body: payload
             });
             if (resp.ok) {
                 const data = await resp.json();
-                if (Array.isArray(data.result)) {
+                if (Array.isArray(data.result) && data.result.length > 0) {
                     signatures = data.result;
+                    break;
                 }
             }
-        } catch (e) {}
+        } catch (e) {
+            console.warn(`Solana RPC ${rpc} signature query failed:`, e);
+        }
     }
 
-    // 2. Fetch and parse transactions
-    const total = signatures.length;
+    if (signatures.length === 0) {
+        return [];
+    }
+
+    const txMap = new Map();
+    const total = Math.min(signatures.length, 50);
+    const activeRpc = rpcUrls[0] || 'https://solana-rpc.publicnode.com';
+
+    // 2. Extract parsed transaction details
     for (let i = 0; i < total; i++) {
         const sig = signatures[i];
         const pct = Math.round(20 + ((i + 1) / total) * 50);
-        updateCryptoProgress(`Extracting Solana transaction ${i + 1} of ${total}...`, pct);
+        updateCryptoProgress(`Analyzing Solana transaction ${i + 1} of ${total}...`, pct);
+
+        // Friendly delay to avoid RPC rate limit
+        await new Promise(r => setTimeout(r, 60));
 
         try {
             const txPayload = JSON.stringify({
@@ -12697,69 +12847,277 @@ async function fetchSolanaTransactions(address) {
                 method: 'getTransaction',
                 params: [sig.signature, { maxSupportedTransactionVersion: 1, encoding: 'jsonParsed' }]
             });
-            const txResp = await fetchWithProxyFallback(rpcUrl, {
+            let txResp = await fetchWithProxyFallback(activeRpc, {
                 method: 'POST',
                 headers: { 'Content-Type': 'application/json' },
                 body: txPayload
             });
 
+            // If primary RPC rate limits or errors, try secondary RPC
+            if (!txResp.ok && rpcUrls.length > 1) {
+                const secondaryRpc = rpcUrls[1];
+                txResp = await fetchWithProxyFallback(secondaryRpc, {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/json' },
+                    body: txPayload
+                });
+            }
+
             if (txResp.ok) {
                 const txData = await txResp.json();
                 const res = txData.result;
-                if (res && res.meta && res.meta.err === null) {
-                    const blockTime = res.blockTime || sig.blockTime;
-                    const ts = blockTime ? blockTime * 1000 : Date.now();
-                    const dt = new Date(ts);
-                    const dateStr = dt.toISOString().split('T')[0];
-                    const dateTimeStr = dt.toISOString().replace('T', ' ').substring(0, 19);
+                if (!res || !res.meta || res.meta.err !== null) continue;
 
-                    // Find account in accountKeys
-                    const accountKeys = res.transaction?.message?.accountKeys || [];
-                    let targetIdx = -1;
-                    let senderAddr = 'Unknown Sender';
+                const meta = res.meta;
+                const blockTime = res.blockTime || sig.blockTime;
+                const ts = blockTime ? blockTime * 1000 : Date.now();
+                const dt = new Date(ts);
+                const dateStr = dt.toISOString().split('T')[0];
+                const dateTimeStr = dt.toISOString().replace('T', ' ').substring(0, 19);
+                const yearStr = dt.getUTCFullYear().toString();
 
-                    for (let a = 0; a < accountKeys.length; a++) {
-                        const pub = typeof accountKeys[a] === 'string' ? accountKeys[a] : accountKeys[a]?.pubkey;
-                        if (pub === address) targetIdx = a;
+                const accountKeys = res.transaction?.message?.accountKeys || [];
+                let targetIdx = -1;
+                let senderAddr = 'Solana Signer';
+
+                for (let a = 0; a < accountKeys.length; a++) {
+                    const pub = typeof accountKeys[a] === 'string' ? accountKeys[a] : accountKeys[a]?.pubkey;
+                    if (pub === cleanAddr) targetIdx = a;
+                }
+
+                if (accountKeys.length > 0) {
+                    const firstAcc = accountKeys[0];
+                    senderAddr = typeof firstAcc === 'string' ? firstAcc : firstAcc?.pubkey || 'Solana Signer';
+                }
+
+                // Check A: Native SOL balance changes
+                if (targetIdx !== -1 && meta.preBalances && meta.postBalances) {
+                    const pre = meta.preBalances[targetIdx] || 0;
+                    const post = meta.postBalances[targetIdx] || 0;
+                    const diffLamports = post - pre;
+                    if (diffLamports !== 0) {
+                        const isInc = diffLamports > 0;
+                        const amtSol = Math.abs(diffLamports) / 1e9;
+                        txMap.set(`${sig.signature}_SOL`, {
+                            id: `${sig.signature}_SOL`,
+                            chain: 'Solana',
+                            coin: 'SOL',
+                            hash: sig.signature,
+                            from: isInc ? senderAddr : cleanAddr,
+                            to: isInc ? cleanAddr : 'External Account',
+                            amount: amtSol,
+                            timestamp: ts,
+                            dateStr: dateStr,
+                            dateTimeStr: dateTimeStr,
+                            year: yearStr,
+                            isIncoming: isInc,
+                            isSuccess: true,
+                            explorerUrl: `https://solscan.io/tx/${sig.signature}`
+                        });
+                        continue;
                     }
+                }
 
-                    if (accountKeys.length > 0) {
-                        const firstAcc = accountKeys[0];
-                        senderAddr = typeof firstAcc === 'string' ? firstAcc : firstAcc?.pubkey || 'Solana Signer';
+                // Check B: SPL Token Balances (USDC, USDT, etc.)
+                const preTokens = meta.preTokenBalances || [];
+                const postTokens = meta.postTokenBalances || [];
+                const preMap = {};
+                preTokens.forEach(pt => {
+                    if (pt.owner === cleanAddr) {
+                        preMap[pt.mint] = pt.uiTokenAmount?.uiAmount || 0;
                     }
+                });
 
-                    if (targetIdx !== -1 && res.meta.preBalances && res.meta.postBalances) {
-                        const pre = res.meta.preBalances[targetIdx] || 0;
-                        const post = res.meta.postBalances[targetIdx] || 0;
-                        const diffLamports = post - pre;
-                        if (diffLamports > 0) {
-                            const amountSol = diffLamports / 1e9;
-                            txs.push({
-                                id: sig.signature,
+                postTokens.forEach(pot => {
+                    if (pot.owner === cleanAddr) {
+                        const mint = pot.mint;
+                        const postAmt = pot.uiTokenAmount?.uiAmount || 0;
+                        const preAmt = preMap[mint] || 0;
+                        const diff = postAmt - preAmt;
+                        if (diff !== 0) {
+                            const isInc = diff > 0;
+                            const symbol = mint === 'EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v' ? 'USDC' :
+                                           mint === 'Es9vMFrzaCERmJfrF4H2FYD4KCoNkY11McCe8BenwNYB' ? 'USDT' : 'SPL';
+                            const key = `${sig.signature}_${symbol}`;
+                            txMap.set(key, {
+                                id: key,
                                 chain: 'Solana',
-                                coin: 'SOL',
+                                coin: symbol,
                                 hash: sig.signature,
-                                from: senderAddr,
-                                to: address,
-                                amount: amountSol,
+                                from: isInc ? senderAddr : cleanAddr,
+                                to: isInc ? cleanAddr : 'Recipient Token Account',
+                                amount: Math.abs(diff),
                                 timestamp: ts,
                                 dateStr: dateStr,
                                 dateTimeStr: dateTimeStr,
-                                year: dt.getUTCFullYear().toString(),
-                                isIncoming: true,
+                                year: yearStr,
+                                isIncoming: isInc,
                                 isSuccess: true,
                                 explorerUrl: `https://solscan.io/tx/${sig.signature}`
                             });
                         }
                     }
+                });
+
+                // Check C: Direct Parsed System / Token Transfer Instructions
+                const instructions = res.transaction?.message?.instructions || [];
+                for (const inst of instructions) {
+                    if (inst.parsed && inst.parsed.type === 'transfer') {
+                        const info = inst.parsed.info || {};
+                        if (info.destination === cleanAddr && info.lamports) {
+                            const amt = info.lamports / 1e9;
+                            const key = `${sig.signature}_INST_SOL`;
+                            if (!txMap.has(key)) {
+                                txMap.set(key, {
+                                    id: key,
+                                    chain: 'Solana',
+                                    coin: 'SOL',
+                                    hash: sig.signature,
+                                    from: info.source || senderAddr,
+                                    to: cleanAddr,
+                                    amount: amt,
+                                    timestamp: ts,
+                                    dateStr: dateStr,
+                                    dateTimeStr: dateTimeStr,
+                                    year: yearStr,
+                                    isIncoming: true,
+                                    isSuccess: true,
+                                    explorerUrl: `https://solscan.io/tx/${sig.signature}`
+                                });
+                            }
+                        }
+                    }
                 }
             }
         } catch (e) {
-            console.warn(`Solana tx ${sig.signature} parse failed:`, e);
+            console.warn(`Error parsing Solana tx ${sig.signature}:`, e);
         }
     }
 
-    return txs;
+    return Array.from(txMap.values()).sort((a, b) => b.timestamp - a.timestamp);
+}
+
+// ────────────────────────────────────────────────────────────────────────────────
+// File Import Support (CSV / JSON)
+// ────────────────────────────────────────────────────────────────────────────────
+
+function triggerCryptoFileImport() {
+    const fileInput = document.getElementById('crypto-file-import-input');
+    if (fileInput) fileInput.click();
+}
+
+function stripQuotes(str) {
+    if (!str) return '';
+    let s = str.trim();
+    if ((s.startsWith('"') && s.endsWith('"')) || (s.startsWith("'") && s.endsWith("'"))) {
+        return s.slice(1, -1).trim();
+    }
+    return s;
+}
+
+function parseCsvTransactions(csvText) {
+    const lines = csvText.split(/\r?\n/).filter(l => l.trim().length > 0);
+    if (lines.length < 2) return [];
+
+    const cols = lines[0].split(',').map(c => stripQuotes(c).toLowerCase());
+
+    let dateIdx = cols.findIndex(c => c.includes('date') || c.includes('time'));
+    let amtIdx = cols.findIndex(c => c.includes('amount') || c.includes('value') || c.includes('received') || c.includes('qty'));
+    let coinIdx = cols.findIndex(c => c.includes('currency') || c.includes('token') || c.includes('coin') || c.includes('symbol') || c.includes('asset'));
+    let hashIdx = cols.findIndex(c => c.includes('hash') || c.includes('tx') || c.includes('id') || c.includes('signature'));
+    let fromIdx = cols.findIndex(c => c.includes('from') || c.includes('sender') || c.includes('source'));
+
+    if (amtIdx === -1) amtIdx = 1;
+    if (dateIdx === -1) dateIdx = 0;
+
+    const parsedTxs = [];
+    for (let i = 1; i < lines.length; i++) {
+        const parts = lines[i].split(',').map(p => stripQuotes(p));
+        if (parts.length <= amtIdx) continue;
+
+        const rawAmt = parseFloat(parts[amtIdx].replace(/[^0-9.-]/g, ''));
+        if (isNaN(rawAmt) || rawAmt === 0) continue;
+
+        const dateRaw = dateIdx !== -1 && parts[dateIdx] ? parts[dateIdx] : new Date().toISOString();
+        let dt = new Date(dateRaw);
+        if (isNaN(dt.getTime())) dt = new Date();
+
+        const dateStr = dt.toISOString().split('T')[0];
+        const dateTimeStr = dt.toISOString().replace('T', ' ').substring(0, 19);
+        const coin = coinIdx !== -1 && parts[coinIdx] ? parts[coinIdx].toUpperCase() : 'CRYPTO';
+        const hash = hashIdx !== -1 && parts[hashIdx] ? parts[hashIdx] : `manual_tx_${i}`;
+        const from = fromIdx !== -1 && parts[fromIdx] ? parts[fromIdx] : 'External Payer';
+
+        parsedTxs.push({
+            id: `import_${i}_${hash}`,
+            chain: coin.includes('SOL') ? 'Solana' : 'Ethereum',
+            coin: coin,
+            hash: hash,
+            from: from,
+            to: 'My Wallet',
+            amount: Math.abs(rawAmt),
+            timestamp: dt.getTime(),
+            dateStr: dateStr,
+            dateTimeStr: dateTimeStr,
+            year: dt.getUTCFullYear().toString(),
+            isIncoming: rawAmt > 0,
+            isSuccess: true,
+            explorerUrl: hash.startsWith('0x') ? `https://etherscan.io/tx/${hash}` : `https://solscan.io/tx/${hash}`
+        });
+    }
+
+    return parsedTxs;
+}
+
+function handleCryptoFileImport(event) {
+    const file = event.target?.files?.[0];
+    if (!file) return;
+
+    const reader = new FileReader();
+    reader.onload = async (e) => {
+        try {
+            const content = e.target.result;
+            let txs = [];
+            if (file.name.endsWith('.json')) {
+                const data = JSON.parse(content);
+                const arr = Array.isArray(data) ? data : (data.transactions || []);
+                txs = arr.map((t, idx) => ({
+                    id: t.id || t.hash || `json_${idx}`,
+                    chain: t.chain || 'Ethereum',
+                    coin: (t.coin || t.token || 'ETH').toUpperCase(),
+                    hash: t.hash || t.tx || `tx_${idx}`,
+                    from: t.from || 'Imported Payer',
+                    to: t.to || 'Wallet',
+                    amount: parseFloat(t.amount || t.value || 0),
+                    timestamp: t.timestamp || Date.now(),
+                    dateStr: t.dateStr || (t.date || new Date().toISOString()).split('T')[0],
+                    dateTimeStr: t.dateTimeStr || new Date().toISOString().replace('T', ' ').substring(0, 19),
+                    year: (t.year || new Date().getUTCFullYear()).toString(),
+                    isIncoming: t.isIncoming !== false,
+                    isSuccess: true,
+                    explorerUrl: t.explorerUrl || '#'
+                }));
+            } else {
+                txs = parseCsvTransactions(content);
+            }
+
+            if (txs.length > 0) {
+                cryptoAccountingState.transactions = txs;
+                cryptoAccountingState.address = file.name;
+                const addrInput = document.getElementById('crypto-address-input');
+                if (addrInput) addrInput.value = `Imported: ${file.name}`;
+                await calculateCryptoTaxes();
+                showToast(`Imported ${txs.length} transactions from ${file.name}!`, 'success');
+            } else {
+                showToast('No valid transactions parsed from file. Please check column headers.', 'error');
+            }
+        } catch (err) {
+            console.error('File import error:', err);
+            showToast(`Import error: ${err.message}`, 'error');
+        }
+    };
+    reader.readAsText(file);
+    if (event.target) event.target.value = '';
 }
 
 // ────────────────────────────────────────────────────────────────────────────────
@@ -12777,7 +13135,6 @@ function loadSampleCryptoWallet(network) {
         if (netSelect) netSelect.value = 'solana';
         onCryptoAddressInput(sampleSolAddr);
 
-        // Prepopulate realistic multi-year Solana earnings ledger
         cryptoAccountingState.transactions = [
             { id: 'sol_tx_1', chain: 'Solana', coin: 'SOL', hash: '5K3W2Dq4YtN9pZv1m8LxCj7RoXeAbHfUsGeKqWpLt2Nm', from: 'Phantom Staking Validator', to: sampleSolAddr, amount: 8.50, timestamp: 1710244800000, dateStr: '2024-03-12', dateTimeStr: '2024-03-12 12:00:00', year: '2024', isIncoming: true, isSuccess: true, explorerUrl: 'https://solscan.io/tx/5K3W2Dq4YtN9pZv1m8LxCj7RoXeAbHfUsGeKqWpLt2Nm' },
             { id: 'sol_tx_2', chain: 'Solana', coin: 'SOL', hash: '4F8x9M2qLw7kRt1nPz3vCj5SbGeAaHfKsGeRqWpMt1Nm', from: 'DePIN Edge Compute Client', to: sampleSolAddr, amount: 14.20, timestamp: 1718884800000, dateStr: '2024-06-20', dateTimeStr: '2024-06-20 12:00:00', year: '2024', isIncoming: true, isSuccess: true, explorerUrl: 'https://solscan.io/tx/4F8x9M2qLw7kRt1nPz3vCj5SbGeAaHfKsGeRqWpMt1Nm' },
@@ -12826,8 +13183,8 @@ function loadSampleCryptoWallet(network) {
 // ────────────────────────────────────────────────────────────────────────────────
 
 async function runCryptoAccounting() {
-    const addr = (cryptoAccountingState.address || '').trim();
-    if (!addr) {
+    const rawAddr = (cryptoAccountingState.address || '').trim();
+    if (!rawAddr) {
         showToast('Please paste a Solana or Ethereum wallet address, or click a Sample button.', 'info');
         return;
     }
@@ -12845,30 +13202,28 @@ async function runCryptoAccounting() {
     try {
         let net = cryptoAccountingState.selectedNetwork;
         if (net === 'auto') {
-            net = detectCryptoNetwork(addr);
+            net = detectCryptoNetwork(rawAddr);
         }
 
         let extractedTxs = [];
-        if (net === 'ethereum') {
-            extractedTxs = await fetchEthereumTransactions(addr);
-        } else if (net === 'solana') {
-            extractedTxs = await fetchSolanaTransactions(addr);
+        if (net === 'ethereum' || rawAddr.startsWith('0x')) {
+            extractedTxs = await fetchEthereumTransactions(rawAddr);
+        } else if (net === 'solana' || rawAddr.length >= 32) {
+            extractedTxs = await fetchSolanaTransactions(rawAddr);
         } else {
-            // Try detecting automatically based on length
-            if (addr.startsWith('0x')) {
-                extractedTxs = await fetchEthereumTransactions(addr);
-            } else {
-                extractedTxs = await fetchSolanaTransactions(addr);
+            // Try Ethereum first, then Solana
+            extractedTxs = await fetchEthereumTransactions(rawAddr);
+            if (extractedTxs.length === 0) {
+                extractedTxs = await fetchSolanaTransactions(rawAddr);
             }
         }
 
         if (extractedTxs.length === 0) {
-            updateCryptoProgress('No direct transactions found on RPC/explorer. Checking backup...', 90);
-            showToast('No incoming transactions found for this address on mainnet.', 'info');
+            showToast('No transactions found on mainnet for this address. Check address or try Import CSV/JSON.', 'info');
         } else {
             cryptoAccountingState.transactions = extractedTxs;
             await calculateCryptoTaxes();
-            showToast(`Extracted ${extractedTxs.length} incoming transactions successfully!`, 'success');
+            showToast(`Extracted ${extractedTxs.length} transactions successfully!`, 'success');
         }
     } catch (e) {
         console.error('Error during crypto accounting calculation:', e);
@@ -12900,6 +13255,14 @@ async function calculateCryptoTaxes() {
         tx.taxDue = tx.fiatValue * (taxRate / 100);
     }
 
+    // Smart Auto-Toggle 1: If 0 incoming transactions exist but total txs > 0, auto-switch to 'all'
+    const incomingTxs = txs.filter(t => t.isIncoming);
+    if (incomingTxs.length === 0 && txs.length > 0 && cryptoAccountingState.typeFilter === 'incoming') {
+        cryptoAccountingState.typeFilter = 'all';
+        const typeSelect = document.getElementById('crypto-type-filter');
+        if (typeSelect) typeSelect.value = 'all';
+    }
+
     // 2. Aggregate yearly stats
     const yearlyMap = {};
     for (const tx of txs) {
@@ -12907,9 +13270,11 @@ async function calculateCryptoTaxes() {
         if (!yearlyMap[y]) {
             yearlyMap[y] = { year: y, count: 0, cryptoTotal: 0, grossFiat: 0, taxOwed: 0 };
         }
-        yearlyMap[y].count++;
-        yearlyMap[y].cryptoTotal += tx.amount;
-        yearlyMap[y].grossFiat += tx.fiatValue;
+        if (cryptoAccountingState.typeFilter === 'all' || tx.isIncoming) {
+            yearlyMap[y].count++;
+            yearlyMap[y].cryptoTotal += tx.amount;
+            yearlyMap[y].grossFiat += tx.fiatValue;
+        }
     }
 
     for (const y in yearlyMap) {
@@ -12920,13 +13285,35 @@ async function calculateCryptoTaxes() {
 
     cryptoAccountingState.yearlyStats = yearlyMap;
 
-    // 3. Determine active year
+    // 3. Determine active year with smart auto-adjust if selected year has 0 items
     const currentYear = new Date().getUTCFullYear();
     const lastYear = (currentYear - 1).toString();
     let activeYear = cryptoAccountingState.selectedYear;
 
     if (activeYear === 'last_year') activeYear = lastYear;
     else if (activeYear === 'current_year') activeYear = currentYear.toString();
+
+    // Auto-adjust active year if selected year has 0 transactions matching the filter
+    if (activeYear !== 'all' && (!yearlyMap[activeYear] || yearlyMap[activeYear].count === 0)) {
+        let bestYear = 'all';
+        let maxCount = 0;
+        for (const y in yearlyMap) {
+            if (yearlyMap[y].count > maxCount) {
+                maxCount = yearlyMap[y].count;
+                bestYear = y;
+            }
+        }
+        if (maxCount > 0) {
+            activeYear = bestYear;
+            cryptoAccountingState.selectedYear = bestYear;
+            const yearSel = document.getElementById('crypto-year-select');
+            if (yearSel) {
+                if (bestYear === lastYear) yearSel.value = 'last_year';
+                else if (bestYear === currentYear.toString()) yearSel.value = 'current_year';
+                else yearSel.value = bestYear;
+            }
+        }
+    }
 
     // 4. Calculate active year totals
     let activeGross = 0;
@@ -12935,7 +13322,8 @@ async function calculateCryptoTaxes() {
     let primaryCoin = txs[0]?.coin || 'SOL';
 
     for (const tx of txs) {
-        if (activeYear === 'all' || tx.year === activeYear) {
+        const matchesFilter = (cryptoAccountingState.typeFilter === 'all' || tx.isIncoming);
+        if (matchesFilter && (activeYear === 'all' || tx.year === activeYear)) {
             activeGross += tx.fiatValue;
             activeCryptoTotal += tx.amount;
             activeTxCount++;
@@ -12964,7 +13352,7 @@ async function calculateCryptoTaxes() {
         kpiTaxSub.textContent = `At ${taxRate.toFixed(1)}% statutory rate (${yearLabel})`;
     }
     if (kpiCrypto) kpiCrypto.textContent = `${activeCryptoTotal.toLocaleString('en-US', { minimumFractionDigits: 4, maximumFractionDigits: 4 })} ${primaryCoin}`;
-    if (kpiCryptoSub) kpiCryptoSub.textContent = `${activeTxCount} incoming payments`;
+    if (kpiCryptoSub) kpiCryptoSub.textContent = `${activeTxCount} transactions`;
     if (kpiAvgSpot) kpiAvgSpot.textContent = `${currSymbol} ${activeAvgSpot.toLocaleString('en-US', { minimumFractionDigits: 2, maximumFractionDigits: 2 })} / ${primaryCoin}`;
     if (kpiNet) kpiNet.textContent = `${currSymbol} ${activeNetRetained.toLocaleString('en-US', { minimumFractionDigits: 2, maximumFractionDigits: 2 })}`;
 
@@ -12994,41 +13382,56 @@ function renderYearTabs(yearlyMap, activeYear) {
         totalAllFiat += yearlyMap[y].grossFiat;
     }
 
-    let html = `
-        <button type="button" class="crypto-year-pill ${activeYear === 'all' ? 'active' : ''}" onclick="selectCryptoYearTab('all')">
-            <span>All Years</span>
-            <span class="crypto-pill-count">${totalAllCount}</span>
+    let tabsHtml = '';
+
+    // "All Years" Tab
+    const isAllActive = activeYear === 'all';
+    tabsHtml += `
+        <button type="button" class="crypto-year-tab ${isAllActive ? 'active' : ''}" onclick="selectCryptoYearTab('all')">
+            <span class="crypto-tab-year">All Years</span>
+            <span class="crypto-tab-badge">${totalAllCount}</span>
+            <span class="crypto-tab-sub">${sym} ${Math.round(totalAllFiat).toLocaleString('en-US')}</span>
         </button>
     `;
 
-    for (const y of years) {
-        const isLastYear = y === lastYear;
-        const isCurrentYear = y === currentYear.toString();
-        const label = isLastYear ? `${y} (Last Year)` : isCurrentYear ? `${y} (Current)` : y;
-        const stat = yearlyMap[y];
-        const fiatFormatted = `${sym}${Math.round(stat.grossFiat).toLocaleString('en-US')}`;
+    // Individual Year Tabs
+    years.forEach(y => {
+        const stats = yearlyMap[y];
+        const isActive = activeYear === y;
+        let label = y;
+        if (y === lastYear) label = `${y} (Last Year)`;
+        else if (y === currentYear.toString()) label = `${y} (Current)`;
 
-        html += `
-            <button type="button" class="crypto-year-pill ${activeYear === y ? 'active' : ''}" onclick="selectCryptoYearTab('${y}')" title="${stat.count} txs, Gross: ${fiatFormatted}">
-                <span>${label}</span>
-                <span class="crypto-pill-count">${stat.count}</span>
+        tabsHtml += `
+            <button type="button" class="crypto-year-tab ${isActive ? 'active' : ''}" onclick="selectCryptoYearTab('${y}')">
+                <span class="crypto-tab-year">${label}</span>
+                <span class="crypto-tab-badge">${stats.count}</span>
+                <span class="crypto-tab-sub">${sym} ${Math.round(stats.grossFiat).toLocaleString('en-US')}</span>
             </button>
         `;
-    }
+    });
 
-    tabsContainer.innerHTML = html;
+    tabsContainer.innerHTML = tabsHtml;
 }
 
 function selectCryptoYearTab(yearVal) {
     cryptoAccountingState.selectedYear = yearVal;
     const yearSelect = document.getElementById('crypto-year-select');
     if (yearSelect) {
+        const currentYear = new Date().getUTCFullYear().toString();
+        const lastYear = (new Date().getUTCFullYear() - 1).toString();
         if (yearVal === 'all') yearSelect.value = 'all';
+        else if (yearVal === lastYear) yearSelect.value = 'last_year';
+        else if (yearVal === currentYear) yearSelect.value = 'current_year';
         else {
-            const currentYear = new Date().getUTCFullYear();
-            const lastYear = (currentYear - 1).toString();
-            if (yearVal === lastYear) yearSelect.value = 'last_year';
-            else if (yearVal === currentYear.toString()) yearSelect.value = 'current_year';
+            const hasOpt = Array.from(yearSelect.options).some(o => o.value === yearVal);
+            if (!hasOpt) {
+                const opt = document.createElement('option');
+                opt.value = yearVal;
+                opt.textContent = `Year ${yearVal}`;
+                yearSelect.appendChild(opt);
+                yearSelect.value = yearVal;
+            }
             else yearSelect.value = yearVal;
         }
     }
@@ -13060,11 +13463,11 @@ function renderLedgerTable(activeYear) {
     const query = cryptoAccountingState.searchQuery || '';
     const currency = cryptoAccountingState.currency || 'EUR';
     const sym = currency === 'EUR' ? '€' : '$';
+    const onlyIncoming = cryptoAccountingState.typeFilter === 'incoming';
 
     const filtered = txs.filter(tx => {
-        // Year filter
+        if (onlyIncoming && !tx.isIncoming) return false;
         if (activeYear !== 'all' && tx.year !== activeYear) return false;
-        // Search query
         if (query) {
             const matchHash = tx.hash.toLowerCase().includes(query);
             const matchFrom = tx.from.toLowerCase().includes(query);
@@ -13075,13 +13478,15 @@ function renderLedgerTable(activeYear) {
     });
 
     if (filtered.length === 0) {
+        const yearMsg = activeYear === 'all' ? 'any year' : `year ${activeYear}`;
+        const filterMsg = onlyIncoming ? 'incoming payments' : 'transactions';
         tbody.innerHTML = `
             <tr class="crypto-empty-row">
                 <td colspan="10">
                     <div class="crypto-empty-state">
                         <span class="material-symbols-outlined">receipt_long</span>
-                        <p>No transactions found matching this filter.</p>
-                        <small>Try selecting a different year or clearing your search term.</small>
+                        <p>No ${filterMsg} found for ${yearMsg}.</p>
+                        <small>Try clicking <b>All Years</b> or switching filter to <b>All Transactions</b> above.</small>
                     </div>
                 </td>
             </tr>
@@ -13103,6 +13508,10 @@ function renderLedgerTable(activeYear) {
         const chainBadgeClass = tx.chain === 'Solana' ? 'sol' : 'eth';
         const truncHash = tx.hash.length > 16 ? `${tx.hash.substring(0, 6)}...${tx.hash.substring(tx.hash.length - 4)}` : tx.hash;
         const truncFrom = tx.from.length > 22 ? `${tx.from.substring(0, 10)}...${tx.from.substring(tx.from.length - 6)}` : tx.from;
+        const sign = tx.isIncoming ? '+' : '-';
+        const amtColor = tx.isIncoming ? '#4ade80' : '#f87171';
+        const statusClass = tx.isIncoming ? 'confirmed' : 'outgoing';
+        const statusLabel = tx.isIncoming ? 'Received' : 'Outgoing';
 
         rowsHtml += `
             <tr>
@@ -13116,11 +13525,11 @@ function renderLedgerTable(activeYear) {
                     </a>
                 </td>
                 <td class="crypto-sender-addr" title="${tx.from}">${truncFrom}</td>
-                <td style="text-align: right;" class="crypto-amount-in">+${tx.amount.toFixed(4)} ${tx.coin}</td>
+                <td style="text-align: right; color: ${amtColor}; font-weight: 600;" class="crypto-amount-in">${sign}${tx.amount.toFixed(4)} ${tx.coin}</td>
                 <td style="text-align: right;" class="crypto-spot-price">${sym} ${tx.spotRate.toLocaleString('en-US', { minimumFractionDigits: 2, maximumFractionDigits: 2 })}</td>
                 <td style="text-align: right;" class="crypto-fiat-val">${sym} ${tx.fiatValue.toLocaleString('en-US', { minimumFractionDigits: 2, maximumFractionDigits: 2 })}</td>
                 <td style="text-align: right;" class="crypto-tax-val">${sym} ${tx.taxDue.toLocaleString('en-US', { minimumFractionDigits: 2, maximumFractionDigits: 2 })}</td>
-                <td style="text-align: center;"><span class="crypto-status-pill confirmed">Received</span></td>
+                <td style="text-align: center;"><span class="crypto-status-pill ${statusClass}">${statusLabel}</span></td>
             </tr>
         `;
     });
@@ -13138,142 +13547,117 @@ function renderLedgerTable(activeYear) {
         const tfTax = document.getElementById('tfoot-tax-total');
 
         if (tfCrypto) tfCrypto.textContent = `${totCrypto.toFixed(4)} ${primaryCoin}`;
-        if (tfSpot) tfSpot.textContent = `Avg: ${sym}${avgSpot.toFixed(2)}`;
+        if (tfSpot) tfSpot.textContent = `${sym} ${avgSpot.toFixed(2)}`;
         if (tfFiat) tfFiat.textContent = `${sym} ${totFiat.toLocaleString('en-US', { minimumFractionDigits: 2, maximumFractionDigits: 2 })}`;
         if (tfTax) tfTax.textContent = `${sym} ${totTax.toLocaleString('en-US', { minimumFractionDigits: 2, maximumFractionDigits: 2 })}`;
     }
 }
 
 // ────────────────────────────────────────────────────────────────────────────────
-// Exports & Chat Integration
+// Export Utilities (CSV, JSON, Clipboard synopsis, Chat injection)
 // ────────────────────────────────────────────────────────────────────────────────
 
 function exportCryptoTaxCsv() {
     const txs = cryptoAccountingState.transactions || [];
     if (txs.length === 0) {
-        showToast('No transaction data to export.', 'info');
+        showToast('No transactions to export.', 'info');
         return;
     }
 
     const currency = cryptoAccountingState.currency || 'EUR';
-    const taxRate = cryptoAccountingState.taxRate || 30.0;
+    const sym = currency === 'EUR' ? 'EUR' : 'USD';
     const currentYear = new Date().getUTCFullYear();
     const lastYear = (currentYear - 1).toString();
     let activeYear = cryptoAccountingState.selectedYear;
     if (activeYear === 'last_year') activeYear = lastYear;
     else if (activeYear === 'current_year') activeYear = currentYear.toString();
 
-    const filtered = txs.filter(tx => activeYear === 'all' || tx.year === activeYear);
-
-    const headers = [
-        'Index', 'Date_UTC', 'Blockchain', 'Tx_Hash', 'Sender_From', 'Token',
-        'Amount_Received', `Spot_FX_${currency}`, `Gross_Value_${currency}`,
-        'Tax_Rate_Pct', `Tax_Owed_${currency}`, 'Status', 'Explorer_URL'
-    ];
-
-    const escapeCsv = (val) => {
-        const s = String(val === undefined || val === null ? '' : val);
-        return `"${s.replace(/"/g, '""')}"`;
-    };
-
-    let csvContent = '\uFEFF' + headers.map(escapeCsv).join(',') + '\r\n';
-
-    filtered.forEach((tx, idx) => {
-        const row = [
-            idx + 1,
-            tx.dateTimeStr,
-            tx.chain,
-            tx.hash,
-            tx.from,
-            tx.coin,
-            tx.amount.toFixed(6),
-            tx.spotRate.toFixed(2),
-            tx.fiatValue.toFixed(2),
-            taxRate.toFixed(1),
-            tx.taxDue.toFixed(2),
-            'Received',
-            tx.explorerUrl
-        ];
-        csvContent += row.map(escapeCsv).join(',') + '\r\n';
+    const filtered = txs.filter(tx => {
+        if (cryptoAccountingState.typeFilter === 'incoming' && !tx.isIncoming) return false;
+        if (activeYear !== 'all' && tx.year !== activeYear) return false;
+        return true;
     });
 
-    const blob = new Blob([csvContent], { type: 'text/csv;charset=utf-8;' });
-    const url = URL.createObjectURL(blob);
+    const headers = [
+        'Transaction ID',
+        'Date UTC',
+        'Blockchain',
+        'Asset / Coin',
+        'Amount',
+        'Direction',
+        `Spot Rate (${sym})`,
+        `Gross Fiat Value (${sym})`,
+        `Tax Due (${sym})`,
+        'From Address',
+        'To Address',
+        'Tx Hash',
+        'Explorer URL'
+    ];
+
+    const rows = filtered.map(t => [
+        `"${t.id}"`,
+        `"${t.dateTimeStr}"`,
+        `"${t.chain}"`,
+        `"${t.coin}"`,
+        t.amount.toFixed(6),
+        t.isIncoming ? '"Incoming"' : '"Outgoing"',
+        t.spotRate.toFixed(4),
+        t.fiatValue.toFixed(2),
+        t.taxDue.toFixed(2),
+        `"${t.from}"`,
+        `"${t.to}"`,
+        `"${t.hash}"`,
+        `"${t.explorerUrl}"`
+    ]);
+
+    const csvContent = 'data:text/csv;charset=utf-8,' + [headers.join(','), ...rows.map(r => r.join(','))].join('\n');
+    const encodedUri = encodeURI(csvContent);
     const link = document.createElement('a');
-    link.href = url;
-    link.download = `Crypto_Tax_Ledger_${activeYear}_${currency}.csv`;
+    link.setAttribute('href', encodedUri);
+    link.setAttribute('download', `Moecher_Crypto_Tax_Ledger_${activeYear}_${currency}.csv`);
     document.body.appendChild(link);
     link.click();
     document.body.removeChild(link);
-    URL.revokeObjectURL(url);
 
-    showToast(`Exported ${filtered.length} rows to CSV (${activeYear})`, 'success');
+    showToast(`Exported ${filtered.length} transactions to CSV`, 'success');
 }
 
 function exportCryptoTaxJson() {
     const txs = cryptoAccountingState.transactions || [];
     if (txs.length === 0) {
-        showToast('No transaction data to export.', 'info');
+        showToast('No transactions to export.', 'info');
         return;
     }
 
-    const currency = cryptoAccountingState.currency || 'EUR';
-    const currentYear = new Date().getUTCFullYear();
-    const lastYear = (currentYear - 1).toString();
-    let activeYear = cryptoAccountingState.selectedYear;
-    if (activeYear === 'last_year') activeYear = lastYear;
-    else if (activeYear === 'current_year') activeYear = currentYear.toString();
-
-    const filtered = txs.filter(tx => activeYear === 'all' || tx.year === activeYear);
-
-    let totGross = 0;
-    let totCrypto = 0;
-    let totTax = 0;
-    filtered.forEach(t => {
-        totGross += t.fiatValue;
-        totCrypto += t.amount;
-        totTax += t.taxDue;
-    });
-
     const payload = {
-        title: 'Moecher Crypto Earnings & Tax Accounting Audit Trail',
-        exportedAt: new Date().toISOString(),
+        exportDate: new Date().toISOString(),
+        engine: 'MinnieTheMoEcher Crypto Tax Accounting Engine',
         walletAddress: cryptoAccountingState.address,
-        blockchain: cryptoAccountingState.selectedNetwork,
-        taxYear: activeYear,
-        fiatCurrency: currency,
-        statutoryTaxRatePct: cryptoAccountingState.taxRate,
+        network: cryptoAccountingState.selectedNetwork,
+        currency: cryptoAccountingState.currency,
+        selectedYear: cryptoAccountingState.selectedYear,
+        statutoryTaxRate: cryptoAccountingState.taxRate,
         deductibleExpenses: cryptoAccountingState.deductible,
-        summary: {
-            totalIncomingTransactions: filtered.length,
-            totalCryptoReceived: totCrypto,
-            grossCryptoEarningsFiat: totGross,
-            estimatedTaxOwedToState: totTax,
-            netRetainedAfterTax: totGross - totTax,
-            weightedAverageSpotRate: totCrypto > 0 ? totGross / totCrypto : 0
-        },
-        yearlyBreakdown: cryptoAccountingState.yearlyStats,
-        transactions: filtered
+        annualSummaries: cryptoAccountingState.yearlyStats,
+        transactions: txs
     };
 
-    const blob = new Blob([JSON.stringify(payload, null, 2)], { type: 'application/json' });
-    const url = URL.createObjectURL(blob);
-    const link = document.createElement('a');
-    link.href = url;
-    link.download = `Crypto_Tax_Audit_${activeYear}.json`;
-    document.body.appendChild(link);
-    link.click();
-    document.body.removeChild(link);
-    URL.revokeObjectURL(url);
+    const dataStr = 'data:text/json;charset=utf-8,' + encodeURIComponent(JSON.stringify(payload, null, 2));
+    const dlAnchor = document.createElement('a');
+    dlAnchor.setAttribute('href', dataStr);
+    dlAnchor.setAttribute('download', `Moecher_Crypto_Tax_Audit_${cryptoAccountingState.selectedYear}.json`);
+    document.body.appendChild(dlAnchor);
+    dlAnchor.click();
+    dlAnchor.remove();
 
-    showToast(`Audit JSON exported successfully`, 'success');
+    showToast('Exported complete crypto tax audit trail to JSON', 'success');
 }
 
 function copyCryptoTaxSummary() {
     const txs = cryptoAccountingState.transactions || [];
     if (txs.length === 0) {
-        showToast('No transaction data to copy.', 'info');
-        return;
+        showToast('No calculation available to summarize.', 'info');
+        return '';
     }
 
     const currency = cryptoAccountingState.currency || 'EUR';
@@ -13302,7 +13686,7 @@ function copyCryptoTaxSummary() {
         `- Tax Accounting Year: ${activeYear === 'all' ? 'All Years' : activeYear}`,
         `- Wallet Address: ${cryptoAccountingState.address || 'Sample Wallet'}`,
         `- Network: ${cryptoAccountingState.selectedNetwork.toUpperCase()}`,
-        `- Number of Incoming Payments: ${filtered.length}`,
+        `- Number of Transactions: ${filtered.length}`,
         `- Total Crypto Received: ${totCrypto.toFixed(4)} ${primaryCoin}`,
         `- Weighted Average Spot FX on Receipt Dates: ${sym} ${avgSpot.toFixed(2)} / ${primaryCoin}`,
         `- Gross Taxable Crypto Income: ${sym} ${totGross.toLocaleString('en-US', { minimumFractionDigits: 2, maximumFractionDigits: 2 })}`,
@@ -13384,7 +13768,6 @@ function loadCryptoTaxSettings() {
         cryptoTaxSettings.customSolanaRpc = solRpc;
         cryptoTaxSettings.etherscanApiKey = ethKey;
 
-        // Sync modal inputs if first time
         if (!cryptoAccountingState.address) {
             setCryptoCurrency(curr);
             setQuickTaxRate(cryptoTaxSettings.defaultTaxRate);
@@ -13406,7 +13789,6 @@ function loadCryptoTaxSettings() {
 function initCryptoAccountingUI() {
     loadCryptoTaxSettings();
 
-    // Keydown listener for Enter on address input
     const addrInput = document.getElementById('crypto-address-input');
     if (addrInput) {
         addrInput.addEventListener('keydown', (e) => {
@@ -13417,7 +13799,6 @@ function initCryptoAccountingUI() {
         });
     }
 
-    // Advanced inputs change
     const solRpcInput = document.getElementById('crypto-solana-rpc');
     if (solRpcInput) {
         solRpcInput.addEventListener('change', () => {
@@ -13434,5 +13815,3 @@ function initCryptoAccountingUI() {
         });
     }
 }
-
-

@@ -2409,6 +2409,11 @@
                                 <span class="material-symbols-outlined">dataset</span>
                                 <span>Sample ETH Wallet</span>
                             </button>
+                            <button type="button" class="crypto-btn-sample" onclick="triggerCryptoFileImport()" title="Import transactions from CSV or JSON file (Etherscan, Solscan, Koinly, Phantom, etc.)">
+                                <span class="material-symbols-outlined">upload_file</span>
+                                <span>Import CSV / JSON</span>
+                            </button>
+                            <input type="file" id="crypto-file-import-input" accept=".csv,.json" style="display:none;" onchange="handleCryptoFileImport(event)">
                         </div>
                         <div class="crypto-secondary-actions">
                             <button type="button" class="crypto-btn-text" onclick="toggleAdvancedCryptoSettings()" title="Custom RPC / Etherscan API key">
