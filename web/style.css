@@ -6904,6 +6904,22 @@ iframe#preview-iframe {
     border: 1px solid rgba(34, 197, 94, 0.3);
 }
 
+.crypto-status-pill.outgoing {
+    background: rgba(239, 68, 68, 0.15);
+    color: #fca5a5;
+    border: 1px solid rgba(239, 68, 68, 0.3);
+}
+
+.crypto-sender-addr {
+    font-family: monospace;
+    font-size: 11px;
+    color: #cbd5e1;
+    max-width: 180px;
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+}
+
 .crypto-empty-row td {
     padding: 40px 20px;
     text-align: center;

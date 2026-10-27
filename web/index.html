@@ -4,7 +4,7 @@
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
     <title>Moecher Chat</title>
-    <link rel="stylesheet" href="style.css?v=20261027_v3">
+    <link rel="stylesheet" href="style.css?v=20261027_v4">
     <!-- Google Fonts for Gemini-like typography -->
     <link href="https://fonts.googleapis.com/css2?family=Outfit:wght@300;400;500;600&family=Inter:wght@300;400;500;600&display=swap" rel="stylesheet">
     <link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=Material+Symbols+Outlined:opsz,wght,FILL,GRAD@20..48,100..700,0..1,-50..200" />
@@ -2536,9 +2536,13 @@
                         <input type="text" id="crypto-ledger-search" placeholder="Search by Tx Hash, Sender Address, or Date..." oninput="filterCryptoLedger()">
                     </div>
                     <div class="crypto-ledger-filters">
-                        <select id="crypto-type-filter" class="crypto-select-sm" onchange="filterCryptoLedger()">
+                        <select id="crypto-type-filter" class="crypto-select-sm" onchange="filterCryptoLedger()" title="Filter by transfer direction">
                             <option value="incoming" selected>Incoming Only (Earnings)</option>
-                            <option value="all">All Transactions</option>
+                            <option value="outgoing">Outgoing Only (Transfers)</option>
+                            <option value="all">All Directions</option>
+                        </select>
+                        <select id="crypto-sender-filter" class="crypto-select-sm" onchange="filterCryptoLedger()" title="Filter by sender (e.g. Render Network Distribution)">
+                            <option value="all" selected>All Senders</option>
                         </select>
                     </div>
                     <div class="crypto-export-actions">
@@ -2571,7 +2575,7 @@
                                 <th style="width: 90px;">Chain</th>
                                 <th style="width: 130px;">Tx Hash</th>
                                 <th>From / Sender</th>
-                                <th style="text-align: right;">Amount Received</th>
+                                <th style="text-align: right;" id="crypto-amount-th">Amount</th>
                                 <th style="text-align: right;">Spot FX at Date</th>
                                 <th style="text-align: right;">Fiat Value</th>
                                 <th style="text-align: right;">Tax Due</th>
@@ -2605,6 +2609,6 @@
         </div>
     </div>
 
-    <script src="script.js?v=20261027_v3"></script>
+    <script src="script.js?v=20261027_v4"></script>
 </body>
 </html>

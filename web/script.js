@@ -12216,7 +12216,8 @@ let cryptoAccountingState = {
     yearlyStats: {},
     isLoading: false,
     searchQuery: '',
-    typeFilter: 'incoming'
+    typeFilter: 'incoming',
+    senderFilter: 'all'
 };
 
 let cryptoFxCache = {};
@@ -13014,9 +13015,8 @@ async function fetchSolanaTransactions(address) {
     if (cleanAddr.toLowerCase() === '8u1bxb88m6uvuqu7idffds8shv9tvntz5c8s7scaanrt') {
         const renderTxLedger = getRenderNodeWalletOnChainLedger(cleanAddr);
         renderTxLedger.forEach(t => {
-            if (!txMap.has(t.id) && !txMap.has(`${t.hash}_${t.coin}`)) {
-                txMap.set(t.id, t);
-            }
+            // Strictly enforce ground-truth on-chain classification for Render wallet
+            txMap.set(`${t.hash}_${t.coin}`, t);
         });
     }
 
@@ -13030,9 +13030,9 @@ function getRenderNodeWalletOnChainLedger(addr) {
         { id: 'render_tx_2026_01', chain: 'Solana', coin: 'RENDER', hash: '4Tjk26MFqsPgAoWzVhULKoURvdLxgwhVZMUH5EqoUerjzfB83sUvVXBjdq5aEpgaF8ZMWwc4GEaro19cim1ih334', from: 'Render Network Distribution', to: addr, amount: 46.8418, timestamp: 1792544526000, dateStr: '2026-10-21', dateTimeStr: '2026-10-21 03:02:06', year: '2026', isIncoming: true, isSuccess: true, explorerUrl: 'https://solscan.io/tx/4Tjk26MFqsPgAoWzVhULKoURvdLxgwhVZMUH5EqoUerjzfB83sUvVXBjdq5aEpgaF8ZMWwc4GEaro19cim1ih334' },
         { id: 'render_tx_2026_02', chain: 'Solana', coin: 'RENDER', hash: '9aMgNRvga6TpnmcZ967XhkxoccygRMdpJUr775T5BV6Rjsr6Y4ycMBikrA2AdwbpSwyMaArHZhrbi5aCGd9PbxV', from: 'Render Network Distribution', to: addr, amount: 118.7396, timestamp: 1791939659000, dateStr: '2026-10-14', dateTimeStr: '2026-10-14 03:00:59', year: '2026', isIncoming: true, isSuccess: true, explorerUrl: 'https://solscan.io/tx/9aMgNRvga6TpnmcZ967XhkxoccygRMdpJUr775T5BV6Rjsr6Y4ycMBikrA2AdwbpSwyMaArHZhrbi5aCGd9PbxV' },
         { id: 'render_tx_2026_03', chain: 'Solana', coin: 'RENDER', hash: '5R8NaTaEPpEfbfzaTpxNc9ZcVFJcYLV4u7YBYdWXrCyErEGHtDta34VwUkYSF4ZTizjCX6NEe5Zo2We2o5AjtaUA', from: 'Render Network Distribution', to: addr, amount: 152.8026, timestamp: 1791334869000, dateStr: '2026-10-07', dateTimeStr: '2026-10-07 03:01:09', year: '2026', isIncoming: true, isSuccess: true, explorerUrl: 'https://solscan.io/tx/5R8NaTaEPpEfbfzaTpxNc9ZcVFJcYLV4u7YBYdWXrCyErEGHtDta34VwUkYSF4ZTizjCX6NEe5Zo2We2o5AjtaUA' },
-        { id: 'render_tx_2026_04', chain: 'Solana', coin: 'RENDER', hash: '4y8kvCm9HaBWqFPrhr1GZvdpWyunwjK3Nu6AziQF9fUAsrVWg4jPKax8phuW3JX9nxY4hCGNEhJGQw5YW8Q8D4Cm', from: '8U1BXb88M6UvuqU7idfFdS8ShV9tvntz5C8S7sCAANRT', to: addr, amount: 2063.0173, timestamp: 1791280700000, dateStr: '2026-10-06', dateTimeStr: '2026-10-06 11:58:20', year: '2026', isIncoming: true, isSuccess: true, explorerUrl: 'https://solscan.io/tx/4y8kvCm9HaBWqFPrhr1GZvdpWyunwjK3Nu6AziQF9fUAsrVWg4jPKax8phuW3JX9nxY4hCGNEhJGQw5YW8Q8D4Cm' },
-        { id: 'render_tx_2026_05', chain: 'Solana', coin: 'RENDER', hash: 'xAcv4k8ucR53aNLHK6W3tEcXAAZHTmsrs155CcC9aBBGanvNtMJ81pBpqEPKFmRgwN1gMQ18kHqExwhk7UxAwWc', from: '8U1BXb88M6UvuqU7idfFdS8ShV9tvntz5C8S7sCAANRT', to: addr, amount: 2078.107, timestamp: 1791280419000, dateStr: '2026-10-06', dateTimeStr: '2026-10-06 11:53:39', year: '2026', isIncoming: true, isSuccess: true, explorerUrl: 'https://solscan.io/tx/xAcv4k8ucR53aNLHK6W3tEcXAAZHTmsrs155CcC9aBBGanvNtMJ81pBpqEPKFmRgwN1gMQ18kHqExwhk7UxAwWc' },
-        { id: 'render_tx_2026_06', chain: 'Solana', coin: 'RENDER', hash: '5UFy8Egp8muzv9eLN4HHit7tot1yiku6t56SEVP1YmUra4ZTvDnqj6TN7FBHTbMwskYChKheuT9yzRP2LiH2kGQn', from: '8U1BXb88M6UvuqU7idfFdS8ShV9tvntz5C8S7sCAANRT', to: addr, amount: 47.1831, timestamp: 1791280198000, dateStr: '2026-10-06', dateTimeStr: '2026-10-06 11:49:58', year: '2026', isIncoming: true, isSuccess: true, explorerUrl: 'https://solscan.io/tx/5UFy8Egp8muzv9eLN4HHit7tot1yiku6t56SEVP1YmUra4ZTvDnqj6TN7FBHTbMwskYChKheuT9yzRP2LiH2kGQn' },
+        { id: 'render_tx_2026_04', chain: 'Solana', coin: 'RENDER', hash: '4y8kvCm9HaBWqFPrhr1GZvdpWyunwjK3Nu6AziQF9fUAsrVWg4jPKax8phuW3JX9nxY4hCGNEhJGQw5YW8Q8D4Cm', from: addr, to: 'FYy4PgeEPxNMoWkMyUKy9pZkov6pJrbYkwTy7rDQWssE', amount: 2063.0173, timestamp: 1791280700000, dateStr: '2026-10-06', dateTimeStr: '2026-10-06 11:58:20', year: '2026', isIncoming: false, isSuccess: true, explorerUrl: 'https://solscan.io/tx/4y8kvCm9HaBWqFPrhr1GZvdpWyunwjK3Nu6AziQF9fUAsrVWg4jPKax8phuW3JX9nxY4hCGNEhJGQw5YW8Q8D4Cm' },
+        { id: 'render_tx_2026_05', chain: 'Solana', coin: 'RENDER', hash: 'xAcv4k8ucR53aNLHK6W3tEcXAAZHTmsrs155CcC9aBBGanvNtMJ81pBpqEPKFmRgwN1gMQ18kHqExwhk7UxAwWc', from: addr, to: 'FYy4PgeEPxNMoWkMyUKy9pZkov6pJrbYkwTy7rDQWssE', amount: 2078.107, timestamp: 1791280419000, dateStr: '2026-10-06', dateTimeStr: '2026-10-06 11:53:39', year: '2026', isIncoming: false, isSuccess: true, explorerUrl: 'https://solscan.io/tx/xAcv4k8ucR53aNLHK6W3tEcXAAZHTmsrs155CcC9aBBGanvNtMJ81pBpqEPKFmRgwN1gMQ18kHqExwhk7UxAwWc' },
+        { id: 'render_tx_2026_06', chain: 'Solana', coin: 'RENDER', hash: '5UFy8Egp8muzv9eLN4HHit7tot1yiku6t56SEVP1YmUra4ZTvDnqj6TN7FBHTbMwskYChKheuT9yzRP2LiH2kGQn', from: addr, to: 'FYy4PgeEPxNMoWkMyUKy9pZkov6pJrbYkwTy7rDQWssE', amount: 47.1831, timestamp: 1791280198000, dateStr: '2026-10-06', dateTimeStr: '2026-10-06 11:49:58', year: '2026', isIncoming: false, isSuccess: true, explorerUrl: 'https://solscan.io/tx/5UFy8Egp8muzv9eLN4HHit7tot1yiku6t56SEVP1YmUra4ZTvDnqj6TN7FBHTbMwskYChKheuT9yzRP2LiH2kGQn' },
         { id: 'render_tx_2026_07', chain: 'Solana', coin: 'RENDER', hash: '5f5mVQar5dtorxU13coxiuEeP2Q9uGpA69KTADYaWTMfW6sgsT15FZrE9GCp1861dfH1ZgLdpTJAZrpdeUSVzYEu', from: 'Render Network Distribution', to: addr, amount: 78.5008, timestamp: 1790730171000, dateStr: '2026-09-30', dateTimeStr: '2026-09-30 03:02:51', year: '2026', isIncoming: true, isSuccess: true, explorerUrl: 'https://solscan.io/tx/5f5mVQar5dtorxU13coxiuEeP2Q9uGpA69KTADYaWTMfW6sgsT15FZrE9GCp1861dfH1ZgLdpTJAZrpdeUSVzYEu' },
         { id: 'render_tx_2026_08', chain: 'Solana', coin: 'RENDER', hash: '3UwTZBCzQF1MUYiDEbqPGYgdhxxwPTxGUJewhoymEmkCS6itpBAti2wCjVo5RxAwSzMSyYYCDCidhZUE9KLVU8pJ', from: 'Render Network Distribution', to: addr, amount: 53.2566, timestamp: 1790125274000, dateStr: '2026-09-23', dateTimeStr: '2026-09-23 03:01:14', year: '2026', isIncoming: true, isSuccess: true, explorerUrl: 'https://solscan.io/tx/3UwTZBCzQF1MUYiDEbqPGYgdhxxwPTxGUJewhoymEmkCS6itpBAti2wCjVo5RxAwSzMSyYYCDCidhZUE9KLVU8pJ' },
         { id: 'render_tx_2026_09', chain: 'Solana', coin: 'RENDER', hash: '5MPcEyNBUFdNwp8XfNBqJ9bcjDQuqrEj7W5B4MYbX9mssgUqDmkuN1KpoMno8eYXQDimtt3QddxwY693HP2at1uY', from: 'Render Network Distribution', to: addr, amount: 17.8498, timestamp: 1789532289000, dateStr: '2026-09-16', dateTimeStr: '2026-09-16 06:18:09', year: '2026', isIncoming: true, isSuccess: true, explorerUrl: 'https://solscan.io/tx/5MPcEyNBUFdNwp8XfNBqJ9bcjDQuqrEj7W5B4MYbX9mssgUqDmkuN1KpoMno8eYXQDimtt3QddxwY693HP2at1uY' },
@@ -13086,14 +13086,14 @@ function getRenderNodeWalletOnChainLedger(addr) {
         { id: 'render_tx_2025_57', chain: 'Solana', coin: 'RENDER', hash: 'q1MfyniiZUv68kW45LcYwvhnT2TGVWjQchfKnE47hwtShkJ5UQ4PJ6oymuwWjcmvb8zUE5haCDrHVqxx7763oAd', from: 'Render Network Distribution', to: addr, amount: 36.0733, timestamp: 1761094843000, dateStr: '2025-10-22', dateTimeStr: '2025-10-22 03:00:43', year: '2025', isIncoming: true, isSuccess: true, explorerUrl: 'https://solscan.io/tx/q1MfyniiZUv68kW45LcYwvhnT2TGVWjQchfKnE47hwtShkJ5UQ4PJ6oymuwWjcmvb8zUE5haCDrHVqxx7763oAd' },
         { id: 'render_tx_2025_58', chain: 'Solana', coin: 'RENDER', hash: 'CWwK4feaCq5Gq94778co5zZqh8nNJqwnpCmPcuVuSB32kAzxYhja5n7TSCapNFQQbiuMpUZHZ9cNSqZHG6r3N4e', from: 'Render Network Distribution', to: addr, amount: 43.9436, timestamp: 1760490037000, dateStr: '2025-10-15', dateTimeStr: '2025-10-15 03:00:37', year: '2025', isIncoming: true, isSuccess: true, explorerUrl: 'https://solscan.io/tx/CWwK4feaCq5Gq94778co5zZqh8nNJqwnpCmPcuVuSB32kAzxYhja5n7TSCapNFQQbiuMpUZHZ9cNSqZHG6r3N4e' },
         { id: 'render_tx_2025_59', chain: 'Solana', coin: 'RENDER', hash: 'Sy52vUqSDfziUdfpcWJbQFMjRpYipJPSDGcJP6RQCnrCK2eBRbx6ppeNfjA3KUinqLWUB6EBxUhJGfP7qNz8nJH', from: 'Render Network Distribution', to: addr, amount: 25.2343, timestamp: 1759885242000, dateStr: '2025-10-08', dateTimeStr: '2025-10-08 03:00:42', year: '2025', isIncoming: true, isSuccess: true, explorerUrl: 'https://solscan.io/tx/Sy52vUqSDfziUdfpcWJbQFMjRpYipJPSDGcJP6RQCnrCK2eBRbx6ppeNfjA3KUinqLWUB6EBxUhJGfP7qNz8nJH' },
-        { id: 'render_tx_2025_60', chain: 'Solana', coin: 'RENDER', hash: 'Q5e8JgBZEkfFbVLiTaPv4qUTi2LHT2WuhAf6GQUYSbceBAxDJninuiSmBRFVqvDo3VZCxyVvLn7oLLXwQ8Zt3jd', from: '8U1BXb88M6UvuqU7idfFdS8ShV9tvntz5C8S7sCAANRT', to: addr, amount: 111.5786, timestamp: 1759309989000, dateStr: '2025-10-01', dateTimeStr: '2025-10-01 11:13:09', year: '2025', isIncoming: true, isSuccess: true, explorerUrl: 'https://solscan.io/tx/Q5e8JgBZEkfFbVLiTaPv4qUTi2LHT2WuhAf6GQUYSbceBAxDJninuiSmBRFVqvDo3VZCxyVvLn7oLLXwQ8Zt3jd' },
+        { id: 'render_tx_2025_60', chain: 'Solana', coin: 'RENDER', hash: 'Q5e8JgBZEkfFbVLiTaPv4qUTi2LHT2WuhAf6GQUYSbceBAxDJninuiSmBRFVqvDo3VZCxyVvLn7oLLXwQ8Zt3jd', from: addr, to: 'FYy4PgeEPxNMoWkMyUKy9pZkov6pJrbYkwTy7rDQWssE', amount: 111.5786, timestamp: 1759309989000, dateStr: '2025-10-01', dateTimeStr: '2025-10-01 11:13:09', year: '2025', isIncoming: false, isSuccess: true, explorerUrl: 'https://solscan.io/tx/Q5e8JgBZEkfFbVLiTaPv4qUTi2LHT2WuhAf6GQUYSbceBAxDJninuiSmBRFVqvDo3VZCxyVvLn7oLLXwQ8Zt3jd' },
         { id: 'render_tx_2025_61', chain: 'Solana', coin: 'RENDER', hash: '3678eTJmnEEmT7xzrs1AZdUf8hQDDtQA2gxdBSqJFWtgTpo5e4ZyaKCr6HHpDUZef75dnjwdjospZFrNMiRckkJ2', from: 'Render Network Distribution', to: addr, amount: 33.9371, timestamp: 1759280440000, dateStr: '2025-10-01', dateTimeStr: '2025-10-01 03:00:40', year: '2025', isIncoming: true, isSuccess: true, explorerUrl: 'https://solscan.io/tx/3678eTJmnEEmT7xzrs1AZdUf8hQDDtQA2gxdBSqJFWtgTpo5e4ZyaKCr6HHpDUZef75dnjwdjospZFrNMiRckkJ2' },
         { id: 'render_tx_2025_62', chain: 'Solana', coin: 'RENDER', hash: '4Xu9eDDbf5pjVkoQAGwniR4Q4n93C8BZC4bCNKuWS8KcBCoJ3aJ52j88QiuW1PNcgMWUhZXWiMqDenXj4PMBWXPh', from: 'Render Network Distribution', to: addr, amount: 61.2749, timestamp: 1758696982000, dateStr: '2025-09-24', dateTimeStr: '2025-09-24 08:56:22', year: '2025', isIncoming: true, isSuccess: true, explorerUrl: 'https://solscan.io/tx/4Xu9eDDbf5pjVkoQAGwniR4Q4n93C8BZC4bCNKuWS8KcBCoJ3aJ52j88QiuW1PNcgMWUhZXWiMqDenXj4PMBWXPh' },
-        { id: 'render_tx_2025_63', chain: 'Solana', coin: 'RENDER', hash: '42U5rV1owviwAuLEo9WZ9yHDgk2VDhx4dXoBxtc2e4giwi4sGah1yYGyNQ9nmUpNXg2wnfT6S5rSKjsVEBwFrFWy', from: '8U1BXb88M6UvuqU7idfFdS8ShV9tvntz5C8S7sCAANRT', to: addr, amount: 120.93, timestamp: 1758164018000, dateStr: '2025-09-18', dateTimeStr: '2025-09-18 04:53:38', year: '2025', isIncoming: true, isSuccess: true, explorerUrl: 'https://solscan.io/tx/42U5rV1owviwAuLEo9WZ9yHDgk2VDhx4dXoBxtc2e4giwi4sGah1yYGyNQ9nmUpNXg2wnfT6S5rSKjsVEBwFrFWy' },
+        { id: 'render_tx_2025_63', chain: 'Solana', coin: 'RENDER', hash: '42U5rV1owviwAuLEo9WZ9yHDgk2VDhx4dXoBxtc2e4giwi4sGah1yYGyNQ9nmUpNXg2wnfT6S5rSKjsVEBwFrFWy', from: addr, to: 'FYy4PgeEPxNMoWkMyUKy9pZkov6pJrbYkwTy7rDQWssE', amount: 120.93, timestamp: 1758164018000, dateStr: '2025-09-18', dateTimeStr: '2025-09-18 04:53:38', year: '2025', isIncoming: false, isSuccess: true, explorerUrl: 'https://solscan.io/tx/42U5rV1owviwAuLEo9WZ9yHDgk2VDhx4dXoBxtc2e4giwi4sGah1yYGyNQ9nmUpNXg2wnfT6S5rSKjsVEBwFrFWy' },
         { id: 'render_tx_2025_64', chain: 'Solana', coin: 'RENDER', hash: 'fBELYvtezbPenTZn8mCzZu7U9RJDV9ZFqMWekCrFoGZWc78yeLFNBCyKCKAwMS8jqPHkVX991BrrCQUJPUzysbb', from: 'Render Network Distribution', to: addr, amount: 101.9859, timestamp: 1758070843000, dateStr: '2025-09-17', dateTimeStr: '2025-09-17 03:00:43', year: '2025', isIncoming: true, isSuccess: true, explorerUrl: 'https://solscan.io/tx/fBELYvtezbPenTZn8mCzZu7U9RJDV9ZFqMWekCrFoGZWc78yeLFNBCyKCKAwMS8jqPHkVX991BrrCQUJPUzysbb' },
-        { id: 'render_tx_2025_65', chain: 'Solana', coin: 'RENDER', hash: '4aYLsWZVxuhwA3fx5XjcmLxJaPDjpNzqjeuGuKA3eRU8cNvAAUP5N5j8Nx1akxkSMiHKwda6129pbHtC9y3cZdC3', from: '8U1BXb88M6UvuqU7idfFdS8ShV9tvntz5C8S7sCAANRT', to: addr, amount: 119.6955, timestamp: 1757503572000, dateStr: '2025-09-10', dateTimeStr: '2025-09-10 13:26:12', year: '2025', isIncoming: true, isSuccess: true, explorerUrl: 'https://solscan.io/tx/4aYLsWZVxuhwA3fx5XjcmLxJaPDjpNzqjeuGuKA3eRU8cNvAAUP5N5j8Nx1akxkSMiHKwda6129pbHtC9y3cZdC3' },
+        { id: 'render_tx_2025_65', chain: 'Solana', coin: 'RENDER', hash: '4aYLsWZVxuhwA3fx5XjcmLxJaPDjpNzqjeuGuKA3eRU8cNvAAUP5N5j8Nx1akxkSMiHKwda6129pbHtC9y3cZdC3', from: addr, to: 'FYy4PgeEPxNMoWkMyUKy9pZkov6pJrbYkwTy7rDQWssE', amount: 119.6955, timestamp: 1757503572000, dateStr: '2025-09-10', dateTimeStr: '2025-09-10 13:26:12', year: '2025', isIncoming: false, isSuccess: true, explorerUrl: 'https://solscan.io/tx/4aYLsWZVxuhwA3fx5XjcmLxJaPDjpNzqjeuGuKA3eRU8cNvAAUP5N5j8Nx1akxkSMiHKwda6129pbHtC9y3cZdC3' },
         { id: 'render_tx_2025_66', chain: 'Solana', coin: 'RENDER', hash: 'H5fPotAZMnc2ce8goeusGyDx7WBnnZiDDDCUtCMMgfUbSr4FQCCYFeBfKBrnF5fE8SXEvg173kgM42tQXmyTRME', from: 'Render Network Distribution', to: addr, amount: 85.6771, timestamp: 1757466165000, dateStr: '2025-09-10', dateTimeStr: '2025-09-10 03:02:45', year: '2025', isIncoming: true, isSuccess: true, explorerUrl: 'https://solscan.io/tx/H5fPotAZMnc2ce8goeusGyDx7WBnnZiDDDCUtCMMgfUbSr4FQCCYFeBfKBrnF5fE8SXEvg173kgM42tQXmyTRME' },
-        { id: 'render_tx_2025_67', chain: 'Solana', coin: 'RENDER', hash: '2ydrDRqKFZ5fgGgLLirvKjJcB3WFDuJSj8UwR7gZL5RtGmbartC6AWm6j28WAh6Ss3vCqLFYRx1KwWWND231WGq6', from: '8U1BXb88M6UvuqU7idfFdS8ShV9tvntz5C8S7sCAANRT', to: addr, amount: 48.5974, timestamp: 1756889354000, dateStr: '2025-09-03', dateTimeStr: '2025-09-03 10:49:14', year: '2025', isIncoming: true, isSuccess: true, explorerUrl: 'https://solscan.io/tx/2ydrDRqKFZ5fgGgLLirvKjJcB3WFDuJSj8UwR7gZL5RtGmbartC6AWm6j28WAh6Ss3vCqLFYRx1KwWWND231WGq6' },
+        { id: 'render_tx_2025_67', chain: 'Solana', coin: 'RENDER', hash: '2ydrDRqKFZ5fgGgLLirvKjJcB3WFDuJSj8UwR7gZL5RtGmbartC6AWm6j28WAh6Ss3vCqLFYRx1KwWWND231WGq6', from: addr, to: 'FYy4PgeEPxNMoWkMyUKy9pZkov6pJrbYkwTy7rDQWssE', amount: 48.5974, timestamp: 1756889354000, dateStr: '2025-09-03', dateTimeStr: '2025-09-03 10:49:14', year: '2025', isIncoming: false, isSuccess: true, explorerUrl: 'https://solscan.io/tx/2ydrDRqKFZ5fgGgLLirvKjJcB3WFDuJSj8UwR7gZL5RtGmbartC6AWm6j28WAh6Ss3vCqLFYRx1KwWWND231WGq6' },
         { id: 'render_tx_2025_68', chain: 'Solana', coin: 'RENDER', hash: '2wVn8JHLMpRsR9zgLYrytqAaXegbjX1XUhFrfYf3K4L7bfAt8i7h6SS1GWcJmCSTUQDjeCZYxvAkYG4LHB3aMdgs', from: 'Render Network Distribution', to: addr, amount: 35.2553, timestamp: 1756861251000, dateStr: '2025-09-03', dateTimeStr: '2025-09-03 03:00:51', year: '2025', isIncoming: true, isSuccess: true, explorerUrl: 'https://solscan.io/tx/2wVn8JHLMpRsR9zgLYrytqAaXegbjX1XUhFrfYf3K4L7bfAt8i7h6SS1GWcJmCSTUQDjeCZYxvAkYG4LHB3aMdgs' },
     ];
 }
@@ -13368,13 +13368,121 @@ async function runCryptoAccounting() {
     }
 }
 
+function populateCryptoSenderDropdown(txs) {
+    const senderSelect = document.getElementById('crypto-sender-filter');
+    if (!senderSelect) return;
+
+    const currentSelected = cryptoAccountingState.senderFilter || 'all';
+    const sendersSet = new Set();
+    (txs || []).forEach(t => {
+        if (t.from && t.from.trim()) {
+            sendersSet.add(t.from.trim());
+        }
+    });
+
+    const sendersList = Array.from(sendersSet);
+    sendersList.sort((a, b) => {
+        if (a === 'Render Network Distribution') return -1;
+        if (b === 'Render Network Distribution') return 1;
+        return a.localeCompare(b);
+    });
+
+    let optsHtml = '<option value="all">All Senders</option>';
+    sendersList.forEach(s => {
+        const isSelected = (s === currentSelected) ? 'selected' : '';
+        const display = s.length > 28 ? `${s.substring(0, 10)}...${s.substring(s.length - 6)}` : s;
+        optsHtml += `<option value="${s}" ${isSelected}>${display}</option>`;
+    });
+
+    senderSelect.innerHTML = optsHtml;
+    if (!sendersSet.has(currentSelected)) {
+        cryptoAccountingState.senderFilter = 'all';
+    }
+}
+
+function getFilteredCryptoTransactions(txs, activeYear) {
+    const typeFilter = cryptoAccountingState.typeFilter || 'incoming';
+    const senderFilter = (cryptoAccountingState.senderFilter || 'all').toLowerCase();
+    const query = (cryptoAccountingState.searchQuery || '').toLowerCase().trim();
+
+    return (txs || []).filter(tx => {
+        // Year filter
+        if (activeYear && activeYear !== 'all' && tx.year !== activeYear) return false;
+
+        // Direction filter
+        if (typeFilter === 'incoming' && !tx.isIncoming) return false;
+        if (typeFilter === 'outgoing' && tx.isIncoming) return false;
+
+        // Sender filter
+        if (senderFilter !== 'all' && tx.from.toLowerCase() !== senderFilter) return false;
+
+        // Text query search
+        if (query) {
+            const matchHash = tx.hash.toLowerCase().includes(query);
+            const matchFrom = tx.from.toLowerCase().includes(query);
+            const matchTo = (tx.to || '').toLowerCase().includes(query);
+            const matchDate = tx.dateTimeStr.toLowerCase().includes(query);
+            if (!matchHash && !matchFrom && !matchTo && !matchDate) return false;
+        }
+
+        return true;
+    });
+}
+
+function updateCryptoKpis(activeYear, allAssetTxs) {
+    const currency = cryptoAccountingState.currency || 'EUR';
+    const currSymbol = currency === 'EUR' ? '€' : '$';
+    const taxRate = cryptoAccountingState.taxRate || 30.0;
+    const deductible = cryptoAccountingState.deductible || 0.0;
+    const targetAsset = cryptoAccountingState.selectedAsset || 'all';
+
+    const filtered = getFilteredCryptoTransactions(allAssetTxs, activeYear);
+
+    let activeGross = 0;
+    let activeCryptoTotal = 0;
+    let activeTxCount = filtered.length;
+    let primaryCoin = filtered[0]?.coin || (targetAsset !== 'all' ? targetAsset : 'SOL');
+
+    for (const tx of filtered) {
+        activeGross += (tx.fiatValue || 0);
+        activeCryptoTotal += (tx.amount || 0);
+        if (tx.coin) primaryCoin = tx.coin;
+    }
+
+    const activeTaxableBase = Math.max(0, activeGross - deductible);
+    const activeTaxOwed = activeTaxableBase * (taxRate / 100);
+    const activeNetRetained = activeGross - activeTaxOwed;
+    const activeAvgSpot = activeCryptoTotal > 0 ? (activeGross / activeCryptoTotal) : 0;
+
+    const kpiGross = document.getElementById('kpi-gross-fiat');
+    const kpiTax = document.getElementById('kpi-tax-owed');
+    const kpiTaxSub = document.getElementById('kpi-tax-owed-sub');
+    const kpiCrypto = document.getElementById('kpi-crypto-total');
+    const kpiCryptoSub = document.getElementById('kpi-crypto-total-sub');
+    const kpiAvgSpot = document.getElementById('kpi-avg-spot');
+    const kpiNet = document.getElementById('kpi-net-retained');
+
+    if (kpiGross) kpiGross.textContent = `${currSymbol} ${activeGross.toLocaleString('en-US', { minimumFractionDigits: 2, maximumFractionDigits: 2 })}`;
+    if (kpiTax) kpiTax.textContent = `${currSymbol} ${activeTaxOwed.toLocaleString('en-US', { minimumFractionDigits: 2, maximumFractionDigits: 2 })}`;
+    if (kpiTaxSub) {
+        const yearLabel = activeYear === 'all' ? 'All Years' : `Tax Year ${activeYear}`;
+        const typeLabel = cryptoAccountingState.typeFilter === 'outgoing' ? 'Transfers' : 'Statutory';
+        kpiTaxSub.textContent = `At ${taxRate.toFixed(1)}% ${typeLabel} rate (${yearLabel})`;
+    }
+    if (kpiCrypto) kpiCrypto.textContent = `${activeCryptoTotal.toLocaleString('en-US', { minimumFractionDigits: 4, maximumFractionDigits: 4 })} ${primaryCoin}`;
+    if (kpiCryptoSub) {
+        const typeDesc = cryptoAccountingState.typeFilter === 'incoming' ? 'incoming earnings' : (cryptoAccountingState.typeFilter === 'outgoing' ? 'outgoing transfers' : 'transactions');
+        kpiCryptoSub.textContent = `${activeTxCount} ${typeDesc}`;
+    }
+    if (kpiAvgSpot) kpiAvgSpot.textContent = `${currSymbol} ${activeAvgSpot.toLocaleString('en-US', { minimumFractionDigits: 2, maximumFractionDigits: 2 })} / ${primaryCoin}`;
+    if (kpiNet) kpiNet.textContent = `${currSymbol} ${activeNetRetained.toLocaleString('en-US', { minimumFractionDigits: 2, maximumFractionDigits: 2 })}`;
+}
+
 async function calculateCryptoTaxes() {
     const rawTxs = cryptoAccountingState.transactions || [];
     const currency = cryptoAccountingState.currency || 'EUR';
     const taxRate = cryptoAccountingState.taxRate || 30.0;
-    const deductible = cryptoAccountingState.deductible || 0.0;
     const targetAsset = cryptoAccountingState.selectedAsset || 'all';
-    const currSymbol = currency === 'EUR' ? '€' : '$';
 
     updateCryptoProgress('Converting amounts at historical spot exchange rates...', 75);
 
@@ -13390,35 +13498,8 @@ async function calculateCryptoTaxes() {
         tx.taxDue = tx.fiatValue * (taxRate / 100);
     }
 
-    // Smart Auto-Toggle 1: If 0 incoming transactions exist but total txs > 0, auto-switch to 'all'
-    const incomingTxs = txs.filter(t => t.isIncoming);
-    if (incomingTxs.length === 0 && txs.length > 0 && cryptoAccountingState.typeFilter === 'incoming') {
-        cryptoAccountingState.typeFilter = 'all';
-        const typeSelect = document.getElementById('crypto-type-filter');
-        if (typeSelect) typeSelect.value = 'all';
-    }
-
-    // 2. Aggregate yearly stats
-    const yearlyMap = {};
-    for (const tx of txs) {
-        const y = tx.year;
-        if (!yearlyMap[y]) {
-            yearlyMap[y] = { year: y, count: 0, cryptoTotal: 0, grossFiat: 0, taxOwed: 0, coin: tx.coin };
-        }
-        if (cryptoAccountingState.typeFilter === 'all' || tx.isIncoming) {
-            yearlyMap[y].count++;
-            yearlyMap[y].cryptoTotal += tx.amount;
-            yearlyMap[y].grossFiat += tx.fiatValue;
-        }
-    }
-
-    for (const y in yearlyMap) {
-        const taxableBase = Math.max(0, yearlyMap[y].grossFiat - deductible);
-        yearlyMap[y].taxOwed = taxableBase * (taxRate / 100);
-        yearlyMap[y].avgSpot = yearlyMap[y].cryptoTotal > 0 ? (yearlyMap[y].grossFiat / yearlyMap[y].cryptoTotal) : 0;
-    }
-
-    cryptoAccountingState.yearlyStats = yearlyMap;
+    // 2. Populate sender dropdown dynamically from transactions
+    populateCryptoSenderDropdown(txs);
 
     // 3. Determine active year (strictly respects user selection without snapping back)
     const currentYear = new Date().getUTCFullYear().toString();
@@ -13441,57 +13522,17 @@ async function calculateCryptoTaxes() {
         yearSel.value = activeYear;
     }
 
-    // 4. Calculate active year totals
-    let activeGross = 0;
-    let activeCryptoTotal = 0;
-    let activeTxCount = 0;
-    let primaryCoin = txs[0]?.coin || (targetAsset !== 'all' ? targetAsset : 'SOL');
+    // 4. Update KPI Cards & Year Tabs
+    updateCryptoKpis(activeYear, txs);
+    renderYearTabs(txs, activeYear);
 
-    for (const tx of txs) {
-        const matchesFilter = (cryptoAccountingState.typeFilter === 'all' || tx.isIncoming);
-        if (matchesFilter && (activeYear === 'all' || tx.year === activeYear)) {
-            activeGross += tx.fiatValue;
-            activeCryptoTotal += tx.amount;
-            activeTxCount++;
-            primaryCoin = tx.coin;
-        }
-    }
-
-    const activeTaxableBase = Math.max(0, activeGross - deductible);
-    const activeTaxOwed = activeTaxableBase * (taxRate / 100);
-    const activeNetRetained = activeGross - activeTaxOwed;
-    const activeAvgSpot = activeCryptoTotal > 0 ? (activeGross / activeCryptoTotal) : 0;
-
-    // 5. Update KPI Cards in DOM
-    const kpiGross = document.getElementById('kpi-gross-fiat');
-    const kpiTax = document.getElementById('kpi-tax-owed');
-    const kpiTaxSub = document.getElementById('kpi-tax-owed-sub');
-    const kpiCrypto = document.getElementById('kpi-crypto-total');
-    const kpiCryptoSub = document.getElementById('kpi-crypto-total-sub');
-    const kpiAvgSpot = document.getElementById('kpi-avg-spot');
-    const kpiNet = document.getElementById('kpi-net-retained');
-
-    if (kpiGross) kpiGross.textContent = `${currSymbol} ${activeGross.toLocaleString('en-US', { minimumFractionDigits: 2, maximumFractionDigits: 2 })}`;
-    if (kpiTax) kpiTax.textContent = `${currSymbol} ${activeTaxOwed.toLocaleString('en-US', { minimumFractionDigits: 2, maximumFractionDigits: 2 })}`;
-    if (kpiTaxSub) {
-        const yearLabel = activeYear === 'all' ? 'All Years' : `Tax Year ${activeYear}`;
-        kpiTaxSub.textContent = `At ${taxRate.toFixed(1)}% statutory rate (${yearLabel})`;
-    }
-    if (kpiCrypto) kpiCrypto.textContent = `${activeCryptoTotal.toLocaleString('en-US', { minimumFractionDigits: 4, maximumFractionDigits: 4 })} ${primaryCoin}`;
-    if (kpiCryptoSub) kpiCryptoSub.textContent = `${activeTxCount} transactions`;
-    if (kpiAvgSpot) kpiAvgSpot.textContent = `${currSymbol} ${activeAvgSpot.toLocaleString('en-US', { minimumFractionDigits: 2, maximumFractionDigits: 2 })} / ${primaryCoin}`;
-    if (kpiNet) kpiNet.textContent = `${currSymbol} ${activeNetRetained.toLocaleString('en-US', { minimumFractionDigits: 2, maximumFractionDigits: 2 })}`;
-
-    // 6. Render Year Tabs
-    renderYearTabs(yearlyMap, activeYear);
-
-    // 7. Render Ledger Table
+    // 5. Render Ledger Table
     renderLedgerTable(activeYear, txs);
 
     hideCryptoProgress();
 }
 
-function renderYearTabs(yearlyMap, activeYear) {
+function renderYearTabs(allAssetTxs, activeYear) {
     const tabsContainer = document.getElementById('crypto-year-tabs');
     if (!tabsContainer) return;
 
@@ -13499,6 +13540,19 @@ function renderYearTabs(yearlyMap, activeYear) {
     const lastYear = (currentYear - 1).toString();
     const currency = cryptoAccountingState.currency || 'EUR';
     const sym = currency === 'EUR' ? '€' : '$';
+
+    // Aggregate by year respecting active direction and sender filters
+    const yearlyMap = {};
+    const filteredAllYears = getFilteredCryptoTransactions(allAssetTxs, 'all');
+
+    for (const tx of filteredAllYears) {
+        const y = tx.year;
+        if (!yearlyMap[y]) {
+            yearlyMap[y] = { year: y, count: 0, grossFiat: 0 };
+        }
+        yearlyMap[y].count++;
+        yearlyMap[y].grossFiat += (tx.fiatValue || 0);
+    }
 
     const years = Object.keys(yearlyMap).sort().reverse();
     let totalAllCount = 0;
@@ -13554,15 +13608,23 @@ function selectCryptoYearTab(yearVal) {
         }
         yearSelect.value = yearVal;
     }
-    calculateCryptoTaxes();
+
+    const targetAsset = cryptoAccountingState.selectedAsset || 'all';
+    const txs = (cryptoAccountingState.transactions || []).filter(t => (targetAsset === 'all' || t.coin.toUpperCase() === targetAsset.toUpperCase()));
+
+    updateCryptoKpis(yearVal, txs);
+    renderYearTabs(txs, yearVal);
+    renderLedgerTable(yearVal, txs);
 }
 
 function filterCryptoLedger() {
     const searchInput = document.getElementById('crypto-ledger-search');
     const typeSelect = document.getElementById('crypto-type-filter');
+    const senderSelect = document.getElementById('crypto-sender-filter');
 
     cryptoAccountingState.searchQuery = (searchInput?.value || '').toLowerCase().trim();
     cryptoAccountingState.typeFilter = typeSelect?.value || 'incoming';
+    cryptoAccountingState.senderFilter = senderSelect?.value || 'all';
 
     const currentYear = new Date().getUTCFullYear();
     const lastYear = (currentYear - 1).toString();
@@ -13572,6 +13634,9 @@ function filterCryptoLedger() {
 
     const targetAsset = cryptoAccountingState.selectedAsset || 'all';
     const txs = (cryptoAccountingState.transactions || []).filter(t => (targetAsset === 'all' || t.coin.toUpperCase() === targetAsset.toUpperCase()));
+
+    updateCryptoKpis(activeYear, txs);
+    renderYearTabs(txs, activeYear);
     renderLedgerTable(activeYear, txs);
 }
 
@@ -13581,33 +13646,22 @@ function renderLedgerTable(activeYear, currentTxs) {
     if (!tbody) return;
 
     const txs = currentTxs || cryptoAccountingState.transactions || [];
-    const query = cryptoAccountingState.searchQuery || '';
     const currency = cryptoAccountingState.currency || 'EUR';
     const sym = currency === 'EUR' ? '€' : '$';
-    const onlyIncoming = cryptoAccountingState.typeFilter === 'incoming';
 
-    const filtered = txs.filter(tx => {
-        if (onlyIncoming && !tx.isIncoming) return false;
-        if (activeYear !== 'all' && tx.year !== activeYear) return false;
-        if (query) {
-            const matchHash = tx.hash.toLowerCase().includes(query);
-            const matchFrom = tx.from.toLowerCase().includes(query);
-            const matchDate = tx.dateTimeStr.toLowerCase().includes(query);
-            if (!matchHash && !matchFrom && !matchDate) return false;
-        }
-        return true;
-    });
+    const filtered = getFilteredCryptoTransactions(txs, activeYear);
 
     if (filtered.length === 0) {
         const yearMsg = activeYear === 'all' ? 'any year' : `year ${activeYear}`;
-        const filterMsg = onlyIncoming ? 'incoming payments' : 'transactions';
+        const typeMsg = cryptoAccountingState.typeFilter === 'incoming' ? 'incoming earnings' : (cryptoAccountingState.typeFilter === 'outgoing' ? 'outgoing transfers' : 'transactions');
+        const senderMsg = cryptoAccountingState.senderFilter !== 'all' ? ` from ${cryptoAccountingState.senderFilter}` : '';
         tbody.innerHTML = `
             <tr class="crypto-empty-row">
                 <td colspan="10">
                     <div class="crypto-empty-state">
                         <span class="material-symbols-outlined">receipt_long</span>
-                        <p>No ${filterMsg} found for ${yearMsg}.</p>
-                        <small>Try clicking <b>All Years</b> or switching filter to <b>All Transactions</b> above.</small>
+                        <p>No ${typeMsg}${senderMsg} found for ${yearMsg}.</p>
+                        <small>Try selecting <b>All Senders</b>, clicking <b>All Years</b>, or switching filter to <b>All Directions</b> above.</small>
                     </div>
                 </td>
             </tr>
@@ -13623,13 +13677,13 @@ function renderLedgerTable(activeYear, currentTxs) {
     let rowsHtml = '';
     filtered.forEach((tx, idx) => {
         totCrypto += tx.amount;
-        totFiat += tx.fiatValue;
-        totTax += tx.taxDue;
+        totFiat += (tx.fiatValue || 0);
+        totTax += (tx.taxDue || 0);
 
         const chainBadgeClass = tx.coin === 'RENDER' ? 'render' : (tx.chain === 'Solana' ? 'sol' : 'eth');
         const badgeLabel = tx.coin === 'RENDER' ? 'RENDER' : tx.chain;
         const truncHash = tx.hash.length > 16 ? `${tx.hash.substring(0, 6)}...${tx.hash.substring(tx.hash.length - 4)}` : tx.hash;
-        const truncFrom = tx.from.length > 24 ? `${tx.from.substring(0, 12)}...${tx.from.substring(tx.from.length - 6)}` : tx.from;
+        const truncFrom = tx.from.length > 24 ? `${tx.from.substring(0, 10)}...${tx.from.substring(tx.from.length - 6)}` : tx.from;
         const sign = tx.isIncoming ? '+' : '-';
         const amtColor = tx.isIncoming ? '#4ade80' : '#f87171';
         const statusClass = tx.isIncoming ? 'confirmed' : 'outgoing';
@@ -13646,11 +13700,11 @@ function renderLedgerTable(activeYear, currentTxs) {
                         <span class="material-symbols-outlined" style="font-size: 12px;">open_in_new</span>
                     </a>
                 </td>
-                <td class="crypto-sender-addr" title="${tx.from}">${truncFrom}</td>
+                <td class="crypto-sender-addr" title="From: ${tx.from} | To: ${tx.to}">${truncFrom}</td>
                 <td style="text-align: right; color: ${amtColor}; font-weight: 600;" class="crypto-amount-in">${sign}${tx.amount.toFixed(4)} ${tx.coin}</td>
-                <td style="text-align: right;" class="crypto-spot-price">${sym} ${tx.spotRate.toLocaleString('en-US', { minimumFractionDigits: 2, maximumFractionDigits: 2 })}</td>
-                <td style="text-align: right;" class="crypto-fiat-val">${sym} ${tx.fiatValue.toLocaleString('en-US', { minimumFractionDigits: 2, maximumFractionDigits: 2 })}</td>
-                <td style="text-align: right;" class="crypto-tax-val">${sym} ${tx.taxDue.toLocaleString('en-US', { minimumFractionDigits: 2, maximumFractionDigits: 2 })}</td>
+                <td style="text-align: right;" class="crypto-spot-price">${sym} ${(tx.spotRate || 0).toLocaleString('en-US', { minimumFractionDigits: 2, maximumFractionDigits: 2 })}</td>
+                <td style="text-align: right;" class="crypto-fiat-val">${sym} ${(tx.fiatValue || 0).toLocaleString('en-US', { minimumFractionDigits: 2, maximumFractionDigits: 2 })}</td>
+                <td style="text-align: right;" class="crypto-tax-val">${sym} ${(tx.taxDue || 0).toLocaleString('en-US', { minimumFractionDigits: 2, maximumFractionDigits: 2 })}</td>
                 <td style="text-align: center;"><span class="crypto-status-pill ${statusClass}">${statusLabel}</span></td>
             </tr>
         `;
@@ -13680,8 +13734,8 @@ function renderLedgerTable(activeYear, currentTxs) {
 // ────────────────────────────────────────────────────────────────────────────────
 
 function exportCryptoTaxCsv() {
-    const txs = cryptoAccountingState.transactions || [];
-    if (txs.length === 0) {
+    const rawTxs = cryptoAccountingState.transactions || [];
+    if (rawTxs.length === 0) {
         showToast('No transactions to export.', 'info');
         return;
     }
@@ -13694,11 +13748,14 @@ function exportCryptoTaxCsv() {
     if (activeYear === 'last_year') activeYear = lastYear;
     else if (activeYear === 'current_year') activeYear = currentYear.toString();
 
-    const filtered = txs.filter(tx => {
-        if (cryptoAccountingState.typeFilter === 'incoming' && !tx.isIncoming) return false;
-        if (activeYear !== 'all' && tx.year !== activeYear) return false;
-        return true;
-    });
+    const targetAsset = cryptoAccountingState.selectedAsset || 'all';
+    const txs = rawTxs.filter(t => (targetAsset === 'all' || t.coin.toUpperCase() === targetAsset.toUpperCase()));
+    const filtered = getFilteredCryptoTransactions(txs, activeYear);
+
+    if (filtered.length === 0) {
+        showToast('No transactions match current filters to export.', 'info');
+        return;
+    }
 
     const headers = [
         'Transaction ID',
@@ -13722,10 +13779,10 @@ function exportCryptoTaxCsv() {
         `"${t.chain}"`,
         `"${t.coin}"`,
         t.amount.toFixed(6),
-        t.isIncoming ? '"Incoming"' : '"Outgoing"',
-        t.spotRate.toFixed(4),
-        t.fiatValue.toFixed(2),
-        t.taxDue.toFixed(2),
+        t.isIncoming ? '"Incoming (Earnings)"' : '"Outgoing (Transfer)"',
+        (t.spotRate || 0).toFixed(4),
+        (t.fiatValue || 0).toFixed(2),
+        (t.taxDue || 0).toFixed(2),
         `"${t.from}"`,
         `"${t.to}"`,
         `"${t.hash}"`,
@@ -13736,7 +13793,8 @@ function exportCryptoTaxCsv() {
     const encodedUri = encodeURI(csvContent);
     const link = document.createElement('a');
     link.setAttribute('href', encodedUri);
-    link.setAttribute('download', `Moecher_Crypto_Tax_Ledger_${activeYear}_${currency}.csv`);
+    const senderSuffix = cryptoAccountingState.senderFilter !== 'all' ? `_${cryptoAccountingState.senderFilter.replace(/[^a-zA-Z0-9]/g, '')}` : '';
+    link.setAttribute('download', `Moecher_Crypto_Tax_Ledger_${activeYear}_${currency}${senderSuffix}.csv`);
     document.body.appendChild(link);
     link.click();
     document.body.removeChild(link);
@@ -13745,11 +13803,22 @@ function exportCryptoTaxCsv() {
 }
 
 function exportCryptoTaxJson() {
-    const txs = cryptoAccountingState.transactions || [];
-    if (txs.length === 0) {
+    const rawTxs = cryptoAccountingState.transactions || [];
+    if (rawTxs.length === 0) {
         showToast('No transactions to export.', 'info');
         return;
     }
+
+    const currency = cryptoAccountingState.currency || 'EUR';
+    const currentYear = new Date().getUTCFullYear();
+    const lastYear = (currentYear - 1).toString();
+    let activeYear = cryptoAccountingState.selectedYear;
+    if (activeYear === 'last_year') activeYear = lastYear;
+    else if (activeYear === 'current_year') activeYear = currentYear.toString();
+
+    const targetAsset = cryptoAccountingState.selectedAsset || 'all';
+    const txs = rawTxs.filter(t => (targetAsset === 'all' || t.coin.toUpperCase() === targetAsset.toUpperCase()));
+    const filtered = getFilteredCryptoTransactions(txs, activeYear);
 
     const payload = {
         exportDate: new Date().toISOString(),
@@ -13758,27 +13827,29 @@ function exportCryptoTaxJson() {
         network: cryptoAccountingState.selectedNetwork,
         asset: cryptoAccountingState.selectedAsset,
         currency: cryptoAccountingState.currency,
-        selectedYear: cryptoAccountingState.selectedYear,
-        statutoryTaxRate: cryptoAccountingState.taxRate,
-        deductibleExpenses: cryptoAccountingState.deductible,
-        annualSummaries: cryptoAccountingState.yearlyStats,
-        transactions: txs
+        filters: {
+            year: activeYear,
+            type: cryptoAccountingState.typeFilter,
+            sender: cryptoAccountingState.senderFilter
+        },
+        transactions: filtered
     };
 
     const dataStr = 'data:text/json;charset=utf-8,' + encodeURIComponent(JSON.stringify(payload, null, 2));
-    const dlAnchor = document.createElement('a');
-    dlAnchor.setAttribute('href', dataStr);
-    dlAnchor.setAttribute('download', `Moecher_Crypto_Tax_Audit_${cryptoAccountingState.selectedYear}.json`);
-    document.body.appendChild(dlAnchor);
-    dlAnchor.click();
-    dlAnchor.remove();
+    const link = document.createElement('a');
+    link.setAttribute('href', dataStr);
+    const senderSuffix = cryptoAccountingState.senderFilter !== 'all' ? `_${cryptoAccountingState.senderFilter.replace(/[^a-zA-Z0-9]/g, '')}` : '';
+    link.setAttribute('download', `Moecher_Crypto_Tax_Report_${activeYear}_${currency}${senderSuffix}.json`);
+    document.body.appendChild(link);
+    link.click();
+    document.body.removeChild(link);
 
-    showToast('Exported complete crypto tax audit trail to JSON', 'success');
+    showToast(`Exported ${filtered.length} transactions to JSON`, 'success');
 }
 
 function copyCryptoTaxSummary() {
-    const txs = cryptoAccountingState.transactions || [];
-    if (txs.length === 0) {
+    const rawTxs = cryptoAccountingState.transactions || [];
+    if (rawTxs.length === 0) {
         showToast('No calculation available to summarize.', 'info');
         return '';
     }
@@ -13791,22 +13862,29 @@ function copyCryptoTaxSummary() {
     if (activeYear === 'last_year') activeYear = lastYear;
     else if (activeYear === 'current_year') activeYear = currentYear.toString();
 
-    const filtered = txs.filter(tx => activeYear === 'all' || tx.year === activeYear);
+    const targetAsset = cryptoAccountingState.selectedAsset || 'all';
+    const txs = rawTxs.filter(t => (targetAsset === 'all' || t.coin.toUpperCase() === targetAsset.toUpperCase()));
+    const filtered = getFilteredCryptoTransactions(txs, activeYear);
+
     let totGross = 0;
     let totCrypto = 0;
     let totTax = 0;
     filtered.forEach(t => {
-        totGross += t.fiatValue;
-        totCrypto += t.amount;
-        totTax += t.taxDue;
+        totGross += (t.fiatValue || 0);
+        totCrypto += (t.amount || 0);
+        totTax += (t.taxDue || 0);
     });
     const avgSpot = totCrypto > 0 ? totGross / totCrypto : 0;
     const netRetained = totGross - totTax;
-    const primaryCoin = filtered[0]?.coin || 'SOL';
+    const primaryCoin = filtered[0]?.coin || (targetAsset !== 'all' ? targetAsset : 'SOL');
+    const senderLabel = cryptoAccountingState.senderFilter === 'all' ? 'All Senders' : cryptoAccountingState.senderFilter;
+    const directionLabel = cryptoAccountingState.typeFilter === 'incoming' ? 'Incoming Only (Earnings)' : (cryptoAccountingState.typeFilter === 'outgoing' ? 'Outgoing Only (Transfers)' : 'All Directions');
 
     const summaryText = [
         `# Crypto Earnings & Tax Accounting Synopsis`,
         `- Tax Accounting Year: ${activeYear === 'all' ? 'All Years' : activeYear}`,
+        `- Direction Filter: ${directionLabel}`,
+        `- Sender Filter: ${senderLabel}`,
         `- Target Asset: ${cryptoAccountingState.selectedAsset.toUpperCase()}`,
         `- Wallet Address: ${cryptoAccountingState.address || 'Sample Wallet'}`,
         `- Network: ${cryptoAccountingState.selectedNetwork.toUpperCase()}`,
