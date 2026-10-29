@@ -35,20 +35,37 @@ def main():
         manifest = json.load(f)
     dense_tensors = manifest.get("dense_tensors", {})
 
+    counts_path = Path("F:/Moecher/models/deepseek_v41_nvfp4/deepseek_v41_imatrix.dat.counts.json")
+    expert_counts = {}
+    if counts_path.exists():
+        print(f"  Loaded Calibrated Imatrix Counts: {counts_path}")
+        with open(counts_path, "r") as f_c:
+            expert_counts = json.load(f_c)
+    else:
+        print("  Notice: No imatrix counts found, falling back to router bias.")
+
     expert_map = np.zeros(total_experts, dtype=np.uint8)
 
     with open(dense_path, "rb") as f_dense:
         for l in range(n_layers):
+            layer_key = f"layer_{l}"
+            biases = np.zeros(n_experts, dtype=np.float32)
             bias_key = f"layers.{l}.ffn.gate.bias"
             if bias_key in dense_tensors:
                 tinfo = dense_tensors[bias_key]
                 f_dense.seek(tinfo["offset"])
                 biases = np.frombuffer(f_dense.read(tinfo["nbytes"]), dtype=np.float32)
-                # Rank experts descending by bias
+
+            if layer_key in expert_counts:
+                counts = np.array(expert_counts[layer_key], dtype=np.float64)
+                # Primary sort key: activation frequency; secondary: router bias
+                composite_score = counts * 1e6 + biases.astype(np.float64)
+                ranked = np.argsort(composite_score)[::-1]
+                hot_eids = ranked[:hot_per_layer]
+            elif bias_key in dense_tensors:
                 ranked = np.argsort(biases)[::-1]
                 hot_eids = ranked[:hot_per_layer]
             else:
-                # Fallback: first hot_per_layer
                 hot_eids = np.arange(hot_per_layer)
                 
             for eid in hot_eids:

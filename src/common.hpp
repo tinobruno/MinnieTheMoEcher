@@ -74,6 +74,7 @@ struct ModelConfig {
     bool is_nemotron() const { return architecture == ModelArch::NEMOTRON_35; }
     bool is_nemotron_bolt() const { return is_nemotron() && (moe_latent_size > 0 || num_hidden_layers > 60); }
     bool is_deepseek() const { return architecture == ModelArch::DEEPSEEK_V4 || architecture == ModelArch::DEEPSEEK_V41; }
+    bool is_deepseek_v4() const { return architecture == ModelArch::DEEPSEEK_V4; }
     bool is_deepseek_v41() const { return architecture == ModelArch::DEEPSEEK_V41; }
     std::string model_name = "";
     std::string model_id = "";
@@ -332,10 +333,10 @@ struct ModelConfig {
         get(default_thinking_budget, "default_thinking_budget");
 
         if (default_temperature < 0.0f) {
-            default_temperature = is_nemotron() ? 0.6f : (is_deepseek() ? 0.6f : 0.7f);
+            default_temperature = is_nemotron() ? 0.6f : (is_deepseek() ? 0.0f : 0.7f);
         }
         if (default_repetition_penalty < 0.0f) {
-            default_repetition_penalty = (is_nemotron() || is_deepseek()) ? 1.05f : 1.00f;
+            default_repetition_penalty = is_nemotron() ? 1.05f : 1.00f;
         }
         if (default_reasoning_effort.empty()) {
             default_reasoning_effort = is_nemotron() ? "high" : "medium";
@@ -346,12 +347,6 @@ struct ModelConfig {
         if (is_deepseek_v41()) {
             if (moe_shared_expert_intermediate_size == 3712 || moe_shared_expert_intermediate_size <= 0) {
                 moe_shared_expert_intermediate_size = moe_intermediate_size;
-            }
-            if (window_size <= 0) {
-                window_size = 128;
-            }
-            if (sliding_window <= 0) {
-                sliding_window = 128;
             }
         }
     }

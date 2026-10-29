@@ -342,13 +342,30 @@ def quantize_q2_k_gpu(weights_f32: torch.Tensor, col_weights: torch.Tensor = Non
     # 3. 4-bit scale and min indices
     sc_idx = torch.round(dl_raw / d.unsqueeze(-1)).clamp(0, 15).to(torch.int32)
     min_idx = torch.round(ml_raw / dmin.unsqueeze(-1)).clamp(0, 15).to(torch.int32)
-    scales = (min_idx << 4) | sc_idx # [n_blocks, 16]
     
     dl = (d.unsqueeze(-1) * sc_idx.float()).clamp(min=1e-8)
     ml = dmin.unsqueeze(-1) * min_idx.float()
     
     # 4. Quantize to 2-bit [0..3]
     q = torch.round((w + ml.unsqueeze(-1)) / dl.unsqueeze(-1)).clamp(0, 3).to(torch.uint8)
+
+    # 4b. Optional Weighted Least-Squares Scale Refinement using col_weights
+    if col_weights is not None:
+        cw = col_weights.view(n_blocks, 16, 16)
+        q_f = q.float()
+        num = torch.sum(cw * (w + ml.unsqueeze(-1)) * q_f, dim=-1)
+        denom = torch.sum(cw * (q_f ** 2), dim=-1).clamp(min=1e-8)
+        dl_opt = torch.where(denom > 1e-6, num / denom, dl)
+        dl_raw = torch.clamp(dl_opt, min=1e-8)
+        d_max = dl_raw.max(dim=-1)[0]
+        d_raw = (d_max / 15.0).clamp(min=1e-8)
+        d_half = d_raw.to(torch.float16)
+        d = d_half.to(torch.float32)
+        sc_idx = torch.round(dl_raw / d.unsqueeze(-1)).clamp(0, 15).to(torch.int32)
+        dl = (d.unsqueeze(-1) * sc_idx.float()).clamp(min=1e-8)
+        q = torch.round((w + ml.unsqueeze(-1)) / dl.unsqueeze(-1)).clamp(0, 3).to(torch.uint8)
+
+    scales = (min_idx << 4) | sc_idx # [n_blocks, 16]
     
     # 5. Pack into qs [n_blocks, 64] uint8
     qs = torch.zeros((n_blocks, 64), dtype=torch.uint8, device=weights_f32.device)

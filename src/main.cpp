@@ -63,6 +63,7 @@ int main(int argc, char** argv) {
     int prefill_chunk_size = 512;
     int max_seq_len_override = 0;
     int mtp_k = 4;
+    bool enable_anti_loop = false;
     bool enable_vision = true;
 
     for (int i = 1; i < argc; i++) {
@@ -85,6 +86,7 @@ int main(int argc, char** argv) {
             printf("  --workspace <path>          Set restricted workspace sandbox root (default: ./workspace)\n");
             printf("  --tools / --no-tools        Enable or disable tool calling schemas (default: disabled)\n");
             printf("  --budget <tokens>           Default thinking budget tokens\n");
+            printf("  --anti-loop                 Enable n-gram repetition loop detector & breaker (default: disabled)\n");
             printf("  --max-tool-rounds <n>       Max sequential tool execution rounds per turn (default: %d)\n", g_max_tool_rounds);
             printf("  --help, -h                  Show this help message\n");
             return 0;
@@ -140,6 +142,10 @@ int main(int argc, char** argv) {
             enable_vision = false;
         } else if (std::string(argv[i]) == "--no-spec" || std::string(argv[i]) == "--disable-spec") {
             enable_spec = false;
+        } else if (std::string(argv[i]) == "--anti-loop" || std::string(argv[i]) == "--enable-anti-loop") {
+            enable_anti_loop = true;
+        } else if (std::string(argv[i]) == "--no-anti-loop" || std::string(argv[i]) == "--disable-anti-loop") {
+            enable_anti_loop = false;
         } else if ((std::string(argv[i]) == "--pld-tokens" || std::string(argv[i]) == "--pld-draft-tokens") && i + 1 < argc) {
             pld_draft_tokens = std::stoi(argv[++i]);
         } else if (std::string(argv[i]) == "--log-experts") {
@@ -232,6 +238,8 @@ int main(int argc, char** argv) {
     engine.default_enable_tree_mtp_ = enable_tree_mtp;
     engine.default_tree_nodes_ = tree_nodes;
     engine.default_enable_spec_ = enable_spec;
+    engine.enable_anti_loop_ = enable_anti_loop;
+    engine.default_enable_anti_loop_ = enable_anti_loop;
     engine.enable_vision_ = enable_vision;
     LOG_INFO("Speculative decoding: %s (PLD: %s, MTP: %s, Tree MTP: %s, tree_nodes=%d, mtp_k=%d)",
              enable_spec ? "enabled" : "disabled",
@@ -264,7 +272,7 @@ int main(int argc, char** argv) {
         json messages = json::array({
             {{"role", "user"}, {"content", prompt_str}}
         });
-        std::vector<int> prompt = apply_chat_template(messages, engine.tokenizer_, test_thinking, "high", json(), engine.cfg_.is_nemotron(), engine.cfg_.is_deepseek_v41());
+        std::vector<int> prompt = engine.apply_chat_template(messages, test_thinking, "high", json());
         LOG_INFO("Running test generation for prompt: '%s' (%zu prompt tokens, temp=%.2f, max_tokens=%d, thinking=%d)...",
                  prompt_str.c_str(), prompt.size(), test_temp, test_max_tokens, test_thinking ? 1 : 0);
         float rep_pen = engine.cfg_.default_repetition_penalty > 1.0f ? engine.cfg_.default_repetition_penalty : 1.0f;
@@ -303,12 +311,9 @@ int main(int argc, char** argv) {
     char date_buf[128];
     std::strftime(date_buf, sizeof(date_buf), "%A, %B %d, %Y", &tm_now);
 
-    if (!g_enable_tools && !g_server_exec) {
-        if (!engine.cfg_.is_deepseek()) {
-            g_base_system_prompt = "You are a helpful assistant.\nCurrent date: " + std::string(date_buf);
-        } else {
-            g_base_system_prompt = "";
-        }
+    g_base_system_prompt = engine.get_model_default_system_prompt();
+    if (!g_base_system_prompt.empty() && !engine.cfg_.is_deepseek()) {
+        g_base_system_prompt += "\nCurrent date: " + std::string(date_buf);
     }
 
     // Pre-warm default system prompt and tooling into KV Cache for 0ms initial prefill latency

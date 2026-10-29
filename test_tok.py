@@ -1,7 +1,10 @@
-import tiktoken
-enc = tiktoken.get_encoding("cl100k_base")
-t1 = enc.encode("system\n") + enc.encode("You are a helpful assistant")
-t2 = enc.encode("system\nYou are a helpful assistant")
-print(t1 == t2)
-print(t1)
-print(t2)
+import sys
+sys.stdout.reconfigure(encoding='utf-8')
+from transformers import AutoTokenizer
+
+tok = AutoTokenizer.from_pretrained(r'F:\Moecher\models\deepseek_v41_nvfp4')
+text = '<meta charset="UTF-8">'
+tokens = tok.encode(text, add_special_tokens=False)
+print('Tokens:', tokens)
+for t in tokens:
+    print(t, repr(tok.decode([t])))

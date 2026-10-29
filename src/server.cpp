@@ -63,7 +63,7 @@ struct ServerConfigState {
     float zdb_max_top1_gap = 1.50f;
 
     float temperature = 0.6f;
-    float repetition_penalty = 1.10f;
+    float repetition_penalty = -1.0f;
     std::string reasoning_effort = "medium";
     int thinking_budget = 4096;
     bool thinking_enabled = true;
@@ -207,7 +207,7 @@ void rebuild_system_prefix(
         {{"role", "user"}, {"content", ""}}
     });
 
-    std::vector<int> prompt = apply_chat_template(default_messages, engine.tokenizer_, true, "high", resolved_tools, engine.cfg_.is_nemotron(), engine.cfg_.is_deepseek_v41());
+    std::vector<int> prompt = engine.apply_chat_template(default_messages, true, "high", resolved_tools);
 
     bool is_chatml = (engine.cfg_.architecture == ModelArch::QWEN || engine.cfg_.architecture == ModelArch::QWEN2 || engine.cfg_.architecture == ModelArch::NEMOTRON_35);
     int user_start = is_chatml
@@ -393,18 +393,16 @@ static bool check_and_build_continuation(
 // ─────────────────────────────────────────────────────────────────────────────
 static json prune_messages_to_fit(
     const json& messages,
-    const BPETokenizer& tok,
+    const MoecherEngine& engine,
     int max_allowed_tokens,
     bool enable_thinking,
     const std::string& reasoning_effort,
-    const json& tools,
-    bool is_nemotron = false,
-    bool is_deepseek_v41 = false)
+    const json& tools)
 {
     json pruned = messages;
     if (pruned.empty()) return pruned;
 
-    std::vector<int> test_prompt = apply_chat_template(pruned, tok, enable_thinking, reasoning_effort, tools, is_nemotron, is_deepseek_v41);
+    std::vector<int> test_prompt = engine.apply_chat_template(pruned, enable_thinking, reasoning_effort, tools);
     if (test_prompt.size() <= (size_t)max_allowed_tokens) {
         return pruned;
     }
@@ -418,7 +416,7 @@ static json prune_messages_to_fit(
     // Prune oldest non-system messages
     while (pruned.size() > min_idx + 2) {
         pruned.erase(min_idx);
-        test_prompt = apply_chat_template(pruned, tok, enable_thinking, reasoning_effort, tools, is_nemotron, is_deepseek_v41);
+        test_prompt = engine.apply_chat_template(pruned, enable_thinking, reasoning_effort, tools);
         if (test_prompt.size() <= (size_t)max_allowed_tokens) {
             LOG_INFO("[Context] Pruning complete: retained %zu messages, prompt length %zu / %d",
                      pruned.size(), test_prompt.size(), max_allowed_tokens);
@@ -447,7 +445,7 @@ static json prune_messages_to_fit(
         } else {
             pruned[largest_idx]["content"] = notice;
         }
-        test_prompt = apply_chat_template(pruned, tok, enable_thinking, reasoning_effort, tools, is_nemotron, is_deepseek_v41);
+        test_prompt = engine.apply_chat_template(pruned, enable_thinking, reasoning_effort, tools);
     }
 
     LOG_INFO("[Context] Pruning finished: final prompt length %zu / %d",
@@ -871,6 +869,18 @@ static bool is_conversational_greeting(const std::string& text) {
 
 void run_server(MoecherEngine& engine, int port, int default_thinking_budget, int proxy_port, bool enable_forward_proxy, bool enable_system_proxy) {
     load_server_config("server_config.json");
+    // Whenever the server is started, reset temp, repetition penalty, and anti-loop to proper model defaults
+    nlohmann::json rec_sampling = engine.get_model_recommended_sampling();
+    float model_default_temp = rec_sampling.value("temperature", engine.cfg_.default_temperature >= 0.0f ? engine.cfg_.default_temperature : 0.0f);
+    float model_default_rep = rec_sampling.value("repetition_penalty", engine.cfg_.default_repetition_penalty > 0.0f ? engine.cfg_.default_repetition_penalty : 1.00f);
+    bool model_anti_loop = rec_sampling.value("anti_loop", false);
+    g_server_config.temperature = model_default_temp;
+    g_server_config.repetition_penalty = model_default_rep;
+    engine.enable_anti_loop_ = model_anti_loop;
+    engine.default_enable_anti_loop_ = model_anti_loop;
+    save_server_config("server_config.json");
+    LOG_INFO("[Config] Reset server parameters on startup to model defaults: temp=%.2f, rep_penalty=%.2f, anti_loop=%s",
+             g_server_config.temperature, g_server_config.repetition_penalty, model_anti_loop ? "enabled" : "disabled");
     httplib::Server svr;
     svr.set_tcp_nodelay(true);
     svr.set_payload_max_length(64 * 1024 * 1024); // 64 MB
@@ -1016,7 +1026,7 @@ void run_server(MoecherEngine& engine, int port, int default_thinking_budget, in
             {"base_prompt", g_base_system_prompt},
             {"system_prompt", g_current_system_prompt},
             {"active_tools", g_enable_tools ? g_current_active_tools : json::array()},
-            {"repetition_penalty", g_server_config.repetition_penalty > 1.0f ? g_server_config.repetition_penalty : 1.05f},
+            {"repetition_penalty", g_server_config.repetition_penalty > 0.0f ? g_server_config.repetition_penalty : 1.00f},
             {"tokens_count", engine.system_kv_snapshot_.valid ? engine.system_kv_snapshot_.tokens.size() : 0}
         };
         res.set_content(body.dump(), "application/json");
@@ -1100,7 +1110,7 @@ void run_server(MoecherEngine& engine, int port, int default_thinking_budget, in
             {"base_prompt", g_base_system_prompt},
             {"system_prompt", g_current_system_prompt},
             {"active_tools", g_enable_tools ? g_current_active_tools : json::array()},
-            {"repetition_penalty", g_server_config.repetition_penalty > 1.0f ? g_server_config.repetition_penalty : 1.05f},
+            {"repetition_penalty", g_server_config.repetition_penalty > 0.0f ? g_server_config.repetition_penalty : 1.05f},
             {"tokens_count", engine.system_kv_snapshot_.valid ? engine.system_kv_snapshot_.tokens.size() : 0}
         };
         res.set_content(body.dump(), "application/json");
@@ -1141,9 +1151,12 @@ void run_server(MoecherEngine& engine, int port, int default_thinking_budget, in
 
             rebuild_system_prefix(engine, base_prompt, active_tools, custom_full_prompt);
 
-            if (g_enable_tools) {
+            {
                 std::lock_guard<std::mutex> lock(g_server_config_mutex);
-                if (active_tools.is_array()) {
+                if (j.contains("repetition_penalty") && j["repetition_penalty"].is_number()) {
+                    g_server_config.repetition_penalty = j["repetition_penalty"].get<float>();
+                }
+                if (g_enable_tools && active_tools.is_array()) {
                     g_server_config.active_tools.clear();
                     for (const auto& t : active_tools) {
                         if (t.is_string()) g_server_config.active_tools.push_back(t.get<std::string>());
@@ -1161,7 +1174,7 @@ void run_server(MoecherEngine& engine, int port, int default_thinking_budget, in
                 {"base_prompt", g_base_system_prompt},
                 {"system_prompt", g_current_system_prompt},
                 {"active_tools", g_enable_tools ? g_current_active_tools : json::array()},
-                {"repetition_penalty", g_server_config.repetition_penalty > 1.0f ? g_server_config.repetition_penalty : 1.05f},
+                {"repetition_penalty", g_server_config.repetition_penalty > 0.0f ? g_server_config.repetition_penalty : 1.05f},
                 {"tokens_count", engine.system_kv_snapshot_.valid ? engine.system_kv_snapshot_.tokens.size() : 0}
             };
             res.set_content(body.dump(), "application/json");
@@ -1263,12 +1276,7 @@ void run_server(MoecherEngine& engine, int port, int default_thinking_budget, in
                         ? "MoE Coder (64 Experts)"
                         : "Sparse MoE (11,008 Experts) + MLA Latent Attention")));
         json sys_res = get_system_resource_telemetry();
-        json rec_sampling = {
-            {"temperature", engine.cfg_.default_temperature},
-            {"repetition_penalty", engine.cfg_.default_repetition_penalty},
-            {"reasoning_effort", engine.cfg_.default_reasoning_effort},
-            {"thinking_budget", engine.cfg_.default_thinking_budget}
-        };
+        json rec_sampling = engine.get_model_recommended_sampling();
         json model_entry = {
             {"id", model_id},
             {"name", display_name},
@@ -1279,6 +1287,7 @@ void run_server(MoecherEngine& engine, int port, int default_thinking_budget, in
             {"max_context_length", engine.cfg_.max_seq_len},
             {"has_vision", engine.supports_vision()},
             {"has_vision_delegate", engine.has_vision_delegate()},
+            {"default_system_prompt", engine.get_model_default_system_prompt()},
             {"recommended_sampling", rec_sampling},
             {"active", true},
             {"resources", sys_res}
@@ -1305,12 +1314,7 @@ void run_server(MoecherEngine& engine, int port, int default_thinking_budget, in
                         ? "MoE Coder (64 Experts)"
                         : "Sparse MoE (11,008 Experts) + MLA Latent Attention")));
         json sys_res = get_system_resource_telemetry();
-        json rec_sampling = {
-            {"temperature", engine.cfg_.default_temperature},
-            {"repetition_penalty", engine.cfg_.default_repetition_penalty},
-            {"reasoning_effort", engine.cfg_.default_reasoning_effort},
-            {"thinking_budget", engine.cfg_.default_thinking_budget}
-        };
+        json rec_sampling = engine.get_model_recommended_sampling();
         json body = {
             {"id", model_id},
             {"name", display_name},
@@ -1321,6 +1325,7 @@ void run_server(MoecherEngine& engine, int port, int default_thinking_budget, in
             {"max_tool_rounds", g_max_tool_rounds},
             {"has_vision", engine.supports_vision()},
             {"has_vision_delegate", engine.has_vision_delegate()},
+            {"default_system_prompt", engine.get_model_default_system_prompt()},
             {"recommended_sampling", rec_sampling},
             {"active", true},
             {"resources", sys_res}
@@ -1391,7 +1396,7 @@ void run_server(MoecherEngine& engine, int port, int default_thinking_budget, in
 
         std::vector<int> prompt;
         if (request.contains("messages") && request["messages"].is_array()) {
-            prompt = apply_chat_template(request["messages"], engine.tokenizer_, /*enable_thinking=*/false, /*reasoning_effort=*/"none", json(), engine.cfg_.is_nemotron(), engine.cfg_.is_deepseek_v41());
+            prompt = engine.apply_chat_template(request["messages"], /*enable_thinking=*/false, /*reasoning_effort=*/"none", json());
         } else if (request.contains("prompt") && request["prompt"].is_string()) {
             prompt = engine.tokenizer_.encode(request["prompt"].get<std::string>());
         }
@@ -1533,22 +1538,33 @@ void run_server(MoecherEngine& engine, int port, int default_thinking_budget, in
             int top_k = request.value("top_k", 1024);
             int max_tokens = request.value("max_tokens", 20000);
             bool stream = request.value("stream", false);
-            float repetition_penalty = request.value("repetition_penalty",
-                engine.cfg_.default_repetition_penalty > 1.0f ? engine.cfg_.default_repetition_penalty :
-                ((engine.cfg_.is_nemotron() || engine.cfg_.is_deepseek()) ? 1.05f : 1.0f));
+            nlohmann::json rec = engine.get_model_recommended_sampling();
+            float default_rep = g_server_config.repetition_penalty > 0.0f ? g_server_config.repetition_penalty :
+                (engine.cfg_.default_repetition_penalty > 0.0f ? engine.cfg_.default_repetition_penalty :
+                rec.value("repetition_penalty", 1.00f));
+            float repetition_penalty = request.value("repetition_penalty", default_rep);
             float presence_penalty = request.value("presence_penalty", 0.0f);
             float frequency_penalty = request.value("frequency_penalty", 0.0f);
             if (repetition_penalty <= 1.0f && (presence_penalty > 0.0f || frequency_penalty > 0.0f)) {
                 repetition_penalty = 1.0f + std::max(presence_penalty, frequency_penalty) * 0.1f;
             }
-            if (engine.cfg_.is_deepseek() && messages.is_array() && !messages.empty() && messages[0].value("role", "") == "system") {
-                std::string sys_txt = messages[0].value("content", "");
-                size_t d_pos = sys_txt.find("\nCurrent date:");
-                if (d_pos != std::string::npos) {
-                    sys_txt = sys_txt.substr(0, d_pos);
-                    messages[0]["content"] = sys_txt;
+            std::vector<std::string> stop_words;
+            if (request.contains("stop")) {
+                if (request["stop"].is_string()) {
+                    std::string s = request["stop"].get<std::string>();
+                    if (!s.empty()) stop_words.push_back(s);
+                } else if (request["stop"].is_array()) {
+                    for (const auto& item : request["stop"]) {
+                        if (item.is_string()) {
+                            std::string s = item.get<std::string>();
+                            if (!s.empty()) stop_words.push_back(s);
+                        }
+                    }
                 }
-                if (sys_txt.empty() || sys_txt == "You are a helpful assistant." || sys_txt == "You are a helpful assistant") {
+            }
+            if (messages.is_array() && !messages.empty() && messages[0].value("role", "") == "system") {
+                std::string sys_txt = messages[0].value("content", "");
+                if (sys_txt.empty()) {
                     messages.erase(0);
                 }
             }
@@ -1617,6 +1633,13 @@ void run_server(MoecherEngine& engine, int port, int default_thinking_budget, in
                 engine.tree_nodes_ = std::clamp(request["tree_branches"].get<int>(), 1, 4);
             }
 
+            engine.enable_anti_loop_ = engine.default_enable_anti_loop_;
+            if (request.contains("enable_anti_loop") && request["enable_anti_loop"].is_boolean()) {
+                engine.enable_anti_loop_ = request["enable_anti_loop"].get<bool>();
+            } else if (request.contains("anti_loop") && request["anti_loop"].is_boolean()) {
+                engine.enable_anti_loop_ = request["anti_loop"].get<bool>();
+            }
+
             if (reasoning_effort == "none") {
                 enable_thinking = false;
                 max_thinking_tokens = 0;
@@ -1656,10 +1679,6 @@ void run_server(MoecherEngine& engine, int port, int default_thinking_budget, in
                 enable_thinking = false;
                 max_thinking_tokens = 0;
                 reasoning_effort = "none";
-            }
-
-            if (repetition_penalty <= 1.0f && (engine.cfg_.is_nemotron() || engine.cfg_.is_deepseek())) {
-                repetition_penalty = 1.05f;
             }
 
             bool req_has_image = false;
@@ -1790,9 +1809,10 @@ void run_server(MoecherEngine& engine, int port, int default_thinking_budget, in
                 bypass_prefix_cache = request["bypass_prefix_cache"].get<bool>();
             }
 
-            LOG_INFO("Reasoning effort: %s, Thinking: %s, Thinking budget: %d, Tools: %zu, Server-Exec: %s (client_tool_exec: %s, headless: %s), Max-Tool-Rounds: %d, Timeout: %dms, Bypass-Cache: %s",
+            LOG_INFO("Reasoning effort: %s, Thinking: %s, Thinking budget: %d, Tools: %zu, Anti-Loop: %s, Stop-Words: %zu, Server-Exec: %s (client_tool_exec: %s, headless: %s), Max-Tool-Rounds: %d, Timeout: %dms, Bypass-Cache: %s",
                      reasoning_effort.c_str(), enable_thinking ? "enabled" : "disabled", max_thinking_tokens,
-                     tools.size(), (do_server_exec ? "enabled" : "disabled"), client_tool_exec ? "true" : "false", g_headless_browsing ? "true" : "false", req_max_tool_rounds, execution_timeout_ms,
+                     tools.size(), (engine.enable_anti_loop_ ? "enabled" : "disabled"), stop_words.size(),
+                     (do_server_exec ? "enabled" : "disabled"), client_tool_exec ? "true" : "false", g_headless_browsing ? "true" : "false", req_max_tool_rounds, execution_timeout_ms,
                      bypass_prefix_cache ? "true" : "false");
 
             std::string req_id = "chatcmpl-moecher-" + std::to_string(++g_request_counter);
@@ -1838,7 +1858,7 @@ void run_server(MoecherEngine& engine, int port, int default_thinking_budget, in
                 {
                     std::lock_guard<std::mutex> lock(g_engine_mutex);
                     // For ZDB in chat completions, apply chat template with thinking disabled for step-0 logit extraction
-                    auto mm_prompt = apply_chat_template_multimodal(messages, engine.tokenizer_, false, "none", json(), false, engine.cfg_.is_nemotron(), engine.cfg_.is_deepseek_v41());
+                    auto mm_prompt = engine.format_chat_prompt(messages, false, "none", json(), false);
                     std::vector<int> prompt = mm_prompt.prompt;
                     zdb_res = engine.execute_zero_decode_bypass(prompt, zdb_choices, temperature, zdb_format, bypass_prefix_cache, min_confidence, max_top1_gap);
                 }
@@ -1944,7 +1964,7 @@ void run_server(MoecherEngine& engine, int port, int default_thinking_budget, in
                 // SSE streaming
                 res.set_chunked_content_provider(
                     "text/event-stream",
-                    [&engine, messages, tools, max_tokens, temperature, req_id, repetition_penalty, enable_thinking, max_thinking_tokens, top_p, min_p, top_k, reasoning_effort, model_id, execution_timeout_ms, require_external_authorization, workspace_boundary_enforced, authorized_paths, do_server_exec, req_max_tool_rounds, busy_guard, send_sse_delta, bypass_prefix_cache, had_image_originally](size_t offset, httplib::DataSink &sink) {
+                    [&engine, messages, tools, max_tokens, temperature, req_id, repetition_penalty, enable_thinking, max_thinking_tokens, top_p, min_p, top_k, reasoning_effort, model_id, execution_timeout_ms, require_external_authorization, workspace_boundary_enforced, authorized_paths, do_server_exec, req_max_tool_rounds, busy_guard, send_sse_delta, bypass_prefix_cache, had_image_originally, stop_words](size_t offset, httplib::DataSink &sink) {
                         if (offset > 0) return false;
                         std::lock_guard<std::mutex> lock(g_engine_mutex);
 
@@ -2017,8 +2037,8 @@ void run_server(MoecherEngine& engine, int port, int default_thinking_budget, in
                             MultimodalPrompt mm_prompt;
                             const __nv_bfloat16* d_vis_out = nullptr;
                             if (!is_continuation) {
-                                current_messages = prune_messages_to_fit(current_messages, engine.tokenizer_, max_allowed_prompt, req_thinking, reasoning_effort, tools, engine.cfg_.is_nemotron(), engine.cfg_.is_deepseek_v41());
-                                mm_prompt = apply_chat_template_multimodal(current_messages, engine.tokenizer_, req_thinking, reasoning_effort, tools, engine.has_vision(), engine.cfg_.is_nemotron(), engine.cfg_.is_deepseek_v41());
+                                current_messages = prune_messages_to_fit(current_messages, engine, max_allowed_prompt, req_thinking, reasoning_effort, tools);
+                                mm_prompt = engine.format_chat_prompt(current_messages, req_thinking, reasoning_effort, tools, engine.has_vision());
                                 prompt = mm_prompt.prompt;
                                 if (engine.has_vision() && !mm_prompt.image_b64.empty() && mm_prompt.visual_start_pos >= 0) {
                                     if (engine.ensure_vision_loaded()) {
@@ -2100,7 +2120,7 @@ void run_server(MoecherEngine& engine, int port, int default_thinking_budget, in
                                     }
                                 }
                             }, repetition_penalty, req_thinking, req_thinking_tokens, top_p, min_p, top_k,
-                               d_vis_out, mm_prompt.visual_start_pos, mm_prompt.visual_num_tokens, eff_bypass_prefix_cache);
+                               d_vis_out, mm_prompt.visual_start_pos, mm_prompt.visual_num_tokens, eff_bypass_prefix_cache, stop_words);
 
                             if (d_vis_out != nullptr && engine.gpu_caps_.is_vram_constrained) {
                                 engine.unload_vision_tower();
@@ -2912,8 +2932,8 @@ void run_server(MoecherEngine& engine, int port, int default_thinking_budget, in
                     MultimodalPrompt mm_prompt;
                     const __nv_bfloat16* d_vis_out = nullptr;
                     if (!is_continuation) {
-                        current_messages = prune_messages_to_fit(current_messages, engine.tokenizer_, max_allowed_prompt, req_thinking, reasoning_effort, tools, engine.cfg_.is_nemotron(), engine.cfg_.is_deepseek_v41());
-                        mm_prompt = apply_chat_template_multimodal(current_messages, engine.tokenizer_, req_thinking, reasoning_effort, tools, engine.has_vision(), engine.cfg_.is_nemotron(), engine.cfg_.is_deepseek_v41());
+                        current_messages = prune_messages_to_fit(current_messages, engine, max_allowed_prompt, req_thinking, reasoning_effort, tools);
+                        mm_prompt = engine.format_chat_prompt(current_messages, req_thinking, reasoning_effort, tools, engine.has_vision());
                         prompt = mm_prompt.prompt;
                         if (engine.has_vision() && !mm_prompt.image_b64.empty() && mm_prompt.visual_start_pos >= 0) {
                             if (engine.ensure_vision_loaded()) {
@@ -2942,7 +2962,7 @@ void run_server(MoecherEngine& engine, int port, int default_thinking_budget, in
                     {
                         std::lock_guard<std::mutex> lock(g_engine_mutex);
                         response_text = engine.generate(prompt, max_tokens, temperature, nullptr, repetition_penalty, req_thinking, req_thinking_tokens, top_p, min_p, top_k,
-                                                        d_vis_out, mm_prompt.visual_start_pos, mm_prompt.visual_num_tokens, eff_bypass_prefix_cache);
+                                                        d_vis_out, mm_prompt.visual_start_pos, mm_prompt.visual_num_tokens, eff_bypass_prefix_cache, stop_words);
                         finish_reason = engine.last_finish_reason_;
 
                         if (d_vis_out != nullptr && engine.gpu_caps_.is_vram_constrained) {

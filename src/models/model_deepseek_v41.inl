@@ -80,7 +80,7 @@
         int head_dim_val = cfg_.head_dim;
         int q_lora = cfg_.q_lora_rank > 0 ? cfg_.q_lora_rank : 1280;
         int rope_dim = cfg_.qk_rope_head_dim > 0 ? cfg_.qk_rope_head_dim : 64;
-        int window = cfg_.sliding_window > 0 ? cfg_.sliding_window : (cfg_.window_size > 0 ? cfg_.window_size : 4096);
+        int window = cfg_.window_size > 0 ? cfg_.window_size : (cfg_.sliding_window > 0 ? cfg_.sliding_window : 128);
 
         // Select per-layer RoPE frequencies based on compress_ratio (matches DeepSeek V4.1 reference architecture)
         bool is_compressed = (layer_id < (int)cfg_.compress_ratios.size() &&
@@ -235,6 +235,17 @@
             1.0f,
             main_stream_);
 
+        // ── 2b. Collect imatrix activations during calibration pass ───────────
+        if (collect_imatrix_) {
+            float* g_accum = (float*)d_gate_accum_.data + (size_t)layer_id * n_experts * dim;
+            float* d_accum = (float*)d_down_accum_.data + (size_t)layer_id * n_experts * moe_inter;
+            uint32_t* e_cnt = (uint32_t*)d_expert_counts_.data + (size_t)layer_id * n_experts;
+            accumulate_expert_imatrix_cuda(
+                g_accum, d_accum, e_cnt,
+                buf_hidden_.bf16(), buf_topk_idx_.i32(),
+                1, top_k, n_experts, dim, moe_inter, main_stream_);
+        }
+
         // ── 3. Asynchronously Copy Top-6 Expert IDs to Host ──────────────────
         CUDA_CHECK(cudaMemcpyAsync(topk_ids_host_, buf_topk_idx_.i32(),
                                    top_k * sizeof(int32_t), cudaMemcpyDeviceToHost, main_stream_));
@@ -354,4 +365,195 @@
         for (int m = 0; m < M; m++) {
             forward_layer_deepseek_v41(layer_id, 0, position + m);
         }
+    }
+
+    // ── DeepSeek-V4.1 Protocol, Parameters & Chat Templating ──────────────────
+
+    std::string get_default_system_prompt_deepseek_v41() const {
+        return "";
+    }
+
+    nlohmann::json get_recommended_sampling_deepseek_v41() const {
+        return {
+            {"temperature", 0.0f},
+            {"top_p", 1.0f},
+            {"repetition_penalty", 1.0f},
+            {"reasoning_effort", "high"},
+            {"thinking_budget", 75},
+            {"anti_loop", false}
+        };
+    }
+
+    MultimodalPrompt format_chat_prompt_deepseek_v41(
+        const nlohmann::json& messages,
+        bool enable_thinking = true,
+        const std::string& reasoning_effort = "high",
+        const nlohmann::json& tools = nlohmann::json(),
+        bool model_has_vision = false) const
+    {
+        MultimodalPrompt out;
+        std::vector<int> result;
+
+        int BOS = tokenizer_.get_token_id("<｜begin of sentence｜>");
+        if (BOS < 0) BOS = tokenizer_.get_token_id("<｜begin\xe2\x96\x81of\xe2\x96\x81sentence｜>");
+        if (BOS < 0) BOS = 0;
+
+        int EOS = tokenizer_.get_token_id("<｜end of sentence｜>");
+        if (EOS < 0) EOS = tokenizer_.get_token_id("<｜end\xe2\x96\x81of\xe2\x96\x81sentence｜>");
+        if (EOS < 1) EOS = 1;
+
+        int SYSTEM = tokenizer_.get_token_id("<｜System｜>");
+        if (SYSTEM < 0) SYSTEM = tokenizer_.get_token_id("<｜System\xe2\x96\x81｜>");
+        if (SYSTEM < 0) SYSTEM = 128799;
+
+        int USER = tokenizer_.get_token_id("<｜User｜>");
+        if (USER < 0) USER = 128803;
+
+        int ASSISTANT = tokenizer_.get_token_id("<｜Assistant｜>");
+        if (ASSISTANT < 0) ASSISTANT = 128804;
+
+        int THINK_BEGIN = tokenizer_.get_token_id("<think>");
+        if (THINK_BEGIN < 0) THINK_BEGIN = 128821;
+
+        int THINK_END = tokenizer_.get_token_id("</think>");
+        if (THINK_END < 0) THINK_END = 128822;
+
+        bool has_image = false;
+        for (const auto& msg : messages) {
+            if (message_has_image(msg)) {
+                has_image = true;
+                break;
+            }
+        }
+        bool actual_thinking = enable_thinking && !has_image;
+
+        // V4.1 official numeric reasoning budget: low=50, high=75, max=100
+        int budget = 75;
+        std::string effort_lower = reasoning_effort;
+        for (char& c : effort_lower) c = (char)std::tolower((unsigned char)c);
+        if (effort_lower == "low") {
+            budget = 50;
+        } else if (effort_lower == "high" || effort_lower.empty()) {
+            budget = 75;
+        } else if (effort_lower == "max") {
+            budget = 100;
+        } else {
+            try {
+                int parsed = std::stoi(reasoning_effort);
+                if (parsed >= 1 && parsed <= 100) budget = parsed;
+            } catch (...) {}
+        }
+
+        result.push_back(BOS);
+
+        // Check if messages contains an initial system prompt
+        bool has_system = (!messages.empty() && messages[0].value("role", "") == "system");
+        std::string sys_content = "";
+        if (has_system) {
+            sys_content = get_message_content_string(messages[0]);
+        }
+
+        // Render tools using official V4.1 DSML format (<｜DSML｜ calls>)
+        std::string tools_prompt = "";
+        if (!tools.is_null() && !tools.empty()) {
+            tools_prompt = "## Tools\n\nYou have access to a set of tools to help answer the user's question. You can invoke tools by writing a \"<｜DSML｜ calls>\" block like the following:\n\n<｜DSML｜ calls>\n<｜DSML｜ invoke name=\"$TOOL_NAME\">\n<｜DSML｜ parameter name=\"$PARAMETER_NAME\" string=\"true|false\">$PARAMETER_VALUE</｜DSML｜ parameter>\n...\n</｜DSML｜ invoke>\n</｜DSML｜ calls>\n\n### Available Tool Schemas\n\n";
+            for (const auto& t : tools) {
+                tools_prompt += t.dump() + "\n";
+            }
+            tools_prompt += "\nYou MUST strictly follow the above defined tool name and parameter schemas to invoke tool calls.";
+        }
+
+        if (actual_thinking) {
+            // In thinking mode: <｜System｜>Reasoning Effort: {budget} ...
+            result.push_back(SYSTEM);
+            std::string leading_sys = "Reasoning Effort: " + std::to_string(budget) +
+                                      " (range 1-100, the higher the value, the more thorough the reasoning)\n\n";
+            if (!sys_content.empty()) {
+                leading_sys += sys_content;
+                if (!tools_prompt.empty()) leading_sys += "\n\n" + tools_prompt;
+            } else if (!tools_prompt.empty()) {
+                leading_sys += tools_prompt;
+            }
+            auto enc = tokenizer_.encode(leading_sys);
+            result.insert(result.end(), enc.begin(), enc.end());
+        } else {
+            // In chat mode (non-thinking): only emit <｜System｜> if a system prompt or tools exist
+            if (!sys_content.empty() || !tools_prompt.empty()) {
+                result.push_back(SYSTEM);
+                std::string leading_sys = sys_content;
+                if (!tools_prompt.empty()) {
+                    if (!leading_sys.empty()) leading_sys += "\n\n";
+                    leading_sys += tools_prompt;
+                }
+                auto enc = tokenizer_.encode(leading_sys);
+                result.insert(result.end(), enc.begin(), enc.end());
+            }
+        }
+
+        // Process message turns
+        size_t start_idx = has_system ? 1 : 0;
+        for (size_t i = start_idx; i < messages.size(); i++) {
+            std::string role = messages[i].value("role", "user");
+            std::string content = get_message_content_string(messages[i]);
+
+            if (role == "system") {
+                // Mid-conversation system message (V4.1 feature)
+                result.push_back(SYSTEM);
+                auto enc = tokenizer_.encode(content);
+                result.insert(result.end(), enc.begin(), enc.end());
+            } else if (role == "user") {
+                result.push_back(USER);
+                if (model_has_vision && message_has_image(messages[i])) {
+                    int IMAGE_TOKEN = tokenizer_.get_token_id("<｜image｜>");
+                    if (IMAGE_TOKEN < 0) IMAGE_TOKEN = 129279;
+                    out.image_b64 = extract_image_b64_from_message(messages[i]);
+                    out.visual_start_pos = (int)result.size();
+                    out.visual_num_tokens = 576;
+                    result.insert(result.end(), 576, IMAGE_TOKEN);
+                    auto newline_enc = tokenizer_.encode("\n");
+                    result.insert(result.end(), newline_enc.begin(), newline_enc.end());
+                }
+                auto enc = tokenizer_.encode(content);
+                result.insert(result.end(), enc.begin(), enc.end());
+            } else if (role == "assistant") {
+                result.push_back(ASSISTANT);
+                bool has_reasoning = false;
+                if (messages[i].contains("reasoning_content") && messages[i]["reasoning_content"].is_string()) {
+                    std::string r_content = messages[i]["reasoning_content"].get<std::string>();
+                    if (!r_content.empty()) {
+                        result.push_back(THINK_BEGIN);
+                        auto r_enc = tokenizer_.encode(r_content);
+                        result.insert(result.end(), r_enc.begin(), r_enc.end());
+                        result.push_back(THINK_END);
+                        has_reasoning = true;
+                    }
+                }
+                if (!has_reasoning) {
+                    result.push_back(THINK_END);
+                }
+                auto enc = tokenizer_.encode(content);
+                result.insert(result.end(), enc.begin(), enc.end());
+                result.push_back(EOS);
+            } else if (role == "tool" || role == "function") {
+                result.push_back(USER);
+                auto enc = tokenizer_.encode("<tool_result>\n" + content + "\n</tool_result>");
+                result.insert(result.end(), enc.begin(), enc.end());
+            }
+        }
+
+        // Final assistant generation header
+        if (!messages.empty()) {
+            std::string last_role = messages.back().value("role", "user");
+            if (last_role == "user" || last_role == "tool" || last_role == "function" || (last_role == "system" && messages.size() > 1)) {
+                result.push_back(ASSISTANT);
+                if (actual_thinking) {
+                    result.push_back(THINK_BEGIN);
+                } else {
+                    result.push_back(THINK_END);
+                }
+            }
+        }
+
+        out.prompt = result;
+        return out;
     }

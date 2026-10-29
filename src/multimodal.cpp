@@ -530,6 +530,7 @@ MultimodalPrompt apply_chat_template_multimodal(
             result.insert(result.end(), enc.begin(), enc.end());
         } else if (role == "assistant") {
             result.push_back(ASSISTANT);
+            bool has_reasoning = false;
             if (messages[i].contains("reasoning_content") && messages[i]["reasoning_content"].is_string()) {
                 std::string r_content = messages[i]["reasoning_content"].get<std::string>();
                 if (!r_content.empty()) {
@@ -537,10 +538,10 @@ MultimodalPrompt apply_chat_template_multimodal(
                     auto r_enc = tok.encode(r_content);
                     result.insert(result.end(), r_enc.begin(), r_enc.end());
                     result.push_back(THINK_END);
-                } else if (is_deepseek_v41) {
-                    result.push_back(THINK_END);
+                    has_reasoning = true;
                 }
-            } else if (is_deepseek_v41) {
+            }
+            if (!has_reasoning) {
                 result.push_back(THINK_END);
             }
             std::string body = content;

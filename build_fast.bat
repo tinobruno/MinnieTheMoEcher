@@ -5,11 +5,9 @@ if %errorlevel% neq 0 exit /b 1
 set "CUDA_PATH=C:\Program Files\NVIDIA GPU Computing Toolkit\CUDA\v13.3"
 set "PATH=C:\Program Files\Microsoft Visual Studio\18\Community\Common7\IDE\CommonExtensions\Microsoft\CMake\CMake\bin;C:\Program Files\Microsoft Visual Studio\18\Community\Common7\IDE\CommonExtensions\Microsoft\CMake\Ninja;C:\Program Files\NVIDIA GPU Computing Toolkit\CUDA\v13.3\bin;%PATH%"
 
-if not exist src\embedded_web.hpp (
-    echo [INFO] Embedding Web UI assets into binary...
-    python scripts\embed_web.py
-    if %errorlevel% neq 0 exit /b 1
-)
+echo [INFO] Embedding Web UI assets into binary...
+python scripts\embed_web.py
+if %errorlevel% neq 0 exit /b 1
 
 if not exist build (
     cmake -B build -G Ninja ^

@@ -19,11 +19,12 @@ from pathlib import Path
 
 # Insert scripts dir for IQ2 helper tables
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
-from quantize_experts_iq2 import dequantize_fp4_gpu, quantize_iq2_xxs_gpu, quantize_q2_k_gpu
+from quantize_experts_iq2 import dequantize_fp4_gpu, quantize_iq2_xxs_gpu, quantize_q2_k_gpu, ImatrixLoader
 
 def main():
     expert_bin_path = Path("F:/Moecher/models/deepseek_v41_nvfp4/expert.bin")
     map_path = Path("F:/Moecher/models/deepseek_v41_nvfp4/mixed_expert_map.bin")
+    imatrix_path = Path("F:/Moecher/models/deepseek_v41_nvfp4/deepseek_v41_imatrix.dat")
     hot_bin_path = Path("F:/Moecher/models/deepseek_v41_nvfp4/moe_experts_hot.bin")
     cold_bin_path = Path("F:/Moecher/models/deepseek_v41_nvfp4/moe_experts_iq2.bin")
     
@@ -54,6 +55,13 @@ def main():
     with open(map_path, "rb") as f_map:
         expert_map = np.frombuffer(f_map.read(), dtype=np.uint8)
     assert len(expert_map) == total_experts
+
+    imatrix_loader = None
+    if imatrix_path.exists():
+        print(f"Loading importance matrix from: {imatrix_path}")
+        imatrix_loader = ImatrixLoader(str(imatrix_path))
+    else:
+        print("Notice: No imatrix found at default path, running unweighted quantization.")
 
     total_hot = int(np.sum(expert_map == 1))
     total_cold = int(np.sum(expert_map == 0))
@@ -122,9 +130,27 @@ def main():
             w2_s_gpu = torch.stack(w2_s_list).to("cuda")
             w2_f32 = dequantize_fp4_gpu(w2_p_gpu.view(-1, 1152), w2_s_gpu.view(-1, 72), b_cnt * 5120, 2304, 72)
 
-            w1_iq2_bytes = quantize_iq2_xxs_gpu(w1_f32)
-            w3_iq2_bytes = quantize_iq2_xxs_gpu(w3_f32)
-            w2_q2_bytes = quantize_q2_k_gpu(w2_f32)
+            if imatrix_loader:
+                w1_cw_list, w3_cw_list, w2_cw_list = [], [], []
+                for glob_idx in indices:
+                    l_idx = glob_idx // n_experts
+                    e_idx = glob_idx % n_experts
+                    w1_cw = imatrix_loader.get_expert_weights(l_idx, e_idx, "w1", 5120, device="cuda")
+                    w3_cw = imatrix_loader.get_expert_weights(l_idx, e_idx, "w3", 5120, device="cuda")
+                    w2_cw = imatrix_loader.get_expert_weights(l_idx, e_idx, "w2", 2304, device="cuda")
+                    w1_cw_list.append(w1_cw if w1_cw is not None else torch.ones(5120, device="cuda"))
+                    w3_cw_list.append(w3_cw if w3_cw is not None else torch.ones(5120, device="cuda"))
+                    w2_cw_list.append(w2_cw if w2_cw is not None else torch.ones(2304, device="cuda"))
+
+                w1_cw_b = torch.stack(w1_cw_list).view(b_cnt, 1, 5120).expand(b_cnt, 2304, 5120).contiguous()
+                w3_cw_b = torch.stack(w3_cw_list).view(b_cnt, 1, 5120).expand(b_cnt, 2304, 5120).contiguous()
+                w2_cw_b = torch.stack(w2_cw_list).view(b_cnt, 1, 2304).expand(b_cnt, 5120, 2304).contiguous()
+            else:
+                w1_cw_b, w3_cw_b, w2_cw_b = None, None, None
+
+            w1_iq2_bytes = quantize_iq2_xxs_gpu(w1_f32, w1_cw_b)
+            w3_iq2_bytes = quantize_iq2_xxs_gpu(w3_f32, w3_cw_b)
+            w2_q2_bytes = quantize_q2_k_gpu(w2_f32, w2_cw_b)
             torch.cuda.synchronize()
 
             for idx, glob_idx in enumerate(indices):

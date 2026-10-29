@@ -1192,3 +1192,128 @@
             }
         }
     }
+
+    // ── Qwen Protocol, Parameters & Chat Templating ───────────────────────────
+
+    std::string get_default_system_prompt_qwen() const {
+        return "You are a helpful assistant.";
+    }
+
+    nlohmann::json get_recommended_sampling_qwen() const {
+        return {
+            {"temperature", 0.7f},
+            {"repetition_penalty", 1.05f},
+            {"reasoning_effort", "none"},
+            {"thinking_budget", 0},
+            {"anti_loop", true}
+        };
+    }
+
+    MultimodalPrompt format_chat_prompt_qwen(
+        const nlohmann::json& messages,
+        bool enable_thinking = true,
+        const std::string& reasoning_effort = "high",
+        const nlohmann::json& tools = nlohmann::json(),
+        bool model_has_vision = false) const
+    {
+        MultimodalPrompt out;
+        std::vector<int> result;
+
+        int IM_START = tokenizer_.get_token_id("<|im_start|>");
+        if (IM_START < 0) IM_START = 151644;
+
+        int IM_END = tokenizer_.get_token_id("<|im_end|>");
+        if (IM_END < 0) IM_END = 151645;
+
+        bool has_system = (!messages.empty() && messages[0].value("role", "") == "system");
+        std::string sys_content = has_system ? get_message_content_string(messages[0]) : "You are a helpful assistant.";
+
+        std::string tools_prompt = "";
+        if (!tools.is_null() && !tools.empty()) {
+            tools_prompt = "\n# Tools\nYou have access to the following tools:\n" + tools.dump() + "\n";
+        }
+
+        std::string full_sys = sys_content + tools_prompt;
+        if (!full_sys.empty()) {
+            result.push_back(IM_START);
+            auto sys_role = tokenizer_.encode("system\n" + full_sys);
+            result.insert(result.end(), sys_role.begin(), sys_role.end());
+            result.push_back(IM_END);
+            auto nl_enc = tokenizer_.encode("\n");
+            result.insert(result.end(), nl_enc.begin(), nl_enc.end());
+        }
+
+        size_t start_idx = has_system ? 1 : 0;
+        for (size_t i = start_idx; i < messages.size(); i++) {
+            std::string role = messages[i].value("role", "user");
+            std::string content = get_message_content_string(messages[i]);
+
+            if (role == "tool" || role == "function") {
+                result.push_back(IM_START);
+                auto user_role = tokenizer_.encode("user\n<tool_response>\n" + content + "\n</tool_response>");
+                result.insert(result.end(), user_role.begin(), user_role.end());
+                result.push_back(IM_END);
+                auto nl_enc = tokenizer_.encode("\n");
+                result.insert(result.end(), nl_enc.begin(), nl_enc.end());
+                continue;
+            }
+
+            result.push_back(IM_START);
+            auto role_enc = tokenizer_.encode(role + "\n");
+            result.insert(result.end(), role_enc.begin(), role_enc.end());
+
+            // Multimodal image injection for Qwen Vision
+            if (model_has_vision && message_has_image(messages[i]) && role == "user") {
+                int VISION_START = tokenizer_.get_token_id("<|vision_start|>");
+                if (VISION_START < 0) VISION_START = 248053;
+                int VISION_END = tokenizer_.get_token_id("<|vision_end|>");
+                if (VISION_END < 0) VISION_END = 248054;
+                int IMAGE_PAD = tokenizer_.get_token_id("<|image_pad|>");
+                if (IMAGE_PAD < 0) IMAGE_PAD = 248056;
+
+                out.image_b64 = extract_image_b64_from_message(messages[i]);
+                result.push_back(VISION_START);
+                out.visual_start_pos = (int)result.size();
+                out.visual_num_tokens = 576;
+                result.insert(result.end(), 576, IMAGE_PAD);
+                result.push_back(VISION_END);
+            }
+
+            std::string body = content;
+            if (role == "assistant") {
+                if (messages[i].contains("reasoning_content") && messages[i]["reasoning_content"].is_string()) {
+                    std::string r_content = messages[i]["reasoning_content"].get<std::string>();
+                    if (!r_content.empty()) {
+                        body = "<think>\n" + r_content + "\n</think>\n" + body;
+                    }
+                }
+            }
+
+            auto enc = tokenizer_.encode(body);
+            result.insert(result.end(), enc.begin(), enc.end());
+            result.push_back(IM_END);
+            auto nl_enc = tokenizer_.encode("\n");
+            result.insert(result.end(), nl_enc.begin(), nl_enc.end());
+        }
+
+        // Final assistant turn header
+        if (!messages.empty()) {
+            std::string last_role = messages.back().value("role", "user");
+            if (last_role == "user" || last_role == "tool" || last_role == "function") {
+                result.push_back(IM_START);
+                auto asst_enc = tokenizer_.encode("assistant\n");
+                result.insert(result.end(), asst_enc.begin(), asst_enc.end());
+                bool actual_thinking = enable_thinking && out.image_b64.empty();
+                if (actual_thinking) {
+                    auto think_enc = tokenizer_.encode("<think>\n");
+                    result.insert(result.end(), think_enc.begin(), think_enc.end());
+                } else {
+                    auto think_enc = tokenizer_.encode("<think>\n\n</think>\n");
+                    result.insert(result.end(), think_enc.begin(), think_enc.end());
+                }
+            }
+        }
+
+        out.prompt = result;
+        return out;
+    }

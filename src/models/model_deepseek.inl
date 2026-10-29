@@ -1222,3 +1222,159 @@
         LOG_INFO("[PREFILL STATS] %zu prompt tokens prefilled in %.3fs -> %.2f tok/s (batched chunk_size=%d, offset=%d)",
                  evaluated_tokens, elapsed_sec, tok_per_sec, chunk_size, start_offset);
     }
+
+    // ── DeepSeek-V4 Protocol, Parameters & Chat Templating ────────────────────
+
+    std::string get_default_system_prompt_deepseek_v4() const {
+        return "";
+    }
+
+    nlohmann::json get_recommended_sampling_deepseek_v4() const {
+        return {
+            {"temperature", 0.0f},
+            {"repetition_penalty", 1.0f},
+            {"reasoning_effort", "high"},
+            {"thinking_budget", 4096},
+            {"anti_loop", false}
+        };
+    }
+
+    MultimodalPrompt format_chat_prompt_deepseek_v4(
+        const nlohmann::json& messages,
+        bool enable_thinking = true,
+        const std::string& reasoning_effort = "high",
+        const nlohmann::json& tools = nlohmann::json(),
+        bool model_has_vision = false) const
+    {
+        MultimodalPrompt out;
+        std::vector<int> result;
+
+        int BOS = tokenizer_.get_token_id("<｜begin of sentence｜>");
+        if (BOS < 0) BOS = tokenizer_.get_token_id("<｜begin\xe2\x96\x81of\xe2\x96\x81sentence｜>");
+        if (BOS < 0) BOS = 0;
+
+        int EOS = tokenizer_.get_token_id("<｜end of sentence｜>");
+        if (EOS < 0) EOS = tokenizer_.get_token_id("<｜end\xe2\x96\x81of\xe2\x96\x81sentence｜>");
+        if (EOS < 1) EOS = 1;
+
+        int USER = tokenizer_.get_token_id("<｜User｜>");
+        if (USER < 0) USER = 128803;
+
+        int ASSISTANT = tokenizer_.get_token_id("<｜Assistant｜>");
+        if (ASSISTANT < 0) ASSISTANT = 128804;
+
+        int THINK_BEGIN = tokenizer_.get_token_id("<think>");
+        if (THINK_BEGIN < 0) THINK_BEGIN = 128821;
+
+        int THINK_END = tokenizer_.get_token_id("</think>");
+        if (THINK_END < 0) THINK_END = 128822;
+
+        bool has_image = false;
+        for (const auto& msg : messages) {
+            if (message_has_image(msg)) {
+                has_image = true;
+                break;
+            }
+        }
+        bool actual_thinking = enable_thinking && !has_image;
+
+        result.push_back(BOS);
+
+        // Check if messages contains an initial system prompt
+        bool has_system = (!messages.empty() && messages[0].value("role", "") == "system");
+        std::string sys_content = "";
+        if (has_system) {
+            sys_content = get_message_content_string(messages[0]);
+        }
+
+        // Render tools schema if tools exist (DeepSeek-V4 DSML format)
+        std::string tools_prompt = "";
+        if (!tools.is_null() && !tools.empty()) {
+            tools_prompt = "## Tools\n\nYou have access to a set of tools to help answer the user's question. You can invoke tools by writing a \"<｜DSML｜tool_calls>\" block like the following:\n\n<｜DSML｜tool_calls>\n```tool_call\n{\"name\": \"$TOOL_NAME\", \"arguments\": {\"$PARAMETER_NAME\": \"$PARAMETER_VALUE\"}}\n```\n</｜DSML｜tool_calls>\n\n### Available Tool Schemas\n\n";
+            for (const auto& t : tools) {
+                tools_prompt += t.dump() + "\n";
+            }
+            tools_prompt += "\nYou MUST strictly follow the above defined tool name and parameter schemas to invoke tool calls.";
+        }
+
+        // DeepSeek-V4 Base has NO <｜System｜> token. Any system prompt or tools text
+        // is placed as raw text before the first <｜User｜> turn.
+        std::string prefix_text = "";
+        if (!sys_content.empty()) {
+            prefix_text = sys_content;
+            if (!tools_prompt.empty()) prefix_text += "\n\n" + tools_prompt;
+        } else if (!tools_prompt.empty()) {
+            prefix_text = tools_prompt;
+        }
+
+        if (!prefix_text.empty()) {
+            auto enc = tokenizer_.encode(prefix_text);
+            result.insert(result.end(), enc.begin(), enc.end());
+        }
+
+        // Process message turns
+        size_t start_idx = has_system ? 1 : 0;
+        for (size_t i = start_idx; i < messages.size(); i++) {
+            std::string role = messages[i].value("role", "user");
+            std::string content = get_message_content_string(messages[i]);
+
+            if (role == "system") {
+                // Secondary system prompt text in V4 is also plain text
+                auto enc = tokenizer_.encode(content);
+                result.insert(result.end(), enc.begin(), enc.end());
+            } else if (role == "user") {
+                result.push_back(USER);
+                if (model_has_vision && message_has_image(messages[i])) {
+                    int IMAGE_TOKEN = tokenizer_.get_token_id("<｜image｜>");
+                    if (IMAGE_TOKEN < 0) IMAGE_TOKEN = 129279;
+                    out.image_b64 = extract_image_b64_from_message(messages[i]);
+                    out.visual_start_pos = (int)result.size();
+                    out.visual_num_tokens = 576;
+                    result.insert(result.end(), 576, IMAGE_TOKEN);
+                    auto newline_enc = tokenizer_.encode("\n");
+                    result.insert(result.end(), newline_enc.begin(), newline_enc.end());
+                }
+                auto enc = tokenizer_.encode(content);
+                result.insert(result.end(), enc.begin(), enc.end());
+            } else if (role == "assistant") {
+                result.push_back(ASSISTANT);
+                bool has_reasoning = false;
+                if (messages[i].contains("reasoning_content") && messages[i]["reasoning_content"].is_string()) {
+                    std::string r_content = messages[i]["reasoning_content"].get<std::string>();
+                    if (!r_content.empty()) {
+                        result.push_back(THINK_BEGIN);
+                        auto r_enc = tokenizer_.encode(r_content);
+                        result.insert(result.end(), r_enc.begin(), r_enc.end());
+                        result.push_back(THINK_END);
+                        has_reasoning = true;
+                    }
+                }
+                if (!has_reasoning) {
+                    result.push_back(THINK_END);
+                }
+                auto enc = tokenizer_.encode(content);
+                result.insert(result.end(), enc.begin(), enc.end());
+                result.push_back(EOS);
+            } else if (role == "tool" || role == "function") {
+                result.push_back(USER);
+                auto enc = tokenizer_.encode("<tool_result>\n" + content + "\n</tool_result>");
+                result.insert(result.end(), enc.begin(), enc.end());
+            }
+        }
+
+        // Final assistant generation header
+        if (!messages.empty()) {
+            std::string last_role = messages.back().value("role", "user");
+            if (last_role == "user" || last_role == "tool" || last_role == "function" || (last_role == "system" && messages.size() > 1)) {
+                result.push_back(ASSISTANT);
+                if (actual_thinking) {
+                    result.push_back(THINK_BEGIN);
+                } else {
+                    result.push_back(THINK_END);
+                }
+            }
+        }
+
+        out.prompt = result;
+        return out;
+    }

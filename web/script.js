@@ -210,15 +210,50 @@ function stopGeneration() {
     fetch(apiUrl, { method: 'POST' }).catch(() => { });
 }
 
-tempSlider.addEventListener('input', (e) => {
-    tempVal.textContent = e.target.value;
-});
+if (tempSlider && tempVal) {
+    try {
+        const savedTemp = localStorage.getItem('moecher_temperature');
+        if (savedTemp !== null && parseFloat(savedTemp) !== 0.6 && parseFloat(savedTemp) !== 1.0) {
+            tempSlider.value = savedTemp;
+            tempVal.textContent = parseFloat(savedTemp).toFixed(1);
+        } else {
+            tempSlider.value = '0.0';
+            tempVal.textContent = '0.0';
+        }
+    } catch(e) {}
+    tempSlider.addEventListener('input', (e) => {
+        tempVal.textContent = e.target.value;
+        try { localStorage.setItem('moecher_temperature', e.target.value); } catch(e) {}
+    });
+}
 
 const repPenaltySlider = document.getElementById('rep-penalty-slider');
 const repPenaltyVal = document.getElementById('rep-penalty-val');
 if (repPenaltySlider && repPenaltyVal) {
+    try {
+        const savedRep = localStorage.getItem('moecher_repetition_penalty');
+        if (savedRep !== null) {
+            repPenaltySlider.value = savedRep;
+            repPenaltyVal.textContent = parseFloat(savedRep).toFixed(2);
+        } else {
+            repPenaltySlider.value = '1.00';
+            repPenaltyVal.textContent = '1.00';
+        }
+    } catch (e) {}
+
     repPenaltySlider.addEventListener('input', (e) => {
-        repPenaltyVal.textContent = parseFloat(e.target.value).toFixed(2);
+        const val = parseFloat(e.target.value).toFixed(2);
+        repPenaltyVal.textContent = val;
+        try {
+            localStorage.setItem('moecher_repetition_penalty', val);
+        } catch (e) {}
+    });
+
+    repPenaltySlider.addEventListener('change', (e) => {
+        const val = parseFloat(e.target.value).toFixed(2);
+        try {
+            localStorage.setItem('moecher_repetition_penalty', val);
+        } catch (e) {}
     });
 }
 
@@ -286,6 +321,24 @@ if (reasoningEffort) {
 if (thinkingBudget) {
     thinkingBudget.addEventListener('input', (e) => {
         localStorage.setItem('moecher_thinking_budget', e.target.value);
+    });
+}
+
+const antiLoopEnabled = document.getElementById('anti-loop-enabled');
+try {
+    const savedAntiLoop = localStorage.getItem('moecher_anti_loop_enabled');
+    if (savedAntiLoop !== null && antiLoopEnabled) {
+        antiLoopEnabled.checked = (savedAntiLoop === 'true');
+    } else if (antiLoopEnabled) {
+        antiLoopEnabled.checked = false; // Default disabled
+    }
+} catch (e) {
+    console.warn('Could not load anti-loop setting from localStorage', e);
+}
+
+if (antiLoopEnabled) {
+    antiLoopEnabled.addEventListener('change', (e) => {
+        localStorage.setItem('moecher_anti_loop_enabled', String(e.target.checked));
     });
 }
 
@@ -3063,7 +3116,15 @@ async function fetchBackendSystemPrompt() {
         } else if (data && data.tools_enabled === true) {
             window.serverToolsDisabled = false;
         }
-        if (data && data.repetition_penalty !== undefined && repPenaltySlider) {
+        const savedRep = localStorage.getItem('moecher_repetition_penalty');
+        if (data && data.repetition_penalty !== undefined && repPenaltySlider && (!savedRep || (data.server_instance_id && lastServerInstanceId && lastServerInstanceId !== data.server_instance_id))) {
+            repPenaltySlider.value = data.repetition_penalty;
+            if (repPenaltyVal) repPenaltyVal.textContent = parseFloat(data.repetition_penalty).toFixed(2);
+            try { localStorage.setItem('moecher_repetition_penalty', String(data.repetition_penalty)); } catch(e) {}
+        } else if (savedRep !== null && repPenaltySlider) {
+            repPenaltySlider.value = savedRep;
+            if (repPenaltyVal) repPenaltyVal.textContent = parseFloat(savedRep).toFixed(2);
+        } else if (data && data.repetition_penalty !== undefined && repPenaltySlider) {
             repPenaltySlider.value = data.repetition_penalty;
             if (repPenaltyVal) repPenaltyVal.textContent = parseFloat(data.repetition_penalty).toFixed(2);
         }
@@ -3388,18 +3449,23 @@ function buildOptimizedMessagesPayload() {
     const now = new Date();
     const dateStr = now.toLocaleDateString('en-US', { weekday: 'long', year: 'numeric', month: 'long', day: '2-digit' });
 
-    const defaultBaseSys = "You are a helpful assistant that can write code, analyze data, and create complete applications using HTML, CSS, JavaScript, Python, and other programming languages. When asked to create or build something, always provide complete, functional, working code.";
+    // Model-specific default system prompt from backend (/v1/models)
+    const modelDefaultSys = (currentModelData && currentModelData.default_system_prompt !== undefined)
+        ? currentModelData.default_system_prompt
+        : "";
+    let baseSys = (sysPrompt !== '') ? sysPrompt : modelDefaultSys;
+
     if (window.serverToolsDisabled) {
-        let baseSys = sysPrompt || defaultBaseSys;
         let fullSys = baseSys;
-        if (!fullSys.includes('Current date:') && (!currentModelId || !currentModelId.includes('deepseek'))) {
+        if (fullSys && !fullSys.includes('Current date:') && (!currentModelId || !currentModelId.includes('deepseek'))) {
             fullSys += `\nCurrent date: ${dateStr}`;
         }
-        messagesToSend.push({ role: 'system', content: fullSys });
+        if (fullSys && fullSys.trim().length > 0) {
+            messagesToSend.push({ role: 'system', content: fullSys.trim() });
+        }
     } else {
-        let baseSys = sysPrompt || defaultBaseSys;
         // Strip any stale # Tools or <tools> block if activeTools has changed or youtube_search was disabled
-        if (baseSys.includes('# Tools') || baseSys.includes('<tools>')) {
+        if (baseSys && (baseSys.includes('# Tools') || baseSys.includes('<tools>'))) {
             const hasYt = activeTools.includes('youtube_search');
             if (activeTools.length === 0 || (!hasYt && baseSys.includes('youtube_search'))) {
                 let toolsIdx = baseSys.indexOf('\n\n# Tools');
@@ -3410,7 +3476,7 @@ function buildOptimizedMessagesPayload() {
                 }
             }
         }
-        if (window.lastUserPromptWas3D && baseSys) {
+        if (window.lastUserPromptWas3D && baseSys !== undefined) {
             // Strip any short/stale 3D instructions from base system prompt
             let basicIdx = baseSys.indexOf('\n\n# 3D Modeling Instructions');
             if (basicIdx === -1) basicIdx = baseSys.indexOf('# 3D Modeling Instructions');
@@ -3419,7 +3485,8 @@ function buildOptimizedMessagesPayload() {
             if (basicIdx !== -1) {
                 baseSys = baseSys.substring(0, basicIdx).trim();
             }
-            baseSys += "\n\n# High-Fidelity Analytic 3D Modeling Instructions\n" +
+            if (baseSys) baseSys += "\n\n";
+            baseSys += "# High-Fidelity Analytic 3D Modeling Instructions\n" +
                 "When asked to create, model, or reconstruct in 3D (or reconstruct an object from an image), always output Three.js representation code defining `function createModel(scene, THREE, inputImage, helpers) { ... }` inside a ```javascript code block (never output a full HTML file), adding all meshes to `scene`.\n\n" +
                 "CRITICAL RULES FOR ANALYTIC MODELING, PART-SPECIFIC TEXTURING & UV MAPPING:\n" +
                 "1. SEMANTIC & GEOMETRIC PART DECOMPOSITION:\n" +
@@ -3439,10 +3506,12 @@ function buildOptimizedMessagesPayload() {
                 "   - Attachments (stems, leaves, handles, spouts) must penetrate 5-10% deep into parent meshes to prevent floating seams or gaps.";
         }
         let fullSys = baseSys;
-        if (!fullSys.includes('Current date:') && (!currentModelId || !currentModelId.includes('deepseek'))) {
+        if (fullSys && !fullSys.includes('Current date:') && (!currentModelId || !currentModelId.includes('deepseek'))) {
             fullSys += `\nCurrent date: ${dateStr}`;
         }
-        messagesToSend.push({ role: 'system', content: fullSys });
+        if (fullSys && fullSys.trim().length > 0) {
+            messagesToSend.push({ role: 'system', content: fullSys.trim() });
+        }
     }
 
     // 1. Slice history according to maxTurns limit (1 turn = 1 user + 1 assistant message)
@@ -4603,7 +4672,7 @@ async function sendMessage(options = {}) {
                 messages: messagesToSend,
                 max_tokens: parseInt(tokensInput ? tokensInput.value : 20000, 10) || 20000,
                 temperature: parseFloat(tempSlider.value),
-                repetition_penalty: parseFloat(repPenaltySlider ? repPenaltySlider.value : 1.05),
+                repetition_penalty: parseFloat(repPenaltySlider ? repPenaltySlider.value : 1.00),
                 stream: true,
                 enable_thinking: isThinking,
                 thinking: {
@@ -4612,6 +4681,8 @@ async function sendMessage(options = {}) {
                 },
                 max_thinking_tokens: budgetVal,
                 reasoning_effort: isThinking ? (reasoningEffort ? reasoningEffort.value : "high") : "none",
+                enable_anti_loop: (antiLoopEnabled ? antiLoopEnabled.checked : false),
+                anti_loop: (antiLoopEnabled ? antiLoopEnabled.checked : false),
                 enable_spec: speculativeSettings.enableMtp,
                 enable_mtp: speculativeSettings.enableMtp,
                 mtp: speculativeSettings.enableMtp,
@@ -5855,6 +5926,11 @@ async function initModelSelector() {
                     }
                     currentModelHasVision = (active.has_vision === true || active.has_vision === 'true');
                     updateVisionUploadVisibility();
+
+                    // If system prompt input is empty or matches previous default placeholder, update to active model's default
+                    if (systemPromptInput && (!systemPromptInput.value || systemPromptInput.value === "You are a helpful assistant." || systemPromptInput.value.trim() === "")) {
+                        systemPromptInput.value = (active.default_system_prompt !== undefined) ? active.default_system_prompt : "";
+                    }
 
                     // Update Vision capabilities badge
                     if (dropdownVisionBadge && dropdownVisionText) {

@@ -1289,3 +1289,136 @@
         LOG_INFO("Nemotron Batched Prefill completed: %d tokens in %.2f ms (%.1f tok/s, cold disk reads: %llu)",
                  remaining_tokens, ms, tok_per_sec, (unsigned long long)expert_loader_.cold_disk_reads_.load());
     }
+
+    // ── Nemotron-3.5 Protocol, Parameters & Chat Templating ───────────────────
+
+    std::string get_default_system_prompt_nemotron() const {
+        return "You are a helpful, respectful and honest assistant.";
+    }
+
+    nlohmann::json get_recommended_sampling_nemotron() const {
+        return {
+            {"temperature", 0.6f},
+            {"repetition_penalty", 1.05f},
+            {"reasoning_effort", "medium"},
+            {"thinking_budget", 2048},
+            {"anti_loop", true}
+        };
+    }
+
+    MultimodalPrompt format_chat_prompt_nemotron(
+        const nlohmann::json& messages,
+        bool enable_thinking = true,
+        const std::string& reasoning_effort = "medium",
+        const nlohmann::json& tools = nlohmann::json(),
+        bool model_has_vision = false) const
+    {
+        MultimodalPrompt out;
+        std::vector<int> result;
+
+        int IM_START = tokenizer_.get_token_id("<|im_start|>");
+        if (IM_START < 0) IM_START = 151644;
+
+        int IM_END = tokenizer_.get_token_id("<|im_end|>");
+        if (IM_END < 0) IM_END = 151645;
+
+        bool has_system = (!messages.empty() && messages[0].value("role", "") == "system");
+        std::string sys_content = "";
+        if (has_system) {
+            sys_content = get_message_content_string(messages[0]);
+        }
+
+        // Tools schema
+        std::string tools_prompt = "";
+        if (!tools.is_null() && !tools.empty()) {
+            tools_prompt = "\n# Tools\nYou have access to the following tools:\n" + tools.dump() + "\n";
+        }
+
+        std::string full_sys = sys_content;
+        if (!tools_prompt.empty()) {
+            if (full_sys.empty()) full_sys = "You are a helpful assistant.";
+            full_sys += tools_prompt;
+        }
+
+        if (!full_sys.empty()) {
+            result.push_back(IM_START);
+            auto sys_role = tokenizer_.encode("system\n" + full_sys);
+            result.insert(result.end(), sys_role.begin(), sys_role.end());
+            result.push_back(IM_END);
+            auto nl_enc = tokenizer_.encode("\n");
+            result.insert(result.end(), nl_enc.begin(), nl_enc.end());
+        }
+
+        int last_user_idx = -1;
+        for (int i = 0; i < (int)messages.size(); i++) {
+            if (messages[i].value("role", "") == "user") {
+                last_user_idx = i;
+            }
+        }
+
+        size_t start_idx = has_system ? 1 : 0;
+        for (size_t i = start_idx; i < messages.size(); i++) {
+            std::string role = messages[i].value("role", "user");
+            std::string content = get_message_content_string(messages[i]);
+
+            if (role == "tool" || role == "function") {
+                result.push_back(IM_START);
+                auto user_role = tokenizer_.encode("user\n<tool_response>\n" + content + "\n</tool_response>");
+                result.insert(result.end(), user_role.begin(), user_role.end());
+                result.push_back(IM_END);
+                auto nl_enc = tokenizer_.encode("\n");
+                result.insert(result.end(), nl_enc.begin(), nl_enc.end());
+                continue;
+            }
+
+            result.push_back(IM_START);
+            auto role_enc = tokenizer_.encode(role + "\n");
+            result.insert(result.end(), role_enc.begin(), role_enc.end());
+
+            std::string body = content;
+            if (role == "user" && (int)i == last_user_idx) {
+                if (enable_thinking && (reasoning_effort == "efficient" || reasoning_effort == "medium" || reasoning_effort == "low")) {
+                    body += "\n\n{reasoning effort: efficient}";
+                }
+            }
+
+            if (role == "assistant") {
+                if (messages[i].contains("reasoning_content") && messages[i]["reasoning_content"].is_string()) {
+                    std::string r_content = messages[i]["reasoning_content"].get<std::string>();
+                    if (!r_content.empty()) {
+                        body = "<think>\n" + r_content + "\n</think>\n" + body;
+                    }
+                } else {
+                    if (body.find("<think>") == std::string::npos && body.find("</think>") == std::string::npos) {
+                        body = "<think></think>" + body;
+                    }
+                }
+            }
+
+            auto enc = tokenizer_.encode(body);
+            result.insert(result.end(), enc.begin(), enc.end());
+            result.push_back(IM_END);
+            auto nl_enc = tokenizer_.encode("\n");
+            result.insert(result.end(), nl_enc.begin(), nl_enc.end());
+        }
+
+        // Final assistant turn header
+        if (!messages.empty()) {
+            std::string last_role = messages.back().value("role", "user");
+            if (last_role == "user" || last_role == "tool" || last_role == "function") {
+                result.push_back(IM_START);
+                auto asst_enc = tokenizer_.encode("assistant\n");
+                result.insert(result.end(), asst_enc.begin(), asst_enc.end());
+                if (enable_thinking) {
+                    auto think_enc = tokenizer_.encode("<think>\n");
+                    result.insert(result.end(), think_enc.begin(), think_enc.end());
+                } else {
+                    auto think_enc = tokenizer_.encode("<think></think>");
+                    result.insert(result.end(), think_enc.begin(), think_enc.end());
+                }
+            }
+        }
+
+        out.prompt = result;
+        return out;
+    }
