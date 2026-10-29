@@ -864,7 +864,7 @@ json resolve_canonical_tools(const json& tools_input) {
             {"type", "function"},
             {"function", {
                 {"name", "write_file"},
-                {"description", "Write or overwrite a file on local filesystem."},
+                {"description", "Write or overwrite a file on the local filesystem. ONLY invoke this tool when the user explicitly instructs to create, save, or write to a specific file or workspace path. Never invoke this tool if the user asks for code, models, or text to be output in the chat."},
                 {"parameters", {
                     {"type", "object"},
                     {"properties", {
@@ -880,7 +880,7 @@ json resolve_canonical_tools(const json& tools_input) {
             {"type", "function"},
             {"function", {
                 {"name", "edit_file"},
-                {"description", "Replace unique text in an existing file."},
+                {"description", "Replace unique text in an existing file. ONLY invoke this tool when the user explicitly instructs to edit or update an existing file on the filesystem."},
                 {"parameters", {
                     {"type", "object"},
                     {"properties", {
@@ -998,28 +998,49 @@ std::string build_dynamic_tools_prompt(const json& resolved_tools, bool is_qwen)
             "</tool_call>\n\n";
     }
 
+    bool has_write = false;
+    for (const auto& item : resolved_tools) {
+        std::string n = item.value("function", json::object()).value("name", "");
+        if (n == "write_file" || n == "edit_file") { has_write = true; break; }
+    }
+
+    if (!has_write) {
+        prompt +=
+            "## Output Format Instructions:\n"
+            "- Only call tools that are listed in the <tools> schema above. Never invoke write_file or edit_file.\n"
+            "- When asked to create, write, or generate code, models, HTML, or scripts, output the full code directly in your response inside markdown code blocks (e.g. ```html, ```javascript, ```python).\n\n";
+    }
+
     if (has_yt) {
         prompt +=
             "## Tool Usage Instructions:\n"
             "- When the user asks to play music, a song, or a video, invoke `youtube_search` directly. The video will automatically load and play in the user's preview panel with autoplay.\n";
     }
 
-    prompt +=
-        "## High-Fidelity Analytic 3D Modeling Instructions:\n"
-        "- When asked to create, model, or reconstruct in 3D (or reconstruct an object from an image), always output Three.js representation code defining `function createModel(scene, THREE, inputImage, helpers) { ... }` inside a ```javascript code block (never output a full HTML file), adding all meshes to `scene`.\n"
-        "- 1. SEMANTIC PART DECOMPOSITION: Never model an object as a single monolithic mesh. Deconstruct the object into its distinct structural and anatomical parts (e.g. for an apple: body, stem, leaf; for a teapot: vessel body, lid, knob, handle, spout; for vehicles/furniture: body, wheels, windows, panels). Model EVERY part as a separate named `THREE.Mesh` with its own geometry and material (or use `helpers.createPart(name, geometry, material, scene)`).\n"
-        "- 2. PART-SPECIFIC TEXTURES & COLORS (DO NOT NAIVELY APPLY THE ENTIRE PHOTO!):\n"
-        "  * NEVER blindly apply the entire input photo onto the whole model or primary mesh (which stretches background, shadows, and unrelated features across surfaces).\n"
-        "  * For parts requiring surface textures (skin, patterns, labels, dials, leaves): use `helpers.cropTexture(inputImage, uMin, vMin, uMax, vMax, options)` to crop clean sub-regions of the photo matching that part (normalized coordinates 0..1).\n"
-        "  * For uniform, solid, or metallic parts (stems, chrome handles, rims, bases): use `helpers.sampleColor(inputImage, u, v)` to sample realistic colors and set physically accurate PBR properties (`roughness`, `metalness`, `clearcoat`).\n"
-        "- 3. ACCURATE UV MAPPING:\n"
-        "  * For flat, curved, or extruded parts (leaves, labels, panels, wings): apply planar UVs using `helpers.applyPlanarUV(geometry, 'z')` so cropped sub-textures map cleanly without distortion.\n"
-        "  * For cylindrical or revolved parts: use cylindrical UVs (`helpers.applyCylindricalUV(geometry)` or standard Lathe UVs) with `wrapS: THREE.RepeatWrapping`.\n"
-        "  * For complex multi-sided parts: use `helpers.applyBoxUV(geometry)`.\n"
-        "- 4. WATERTIGHT GEOMETRY & SEAMLESS INTEGRATION:\n"
-        "  * Revolved profiles must start and end at x=0 (use `helpers.createWatertightLathe` or `helpers.createHollowVessel` for vessels with solid wall thickness).\n"
-        "  * Tubes, pipes, stems, and handles must have sealed end caps (use `helpers.createCappedTube`).\n"
-        "  * Attachments (stems, leaves, handles, spouts) must penetrate 5-10% deep into parent meshes to prevent floating seams or gaps.\n";
+    bool has_3d = false;
+    for (const auto& item : resolved_tools) {
+        std::string n = item.value("function", json::object()).value("name", "");
+        if (n == "create_3d_model" || n == "model_3d") { has_3d = true; break; }
+    }
+
+    if (has_3d) {
+        prompt +=
+            "## High-Fidelity Analytic 3D Modeling Instructions:\n"
+            "- When asked to create, model, or reconstruct in 3D (or reconstruct an object from an image), always output Three.js representation code defining `function createModel(scene, THREE, inputImage, helpers) { ... }` inside a ```javascript code block (never output a full HTML file), adding all meshes to `scene`.\n"
+            "- 1. SEMANTIC PART DECOMPOSITION: Never model an object as a single monolithic mesh. Deconstruct the object into its distinct structural and anatomical parts (e.g. for an apple: body, stem, leaf; for a teapot: vessel body, lid, knob, handle, spout; for vehicles/furniture: body, wheels, windows, panels). Model EVERY part as a separate named `THREE.Mesh` with its own geometry and material (or use `helpers.createPart(name, geometry, material, scene)`).\n"
+            "- 2. PART-SPECIFIC TEXTURES & COLORS (DO NOT NAIVELY APPLY THE ENTIRE PHOTO!):\n"
+            "  * NEVER blindly apply the entire input photo onto the whole model or primary mesh (which stretches background, shadows, and unrelated features across surfaces).\n"
+            "  * For parts requiring surface textures (skin, patterns, labels, dials, leaves): use `helpers.cropTexture(inputImage, uMin, vMin, uMax, vMax, options)` to crop clean sub-regions of the photo matching that part (normalized coordinates 0..1).\n"
+            "  * For uniform, solid, or metallic parts (stems, chrome handles, rims, bases): use `helpers.sampleColor(inputImage, u, v)` to sample realistic colors and set physically accurate PBR properties (`roughness`, `metalness`, `clearcoat`).\n"
+            "- 3. ACCURATE UV MAPPING:\n"
+            "  * For flat, curved, or extruded parts (leaves, labels, panels, wings): apply planar UVs using `helpers.applyPlanarUV(geometry, 'z')` so cropped sub-textures map cleanly without distortion.\n"
+            "  * For cylindrical or revolved parts: use cylindrical UVs (`helpers.applyCylindricalUV(geometry)` or standard Lathe UVs) with `wrapS: THREE.RepeatWrapping`.\n"
+            "  * For complex multi-sided parts: use `helpers.applyBoxUV(geometry)`.\n"
+            "- 4. WATERTIGHT GEOMETRY & SEAMLESS INTEGRATION:\n"
+            "  * Revolved profiles must start and end at x=0 (use `helpers.createWatertightLathe` or `helpers.createHollowVessel` for vessels with solid wall thickness).\n"
+            "  * Tubes, pipes, stems, and handles must have sealed end caps (use `helpers.createCappedTube`).\n"
+            "  * Attachments (stems, leaves, handles, spouts) must penetrate 5-10% deep into parent meshes to prevent floating seams or gaps.\n";
+    }
 
     return prompt;
 }
@@ -1042,6 +1063,186 @@ std::string update_system_prompt_with_tools(const std::string& original_content,
         content += tools_system_prompt;
     }
     return content;
+}
+
+bool user_prompt_requests_filesystem_write(const std::string& prompt) {
+    if (prompt.empty()) return false;
+
+    // Convert to lowercase for case-insensitive inspection
+    std::string lower;
+    lower.reserve(prompt.size());
+    for (char c : prompt) {
+        lower.push_back((char)std::tolower((unsigned char)c));
+    }
+
+    // 1. Direct workspace or disk filesystem keywords
+    static const std::vector<std::string> fs_targets = {
+        "workspace",
+        "to disk",
+        "on disk",
+        "in disk",
+        "local disk",
+        "file system",
+        "filesystem",
+        "nel workspace",
+        "su disco",
+        "sul disco"
+    };
+    for (const auto& target : fs_targets) {
+        if (lower.find(target) != std::string::npos) {
+            return true;
+        }
+    }
+
+    // 2. Explicit file creation / saving action phrases
+    static const std::vector<std::string> file_action_phrases = {
+        "create a file",
+        "create file",
+        "make a file",
+        "make file",
+        "new file",
+        "save a file",
+        "save file",
+        "write a file",
+        "write file",
+        "save to file",
+        "save into file",
+        "save in file",
+        "write to file",
+        "write into file",
+        "dump to file",
+        "output to file",
+        "export to file",
+        "store in file",
+        "save to a file",
+        "write to a file",
+        "save to path",
+        "write to path",
+        "save as ",
+        "save it as ",
+        "save this as ",
+        "save it to ",
+        "save this to ",
+        "write it to ",
+        "write this to ",
+        "file named ",
+        "file called ",
+        "named file ",
+        "called file ",
+        "edit file",
+        "modify file",
+        "update file",
+        "patch file",
+        "replace in file",
+        "crea un file",
+        "crea file",
+        "salva file",
+        "salva su file",
+        "salva in file",
+        "scrivi su file",
+        "salva come ",
+        "salva in ",
+        "salva su ",
+        "file chiamato ",
+        "file chiamata "
+    };
+    for (const auto& phrase : file_action_phrases) {
+        if (lower.find(phrase) != std::string::npos) {
+            return true;
+        }
+    }
+
+    // 3. Named / called with filename or extension pattern
+    auto check_named_target = [&](const std::string& prefix) -> bool {
+        size_t pos = 0;
+        while ((pos = lower.find(prefix, pos)) != std::string::npos) {
+            size_t start = pos + prefix.size();
+            while (start < lower.size() && (lower[start] == ' ' || lower[start] == '"' || lower[start] == '\'' || lower[start] == '`')) {
+                start++;
+            }
+            size_t end = start;
+            while (end < lower.size() && (std::isalnum((unsigned char)lower[end]) || lower[end] == '_' || lower[end] == '-' || lower[end] == '.' || lower[end] == '/' || lower[end] == '\\')) {
+                end++;
+            }
+            if (end > start) {
+                std::string target = lower.substr(start, end - start);
+                // If target contains a dot with an extension (e.g. "calc.html", "main.py"), it's a file!
+                if (target.find('.') != std::string::npos) {
+                    return true;
+                }
+            }
+            pos = end;
+        }
+        return false;
+    };
+
+    if (check_named_target("named ")) return true;
+    if (check_named_target("called ")) return true;
+    if (check_named_target("name it ")) return true;
+    if (check_named_target("call it ")) return true;
+    if (check_named_target("chiamato ")) return true;
+    if (check_named_target("chiamata ")) return true;
+
+    // 4. File path or filename with common extension in an action context
+    static const std::vector<std::string> extensions = {
+        ".html", ".htm", ".js", ".mjs", ".ts", ".jsx", ".tsx", ".css", ".scss",
+        ".py", ".cpp", ".c", ".h", ".hpp", ".cu", ".cuh", ".cs", ".java", ".go",
+        ".rs", ".php", ".rb", ".json", ".xml", ".yaml", ".yml", ".toml", ".ini",
+        ".txt", ".md", ".csv", ".sql", ".sh", ".bat", ".ps1", ".gltf", ".glb",
+        ".obj", ".stl", ".svg", ".log"
+    };
+
+    static const std::vector<std::string> action_verbs = {
+        "create", "save", "write", "dump", "export", "generate", "make",
+        "edit", "modify", "update", "patch", "overwrite", "into", "to", "in",
+        "crea", "salva", "scrivi", "modifica", "aggiorna"
+    };
+
+    for (const auto& ext : extensions) {
+        size_t ext_pos = 0;
+        while ((ext_pos = lower.find(ext, ext_pos)) != std::string::npos) {
+            size_t after_ext = ext_pos + ext.size();
+            if (after_ext < lower.size() && std::isalnum((unsigned char)lower[after_ext])) {
+                ext_pos = after_ext;
+                continue;
+            }
+
+            size_t token_start = ext_pos;
+            while (token_start > 0 && (std::isalnum((unsigned char)lower[token_start - 1]) ||
+                   lower[token_start - 1] == '_' || lower[token_start - 1] == '-' ||
+                   lower[token_start - 1] == '/' || lower[token_start - 1] == '\\' ||
+                   lower[token_start - 1] == '.')) {
+                token_start--;
+            }
+
+            std::string token = lower.substr(token_start, after_ext - token_start);
+
+            // Filter out common false positives
+            if (token == "node.js" || token == "vue.js" || token == "three.js" ||
+                token == "react.js" || token == "next.js" || token == "d3.js") {
+                ext_pos = after_ext;
+                continue;
+            }
+
+            // Check if there is a file action verb in the nearby text (within ~40 chars preceding the filename)
+            size_t window_start = (token_start > 40) ? (token_start - 40) : 0;
+            std::string preceding_window = lower.substr(window_start, token_start - window_start);
+            for (const auto& verb : action_verbs) {
+                size_t vpos = preceding_window.find(verb);
+                if (vpos != std::string::npos) {
+                    bool left_boundary = (vpos == 0 || !std::isalnum((unsigned char)preceding_window[vpos - 1]));
+                    bool right_boundary = (vpos + verb.size() == preceding_window.size() || !std::isalnum((unsigned char)preceding_window[vpos + verb.size()]));
+                    if (left_boundary && right_boundary) {
+                        return true;
+                    }
+                }
+            }
+
+            ext_pos = after_ext;
+        }
+    }
+
+    return false;
 }
 
 void register_agentic_routes(httplib::Server& svr) {

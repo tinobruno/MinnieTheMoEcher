@@ -19,6 +19,8 @@ bool g_allow_file_write = false;
 std::string g_workspace_root = "./workspace";
 bool g_headless_browsing = false;
 int g_max_tool_rounds = 10;
+bool g_intent_gating = true;
+bool g_intent_gating_cli_explicit = false;
 std::atomic<bool> g_stop_requested{false};
 
 void log_msg(const char* level, const char* fmt, ...) {

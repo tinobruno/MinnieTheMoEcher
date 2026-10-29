@@ -1957,7 +1957,8 @@ let speculativeSettings = {
     enableMtp: true,
     mtpK: 0,
     enableTreeMtp: false,
-    treeNodes: 2
+    treeNodes: 2,
+    enablePld: false
 };
 
 function loadSpeculativeSettings() {
@@ -1981,6 +1982,9 @@ function loadSpeculativeSettings() {
         const savedTreeNodes = localStorage.getItem('moecher_tree_nodes');
         if (savedTreeNodes !== null) speculativeSettings.treeNodes = parseInt(savedTreeNodes, 10) || 2;
 
+        const savedPld = localStorage.getItem('moecher_enable_pld');
+        if (savedPld !== null) speculativeSettings.enablePld = savedPld === 'true';
+
         const elMtp = document.getElementById('mtp-enabled');
         if (elMtp) elMtp.checked = speculativeSettings.enableMtp;
 
@@ -1992,6 +1996,9 @@ function loadSpeculativeSettings() {
 
         const elTreeNodes = document.getElementById('tree-nodes-select');
         if (elTreeNodes) elTreeNodes.value = String(speculativeSettings.treeNodes);
+
+        const elPld = document.getElementById('pld-enabled');
+        if (elPld) elPld.checked = speculativeSettings.enablePld;
 
         updateSpeculativeControls();
     } catch (e) {
@@ -2013,11 +2020,15 @@ function saveSpeculativeSettings() {
         const elTreeNodes = document.getElementById('tree-nodes-select');
         if (elTreeNodes) speculativeSettings.treeNodes = parseInt(elTreeNodes.value, 10) || 2;
 
+        const elPld = document.getElementById('pld-enabled');
+        if (elPld) speculativeSettings.enablePld = elPld.checked;
+
         localStorage.setItem('moecher_enable_mtp', speculativeSettings.enableMtp);
         localStorage.setItem('moecher_mtp_k', speculativeSettings.mtpK);
         localStorage.setItem('moecher_enable_tree_mtp', speculativeSettings.enableTreeMtp);
         localStorage.setItem('moecher_enable_tree_mtp_v2', speculativeSettings.enableTreeMtp);
         localStorage.setItem('moecher_tree_nodes', speculativeSettings.treeNodes);
+        localStorage.setItem('moecher_enable_pld', speculativeSettings.enablePld);
 
         updateSpeculativeControls();
     } catch (e) {
@@ -2055,13 +2066,21 @@ function updateSpeculativeControls() {
         treeNodesCont.style.pointerEvents = treeActive ? 'auto' : 'none';
     }
 
+    const elPld = document.getElementById('pld-enabled');
+    const pldActive = elPld ? elPld.checked : false;
+
     const badge = document.getElementById('speculative-mode-badge');
     if (badge) {
-        if (!mtpActive) {
-            badge.textContent = 'MTP Off';
+        if (!mtpActive && !pldActive) {
+            badge.textContent = 'Spec Off';
             badge.style.color = 'var(--text-secondary, #94a3b8)';
             badge.style.borderColor = 'rgba(148, 163, 184, 0.3)';
             badge.style.background = 'rgba(148, 163, 184, 0.1)';
+        } else if (!mtpActive && pldActive) {
+            badge.textContent = 'PLD';
+            badge.style.color = '#38bdf8';
+            badge.style.borderColor = 'rgba(56, 189, 248, 0.35)';
+            badge.style.background = 'rgba(56, 189, 248, 0.15)';
         } else if (!treeActive) {
             const kStr = elMtpK && elMtpK.value !== '0' ? `K=${elMtpK.value}` : 'Auto';
             badge.textContent = `MTP (${kStr})`;
@@ -2985,6 +3004,61 @@ function renderServerRestartNotice() {
     }
 }
 
+let currentOperationalMode = 'chat'; // 'chat' or 'agentic'
+
+function setOperationalMode(mode, skipSync = false) {
+    if (mode !== 'chat' && mode !== 'agentic') mode = 'chat';
+    currentOperationalMode = mode;
+    try { localStorage.setItem('moecher_operational_mode', mode); } catch (e) {}
+
+    const btnChat = document.getElementById('mode-btn-chat');
+    const btnAgentic = document.getElementById('mode-btn-agentic');
+    const toggleInput = document.getElementById('intent-gating-toggle');
+    const statusTitle = document.getElementById('agentic-mode-status-title');
+    const statusDesc = document.getElementById('agentic-mode-status-desc');
+
+    if (btnChat) {
+        if (mode === 'chat') btnChat.classList.add('active');
+        else btnChat.classList.remove('active');
+    }
+    if (btnAgentic) {
+        if (mode === 'agentic') btnAgentic.classList.add('active');
+        else btnAgentic.classList.remove('active');
+    }
+    if (toggleInput) {
+        toggleInput.checked = (mode === 'chat');
+    }
+    if (statusTitle) {
+        statusTitle.textContent = (mode === 'chat')
+            ? 'Dynamic Intent Layer (Chat Mode Active)'
+            : 'Dynamic Intent Layer (Agentic Mode Active)';
+    }
+    if (statusDesc) {
+        statusDesc.textContent = (mode === 'chat')
+            ? 'Chat Mode: Code, HTML, and models output directly in chat markdown unless file creation is explicitly requested.'
+            : 'Agentic Mode: Unrestricted autonomous filesystem access. Model creates and modifies files directly in workspace.';
+    }
+
+    if (!skipSync) {
+        syncOperationalModeWithBackend(mode);
+    }
+}
+
+async function syncOperationalModeWithBackend(mode) {
+    try {
+        await fetch(`${getApiBase()}/api/system/configure`, {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({
+                operational_mode: mode,
+                intent_gating: (mode === 'chat')
+            })
+        });
+    } catch (e) {
+        console.warn('Failed to sync operational mode with server:', e);
+    }
+}
+
 async function fetchBackendSystemPrompt() {
     try {
         setSystemPromptSyncStatus('syncing', 'Fetching engine prompt...');
@@ -2995,6 +3069,14 @@ async function fetchBackendSystemPrompt() {
             window.serverToolsDisabled = true;
         } else if (data && data.tools_enabled === true) {
             window.serverToolsDisabled = false;
+        }
+        if (data && (data.operational_mode || data.intent_gating !== undefined)) {
+            const serverMode = data.operational_mode || (data.intent_gating ? 'chat' : 'agentic');
+            setOperationalMode(serverMode, true);
+        } else {
+            let localMode = 'chat';
+            try { localMode = localStorage.getItem('moecher_operational_mode') || 'chat'; } catch (e) {}
+            setOperationalMode(localMode, true);
         }
         if (data && data.repetition_penalty !== undefined && repPenaltySlider) {
             repPenaltySlider.value = data.repetition_penalty;
@@ -3476,7 +3558,12 @@ function extractToolCallsFromContent(text) {
     function addCall(name, args) {
         if (!name || typeof name !== 'string') return;
         name = name.trim();
-        if (name === '<function>' || name === 'function') name = 'web_search';
+        if (name === '<function>' || name === 'function' || name === 'search' || name === 'google_search') name = 'web_search';
+        else if (name === 'fetch' || name === 'fetch_page' || name === 'browse' || name === 'curl' || name === 'get_url') name = 'fetch_url';
+        else if (name === 'bash' || name === 'sh' || name === 'shell' || name === 'cmd' || name === 'exec' || name === 'run_command') name = 'execute_command';
+        else if (name === 'read' || name === 'view_file' || name === 'cat') name = 'read_file';
+        else if (name === 'write' || name === 'create_file') name = 'write_file';
+        else if (name === 'edit' || name === 'modify_file') name = 'edit_file';
         // Only accept calls for tools that are currently active or valid MCP servers
         if (!activeTools.includes(name) && !name.startsWith('mcp__') && !name.startsWith('tinobruno-')) {
             return;
@@ -4534,7 +4621,7 @@ async function sendMessage(options = {}) {
                 messages: messagesToSend,
                 max_tokens: parseInt(tokensInput ? tokensInput.value : 20000, 10) || 20000,
                 temperature: parseFloat(tempSlider.value),
-                repetition_penalty: parseFloat(repPenaltySlider ? repPenaltySlider.value : 1.05),
+                repetition_penalty: parseFloat(repPenaltySlider ? repPenaltySlider.value : 1.0),
                 stream: true,
                 enable_thinking: isThinking,
                 thinking: {
@@ -4543,18 +4630,23 @@ async function sendMessage(options = {}) {
                 },
                 max_thinking_tokens: budgetVal,
                 reasoning_effort: isThinking ? reasoningEffort.value : "none",
-                enable_spec: speculativeSettings.enableMtp,
+                enable_spec: speculativeSettings.enableMtp || speculativeSettings.enablePld,
                 enable_mtp: speculativeSettings.enableMtp,
                 mtp: speculativeSettings.enableMtp,
                 mtp_k: speculativeSettings.mtpK,
                 enable_tree_mtp: speculativeSettings.enableMtp && speculativeSettings.enableTreeMtp,
                 tree_mtp: speculativeSettings.enableMtp && speculativeSettings.enableTreeMtp,
                 tree_nodes: speculativeSettings.treeNodes,
+                enable_pld: speculativeSettings.enablePld,
+                pld: speculativeSettings.enablePld,
                 execution_timeout_sec: agenticSettings.timeoutSec || 60,
                 workspace_boundary_enforced: agenticSettings.boundaryEnforced !== false,
                 require_external_authorization: agenticSettings.requireAuth !== false,
                 authorized_paths: agenticSettings.authorizedPaths || [],
                 max_tool_rounds: agenticSettings.maxToolRounds || 10,
+                mode: currentOperationalMode,
+                operational_mode: currentOperationalMode,
+                intent_gating: (currentOperationalMode === 'chat'),
                 client_tool_execution: true,
                 client_context: {
                     user_agent: clientUa,
@@ -4591,7 +4683,7 @@ async function sendMessage(options = {}) {
             if (zdbSettings && zdbSettings.enabled) {
                 payload.tools = [];
             } else {
-                payload.tools = (round >= maxRounds || turnExecutedSearch || turnEncounteredToolIssue) ? [] : activeTools;
+                payload.tools = (round >= maxRounds) ? [] : activeTools;
             }
 
             let roundReasoning = "";
@@ -4967,7 +5059,7 @@ async function sendMessage(options = {}) {
                         let cleanUserQuery = lastUserMsg.replace(/^(?:hello|hi|hey|please|can you|could you|tell me|do you know|cerca(?:\s+su\s+google|\s+online)?|search(?:\s+the\s+web|\s+online)?)\s+/i, "").trim();
                         const asksForDateOrEvent = /(?:which|what)\s+(?:date|race|circuit|event)\b|(?:specify|clarify|tell me)\s+(?:the\s+)?date/i.test(roundContent);
                         const userAskedTemporal = /(?:this morning|today|tonight|yesterday|this weekend|pole position|who won|latest|current)/i.test(lastUserMsg);
-                        const userExplicitSearch = /^(?:cerca\b|search\b|find\b|look up\b)/i.test(lastUserMsg);
+                        const userExplicitSearch = /^(?:cerca\s+(?:su\s+google|online|sul\s+web)|search\s+(?:the\s+web|google|online)|google\b)/i.test(lastUserMsg);
 
                         if ((isRealTimeRefusal || userExplicitSearch || (asksForDateOrEvent && userAskedTemporal)) && cleanUserQuery.length >= 3) {
                             console.log("[Agentic Auto-Tool] Triggering web_search for explicit query or temporal inquiry:", cleanUserQuery);
@@ -5298,6 +5390,13 @@ async function sendMessage(options = {}) {
         if ((!lastRoundContent || lastRoundContent.trim().length === 0) && turnToolCallsCount > 0) {
             console.log('[Turn Synthesis Guard] Formulating final answer for user...');
             try {
+                while (chatHistory.length > 0 && chatHistory[chatHistory.length - 1].role === 'assistant' && (!chatHistory[chatHistory.length - 1].content || chatHistory[chatHistory.length - 1].content.trim().length === 0)) {
+                    chatHistory.pop();
+                }
+                chatHistory.push({
+                    role: 'user',
+                    content: 'Please synthesize and provide your comprehensive findings and final answer based on all tool results above.'
+                });
                 const finalMessages = buildOptimizedMessagesPayload();
                 const finalPayload = {
                     model: currentModelId || "deepseek-v4-flash",
@@ -5305,7 +5404,8 @@ async function sendMessage(options = {}) {
                     max_tokens: parseInt(tokensInput ? tokensInput.value : 20000, 10) || 20000,
                     temperature: parseFloat(tempSlider.value),
                     stream: true,
-                    enable_thinking: false,
+                    enable_thinking: isThinking,
+                    thinking_budget: 4096,
                     enable_spec: speculativeSettings.enableMtp,
                     enable_mtp: speculativeSettings.enableMtp,
                     mtp: speculativeSettings.enableMtp,

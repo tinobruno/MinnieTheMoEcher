@@ -296,10 +296,20 @@ MultimodalPrompt apply_chat_template_multimodal(
         }
         if (!messages.empty()) {
             std::string last_role = messages.back().value("role", "user");
-            if (last_role == "user" || last_role == "tool" || last_role == "function") {
-                result.push_back(IM_START);
-                auto asst_enc = tok.encode("assistant\n");
-                result.insert(result.end(), asst_enc.begin(), asst_enc.end());
+            std::string last_content = get_message_content_string(messages.back());
+            bool assistant_needs_completion = (last_role == "assistant" && last_content.empty());
+            if (last_role == "user" || last_role == "tool" || last_role == "function" || assistant_needs_completion) {
+                if (assistant_needs_completion) {
+                    while (!result.empty() && result.back() != IM_START) {
+                        result.pop_back();
+                    }
+                    auto asst_enc = tok.encode("assistant\n");
+                    result.insert(result.end(), asst_enc.begin(), asst_enc.end());
+                } else {
+                    result.push_back(IM_START);
+                    auto asst_enc = tok.encode("assistant\n");
+                    result.insert(result.end(), asst_enc.begin(), asst_enc.end());
+                }
                 if (is_nemotron) {
                     if (enable_thinking) {
                         auto think_enc = tok.encode("<think>\n");

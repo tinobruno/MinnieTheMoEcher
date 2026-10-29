@@ -27,6 +27,7 @@ namespace moecher::agentic {
     nlohmann::json resolve_canonical_tools(const nlohmann::json& tools_input);
     std::string build_dynamic_tools_prompt(const nlohmann::json& resolved_tools, bool is_qwen = false);
     std::string update_system_prompt_with_tools(const std::string& original_content, const std::string& tools_system_prompt, bool has_tools);
+    bool user_prompt_requests_filesystem_write(const std::string& prompt);
 
     void register_agentic_routes(httplib::Server& svr);
 }
@@ -35,6 +36,7 @@ namespace moecher::agentic {
 using moecher::agentic::resolve_canonical_tools;
 using moecher::agentic::build_dynamic_tools_prompt;
 using moecher::agentic::update_system_prompt_with_tools;
+using moecher::agentic::user_prompt_requests_filesystem_write;
 using moecher::agentic::g_base_system_prompt;
 using moecher::agentic::g_current_system_prompt;
 using moecher::agentic::g_current_active_tools;

@@ -3796,12 +3796,21 @@ inline bool try_parse_tool_json(const std::string& str, ToolCall& tc, int idx) {
         } else if (j.contains("name") && j["name"].is_string()) {
             // Require explicit tool/function signature so standard data objects like {"name": "John", "age": 23} are never mistaken for tool invocations
             if (j.contains("arguments") || j.contains("parameters") || j.contains("args") ||
-                j.value("type", "") == "function") {
+                j.value("type", "") == "function" ||
+                j.contains("url") || j.contains("query") || j.contains("command") || j.contains("path")) {
                 fn_name = j["name"].get<std::string>();
             }
         }
 
         if (fn_name.empty()) return false;
+
+        // Canonicalize tool aliases
+        if (fn_name == "fetch" || fn_name == "fetch_page" || fn_name == "browse" || fn_name == "curl" || fn_name == "get_url") fn_name = "fetch_url";
+        else if (fn_name == "search" || fn_name == "google_search") fn_name = "web_search";
+        else if (fn_name == "bash" || fn_name == "sh" || fn_name == "shell" || fn_name == "cmd" || fn_name == "exec" || fn_name == "run_command") fn_name = "execute_command";
+        else if (fn_name == "read" || fn_name == "view_file" || fn_name == "cat") fn_name = "read_file";
+        else if (fn_name == "write" || fn_name == "create_file") fn_name = "write_file";
+        else if (fn_name == "edit" || fn_name == "modify_file") fn_name = "edit_file";
 
         tc.name = fn_name;
         tc.id = "call_" + std::to_string(idx) + "_" + std::to_string(std::chrono::steady_clock::now().time_since_epoch().count() % 1000000);
@@ -3828,6 +3837,20 @@ inline bool try_parse_tool_json(const std::string& str, ToolCall& tc, int idx) {
         }
         return true;
     } catch (...) {
+        if (str.find("\"write_file\"") != std::string::npos || str.find("'write_file'") != std::string::npos) {
+            tc.name = "write_file";
+            tc.id = "call_" + std::to_string(idx) + "_" + std::to_string(std::chrono::steady_clock::now().time_since_epoch().count() % 1000000);
+            tc.type = "function";
+            tc.arguments = str;
+            return true;
+        }
+        if (str.find("\"edit_file\"") != std::string::npos || str.find("'edit_file'") != std::string::npos) {
+            tc.name = "edit_file";
+            tc.id = "call_" + std::to_string(idx) + "_" + std::to_string(std::chrono::steady_clock::now().time_since_epoch().count() % 1000000);
+            tc.type = "function";
+            tc.arguments = str;
+            return true;
+        }
         return false;
     }
 }

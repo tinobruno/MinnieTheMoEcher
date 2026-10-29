@@ -170,7 +170,8 @@ public:
     bool supports_vision() const { return has_vision() || has_vision_delegate(); }
 
     // Prompt-Lookup Drafting (PLD) Speculative Decoding
-    bool enable_pld_ = true;
+    bool enable_pld_ = false;
+    bool default_enable_pld_ = false;
     int pld_draft_tokens_ = 4;
     bool enable_mtp_ = true;
     bool default_enable_mtp_ = true;
