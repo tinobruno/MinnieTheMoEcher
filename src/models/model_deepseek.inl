@@ -1,3 +1,14 @@
+    // ── Standard sampling defaults for DeepSeek models ──────────────────────
+    void apply_sampling_defaults_deepseek() {
+        if (cfg_.default_temperature < 0.0f) cfg_.default_temperature = 0.60f;
+        if (cfg_.default_top_p < 0.0f) cfg_.default_top_p = 0.95f;
+        if (cfg_.default_top_k < 0) cfg_.default_top_k = 1024;
+        if (cfg_.default_min_p < 0.0f) cfg_.default_min_p = 0.00f;
+        if (cfg_.default_repetition_penalty < 0.0f) cfg_.default_repetition_penalty = 1.00f;
+        if (cfg_.default_reasoning_effort.empty()) cfg_.default_reasoning_effort = "high";
+        if (cfg_.default_thinking_budget < 0) cfg_.default_thinking_budget = 8192;
+    }
+
     // ── Forward one layer ───────────────────────────────────────────────────
 
     void forward_layer(int layer_id, int token_id, int position) {

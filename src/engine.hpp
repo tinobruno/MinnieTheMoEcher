@@ -2244,7 +2244,7 @@ public:
         }
 
         bool can_reuse_prefix = (prefix_len > 0);
-        if ((cfg_.architecture == ModelArch::DEEPSEEK_V4 || cfg_.is_nemotron()) && prefix_len < cached_tokens_.size()) {
+        if (cfg_.has_recurrent_state() && prefix_len < cached_tokens_.size()) {
             can_reuse_prefix = false;
             prefix_len = 0;
         }
@@ -2437,11 +2437,25 @@ public:
         expert_loader_.begin_request_epoch();
         // Ensure prompt fits within max_seq_len (defense-in-depth safety clamp)
         std::vector<int> prompt = prompt_in;
-        if (prompt.size() > (size_t)cfg_.max_seq_len) {
-            LOG_WARN("[Engine] Prompt size (%zu) exceeds max_seq_len (%d). Clamping prompt to context limit.",
+        if (prompt.size() >= (size_t)cfg_.max_seq_len) {
+            LOG_WARN("[Engine] Prompt size (%zu) reaches or exceeds max_seq_len (%d). Clamping prompt to leave context headroom.",
                      prompt.size(), cfg_.max_seq_len);
-            size_t excess = prompt.size() - (size_t)cfg_.max_seq_len;
+            size_t excess = prompt.size() - (size_t)cfg_.max_seq_len + 1;
             prompt.erase(prompt.begin(), prompt.begin() + excess);
+        }
+
+        // Clamp requested max_tokens to physical context window headroom
+        int max_available = cfg_.max_seq_len - (int)prompt.size() - 1;
+        if (max_available <= 0) {
+            LOG_WARN("[Engine] No context headroom left for generation (prompt=%zu, max_seq_len=%d)",
+                     prompt.size(), cfg_.max_seq_len);
+            last_finish_reason_ = "length";
+            return "";
+        }
+        if (max_tokens > max_available) {
+            LOG_INFO("[Engine] Clamping requested max_tokens (%d) to available context budget (%d)",
+                     max_tokens, max_available);
+            max_tokens = max_available;
         }
 
         // Configure visual embeddings for prompt prefill if present
@@ -2489,14 +2503,14 @@ public:
             }
         }
 
-        // For architectures with recurrent/stateful compression (DeepSeek V4 MLA / Linear Attn),
+        // For architectures with recurrent/stateful compression (DeepSeek V4 MLA / Linear Attn DeltaNet / Nemotron),
         // we can safely reuse the prefix when prefix_len == cached_tokens_.size() (exact continuation)
         // or for pure positional GQA.
         bool can_reuse_prefix = (prefix_len > 0);
         if (active_visual_embeddings_) {
             can_reuse_prefix = false;
             prefix_len = 0;
-        } else if ((cfg_.architecture == ModelArch::DEEPSEEK_V4 || cfg_.is_nemotron()) && prefix_len < cached_tokens_.size()) {
+        } else if (cfg_.has_recurrent_state() && prefix_len < cached_tokens_.size()) {
             can_reuse_prefix = false;
             prefix_len = 0;
         }
@@ -2885,6 +2899,56 @@ public:
         };
 
         int next_token = -1;
+
+        auto transition_out_of_think = [&](const char* reason) {
+            LOG_WARN("[ThinkTransition] %s (%d thinking tokens). Closing </think> and starting content.",
+                     reason, thinking_tokens_generated);
+            in_think_block = false;
+            think_block_ended = true;
+            if (content_start_history_idx < 0) {
+                content_start_history_idx = (int)history.size();
+            }
+            track_current_token_ = false;
+            if (think_end_id >= 0) {
+                forward_token(think_end_id, position);
+                if (qwen_draft_.loaded_) {
+                    qwen_draft_.forward_token_async(think_end_id, position, main_stream_);
+                }
+                position++;
+                output_ids.push_back(think_end_id);
+                history.push_back(think_end_id);
+            }
+            if (on_token) {
+                on_token("", false); // Signal end of reasoning to stream consumer
+            }
+            std::vector<int> transition_tokens = tokenizer_.encode("\n\n");
+            for (int tok_id : transition_tokens) {
+                track_current_token_ = false; // Synthetic transition tokens not tracked
+                forward_token(tok_id, position);
+                if (qwen_draft_.loaded_) {
+                    qwen_draft_.forward_token_async(tok_id, position, main_stream_);
+                }
+                position++;
+                output_ids.push_back(tok_id);
+                history.push_back(tok_id);
+                content_tokens_generated++;
+                std::string tok_str = tokenizer_.decode({tok_id});
+                generated_text += tok_str;
+                if (on_token) {
+                    on_token(tok_str, false); // Streamed directly as content
+                }
+            }
+            float neg_inf = -1e9f;
+            if (think_start_id >= 0) {
+                CUDA_CHECK(cudaMemcpyAsync(buf_logits_.f32() + think_start_id, &neg_inf, sizeof(float), cudaMemcpyHostToDevice, main_stream_));
+            }
+            if (think_end_id >= 0) {
+                CUDA_CHECK(cudaMemcpyAsync(buf_logits_.f32() + think_end_id, &neg_inf, sizeof(float), cudaMemcpyHostToDevice, main_stream_));
+            }
+            argmax_cache_valid_ = false;
+            next_token = -1;
+        };
+
         for (int t = 0; content_tokens_generated < max_tokens; t++) {
             if (g_stop_requested.load()) {
                 LOG_WARN("Generation stopped by client stop request at step %d", t);
@@ -2892,144 +2956,14 @@ public:
                 break;
             }
 
-            // N-Gram Repetition Loop Detector & Breaker (breaks attractor loops in reasoning & content)
-            int loop_len = 0;
-            int n_out = (int)output_ids.size();
-            if (in_think_block) {
-                // Reasoning phase: detect exact token repetition loops.
-                // To avoid false positives on legitimate formatting, markdown lists, bullet points,
-                // table dividers, equations, or code planning, require a robust minimum number of cycles
-                // and a substantial total repeated token span (at least 40+ tokens).
-                for (int L = 1; L <= 512; L++) {
-                    int min_cycles = (L == 1) ? 40 :
-                                     ((L == 2) ? 24 :
-                                     ((L <= 4) ? 16 :
-                                     ((L <= 8) ? 10 :
-                                     ((L <= 16) ? 6 :
-                                     ((L <= 32) ? 4 :
-                                     ((L <= 64) ? 4 : 3))))));
-                    if (min_cycles * L > n_out) continue;
-                    if (min_cycles * L < 40) continue; // Safety floor: never trip on less than 40 repeated tokens
-                    bool match = true;
-                    const int* p_last = output_ids.data() + (n_out - L);
-                    for (int c = 1; c < min_cycles; c++) {
-                        const int* p_prev = output_ids.data() + (n_out - (c + 1) * L);
-                        for (int i = 0; i < L; i++) {
-                            if (p_last[i] != p_prev[i]) {
-                                match = false;
-                                break;
-                            }
-                        }
-                        if (!match) break;
-                    }
-                    if (match) {
-                        loop_len = L;
-                        break;
-                    }
-                }
-                // Structural repetition matching is disabled: normal reasoning routinely lists
-                // parallel items (buttons, steps, features, cases) which falsely trigger fuzzy pattern matchers.
-                // Exact repetition detection robustly catches true attractor loops.
-            } else {
-                // Content generation phase:
-                // Only inspect content tokens (NEVER cross back into reasoning scratchpad!).
-                // In code/HTML/CSS generation, structural repetitions (buttons, rows, list items) are NORMAL.
-                // Exact token loops require substantial cycle count and at least 48 tokens.
-                int n_content = content_tokens_generated;
-                for (int L = 1; L <= 512; L++) {
-                    int min_cycles = (L == 1) ? 40 :
-                                     ((L == 2) ? 24 :
-                                     ((L <= 4) ? 16 :
-                                     ((L <= 8) ? 10 :
-                                     ((L <= 16) ? 6 :
-                                     ((L <= 32) ? 4 :
-                                     ((L <= 64) ? 4 : 3))))));
-                    if (min_cycles * L > n_content) continue;
-                    if (min_cycles * L < 48) continue; // Content safety floor: at least 48 identical repeated tokens
-                    bool match = true;
-                    const int* p_last = output_ids.data() + (n_out - L);
-                    for (int c = 1; c < min_cycles; c++) {
-                        const int* p_prev = output_ids.data() + (n_out - (c + 1) * L);
-                        for (int i = 0; i < L; i++) {
-                            if (p_last[i] != p_prev[i]) {
-                                match = false;
-                                break;
-                            }
-                        }
-                        if (!match) break;
-                    }
-                    if (match) {
-                        loop_len = L;
-                        break;
-                    }
-                }
-            }
-
-            if (loop_len > 0) {
-                if (in_think_block) {
-                    LOG_WARN("[Anti-Loop] Repetition loop detected during reasoning (cycle length %d). Forcing </think> and starting content.", loop_len);
-                    in_think_block = false;
-                    think_block_ended = true;
-                    if (content_start_history_idx < 0) {
-                        content_start_history_idx = (int)history.size();
-                    }
-                    track_current_token_ = false;
-                    if (think_end_id >= 0) {
-                        forward_token(think_end_id, position);
-                        if (qwen_draft_.loaded_) {
-                            qwen_draft_.forward_token_async(think_end_id, position, main_stream_);
-                        }
-                        position++;
-                        output_ids.push_back(think_end_id);
-                        history.push_back(think_end_id);
-                    }
-                    if (on_token) {
-                        on_token("", false); // Signal end of reasoning to stream consumer
-                    }
-                    std::vector<int> transition_tokens = tokenizer_.encode("\n\n");
-                    for (int tok_id : transition_tokens) {
-                        track_current_token_ = false;
-                        forward_token(tok_id, position);
-                        if (qwen_draft_.loaded_) {
-                            qwen_draft_.forward_token_async(tok_id, position, main_stream_);
-                        }
-                        position++;
-                        output_ids.push_back(tok_id);
-                        history.push_back(tok_id);
-                        content_tokens_generated++;
-                        std::string tok_str = tokenizer_.decode({tok_id});
-                        generated_text += tok_str;
-                        if (on_token) {
-                            on_token(tok_str, false);
-                        }
-                    }
-                    // Mask think tokens in logits so content generation cannot immediately re-open a think block
-                    float neg_inf = -1e9f;
-                    if (think_start_id >= 0) {
-                        CUDA_CHECK(cudaMemcpyAsync(buf_logits_.f32() + think_start_id, &neg_inf, sizeof(float), cudaMemcpyHostToDevice, main_stream_));
-                    }
-                    if (think_end_id >= 0) {
-                        CUDA_CHECK(cudaMemcpyAsync(buf_logits_.f32() + think_end_id, &neg_inf, sizeof(float), cudaMemcpyHostToDevice, main_stream_));
-                    }
-                    argmax_cache_valid_ = false;
-                    next_token = -1;
-                    continue;
-                } else {
-                    LOG_WARN("[Anti-Loop] Repetition loop detected during content generation (cycle length %d). Halting generation cleanly.", loop_len);
-                    // If inside an unclosed code block, cleanly close it before halting
-                    size_t code_blocks = 0;
-                    size_t pos = 0;
-                    while ((pos = generated_text.find("```", pos)) != std::string::npos) {
-                        code_blocks++;
-                        pos += 3;
-                    }
-                    if (code_blocks % 2 != 0) {
-                        if (on_token) on_token("\n```\n", false);
-                        generated_text += "\n```\n";
-                    }
-                    finish_reason = "stop";
-                    break;
-                }
+            // Hard context limit check: ensure position NEVER reaches or exceeds cfg_.max_seq_len
+            if (position + 1 >= cfg_.max_seq_len) {
+                LOG_WARN("[Engine] Physical context limit reached: position %d >= max_seq_len %d (content: %d/%d, think: %d/%d). Stopping generation.",
+                         position + 1, cfg_.max_seq_len,
+                         content_tokens_generated, max_tokens,
+                         thinking_tokens_generated, max_thinking_tokens);
+                finish_reason = "length";
+                break;
             }
 
             // Graceful sentence boundary transition when thinking budget is reached
@@ -3045,45 +2979,7 @@ public:
                     }
                 }
                 if (is_clean_boundary || thinking_tokens_generated >= grace_limit) {
-                    LOG_WARN("Thinking budget reached (%d/%d tokens, clean_boundary=%d). Closing </think> and starting content.",
-                             thinking_tokens_generated, max_thinking_tokens, is_clean_boundary ? 1 : 0);
-
-                    // 1. Inject </think> to close thinking block
-                    in_think_block = false;
-                    think_block_ended = true;
-                    if (content_start_history_idx < 0) {
-                        content_start_history_idx = (int)history.size();
-                    }
-                    track_current_token_ = false;
-                    if (think_end_id >= 0) {
-                        forward_token(think_end_id, position);
-                        if (qwen_draft_.loaded_) {
-                            qwen_draft_.forward_token_async(think_end_id, position, main_stream_);
-                        }
-                        position++;
-                        output_ids.push_back(think_end_id);
-                        history.push_back(think_end_id);
-                    }
-
-                    // 2. Inject and stream "\n\n" as the beginning of CONTENT
-                    std::vector<int> transition_tokens = tokenizer_.encode("\n\n");
-                    for (int tok_id : transition_tokens) {
-                        track_current_token_ = false; // Synthetic transition tokens not tracked
-                        forward_token(tok_id, position);
-                        if (qwen_draft_.loaded_) {
-                            qwen_draft_.forward_token_async(tok_id, position, main_stream_);
-                        }
-                        position++;
-                        output_ids.push_back(tok_id);
-                        history.push_back(tok_id);
-                        content_tokens_generated++;
-                        std::string tok_str = tokenizer_.decode({tok_id});
-                        generated_text += tok_str;
-                        if (on_token) {
-                            on_token(tok_str, false); // Streamed directly as content
-                        }
-                    }
-                    next_token = -1;
+                    transition_out_of_think("Thinking budget reached");
                     continue;
                 }
             }
@@ -3143,52 +3039,7 @@ public:
             
             // If EOS is sampled while inside think block, transition to </think> and continue
             if (in_think_block && (next_token == cfg_.eos_token_id || (eos2_id >= 0 && next_token == eos2_id))) {
-                LOG_WARN("EOS sampled during thinking at step %d (%d thinking tokens). Transitioning to </think> and starting content.",
-                         t, thinking_tokens_generated);
-                in_think_block = false;
-                think_block_ended = true;
-                if (content_start_history_idx < 0) {
-                    content_start_history_idx = (int)history.size();
-                }
-                track_current_token_ = false;
-                if (think_end_id >= 0) {
-                    forward_token(think_end_id, position);
-                    if (qwen_draft_.loaded_) {
-                        qwen_draft_.forward_token_async(think_end_id, position, main_stream_);
-                    }
-                    position++;
-                    output_ids.push_back(think_end_id);
-                    history.push_back(think_end_id);
-                }
-                if (on_token) {
-                    on_token("", false); // Signal end of reasoning to stream consumer
-                }
-                std::vector<int> transition_tokens = tokenizer_.encode("\n\n");
-                for (int tok_id : transition_tokens) {
-                    track_current_token_ = false;
-                    forward_token(tok_id, position);
-                    if (qwen_draft_.loaded_) {
-                        qwen_draft_.forward_token_async(tok_id, position, main_stream_);
-                    }
-                    position++;
-                    output_ids.push_back(tok_id);
-                    history.push_back(tok_id);
-                    content_tokens_generated++;
-                    std::string tok_str = tokenizer_.decode({tok_id});
-                    generated_text += tok_str;
-                    if (on_token) {
-                        on_token(tok_str, false);
-                    }
-                }
-                float neg_inf = -1e9f;
-                if (think_start_id >= 0) {
-                    CUDA_CHECK(cudaMemcpyAsync(buf_logits_.f32() + think_start_id, &neg_inf, sizeof(float), cudaMemcpyHostToDevice, main_stream_));
-                }
-                if (think_end_id >= 0) {
-                    CUDA_CHECK(cudaMemcpyAsync(buf_logits_.f32() + think_end_id, &neg_inf, sizeof(float), cudaMemcpyHostToDevice, main_stream_));
-                }
-                argmax_cache_valid_ = false;
-                next_token = -1;
+                transition_out_of_think("EOS sampled during thinking");
                 continue;
             }
 
@@ -3216,9 +3067,30 @@ public:
                 continue;
             }
 
+            // Check if currently generating inside a tool call block
+            bool in_tool_call = false;
+            size_t last_tc_open = generated_text.rfind("<tool_call>");
+            if (last_tc_open == std::string::npos) last_tc_open = generated_text.rfind("<tool_calls>");
+            if (last_tc_open == std::string::npos) last_tc_open = generated_text.rfind("<|tool call begin|>");
+            if (last_tc_open == std::string::npos) last_tc_open = generated_text.rfind("<｜tool call begin｜>");
+            if (last_tc_open == std::string::npos) last_tc_open = generated_text.rfind("<dsml:tool_calls>");
+            if (last_tc_open == std::string::npos) last_tc_open = generated_text.rfind("<dsml_tool_calls>");
+            if (last_tc_open != std::string::npos) {
+                size_t last_tc_close = generated_text.rfind("</tool_call>");
+                if (last_tc_close == std::string::npos) last_tc_close = generated_text.rfind("</tool_calls>");
+                if (last_tc_close == std::string::npos) last_tc_close = generated_text.rfind("<|tool call end|>");
+                if (last_tc_close == std::string::npos) last_tc_close = generated_text.rfind("<｜tool call end｜>");
+                if (last_tc_close == std::string::npos) last_tc_close = generated_text.rfind("</dsml:tool_calls>");
+                if (last_tc_close == std::string::npos) last_tc_close = generated_text.rfind("</dsml_tool_calls>");
+                if (last_tc_close == std::string::npos || last_tc_close < last_tc_open) {
+                    in_tool_call = true;
+                }
+            }
+
             // 2. Speculative Decoding Verification Loop (MTP Self-Drafter + PLD + 2B Neural Drafter fallback)
-            bool allow_draft = (cfg_.architecture == ModelArch::QWEN || cfg_.is_nemotron()) && enable_spec_ && (draft_streak >= 0) && !in_think_block &&
-                               (content_tokens_generated + 4 < max_tokens) && !g_stop_requested.load();
+            // Speculative drafting is explicitly disabled inside tool calls to prevent repetitive loops
+            bool allow_draft = !in_tool_call && (cfg_.architecture == ModelArch::QWEN || cfg_.is_nemotron()) && enable_spec_ && (draft_streak >= 0) && !in_think_block &&
+                               (content_tokens_generated + 4 < max_tokens) && (position + 8 < cfg_.max_seq_len) && !g_stop_requested.load();
 
             if (allow_draft) {
                 if (!emit_token_cpu(next_token, t)) {
@@ -3342,31 +3214,21 @@ public:
                 }
 
                 // Priority 1b: Linear MTP Self-Drafter (fallback if tree drafting disabled/unloaded)
-                if (cfg_.architecture == ModelArch::QWEN && enable_mtp_ && mtp_drafter_.loaded_) {
-                    bool in_tool_call = false;
-                    size_t last_tc_open = generated_text.rfind("<tool_call>");
-                    if (last_tc_open != std::string::npos) {
-                        size_t last_tc_close = generated_text.rfind("</tool_call>");
-                        if (last_tc_close == std::string::npos || last_tc_close < last_tc_open) {
-                            in_tool_call = true;
-                        }
-                    }
-                    if (in_tool_call || draft_streak >= 0) {
-                        int max_k = (mtp_k_ > 0) ? mtp_k_ : (gpu_caps_.is_vram_constrained ? 1 : 4);
-                        int K = (in_tool_call || draft_streak >= 3) ? 4 : ((draft_streak >= 1) ? 2 : 1);
-                        if (K > max_k) K = max_k;
-                        auto t0 = std::chrono::steady_clock::now();
-                        mtp_drafter_.draft_k_tokens(buf_hidden2_.bf16(), next_token, position, K, cand_tokens, main_stream_);
-                        auto t1 = std::chrono::steady_clock::now();
-                        total_draft_ms += std::chrono::duration<double, std::milli>(t1 - t0).count();
-                        is_mtp = (cand_tokens.size() > 1);
-                    }
+                if (cfg_.architecture == ModelArch::QWEN && enable_mtp_ && mtp_drafter_.loaded_ && draft_streak >= 0) {
+                    int max_k = (mtp_k_ > 0) ? mtp_k_ : (gpu_caps_.is_vram_constrained ? 1 : 4);
+                    int K = (draft_streak >= 3) ? 4 : ((draft_streak >= 1) ? 2 : 1);
+                    if (K > max_k) K = max_k;
+                    auto t0 = std::chrono::steady_clock::now();
+                    mtp_drafter_.draft_k_tokens(buf_hidden2_.bf16(), next_token, position, K, cand_tokens, main_stream_);
+                    auto t1 = std::chrono::steady_clock::now();
+                    total_draft_ms += std::chrono::duration<double, std::milli>(t1 - t0).count();
+                    is_mtp = (cand_tokens.size() > 1);
                 }
 
                 // Priority 2: Prompt-Lookup Drafting (only as fallback when MTP is not loaded / disabled)
                 if ((cfg_.architecture == ModelArch::QWEN || cfg_.is_nemotron()) && !is_mtp && (!enable_mtp_ || !mtp_drafter_.loaded_) && enable_pld_ && !history.empty()) {
                     int max_pld = cfg_.is_nemotron() ? 3 : std::min(pld_draft_tokens_, 3);
-                    int pld_min_ngram = cfg_.is_nemotron() ? 2 : 1;
+                    int pld_min_ngram = 2;
                     std::vector<int> pld_cands = PromptLookupDrafter::draft(history, max_pld, 4, pld_min_ngram);
                     if (!pld_cands.empty()) {
                         for (int tok : pld_cands) {
@@ -3387,6 +3249,9 @@ public:
                     qwen_draft_.draft_k_tokens(next_token, position, K, cand_tokens, main_stream_);
                 }
 
+                while (cand_tokens.size() > 1 && (int)(position + cand_tokens.size()) >= cfg_.max_seq_len) {
+                    cand_tokens.pop_back();
+                }
                 int M = (int)cand_tokens.size();
                 if ((cfg_.architecture == ModelArch::QWEN || cfg_.is_nemotron()) && M >= 2) {
                     auto tv0 = std::chrono::steady_clock::now();
@@ -3520,8 +3385,28 @@ public:
                             }
                         }
 
-                        // 3. bonus_token becomes next_token for next cycle
-                        next_token = bonus_token;
+                        // 3. bonus_token becomes next_token for next cycle (sample with temperature if temperature > 0)
+                        if (temperature <= 0.0f) {
+                            next_token = bonus_token;
+                        } else {
+                            CUDA_CHECK(cudaMemcpyAsync(buf_logits_.f32(),
+                                                       buf_logits_batch_.f32() + (size_t)accepted * cfg_.vocab_size,
+                                                       cfg_.vocab_size * sizeof(float),
+                                                       cudaMemcpyDeviceToDevice, main_stream_));
+                            if (!in_think_block || think_block_ended) {
+                                float neg_inf = -1e9f;
+                                if (think_start_id >= 0) {
+                                    CUDA_CHECK(cudaMemcpyAsync(buf_logits_.f32() + think_start_id, &neg_inf, sizeof(float), cudaMemcpyHostToDevice, main_stream_));
+                                }
+                                if (think_end_id >= 0) {
+                                    CUDA_CHECK(cudaMemcpyAsync(buf_logits_.f32() + think_end_id, &neg_inf, sizeof(float), cudaMemcpyHostToDevice, main_stream_));
+                                }
+                            }
+                            CUDA_CHECK(cudaStreamSynchronize(main_stream_));
+                            argmax_cache_valid_ = false;
+                            next_token = sample_token(temperature, history, content_tokens_generated, in_think_block,
+                                                      top_k, top_p, min_p, content_start_history_idx);
+                        }
 
                         position += (accepted + 1);
                         decode_step_idx_ += (accepted + 1);
@@ -3556,8 +3441,8 @@ public:
             next_token = -1;
         }
 
-        // Check if we hit max_tokens
-        if ((int)output_ids.size() >= max_tokens) {
+        // Check if we hit max_tokens or context limit
+        if (finish_reason != "stop" && (content_tokens_generated >= max_tokens || position + 1 >= cfg_.max_seq_len)) {
             finish_reason = "length";
         }
 
@@ -4418,10 +4303,24 @@ private:
                 std::string draft_ids_path = mtp_model_dir + "/draft_vocab_ids.bin";
                 std::string draft_head_path = mtp_model_dir + "/draft_lm_head_int8_bf16.bin";
                 bool has_draft_head = (std::filesystem::exists(draft_ids_path) && std::filesystem::exists(draft_head_path));
-                if ((head_weight_.dtype == "int4" || head_weight_.dtype == "fp4") && !has_draft_head) {
+
+                size_t free_vram = 0, total_vram = 0;
+                cudaMemGetInfo(&free_vram, &total_vram);
+                size_t min_headroom_for_mtp = 1350ULL * 1024 * 1024; // Requires ~650MB MTP + ~700MB for engine working buffers & KV cache
+
+                if (free_vram < min_headroom_for_mtp) {
+                    LOG_WARN("[MTP] Constrained VRAM headroom (%.1f MB free, requires %.1f MB for MTP + working buffers). Auto-bypassing MTP to ensure base model and %d context fit safely without OOM.",
+                             (double)free_vram / (1024.0 * 1024.0),
+                             (double)min_headroom_for_mtp / (1024.0 * 1024.0),
+                             cfg_.max_seq_len);
+                    enable_mtp_ = false;
+                    default_enable_mtp_ = false;
+                } else if ((head_weight_.dtype == "int4" || head_weight_.dtype == "fp4") && !has_draft_head) {
                     LOG_WARN("MTP: Full lm_head is %s and no draft_lm_head_int8_bf16.bin found — skipping MTP", head_weight_.dtype.c_str());
+                    enable_mtp_ = false;
+                    default_enable_mtp_ = false;
                 } else {
-                    mtp_drafter_.load_mtp_weights(mapped, tensor_map, 
+                    if (!mtp_drafter_.load_mtp_weights(mapped, tensor_map, 
                                                   (embed_weight_.dtype == "int4" || embed_weight_.dtype == "fp4") ? nullptr : embed_weight_.bf16(),
                                                   (embed_weight_.dtype == "int4" || embed_weight_.dtype == "fp4") ? (uint8_t*)embed_weight_.data : nullptr,
                                                   embed_weight_scale_.data,
@@ -4429,7 +4328,11 @@ private:
                                                   embed_weight_.dtype == "fp4",
                                                   (head_weight_.dtype == "int4" || head_weight_.dtype == "fp4") ? nullptr : head_weight_.bf16(),
                                                   cfg_.vocab_size, mtp_model_dir, main_stream_,
-                                                  cfg_.max_seq_len);
+                                                  cfg_.max_seq_len)) {
+                        LOG_WARN("[MTP] MTP weight initialization failed or VRAM exhausted. Auto-falling back to non-MTP decoding.");
+                        enable_mtp_ = false;
+                        default_enable_mtp_ = false;
+                    }
                 }
             }
         } else if (!enable_mtp_) {
@@ -5358,9 +5261,6 @@ private:
 
     void apply_repetition_penalty_to_batch(float* logits_batch, int M, const std::vector<int>& history, bool is_reasoning = true, int content_start_idx = 0) {
         float eff_penalty = current_rep_penalty_;
-        if (eff_penalty <= 1.0f && cfg_.is_nemotron()) {
-            eff_penalty = 1.05f;
-        }
         if (eff_penalty <= 1.0f || history.empty()) return;
         static int32_t* d_rep_hist = nullptr;
         static const int MAX_REP_HIST = 2048;
@@ -5368,7 +5268,8 @@ private:
             CUDA_CHECK(cudaMalloc(&d_rep_hist, MAX_REP_HIST * sizeof(int32_t)));
         }
         int hist_len = (int)history.size();
-        int start_idx = is_reasoning ? 0 : std::max(0, content_start_idx);
+        int min_content_lookback = std::max(0, content_start_idx - 256);
+        int start_idx = is_reasoning ? 0 : min_content_lookback;
         int available = std::max(0, hist_len - start_idx);
         int n_penalize = std::min(available, MAX_REP_HIST);
         if (n_penalize > 0) {
@@ -5403,9 +5304,6 @@ private:
 
         apply_repetition_penalty_to_batch(logits_ptr, 1, history, is_reasoning, content_start_idx);
         float eff_penalty = current_rep_penalty_;
-        if (eff_penalty <= 1.0f && cfg_.is_nemotron()) {
-            eff_penalty = 1.05f;
-        }
         if (eff_penalty > 1.0f) {
             argmax_cache_valid_ = false;
         }
@@ -5422,12 +5320,8 @@ private:
 
         std::uniform_real_distribution<float> dist(0.0f, 1.0f);
         float r = dist(rng_);
-        float eff_min_p = (min_p > 0.0f) ? min_p : 0.05f;
-#if defined(__APPLE__)
+        float eff_min_p = (min_p > 0.0f) ? min_p : 0.0f;
         sample_multinomial_f32_cuda(buf_argmax_out_.i32(), logits_ptr, vocab, temperature, r, eff_min_p, main_stream_, top_k, top_p);
-#else
-        sample_multinomial_f32_cuda(buf_argmax_out_.i32(), logits_ptr, vocab, temperature, r, eff_min_p, main_stream_);
-#endif
         CUDA_CHECK(cudaMemcpyAsync(h_sample_pin, buf_argmax_out_.i32(), sizeof(int32_t), cudaMemcpyDeviceToHost, main_stream_));
         CUDA_CHECK(cudaStreamSynchronize(main_stream_));
         return *h_sample_pin;

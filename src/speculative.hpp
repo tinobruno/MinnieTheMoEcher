@@ -709,7 +709,6 @@ public:
     int32_t* h_draft_pos_ = nullptr;
     int32_t* h_draft_top2_ = nullptr;
 
-
     // Reference to target model's embedding table (shared, not owned)
     __nv_bfloat16* target_embed_w_ = nullptr;
     uint8_t* target_embed_w_int4_ = nullptr;
@@ -718,6 +717,56 @@ public:
     const uint8_t* target_embed_s_fp4_ = nullptr;
     bool is_embed_int4_ = false;
     bool is_embed_fp4_ = false;
+
+    void free_resources() {
+        mtp_fc_w_.free(); mtp_fc_s_.free();
+        mtp_pre_fc_norm_hidden_w_.free();
+        mtp_pre_fc_norm_embed_w_.free();
+        mtp_norm_w_.free();
+        mtp_layer_attn_norm_w_.free();
+        mtp_layer_post_attn_norm_w_.free();
+        mtp_layer_q_proj_w_.free(); mtp_layer_q_proj_s_.free();
+        mtp_layer_k_proj_w_.free(); mtp_layer_k_proj_s_.free();
+        mtp_layer_v_proj_w_.free(); mtp_layer_v_proj_s_.free();
+        mtp_layer_o_proj_w_.free(); mtp_layer_o_proj_s_.free();
+        mtp_layer_q_norm_w_.free();
+        mtp_layer_k_norm_w_.free();
+        mtp_layer_gate_w_.free(); mtp_layer_gate_s_.free();
+        mtp_layer_up_w_.free(); mtp_layer_up_s_.free();
+        mtp_layer_down_w_.free(); mtp_layer_down_s_.free();
+        mtp_k_cache_.free();
+        mtp_v_cache_.free();
+        draft_lm_head_w_.free();
+        draft_vocab_ids_.clear();
+        buf_mtp_hidden_.free();
+        buf_mtp_hidden2_.free();
+        buf_mtp_concat_.free();
+        buf_mtp_embed_.free();
+        buf_mtp_q_.free();
+        buf_mtp_k_.free();
+        buf_mtp_v_.free();
+        buf_mtp_attn_out_.free();
+        buf_mtp_gate_.free();
+        buf_mtp_up_.free();
+        buf_mtp_logits_.free();
+        buf_mtp_argmax_.free();
+        buf_mtp_input_pos_.free();
+        buf_draft_k_tokens_.free();
+        buf_mtp_top2_idx_.free();
+        buf_mtp_top2_val_.free();
+        buf_mtp_hidden_saved_.free();
+        buf_mtp_hidden_saved_2_.free();
+        if (h_draft_best_) { cudaFreeHost(h_draft_best_); h_draft_best_ = nullptr; }
+        if (h_draft_k_cands_) { cudaFreeHost(h_draft_k_cands_); h_draft_k_cands_ = nullptr; }
+        if (h_draft_pos_) { cudaFreeHost(h_draft_pos_); h_draft_pos_ = nullptr; }
+        if (h_draft_top2_) { cudaFreeHost(h_draft_top2_); h_draft_top2_ = nullptr; }
+        loaded_ = false;
+        use_draft_vocab_ = false;
+    }
+
+    ~MTPSelfDrafter() {
+        free_resources();
+    }
 
     bool load_mtp_weights(const void* mapped_data, const json& tensor_map,
                           __nv_bfloat16* embed_w, uint8_t* embed_w_int4, void* embed_s, bool is_embed_int4, bool is_embed_fp4,
@@ -743,9 +792,18 @@ public:
             gpu.dtype = info["dtype"].get<std::string>();
             gpu.shape.clear();
             for (auto& s : info["shape"]) gpu.shape.push_back(s.get<int>());
-            gpu.alloc(nbytes);
-            CUDA_CHECK(cudaMemcpyAsync(gpu.data, (const char*)mapped_data + offset, nbytes,
-                                       cudaMemcpyHostToDevice, stream));
+            if (!gpu.try_alloc(nbytes)) {
+                LOG_WARN("MTP: Out of VRAM allocating %s (%.1f MB)", name.c_str(), nbytes / (1024.0 * 1024.0));
+                return false;
+            }
+            cudaError_t cpy_err = cudaMemcpyAsync(gpu.data, (const char*)mapped_data + offset, nbytes,
+                                                  cudaMemcpyHostToDevice, stream);
+            if (cpy_err != cudaSuccess) {
+                cudaGetLastError();
+                LOG_WARN("MTP: Out of VRAM copying %s: %s", name.c_str(), cudaGetErrorString(cpy_err));
+                gpu.free();
+                return false;
+            }
             return true;
         };
 
@@ -758,17 +816,37 @@ public:
             gpu_w.dtype = dtype;
             gpu_w.shape.clear();
             for (auto& s : info["shape"]) gpu_w.shape.push_back(s.get<int>());
-            gpu_w.alloc(nbytes);
-            CUDA_CHECK(cudaMemcpyAsync(gpu_w.data, (const char*)mapped_data + offset, nbytes,
-                                       cudaMemcpyHostToDevice, stream));
+            if (!gpu_w.try_alloc(nbytes)) {
+                LOG_WARN("MTP: Out of VRAM allocating %s (%.1f MB)", name.c_str(), nbytes / (1024.0 * 1024.0));
+                return false;
+            }
+            cudaError_t cpy_err = cudaMemcpyAsync(gpu_w.data, (const char*)mapped_data + offset, nbytes,
+                                                  cudaMemcpyHostToDevice, stream);
+            if (cpy_err != cudaSuccess) {
+                cudaGetLastError();
+                LOG_WARN("MTP: Out of VRAM copying %s: %s", name.c_str(), cudaGetErrorString(cpy_err));
+                gpu_w.free();
+                return false;
+            }
             if (dtype == "int4" || dtype == "fp4") {
                 if (info.contains("scale_offset")) {
                     int64_t scale_offset = info["scale_offset"].get<int64_t>();
                     int64_t scale_nbytes = info["scale_nbytes"].get<int64_t>();
                     gpu_s.dtype = info.value("scale_dtype", dtype == "fp4" ? "F8_E8M0" : "bfloat16");
-                    gpu_s.alloc(scale_nbytes);
-                    CUDA_CHECK(cudaMemcpyAsync(gpu_s.data, (const char*)mapped_data + scale_offset, scale_nbytes,
-                                               cudaMemcpyHostToDevice, stream));
+                    if (!gpu_s.try_alloc(scale_nbytes)) {
+                        LOG_WARN("MTP: Out of VRAM allocating scale for %s (%.1f MB)", name.c_str(), scale_nbytes / (1024.0 * 1024.0));
+                        gpu_w.free();
+                        return false;
+                    }
+                    cpy_err = cudaMemcpyAsync(gpu_s.data, (const char*)mapped_data + scale_offset, scale_nbytes,
+                                              cudaMemcpyHostToDevice, stream);
+                    if (cpy_err != cudaSuccess) {
+                        cudaGetLastError();
+                        LOG_WARN("MTP: Out of VRAM copying scale for %s: %s", name.c_str(), cudaGetErrorString(cpy_err));
+                        gpu_s.free();
+                        gpu_w.free();
+                        return false;
+                    }
                 }
             }
             return true;
@@ -778,37 +856,42 @@ public:
         bool fc_loaded = load_layer_weight(mtp_fc_w_, mtp_fc_s_, "mtp.fc.weight");
         if (!fc_loaded) {
             LOG_WARN("MTP: mtp.fc.weight not found or failed to load, MTP self-drafter disabled");
+            free_resources();
             return false;
         }
-        load_t(mtp_pre_fc_norm_hidden_w_, "mtp.pre_fc_norm_hidden.weight");
-        load_t(mtp_pre_fc_norm_embed_w_, "mtp.pre_fc_norm_embedding.weight");
-        load_t(mtp_norm_w_, "mtp.norm.weight");
+        if (!load_t(mtp_pre_fc_norm_hidden_w_, "mtp.pre_fc_norm_hidden.weight") ||
+            !load_t(mtp_pre_fc_norm_embed_w_, "mtp.pre_fc_norm_embedding.weight") ||
+            !load_t(mtp_norm_w_, "mtp.norm.weight")) {
+            LOG_WARN("MTP: Pre-FC norm weights failed to load, MTP self-drafter disabled");
+            free_resources();
+            return false;
+        }
 
         // Load MTP transformer layer
-        load_t(mtp_layer_attn_norm_w_, "mtp.layers.0.input_layernorm.weight");
-        load_t(mtp_layer_post_attn_norm_w_, "mtp.layers.0.post_attention_layernorm.weight");
-        load_layer_weight(mtp_layer_q_proj_w_, mtp_layer_q_proj_s_, "mtp.layers.0.self_attn.q_proj.weight");
-        load_layer_weight(mtp_layer_k_proj_w_, mtp_layer_k_proj_s_, "mtp.layers.0.self_attn.k_proj.weight");
-        load_layer_weight(mtp_layer_v_proj_w_, mtp_layer_v_proj_s_, "mtp.layers.0.self_attn.v_proj.weight");
-        load_layer_weight(mtp_layer_o_proj_w_, mtp_layer_o_proj_s_, "mtp.layers.0.self_attn.o_proj.weight");
-        load_t(mtp_layer_q_norm_w_, "mtp.layers.0.self_attn.q_norm.weight");
-        load_t(mtp_layer_k_norm_w_, "mtp.layers.0.self_attn.k_norm.weight");
-        load_layer_weight(mtp_layer_gate_w_, mtp_layer_gate_s_, "mtp.layers.0.mlp.gate_proj.weight");
-        load_layer_weight(mtp_layer_up_w_, mtp_layer_up_s_, "mtp.layers.0.mlp.up_proj.weight");
-        load_layer_weight(mtp_layer_down_w_, mtp_layer_down_s_, "mtp.layers.0.mlp.down_proj.weight");
-
-        if (!mtp_layer_attn_norm_w_.data || !mtp_layer_post_attn_norm_w_.data ||
-            !mtp_layer_q_proj_w_.data || !mtp_layer_k_proj_w_.data ||
-            !mtp_layer_v_proj_w_.data || !mtp_layer_o_proj_w_.data ||
-            !mtp_layer_gate_w_.data || !mtp_layer_up_w_.data || !mtp_layer_down_w_.data) {
+        if (!load_t(mtp_layer_attn_norm_w_, "mtp.layers.0.input_layernorm.weight") ||
+            !load_t(mtp_layer_post_attn_norm_w_, "mtp.layers.0.post_attention_layernorm.weight") ||
+            !load_layer_weight(mtp_layer_q_proj_w_, mtp_layer_q_proj_s_, "mtp.layers.0.self_attn.q_proj.weight") ||
+            !load_layer_weight(mtp_layer_k_proj_w_, mtp_layer_k_proj_s_, "mtp.layers.0.self_attn.k_proj.weight") ||
+            !load_layer_weight(mtp_layer_v_proj_w_, mtp_layer_v_proj_s_, "mtp.layers.0.self_attn.v_proj.weight") ||
+            !load_layer_weight(mtp_layer_o_proj_w_, mtp_layer_o_proj_s_, "mtp.layers.0.self_attn.o_proj.weight") ||
+            !load_t(mtp_layer_q_norm_w_, "mtp.layers.0.self_attn.q_norm.weight") ||
+            !load_t(mtp_layer_k_norm_w_, "mtp.layers.0.self_attn.k_norm.weight") ||
+            !load_layer_weight(mtp_layer_gate_w_, mtp_layer_gate_s_, "mtp.layers.0.mlp.gate_proj.weight") ||
+            !load_layer_weight(mtp_layer_up_w_, mtp_layer_up_s_, "mtp.layers.0.mlp.up_proj.weight") ||
+            !load_layer_weight(mtp_layer_down_w_, mtp_layer_down_s_, "mtp.layers.0.mlp.down_proj.weight")) {
             LOG_WARN("MTP: One or more MTP transformer layer weights could not be loaded, MTP self-drafter disabled");
+            free_resources();
             return false;
         }
 
         // Allocate MTP KV cache
         int max_seq = max_seq_len_ > 0 ? max_seq_len_ : 32768;
-        mtp_k_cache_.alloc((size_t)max_seq * num_kv_heads_ * head_dim_ * sizeof(__nv_bfloat16));
-        mtp_v_cache_.alloc((size_t)max_seq * num_kv_heads_ * head_dim_ * sizeof(__nv_bfloat16));
+        size_t kv_sz = (size_t)max_seq * num_kv_heads_ * head_dim_ * sizeof(__nv_bfloat16);
+        if (!mtp_k_cache_.try_alloc(kv_sz) || !mtp_v_cache_.try_alloc(kv_sz)) {
+            LOG_WARN("MTP: Out of VRAM for MTP KV cache, MTP self-drafter disabled");
+            free_resources();
+            return false;
+        }
         CUDA_CHECK(cudaMemsetAsync(mtp_k_cache_.data, 0, mtp_k_cache_.size_bytes, stream));
         CUDA_CHECK(cudaMemsetAsync(mtp_v_cache_.data, 0, mtp_v_cache_.size_bytes, stream));
 
@@ -830,12 +913,21 @@ public:
                         size_t head_bytes = (size_t)rows * cols * sizeof(__nv_bfloat16);
                         std::vector<char> head_buf(head_bytes);
                         if (fread(head_buf.data(), 1, head_bytes, f_head) == head_bytes) {
-                            draft_lm_head_w_.alloc(head_bytes);
-                            CUDA_CHECK(cudaMemcpyAsync(draft_lm_head_w_.data, head_buf.data(), head_bytes, cudaMemcpyHostToDevice, stream));
-                            use_draft_vocab_ = true;
-                            draft_vocab_size_ = (int)n_ids;
-                            LOG_INFO("MTP: Loaded draft vocabulary (%d tokens) and draft lm_head (%.1f MB BF16, 6.2x faster drafting!)",
-                                     draft_vocab_size_, head_bytes / (1024.0 * 1024.0));
+                            if (!draft_lm_head_w_.try_alloc(head_bytes)) {
+                                LOG_WARN("MTP: Insufficient VRAM to allocate draft lm_head (%.1f MB)", head_bytes / (1024.0 * 1024.0));
+                            } else {
+                                cudaError_t cpy_err = cudaMemcpyAsync(draft_lm_head_w_.data, head_buf.data(), head_bytes, cudaMemcpyHostToDevice, stream);
+                                if (cpy_err != cudaSuccess) {
+                                    cudaGetLastError();
+                                    LOG_WARN("MTP: Insufficient VRAM to copy draft lm_head (%.1f MB): %s", head_bytes / (1024.0 * 1024.0), cudaGetErrorString(cpy_err));
+                                    draft_lm_head_w_.free();
+                                } else {
+                                    use_draft_vocab_ = true;
+                                    draft_vocab_size_ = (int)n_ids;
+                                    LOG_INFO("MTP: Loaded draft vocabulary (%d tokens) and draft lm_head (%.1f MB BF16, 6.2x faster drafting!)",
+                                             draft_vocab_size_, head_bytes / (1024.0 * 1024.0));
+                                }
+                            }
                         }
                     }
                 }
@@ -847,7 +939,8 @@ public:
         // Validate lm_head pointer if draft vocabulary is not available
         if (!use_draft_vocab_) {
             if (!full_lm_head_w_) {
-                LOG_WARN("MTP: full lm_head pointer is null and no draft lm_head found, MTP drafter disabled");
+                LOG_WARN("MTP: full lm_head pointer is null and no draft lm_head available in VRAM, MTP drafter disabled gracefully");
+                free_resources();
                 return false;
             }
             LOG_INFO("MTP: Using full model lm_head [%d, %d] BF16 (shared, no extra VRAM)",
@@ -855,30 +948,34 @@ public:
         }
 
         // Allocate working buffers
-        buf_mtp_hidden_.alloc(hidden_size_ * sizeof(__nv_bfloat16));
-        buf_mtp_hidden2_.alloc(hidden_size_ * sizeof(__nv_bfloat16));
-        buf_mtp_concat_.alloc(2 * hidden_size_ * sizeof(__nv_bfloat16));
-        buf_mtp_embed_.alloc(hidden_size_ * sizeof(__nv_bfloat16));
-        buf_mtp_q_.alloc(2 * num_heads_ * head_dim_ * sizeof(__nv_bfloat16));
-        buf_mtp_k_.alloc(num_kv_heads_ * head_dim_ * sizeof(__nv_bfloat16));
-        buf_mtp_v_.alloc(num_kv_heads_ * head_dim_ * sizeof(__nv_bfloat16));
-        buf_mtp_attn_out_.alloc(num_heads_ * head_dim_ * sizeof(__nv_bfloat16));
-        buf_mtp_gate_.alloc(intermediate_size_ * sizeof(__nv_bfloat16));
-        buf_mtp_up_.alloc(intermediate_size_ * sizeof(__nv_bfloat16));
-        buf_mtp_logits_.alloc(full_vocab_size_ * sizeof(float));
-        buf_mtp_argmax_.alloc(sizeof(int32_t));
-        buf_mtp_input_pos_.alloc(sizeof(int32_t));
-        buf_draft_k_tokens_.alloc(16 * sizeof(int32_t));
-        buf_mtp_top2_idx_.alloc(2 * sizeof(int32_t));
-        buf_mtp_top2_val_.alloc(2 * sizeof(float));
-        buf_mtp_hidden_saved_.alloc(hidden_size_ * sizeof(__nv_bfloat16));
-        buf_mtp_hidden_saved_2_.alloc(hidden_size_ * sizeof(__nv_bfloat16));
+        bool buf_ok = buf_mtp_hidden_.try_alloc(hidden_size_ * sizeof(__nv_bfloat16)) &&
+                      buf_mtp_hidden2_.try_alloc(hidden_size_ * sizeof(__nv_bfloat16)) &&
+                      buf_mtp_concat_.try_alloc(2 * hidden_size_ * sizeof(__nv_bfloat16)) &&
+                      buf_mtp_embed_.try_alloc(hidden_size_ * sizeof(__nv_bfloat16)) &&
+                      buf_mtp_q_.try_alloc(2 * num_heads_ * head_dim_ * sizeof(__nv_bfloat16)) &&
+                      buf_mtp_k_.try_alloc(num_kv_heads_ * head_dim_ * sizeof(__nv_bfloat16)) &&
+                      buf_mtp_v_.try_alloc(num_kv_heads_ * head_dim_ * sizeof(__nv_bfloat16)) &&
+                      buf_mtp_attn_out_.try_alloc(num_heads_ * head_dim_ * sizeof(__nv_bfloat16)) &&
+                      buf_mtp_gate_.try_alloc(intermediate_size_ * sizeof(__nv_bfloat16)) &&
+                      buf_mtp_up_.try_alloc(intermediate_size_ * sizeof(__nv_bfloat16)) &&
+                      buf_mtp_logits_.try_alloc(full_vocab_size_ * sizeof(float)) &&
+                      buf_mtp_argmax_.try_alloc(sizeof(int32_t)) &&
+                      buf_mtp_input_pos_.try_alloc(sizeof(int32_t)) &&
+                      buf_draft_k_tokens_.try_alloc(16 * sizeof(int32_t)) &&
+                      buf_mtp_top2_idx_.try_alloc(2 * sizeof(int32_t)) &&
+                      buf_mtp_top2_val_.try_alloc(2 * sizeof(float)) &&
+                      buf_mtp_hidden_saved_.try_alloc(hidden_size_ * sizeof(__nv_bfloat16)) &&
+                      buf_mtp_hidden_saved_2_.try_alloc(hidden_size_ * sizeof(__nv_bfloat16));
+        if (!buf_ok) {
+            LOG_WARN("MTP: Out of VRAM allocating MTP working buffers, MTP drafter disabled gracefully");
+            free_resources();
+            return false;
+        }
 
-        CUDA_CHECK(cudaMallocHost(&h_draft_best_, sizeof(int32_t)));
-        CUDA_CHECK(cudaMallocHost(&h_draft_k_cands_, 16 * sizeof(int32_t)));
-        CUDA_CHECK(cudaMallocHost(&h_draft_pos_, sizeof(int32_t)));
-        CUDA_CHECK(cudaMallocHost(&h_draft_top2_, 2 * sizeof(int32_t)));
-
+        if (!h_draft_best_) CUDA_CHECK(cudaMallocHost(&h_draft_best_, sizeof(int32_t)));
+        if (!h_draft_k_cands_) CUDA_CHECK(cudaMallocHost(&h_draft_k_cands_, 16 * sizeof(int32_t)));
+        if (!h_draft_pos_) CUDA_CHECK(cudaMallocHost(&h_draft_pos_, sizeof(int32_t)));
+        if (!h_draft_top2_) CUDA_CHECK(cudaMallocHost(&h_draft_top2_, 2 * sizeof(int32_t)));
 
         CUDA_CHECK(cudaStreamSynchronize(stream));
 

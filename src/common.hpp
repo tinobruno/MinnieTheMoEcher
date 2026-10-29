@@ -66,6 +66,7 @@ struct ModelConfig {
     bool is_nemotron() const { return architecture == ModelArch::NEMOTRON_35; }
     bool is_nemotron_bolt() const { return is_nemotron() && (moe_latent_size > 0 || num_hidden_layers > 60); }
     bool is_deepseek() const { return architecture == ModelArch::DEEPSEEK_V4; }
+    bool has_recurrent_state() const { return architecture == ModelArch::DEEPSEEK_V4 || architecture == ModelArch::NEMOTRON_35 || architecture == ModelArch::QWEN; }
     std::string model_name = "";
     std::string model_id = "";
     int vocab_size = 129280;
@@ -170,6 +171,9 @@ struct ModelConfig {
 
     // Recommended / default inference parameters per model
     float default_temperature = -1.0f;
+    float default_top_p = -1.0f;
+    float default_min_p = -1.0f;
+    int default_top_k = -1;
     float default_repetition_penalty = -1.0f;
     std::string default_reasoning_effort = "";
     int default_thinking_budget = -1;
@@ -301,22 +305,12 @@ struct ModelConfig {
             }
         }
         get(default_temperature, "default_temperature");
+        get(default_top_p, "default_top_p");
+        get(default_min_p, "default_min_p");
+        get(default_top_k, "default_top_k");
         get(default_repetition_penalty, "default_repetition_penalty");
         get(default_reasoning_effort, "default_reasoning_effort");
         get(default_thinking_budget, "default_thinking_budget");
-
-        if (default_temperature < 0.0f) {
-            default_temperature = is_nemotron() ? 0.6f : 0.7f;
-        }
-        if (default_repetition_penalty < 0.0f) {
-            default_repetition_penalty = is_nemotron() ? 1.05f : 1.00f;
-        }
-        if (default_reasoning_effort.empty()) {
-            default_reasoning_effort = is_nemotron() ? "high" : "medium";
-        }
-        if (default_thinking_budget < 0) {
-            default_thinking_budget = 4096;
-        }
     }
 };
 
@@ -411,6 +405,22 @@ struct GPUTensor {
         size_bytes = bytes;
         is_host = false;
         is_pinned = false;
+    }
+    bool try_alloc(size_t bytes) {
+        if (data) free();
+#if !defined(__APPLE__)
+        cudaError_t err = cudaMalloc(&data, bytes);
+        if (err != cudaSuccess) {
+            cudaGetLastError();
+            data = nullptr;
+            size_bytes = 0;
+            return false;
+        }
+#endif
+        size_bytes = bytes;
+        is_host = false;
+        is_pinned = false;
+        return true;
     }
     void alloc_host(size_t bytes) {
         if (data) free();

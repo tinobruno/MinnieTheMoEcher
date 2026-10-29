@@ -1681,14 +1681,14 @@ void run_server(MoecherEngine& engine, int port, int default_thinking_budget, in
 
             auto& messages = request["messages"];
             float temperature = request.value("temperature", 1.0f);
-            float default_top_p = 0.95f;
+            float default_top_p = (engine.cfg_.default_top_p > 0.0f) ? engine.cfg_.default_top_p : 0.80f;
             float top_p = request.value("top_p", default_top_p);
-            float default_min_p = 0.05f;
+            float default_min_p = (engine.cfg_.default_min_p >= 0.0f) ? engine.cfg_.default_min_p : 0.0f;
             float min_p = request.value("min_p", default_min_p);
-            int top_k = request.value("top_k", 1024);
+            int top_k = request.value("top_k", 40);
             int max_tokens = request.value("max_tokens", 20000);
             bool stream = request.value("stream", false);
-            float default_rep = (engine.cfg_.default_repetition_penalty > 0.0f) ? engine.cfg_.default_repetition_penalty : 1.0f;
+            float default_rep = engine.cfg_.default_repetition_penalty;
             float repetition_penalty = request.value("repetition_penalty", default_rep);
             std::string reasoning_effort = request.value("reasoning_effort", "high");
             bool enable_thinking = true;
