@@ -86,6 +86,11 @@ int main(int argc, char** argv) {
             printf("  --tools / --no-tools        Enable or disable tool calling schemas (default: disabled)\n");
             printf("  --budget <tokens>           Default thinking budget tokens\n");
             printf("  --max-tool-rounds <n>       Max sequential tool execution rounds per turn (default: %d)\n", g_max_tool_rounds);
+            printf("  --mode <chat|agentic>       Operational mode: 'chat' (dynamic intent gating) or 'agentic' (unrestricted tools, default: chat)\n");
+            printf("  --chat-mode                 Enable chat mode with dynamic intent gating (outputs code in chat by default)\n");
+            printf("  --agentic-mode              Enable full autonomous agentic mode (unrestricted tool & workspace access)\n");
+            printf("  --intent-gating             Enable dynamic intent gating (chat mode)\n");
+            printf("  --no-intent-gating          Disable dynamic intent gating (agentic mode)\n");
             printf("  --help, -h                  Show this help message\n");
             return 0;
         } else if ((std::string(argv[i]) == "--manifest" || std::string(argv[i]) == "-m") && i + 1 < argc) {
@@ -126,6 +131,8 @@ int main(int argc, char** argv) {
             benchmark_mode = true;
         } else if (std::string(argv[i]) == "--no-pld" || std::string(argv[i]) == "--disable-pld") {
             enable_pld = false;
+        } else if (std::string(argv[i]) == "--pld" || std::string(argv[i]) == "--enable-pld") {
+            enable_pld = true;
         } else if (std::string(argv[i]) == "--no-mtp" || std::string(argv[i]) == "--disable-mtp") {
             enable_mtp = false;
         } else if (std::string(argv[i]) == "--no-tree-mtp" || std::string(argv[i]) == "--disable-tree-mtp") {
@@ -193,6 +200,31 @@ int main(int argc, char** argv) {
             max_seq_len_override = std::stoi(argv[++i]);
         } else if ((std::string(argv[i]) == "--max-tool-rounds" || std::string(argv[i]) == "--max-rounds") && i + 1 < argc) {
             g_max_tool_rounds = std::max(1, std::stoi(argv[++i]));
+        } else if (std::string(argv[i]) == "--mode" && i + 1 < argc) {
+            std::string m = argv[++i];
+            if (m == "agentic") {
+                g_intent_gating = false;
+                g_intent_gating_cli_explicit = true;
+            } else if (m == "chat") {
+                g_intent_gating = true;
+                g_intent_gating_cli_explicit = true;
+            } else {
+                LOG_WARN("Unknown operational mode '%s' (valid: chat, agentic). Defaulting to chat.", m.c_str());
+                g_intent_gating = true;
+                g_intent_gating_cli_explicit = true;
+            }
+        } else if (std::string(argv[i]) == "--agentic-mode" || std::string(argv[i]) == "--agentic") {
+            g_intent_gating = false;
+            g_intent_gating_cli_explicit = true;
+        } else if (std::string(argv[i]) == "--chat-mode" || std::string(argv[i]) == "--chat") {
+            g_intent_gating = true;
+            g_intent_gating_cli_explicit = true;
+        } else if (std::string(argv[i]) == "--no-intent-gating" || std::string(argv[i]) == "--disable-intent-gating") {
+            g_intent_gating = false;
+            g_intent_gating_cli_explicit = true;
+        } else if (std::string(argv[i]) == "--intent-gating" || std::string(argv[i]) == "--enable-intent-gating") {
+            g_intent_gating = true;
+            g_intent_gating_cli_explicit = true;
         }
     }
 
@@ -201,6 +233,7 @@ int main(int argc, char** argv) {
     LOG_INFO("=== moecher starting ===");
     LOG_INFO("=== v%s ===", MOECHER_VERSION);
     LOG_INFO("Default thinking token budget: %d", default_thinking_budget);
+    LOG_INFO("Operational mode: %s (Dynamic intent gating: %s)", g_intent_gating ? "Chat" : "Agentic", g_intent_gating ? "enabled" : "disabled");
     LOG_INFO("Tool calling support: %s", g_enable_tools ? "enabled" : "disabled");
     LOG_INFO("Max tool execution rounds: %d", g_max_tool_rounds);
     LOG_INFO("Server-side tool execution: %s (headless-browsing: %s)", g_server_exec ? "enabled" : "disabled", g_headless_browsing ? "enabled" : "disabled");

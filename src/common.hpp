@@ -66,6 +66,7 @@ struct ModelConfig {
     bool is_nemotron() const { return architecture == ModelArch::NEMOTRON_35; }
     bool is_nemotron_bolt() const { return is_nemotron() && (moe_latent_size > 0 || num_hidden_layers > 60); }
     bool is_deepseek() const { return architecture == ModelArch::DEEPSEEK_V4; }
+    bool has_recurrent_state() const { return architecture == ModelArch::DEEPSEEK_V4 || architecture == ModelArch::NEMOTRON_35 || architecture == ModelArch::QWEN; }
     std::string model_name = "";
     std::string model_id = "";
     int vocab_size = 129280;

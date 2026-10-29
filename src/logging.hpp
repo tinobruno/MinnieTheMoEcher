@@ -17,6 +17,8 @@ extern bool g_allow_file_write;
 extern std::string g_workspace_root;
 extern bool g_headless_browsing;
 extern int g_max_tool_rounds;
+extern bool g_intent_gating;
+extern bool g_intent_gating_cli_explicit;
 extern std::atomic<bool> g_stop_requested;
 extern std::ofstream g_log_file;
 

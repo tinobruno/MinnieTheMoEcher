@@ -3837,6 +3837,20 @@ inline bool try_parse_tool_json(const std::string& str, ToolCall& tc, int idx) {
         }
         return true;
     } catch (...) {
+        if (str.find("\"write_file\"") != std::string::npos || str.find("'write_file'") != std::string::npos) {
+            tc.name = "write_file";
+            tc.id = "call_" + std::to_string(idx) + "_" + std::to_string(std::chrono::steady_clock::now().time_since_epoch().count() % 1000000);
+            tc.type = "function";
+            tc.arguments = str;
+            return true;
+        }
+        if (str.find("\"edit_file\"") != std::string::npos || str.find("'edit_file'") != std::string::npos) {
+            tc.name = "edit_file";
+            tc.id = "call_" + std::to_string(idx) + "_" + std::to_string(std::chrono::steady_clock::now().time_since_epoch().count() % 1000000);
+            tc.type = "function";
+            tc.arguments = str;
+            return true;
+        }
         return false;
     }
 }

@@ -235,6 +235,17 @@
                         </div>
                     </div>
                 </div>
+                <!-- Operational Mode Switch (Chat vs Agentic) -->
+                <div class="mode-toggle-group" id="mode-toggle-group" title="Operational Mode: Chat (Outputs code to chat markdown) vs Agentic (Autonomous workspace tools)">
+                    <button type="button" class="mode-toggle-btn active" id="mode-btn-chat" onclick="setOperationalMode('chat')" title="Chat Mode: Code, models, and results output directly in chat markdown unless file creation is explicitly requested">
+                        <span class="material-symbols-outlined mode-toggle-icon">chat</span>
+                        <span>Chat</span>
+                    </button>
+                    <button type="button" class="mode-toggle-btn" id="mode-btn-agentic" onclick="setOperationalMode('agentic')" title="Agentic Mode: Unrestricted autonomous workspace tool and file execution">
+                        <span class="material-symbols-outlined mode-toggle-icon">smart_toy</span>
+                        <span>Agentic</span>
+                    </button>
+                </div>
                 <div class="topbar-actions">
                     <button type="button" class="topbar-icon-btn settings-toggle-btn" id="settings-toggle-btn" onclick="toggleSettingsPanel()" title="Toggle Settings Panel">
                         <span class="material-symbols-outlined">tune</span>
@@ -991,6 +1002,14 @@
                                 </select>
                                 <small style="color: var(--text-secondary); font-size: 11px; margin-top: 4px; display: block;">Number of alternative draft candidate branches verified in parallel.</small>
                             </div>
+
+                            <div class="setting-item" id="pld-container" style="margin-top: 10px; border-top: 1px dashed rgba(255, 255, 255, 0.1); padding-top: 10px;">
+                                <label class="checkbox-label" title="Enable Prompt-Lookup Drafting (PLD) n-gram fallback when MTP is disabled or unloaded">
+                                    <input type="checkbox" id="pld-enabled" onchange="updateSpeculativeControls(); saveSpeculativeSettings();">
+                                    Enable Prompt-Lookup Drafting (pld)
+                                </label>
+                                <small style="color: var(--text-secondary); font-size: 11px; margin-top: 4px; display: block;">Drafts candidate tokens from matching n-grams in history. Keep off to avoid repetition loops.</small>
+                            </div>
                         </div>
 
                         <!-- Voice & Speech Recognition Settings Card -->
@@ -1137,6 +1156,26 @@
                 <!-- Tab 2: Agentic & Tools -->
                 <div class="settings-tab-pane" id="settings-tab-agentic">
                     <div class="settings-scroll-area">
+                        <!-- Operational Mode Card (Chat vs Agentic) -->
+                        <div class="agentic-card" style="margin-bottom: 14px; border: 1px solid rgba(56, 189, 248, 0.4); background: linear-gradient(180deg, rgba(56, 189, 248, 0.06) 0%, rgba(15, 23, 42, 0.4) 100%);">
+                            <div class="agentic-card-header">
+                                <span class="material-symbols-outlined agentic-card-icon" style="color: #38bdf8;">tune</span>
+                                <div class="agentic-card-title-group">
+                                    <h4>Operational Mode (Chat vs Agentic)</h4>
+                                    <p class="agentic-subtitle">Switch between dynamic intent verification and unrestricted autonomous tooling</p>
+                                </div>
+                            </div>
+                            <div class="agentic-toggle-group" style="margin-top: 10px;">
+                                <label class="agentic-switch-row">
+                                    <div class="agentic-switch-info">
+                                        <span class="agentic-switch-label" id="agentic-mode-status-title">Dynamic Intent Layer (Chat Mode)</span>
+                                        <span class="agentic-switch-sub" id="agentic-mode-status-desc">When enabled (Chat Mode), code, models, and apps are displayed directly in chat markdown unless you explicitly ask to create/save a file. When disabled (Agentic Mode), model has unrestricted autonomous file write & edit access.</span>
+                                    </div>
+                                    <input type="checkbox" id="intent-gating-toggle" class="agentic-toggle" checked onchange="setOperationalMode(this.checked ? 'chat' : 'agentic')">
+                                </label>
+                            </div>
+                        </div>
+
                         <div class="agentic-card">
                             <div class="agentic-card-header">
                                 <span class="material-symbols-outlined agentic-card-icon">folder_open</span>

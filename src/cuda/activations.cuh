@@ -640,27 +640,16 @@ void argmax_f32_batch_cuda(
     int n, int M,
     cudaStream_t stream = 0);
 
-#if defined(__APPLE__)
 void sample_multinomial_f32_cuda(
     int32_t* out,
     float* logits,
     int n,
     float temperature,
     float rand_val,
-    float min_p = 0.05f,
+    float min_p = 0.0f,
     cudaStream_t stream = 0,
-    int top_k = 50,
+    int top_k = 40,
     float top_p = 0.95f);
-#else
-void sample_multinomial_f32_cuda(
-    int32_t* out,
-    float* logits,
-    int n,
-    float temperature,
-    float rand_val,
-    float min_p = 0.05f,
-    cudaStream_t stream = 0);
-#endif
 
 // ── sqrt(softplus(x)) scoring ──────────────────────────────────────────────────
 void sqrtsoftplus_cuda(
