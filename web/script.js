@@ -223,12 +223,12 @@ function stopGeneration() {
 if (tempSlider && tempVal) {
     try {
         const savedTemp = localStorage.getItem('moecher_temperature');
-        if (savedTemp !== null && parseFloat(savedTemp) !== 0.6 && parseFloat(savedTemp) !== 1.0) {
+        if (savedTemp !== null) {
             tempSlider.value = savedTemp;
             tempVal.textContent = parseFloat(savedTemp).toFixed(1);
         } else {
-            tempSlider.value = '0.0';
-            tempVal.textContent = '0.0';
+            tempSlider.value = '1.0';
+            tempVal.textContent = '1.0';
         }
     } catch(e) {}
     tempSlider.addEventListener('input', (e) => {
@@ -3141,6 +3141,12 @@ async function fetchBackendSystemPrompt() {
         const isNewServerInstance = data && data.server_instance_id && ((lastServerInstanceId && lastServerInstanceId !== data.server_instance_id) || (savedInstanceId !== data.server_instance_id));
         if (data && data.server_instance_id) {
             try { localStorage.setItem('moecher_server_instance_id', String(data.server_instance_id)); } catch(e) {}
+        }
+        const savedTemp = localStorage.getItem('moecher_temperature');
+        if (data && data.temperature !== undefined && tempSlider && (!savedTemp || isNewServerInstance)) {
+            tempSlider.value = data.temperature;
+            if (tempVal) tempVal.textContent = parseFloat(data.temperature).toFixed(1);
+            try { localStorage.setItem('moecher_temperature', String(data.temperature)); } catch(e) {}
         }
         const savedRep = localStorage.getItem('moecher_repetition_penalty');
         if (data && data.repetition_penalty !== undefined && repPenaltySlider && (!savedRep || isNewServerInstance)) {

@@ -1415,7 +1415,7 @@
 
     nlohmann::json get_recommended_sampling_deepseek_v41() const {
         return {
-            {"temperature", 0.0f},
+            {"temperature", 1.0f},
             {"top_p", 1.0f},
             {"repetition_penalty", 1.0f},
             {"reasoning_effort", "high"},

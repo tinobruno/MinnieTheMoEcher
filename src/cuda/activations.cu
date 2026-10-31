@@ -8854,6 +8854,16 @@ void compressor_device_batch_step_cuda(
 //  DeepSeek V4 / V4.1 Indexer Scoring and Top-K Selection (Device-Driven)
 // ════════════════════════════════════════════════════════════════════════════════
 
+__device__ __forceinline__ uint32_t float_to_ordered_uint_idx(float f) {
+    uint32_t u = __float_as_uint(f);
+    return (u & 0x80000000u) ? (~u) : (u | 0x80000000u);
+}
+
+__device__ __forceinline__ float ordered_uint_to_float_idx(uint32_t u) {
+    uint32_t bits = (u & 0x80000000u) ? (u & 0x7fffffffu) : (~u);
+    return __uint_as_float(bits);
+}
+
 __global__ void indexer_score_kernel(
     float* __restrict__ out_scores,
     const __nv_bfloat16* __restrict__ index_comp, // [max_comp, 128]
@@ -8910,7 +8920,8 @@ __global__ void indexer_score_kernel(
                 val += __shfl_down_sync(0xffffffff, val, offset);
             }
             if (lane == 0) {
-                out_scores[c] = val;
+                // Scale by softmax_scale * n_heads^-0.5 = 128^-0.5 * 32^-0.5 = 1/64
+                out_scores[c] = val * (1.0f / 64.0f);
             }
         }
         __syncthreads();
@@ -8980,13 +8991,15 @@ __global__ void indexer_mask_topk_kernel(
     }
     __syncthreads();
 
-    float lo = s_min[0];
-    float hi = s_max[0];
+    // 2. Exact 1-ULP Parallel Binary Search in IEEE-754 ordered uint32 bit-space across [0, n_comp)
+    uint32_t lo_u = float_to_ordered_uint_idx(s_min[0]);
+    uint32_t hi_u = float_to_ordered_uint_idx(s_max[0]);
 
-    // 2. Parallel Binary Search for threshold T across all 256 threads in [0, n_comp)
     __shared__ int s_count[8];
-    for (int iter = 0; iter < 20; iter++) {
-        float mid = 0.5f * (lo + hi);
+    for (int iter = 0; iter < 32; iter++) {
+        if (hi_u - lo_u <= 1u) break;
+        uint32_t mid_u = lo_u + ((hi_u - lo_u) >> 1);
+        float mid = ordered_uint_to_float_idx(mid_u);
         int local_cnt = 0;
         for (int i = tid; i < n_comp; i += n_threads) {
             if (scores[i] >= mid) local_cnt++;
@@ -9011,14 +9024,38 @@ __global__ void indexer_mask_topk_kernel(
         __syncthreads();
 
         if (s_count[0] >= top_k) {
-            lo = mid;
+            lo_u = mid_u;
         } else {
-            hi = mid;
+            hi_u = mid_u;
         }
     }
 
-    // 3. Exact Top-K selection with tie-breaking (critical when many ReLU scores tie at 0.0f)
-    float threshold = lo;
+    // Check if hi_u itself has >= top_k (when max_val itself has >= top_k ties)
+    float hi_val = ordered_uint_to_float_idx(hi_u);
+    int hi_cnt = 0;
+    for (int i = tid; i < n_comp; i += n_threads) {
+        if (scores[i] >= hi_val) hi_cnt++;
+    }
+    #pragma unroll
+    for (int offset = 16; offset > 0; offset /= 2) {
+        hi_cnt += __shfl_down_sync(0xffffffff, hi_cnt, offset);
+    }
+    if (lane == 0) s_count[warp] = hi_cnt;
+    __syncthreads();
+    if (warp == 0) {
+        int n_warps = n_threads >> 5;
+        int total_hi = (lane < n_warps) ? s_count[lane] : 0;
+        #pragma unroll
+        for (int offset = 4; offset > 0; offset /= 2) {
+            total_hi += __shfl_down_sync(0xffffffff, total_hi, offset);
+        }
+        if (lane == 0) s_count[0] = total_hi;
+    }
+    __syncthreads();
+
+    float threshold = (s_count[0] >= top_k) ? hi_val : ordered_uint_to_float_idx(lo_u);
+
+    // 3. Exact Top-K selection with recency-preserving tie-breaking (newest positions first)
     int strict_cnt = 0;
     for (int i = tid; i < n_comp; i += n_threads) {
         if (scores[i] > threshold) strict_cnt++;
@@ -9044,12 +9081,14 @@ __global__ void indexer_mask_topk_kernel(
     }
     __syncthreads();
 
-    for (int i = tid; i < n_comp; i += n_threads) {
+    // Traverse from newest compressed entry (n_comp - 1) down to 0 so ties prefer recent context
+    for (int idx = tid; idx < n_comp; idx += n_threads) {
+        int i = n_comp - 1 - idx;
         float sc = scores[i];
         uint8_t keep = 0;
         if (sc > threshold) {
             keep = 1;
-        } else if (sc >= threshold) {
+        } else if (sc == threshold) {
             if (atomicSub(&s_tie_rem, 1) > 0) {
                 keep = 1;
             }
@@ -9215,12 +9254,14 @@ __global__ void indexer_mask_topk_batch_kernel(
     }
     __syncthreads();
 
-    float lo = s_min[0];
-    float hi = s_max[0];
+    uint32_t lo_u = float_to_ordered_uint_idx(s_min[0]);
+    uint32_t hi_u = float_to_ordered_uint_idx(s_max[0]);
 
     __shared__ int s_count[8];
-    for (int iter = 0; iter < 20; iter++) {
-        float mid = 0.5f * (lo + hi);
+    for (int iter = 0; iter < 32; iter++) {
+        if (hi_u - lo_u <= 1u) break;
+        uint32_t mid_u = lo_u + ((hi_u - lo_u) >> 1);
+        float mid = ordered_uint_to_float_idx(mid_u);
         int local_cnt = 0;
         for (int i = tid; i < n_comp; i += n_threads) {
             if (scores[i] >= mid) local_cnt++;
@@ -9245,13 +9286,35 @@ __global__ void indexer_mask_topk_batch_kernel(
         __syncthreads();
 
         if (s_count[0] >= top_k) {
-            lo = mid;
+            lo_u = mid_u;
         } else {
-            hi = mid;
+            hi_u = mid_u;
         }
     }
 
-    float threshold = lo;
+    float hi_val = ordered_uint_to_float_idx(hi_u);
+    int hi_cnt = 0;
+    for (int i = tid; i < n_comp; i += n_threads) {
+        if (scores[i] >= hi_val) hi_cnt++;
+    }
+    #pragma unroll
+    for (int offset = 16; offset > 0; offset /= 2) {
+        hi_cnt += __shfl_down_sync(0xffffffff, hi_cnt, offset);
+    }
+    if (lane == 0) s_count[warp] = hi_cnt;
+    __syncthreads();
+    if (warp == 0) {
+        int n_warps = n_threads >> 5;
+        int total_hi = (lane < n_warps) ? s_count[lane] : 0;
+        #pragma unroll
+        for (int offset = 4; offset > 0; offset /= 2) {
+            total_hi += __shfl_down_sync(0xffffffff, total_hi, offset);
+        }
+        if (lane == 0) s_count[0] = total_hi;
+    }
+    __syncthreads();
+
+    float threshold = (s_count[0] >= top_k) ? hi_val : ordered_uint_to_float_idx(lo_u);
     int strict_cnt = 0;
     for (int i = tid; i < n_comp; i += n_threads) {
         if (scores[i] > threshold) strict_cnt++;
@@ -9277,12 +9340,13 @@ __global__ void indexer_mask_topk_batch_kernel(
     }
     __syncthreads();
 
-    for (int i = tid; i < n_comp; i += n_threads) {
+    for (int idx = tid; idx < n_comp; idx += n_threads) {
+        int i = n_comp - 1 - idx;
         float sc = scores[i];
         uint8_t keep = 0;
         if (sc > threshold) {
             keep = 1;
-        } else if (sc >= threshold) {
+        } else if (sc == threshold) {
             if (atomicSub(&s_tie_rem, 1) > 0) {
                 keep = 1;
             }

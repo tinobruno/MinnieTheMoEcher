@@ -333,7 +333,7 @@ struct ModelConfig {
         get(default_thinking_budget, "default_thinking_budget");
 
         if (default_temperature < 0.0f) {
-            default_temperature = is_nemotron() ? 0.6f : (is_deepseek() ? 0.0f : 0.7f);
+            default_temperature = is_nemotron() ? 0.6f : (is_deepseek_v41() ? 1.0f : (is_deepseek() ? 0.0f : 0.7f));
         }
         if (default_repetition_penalty < 0.0f) {
             default_repetition_penalty = is_nemotron() ? 1.05f : 1.00f;
