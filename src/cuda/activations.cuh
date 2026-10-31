@@ -874,6 +874,15 @@ void deepseek_v41_gating_top6_cuda(
     float temperature = 1.0f,
     cudaStream_t stream = 0);
 
+void deepseek_v41_gating_top6_batch_cuda(
+    int32_t* topk_ids,
+    float* topk_weights,
+    const __nv_bfloat16* scores_bf16,
+    const float* gate_bias,
+    int M, int n_experts, int top_k, float routed_scaling_factor,
+    float temperature = 1.0f,
+    cudaStream_t stream = 0);
+
 inline void moe_route_topk_from_bf16_cuda(
     int32_t* topk_ids,
     float* topk_weights,
@@ -935,9 +944,19 @@ void rope_device_pos_cuda(
     const int32_t* d_position, const float* freq_table, bool inverse,
     cudaStream_t stream = 0);
 
+void rope_device_pos_batch_cuda(
+    __nv_bfloat16* x, int M, int head_dim, int rope_dim,
+    const int32_t* d_positions, const float* freq_table, bool inverse,
+    cudaStream_t stream = 0);
+
 void store_kv_device_pos_cuda(
     __nv_bfloat16* kv_cache, const __nv_bfloat16* kv_val,
     const int32_t* d_position, int window, int head_dim,
+    cudaStream_t stream = 0);
+
+void store_kv_batch_cuda(
+    __nv_bfloat16* kv_cache, const __nv_bfloat16* kv_val,
+    const int32_t* d_positions, int M, int window, int head_dim,
     cudaStream_t stream = 0);
 
 void init_mla_dynamic_shared_memory();
@@ -957,6 +976,25 @@ void mla_attention_fused_cuda(
     float scale,
     float q_norm_eps,
     const uint8_t* comp_mask = nullptr,
+    int window = 128,
+    cudaStream_t stream = 0);
+
+void mla_attention_fused_batch_cuda(
+    const __nv_bfloat16* raw_q,
+    const __nv_bfloat16* raw_kv,
+    const __nv_bfloat16* batch_kv,
+    const __nv_bfloat16* comp_kv,
+    const float* attn_sink,
+    __nv_bfloat16* out,
+    const int32_t* d_positions,
+    const int32_t* d_comp_counts,
+    int M,
+    const float* freq_table,
+    int max_cache_len,
+    int head_dim,
+    int rope_dim,
+    float scale,
+    float q_norm_eps,
     int window = 128,
     cudaStream_t stream = 0);
 
@@ -983,6 +1021,25 @@ void compressor_device_step_cuda(
     const float* idx_ape = nullptr,
     const __nv_bfloat16* idx_norm = nullptr,
     __nv_bfloat16* idx_comp_kv_cache = nullptr,
+    int max_comp = 0,
+    cudaStream_t stream = 0);
+
+void compressor_device_batch_step_cuda(
+    const int32_t* d_positions,
+    int32_t* d_comp_count,
+    const float* proj_kv_batch,
+    const float* proj_gate_batch,
+    int M,
+    float* comp_kv_state,
+    float* comp_score_state,
+    const float* comp_ape,
+    const __nv_bfloat16* comp_norm,
+    __nv_bfloat16* comp_kv_cache,
+    const float* rope_freqs_compressed,
+    int ratio,
+    int head_dim,
+    int rope_dim,
+    float rms_norm_eps,
     int max_comp = 0,
     cudaStream_t stream = 0);
 
@@ -1354,7 +1411,32 @@ void fused_moe_accum_dynamic_batch_cuda(
     int dim, int M,
     cudaStream_t stream = 0);
 
-// ── Mixed Quantization MoE Operations (Hot: 2:4 Sparse NVFP4, Cold: IQ2_XXS + Q2_K) ──
+// ── Mixed Quantization MoE Operations (Hot: Dense FP4_E2M1, Cold: IQ2_XXS + Q2_K) ──
+void build_moe_work_tiles_cuda(
+    const int32_t* topk_ids,
+    const uint8_t* expert_type_map,
+    int layer_id, int n_experts, int M,
+    cudaStream_t stream = 0);
+
+void gemv_mixed_moe_swiglu_grouped_pass_cuda(
+    __nv_bfloat16* gate_buf,
+    const __nv_bfloat16* vec,
+    int w1_cold_offset, int w3_cold_offset,
+    int N, int K, float swiglu_limit,
+    const void* const* flat_expert_ptrs,
+    int layer_id, int n_experts, int M, bool is_hot_pass,
+    cudaStream_t stream = 0,
+    int exact_num_tiles = -1);
+
+void gemv_mixed_moe_down_grouped_pass_cuda(
+    __nv_bfloat16* down_buf,
+    const __nv_bfloat16* gate_buf,
+    const void* const* flat_expert_ptrs,
+    int layer_id, int n_experts,
+    int w2_cold_offset, int N, int K, int M, bool is_hot_pass,
+    cudaStream_t stream = 0,
+    int exact_num_tiles = -1);
+
 void gemv_mixed_moe_swiglu_fused_batch_cuda(
     __nv_bfloat16* gate_buf,
     const __nv_bfloat16* vec,

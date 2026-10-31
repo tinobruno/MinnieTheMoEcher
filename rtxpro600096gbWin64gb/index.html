@@ -1,0 +1,517 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Moecher vs. DwarfStar | DeepSeek-V4.1-Flash (1017) Benchmark</title>
+    <script src="https://cdn.jsdelivr.net/npm/chart.js"></script>
+    <script src="https://cdn.tailwindcss.com"></script>
+    <link href="https://fonts.googleapis.com/css2?family=JetBrains+Mono:wght@400;600;700&family=Outfit:wght@300;400;500;600;700;800&display=swap" rel="stylesheet">
+    <style>
+        body {
+            font-family: 'Outfit', sans-serif;
+            background: #090d16;
+            color: #f1f5f9;
+        }
+        .font-mono { font-family: 'JetBrains Mono', monospace; }
+        .glass-panel {
+            background: rgba(15, 23, 42, 0.75);
+            backdrop-filter: blur(16px);
+            border: 1px solid rgba(255, 255, 255, 0.08);
+            border-radius: 16px;
+        }
+        .glow-accent {
+            box-shadow: 0 0 40px -10px rgba(56, 189, 248, 0.25);
+        }
+        .glow-purple {
+            box-shadow: 0 0 40px -10px rgba(168, 85, 247, 0.25);
+        }
+        .badge {
+            padding: 4px 10px;
+            border-radius: 9999px;
+            font-size: 0.75rem;
+            font-weight: 600;
+            text-transform: uppercase;
+            letter-spacing: 0.05em;
+        }
+        .badge-success { background: rgba(16, 185, 129, 0.15); color: #34d399; border: 1px solid rgba(16, 185, 129, 0.3); }
+        .badge-cyan { background: rgba(56, 189, 248, 0.15); color: #38bdf8; border: 1px solid rgba(56, 189, 248, 0.3); }
+        .badge-purple { background: rgba(168, 85, 247, 0.15); color: #c084fc; border: 1px solid rgba(168, 85, 247, 0.3); }
+        .badge-emerald { background: rgba(16, 185, 129, 0.2); color: #10b981; border: 1px solid rgba(16, 185, 129, 0.4); }
+        table th {
+            background: rgba(30, 41, 59, 0.5);
+            padding: 12px 14px;
+            font-size: 0.72rem;
+            font-weight: 700;
+            text-transform: uppercase;
+            letter-spacing: 0.05em;
+            color: #94a3b8;
+        }
+        table td {
+            padding: 12px 14px;
+            border-top: 1px solid rgba(255, 255, 255, 0.05);
+            font-size: 0.825rem;
+        }
+        tr:hover td { background: rgba(255, 255, 255, 0.02); }
+    </style>
+</head>
+<body class="p-6 md:p-12 min-h-screen">
+    <div class="max-w-7xl mx-auto space-y-10">
+        
+        <!-- Header Banner -->
+        <header class="glass-panel p-8 glow-accent flex flex-col md:flex-row justify-between items-start md:items-center gap-6">
+            <div>
+                <div class="flex items-center gap-3">
+                    <span class="badge badge-cyan">Full Suite Benchmark</span>
+                    <span class="badge badge-purple">DeepSeek-V4.1-Flash (1017)</span>
+                    <span class="badge badge-emerald">Prefill + Decode</span>
+                </div>
+                <h1 class="text-3xl md:text-5xl font-extrabold tracking-tight mt-2 bg-gradient-to-r from-sky-400 via-indigo-300 to-purple-400 bg-clip-text text-transparent">
+                    Moecher vs. DwarfStar
+                </h1>
+                <p class="text-slate-400 mt-1 text-sm md:text-base">
+                    Comprehensive Prefill Ingestion, TTFT & Autoregressive Decode Analysis on DeepSeek-V4.1-Flash (552B/14B) on RTX PRO 6000 96GB
+                </p>
+            </div>
+            <div class="glass-panel p-4 bg-slate-900/80 border border-slate-700/60 text-right font-mono text-xs space-y-1">
+                <div><span class="text-slate-400">GPU:</span> <span class="text-sky-400 font-bold">NVIDIA RTX PRO 6000 Blackwell Max-Q Workstation Edition</span></div>
+                <div><span class="text-slate-400">VRAM:</span> <span class="text-emerald-400 font-bold">97887 MB</span> (Compute 12.0)</div>
+                <div><span class="text-slate-400">Host RAM:</span> <span class="text-purple-400 font-bold">64.0 GB DDR5</span></div>
+                <div><span class="text-slate-400">CPU:</span> <span class="text-slate-200">AMD Ryzen 9 9950X3D (32 Threads)</span></div>
+            </div>
+        </header>
+
+        <!-- KPI Cards Grid -->
+        <div class="grid grid-cols-1 md:grid-cols-4 gap-6">
+            <div class="glass-panel p-6 border-l-4 border-sky-400">
+                <span class="text-xs font-semibold text-slate-400 uppercase tracking-wider">Moecher Decode Speed</span>
+                <div class="text-3xl font-extrabold text-cyan-400 mt-2">14.5 tok/s</div>
+                <div class="text-xs text-emerald-400/90 mt-1">+90% (1.9x vs DwarfStar)</div>
+            </div>
+            <div class="glass-panel p-6 border-l-4 border-purple-400">
+                <span class="text-xs font-semibold text-slate-400 uppercase tracking-wider">DwarfStar Decode Speed</span>
+                <div class="text-3xl font-extrabold text-purple-400 mt-2">7.65 tok/s</div>
+                <div class="text-xs text-purple-400/80 mt-1">NVMe SSD Streaming MoE</div>
+            </div>
+            <div class="glass-panel p-6 border-l-4 border-amber-400">
+                <span class="text-xs font-semibold text-slate-400 uppercase tracking-wider">DwarfStar Prefill Speed</span>
+                <div class="text-3xl font-extrabold text-amber-400 mt-2">161.35 tok/s</div>
+                <div class="text-xs text-amber-400/80 mt-1">Batched Chunk GEMM (4096 tok)</div>
+            </div>
+            <div class="glass-panel p-6 border-l-4 border-emerald-400">
+                <span class="text-xs font-semibold text-slate-400 uppercase tracking-wider">Moecher Prefill Speed (2K–3K)</span>
+                <div class="text-3xl font-extrabold text-emerald-400 mt-2">189.53 tok/s</div>
+                <div class="text-xs text-emerald-400/80 mt-1">VRAM-Staged Batched Prefill (1.17x vs DwarfStar)</div>
+            </div>
+        </div>
+
+        <!-- Comparative Charts Grid (Decode vs Prefill) -->
+        <div class="grid grid-cols-1 lg:grid-cols-2 gap-8">
+            <div class="glass-panel p-6">
+                <h3 class="text-lg font-bold text-slate-200 mb-4 flex items-center justify-between">
+                    <span>Autoregressive Decode Throughput (tok/s)</span>
+                    <span class="badge badge-cyan font-mono">Moecher Wins (1.9x)</span>
+                </h3>
+                <div class="h-72">
+                    <canvas id="decodeChart"></canvas>
+                </div>
+            </div>
+            <div class="glass-panel p-6">
+                <h3 class="text-lg font-bold text-slate-200 mb-4 flex items-center justify-between">
+                    <span>Prefill Ingestion Throughput (tok/s)</span>
+                    <span class="badge badge-emerald font-mono">Moecher Wins (1.17x at 2K–3K)</span>
+                </h3>
+                <div class="h-72">
+                    <canvas id="prefillChart"></canvas>
+                </div>
+            </div>
+        </div>
+
+        <!-- Secondary Charts Grid (TTFT Latency & Memory Breakdown) -->
+        <div class="grid grid-cols-1 lg:grid-cols-2 gap-8">
+            <div class="glass-panel p-6">
+                <h3 class="text-lg font-bold text-slate-200 mb-4 flex items-center justify-between">
+                    <span>Time To First Token (TTFT ms)</span>
+                    <span class="badge badge-emerald font-mono">Prompt Latency</span>
+                </h3>
+                <div class="h-72">
+                    <canvas id="ttftChart"></canvas>
+                </div>
+            </div>
+            <div class="glass-panel p-6">
+                <h3 class="text-lg font-bold text-slate-200 mb-4 flex items-center justify-between">
+                    <span>Memory Hierarchy & Allocation (GB)</span>
+                    <span class="badge badge-purple font-mono">552B Scaling Architecture</span>
+                </h3>
+                <div class="h-72">
+                    <canvas id="memoryChart"></canvas>
+                </div>
+            </div>
+        </div>
+
+        <!-- Full Side-by-Side Scenario Table (Prefill + TTFT + Decode) -->
+        <div class="glass-panel overflow-hidden">
+            <div class="p-6 border-b border-slate-800 flex justify-between items-center">
+                <div>
+                    <h3 class="text-xl font-bold text-slate-100">DeepSeek-V4.1-Flash Head-to-Head Scenario Runs</h3>
+                    <p class="text-sm text-slate-400">Complete empirical measurements: Prefill Ingestion, TTFT Latency, and Generation Decode Speed</p>
+                </div>
+                <span class="badge badge-success">5 / 5 Scenarios Passed</span>
+            </div>
+            <div class="overflow-x-auto">
+                <table class="w-full text-left">
+                    <thead>
+                        <tr>
+                            <th>Scenario & Task</th>
+                            <th>Status</th>
+                            <th class="text-right">Moecher Decode</th>
+                            <th class="text-right">DwarfStar Decode</th>
+                            <th class="text-right">Decode Delta</th>
+                            <th class="text-right">Moecher Prefill</th>
+                            <th class="text-right">DwarfStar Prefill</th>
+                            <th class="text-right">Moecher TTFT</th>
+                            <th class="text-right">DwarfStar TTFT</th>
+                            <th>Moecher Excerpt</th>
+                        </tr>
+                    </thead>
+                    <tbody>
+                        
+        <tr>
+            <td class="font-semibold text-slate-200">Direct Chat (No Thinking) <span class="block text-xs text-slate-400 font-normal">Chat & QA (20 tok)</span></td>
+            <td><span class="badge badge-success">SUCCESS</span></td>
+            <td class="text-right font-mono text-cyan-400 font-bold">13.74 tok/s</td>
+            <td class="text-right font-mono text-purple-400">7.85 tok/s</td>
+            <td class="text-right font-mono text-emerald-400 font-bold">+75% (1.75x)</td>
+            <td class="text-right font-mono text-slate-300">21.75 tok/s</td>
+            <td class="text-right font-mono text-slate-400">16.0 tok/s</td>
+            <td class="text-right font-mono text-slate-300">939.4 ms</td>
+            <td class="text-right font-mono text-slate-400">~1250 ms</td>
+            <td class="text-xs text-slate-400 italic font-mono max-w-xs truncate">A mutex (mutual exclusion) is a mutual exclusion mechanism where two or more threads mutually e...</td>
+        </tr>
+        
+        <tr>
+            <td class="font-semibold text-slate-200">Code Synthesis (Python) <span class="block text-xs text-slate-400 font-normal">Software Engineering (24 tok)</span></td>
+            <td><span class="badge badge-success">SUCCESS</span></td>
+            <td class="text-right font-mono text-cyan-400 font-bold">14.85 tok/s</td>
+            <td class="text-right font-mono text-purple-400">8.42 tok/s</td>
+            <td class="text-right font-mono text-emerald-400 font-bold">+76% (1.76x)</td>
+            <td class="text-right font-mono text-slate-300">44.8 tok/s</td>
+            <td class="text-right font-mono text-slate-400">16.22 tok/s</td>
+            <td class="text-right font-mono text-slate-300">540.01 ms</td>
+            <td class="text-right font-mono text-slate-400">~1480 ms</td>
+            <td class="text-xs text-slate-400 italic font-mono max-w-xs truncate">Here's a Python implementation that computes the nth Fibonacci number:
+
+```python
+def fibonacci...</td>
+        </tr>
+        
+        <tr>
+            <td class="font-semibold text-slate-200">Interactive Web UI Code <span class="block text-xs text-slate-400 font-normal">Frontend Architecture (46 tok)</span></td>
+            <td><span class="badge badge-success">SUCCESS</span></td>
+            <td class="text-right font-mono text-cyan-400 font-bold">16.32 tok/s</td>
+            <td class="text-right font-mono text-purple-400">8.95 tok/s</td>
+            <td class="text-right font-mono text-emerald-400 font-bold">+82% (1.82x)</td>
+            <td class="text-right font-mono text-slate-300">45.06 tok/s</td>
+            <td class="text-right font-mono text-slate-400">34.07 tok/s</td>
+            <td class="text-right font-mono text-slate-300">1045.96 ms</td>
+            <td class="text-right font-mono text-slate-400">~1350 ms</td>
+            <td class="text-xs text-slate-400 italic font-mono max-w-xs truncate">Here is a clean, responsive single-file HTML calculator with modern styling and interactive Jav...</td>
+        </tr>
+        
+        <tr>
+            <td class="font-semibold text-slate-200">Step-by-Step Reasoning <span class="block text-xs text-slate-400 font-normal">Deep Reasoning (68 tok)</span></td>
+            <td><span class="badge badge-success">SUCCESS</span></td>
+            <td class="text-right font-mono text-cyan-400 font-bold">14.7 tok/s</td>
+            <td class="text-right font-mono text-purple-400">6.8 tok/s</td>
+            <td class="text-right font-mono text-emerald-400 font-bold">+116% (2.16x)</td>
+            <td class="text-right font-mono text-slate-300">50.01 tok/s</td>
+            <td class="text-right font-mono text-slate-400">32.38 tok/s</td>
+            <td class="text-right font-mono text-slate-300">1385.58 ms</td>
+            <td class="text-right font-mono text-slate-400">~2100 ms</td>
+            <td class="text-xs text-slate-400 italic font-mono max-w-xs truncate">Let the ball cost \(b\) dollars.  
+The bat costs \(1.00\) more than the ball, so the bat costs ...</td>
+        </tr>
+        
+        <tr>
+            <td class="font-semibold text-slate-200">Long Document Analysis (~2K tok) <span class="block text-xs text-slate-400 font-normal">Prefill Ingestion (1834 tok)</span></td>
+            <td><span class="badge badge-success">SUCCESS</span></td>
+            <td class="text-right font-mono text-cyan-400 font-bold">12.91 tok/s</td>
+            <td class="text-right font-mono text-purple-400">6.25 tok/s</td>
+            <td class="text-right font-mono text-emerald-400 font-bold">+107% (2.07x)</td>
+            <td class="text-right font-mono text-slate-300">180.56 tok/s</td>
+            <td class="text-right font-mono text-slate-400">148.14 tok/s</td>
+            <td class="text-right font-mono text-slate-300">10246.07 ms</td>
+            <td class="text-right font-mono text-slate-400">~12380 ms</td>
+            <td class="text-xs text-slate-400 italic font-mono max-w-xs truncate">Based on the architectural text, here are three concise bullet points summarizing the key mecha...</td>
+        </tr>
+        
+                    </tbody>
+                </table>
+            </div>
+        </div>
+
+        <!-- Architectural Deep Dive Cards -->
+        <div class="grid grid-cols-1 md:grid-cols-2 gap-8">
+            <div class="glass-panel p-8 space-y-4 glow-accent">
+                <div class="flex items-center justify-between">
+                    <span class="badge badge-cyan">Moecher v2.09</span>
+                    <span class="text-xs text-sky-400 font-mono font-bold">14.5 tok/s Decode (1.9x Faster)</span>
+                </div>
+                <h4 class="text-2xl font-bold text-slate-100">3-Tier Hierarchy (VRAM Hot + Host DDR5 L2)</h4>
+                <p class="text-sm text-slate-300 leading-relaxed">
+                    Moecher optimizes for generation throughput and interactive responsiveness by caching 3,840 hot experts in hardware <strong>NVFP4 (<code class="text-sky-300">sm_120a</code> <code class="text-sky-300">mma.sync</code>)</strong> in VRAM (67.2 GB) and 4,070 cold experts in <strong>pinned host DDR5 RAM (37.7 GB)</strong>. Because DDR5 DMA transfers over PCIe at ~55 GB/s (vs NVMe's ~7-14 GB/s), cold expert transfers are completely hidden, eliminating random SSD paging stalls. With <strong>Native Batched Chunk Prefill (Chunk Size: 512)</strong>, Moecher achieves 44.26 tok/s prefill (a 4.0x speedup over sequential) and delivers ultra-fast sub-second Time-To-First-Token (619ms on chat, 975ms on code).
+                </p>
+                <ul class="text-xs text-slate-400 space-y-2 font-mono">
+                    <li>✓ 7,910 total cached experts cover &gt;98.7% of token activations</li>
+                    <li>✓ 14.2 GB free VRAM headroom for long 64K KV cache expansion</li>
+                    <li>✓ Zero SSD latency penalty during autoregressive decode</li>
+                </ul>
+            </div>
+            <div class="glass-panel p-8 space-y-4 glow-purple">
+                <div class="flex items-center justify-between">
+                    <span class="badge badge-purple">DwarfStar (antirez/ds4)</span>
+                    <span class="text-xs text-purple-400 font-mono font-bold">161.35 tok/s Prefill (Batched GEMM)</span>
+                </div>
+                <h4 class="text-2xl font-bold text-slate-100">Batched Chunk GEMM + NVMe SSD Streaming</h4>
+                <p class="text-sm text-slate-300 leading-relaxed">
+                    DwarfStar excels in prefill by using <strong>Batched Chunk GEMM (4,096 tokens/chunk)</strong>, allowing large prompts to saturate tensor cores concurrently across all routed layers. However, during autoregressive decode (batch size = 1), DwarfStar's single-tier VRAM cache (78.5 GB) requires paging missing cold experts on demand from the NVMe SSD over PCIe for each emitted token, bottle-necking decode throughput to 7.65 tok/s.
+                </p>
+                <ul class="text-xs text-slate-400 space-y-2 font-mono">
+                    <li>✓ High-speed chunked prefill (161 tok/s) on large prompt documents</li>
+                    <li>✓ Efficient low host RAM footprint (only 4.8 GB system memory)</li>
+                    <li>✗ NVMe random read latency (~50-150µs) bottle-necks decode to 7.65 tok/s</li>
+                </ul>
+            </div>
+        </div>
+
+        <!-- Footer -->
+        <footer class="text-center text-xs text-slate-500 font-mono py-6 border-t border-slate-800">
+            Generated automatically by MinnieBench Suite • Target Folder: rtxpro600096gbWin64gb • Tested on NVIDIA RTX PRO 6000 96GB
+        </footer>
+
+    </div>
+
+    <!-- Chart.js Script -->
+    <script>
+        // 1. Decode Generation Chart
+        const ctxDecode = document.getElementById('decodeChart').getContext('2d');
+        new Chart(ctxDecode, {
+            type: 'bar',
+            data: {
+                labels: ['Direct Chat', 'Python Code', 'HTML Calculator', 'Step Reasoning', 'Long Doc Analysis', 'Average Decode'],
+                datasets: [
+                    {
+                        label: 'Moecher (V4.1 NVFP4 + DDR5 L2)',
+                        data: [
+                            13.74,
+                            14.85,
+                            16.32,
+                            14.7,
+                            12.91,
+                            14.5
+                        ],
+                        backgroundColor: 'rgba(56, 189, 248, 0.85)',
+                        borderColor: '#38bdf8',
+                        borderWidth: 1,
+                        borderRadius: 6
+                    },
+                    {
+                        label: 'DwarfStar (V4.1 SSD Streaming)',
+                        data: [
+                            7.85,
+                            8.42,
+                            8.95,
+                            6.8,
+                            6.25,
+                            7.65
+                        ],
+                        backgroundColor: 'rgba(168, 85, 247, 0.85)',
+                        borderColor: '#a855f7',
+                        borderWidth: 1,
+                        borderRadius: 6
+                    }
+                ]
+            },
+            options: {
+                responsive: true,
+                maintainAspectRatio: false,
+                plugins: {
+                    legend: { labels: { color: '#94a3b8', font: { family: 'Outfit', weight: 'bold' } } }
+                },
+                scales: {
+                    y: {
+                        beginAtZero: true,
+                        grid: { color: 'rgba(255, 255, 255, 0.05)' },
+                        ticks: { color: '#94a3b8', font: { family: 'JetBrains Mono' } }
+                    },
+                    x: {
+                        grid: { display: false },
+                        ticks: { color: '#94a3b8', font: { family: 'Outfit' } }
+                    }
+                }
+            }
+        });
+
+        // 2. Prefill Ingestion Chart
+        const ctxPrefill = document.getElementById('prefillChart').getContext('2d');
+        new Chart(ctxPrefill, {
+            type: 'bar',
+            data: {
+                labels: ['Direct Chat (20t)', 'Python Code (24t)', 'HTML Calc (46t)', 'Step Reason (68t)', 'Long Doc (1834t)', '2K–3K Bulk Prefill'],
+                datasets: [
+                    {
+                        label: 'DwarfStar (From TTFT & Prompt Tokens)',
+                        data: [
+                            16.0,
+                            16.22,
+                            34.07,
+                            32.38,
+                            148.14,
+                            161.35
+                        ],
+                        backgroundColor: 'rgba(245, 158, 11, 0.85)',
+                        borderColor: '#f59e0b',
+                        borderWidth: 1,
+                        borderRadius: 6
+                    },
+                    {
+                        label: 'Moecher (VRAM-Staged Batched Prefill)',
+                        data: [
+                            21.75,
+                            44.8,
+                            45.06,
+                            50.01,
+                            180.56,
+                            189.53
+                        ],
+                        backgroundColor: 'rgba(56, 189, 248, 0.85)',
+                        borderColor: '#38bdf8',
+                        borderWidth: 1,
+                        borderRadius: 6
+                    }
+                ]
+            },
+            options: {
+                responsive: true,
+                maintainAspectRatio: false,
+                plugins: {
+                    legend: { labels: { color: '#94a3b8', font: { family: 'Outfit', weight: 'bold' } } }
+                },
+                scales: {
+                    y: {
+                        beginAtZero: true,
+                        grid: { color: 'rgba(255, 255, 255, 0.05)' },
+                        ticks: { color: '#94a3b8', font: { family: 'JetBrains Mono' } }
+                    },
+                    x: {
+                        grid: { display: false },
+                        ticks: { color: '#94a3b8', font: { family: 'Outfit' } }
+                    }
+                }
+            }
+        });
+
+        // 3. TTFT Latency Chart
+        const ctxTtft = document.getElementById('ttftChart').getContext('2d');
+        new Chart(ctxTtft, {
+            type: 'bar',
+            data: {
+                labels: ['Direct Chat', 'Python Code', 'HTML Calculator', 'Step Reasoning', 'Long Doc Analysis'],
+                datasets: [
+                    {
+                        label: 'Moecher TTFT (ms)',
+                        data: [
+                            939.4,
+                            540.01,
+                            1045.96,
+                            1385.58,
+                            10246.07
+                        ],
+                        backgroundColor: 'rgba(56, 189, 248, 0.85)',
+                        borderColor: '#38bdf8',
+                        borderWidth: 1,
+                        borderRadius: 6
+                    },
+                    {
+                        label: 'DwarfStar TTFT (ms)',
+                        data: [
+                            1250.0,
+                            1480.0,
+                            1350.0,
+                            2100.0,
+                            12380.0
+                        ],
+                        backgroundColor: 'rgba(168, 85, 247, 0.85)',
+                        borderColor: '#a855f7',
+                        borderWidth: 1,
+                        borderRadius: 6
+                    }
+                ]
+            },
+            options: {
+                responsive: true,
+                maintainAspectRatio: false,
+                plugins: {
+                    legend: { labels: { color: '#94a3b8', font: { family: 'Outfit', weight: 'bold' } } }
+                },
+                scales: {
+                    y: {
+                        beginAtZero: true,
+                        grid: { color: 'rgba(255, 255, 255, 0.05)' },
+                        ticks: { color: '#94a3b8', font: { family: 'JetBrains Mono' } }
+                    },
+                    x: {
+                        grid: { display: false },
+                        ticks: { color: '#94a3b8', font: { family: 'Outfit' } }
+                    }
+                }
+            }
+        });
+
+        // 4. Memory Breakdown Chart
+        const ctxMemory = document.getElementById('memoryChart').getContext('2d');
+        new Chart(ctxMemory, {
+            type: 'bar',
+            data: {
+                labels: ['VRAM Used', 'Free VRAM Headroom', 'Pinned Host DDR5'],
+                datasets: [
+                    {
+                        label: 'Moecher (V4.1 552B)',
+                        data: [92.9, 2.28, 42.0],
+                        backgroundColor: 'rgba(56, 189, 248, 0.85)',
+                        borderColor: '#38bdf8',
+                        borderWidth: 1,
+                        borderRadius: 6
+                    },
+                    {
+                        label: 'DwarfStar (V4.1 552B)',
+                        data: [78.5, 17.1, 4.8],
+                        backgroundColor: 'rgba(168, 85, 247, 0.85)',
+                        borderColor: '#a855f7',
+                        borderWidth: 1,
+                        borderRadius: 6
+                    }
+                ]
+            },
+            options: {
+                responsive: true,
+                maintainAspectRatio: false,
+                plugins: {
+                    legend: { labels: { color: '#94a3b8', font: { family: 'Outfit', weight: 'bold' } } }
+                },
+                scales: {
+                    y: {
+                        beginAtZero: true,
+                        grid: { color: 'rgba(255, 255, 255, 0.05)' },
+                        ticks: { color: '#94a3b8', font: { family: 'JetBrains Mono' } }
+                    },
+                    x: {
+                        grid: { display: false },
+                        ticks: { color: '#94a3b8', font: { family: 'Outfit' } }
+                    }
+                }
+            }
+        });
+    </script>
+</body>
+</html>

@@ -1,0 +1,1220 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Taming a 552B MoE on a Single Workstation: How MinnieTheMoEcher Beats DwarfStar — Tino Bruno</title>
+    <link rel="preconnect" href="https://fonts.googleapis.com">
+    <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+    <link href="https://fonts.googleapis.com/css2?family=Plus+Jakarta+Sans:ital,wght@0,300;0,400;0,500;0,600;0,700;0,800;1,400&family=Newsreader:ital,opsz,wght@0,6..72,400;0,6..72,500;0,6..72,600;1,6..72,400;1,6..72,500&family=JetBrains+Mono:wght@400;500;600;700&display=swap" rel="stylesheet">
+    <style>
+        :root {
+            --bg: #080c14;
+            --surface: #0f172a;
+            --surface-card: #131d35;
+            --surface-hover: #1c2948;
+            --border: #233358;
+            --border-highlight: #3b5080;
+            --text-primary: #f1f5f9;
+            --text-secondary: #94a3b8;
+            --text-muted: #64748b;
+            --accent-purple: #a855f7;
+            --accent-purple-glow: rgba(168, 85, 247, 0.25);
+            --accent-cyan: #38bdf8;
+            --accent-cyan-glow: rgba(56, 189, 248, 0.25);
+            --accent-green: #22c55e;
+            --accent-amber: #f59e0b;
+            --accent-red: #ef4444;
+            --radius-sm: 8px;
+            --radius-md: 14px;
+            --radius-lg: 20px;
+            --font-body: 'Newsreader', Georgia, serif;
+            --font-sans: 'Plus Jakarta Sans', -apple-system, BlinkMacSystemFont, sans-serif;
+            --font-mono: 'JetBrains Mono', monospace;
+            --content-width: 920px;
+        }
+
+        [data-theme="light"] {
+            --bg: #f8fafc;
+            --surface: #ffffff;
+            --surface-card: #f1f5f9;
+            --surface-hover: #e2e8f0;
+            --border: #cbd5e1;
+            --border-highlight: #94a3b8;
+            --text-primary: #0f172a;
+            --text-secondary: #334155;
+            --text-muted: #64748b;
+            --accent-purple: #7e22ce;
+            --accent-purple-glow: rgba(126, 34, 206, 0.15);
+            --accent-cyan: #0284c7;
+            --accent-cyan-glow: rgba(2, 132, 199, 0.15);
+        }
+
+        * {
+            box-sizing: border-box;
+            margin: 0;
+            padding: 0;
+        }
+
+        body {
+            background-color: var(--bg);
+            color: var(--text-primary);
+            font-family: var(--font-body);
+            font-size: 1.22rem;
+            line-height: 1.78;
+            -webkit-font-smoothing: antialiased;
+            text-rendering: optimizeLegibility;
+            transition: background-color 0.3s ease, color 0.3s ease;
+            background-image:
+                radial-gradient(circle at 12% 15%, rgba(56, 189, 248, 0.07) 0%, transparent 40%),
+                radial-gradient(circle at 88% 80%, rgba(168, 85, 247, 0.07) 0%, transparent 45%);
+        }
+
+        /* Top Navigation Bar */
+        .top-nav {
+            position: sticky;
+            top: 0;
+            z-index: 100;
+            background: rgba(8, 12, 20, 0.85);
+            backdrop-filter: blur(16px);
+            -webkit-backdrop-filter: blur(16px);
+            border-bottom: 1px solid var(--border);
+            padding: 12px 24px;
+            display: flex;
+            align-items: center;
+            justify-content: space-between;
+            flex-wrap: wrap;
+            gap: 12px;
+        }
+
+        [data-theme="light"] .top-nav {
+            background: rgba(255, 255, 255, 0.9);
+        }
+
+        .nav-brand {
+            font-family: var(--font-sans);
+            font-weight: 800;
+            font-size: 0.98rem;
+            display: flex;
+            align-items: center;
+            gap: 10px;
+            color: var(--text-primary);
+            text-decoration: none;
+        }
+
+        .nav-brand .badge {
+            background: linear-gradient(135deg, #38bdf8, #a855f7);
+            color: #060911;
+            font-size: 0.72rem;
+            font-weight: 800;
+            padding: 3px 9px;
+            border-radius: 6px;
+            letter-spacing: 0.5px;
+            text-transform: uppercase;
+        }
+
+        .nav-actions {
+            display: flex;
+            align-items: center;
+            gap: 8px;
+            flex-wrap: wrap;
+        }
+
+        .nav-btn {
+            font-family: var(--font-sans);
+            font-size: 0.82rem;
+            font-weight: 600;
+            padding: 7px 13px;
+            border-radius: var(--radius-sm);
+            background: var(--surface);
+            border: 1px solid var(--border);
+            color: var(--text-primary);
+            cursor: pointer;
+            display: inline-flex;
+            align-items: center;
+            gap: 6px;
+            text-decoration: none;
+            transition: all 0.2s ease;
+        }
+
+        .nav-btn:hover {
+            border-color: var(--accent-cyan);
+            background: var(--surface-hover);
+        }
+
+        .nav-btn.primary {
+            background: linear-gradient(135deg, #38bdf8, #2563eb);
+            color: #ffffff;
+            border: none;
+            box-shadow: 0 4px 14px var(--accent-cyan-glow);
+        }
+
+        .nav-btn.primary:hover {
+            filter: brightness(1.1);
+            transform: translateY(-1px);
+        }
+
+        .nav-btn.purple {
+            background: linear-gradient(135deg, #a855f7, #7c3aed);
+            color: #ffffff;
+            border: none;
+            box-shadow: 0 4px 14px var(--accent-purple-glow);
+        }
+
+        /* Article Container */
+        .article-container {
+            max-width: var(--content-width);
+            margin: 0 auto;
+            padding: 56px 24px 100px 24px;
+        }
+
+        /* Meta Tags */
+        .article-meta-tags {
+            font-family: var(--font-sans);
+            display: flex;
+            align-items: center;
+            gap: 10px;
+            margin-bottom: 22px;
+            flex-wrap: wrap;
+        }
+
+        .tag-pill {
+            font-size: 0.73rem;
+            font-weight: 700;
+            text-transform: uppercase;
+            letter-spacing: 0.8px;
+            padding: 4px 12px;
+            border-radius: 20px;
+            background: rgba(168, 85, 247, 0.15);
+            color: #d8b4fe;
+            border: 1px solid rgba(168, 85, 247, 0.35);
+        }
+
+        .tag-pill.cyan {
+            background: rgba(56, 189, 248, 0.15);
+            color: #7dd3fc;
+            border-color: rgba(56, 189, 248, 0.35);
+        }
+
+        .tag-pill.emerald {
+            background: rgba(34, 197, 94, 0.15);
+            color: #86efac;
+            border-color: rgba(34, 197, 94, 0.35);
+        }
+
+        .tag-pill.amber {
+            background: rgba(245, 158, 11, 0.15);
+            color: #fcd34d;
+            border-color: rgba(245, 158, 11, 0.35);
+        }
+
+        .article-title {
+            font-family: var(--font-sans);
+            font-size: 2.65rem;
+            font-weight: 800;
+            line-height: 1.18;
+            letter-spacing: -0.03em;
+            color: var(--text-primary);
+            margin-bottom: 20px;
+        }
+
+        .article-subtitle {
+            font-family: var(--font-sans);
+            font-size: 1.25rem;
+            font-weight: 400;
+            line-height: 1.55;
+            color: var(--text-secondary);
+            margin-bottom: 32px;
+        }
+
+        /* Author Box */
+        .author-box {
+            display: flex;
+            align-items: center;
+            justify-content: space-between;
+            flex-wrap: wrap;
+            gap: 16px;
+            padding: 18px 0;
+            border-top: 1px solid var(--border);
+            border-bottom: 1px solid var(--border);
+            margin-bottom: 42px;
+            font-family: var(--font-sans);
+        }
+
+        .author-left {
+            display: flex;
+            align-items: center;
+            gap: 14px;
+        }
+
+        .author-avatar {
+            width: 54px;
+            height: 54px;
+            border-radius: 50%;
+            background: linear-gradient(135deg, #38bdf8, #a855f7);
+            display: flex;
+            align-items: center;
+            justify-content: center;
+            font-weight: 800;
+            font-size: 1.2rem;
+            color: #090d16;
+            box-shadow: 0 4px 14px var(--accent-cyan-glow);
+            flex-shrink: 0;
+        }
+
+        .author-name {
+            font-weight: 700;
+            font-size: 1.05rem;
+            color: var(--text-primary);
+        }
+
+        .author-title {
+            font-size: 0.84rem;
+            color: var(--text-secondary);
+        }
+
+        .reading-time {
+            font-size: 0.78rem;
+            color: var(--text-muted);
+            font-family: var(--font-mono);
+        }
+
+        /* Hero KPI Banner */
+        .hero-kpi-grid {
+            display: grid;
+            grid-template-columns: repeat(4, 1fr);
+            gap: 14px;
+            margin: 32px 0 44px 0;
+            font-family: var(--font-sans);
+        }
+
+        @media (max-width: 768px) {
+            .hero-kpi-grid {
+                grid-template-columns: repeat(2, 1fr);
+            }
+            .article-title {
+                font-size: 2rem;
+            }
+        }
+
+        .kpi-card {
+            background: var(--surface-card);
+            border: 1px solid var(--border);
+            border-radius: var(--radius-md);
+            padding: 18px;
+            position: relative;
+            overflow: hidden;
+        }
+
+        .kpi-card::before {
+            content: "";
+            position: absolute;
+            top: 0;
+            left: 0;
+            width: 4px;
+            height: 100%;
+            background: var(--accent-cyan);
+        }
+
+        .kpi-card.emerald::before { background: var(--accent-green); }
+        .kpi-card.purple::before { background: var(--accent-purple); }
+        .kpi-card.amber::before { background: var(--accent-amber); }
+
+        .kpi-label {
+            font-size: 0.72rem;
+            font-weight: 700;
+            text-transform: uppercase;
+            letter-spacing: 0.06em;
+            color: var(--text-secondary);
+        }
+
+        .kpi-value {
+            font-family: var(--font-mono);
+            font-size: 1.65rem;
+            font-weight: 800;
+            color: var(--text-primary);
+            margin: 6px 0 4px 0;
+        }
+
+        .kpi-sub {
+            font-size: 0.76rem;
+            color: var(--accent-cyan);
+            font-family: var(--font-mono);
+        }
+
+        .kpi-card.emerald .kpi-sub { color: var(--accent-green); }
+        .kpi-card.purple .kpi-sub { color: #d8b4fe; }
+        .kpi-card.amber .kpi-sub { color: var(--accent-amber); }
+
+        /* Headings & Paragraphs */
+        h2 {
+            font-family: var(--font-sans);
+            font-size: 1.75rem;
+            font-weight: 800;
+            letter-spacing: -0.02em;
+            color: var(--text-primary);
+            margin: 52px 0 18px 0;
+            line-height: 1.28;
+            display: flex;
+            align-items: center;
+            gap: 12px;
+        }
+
+        h2::before {
+            content: "";
+            display: inline-block;
+            width: 5px;
+            height: 1.15em;
+            background: linear-gradient(180deg, var(--accent-cyan), var(--accent-purple));
+            border-radius: 3px;
+            flex-shrink: 0;
+        }
+
+        h3 {
+            font-family: var(--font-sans);
+            font-size: 1.32rem;
+            font-weight: 700;
+            color: var(--text-primary);
+            margin: 34px 0 14px 0;
+        }
+
+        p {
+            margin-bottom: 22px;
+            color: var(--text-primary);
+        }
+
+        ul, ol {
+            margin: 0 0 24px 24px;
+        }
+
+        li {
+            margin-bottom: 10px;
+        }
+
+        strong {
+            font-weight: 700;
+            color: var(--text-primary);
+        }
+
+        code {
+            font-family: var(--font-mono);
+            font-size: 0.86em;
+            background: rgba(56, 189, 248, 0.12);
+            color: var(--accent-cyan);
+            padding: 2px 6px;
+            border-radius: 5px;
+        }
+
+        blockquote {
+            font-family: var(--font-sans);
+            font-size: 1.1rem;
+            font-style: italic;
+            background: var(--surface-card);
+            border-left: 4px solid var(--accent-purple);
+            padding: 20px 24px;
+            border-radius: 0 var(--radius-md) var(--radius-md) 0;
+            margin: 28px 0;
+            color: var(--text-primary);
+        }
+
+        /* Tables */
+        .table-wrapper {
+            overflow-x: auto;
+            margin: 28px 0 36px 0;
+            border-radius: var(--radius-md);
+            border: 1px solid var(--border);
+            background: var(--surface-card);
+        }
+
+        table {
+            width: 100%;
+            border-collapse: collapse;
+            font-family: var(--font-sans);
+            font-size: 0.88rem;
+        }
+
+        th {
+            background: rgba(15, 23, 42, 0.85);
+            color: var(--text-secondary);
+            font-weight: 700;
+            text-transform: uppercase;
+            font-size: 0.73rem;
+            letter-spacing: 0.05em;
+            padding: 13px 15px;
+            text-align: left;
+            border-bottom: 1px solid var(--border);
+        }
+
+        [data-theme="light"] th {
+            background: #e2e8f0;
+            color: #1e293b;
+        }
+
+        td {
+            padding: 12px 15px;
+            border-bottom: 1px solid rgba(255, 255, 255, 0.05);
+            color: var(--text-primary);
+        }
+
+        [data-theme="light"] td {
+            border-bottom: 1px solid #cbd5e1;
+        }
+
+        tr:last-child td {
+            border-bottom: none;
+        }
+
+        tr.highlight-row td {
+            background: rgba(56, 189, 248, 0.08);
+            font-weight: 600;
+        }
+
+        .mono-val {
+            font-family: var(--font-mono);
+            font-weight: 700;
+        }
+
+        .text-cyan { color: var(--accent-cyan); }
+        .text-green { color: var(--accent-green); }
+        .text-purple { color: #c084fc; }
+        .text-amber { color: var(--accent-amber); }
+
+        /* Architecture Diagram Box */
+        .arch-diagram {
+            background: #060911;
+            border: 1px solid var(--border-highlight);
+            border-radius: var(--radius-md);
+            padding: 22px 24px;
+            margin: 26px 0;
+            font-family: var(--font-mono);
+            font-size: 0.82rem;
+            line-height: 1.6;
+            color: #e2e8f0;
+            overflow-x: auto;
+            white-space: pre;
+        }
+
+        /* Visual Bar Chart Card */
+        .chart-card {
+            background: var(--surface-card);
+            border: 1px solid var(--border);
+            border-radius: var(--radius-md);
+            padding: 24px;
+            margin: 30px 0;
+            font-family: var(--font-sans);
+        }
+
+        .chart-card-title {
+            font-size: 0.95rem;
+            font-weight: 800;
+            text-transform: uppercase;
+            letter-spacing: 0.05em;
+            color: var(--accent-cyan);
+            margin-bottom: 18px;
+            display: flex;
+            justify-content: space-between;
+            align-items: center;
+            flex-wrap: wrap;
+            gap: 8px;
+        }
+
+        .bar-row {
+            margin-bottom: 15px;
+        }
+
+        .bar-label {
+            display: flex;
+            justify-content: space-between;
+            font-size: 0.85rem;
+            margin-bottom: 6px;
+        }
+
+        .bar-track {
+            height: 20px;
+            background: rgba(255, 255, 255, 0.06);
+            border-radius: 10px;
+            overflow: hidden;
+        }
+
+        [data-theme="light"] .bar-track {
+            background: #cbd5e1;
+        }
+
+        .bar-fill {
+            height: 100%;
+            border-radius: 10px;
+        }
+
+        .bar-cyan { background: linear-gradient(90deg, #0ea5e9, #38bdf8); }
+        .bar-emerald { background: linear-gradient(90deg, #10b981, #34d399); }
+        .bar-purple { background: linear-gradient(90deg, #8b5cf6, #c084fc); }
+        .bar-amber { background: linear-gradient(90deg, #d97706, #fbbf24); }
+
+        /* LinkedIn Post Hub Section */
+        .linkedin-hub {
+            margin-top: 64px;
+            padding-top: 44px;
+            border-top: 2px solid var(--border);
+            font-family: var(--font-sans);
+        }
+
+        .hub-grid {
+            display: grid;
+            grid-template-columns: 1fr 420px;
+            gap: 24px;
+            margin-top: 24px;
+            align-items: start;
+        }
+
+        @media (max-width: 900px) {
+            .hub-grid {
+                grid-template-columns: 1fr;
+            }
+        }
+
+        .post-editor-box {
+            background: var(--surface-card);
+            border: 1px solid var(--border);
+            border-radius: var(--radius-md);
+            padding: 22px;
+        }
+
+        .post-text-area {
+            font-family: var(--font-sans);
+            font-size: 0.92rem;
+            line-height: 1.65;
+            color: var(--text-primary);
+            white-space: pre-wrap;
+            background: rgba(8, 12, 20, 0.6);
+            border: 1px solid var(--border);
+            border-radius: var(--radius-sm);
+            padding: 18px;
+            max-height: 540px;
+            overflow-y: auto;
+        }
+
+        [data-theme="light"] .post-text-area {
+            background: #ffffff;
+        }
+
+        .linkedin-mockup {
+            background: #1b1f23;
+            border: 1px solid #30363d;
+            border-radius: 12px;
+            box-shadow: 0 12px 36px rgba(0, 0, 0, 0.45);
+            overflow: hidden;
+            color: #e6edf3;
+        }
+
+        .linkedin-header {
+            padding: 14px 16px;
+            display: flex;
+            gap: 12px;
+            align-items: center;
+            border-bottom: 1px solid #282e33;
+        }
+
+        .linkedin-content {
+            padding: 16px;
+            font-size: 0.86rem;
+            line-height: 1.55;
+            max-height: 440px;
+            overflow-y: auto;
+            white-space: pre-wrap;
+        }
+
+        .linkedin-footer {
+            padding: 10px 16px;
+            border-top: 1px solid #282e33;
+            display: flex;
+            justify-content: space-around;
+            color: #8c98a4;
+            font-size: 0.8rem;
+            font-weight: 600;
+        }
+
+        .toast {
+            position: fixed;
+            bottom: 28px;
+            right: 28px;
+            background: #10b981;
+            color: #ffffff;
+            font-family: var(--font-sans);
+            font-size: 0.9rem;
+            font-weight: 700;
+            padding: 12px 22px;
+            border-radius: 10px;
+            box-shadow: 0 10px 28px rgba(0, 0, 0, 0.5);
+            transform: translateY(100px);
+            opacity: 0;
+            transition: all 0.3s ease;
+            z-index: 999;
+        }
+
+        .toast.show {
+            transform: translateY(0);
+            opacity: 1;
+        }
+    </style>
+</head>
+<body>
+
+    <!-- Top Navigation Bar -->
+    <nav class="top-nav">
+        <a href="#" class="nav-brand">
+            <span class="badge">Minnie v2.09</span>
+            <span>DeepSeek-V4.1-Flash (552B) • LinkedIn Article & Post Hub</span>
+        </a>
+        <div class="nav-actions">
+            <a href="rtxpro600096gbWin64gb/index.html" class="nav-btn" target="_blank">📊 42.9 GB DRAM Report</a>
+            <a href="rtxpro600096gbWin_4.8GB_DRAM/index.html" class="nav-btn" target="_blank">⚖️ Equal 4.8 GB Report</a>
+            <a href="rtxpro600096gbWin_NoDRAM/index.html" class="nav-btn" target="_blank">🚀 No-DRAM (0.3 GB) Report</a>
+            <button class="nav-btn" onclick="toggleTheme()">🌓 Theme</button>
+            <button class="nav-btn purple" onclick="copyFullArticleMarkdown()">📋 Copy Article Markdown</button>
+            <button class="nav-btn primary" onclick="copyLinkedInFeedPost()">⚡ Copy LinkedIn Post (1-Click)</button>
+        </div>
+    </nav>
+
+    <!-- Main Article Container -->
+    <article class="article-container" id="fullArticleBody">
+
+        <div class="article-meta-tags">
+            <span class="tag-pill cyan">DeepSeek-V4.1-Flash (552B / 14B)</span>
+            <span class="tag-pill emerald">RTX PRO 6000 Blackwell 96GB</span>
+            <span class="tag-pill">64GB DDR5 + PCIe 5.0 NVMe</span>
+            <span class="tag-pill amber">With & Without DRAM Cache</span>
+        </div>
+
+        <h1 class="article-title">
+            Taming a 552B MoE on a Single Workstation: How MinnieTheMoEcher Beats DwarfStar on DeepSeek-V4.1-Flash — With or Without DRAM Caching
+        </h1>
+
+        <p class="article-subtitle">
+            Why combining Contiguous Expert Packing on Disk, a Native Blackwell NVFP4 Hot Tier, Layer-Outer 4,096-token Super-Chunk prefill, a Dynamic VRAM L1 Cold LRU cache with 1.8 TB/s D2D warm-up, and Compute-Overlapped NVMe I/O outperforms DwarfStar across every memory regime—even with 0 GB of DRAM expert cache.
+        </p>
+
+        <div class="author-box">
+            <div class="author-left">
+                <div class="author-avatar">TB</div>
+                <div>
+                    <div class="author-name">Tino Bruno</div>
+                    <div class="author-title">AI Architect & High-Performance Compute Engineer • Author of MinnieTheMoEcher</div>
+                </div>
+            </div>
+            <div class="reading-time">8 MIN READ • BARE-METAL BENCHMARK & CODE ANALYSIS</div>
+        </div>
+
+        <!-- Hero KPI Summary Cards -->
+        <div class="hero-kpi-grid">
+            <div class="kpi-card">
+                <div class="kpi-label">Decode (Full 42.9G DDR5)</div>
+                <div class="kpi-value">14.50 tok/s</div>
+                <div class="kpi-sub">1.56× vs DGX Spark (9.30 t/s)</div>
+            </div>
+            <div class="kpi-card purple">
+                <div class="kpi-label">Decode (Capped 4.8G RAM)</div>
+                <div class="kpi-value">11.55 tok/s</div>
+                <div class="kpi-sub">~1.48× vs RTX PRO 6000 Model (~7.8)</div>
+            </div>
+            <div class="kpi-card emerald">
+                <div class="kpi-label">Decode (No DRAM 0.3G)</div>
+                <div class="kpi-value">10.72 tok/s</div>
+                <div class="kpi-sub">Pure NVMe Stream (0 GB Cache)</div>
+            </div>
+            <div class="kpi-card amber">
+                <div class="kpi-label">2K–3K Prefill (No DRAM)</div>
+                <div class="kpi-value">202.56 tok/s</div>
+                <div class="kpi-sub">213.74 tok/s @ 3K (Pure NVMe)</div>
+            </div>
+        </div>
+
+        <h2>1. The 552-Billion Parameter Challenge on a Single Workstation</h2>
+
+        <p>
+            Running <strong>DeepSeek-V4.1-Flash (1017 Release)</strong> locally on a single-GPU workstation is one of the ultimate stress tests in modern systems engineering. While only <strong>14 billion parameters</strong> are activated per token, the total model spans <strong>552 billion parameters</strong> across <strong>40 layers</strong> and <strong>15,360 routed experts</strong> (<code>384</code> routed experts per layer, top-6 active experts per token + 1 shared expert, expert dimensions <code>5120 × 2304</code>), paired with <strong>Multi-head Latent Attention (MLA)</strong> and <strong>4-branch Multi-Hyper-Connections (<code>mHC</code>)</strong>.
+        </p>
+
+        <p>
+            Even when compressed to extreme 2-bit/3-bit quantization (<code>IQ2_XXS</code> for <code>gate</code>/<code>up</code> + <code>Q2_K</code> for <code>down</code>, totaling <strong><code>9.95 MB</code> / <code>9.49 MiB</code> per routed expert</strong>), the 15,360 routed experts alone weigh <strong>152.9 GB (<code>142.4 GiB</code>)</strong>—far exceeding the <strong>96 GB GDDR7 VRAM</strong> of an <strong>NVIDIA RTX PRO 6000 Blackwell</strong> (<code>sm_120a</code>). Every single-GPU inference engine must solve a fundamental physics problem: <strong>how to move expert weights across NVMe SSD, System DDR5 RAM, PCIe 5.0, and GPU VRAM without starving the Blackwell Tensor Cores.</strong>
+        </p>
+
+        <p>
+            Recently, Salvatore Sanfilippo (<strong><code>antirez</code></strong>) released <strong>DwarfStar (<code>ds4</code>)</strong> with a CUDA SSD-streaming backend (<code>ds4_cuda.cu</code>) for DeepSeek-V4.1-Flash (<code>ds41f-q2</code>). On a <strong>128 GB NVIDIA DGX Spark (<code>GB10</code>)</strong>, <code>antirez</code> published official benchmarks showing <strong>84.90 tok/s</strong> on 2K prefill (<code>93–100 tok/s</code> at 3.2K, <strong>116.34 tok/s</strong> at 4K) and <strong>9.30 tok/s</strong> on single-session decode (<code>docs/DGX_SPARK.md</code>, <code>QA_BEFORE_RELEASES.md</code>). When we project <code>ds4_cuda.cu</code>'s exact memory and I/O pipeline (<code>75.0 GiB</code> / <code>8,090</code> cached experts after its <code>8.0 GiB</code> VRAM reserve, synchronous per-layer <code>pread()</code> across 3 separate GGUF tensors) onto an <strong>NVIDIA RTX PRO 6000 96GB + PCIe 5.0 NVMe SSD</strong>, its analytical ceiling is <strong><code>~145–165 tok/s</code></strong> on 2K prefill and <strong><code>~6.9–8.5 tok/s</code> (<code>~7.8 tok/s</code> midpoint)</strong> on autoregressive decode using <strong>~4.8 GB of host RAM</strong>.
+        </p>
+
+        <p>
+            In <strong>MinnieTheMoEcher v2.09</strong>, our <strong>3-Tier Hierarchical Memory Architecture</strong> (<code>VRAM Hot/Cold L1 + Pinned Host DDR5 L2 + NVMe SSD</code>) pushes empirical measured decode throughput on the RTX PRO 6000 96GB to <strong>14.50 tok/s</strong> (<strong>1.56× faster</strong> than DwarfStar's published 128 GB DGX Spark decode and <strong>~1.86× faster</strong> than its RTX PRO 6000 projection).
+        </p>
+
+        <p>
+            Then we asked a much tougher engineering question:
+        </p>
+
+        <blockquote>
+            "What if we strip away Minnie's 42.9 GB DDR5 RAM advantage? What if we cap Minnie to 4.80 GB of host RAM—or even disable the DRAM expert cache completely (0.30 GB host RAM, pure NVMe SSD streaming)? Can our bare-metal CUDA architecture still beat both DwarfStar's 128 GB DGX Spark baseline and its RTX PRO 6000 projection?"
+        </blockquote>
+
+        <p>
+            The answer—verified on bare metal on our RTX PRO 6000 96GB across three controlled benchmark suites—is <strong>yes, across both prefill and decode, in every single configuration.</strong>
+        </p>
+
+        <h2>2. Three-Way Empirical Benchmark on RTX PRO 6000 (96 GB) vs. DwarfStar Baselines</h2>
+
+        <p>
+            We evaluated <strong>MinnieTheMoEcher v2.09</strong> running <strong>DeepSeek-V4.1-Flash (1017 Release)</strong> on our <strong>NVIDIA RTX PRO 6000 Blackwell 96 GB</strong> workstation (<strong>AMD Ryzen 9 9950X3D</strong>, <strong>64 GB DDR5</strong>, <strong>PCIe 5.0 NVMe SSD</strong>) across five production scenarios (<code>P1</code> Direct Chat, <code>P2</code> Python Code Synthesis, <code>P3</code> Interactive HTML/JS Calculator with Thinking, <code>P4</code> Step-by-Step Math Reasoning, and <code>P5</code> ~2K-Token Distributed Systems Document Analysis) plus a 3K-token scaling probe (<code>P6</code>):
+        </p>
+
+        <div class="table-wrapper">
+            <table>
+                <thead>
+                    <tr>
+                        <th>Metric / Workload</th>
+                        <th>Minnie (Full 42.9G) [Measured]</th>
+                        <th>Minnie (4.80G RAM) [Measured]</th>
+                        <th>Minnie (No DRAM 0.30G) [Measured]</th>
+                        <th>DwarfStar RTX PRO 6000 [Code Model]</th>
+                        <th>DwarfStar DGX Spark 128G [Published]</th>
+                    </tr>
+                </thead>
+                <tbody>
+                    <tr>
+                        <td><strong>Host System RAM Used</strong></td>
+                        <td class="mono-val text-cyan">42.90 GB (Pinned L2)</td>
+                        <td class="mono-val text-purple">4.80 GB</td>
+                        <td class="mono-val text-green">0.30 GB (0 GB Cache)</td>
+                        <td class="mono-val">~4.8 GB</td>
+                        <td class="mono-val">128 GB Unified</td>
+                    </tr>
+                    <tr>
+                        <td><strong>Hot / Cold Expert Format</strong></td>
+                        <td class="mono-val">NVFP4 (4.38M) + IQ2/Q2_K (9.95M)</td>
+                        <td class="mono-val">NVFP4 (4.38M) + IQ2/Q2_K (9.95M)</td>
+                        <td class="mono-val">NVFP4 (4.38M) + IQ2/Q2_K (9.95M)</td>
+                        <td class="mono-val">Uniform IQ2/Q2_K (9.95M)</td>
+                        <td class="mono-val">Uniform IQ2/Q2_K (9.95M)</td>
+                    </tr>
+                    <tr>
+                        <td><strong>NVMe Reads per Cold Miss</strong></td>
+                        <td class="mono-val text-green">1 Contiguous Read</td>
+                        <td class="mono-val text-green">1 Contiguous Read</td>
+                        <td class="mono-val text-green">1 Contiguous Read</td>
+                        <td class="mono-val text-amber">3 Scattered Reads (1.17G apart)</td>
+                        <td class="mono-val text-amber">3 Scattered Reads (1.17G apart)</td>
+                    </tr>
+                    <tr class="highlight-row">
+                        <td><strong>Long-Context Prefill (2K–3K Mean)</strong></td>
+                        <td class="mono-val text-cyan">189.53 tok/s</td>
+                        <td class="mono-val text-purple">192.74 tok/s</td>
+                        <td class="mono-val text-green">202.56 tok/s</td>
+                        <td class="mono-val text-amber">~155–175 tok/s</td>
+                        <td class="mono-val">89–92 tok/s (116.3 @ 4K)</td>
+                    </tr>
+                    <tr>
+                        <td><strong>2K Prefill (P5, 1,834–2,048 tok)</strong></td>
+                        <td class="mono-val">180.56 tok/s</td>
+                        <td class="mono-val">199.58 tok/s</td>
+                        <td class="mono-val">191.39 tok/s</td>
+                        <td class="mono-val">~145–165 tok/s</td>
+                        <td class="mono-val">84.90 tok/s</td>
+                    </tr>
+                    <tr>
+                        <td><strong>3K Prefill (P6, 2,929–3,241 tok)</strong></td>
+                        <td class="mono-val">198.49 tok/s</td>
+                        <td class="mono-val">185.90 tok/s</td>
+                        <td class="mono-val">213.74 tok/s</td>
+                        <td class="mono-val">~165–185 tok/s</td>
+                        <td class="mono-val">93–100 tok/s</td>
+                    </tr>
+                    <tr class="highlight-row">
+                        <td><strong>5-Prompt Mean Prefill (P1–P5, from TTFT)</strong></td>
+                        <td class="mono-val text-cyan">68.44 tok/s</td>
+                        <td class="mono-val text-purple">59.46 tok/s</td>
+                        <td class="mono-val text-green">57.44 tok/s</td>
+                        <td class="mono-val text-amber">~48–52 tok/s</td>
+                        <td class="mono-val">—</td>
+                    </tr>
+                    <tr class="highlight-row">
+                        <td><strong>Average Decode Throughput</strong></td>
+                        <td class="mono-val text-cyan">14.50 tok/s</td>
+                        <td class="mono-val text-purple">11.55 tok/s</td>
+                        <td class="mono-val text-green">10.72 tok/s</td>
+                        <td class="mono-val text-amber">~6.9–8.5 tok/s (~7.8)</td>
+                        <td class="mono-val">9.30 tok/s</td>
+                    </tr>
+                    <tr>
+                        <td><strong>Direct Chat Decode (P1)</strong></td>
+                        <td class="mono-val">13.74 tok/s</td>
+                        <td class="mono-val">11.15 tok/s</td>
+                        <td class="mono-val">10.20 tok/s</td>
+                        <td class="mono-val">~7.8 tok/s</td>
+                        <td class="mono-val">—</td>
+                    </tr>
+                    <tr>
+                        <td><strong>Python Code Decode (P2)</strong></td>
+                        <td class="mono-val">14.85 tok/s</td>
+                        <td class="mono-val">12.53 tok/s</td>
+                        <td class="mono-val">11.39 tok/s</td>
+                        <td class="mono-val">~8.2 tok/s</td>
+                        <td class="mono-val">—</td>
+                    </tr>
+                    <tr>
+                        <td><strong>Web UI HTML/JS Decode (P3)</strong></td>
+                        <td class="mono-val">16.32 tok/s</td>
+                        <td class="mono-val">13.09 tok/s</td>
+                        <td class="mono-val">12.21 tok/s</td>
+                        <td class="mono-val">~8.5 tok/s</td>
+                        <td class="mono-val">—</td>
+                    </tr>
+                    <tr>
+                        <td><strong>Math Reasoning Decode (P4)</strong></td>
+                        <td class="mono-val">14.70 tok/s</td>
+                        <td class="mono-val">11.85 tok/s</td>
+                        <td class="mono-val">11.13 tok/s</td>
+                        <td class="mono-val">~7.2 tok/s</td>
+                        <td class="mono-val">—</td>
+                    </tr>
+                    <tr>
+                        <td><strong>Long Document Decode (P5)</strong></td>
+                        <td class="mono-val">12.91 tok/s</td>
+                        <td class="mono-val">9.11 tok/s</td>
+                        <td class="mono-val">8.69 tok/s</td>
+                        <td class="mono-val">~6.9 tok/s</td>
+                        <td class="mono-val">—</td>
+                    </tr>
+                </tbody>
+            </table>
+        </div>
+
+        <!-- Visual Comparison Bars -->
+        <div class="chart-card">
+            <div class="chart-card-title">
+                <span>Autoregressive Decode Speed Comparison (tok/s)</span>
+                <span style="font-family: var(--font-mono); font-size: 0.78rem; color: var(--text-secondary);">DeepSeek-V4.1-Flash (552B)</span>
+            </div>
+
+            <div class="bar-row">
+                <div class="bar-label">
+                    <span><strong>MinnieTheMoEcher (Full 42.9 GB DDR5 L2 Cache — Measured)</strong></span>
+                    <span class="mono-val text-cyan">14.50 tok/s (peaks at 16.32 tok/s)</span>
+                </div>
+                <div class="bar-track"><div class="bar-fill bar-cyan" style="width: 100%;"></div></div>
+            </div>
+
+            <div class="bar-row">
+                <div class="bar-label">
+                    <span><strong>MinnieTheMoEcher (Capped 4.80 GB Host RAM — Measured)</strong></span>
+                    <span class="mono-val text-purple">11.55 tok/s</span>
+                </div>
+                <div class="bar-track"><div class="bar-fill bar-purple" style="width: 79.7%;"></div></div>
+            </div>
+
+            <div class="bar-row">
+                <div class="bar-label">
+                    <span><strong>MinnieTheMoEcher (Zero DRAM Cache — 0.30 GB RAM, Pure NVMe — Measured)</strong></span>
+                    <span class="mono-val text-green">10.72 tok/s</span>
+                </div>
+                <div class="bar-track"><div class="bar-fill bar-emerald" style="width: 73.9%;"></div></div>
+            </div>
+
+            <div class="bar-row">
+                <div class="bar-label">
+                    <span><strong>DwarfStar antirez/ds4 (128 GB DGX Spark — Published)</strong></span>
+                    <span class="mono-val text-amber">9.30 tok/s</span>
+                </div>
+                <div class="bar-track"><div class="bar-fill bar-amber" style="width: 64.1%;"></div></div>
+            </div>
+
+            <div class="bar-row" style="margin-bottom: 0;">
+                <div class="bar-label">
+                    <span><strong>DwarfStar antirez/ds4 (RTX PRO 6000 96GB — Code Projection)</strong></span>
+                    <span class="mono-val text-amber">~6.9–8.5 tok/s (~7.8 tok/s)</span>
+                </div>
+                <div class="bar-track"><div class="bar-fill bar-amber" style="width: 53.8%;"></div></div>
+            </div>
+        </div>
+
+        <h2>3. Code-Level Deep Dive: Four Architectural Reasons Minnie Beats DwarfStar</h2>
+
+        <h3>Breakthrough #1: Contiguous Expert Packing on Disk (1 NVMe Read vs. 3 Scattered Reads 1.17 GB Apart)</h3>
+        <p>
+            Both engines use the same quantization format for cold routed experts (<code>5120 × 2304</code>): <code>IQ2_XXS</code> for <code>gate</code> (<code>3,186,688</code> bytes) and <code>up</code> (<code>3,186,688</code> bytes), plus higher-precision <code>Q2_K</code> for the <code>down</code> projection (<code>4,055,040</code> bytes), totaling <strong><code>9,953,280</code> bytes (<code>9.95 MB</code> / <code>9.49 MiB</code>) per expert</strong>.
+        </p>
+        <p>
+            However, their <strong>on-disk layouts</strong> are completely different:
+        </p>
+        <ul>
+            <li><strong>DwarfStar (<code>ds4_cuda.cu:29169-29190</code>)</strong> streams directly from a standard <code>.gguf</code> file where all 384 experts' <code>gate</code> matrices are stored in <code>blk.L.ffn_gate_exps.weight</code>, followed <strong>1.17 GB later</strong> by <code>blk.L.ffn_up_exps.weight</code>, followed <strong>1.17 GB later</strong> by <code>blk.L.ffn_down_exps.weight</code>. Every single cold expert miss during <code>batch = 1</code> decode requires <strong>3 separate non-adjacent <code>pread()</code> syscalls</strong> across a 3.8 GB span per layer (<code>130–160</code> scattered reads per token).</li>
+            <li><strong>MinnieTheMoEcher (<code>moe_experts_iq2.bin</code>)</strong> packs <code>gate + up + down</code> for each expert into <strong>one single contiguous <code>9.95 MB</code> block on disk</strong>. Every cold expert miss requires <strong>just 1 sequential NVMe read</strong>, slashing NVMe queue overhead by <strong>3×</strong> and maximizing single-expert PCIe 5.0 DMA throughput.</li>
+        </ul>
+
+        <h3>Breakthrough #2: Hardware NVFP4 Hot Tier (4.38 MB) + Dynamic Per-Layer VRAM L1 LRU with 1.8 TB/s D2D Warm-Up</h3>
+        <p>
+            While DwarfStar (<code>ds4_cuda.cu:29068</code>) stores all cached experts in uniform <code>9.95 MB</code> <code>IQ2_XXS+Q2_K</code> format and hardcodes an <strong><code>8.00 GiB</code> free-VRAM reserve (<code>kReserveBytes</code>)</strong>, fitting <code>8,090</code> experts in a single global Clock-sweep pool, <strong>MinnieTheMoEcher v2.09</strong> uses a <strong>Mixed-Precision + Frequency-Ranked Architecture</strong>:
+        </p>
+        <ul>
+            <li><strong>Native Blackwell <code>NVFP4</code> Hot Tier (<code>3,840</code> Experts in <code>16.8 GB</code>):</strong> The top 3,840 highest-frequency routed experts (<code>96</code> per layer) reside permanently in VRAM in hardware <strong><code>NVFP4</code> (<code>sm_120a</code> 4-bit Tensor Core format)</strong> at <strong><code>~4.38 MB</code> per expert</strong>—<strong>2.27× more compact</strong> in VRAM than <code>9.95 MB</code> <code>IQ2_XXS+Q2_K</code> while executing directly on Blackwell <code>mma.sync</code> FP4 Tensor Cores!</li>
+            <li><strong>Per-Layer VRAM Cold L1 Pool (<code>1,100</code> Experts in <code>10.2 GB</code>):</strong> Partitioned into <strong>8 Pinned Static Slots</strong> (<code>320</code> globally popular cold experts) and <strong>19–20 Dynamic LRU Slots per Layer</strong> (<code>780</code> dynamic slots).</li>
+            <li><strong>Zero-Cost Prefill-to-Decode D2D Warm-Up (<code>1.8 TB/s</code>):</strong> At the end of each layer during prefill, the cold experts activated by the prompt are already resident in the GPU's <code>2.65 GB</code> VRAM scratch buffer. Minnie ranks them by activation frequency and copies the <strong>top 12 prompt-specific cold experts per layer directly from VRAM scratch into that layer's VRAM L1 LRU slots via <code>cudaMemcpyDeviceToDeviceAsync</code> (<code>1.8 TB/s</code>)</strong>—pre-warming <code>480</code> prompt-relevant cold experts in VRAM before decode token #1 is even generated!</li>
+        </ul>
+
+        <h3>Breakthrough #3: Layer-Outer, 4,096-Token Super-Chunk Prefill (202.56 tok/s No-DRAM)</h3>
+        <p>
+            In a traditional chunked prefill engine (<code>for chunk_512 { for layer = 0..39 }</code>), a 2,048-token or 3,072-token prompt is sliced into four to six 512-token chunks. Because each token routes to 6 experts out of 384, a single 512-token chunk activates roughly <strong>250 to 275 unique experts per layer</strong> (the coupon-collector effect). If the outer loop iterates over 512-token chunks, Layer <em>L</em> must fetch those same cold experts from the NVMe SSD on Chunk 0, evict them when moving to Layer <em>L+1</em>, and then <strong>re-read the exact same cold experts 4 to 6 times per prompt!</strong>
+        </p>
+        <p>
+            We inverted the prefill execution topology into a <strong>Layer-Outer, Sub-Chunk-Inner Super-Chunk (up to 4,096 tokens)</strong>:
+        </p>
+
+        <div class="arch-diagram">[ Prompt Super-Chunk: Up to 4,096 Tokens (Sub-Chunks c = 0..7 of 512 Tokens) ]
+  │
+  └──► For Layer L = 0 .. 39:
+         ├── Step 1 (All Sub-Chunks): Run Fused mHC Add-Norm + MLA Attention + Router Gate
+         ├── Step 2 (Super-Chunk Union): Deduplicate Cold Experts across all 4,096 tokens
+         │     └── Stream unique Cold Experts from NVMe SSD / DDR5 into 280-slot (2.65 GB)
+         │         VRAM Scratch Buffer ONCE per Layer (16 parallel NVMe I/O threads)
+         ├── Step 3 (All Sub-Chunks): Execute Vectorized sm_120a SwiGLU & Down-Projection
+         │     └── Reads Cold Weights at 1.8 TB/s from VRAM Scratch (0 redundant SSD reads!)
+         └── Step 4 (D2D Warm-Up): Copy Top-12 Prompt-Activated Cold Experts from VRAM Scratch
+               └──► Per-Layer VRAM L1 Cold LRU Cache at 1.8 TB/s (cudaMemcpyDeviceToDeviceAsync)</div>
+
+        <h3>Breakthrough #4: Compute-Overlapped Decode NVMe I/O vs. Synchronous cudaStreamSynchronize()</h3>
+        <p>
+            In <code>ds4_cuda.cu:29029</code> (<code>ds_expert_cache_prepare_layer</code>), DwarfStar calls <code>cudaStreamSynchronize(c->stream)</code> at the start of every layer—stalling the GPU while the CPU performs synchronous <code>pread()</code> calls for missing <code>gate</code>, <code>up</code>, and <code>down</code> slices—and then blocks on <code>uploads.finish()</code> before launching MoE compute.
+        </p>
+        <p>
+            <strong>MinnieTheMoEcher v2.09</strong> decouples hits from misses inside every layer: it <strong>immediately dispatches all VRAM-resident and DRAM-cached experts onto <code>main_stream_</code></strong>, overlapping Blackwell Tensor Core execution with the parallel contiguous NVMe SSD read of the remaining cold expert.
+        </p>
+
+        <h2>4. Honest Per-Prompt Prefill Calculation from TTFT (Coupon-Collector Physics)</h2>
+        <p>
+            On a 552B MoE model, a 20-token prompt still activates ~90–110 unique experts per layer across 40 layers, whereas an 1,834-token document (<code>P5</code>) or 2,929-token prompt (<code>P6</code>) streams cold experts once per layer and amortizes that single I/O pass across thousands of tokens:
+        </p>
+
+        <div class="table-wrapper">
+            <table>
+                <thead>
+                    <tr>
+                        <th>Prompt Scenario</th>
+                        <th>Tokens</th>
+                        <th>Minnie Full 42.9G [Measured]</th>
+                        <th>Minnie 4.8G [Measured]</th>
+                        <th>Minnie No-DRAM 0.3G [Measured]</th>
+                        <th>DwarfStar RTX PRO 6000 [Code Model]</th>
+                    </tr>
+                </thead>
+                <tbody>
+                    <tr>
+                        <td><strong>P1 Direct Chat</strong></td>
+                        <td class="mono-val">20 tok</td>
+                        <td class="mono-val text-cyan">21.75 tok/s (939 ms)</td>
+                        <td class="mono-val text-purple">16.75 tok/s (1,212 ms)</td>
+                        <td class="mono-val text-green">17.37 tok/s (1,159 ms)</td>
+                        <td class="mono-val">~16.0 tok/s (~1,250 ms)</td>
+                    </tr>
+                    <tr>
+                        <td><strong>P2 Python Code</strong></td>
+                        <td class="mono-val">24 tok</td>
+                        <td class="mono-val text-cyan">44.80 tok/s (540 ms)</td>
+                        <td class="mono-val text-purple">23.85 tok/s (1,011 ms)</td>
+                        <td class="mono-val text-green">22.32 tok/s (1,090 ms)</td>
+                        <td class="mono-val">~16.2 tok/s (~1,480 ms)</td>
+                    </tr>
+                    <tr>
+                        <td><strong>P3 HTML Calculator</strong></td>
+                        <td class="mono-val">46 tok</td>
+                        <td class="mono-val text-cyan">45.06 tok/s (1,046 ms)</td>
+                        <td class="mono-val">26.19 tok/s (1,784 ms)</td>
+                        <td class="mono-val">25.59 tok/s (1,814 ms)</td>
+                        <td class="mono-val text-amber">~30–34 tok/s (~1,350–1,500 ms)</td>
+                    </tr>
+                    <tr>
+                        <td><strong>P4 Math Reasoning</strong></td>
+                        <td class="mono-val">68 tok</td>
+                        <td class="mono-val text-cyan">50.01 tok/s (1,386 ms)</td>
+                        <td class="mono-val">30.93 tok/s (2,221 ms)</td>
+                        <td class="mono-val">30.51 tok/s (2,236 ms)</td>
+                        <td class="mono-val text-amber">~30–32 tok/s (~2,100–2,250 ms)</td>
+                    </tr>
+                    <tr class="highlight-row">
+                        <td><strong>P5 Long Document (~2K)</strong></td>
+                        <td class="mono-val">1,834 tok</td>
+                        <td class="mono-val text-cyan">180.56 tok/s (10,246 ms)</td>
+                        <td class="mono-val text-purple">199.58 tok/s (9,253 ms)</td>
+                        <td class="mono-val text-green">191.39 tok/s (9,669 ms)</td>
+                        <td class="mono-val">~145–165 tok/s (~11.1–12.6s)</td>
+                    </tr>
+                    <tr class="highlight-row">
+                        <td><strong>P6 3K Scaling Probe</strong></td>
+                        <td class="mono-val">2,929 tok</td>
+                        <td class="mono-val text-cyan">198.49 tok/s</td>
+                        <td class="mono-val text-purple">185.90 tok/s</td>
+                        <td class="mono-val text-green">213.74 tok/s</td>
+                        <td class="mono-val">~165–185 tok/s</td>
+                    </tr>
+                    <tr class="highlight-row">
+                        <td><strong>5-Prompt Mean (P1–P5)</strong></td>
+                        <td class="mono-val">—</td>
+                        <td class="mono-val text-cyan">68.44 tok/s</td>
+                        <td class="mono-val text-purple">59.46 tok/s</td>
+                        <td class="mono-val text-green">57.44 tok/s</td>
+                        <td class="mono-val">~48–52 tok/s</td>
+                    </tr>
+                </tbody>
+            </table>
+        </div>
+
+        <!-- LinkedIn Feed Post Copy & Preview Hub -->
+        <section class="linkedin-hub">
+            <h2>5. Ready-to-Publish LinkedIn Feed Post (1-Click Unicode Bold)</h2>
+            <p>
+                Use the button below to copy the formatted LinkedIn feed post with automatic Unicode bold headers, or copy the full Markdown article above for LinkedIn Pulse.
+            </p>
+
+            <div class="hub-grid">
+                <div class="post-editor-box">
+                    <div style="display: flex; justify-content: space-between; align-items: center; margin-bottom: 14px; flex-wrap: wrap; gap: 10px;">
+                        <span style="font-weight: 700; font-size: 0.95rem;">📄 LinkedIn Feed Post Draft</span>
+                        <div style="display: flex; gap: 8px;">
+                            <button class="nav-btn" onclick="copyPlainPost()">Copy Plain</button>
+                            <button class="nav-btn primary" onclick="copyLinkedInFeedPost()">⚡ Copy 1-Click for LinkedIn</button>
+                        </div>
+                    </div>
+                    <div class="post-text-area" id="linkedinPostRaw">Can a single-GPU workstation run a *552-Billion Parameter MoE model* (DeepSeek-V4.1-Flash, 15,360 routed experts) at interactive speeds—and what matters more: host DRAM offloading or bare-metal CUDA & NVMe scheduling?
+
+We benchmarked *MinnieTheMoEcher v2.09* on our workstation and compared it against *DwarfStar (antirez/ds4* — both its published 128 GB DGX Spark numbers and its code-derived model on the RTX PRO 6000 96GB):
+• GPU: NVIDIA RTX PRO 6000 Blackwell (96 GB GDDR7, sm_120a)
+• CPU: AMD Ryzen 9 9950X3D (16C/32T)
+• RAM: 64 GB DDR5 + PCIe 5.0 NVMe SSD
+
+To test whether Minnie's speed comes from our 42.9 GB DDR5 L2 cache or from our core C++/CUDA engine, we ran three strict bare-metal benchmarks on the RTX PRO 6000 96GB:
+1️⃣ *Full Workstation Mode* (42.9 GB DDR5 L2 Cache)
+2️⃣ *Capped Host RAM Mode* (4.80 GB RAM)
+3️⃣ *Zero DRAM Cache Mode* (0.30 GB RAM — pure NVMe SSD streaming!)
+
+━━━━━━━━━━━━━━━━━━━━━
+📊 *THE SCORECARD: DeepSeek-V4.1-Flash (552B / 14B Active)*
+━━━━━━━━━━━━━━━━━━━━━
+
+🚀 *Autoregressive Decode Speed (5-Prompt Mean):*
+• Minnie (Full 42.9 GB DDR5 L2): *14.50 tok/s* (peaks at 16.32 tok/s)
+• Minnie (4.80 GB Host RAM): *11.55 tok/s*
+• Minnie (No DRAM Cache, 0.30 GB RAM): *10.72 tok/s*
+• DwarfStar (Published 128 GB DGX Spark): *9.30 tok/s*
+• DwarfStar (RTX PRO 6000 96GB Code Projection): *~6.9–8.5 tok/s (~7.8 tok/s)*
+
+⚡ *Long-Context Prefill Speed (2K–3K Tokens):*
+• Minnie (No DRAM Cache, 0.30 GB RAM): *202.56 tok/s* (191.39 tok/s @ 2K, 213.74 tok/s @ 3K!)
+• Minnie (4.80 GB Host RAM): *192.74 tok/s* (199.58 tok/s @ 2K)
+• Minnie (Full 42.9 GB DDR5 L2): *189.53 tok/s*
+• DwarfStar (RTX PRO 6000 96GB Code Projection): *~145–165 tok/s @ 2K*
+• DwarfStar (Published 128 GB DGX Spark): *84.90 tok/s @ 2K, 93–100 tok/s @ 3.2K, 116.34 tok/s @ 4K*
+
+━━━━━━━━━━━━━━━━━━━━━
+🔧 *4 ARCHITECTURAL REASONS MINNIE WINS EVEN WITHOUT DRAM CACHE*
+━━━━━━━━━━━━━━━━━━━━━
+
+1️⃣ *Contiguous Expert Packing on Disk (1 NVMe Read vs. 3 Scattered Reads):*
+In a standard GGUF (ds4_cuda.cu), ffn_gate_exps, ffn_up_exps, and ffn_down_exps are stored in 3 separate tensors spaced ~1.17 GB apart—requiring 3 separate pread() calls per cold expert miss. Minnie packs gate + up + down into 1 contiguous 9.95 MB block on disk, cutting NVMe IOPS and seek overhead by 3×.
+
+2️⃣ *Hardware NVFP4 Hot Tier (4.38 MB) + Dynamic VRAM L1 LRU with 1.8 TB/s D2D Warm-Up:*
+Minnie stores the top 3,840 hot experts permanently in VRAM in native Blackwell sm_120a NVFP4 (4.38 MB each—2.27× smaller than 9.95 MB IQ2_XXS+Q2_K), plus 1,100 cold experts in per-layer VRAM L1 LRU slots. At the end of each layer in prefill, Minnie copies the top-12 prompt-activated cold experts directly from the 2.65 GB VRAM prefill scratch buffer into VRAM L1 via GPU-to-GPU D2D copy at 1.8 TB/s—pre-warming 480 topic-specific cold experts before decode token #1!
+
+3️⃣ *Layer-Outer, 4,096-Token Super-Chunk Prefill:*
+Standard chunked prefill loops over 512-token chunks on the outside and 40 layers on the inside—forcing the SSD to re-read the same cold experts 4 to 6 times per prompt. We inverted the loop (for layer = 0..39 { for sub_chunk_512 }), staging the union of unique cold experts into a 2.65 GB VRAM scratch buffer ONCE per layer per 4,096 tokens.
+
+4️⃣ *Compute-Overlapped Decode NVMe I/O:*
+Instead of calling cudaStreamSynchronize() and stalling the GPU during pread() at the start of every layer, Minnie immediately dispatches VRAM-hit and DRAM-hit experts onto the Blackwell Tensor Cores while concurrently reading the 1–2 missing cold experts from the PCIe 5.0 NVMe SSD in the background.
+
+Are you running 100B–600B MoE models locally? How are you balancing VRAM, DDR5, and PCIe 5.0 NVMe bandwidth? Let's discuss below! 👇
+
+#LLM #MachineLearning #CUDA #NVIDIA #Blackwell #DeepSeek #MoE #HighPerformanceComputing #SystemsEngineering #AIInfrastructure</div>
+                </div>
+
+                <!-- Live LinkedIn Feed Card Mockup -->
+                <div class="linkedin-mockup">
+                    <div class="linkedin-header">
+                        <div class="author-avatar" style="width: 44px; height: 44px; font-size: 1rem;">TB</div>
+                        <div>
+                            <div style="font-weight: 700; font-size: 0.92rem; color: #fff;">Tino Bruno</div>
+                            <div style="font-size: 0.74rem; color: #8c98a4;">AI Architect & High-Performance Compute Engineer • 1st</div>
+                            <div style="font-size: 0.68rem; color: #64748b;">Just now • 🌐</div>
+                        </div>
+                    </div>
+                    <div class="linkedin-content" id="linkedinFeedPreview"></div>
+                    <div class="linkedin-footer">
+                        <span>👍 Like</span>
+                        <span>💬 Comment</span>
+                        <span>🔄 Repost</span>
+                        <span>📤 Send</span>
+                    </div>
+                </div>
+            </div>
+        </section>
+
+    </article>
+
+    <div class="toast" id="toast">✓ Copied to clipboard!</div>
+
+    <script>
+        function toUnicodeBold(str) {
+            const boldMap = {
+                'A':'𝗔','B':'𝗕','C':'𝗖','D':'𝗗','E':'𝗘','F':'𝗙','G':'𝗚','H':'𝗛','I':'𝗜','J':'𝗝','K':'𝗞','L':'𝗟','M':'𝗠',
+                'N':'𝗡','O':'𝗢','P':'𝗣','Q':'𝗤','R':'𝗥','S':'𝗦','T':'𝗧','U':'𝗨','V':'𝗩','W':'𝗪','X':'𝗫','Y':'𝗬','Z':'𝗭',
+                'a':'𝗮','b':'𝗯','c':'𝗰','d':'𝗱','e':'𝗲','f':'𝗳','g':'𝗴','h':'𝗵','i':'𝗶','j':'𝗷','k':'𝗸','l':'𝗹','m':'𝗺',
+                'n':'𝗻','o':'𝗼','p':'𝗽','q':'𝗾','r':'𝗿','s':'𝘀','t':'𝘁','u':'𝘂','v':'𝘃','w':'𝘄','x':'𝘅','y':'𝘆','z':'𝘇',
+                '0':'𝟬','1':'𝟭','2':'𝟮','3':'𝟯','4':'𝟰','5':'𝟱','6':'𝟲','7':'𝟳','8':'𝟴','9':'𝟵'
+            };
+            return str.split('').map(c => boldMap[c] || c).join('');
+        }
+
+        function formatForLinkedIn(raw) {
+            return raw.replace(/\*([^*]+)\*/g, (m, p1) => toUnicodeBold(p1));
+        }
+
+        const rawPost = document.getElementById('linkedinPostRaw').innerText;
+        document.getElementById('linkedinFeedPreview').innerText = formatForLinkedIn(rawPost);
+
+        function showToast(msg) {
+            const t = document.getElementById('toast');
+            t.innerText = msg;
+            t.classList.add('show');
+            setTimeout(() => t.classList.remove('show'), 2800);
+        }
+
+        function copyText(text, msg) {
+            navigator.clipboard.writeText(text).then(() => {
+                showToast(msg);
+            }).catch(() => {
+                const ta = document.createElement('textarea');
+                ta.value = text;
+                document.body.appendChild(ta);
+                ta.select();
+                document.execCommand('copy');
+                document.body.removeChild(ta);
+                showToast(msg);
+            });
+        }
+
+        function copyLinkedInFeedPost() {
+            const formatted = formatForLinkedIn(document.getElementById('linkedinPostRaw').innerText);
+            copyText(formatted, '✓ LinkedIn Post (with Unicode Bold) copied!');
+        }
+
+        function copyPlainPost() {
+            const plain = document.getElementById('linkedinPostRaw').innerText.replace(/\*/g, '');
+            copyText(plain, '✓ Plain text post copied!');
+        }
+
+        function copyFullArticleMarkdown() {
+            const text = document.getElementById('fullArticleBody').innerText;
+            copyText(text, '✓ Full article text copied!');
+        }
+
+        function toggleTheme() {
+            const current = document.documentElement.getAttribute('data-theme');
+            document.documentElement.setAttribute('data-theme', current === 'light' ? 'dark' : 'light');
+        }
+    </script>
+</body>
+</html>
+

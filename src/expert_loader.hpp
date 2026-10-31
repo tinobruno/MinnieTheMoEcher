@@ -4,6 +4,9 @@
 #include "platform/platform_io.hpp"
 #include "thread_pool.h"
 #include <future>
+#include <filesystem>
+#include <fstream>
+#include <algorithm>
 
 // ════════════════════════════════════════════════════════════════════════════════
 //  O_DIRECT Expert Loader with LRU Cache
@@ -17,13 +20,14 @@ struct ExpertCacheEntry {
     void* gpu_data = nullptr;   // pointer into expert cache pool
     int slot_index = -1;
     uint32_t prefill_epoch = 0;
+    bool is_pinned = true;
     std::atomic<bool> is_ready{true};
 
     ExpertCacheEntry() = default;
     ExpertCacheEntry(const ExpertCacheEntry& o)
         : layer_id(o.layer_id), expert_id(o.expert_id), last_used(o.last_used),
           active_req(o.active_req), gpu_data(o.gpu_data), slot_index(o.slot_index),
-          prefill_epoch(o.prefill_epoch), is_ready(o.is_ready.load()) {}
+          prefill_epoch(o.prefill_epoch), is_pinned(o.is_pinned), is_ready(o.is_ready.load()) {}
     ExpertCacheEntry& operator=(const ExpertCacheEntry& o) {
         layer_id = o.layer_id;
         expert_id = o.expert_id;
@@ -32,6 +36,7 @@ struct ExpertCacheEntry {
         gpu_data = o.gpu_data;
         slot_index = o.slot_index;
         prefill_epoch = o.prefill_epoch;
+        is_pinned = o.is_pinned;
         is_ready.store(o.is_ready.load());
         return *this;
     }
@@ -66,12 +71,14 @@ public:
     int dram_static_capacity_ = 0;
     int dram_dynamic_capacity_ = 0;
     void* dram_cache_pool_ = nullptr;
+    void* virtual_cache_pool_ = nullptr;
     bool dram_is_pinned_ = false;  // True if DRAM cache is pinned (cudaMallocHost or cudaHostRegister succeeded)
     std::vector<ExpertCacheEntry> dram_cache_slots_;
     std::unordered_map<int64_t, int> dram_key_to_slot_; // (layer*n_experts+expert) -> L2 slot index
     std::vector<void*> flat_dram_ptrs_;                 // Lock-free flat array for 0-latency DRAM lookups
     std::vector<int> flat_dram_slots_;                  // Lock-free flat array of DRAM slot indices (-1 if not in L2)
     int dram_clock_hand_ = 0;
+    int dram_allocated_slots_ = 0;
 
     // Pinned staging buffers for DMA when DRAM cache is unpinned
     // cudaMemcpyAsync from pageable memory is SYNCHRONOUS — it blocks the stream.
@@ -89,7 +96,8 @@ public:
     std::vector<StagingBuffer> staging_ring_;
     int staging_idx_ = 0;
 
-    std::atomic<int64_t> access_counter_{0};
+    std::atomic<int64_t> access_counter_{10000000};
+    std::atomic<int64_t> prefill_lru_counter_{1000};
     std::mutex cache_mutex_;
 
     // L2 victim cache: writeback stream for async VRAM→DRAM demotion
@@ -100,10 +108,24 @@ public:
     bool is_mixed_ = false;
     moecher::platform::DirectFileHandle expert_file_cold_;
     moecher::platform::DirectFileHandle expert_file_hot_;
+    moecher::platform::MemoryMappedFile expert_mmap_cold_;
     int cold_block_size_ = 7077888;
     int hot_block_size_ = 10223616;
     void* hot_pool_gpu_ = nullptr;
     void* cold_pool_gpu_ = nullptr;
+    int cold_vram_capacity_ = 0;
+    std::vector<void*> cold_vram_ptrs_;
+    std::vector<int> cold_vram_slots_;
+    std::vector<int> cold_vram_slot_owner_;
+    std::vector<int64_t> cold_vram_slot_lru_;
+    std::vector<uint32_t> cold_vram_slot_epoch_;
+    std::vector<int> layer_cold_vram_dyn_begin_;
+    std::vector<int> layer_cold_vram_dyn_end_;
+    std::vector<int> cold_vram_targets_;
+    std::vector<int> cold_dram_targets_;
+    std::vector<int64_t> cold_dram_target_init_lru_;
+    std::vector<int> layer_dram_dyn_begin_;
+    std::vector<int> layer_dram_dyn_end_;
     std::vector<uint8_t> expert_type_map_host_;
     GPUTensor expert_type_map_gpu_;
 
@@ -127,6 +149,67 @@ public:
             return flat_vram_ptrs_[key];
         }
         return nullptr;
+    }
+
+    inline void* get_cold_vram_ptr(int layer_id, int expert_id) {
+        int64_t key = (int64_t)layer_id * n_experts_ + expert_id;
+        if (key >= 0 && key < (int64_t)cold_vram_ptrs_.size()) {
+            void* ptr = cold_vram_ptrs_[key];
+            if (ptr && key < (int64_t)cold_vram_slots_.size()) {
+                int slot = cold_vram_slots_[key];
+                if (slot >= 0 && slot < cold_vram_capacity_) {
+                    int64_t next_acc = ++access_counter_;
+                    if (next_acc > cold_vram_slot_lru_[slot]) {
+                        cold_vram_slot_lru_[slot] = next_acc;
+                    }
+                    cold_vram_slot_epoch_[slot] = current_request_epoch_.load(std::memory_order_relaxed);
+                }
+            }
+            return ptr;
+        }
+        return nullptr;
+    }
+
+    inline void* allocate_cold_vram_l1_slot(int layer_id, int expert_id) {
+        if (!cold_pool_gpu_ || layer_id < 0 || layer_id >= (int)layer_cold_vram_dyn_begin_.size()) return nullptr;
+        int l_begin = layer_cold_vram_dyn_begin_[layer_id];
+        int l_end = layer_cold_vram_dyn_end_[layer_id];
+        if (l_end <= l_begin) return nullptr;
+
+        int64_t key = (int64_t)layer_id * n_experts_ + expert_id;
+        if (key >= 0 && key < (int64_t)cold_vram_ptrs_.size() && cold_vram_ptrs_[key] != nullptr) {
+            return get_cold_vram_ptr(layer_id, expert_id);
+        }
+
+        uint32_t cur_epoch = current_request_epoch_.load(std::memory_order_relaxed);
+        int evict_slot = -1;
+        int64_t oldest_lru = INT64_MAX;
+        for (int s = l_begin; s < l_end; s++) {
+            if (cold_vram_slot_epoch_[s] == cur_epoch) continue;
+            if (cold_vram_slot_lru_[s] < oldest_lru) {
+                oldest_lru = cold_vram_slot_lru_[s];
+                evict_slot = s;
+            }
+        }
+        if (evict_slot < 0) return nullptr;
+
+        int old_key = cold_vram_slot_owner_[evict_slot];
+        if (old_key >= 0 && old_key < (int)cold_vram_ptrs_.size()) {
+            cold_vram_ptrs_[old_key] = nullptr;
+            cold_vram_slots_[old_key] = -1;
+            flat_vram_ptrs_[old_key] = nullptr;
+        }
+
+        void* dst_ptr = (char*)cold_pool_gpu_ + (size_t)evict_slot * cold_block_size_;
+        cold_vram_slot_owner_[evict_slot] = (int)key;
+        cold_vram_slot_lru_[evict_slot] = ++access_counter_;
+        cold_vram_slot_epoch_[evict_slot] = cur_epoch;
+        if (key >= 0 && key < (int64_t)cold_vram_ptrs_.size()) {
+            cold_vram_ptrs_[key] = dst_ptr;
+            cold_vram_slots_[key] = evict_slot;
+            flat_vram_ptrs_[key] = dst_ptr;
+        }
+        return dst_ptr;
     }
 
     int cold_block_size() const { return cold_block_size_; }
@@ -156,7 +239,10 @@ public:
         if (key >= 0 && key < (int64_t)flat_dram_slots_.size()) {
             int slot = flat_dram_slots_[key];
             if (slot >= 0 && slot < dram_cache_capacity_) {
-                dram_cache_slots_[slot].last_used = ++access_counter_;
+                int64_t next_acc = ++access_counter_;
+                if (next_acc > dram_cache_slots_[slot].last_used) {
+                    dram_cache_slots_[slot].last_used = next_acc;
+                }
                 uint32_t cur_epoch = current_request_epoch_.load(std::memory_order_relaxed);
                 dram_cache_slots_[slot].active_req = cur_epoch;
                 if (in_prefill_) {
@@ -173,7 +259,10 @@ public:
         if (key >= 0 && key < (int64_t)flat_dram_slots_.size()) {
             int slot = flat_dram_slots_[key];
             if (slot >= 0 && slot < dram_cache_capacity_) {
-                dram_cache_slots_[slot].last_used = ++access_counter_;
+                int64_t next_acc = ++access_counter_;
+                if (next_acc > dram_cache_slots_[slot].last_used) {
+                    dram_cache_slots_[slot].last_used = next_acc;
+                }
                 uint32_t cur_epoch = current_request_epoch_.load(std::memory_order_relaxed);
                 dram_cache_slots_[slot].active_req = cur_epoch;
                 if (in_prefill_) {
@@ -196,7 +285,10 @@ public:
             auto it = dram_key_to_slot_.find(key);
             if (it != dram_key_to_slot_.end()) {
                 int slot = it->second;
-                dram_cache_slots_[slot].last_used = ++access_counter_;
+                int64_t next_acc = ++access_counter_;
+                if (next_acc > dram_cache_slots_[slot].last_used) {
+                    dram_cache_slots_[slot].last_used = next_acc;
+                }
                 dram_cache_slots_[slot].active_req = cur_epoch;
                 if (in_prefill_) {
                     dram_cache_slots_[slot].prefill_epoch = cur_epoch;
@@ -208,116 +300,142 @@ public:
                 }
                 return ptr;
             }
-            access_counter_++;
-            int dyn_base = (dram_static_capacity_ > 0 && dram_dynamic_capacity_ > 0) ? dram_static_capacity_ : 0;
-            int dyn_count = (dram_static_capacity_ > 0 && dram_dynamic_capacity_ > 0) ? dram_dynamic_capacity_ : dram_cache_capacity_;
-
+        }
+        if (dram_cache_capacity_ > 0 && (!is_mixed_ || dram_dynamic_capacity_ > 0)) {
+            uint32_t cur_epoch = current_request_epoch_.load(std::memory_order_relaxed);
+            int64_t cur_acc = ++access_counter_;
             int evict_dram = -1;
-            int64_t oldest_dram = INT64_MAX;
-            // Fast clock LRU strictly protecting active request epoch and prefill-pinned slots for current request:
-            for (int s = 0; s < 64 && s < dyn_count; s++) {
-                int cand = dyn_base + ((dram_clock_hand_ + s * 37) % dyn_count);
-                if (dram_cache_slots_[cand].prefill_epoch == cur_epoch) continue;
-                if (dram_cache_slots_[cand].active_req == cur_epoch) continue;
-                if (dram_cache_slots_[cand].layer_id < 0) {
-                    evict_dram = cand;
-                    break;
-                }
-                if (dram_cache_slots_[cand].last_used < oldest_dram && dram_cache_slots_[cand].is_ready.load(std::memory_order_relaxed)) {
-                    oldest_dram = dram_cache_slots_[cand].last_used;
-                    evict_dram = cand;
-                }
-            }
-            if (evict_dram < 0) {
-                // Scan linear dynamic range for any slot not in current active request and not prefill pinned in current request
-                for (int s = 0; s < dyn_count; s++) {
-                    int cand = dyn_base + ((dram_clock_hand_ + s) % dyn_count);
-                    if (dram_cache_slots_[cand].prefill_epoch == cur_epoch) continue;
-                    if (dram_cache_slots_[cand].active_req != cur_epoch && dram_cache_slots_[cand].is_ready.load(std::memory_order_relaxed)) {
+            if (is_mixed_ && layer_id >= 0 && layer_id < (int)layer_dram_dyn_begin_.size() &&
+                layer_dram_dyn_end_[layer_id] > layer_dram_dyn_begin_[layer_id]) {
+                int l_begin = layer_dram_dyn_begin_[layer_id];
+                int l_end = layer_dram_dyn_end_[layer_id];
+                int64_t oldest_dram = INT64_MAX;
+                for (int cand = l_begin; cand < l_end; cand++) {
+                    if (!dram_cache_slots_[cand].is_ready.load(std::memory_order_acquire)) continue;
+                    if (dram_cache_slots_[cand].active_req == cur_epoch) continue;
+                    if (dram_cache_slots_[cand].layer_id < 0) {
                         evict_dram = cand;
                         break;
                     }
-                }
-            }
-            // Fallback if all slots are either prefill pinned or active in current request:
-            if (evict_dram < 0 && in_prefill_) {
-                // Prefill can recycle older prefill-pinned slots if DRAM is saturated with prefill
-                for (int s = 0; s < dyn_count; s++) {
-                    int cand = dyn_base + ((dram_clock_hand_ + s) % dyn_count);
-                    if (dram_cache_slots_[cand].active_req != cur_epoch && dram_cache_slots_[cand].is_ready.load(std::memory_order_relaxed)) {
-                        dram_cache_slots_[cand].prefill_epoch = 0;
+                    if (dram_cache_slots_[cand].last_used < oldest_dram) {
+                        oldest_dram = dram_cache_slots_[cand].last_used;
                         evict_dram = cand;
-                        break;
+                    }
+                }
+            } else if (!is_mixed_) {
+                int dyn_base = (dram_static_capacity_ > 0 && dram_dynamic_capacity_ > 0) ? dram_static_capacity_ : 0;
+                int dyn_count = (dram_static_capacity_ > 0 && dram_dynamic_capacity_ > 0) ? dram_dynamic_capacity_ : dram_cache_capacity_;
+
+                // 1. Prefer unallocated empty slots before performing any evictions!
+                if (dram_allocated_slots_ < dyn_count) {
+                    evict_dram = dyn_base + dram_allocated_slots_++;
+                } else {
+                    int64_t oldest_dram = INT64_MAX;
+                    for (int s = 0; s < 128 && s < dyn_count; s++) {
+                        int cand = dyn_base + ((dram_clock_hand_ + s) % dyn_count);
+                        if (!dram_cache_slots_[cand].is_ready.load(std::memory_order_relaxed)) continue;
+                        if (dram_cache_slots_[cand].active_req == cur_epoch && dram_cache_slots_[cand].layer_id == layer_id) continue;
+                        if (dram_cache_slots_[cand].layer_id < 0) {
+                            evict_dram = cand;
+                            break;
+                        }
+                        if (dram_cache_slots_[cand].last_used < oldest_dram) {
+                            oldest_dram = dram_cache_slots_[cand].last_used;
+                            evict_dram = cand;
+                            if (oldest_dram <= 0) break;
+                        }
+                    }
+                    if (evict_dram < 0) {
+                        for (int s = 0; s < dyn_count; s++) {
+                            int cand = dyn_base + ((dram_clock_hand_ + s) % dyn_count);
+                            if (!dram_cache_slots_[cand].is_ready.load(std::memory_order_relaxed)) continue;
+                            if (dram_cache_slots_[cand].active_req == cur_epoch && dram_cache_slots_[cand].layer_id == layer_id) continue;
+                            if (dram_cache_slots_[cand].last_used < oldest_dram) {
+                                oldest_dram = dram_cache_slots_[cand].last_used;
+                                evict_dram = cand;
+                                if (oldest_dram <= 0) break;
+                            }
+                        }
+                    }
+                    if (evict_dram >= dyn_base) {
+                        dram_clock_hand_ = (evict_dram - dyn_base + 1) % dyn_count;
+                    } else {
+                        evict_dram = dyn_base + (dram_clock_hand_ % dyn_count);
+                        dram_clock_hand_ = (dram_clock_hand_ + 1) % dyn_count;
                     }
                 }
             }
-            if (evict_dram < 0) {
-                // Decode MUST NOT touch current request's prefill-pinned slots; evict oldest unpinned slot
-                for (int s = 0; s < dyn_count; s++) {
-                    int cand = dyn_base + ((dram_clock_hand_ + s) % dyn_count);
-                    if (dram_cache_slots_[cand].prefill_epoch != cur_epoch && dram_cache_slots_[cand].is_ready.load(std::memory_order_relaxed)) {
-                        evict_dram = cand;
-                        break;
+
+            if (evict_dram >= 0) {
+                auto& dslot = dram_cache_slots_[evict_dram];
+                if (dslot.layer_id >= 0) {
+                    int64_t old_dram_key = (int64_t)dslot.layer_id * n_experts_ + dslot.expert_id;
+                    dram_key_to_slot_.erase(old_dram_key);
+                    if (old_dram_key >= 0 && old_dram_key < (int64_t)flat_dram_slots_.size()) {
+                        flat_dram_slots_[old_dram_key] = -1;
+                        flat_dram_ptrs_[old_dram_key] = nullptr;
                     }
                 }
-            }
-            if (evict_dram < 0) evict_dram = dyn_base + (dram_clock_hand_ % dyn_count);
-            dram_clock_hand_ = (dram_clock_hand_ + 1) % dyn_count;
+                dslot.layer_id = layer_id;
+                dslot.expert_id = expert_id;
+                dslot.last_used = in_prefill_ ? (++prefill_lru_counter_) : cur_acc;
+                dslot.active_req = cur_epoch;
+                dslot.prefill_epoch = in_prefill_ ? cur_epoch : 0;
+                dslot.is_ready.store(false, std::memory_order_release);
+                dram_key_to_slot_[key] = evict_dram;
 
-            auto& dslot = dram_cache_slots_[evict_dram];
-            if (dslot.layer_id >= 0) {
-                int64_t old_dram_key = (int64_t)dslot.layer_id * n_experts_ + dslot.expert_id;
-                dram_key_to_slot_.erase(old_dram_key);
-                if (old_dram_key >= 0 && old_dram_key < (int64_t)flat_dram_slots_.size()) {
-                    flat_dram_slots_[old_dram_key] = -1;
-                    flat_dram_ptrs_[old_dram_key] = nullptr;
+                int64_t file_offset = is_mixed_ ? ((int64_t)key * cold_block_size_) : ((int64_t)key * expert_block_size_);
+                size_t cur_block_size = is_mixed_ ? cold_block_size_ : expert_block_size_;
+                void* dst_ptr = dslot.gpu_data;
+
+                // Release lock before I/O so other threads can reserve slots and do I/O concurrently!
+                lock.unlock();
+
+                if (is_mixed_) {
+                    if (expert_mmap_cold_.is_open() && (size_t)(file_offset + cur_block_size) <= expert_mmap_cold_.size()) {
+                        std::memcpy(dst_ptr, (const char*)expert_mmap_cold_.data() + file_offset, cur_block_size);
+                    } else {
+                        expert_file_cold_.pread_exact(dst_ptr, cur_block_size, file_offset);
+                        cold_disk_reads_++;
+                    }
+                } else if (expert_file_.is_open() && !use_buffered_io_) {
+                    expert_file_.pread_exact(dst_ptr, expert_block_size_, file_offset);
+                    cold_disk_reads_++;
+                } else if (expert_mmap_.is_open() && (size_t)(file_offset + expert_block_size_) <= expert_mmap_.size()) {
+                    std::memcpy(dst_ptr, (const char*)expert_mmap_.data() + file_offset, expert_block_size_);
+                } else {
+                    expert_file_.pread_exact(dst_ptr, expert_block_size_, file_offset);
+                    cold_disk_reads_++;
                 }
+
+                dslot.is_ready.store(true, std::memory_order_release);
+
+                lock.lock();
+                if (dslot.layer_id == layer_id && dslot.expert_id == expert_id &&
+                    key >= 0 && key < (int64_t)flat_dram_slots_.size()) {
+                    flat_dram_ptrs_[key] = dst_ptr;
+                    flat_dram_slots_[key] = evict_dram;
+                }
+                return dst_ptr;
             }
-            dslot.layer_id = layer_id;
-            dslot.expert_id = expert_id;
-            dslot.last_used = access_counter_;
-            dslot.active_req = cur_epoch;
-            dslot.prefill_epoch = in_prefill_ ? cur_epoch : 0;
-            dslot.is_ready.store(false, std::memory_order_release);
-            dram_key_to_slot_[key] = evict_dram;
-
-            int64_t file_offset = is_mixed_ ? ((int64_t)key * cold_block_size_) : ((int64_t)key * expert_block_size_);
-            size_t cur_block_size = is_mixed_ ? cold_block_size_ : expert_block_size_;
-            cold_disk_reads_++;
-            void* dst_ptr = dslot.gpu_data;
-
-            // Release lock before I/O so other threads can reserve slots and do I/O concurrently!
-            lock.unlock();
-
-            if (is_mixed_) {
-                expert_file_cold_.pread_exact(dst_ptr, cur_block_size, file_offset);
-            } else if (expert_file_.is_open() && !use_buffered_io_) {
-                expert_file_.pread_exact(dst_ptr, expert_block_size_, file_offset);
-            } else if (expert_mmap_.is_open() && (size_t)(file_offset + expert_block_size_) <= expert_mmap_.size()) {
-                std::memcpy(dst_ptr, (const char*)expert_mmap_.data() + file_offset, expert_block_size_);
-            } else {
-                expert_file_.pread_exact(dst_ptr, expert_block_size_, file_offset);
-            }
-
-            dslot.is_ready.store(true, std::memory_order_release);
-
-            lock.lock();
-            if (key >= 0 && key < (int64_t)flat_dram_slots_.size()) {
-                flat_dram_ptrs_[key] = dst_ptr;
-                flat_dram_slots_[key] = evict_dram;
-            }
-            return dst_ptr;
-        } else {
+        }
+        {
             int stage_idx = staging_idx_;
             staging_idx_ = (staging_idx_ + 1) % NUM_STAGING_BUFFERS;
+            lock.unlock();
             auto& stage = staging_ring_[stage_idx];
             int64_t file_offset = is_mixed_ ? ((int64_t)key * cold_block_size_) : ((int64_t)key * expert_block_size_);
             size_t cur_block_size = is_mixed_ ? cold_block_size_ : expert_block_size_;
-            cold_disk_reads_++;
             if (is_mixed_) {
-                expert_file_cold_.pread_exact(stage.ptr, cur_block_size, file_offset);
+                if (expert_mmap_cold_.is_open() && (size_t)(file_offset + cur_block_size) <= expert_mmap_cold_.size()) {
+                    std::memcpy(stage.ptr, (const char*)expert_mmap_cold_.data() + file_offset, cur_block_size);
+                } else {
+                    expert_file_cold_.pread_exact(stage.ptr, cur_block_size, file_offset);
+                    cold_disk_reads_++;
+                }
             } else {
                 expert_file_.pread_exact(stage.ptr, expert_block_size_, file_offset);
+                cold_disk_reads_++;
             }
             return stage.ptr;
         }
@@ -602,6 +720,10 @@ public:
                               total_experts, cudaMemcpyHostToDevice));
 
         flat_vram_ptrs_.assign(total_experts, nullptr);
+        cold_vram_ptrs_.assign(total_experts, nullptr);
+        cold_vram_targets_.clear();
+        cold_dram_targets_.clear();
+        cold_vram_capacity_ = 0;
         flat_vram_ptrs_gpu_.alloc((size_t)total_experts * sizeof(void*));
 
         if (total_bytes <= free_vram - 4ULL * 1024 * 1024 * 1024) {
@@ -610,6 +732,7 @@ public:
             CUDA_CHECK(cudaMalloc(&hot_pool_gpu_, hot_bytes));
             CUDA_CHECK(cudaMalloc(&cold_pool_gpu_, cold_bytes));
             cache_capacity_ = total_experts;
+            cold_vram_capacity_ = total_cold;
 
             int cur_hot = 0;
             int cur_cold = 0;
@@ -618,13 +741,16 @@ public:
                     flat_vram_ptrs_[i] = (char*)hot_pool_gpu_ + (size_t)cur_hot * hot_block_size;
                     cur_hot++;
                 } else {
-                    flat_vram_ptrs_[i] = (char*)cold_pool_gpu_ + (size_t)cur_cold * cold_block_size;
+                    void* ptr = (char*)cold_pool_gpu_ + (size_t)cur_cold * cold_block_size;
+                    flat_vram_ptrs_[i] = ptr;
+                    cold_vram_ptrs_[i] = ptr;
+                    cold_vram_targets_.push_back(i);
                     cur_cold++;
                 }
             }
         } else {
-            // Hierarchical Mixed Mode (Hot: VRAM, Cold: DRAM + SSD)
-            LOG_INFO("ExpertLoader: Hierarchical Mixed mode (Hot in VRAM, Cold in DRAM/SSD)");
+            // Hierarchical Mixed Mode (Hot + Top Cold in VRAM L1, Next Top Cold in Pinned DRAM L2, Inactive Cold on SSD)
+            LOG_INFO("ExpertLoader: Hierarchical Mixed mode (Hot + Top Cold in VRAM L1, Next Top Cold in DRAM L2)");
             CUDA_CHECK(cudaMalloc(&hot_pool_gpu_, hot_bytes));
             cold_pool_gpu_ = nullptr;
             cache_capacity_ = total_hot;
@@ -639,64 +765,256 @@ public:
                 }
             }
 
-            // Allocate L2 DRAM cache for cold experts
-            dram_cache_capacity_ = (int)(dram_budget_bytes / cold_block_size);
-            if (dram_cache_capacity_ > 0) {
-                dram_static_capacity_ = (dram_cache_capacity_ > 2000) ? 1000 : (dram_cache_capacity_ / 4);
-                dram_dynamic_capacity_ = dram_cache_capacity_ - dram_static_capacity_;
-                LOG_INFO("Expert L2 cache: %d cold slots (%.1f GB) [Static: %d, Dynamic: %d]",
-                         dram_cache_capacity_,
-                         (double)dram_cache_capacity_ * cold_block_size / (1024.0 * 1024.0 * 1024.0),
-                         dram_static_capacity_, dram_dynamic_capacity_);
-
-                size_t total_dram_bytes = (size_t)dram_cache_capacity_ * cold_block_size;
-                size_t try_bytes = total_dram_bytes;
-                cudaError_t err = cudaErrorMemoryAllocation;
-                while (try_bytes >= (size_t)cold_block_size) {
-                    err = cudaMallocHost(&dram_cache_pool_, try_bytes);
-                    if (err == cudaSuccess) break;
-                    cudaGetLastError();
-                    if (try_bytes <= 512ULL * 1024 * 1024) break;
-                    try_bytes -= 512ULL * 1024 * 1024;
+            // Load activation frequencies from companion counts.json to rank Cold experts by actual usage
+            std::vector<uint32_t> cold_freq_counts(total_experts, 0);
+            bool has_counts = false;
+            try {
+                std::filesystem::path base_dir = std::filesystem::path(cold_bin_path).parent_path();
+                std::filesystem::path counts_path = base_dir / "deepseek_v41_imatrix.dat.counts.json";
+                if (!std::filesystem::exists(counts_path)) {
+                    counts_path = base_dir / "imatrix.dat.counts.json";
                 }
-                if (err == cudaSuccess) {
-                    total_dram_bytes = try_bytes;
-                    dram_cache_capacity_ = (int)(total_dram_bytes / cold_block_size);
-                    dram_static_capacity_ = (dram_cache_capacity_ > 2000) ? 1000 : (dram_cache_capacity_ / 4);
-                    dram_dynamic_capacity_ = dram_cache_capacity_ - dram_static_capacity_;
-                    dram_is_pinned_ = true;
-                    LOG_INFO("Allocated %.1f GB PINNED DRAM cache with cudaMallocHost (%d cold slots)",
-                             (double)total_dram_bytes / (1024.0 * 1024.0 * 1024.0), dram_cache_capacity_);
-                } else {
-#if defined(_WIN32) || defined(_WIN64)
-                    dram_cache_pool_ = VirtualAlloc(NULL, total_dram_bytes, MEM_COMMIT | MEM_RESERVE, PAGE_READWRITE);
-#else
-                    dram_cache_pool_ = aligned_alloc(4096, total_dram_bytes);
-#endif
-                    if (dram_cache_pool_) {
-                        cudaError_t reg_err = cudaHostRegister(dram_cache_pool_, total_dram_bytes, cudaHostRegisterDefault);
-                        if (reg_err != cudaSuccess) {
-                            cudaGetLastError();
-                            dram_is_pinned_ = false;
-                            LOG_INFO("Allocated %.1f GB DRAM cache in physical RAM",
-                                     (double)total_dram_bytes / (1024.0 * 1024.0 * 1024.0));
-                        } else {
-                            dram_is_pinned_ = true;
-                            LOG_INFO("Pinned %.1f GB DRAM cache into physical RAM with cudaHostRegister",
-                                     (double)total_dram_bytes / (1024.0 * 1024.0 * 1024.0));
+                if (std::filesystem::exists(counts_path)) {
+                    std::ifstream cf(counts_path);
+                    if (cf.is_open()) {
+                        nlohmann::json cj;
+                        cf >> cj;
+                        uint64_t total_cold_acts = 0;
+                        for (int l = 0; l < n_layers; l++) {
+                            std::string lkey = "layer_" + std::to_string(l);
+                            if (cj.contains(lkey) && cj[lkey].is_array()) {
+                                auto& arr = cj[lkey];
+                                int lim = std::min((int)arr.size(), n_experts);
+                                for (int e = 0; e < lim; e++) {
+                                    int gidx = l * n_experts + e;
+                                    uint32_t c = arr[e].get<uint32_t>();
+                                    cold_freq_counts[gidx] = c;
+                                    if (expert_type_map_host_[gidx] == 0) total_cold_acts += c;
+                                }
+                            }
                         }
-                    } else {
-                        LOG_ERROR("System RAM allocation also failed. Disabling L2 DRAM cache.");
-                        dram_cache_capacity_ = 0;
+                        if (total_cold_acts > 0) {
+                            has_counts = true;
+                            LOG_INFO("ExpertLoader: Loaded Cold expert frequency ranking from %s (%llu cold activations)",
+                                     counts_path.string().c_str(), (unsigned long long)total_cold_acts);
+                        }
                     }
                 }
+            } catch (...) {
+                LOG_WARN("ExpertLoader: Failed to parse imatrix counts.json; falling back to balanced layer order");
+            }
 
-                if (dram_cache_capacity_ > 0 && dram_cache_pool_) {
-                    dram_cache_slots_.resize(dram_cache_capacity_);
-                    for (int i = 0; i < dram_cache_capacity_; i++) {
-                        dram_cache_slots_[i].slot_index = i;
-                        dram_cache_slots_[i].gpu_data = (char*)dram_cache_pool_ + (size_t)i * cold_block_size;
+            // Build per-layer ranked lists of Cold experts by activation frequency
+            std::vector<std::vector<int>> by_layer(n_layers);
+            for (int l = 0; l < n_layers; l++) {
+                by_layer[l].reserve(n_experts);
+                for (int e = 0; e < n_experts; e++) {
+                    int gidx = l * n_experts + e;
+                    if (expert_type_map_host_[gidx] == 0) {
+                        by_layer[l].push_back(gidx);
                     }
+                }
+                if (has_counts) {
+                    std::sort(by_layer[l].begin(), by_layer[l].end(), [&](int a, int b) {
+                        if (cold_freq_counts[a] != cold_freq_counts[b]) {
+                            return cold_freq_counts[a] > cold_freq_counts[b];
+                        }
+                        return a < b;
+                    });
+                }
+            }
+
+            // Allocate spare VRAM (after Hot pool, reserving 6.5 GB for working & prefill buffers + WDDM headroom) for Top Cold Experts!
+            size_t free_after_hot = 0, total_v = 0;
+            cudaMemGetInfo(&free_after_hot, &total_v);
+            size_t reserve_vram = 6656ULL * 1024 * 1024; // 6.5 GB reserved for working buffers + prefill batch buffers + WDDM safety margin
+            if (free_after_hot > reserve_vram + (size_t)cold_block_size) {
+                size_t cold_vram_budget = free_after_hot - reserve_vram;
+                int try_cold_slots = (int)std::min((size_t)total_cold, cold_vram_budget / (size_t)cold_block_size);
+                while (try_cold_slots > 0) {
+                    size_t alloc_bytes = (size_t)try_cold_slots * cold_block_size;
+                    if (cudaMalloc(&cold_pool_gpu_, alloc_bytes) == cudaSuccess) {
+                        cold_vram_capacity_ = try_cold_slots;
+                        cache_capacity_ += cold_vram_capacity_;
+                        LOG_INFO("Allocated %.2f GB VRAM L1 Cold Pool for Top-%d Cold Experts (zero PCIe DMA!)",
+                                 (double)alloc_bytes / (1024.0 * 1024.0 * 1024.0), cold_vram_capacity_);
+                        break;
+                    }
+                    cudaGetLastError();
+                    cold_pool_gpu_ = nullptr;
+                    try_cold_slots -= 64;
+                }
+            }
+
+            // Hybrid Per-Layer Floor + Global Frequency placement for VRAM L1 Cold Pool:
+            // Guarantee every layer at least per_layer_vram_floor slots so no layer is starved,
+            // then assign remaining VRAM L1 slots to highest-frequency Cold experts globally.
+            std::vector<uint8_t> cold_assigned(total_experts, 0);
+            cold_vram_targets_.reserve(cold_vram_capacity_);
+            if (has_counts && cold_vram_capacity_ > 0) {
+                int per_layer_vram_floor = std::min(24, cold_vram_capacity_ / std::max(1, n_layers));
+                for (int r = 0; r < per_layer_vram_floor && (int)cold_vram_targets_.size() < cold_vram_capacity_; r++) {
+                    for (int l = 0; l < n_layers && (int)cold_vram_targets_.size() < cold_vram_capacity_; l++) {
+                        if (r < (int)by_layer[l].size()) {
+                            int gidx = by_layer[l][r];
+                            if (!cold_assigned[gidx] && cold_freq_counts[gidx] > 0) {
+                                cold_assigned[gidx] = 1;
+                                cold_vram_targets_.push_back(gidx);
+                            }
+                        }
+                    }
+                }
+                if ((int)cold_vram_targets_.size() < cold_vram_capacity_) {
+                    std::vector<int> rem_vram;
+                    rem_vram.reserve(total_cold);
+                    for (int l = 0; l < n_layers; l++) {
+                        for (int gidx : by_layer[l]) {
+                            if (!cold_assigned[gidx]) rem_vram.push_back(gidx);
+                        }
+                    }
+                    std::sort(rem_vram.begin(), rem_vram.end(), [&](int a, int b) {
+                        if (cold_freq_counts[a] != cold_freq_counts[b]) {
+                            return cold_freq_counts[a] > cold_freq_counts[b];
+                        }
+                        int ea = a % n_experts, eb = b % n_experts;
+                        if (ea != eb) return ea < eb;
+                        return a < b;
+                    });
+                    for (int gidx : rem_vram) {
+                        if ((int)cold_vram_targets_.size() >= cold_vram_capacity_) break;
+                        cold_assigned[gidx] = 1;
+                        cold_vram_targets_.push_back(gidx);
+                    }
+                }
+            } else {
+                for (int e = 0; e < n_experts && (int)cold_vram_targets_.size() < cold_vram_capacity_; e++) {
+                    for (int l = 0; l < n_layers && (int)cold_vram_targets_.size() < cold_vram_capacity_; l++) {
+                        if (e < (int)by_layer[l].size()) {
+                            int gidx = by_layer[l][e];
+                            cold_assigned[gidx] = 1;
+                            cold_vram_targets_.push_back(gidx);
+                        }
+                    }
+                }
+            }
+
+            // Sort cold_vram_targets_ by layer_id and descending frequency so each layer owns a contiguous VRAM L1 slice
+            std::vector<std::vector<int>> vram_by_layer(n_layers);
+            for (int gidx : cold_vram_targets_) {
+                int l = gidx / n_experts;
+                if (l >= 0 && l < n_layers) vram_by_layer[l].push_back(gidx);
+            }
+            cold_vram_targets_.clear();
+            cold_vram_slots_.assign(total_experts, -1);
+            cold_vram_slot_owner_.assign(cold_vram_capacity_, -1);
+            cold_vram_slot_lru_.assign(cold_vram_capacity_, 0);
+            cold_vram_slot_epoch_.assign(cold_vram_capacity_, 0);
+            layer_cold_vram_dyn_begin_.assign(n_layers, 0);
+            layer_cold_vram_dyn_end_.assign(n_layers, 0);
+
+            for (int l = 0; l < n_layers; l++) {
+                if (has_counts) {
+                    std::sort(vram_by_layer[l].begin(), vram_by_layer[l].end(), [&](int a, int b) {
+                        if (cold_freq_counts[a] != cold_freq_counts[b]) {
+                            return cold_freq_counts[a] > cold_freq_counts[b];
+                        }
+                        return a < b;
+                    });
+                }
+                int l_start = (int)cold_vram_targets_.size();
+                int l_count = (int)vram_by_layer[l].size();
+                int static_vram = std::min(8, l_count / 3);
+                for (int i = 0; i < l_count; i++) {
+                    int gidx = vram_by_layer[l][i];
+                    int slot = (int)cold_vram_targets_.size();
+                    cold_vram_targets_.push_back(gidx);
+                    void* ptr = (char*)cold_pool_gpu_ + (size_t)slot * cold_block_size;
+                    cold_vram_ptrs_[gidx] = ptr;
+                    cold_vram_slots_[gidx] = slot;
+                    flat_vram_ptrs_[gidx] = ptr;
+                    cold_vram_slot_owner_[slot] = gidx;
+                    if (i < static_vram) {
+                        cold_vram_slot_lru_[slot] = INT64_MAX / 4;
+                    } else {
+                        cold_vram_slot_lru_[slot] = 1000LL + (has_counts ? (int64_t)cold_freq_counts[gidx] : 1LL);
+                    }
+                }
+                layer_cold_vram_dyn_begin_[l] = l_start + static_vram;
+                layer_cold_vram_dyn_end_[l] = (int)cold_vram_targets_.size();
+            }
+
+            // Allocate L2 DRAM cache for remaining cold experts:
+            int remaining_cold = total_cold - (int)cold_vram_targets_.size();
+            size_t try_bytes = (size_t)remaining_cold * cold_block_size;
+            if (try_bytes > dram_budget_bytes) try_bytes = dram_budget_bytes;
+            size_t max_pin_bytes = 42ULL * 1024 * 1024 * 1024;
+            if (try_bytes > max_pin_bytes) try_bytes = max_pin_bytes;
+            cudaError_t err = cudaErrorMemoryAllocation;
+            while (try_bytes >= (size_t)cold_block_size) {
+                err = cudaMallocHost(&dram_cache_pool_, try_bytes);
+                if (err == cudaSuccess) break;
+                cudaGetLastError();
+                if (try_bytes <= 512ULL * 1024 * 1024) break;
+                try_bytes -= 512ULL * 1024 * 1024;
+            }
+
+            int pinned_slots = 0;
+            if (err == cudaSuccess) {
+                pinned_slots = (int)(try_bytes / cold_block_size);
+                dram_is_pinned_ = true;
+                LOG_INFO("Allocated %.1f GB PINNED DRAM cache with cudaMallocHost (%d cold slots)",
+                         (double)try_bytes / (1024.0 * 1024.0 * 1024.0), pinned_slots);
+            }
+
+            dram_cache_capacity_ = pinned_slots;
+            int total_dram_preload = std::max(0, std::min(remaining_cold, dram_cache_capacity_));
+
+            cold_dram_targets_.clear();
+            cold_dram_targets_.reserve(total_dram_preload);
+            cold_dram_target_init_lru_.clear();
+            cold_dram_target_init_lru_.reserve(total_dram_preload);
+            layer_dram_dyn_begin_.assign(n_layers, 0);
+            layer_dram_dyn_end_.assign(n_layers, 0);
+            dram_static_capacity_ = 0;
+            dram_dynamic_capacity_ = 0;
+
+            if (total_dram_preload > 0 && n_layers > 0) {
+                int base_per_layer = total_dram_preload / n_layers;
+                int rem_layers = total_dram_preload % n_layers;
+                for (int l = 0; l < n_layers; l++) {
+                    int slots_for_l = base_per_layer + (l < rem_layers ? 1 : 0);
+                    int static_for_l = std::min(25, slots_for_l / 4);
+                    int added_for_l = 0;
+                    int static_added = 0;
+                    int l_slot_start = (int)cold_dram_targets_.size();
+                    for (int gidx : by_layer[l]) {
+                        if (added_for_l >= slots_for_l) break;
+                        if (!cold_assigned[gidx]) {
+                            cold_assigned[gidx] = 1;
+                            cold_dram_targets_.push_back(gidx);
+                            if (static_added < static_for_l) {
+                                cold_dram_target_init_lru_.push_back(INT64_MAX / 4);
+                                static_added++;
+                                dram_static_capacity_++;
+                            } else {
+                                int64_t freq_lru = 10000000LL + (has_counts ? (int64_t)cold_freq_counts[gidx] * 100LL : 1LL);
+                                cold_dram_target_init_lru_.push_back(freq_lru);
+                                dram_dynamic_capacity_++;
+                            }
+                            added_for_l++;
+                        }
+                    }
+                    layer_dram_dyn_begin_[l] = l_slot_start + static_added;
+                    layer_dram_dyn_end_[l] = (int)cold_dram_targets_.size();
+                }
+            }
+
+            if (dram_cache_capacity_ > 0) {
+                dram_cache_slots_.resize(dram_cache_capacity_);
+                for (int i = 0; i < dram_cache_capacity_; i++) {
+                    dram_cache_slots_[i].slot_index = i;
+                    dram_cache_slots_[i].gpu_data = (char*)dram_cache_pool_ + (size_t)i * cold_block_size;
+                    dram_cache_slots_[i].is_pinned = true;
                 }
             }
 
@@ -720,6 +1038,8 @@ public:
 
             flat_dram_ptrs_.assign((size_t)total_experts, nullptr);
             flat_dram_slots_.assign((size_t)total_experts, -1);
+            dram_allocated_slots_ = 0;
+            dram_clock_hand_ = 0;
         }
 
         return true;
@@ -1159,6 +1479,7 @@ public:
         int dram_to_load = (dram_cache_capacity_ > 0) ? std::min(total - to_load, dram_cache_capacity_) : 0;
         flat_dram_ptrs_.assign(total, nullptr);
         flat_dram_slots_.assign(total, -1);
+        dram_allocated_slots_ = 0;
         flat_vram_ptrs_.assign(total, nullptr);
         flat_vram_slots_.assign(total, -1);
         key_to_slot_.clear();
@@ -1493,11 +1814,11 @@ public:
         }
         workers.clear();
 
-        // 2. Cold experts preloading
-        if (cold_pool_gpu_) {
-            // 100% VRAM resident cold pool
-            int num_cold = (int)cold_indices.size();
-            LOG_INFO("Preloading %d Cold experts into VRAM (IQ2_XXS)...", num_cold);
+        // 2a. Cold experts preloading into VRAM L1 Cold Pool (if allocated)
+        if (cold_pool_gpu_ && !cold_vram_targets_.empty()) {
+            int num_cold = (int)cold_vram_targets_.size();
+            LOG_INFO("Preloading %d Top Cold experts into VRAM L1 (IQ2_XXS, %.2f GB)...",
+                     num_cold, (double)num_cold * cold_block_size_ / (1024.0 * 1024.0 * 1024.0));
             std::atomic<int> loaded_cold{0};
             int cold_chunk = (num_cold + n_threads - 1) / n_threads;
 
@@ -1506,7 +1827,7 @@ public:
                 int end_idx = std::min(start_idx + cold_chunk, num_cold);
                 if (start_idx >= end_idx) continue;
 
-                workers.emplace_back([this, start_idx, end_idx, &loaded_cold, num_cold, &cold_indices]() {
+                workers.emplace_back([this, start_idx, end_idx, &loaded_cold, num_cold]() {
                     void* stage_ptr = nullptr;
                     bool is_pinned = true;
                     if (cudaMallocHost(&stage_ptr, cold_block_size_) != cudaSuccess) {
@@ -1522,8 +1843,8 @@ public:
                     CUDA_CHECK(cudaStreamCreate(&stream));
 
                     for (int idx = start_idx; idx < end_idx; idx++) {
-                        int i = cold_indices[idx];
-                        void* dst = flat_vram_ptrs_[i];
+                        int i = cold_vram_targets_[idx];
+                        void* dst = cold_vram_ptrs_[i];
                         int64_t file_offset = (int64_t)i * cold_block_size_;
                         int64_t bytes = expert_file_cold_.pread_exact(stage_ptr, cold_block_size_, file_offset);
                         if (bytes == cold_block_size_) {
@@ -1534,7 +1855,7 @@ public:
                         }
                         int done = ++loaded_cold;
                         if (done % 500 == 0 || done == num_cold) {
-                            LOG_INFO("  Preloaded %d/%d Cold experts into VRAM...", done, num_cold);
+                            LOG_INFO("  Preloaded %d/%d Cold experts into VRAM L1...", done, num_cold);
                         }
                     }
                     CUDA_CHECK(cudaStreamDestroy(stream));
@@ -1552,37 +1873,54 @@ public:
             }
             for (auto& w : workers) w.join();
             workers.clear();
-        } else if (dram_cache_capacity_ > 0) {
-            // Hierarchical Mode: Preload cold experts into L2 Host DRAM!
-            int num_dram = std::min((int)cold_indices.size(), dram_cache_capacity_);
-            LOG_INFO("Preloading %d/%zu Cold experts into DRAM L2 cache (IQ2_XXS)...", num_dram, cold_indices.size());
-            std::atomic<int> loaded_cold{0};
-            int cold_chunk = (num_dram + n_threads - 1) / n_threads;
+        }
+
+        // 2b. Remaining active Cold experts preloading into Pinned DRAM L2 cache
+        if (dram_cache_capacity_ > 0 && !cold_dram_targets_.empty()) {
+            int num_targets = (int)cold_dram_targets_.size();
+            LOG_INFO("ExpertLoader: Preloading %d Cold Experts into pinned DRAM L2 cache (%.1f GB static, %d dynamic slots reserved)...",
+                     num_targets, (double)num_targets * cold_block_size_ / (1024.0 * 1024.0 * 1024.0), dram_dynamic_capacity_);
+
+            std::atomic<int> loaded_dram{0};
+            int dram_chunk = (num_targets + n_threads - 1) / n_threads;
 
             for (int t = 0; t < n_threads; t++) {
-                int start_i = t * cold_chunk;
-                int end_i = std::min(start_i + cold_chunk, num_dram);
-                if (start_i >= end_i) continue;
+                int start_idx = t * dram_chunk;
+                int end_idx = std::min(start_idx + dram_chunk, num_targets);
+                if (start_idx >= end_idx) continue;
 
-                workers.emplace_back([this, start_i, end_i, &loaded_cold, num_dram, &cold_indices]() {
-                    for (int s = start_i; s < end_i; s++) {
-                        int glob_idx = cold_indices[s];
-                        int l = glob_idx / n_experts_;
-                        int e = glob_idx % n_experts_;
-                        int64_t file_offset = (int64_t)glob_idx * cold_block_size_;
-                        void* dst = dram_cache_slots_[s].gpu_data;
-                        int64_t bytes = expert_file_cold_.pread_exact(dst, cold_block_size_, file_offset);
-                        if (bytes == cold_block_size_) {
-                            dram_cache_slots_[s].layer_id = l;
-                            dram_cache_slots_[s].expert_id = e;
-                            dram_cache_slots_[s].last_used = 1;
-                            dram_cache_slots_[s].is_ready.store(true, std::memory_order_release);
+                workers.emplace_back([this, start_idx, end_idx, &loaded_dram, num_targets]() {
+                    for (int slot = start_idx; slot < end_idx; slot++) {
+                        int global_idx = cold_dram_targets_[slot];
+                        int l = global_idx / n_experts_;
+                        int e = global_idx % n_experts_;
+                        int64_t file_offset = (int64_t)global_idx * cold_block_size_;
+                        void* dst = dram_cache_slots_[slot].gpu_data;
+
+                        int64_t bytes = 0;
+                        if (expert_mmap_cold_.is_open() && (size_t)(file_offset + cold_block_size_) <= expert_mmap_cold_.size()) {
+                            std::memcpy(dst, (const char*)expert_mmap_cold_.data() + file_offset, cold_block_size_);
+                            bytes = cold_block_size_;
                         } else {
-                            LOG_ERROR("Failed reading cold expert %d into DRAM at offset %lld (got %lld)", glob_idx, (long long)file_offset, (long long)bytes);
+                            bytes = expert_file_cold_.pread_exact(dst, cold_block_size_, file_offset);
                         }
-                        int done = ++loaded_cold;
-                        if (done % 500 == 0 || done == num_dram) {
-                            LOG_INFO("  Preloaded %d/%d Cold experts into DRAM...", done, num_dram);
+
+                        if (bytes == cold_block_size_) {
+                            dram_cache_slots_[slot].layer_id = l;
+                            dram_cache_slots_[slot].expert_id = e;
+                            dram_cache_slots_[slot].last_used =
+                                (slot < (int)cold_dram_target_init_lru_.size()) ? cold_dram_target_init_lru_[slot] : 0;
+                            dram_cache_slots_[slot].is_ready.store(true, std::memory_order_release);
+
+                            int64_t key = (int64_t)global_idx;
+                            if (key >= 0 && key < (int64_t)flat_dram_slots_.size()) {
+                                flat_dram_slots_[key] = slot;
+                                flat_dram_ptrs_[key] = dst;
+                            }
+                        }
+                        int done = ++loaded_dram;
+                        if (done % 1000 == 0 || done == num_targets) {
+                            LOG_INFO("  Preloaded %d/%d Cold experts into pinned DRAM L2...", done, num_targets);
                         }
                     }
                 });
@@ -1590,16 +1928,15 @@ public:
             for (auto& w : workers) w.join();
             workers.clear();
 
-            for (int s = 0; s < num_dram; s++) {
-                if (dram_cache_slots_[s].layer_id >= 0) {
-                    int64_t key = (int64_t)dram_cache_slots_[s].layer_id * n_experts_ + dram_cache_slots_[s].expert_id;
-                    dram_key_to_slot_[key] = s;
-                    if (key >= 0 && key < (int64_t)flat_dram_ptrs_.size()) {
-                        flat_dram_ptrs_[key] = dram_cache_slots_[s].gpu_data;
-                        flat_dram_slots_[key] = s;
-                    }
+            for (int slot = 0; slot < num_targets; slot++) {
+                if (dram_cache_slots_[slot].layer_id >= 0) {
+                    int64_t key = (int64_t)dram_cache_slots_[slot].layer_id * n_experts_ + dram_cache_slots_[slot].expert_id;
+                    dram_key_to_slot_[key] = slot;
                 }
             }
+            dram_allocated_slots_ = std::max(0, num_targets - dram_static_capacity_); // Preloaded dynamic slots start warm with last_used=1
+            LOG_INFO("ExpertLoader: Finished preloading %d Cold Experts into pinned DRAM L2 (%d static pinned, %d dynamic warm)!",
+                     num_targets, dram_static_capacity_, dram_allocated_slots_);
         }
 
         // Copy flat pointer table to GPU for GPU-native kernel execution
@@ -1607,8 +1944,8 @@ public:
                               flat_vram_ptrs_.size() * sizeof(void*), cudaMemcpyHostToDevice));
 
         auto elapsed = std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now() - start).count();
-        LOG_INFO("Mixed MoE Preload completed in %.2f seconds (Hot: %d in VRAM, Cold: %d in DRAM)",
-                 elapsed / 1000.0, num_hot, (cold_pool_gpu_ ? (total - num_hot) : std::min((int)(total - num_hot), dram_cache_capacity_)));
+        LOG_INFO("Mixed MoE Preload completed in %.2f seconds (Hot VRAM: %d, Cold VRAM: %d, Cold DRAM: %d)",
+                 elapsed / 1000.0, num_hot, (int)cold_vram_targets_.size(), (int)cold_dram_targets_.size());
         return true;
     }
 
@@ -1713,6 +2050,7 @@ public:
         if (is_mixed_) {
             expert_file_cold_.close();
             expert_file_hot_.close();
+            expert_mmap_cold_.close();
             if (hot_pool_gpu_) { cudaFree(hot_pool_gpu_); hot_pool_gpu_ = nullptr; }
             if (cold_pool_gpu_) { cudaFree(cold_pool_gpu_); cold_pool_gpu_ = nullptr; }
             expert_type_map_gpu_.free();
@@ -1736,6 +2074,14 @@ public:
 #endif
             }
             dram_cache_pool_ = nullptr;
+        }
+        if (virtual_cache_pool_) {
+#if defined(_WIN32) || defined(_WIN64)
+            VirtualFree(virtual_cache_pool_, 0, MEM_RELEASE);
+#else
+            free(virtual_cache_pool_);
+#endif
+            virtual_cache_pool_ = nullptr;
         }
         flat_vram_ptrs_gpu_.free();
         for (auto& stage : staging_ring_) {

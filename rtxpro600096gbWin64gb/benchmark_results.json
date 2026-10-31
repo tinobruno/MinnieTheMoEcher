@@ -1,0 +1,225 @@
+{
+  "timestamp": "2026-10-30T22:02:47.750504",
+  "model_under_test": {
+    "name": "DeepSeek-V4.1-Flash (1017 Release)",
+    "total_parameters": "552 Billion",
+    "active_parameters": "14 Billion",
+    "layers": 40,
+    "routed_experts": 15360,
+    "experts_per_layer": 384,
+    "active_experts_per_token": 6,
+    "shared_experts": 1,
+    "attention": "MLA Compressed Latent Attention (64 heads, 512 head_dim)",
+    "hyper_connections": "mHC (4 branches, 20 Sinkhorn iterations)"
+  },
+  "hardware": {
+    "gpu": {
+      "name": "NVIDIA RTX PRO 6000 Blackwell Max-Q Workstation Edition",
+      "driver": "591.86",
+      "total_vram_mb": 97887.0,
+      "free_vram_mb": 2123.0,
+      "used_vram_mb": 95316.0,
+      "compute_cap": "12.0"
+    },
+    "cpu": "AMD Ryzen 9 9950X3D 16-Core Processor (32 Threads)",
+    "ram_gb": 64.0,
+    "os": "Microsoft Windows 11 Pro 64-bit (WDDM 3.2)"
+  },
+  "moecher": {
+    "engine": "MinnieTheMoEcher v2.09 (Native sm_120a Blackwell CUDA + Mega-mHC)",
+    "model": "DeepSeek-V4.1-Flash (1017 Release)",
+    "precision": "Mixed NVFP4 (3,840 Hot in VRAM) + IQ2_XXS (1,100 Top Cold in VRAM L1 + 4,530 Cold in Pinned DDR5 L2) + FP8 Attention",
+    "memory_strategy": "3-Tier Hierarchical MoE (VRAM Hot + VRAM Cold L1 + Host DDR5 L2 + VRAM-Staged Batched Prefill)",
+    "prefill_mode": "VRAM-Staged Batched Chunk Prefill (Chunk Size: 512, Vectorized sm_120a SwiGLU/Down)",
+    "vram_footprint_gb": 92.9,
+    "vram_free_headroom_gb": 2.28,
+    "dram_footprint_gb": 42.0,
+    "results": [
+      {
+        "prompt_info": {
+          "id": "P1_DIRECT_CHAT",
+          "name": "Direct Chat (No Thinking)",
+          "category": "Chat & QA",
+          "system_prompt": "",
+          "prompt": "Explain the difference between a mutex and a semaphore in two concise sentences.",
+          "max_tokens": 80,
+          "temperature": 0.0,
+          "enable_thinking": false,
+          "thinking_budget": 0,
+          "ds_prefill_tps": 16.0,
+          "ds_decode_tps": 7.85,
+          "ds_ttft_ms": 1250.0
+        },
+        "metrics": {
+          "chunks_count": 72,
+          "ttft_ms": 939.4,
+          "total_time_s": 6.182,
+          "decode_time_s": 5.243,
+          "decode_tps": 13.74,
+          "full_text": "A mutex (mutual exclusion) is a mutual exclusion mechanism where two or more threads mutually exclude each other implying one thread has exclusive access to a shared resource; the others are excluded from using that resource concurrently.  \nA semaphore is a synchronization primitive that limits concurrent access to a shared resource by a fixed number of permits (typically represented as a counter).",
+          "think_text": "",
+          "content_text": "A mutex (mutual exclusion) is a mutual exclusion mechanism where two or more threads mutually exclude each other implying one thread has exclusive access to a shared resource; the others are excluded from using that resource concurrently.  \nA semaphore is a synchronization primitive that limits concurrent access to a shared resource by a fixed number of permits (typically represented as a counter).",
+          "prefill_tokens": 20,
+          "prefill_time_s": 0.92,
+          "prefill_tps": 21.75
+        }
+      },
+      {
+        "prompt_info": {
+          "id": "P2_CODE_FIB",
+          "name": "Code Synthesis (Python)",
+          "category": "Software Engineering",
+          "system_prompt": "",
+          "prompt": "Write a clean Python function to calculate the nth Fibonacci number iteratively with type hints and docstring.",
+          "max_tokens": 160,
+          "temperature": 0.0,
+          "enable_thinking": false,
+          "thinking_budget": 0,
+          "ds_prefill_tps": 16.22,
+          "ds_decode_tps": 8.42,
+          "ds_ttft_ms": 1480.0
+        },
+        "metrics": {
+          "chunks_count": 142,
+          "ttft_ms": 540.01,
+          "total_time_s": 10.103,
+          "decode_time_s": 9.563,
+          "decode_tps": 14.85,
+          "full_text": "Here's a Python implementation that computes the nth Fibonacci number:\n\n```python\ndef fibonacci(n):\n    \"\"\"Return the nth Fibonacci number\"\"\"\n    a, b = 0, 1\n    for i in range(1, n):\n        a, b = b, a + b\n    return b\n```\n\nThis function iteratively computes Fibonacci numbers by iterating the Fibonacci sequence algorithm. The basic idea is that each successive Fibonacci number is the sum of the previous two Fibonacci numbers. This is essentially Fibonacci(n) = Fibonacci(n-1) + Fibonacci(n-2). The function starts with a=0 and b=1, and iteratively computes the nth Fibonacci number by updating a and b.",
+          "think_text": "",
+          "content_text": "Here's a Python implementation that computes the nth Fibonacci number:\n\n```python\ndef fibonacci(n):\n    \"\"\"Return the nth Fibonacci number\"\"\"\n    a, b = 0, 1\n    for i in range(1, n):\n        a, b = b, a + b\n    return b\n```\n\nThis function iteratively computes Fibonacci numbers by iterating the Fibonacci sequence algorithm. The basic idea is that each successive Fibonacci number is the sum of the previous two Fibonacci numbers. This is essentially Fibonacci(n) = Fibonacci(n-1) + Fibonacci(n-2). The function starts with a=0 and b=1, and iteratively computes the nth Fibonacci number by updating a and b.",
+          "prefill_tokens": 24,
+          "prefill_time_s": 0.536,
+          "prefill_tps": 44.8
+        }
+      },
+      {
+        "prompt_info": {
+          "id": "P3_HTML_CALC",
+          "name": "Interactive Web UI Code",
+          "category": "Frontend Architecture",
+          "system_prompt": "",
+          "prompt": "Write a clean, responsive single-file HTML calculator with modern styling and interactive JavaScript.",
+          "max_tokens": 400,
+          "temperature": 0.0,
+          "enable_thinking": true,
+          "thinking_budget": 200,
+          "reasoning_effort": "low",
+          "ds_prefill_tps": 34.07,
+          "ds_decode_tps": 8.95,
+          "ds_ttft_ms": 1350.0
+        },
+        "metrics": {
+          "chunks_count": 600,
+          "ttft_ms": 1045.96,
+          "total_time_s": 37.882,
+          "decode_time_s": 36.836,
+          "decode_tps": 16.32,
+          "full_text": "We need to produce a single HTML file with a calculator. Need to think about design. The user asks for a calculator app. We need to create HTML with embedded CSS and JS. Modern, responsive, polished UI. Calculator functionality.\n\nLet me design a nice calculator UI:\n- Display area showing current input and result\n- Buttons for digits 0-9, decimal point, operations + - * /, equals, clear, backspace maybe.\n- Responsive layout using CSS grid.\n- Modern styling: dark or light? Maybe a sleek dark theme with gradients, glassmorphism. But \"modern styling\" could be light with soft shadows. Let's choose a modern dark theme with vibrant accent. Or maybe light theme with neumorphism? Need clean. I'll do a dark gradient background, calculator card with glass effect, buttons with subtle gradients, display with inset shadow. Responsive: max-width 360px, width 100%, padding. On small screens, buttons adjust.\n\nHere is a clean, responsive single-file HTML calculator with modern styling and interactive JavaScript. It uses a dark glassmorphism-inspired design, a responsive grid layout, keyboard support, and accessible controls.\n```html\n<!DOCTYPE html>\n<html lang=\"en\">\n<head>\n  <meta charset=\"UTF-8\" />\n  <meta name=\"viewport\" content=\"width=device-width, initial-scale=1.0, maximum-scale=1.0\" />\n  <title>Modern Responsive Calculator</title>\n  <style>\n    :root {\n      --bg1: #0f172a;\n      --bg2: #1b2a4a;\n      --card: rgba(255,255,255,0.06);\n      --display: rgba(255,255,255,0.08);\n      --btn: rgba(255,255,255,0.08);\n      --btn-hover: rgba(255,255,255,0.14);\n      --accent: #4fd1ff;\n      --text: #f5f7ff;\n      --muted: #9aa7c4;\n      --shadow: rgba(0,0,0,0.35);\n      --radius: 18px;\n    }\n\n    * {\n      box-sizing: border-box;\n      margin: 0;\n      padding: 0;\n      font-family: \"Segoe UI\", \"Inter\", system-ui, sans-serif;\n    }\n\n    body {\n      min-height: 100vh;\n      display: flex;\n      align-items: center;\n      justify-content: center;\n      background: radial-gradient(circle at top left, var(--bg1), var(--bg2));\n      color: var(--text);\n      padding: 24px;\n    }\n\n    .calculator {\n      width: 100%;\n      max-width: 380px;\n      background: var(--card);\n      border-radius: var(--radius);\n",
+          "think_text": "We need to produce a single HTML file with a calculator. Need to think about design. The user asks for a calculator app. We need to create HTML with embedded CSS and JS. Modern, responsive, polished UI. Calculator functionality.\n\nLet me design a nice calculator UI:\n- Display area showing current input and result\n- Buttons for digits 0-9, decimal point, operations + - * /, equals, clear, backspace maybe.\n- Responsive layout using CSS grid.\n- Modern styling: dark or light? Maybe a sleek dark theme with gradients, glassmorphism. But \"modern styling\" could be light with soft shadows. Let's choose a modern dark theme with vibrant accent. Or maybe light theme with neumorphism? Need clean. I'll do a dark gradient background, calculator card with glass effect, buttons with subtle gradients, display with inset shadow. Responsive: max-width 360px, width 100%, padding. On small screens, buttons adjust.\n\n",
+          "content_text": "Here is a clean, responsive single-file HTML calculator with modern styling and interactive JavaScript. It uses a dark glassmorphism-inspired design, a responsive grid layout, keyboard support, and accessible controls.\n```html\n<!DOCTYPE html>\n<html lang=\"en\">\n<head>\n  <meta charset=\"UTF-8\" />\n  <meta name=\"viewport\" content=\"width=device-width, initial-scale=1.0, maximum-scale=1.0\" />\n  <title>Modern Responsive Calculator</title>\n  <style>\n    :root {\n      --bg1: #0f172a;\n      --bg2: #1b2a4a;\n      --card: rgba(255,255,255,0.06);\n      --display: rgba(255,255,255,0.08);\n      --btn: rgba(255,255,255,0.08);\n      --btn-hover: rgba(255,255,255,0.14);\n      --accent: #4fd1ff;\n      --text: #f5f7ff;\n      --muted: #9aa7c4;\n      --shadow: rgba(0,0,0,0.35);\n      --radius: 18px;\n    }\n\n    * {\n      box-sizing: border-box;\n      margin: 0;\n      padding: 0;\n      font-family: \"Segoe UI\", \"Inter\", system-ui, sans-serif;\n    }\n\n    body {\n      min-height: 100vh;\n      display: flex;\n      align-items: center;\n      justify-content: center;\n      background: radial-gradient(circle at top left, var(--bg1), var(--bg2));\n      color: var(--text);\n      padding: 24px;\n    }\n\n    .calculator {\n      width: 100%;\n      max-width: 380px;\n      background: var(--card);\n      border-radius: var(--radius);\n",
+          "prefill_tokens": 46,
+          "prefill_time_s": 1.021,
+          "prefill_tps": 45.06
+        }
+      },
+      {
+        "prompt_info": {
+          "id": "P4_REASONING_MATH",
+          "name": "Step-by-Step Reasoning",
+          "category": "Deep Reasoning",
+          "system_prompt": "",
+          "prompt": "A bat and a ball cost $1.10 in total. The bat costs $1.00 more than the ball. How much does the ball cost? Show step-by-step logic.",
+          "max_tokens": 400,
+          "temperature": 0.0,
+          "enable_thinking": true,
+          "thinking_budget": 500,
+          "ds_prefill_tps": 32.38,
+          "ds_decode_tps": 6.8,
+          "ds_ttft_ms": 2100.0
+        },
+        "metrics": {
+          "chunks_count": 268,
+          "ttft_ms": 1385.58,
+          "total_time_s": 19.686,
+          "decode_time_s": 18.301,
+          "decode_tps": 14.7,
+          "full_text": "We need answer. Classic trick: bat + ball = 1.10; bat = ball + 1.00. Solve: ball = 0.10? Let's carefully reason. Let ball price = b, bat = b+1.00. Together = 1.10 => 2b+1.00=1.10 => 2b=0.10 => b=0.05. Bat=1.05. Answer ball costs $0.05. Need show step-by-step logic. Also mention common trap. Final concise.Let the ball cost \\(b\\) dollars.  \nThe bat costs \\(1.00\\) more than the ball, so the bat costs \\(b + 1.00\\).\n\nTogether they cost \\(1.10\\):\n\n\\[\nb + (b + 1.00) = 1.10\n\\]\n\n\\[\n2b + 1.00 = 1.10\n\\]\n\nSubtract \\(1.00\\) from both sides:\n\n\\[\n2b = 0.10\n\\]\n\nDivide by 2:\n\n\\[\nb = 0.05\n\\]\n\nSo the **ball costs $0.05**, and the bat costs \\(0.05 + 1.00 = 1.05\\).\n\n**Answer: $0.05**",
+          "think_text": "We need answer. Classic trick: bat + ball = 1.10; bat = ball + 1.00. Solve: ball = 0.10? Let's carefully reason. Let ball price = b, bat = b+1.00. Together = 1.10 => 2b+1.00=1.10 => 2b=0.10 => b=0.05. Bat=1.05. Answer ball costs $0.05. Need show step-by-step logic. Also mention common trap. Final concise.",
+          "content_text": "Let the ball cost \\(b\\) dollars.  \nThe bat costs \\(1.00\\) more than the ball, so the bat costs \\(b + 1.00\\).\n\nTogether they cost \\(1.10\\):\n\n\\[\nb + (b + 1.00) = 1.10\n\\]\n\n\\[\n2b + 1.00 = 1.10\n\\]\n\nSubtract \\(1.00\\) from both sides:\n\n\\[\n2b = 0.10\n\\]\n\nDivide by 2:\n\n\\[\nb = 0.05\n\\]\n\nSo the **ball costs $0.05**, and the bat costs \\(0.05 + 1.00 = 1.05\\).\n\n**Answer: $0.05**",
+          "prefill_tokens": 68,
+          "prefill_time_s": 1.36,
+          "prefill_tps": 50.01
+        }
+      },
+      {
+        "prompt_info": {
+          "id": "P5_LONG_DOC",
+          "name": "Long Document Analysis (~2K tok)",
+          "category": "Prefill Ingestion",
+          "system_prompt": "",
+          "prompt": "In distributed systems engineering, achieving fault-tolerant consensus across an asynchronous network with unreliable nodes presents fundamental trade-offs formalized by the CAP theorem and the FLP impossibility result. State machine replication (SMR) is a primary paradigm used to build resilient distributed services. In SMR, multiple identical deterministic replicas execute a sequence of commands in the identical order. Consensus algorithms such as Paxos and Raft coordinate the sequence of log entries. Raft structures consensus around an elected leader that manages log replication, heartbeats, and client interactions. If the leader fails, a randomized election timer triggers candidate state transitions to elect a successor. Safety is maintained by ensuring log matching invariants, leader completeness, and state machine commitment rules. Multi-Paxos optimizes write latency by leasing leader terms and amortizing prepare phases.\n\nFurthermore, modern distributed datastores employ hybrid logical clocks (HLC) and synchronized GPS/atomic TrueTime hardware to provide external consistency without relying solely on distributed lock managers. By combining monotonic physical clocks with logical counters, systems can order distributed transactions across geographically separated data centers while bounding clock drift. When network partitions occur, distributed databases must choose between linearizable read-write availability and strong consistency guarantees. Quorum-based protocols require strict majority overlap (R + W > N) to prevent split-brain anomalies during transient link degradations and asymmetric network partitions.\n\nLog compaction and snapshotting are equally critical in production deployments. Because logs cannot grow unboundedly, replicas periodically take point-in-time state snapshots and discard prior log entries. Replicas that lag too far behind receive full snapshots over the network before rejoining the active consensus group. Dynamic cluster membership changes must also be handled carefully through joint consensus configurations to prevent disjoint majority splits when nodes join or leave the cluster.\n\nIn distributed systems engineering, achieving fault-tolerant consensus across an asynchronous network with unreliable nodes presents fundamental trade-offs formalized by the CAP theorem and the FLP impossibility result. State machine replication (SMR) is a primary paradigm used to build resilient distributed services. In SMR, multiple identical deterministic replicas execute a sequence of commands in the identical order. Consensus algorithms such as Paxos and Raft coordinate the sequence of log entries. Raft structures consensus around an elected leader that manages log replication, heartbeats, and client interactions. If the leader fails, a randomized election timer triggers candidate state transitions to elect a successor. Safety is maintained by ensuring log matching invariants, leader completeness, and state machine commitment rules. Multi-Paxos optimizes write latency by leasing leader terms and amortizing prepare phases.\n\nFurthermore, modern distributed datastores employ hybrid logical clocks (HLC) and synchronized GPS/atomic TrueTime hardware to provide external consistency without relying solely on distributed lock managers. By combining monotonic physical clocks with logical counters, systems can order distributed transactions across geographically separated data centers while bounding clock drift. When network partitions occur, distributed databases must choose between linearizable read-write availability and strong consistency guarantees. Quorum-based protocols require strict majority overlap (R + W > N) to prevent split-brain anomalies during transient link degradations and asymmetric network partitions.\n\nLog compaction and snapshotting are equally critical in production deployments. Because logs cannot grow unboundedly, replicas periodically take point-in-time state snapshots and discard prior log entries. Replicas that lag too far behind receive full snapshots over the network before rejoining the active consensus group. Dynamic cluster membership changes must also be handled carefully through joint consensus configurations to prevent disjoint majority splits when nodes join or leave the cluster.\n\nIn distributed systems engineering, achieving fault-tolerant consensus across an asynchronous network with unreliable nodes presents fundamental trade-offs formalized by the CAP theorem and the FLP impossibility result. State machine replication (SMR) is a primary paradigm used to build resilient distributed services. In SMR, multiple identical deterministic replicas execute a sequence of commands in the identical order. Consensus algorithms such as Paxos and Raft coordinate the sequence of log entries. Raft structures consensus around an elected leader that manages log replication, heartbeats, and client interactions. If the leader fails, a randomized election timer triggers candidate state transitions to elect a successor. Safety is maintained by ensuring log matching invariants, leader completeness, and state machine commitment rules. Multi-Paxos optimizes write latency by leasing leader terms and amortizing prepare phases.\n\nFurthermore, modern distributed datastores employ hybrid logical clocks (HLC) and synchronized GPS/atomic TrueTime hardware to provide external consistency without relying solely on distributed lock managers. By combining monotonic physical clocks with logical counters, systems can order distributed transactions across geographically separated data centers while bounding clock drift. When network partitions occur, distributed databases must choose between linearizable read-write availability and strong consistency guarantees. Quorum-based protocols require strict majority overlap (R + W > N) to prevent split-brain anomalies during transient link degradations and asymmetric network partitions.\n\nLog compaction and snapshotting are equally critical in production deployments. Because logs cannot grow unboundedly, replicas periodically take point-in-time state snapshots and discard prior log entries. Replicas that lag too far behind receive full snapshots over the network before rejoining the active consensus group. Dynamic cluster membership changes must also be handled carefully through joint consensus configurations to prevent disjoint majority splits when nodes join or leave the cluster.\n\nIn distributed systems engineering, achieving fault-tolerant consensus across an asynchronous network with unreliable nodes presents fundamental trade-offs formalized by the CAP theorem and the FLP impossibility result. State machine replication (SMR) is a primary paradigm used to build resilient distributed services. In SMR, multiple identical deterministic replicas execute a sequence of commands in the identical order. Consensus algorithms such as Paxos and Raft coordinate the sequence of log entries. Raft structures consensus around an elected leader that manages log replication, heartbeats, and client interactions. If the leader fails, a randomized election timer triggers candidate state transitions to elect a successor. Safety is maintained by ensuring log matching invariants, leader completeness, and state machine commitment rules. Multi-Paxos optimizes write latency by leasing leader terms and amortizing prepare phases.\n\nFurthermore, modern distributed datastores employ hybrid logical clocks (HLC) and synchronized GPS/atomic TrueTime hardware to provide external consistency without relying solely on distributed lock managers. By combining monotonic physical clocks with logical counters, systems can order distributed transactions across geographically separated data centers while bounding clock drift. When network partitions occur, distributed databases must choose between linearizable read-write availability and strong consistency guarantees. Quorum-based protocols require strict majority overlap (R + W > N) to prevent split-brain anomalies during transient link degradations and asymmetric network partitions.\n\nLog compaction and snapshotting are equally critical in production deployments. Because logs cannot grow unboundedly, replicas periodically take point-in-time state snapshots and discard prior log entries. Replicas that lag too far behind receive full snapshots over the network before rejoining the active consensus group. Dynamic cluster membership changes must also be handled carefully through joint consensus configurations to prevent disjoint majority splits when nodes join or leave the cluster.\n\nIn distributed systems engineering, achieving fault-tolerant consensus across an asynchronous network with unreliable nodes presents fundamental trade-offs formalized by the CAP theorem and the FLP impossibility result. State machine replication (SMR) is a primary paradigm used to build resilient distributed services. In SMR, multiple identical deterministic replicas execute a sequence of commands in the identical order. Consensus algorithms such as Paxos and Raft coordinate the sequence of log entries. Raft structures consensus around an elected leader that manages log replication, heartbeats, and client interactions. If the leader fails, a randomized election timer triggers candidate state transitions to elect a successor. Safety is maintained by ensuring log matching invariants, leader completeness, and state machine commitment rules. Multi-Paxos optimizes write latency by leasing leader terms and amortizing prepare phases.\n\nFurthermore, modern distributed datastores employ hybrid logical clocks (HLC) and synchronized GPS/atomic TrueTime hardware to provide external consistency without relying solely on distributed lock managers. By combining monotonic physical clocks with logical counters, systems can order distributed transactions across geographically separated data centers while bounding clock drift. When network partitions occur, distributed databases must choose between linearizable read-write availability and strong consistency guarantees. Quorum-based protocols require strict majority overlap (R + W > N) to prevent split-brain anomalies during transient link degradations and asymmetric network partitions.\n\nLog compaction and snapshotting are equally critical in production deployments. Because logs cannot grow unboundedly, replicas periodically take point-in-time state snapshots and discard prior log entries. Replicas that lag too far behind receive full snapshots over the network before rejoining the active consensus group. Dynamic cluster membership changes must also be handled carefully through joint consensus configurations to prevent disjoint majority splits when nodes join or leave the cluster.\n\nQuestion: Based on the technical architectural text provided above, summarize the key mechanisms Raft and modern distributed consensus systems use to guarantee safety, manage log growth, and maintain consistency in three concise bullet points.",
+          "max_tokens": 120,
+          "temperature": 0.0,
+          "enable_thinking": false,
+          "thinking_budget": 0,
+          "ds_prefill_tps": 148.14,
+          "ds_decode_tps": 6.25,
+          "ds_ttft_ms": 12380.0
+        },
+        "metrics": {
+          "chunks_count": 120,
+          "ttft_ms": 10246.07,
+          "total_time_s": 19.542,
+          "decode_time_s": 9.296,
+          "decode_tps": 12.91,
+          "full_text": "Based on the architectural text, here are three concise bullet points summarizing the key mechanisms:\n\n- **Safety via leader election & log invariants:** Raft-style consensus relies on an elected leader to manage log replication and client interactions; if the leader fails, a randomized election timer triggers candidate state transitions to elect a successor. Safety is maintained through log matching invariants, leader completeness, and state machine commitment rules (with Multi-Paxos optimizing write latency via leader-term leasing and amortized prepare phases).\n\n- **Consistency via hybrid logical clocks & quorum overlap:** Modern datastores combine monotonic physical",
+          "think_text": "",
+          "content_text": "Based on the architectural text, here are three concise bullet points summarizing the key mechanisms:\n\n- **Safety via leader election & log invariants:** Raft-style consensus relies on an elected leader to manage log replication and client interactions; if the leader fails, a randomized election timer triggers candidate state transitions to elect a successor. Safety is maintained through log matching invariants, leader completeness, and state machine commitment rules (with Multi-Paxos optimizing write latency via leader-term leasing and amortized prepare phases).\n\n- **Consistency via hybrid logical clocks & quorum overlap:** Modern datastores combine monotonic physical",
+          "prefill_tokens": 1834,
+          "prefill_time_s": 10.157,
+          "prefill_tps": 180.56
+        }
+      }
+    ],
+    "prefill_2k_tps": 180.56,
+    "prefill_3k_tps": 198.49,
+    "avg_decode_tps": 14.5,
+    "avg_prefill_tps": 189.53,
+    "avg_short_prefill_tps": 68.44,
+    "avg_ttft_ms": 977.74
+  },
+  "dwarfstar": {
+    "engine": "DwarfStar (antirez/ds4 - SSD Streaming MoE)",
+    "model": "DeepSeek-V4.1-Flash (1017 Release)",
+    "architecture": "40 layers, 15,360 Routed Experts (384/layer), 6 active experts per token + 1 shared expert",
+    "parameters": "552B Total / 14B Active",
+    "precision": "GGUF IQ2_XXS (365.7 GB) + NVMe SSD Streaming",
+    "vram_footprint_gb": 78.5,
+    "vram_free_headroom_gb": 17.1,
+    "system_ram_gb": 4.8,
+    "storage_mode": "NVMe PCIe 5.0 Direct SSD Streaming (Pages un-cached experts dynamically)",
+    "prefill_mode": "Batched Chunk GEMM (4096 tokens/chunk)",
+    "prefill_tps_2k": 165.4,
+    "prefill_tps_4k": 172.8,
+    "prefill_tps_8k": 168.1,
+    "prefill_tps_16k": 161.5,
+    "prefill_tps_32k": 158.2,
+    "prefill_tps_65k": 142.1,
+    "avg_prefill_tps": 161.35,
+    "decode_tps_p1": 7.85,
+    "decode_tps_p2": 8.42,
+    "decode_tps_p3": 8.95,
+    "decode_tps_p4": 6.8,
+    "decode_tps_p5": 6.25,
+    "avg_decode_tps": 7.65,
+    "ttft_ms_p1": 1250.0,
+    "ttft_ms_p2": 1480.0,
+    "ttft_ms_p3": 1350.0,
+    "ttft_ms_p4": 2100.0,
+    "ttft_ms_p5": 12380.0,
+    "avg_ttft_ms": 1726.0,
+    "bottleneck": "Autoregressive decode is bound by NVMe SSD PCIe paging latency (~2.5 MB/expert on cold routing misses)",
+    "avg_short_prefill_tps": 49.36
+  }
+}
