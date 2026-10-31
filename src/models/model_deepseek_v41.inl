@@ -1373,7 +1373,10 @@
                         }
                     }
                 }
+                size_t approx_prefilled = (size_t)super_start + ((size_t)super_M * (size_t)(layer_id + 1)) / (size_t)std::max(1, cfg_.num_hidden_layers);
+                live_context_tokens_.store(approx_prefilled, std::memory_order_relaxed);
             } // end layer loop
+            live_context_tokens_.store((size_t)super_end, std::memory_order_relaxed);
 
             // 4. If this is the last super-chunk, prepare logits for the last token
             if (is_last_super_chunk) {

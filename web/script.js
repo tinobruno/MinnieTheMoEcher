@@ -4809,6 +4809,11 @@ async function sendMessage(options = {}) {
                         try {
                             const data = JSON.parse(dataStr);
 
+                            if (data.kv_cache && typeof renderKvCacheStatusUI === 'function') {
+                                currentKvCacheStatus = data.kv_cache;
+                                renderKvCacheStatusUI(data.kv_cache);
+                            }
+
                             if (data.usage) {
                                 lastTurnUsage = data.usage;
                                 if (data.usage.prompt_tokens !== undefined) totalPromptTokens = data.usage.prompt_tokens;
@@ -5864,9 +5869,14 @@ function initExpertProfileUI() {
         });
     }
 
-    // Initial fetch
+    // Initial fetch & continuous real-time polling (every 2s)
     fetchExpertProfile();
     fetchKvCacheStatus();
+    if (!window.kvBackgroundPollInterval) {
+        window.kvBackgroundPollInterval = setInterval(() => {
+            fetchKvCacheStatus();
+        }, 2000);
+    }
 }
 
 // ════════════════════════════════════════════════════════════════════════════════
@@ -5941,6 +5951,12 @@ async function resetKvCacheFromBox(event) {
 
 function renderKvCacheStatusUI(data) {
     if (!data) return;
+
+    const liveDot = document.getElementById('kv-live-dot');
+    if (liveDot) {
+        liveDot.classList.add('pulse');
+        setTimeout(() => liveDot.classList.remove('pulse'), 260);
+    }
 
     const maxSeq = Math.max(1, data.max_seq_len || 65536);
     const activeTok = data.active_tokens || 0;

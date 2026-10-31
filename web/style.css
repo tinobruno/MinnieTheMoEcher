@@ -2317,6 +2317,21 @@ iframe#preview-iframe {
    KV Cache & Context Window Telemetry UI
    ════════════════════════════════════════════════════════════════════════════════ */
 
+.kv-live-dot {
+    width: 6px;
+    height: 6px;
+    border-radius: 50%;
+    background-color: #34d399;
+    box-shadow: 0 0 6px rgba(52, 211, 153, 0.7);
+    display: inline-block;
+    transition: transform 0.2s ease, box-shadow 0.2s ease;
+}
+
+.kv-live-dot.pulse {
+    transform: scale(1.45);
+    box-shadow: 0 0 10px rgba(52, 211, 153, 1);
+}
+
 .kv-arch-badge {
     font-size: 9.5px;
     padding: 2px 7px;

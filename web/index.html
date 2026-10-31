@@ -114,7 +114,10 @@
             <details class="stats-section kv-cache-section" id="kv-cache-details" open>
                 <summary>
                     <div class="summary-title-row">
-                        <span>KV Cache &amp; Context</span>
+                        <span style="display: inline-flex; align-items: center; gap: 6px;">
+                            <span>KV Cache &amp; Context</span>
+                            <span class="kv-live-dot" id="kv-live-dot" title="Real-time telemetry active (updates every 2s)"></span>
+                        </span>
                         <div style="display: flex; align-items: center; gap: 6px;">
                             <span id="kv-arch-badge" class="kv-arch-badge" title="KV Cache Architecture">MLA + Top-512</span>
                             <span class="refresh-badge-btn" onclick="fetchKvCacheStatus(event)" title="Refresh KV Cache Telemetry">

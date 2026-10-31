@@ -3115,6 +3115,12 @@ public:
                      prefix_len, prefix_len > 0 ? prefix_len - 1 : 0, prefix_len, prompt.size() - 1);
         }
 
+        prompt_token_count_ = (int)prompt.size();
+        completion_token_count_ = 0;
+        last_cached_tokens_ = prefix_len;
+        last_prefill_tokens_ = (prompt.size() > prefix_len) ? (prompt.size() - prefix_len) : 0;
+        live_context_tokens_.store(prefix_len, std::memory_order_relaxed);
+
         // Disable tracking during prompt prefill (prevents system prompt boilerplate from skewing stats)
         track_current_token_ = false;
 
@@ -3343,6 +3349,7 @@ public:
 
             output_ids.push_back(next_token);
             history.push_back(next_token);
+            completion_token_count_ = (int)output_ids.size();
             live_context_tokens_.store(history.size(), std::memory_order_relaxed);
 
             // Enable tracking for all generated tokens produced by the model (excluding control & special tokens)

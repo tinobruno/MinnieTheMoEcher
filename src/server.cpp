@@ -2104,9 +2104,26 @@ void run_server(MoecherEngine& engine, int port, int default_thinking_budget, in
                                 return true;
                             };
 
+                            auto last_kv_emit_time = std::chrono::steady_clock::now();
+
                             engine.generate(prompt, max_tokens, temperature, [&](const std::string& text, bool is_reasoning) -> bool {
                                 if (g_stop_requested.load()) return false;
                                 if (text.empty()) return true;
+
+                                auto now_tp = std::chrono::steady_clock::now();
+                                if (std::chrono::duration<double>(now_tp - last_kv_emit_time).count() >= 1.0) {
+                                    last_kv_emit_time = now_tp;
+                                    json kv_chunk = {
+                                        {"id", req_id},
+                                        {"object", "chat.completion.chunk"},
+                                        {"created", created_time},
+                                        {"model", model_id},
+                                        {"choices", json::array()},
+                                        {"kv_cache", engine.generate_kv_cache_status_json()}
+                                    };
+                                    std::string sse_kv = "data: " + kv_chunk.dump(-1, ' ', false, json::error_handler_t::replace) + "\n\n";
+                                    if (!sink.write(sse_kv.data(), sse_kv.size())) return false;
+                                }
 
                                 if (is_reasoning) {
                                     round_reasoning += text;
