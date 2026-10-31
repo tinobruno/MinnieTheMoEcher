@@ -1402,10 +1402,10 @@
         return {
             {"temperature", 0.0f},
             {"top_p", 1.0f},
-            {"repetition_penalty", 1.05f},
+            {"repetition_penalty", 1.0f},
             {"reasoning_effort", "high"},
             {"thinking_budget", 4096},
-            {"anti_loop", true}
+            {"anti_loop", false}
         };
     }
 

@@ -1111,7 +1111,7 @@ void run_server(MoecherEngine& engine, int port, int default_thinking_budget, in
             {"base_prompt", g_base_system_prompt},
             {"system_prompt", g_current_system_prompt},
             {"active_tools", g_enable_tools ? g_current_active_tools : json::array()},
-            {"repetition_penalty", g_server_config.repetition_penalty > 0.0f ? g_server_config.repetition_penalty : 1.05f},
+            {"repetition_penalty", g_server_config.repetition_penalty > 0.0f ? g_server_config.repetition_penalty : 1.00f},
             {"tokens_count", engine.system_kv_snapshot_.valid ? engine.system_kv_snapshot_.tokens.size() : 0}
         };
         res.set_content(body.dump(), "application/json");
@@ -1175,7 +1175,7 @@ void run_server(MoecherEngine& engine, int port, int default_thinking_budget, in
                 {"base_prompt", g_base_system_prompt},
                 {"system_prompt", g_current_system_prompt},
                 {"active_tools", g_enable_tools ? g_current_active_tools : json::array()},
-                {"repetition_penalty", g_server_config.repetition_penalty > 0.0f ? g_server_config.repetition_penalty : 1.05f},
+                {"repetition_penalty", g_server_config.repetition_penalty > 0.0f ? g_server_config.repetition_penalty : 1.00f},
                 {"tokens_count", engine.system_kv_snapshot_.valid ? engine.system_kv_snapshot_.tokens.size() : 0}
             };
             res.set_content(body.dump(), "application/json");

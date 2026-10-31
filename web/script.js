@@ -330,7 +330,7 @@ try {
     if (savedAntiLoop !== null && antiLoopEnabled) {
         antiLoopEnabled.checked = (savedAntiLoop === 'true');
     } else if (antiLoopEnabled) {
-        antiLoopEnabled.checked = true; // Default enabled
+        antiLoopEnabled.checked = false; // Default disabled
     }
 } catch (e) {
     console.warn('Could not load anti-loop setting from localStorage', e);

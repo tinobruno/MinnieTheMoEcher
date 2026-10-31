@@ -1205,7 +1205,7 @@
             {"repetition_penalty", 1.05f},
             {"reasoning_effort", "none"},
             {"thinking_budget", 0},
-            {"anti_loop", true}
+            {"anti_loop", false}
         };
     }
 
