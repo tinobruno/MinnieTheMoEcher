@@ -1234,17 +1234,17 @@
     // ── DeepSeek-V4.1 Protocol, Parameters & Chat Templating ──────────────────
 
     std::string get_default_system_prompt_deepseek_v41() const {
-        return "";
+        return "You are a helpful assistant.";
     }
 
     nlohmann::json get_recommended_sampling_deepseek_v41() const {
         return {
             {"temperature", 0.0f},
             {"top_p", 1.0f},
-            {"repetition_penalty", 1.0f},
+            {"repetition_penalty", 1.05f},
             {"reasoning_effort", "high"},
-            {"thinking_budget", 75},
-            {"anti_loop", false}
+            {"thinking_budget", 4096},
+            {"anti_loop", true}
         };
     }
 
@@ -1312,10 +1312,7 @@
 
         // Check if messages contains an initial system prompt
         bool has_system = (!messages.empty() && messages[0].value("role", "") == "system");
-        std::string sys_content = "";
-        if (has_system) {
-            sys_content = get_message_content_string(messages[0]);
-        }
+        std::string sys_content = has_system ? get_message_content_string(messages[0]) : get_default_system_prompt_deepseek_v41();
 
         // Render tools using official V4.1 DSML format (<｜DSML｜ calls>)
         std::string tools_prompt = "";

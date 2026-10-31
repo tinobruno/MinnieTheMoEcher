@@ -330,7 +330,7 @@ try {
     if (savedAntiLoop !== null && antiLoopEnabled) {
         antiLoopEnabled.checked = (savedAntiLoop === 'true');
     } else if (antiLoopEnabled) {
-        antiLoopEnabled.checked = false; // Default disabled
+        antiLoopEnabled.checked = true; // Default enabled
     }
 } catch (e) {
     console.warn('Could not load anti-loop setting from localStorage', e);
@@ -3116,8 +3116,13 @@ async function fetchBackendSystemPrompt() {
         } else if (data && data.tools_enabled === true) {
             window.serverToolsDisabled = false;
         }
+        const savedInstanceId = localStorage.getItem('moecher_server_instance_id');
+        const isNewServerInstance = data && data.server_instance_id && ((lastServerInstanceId && lastServerInstanceId !== data.server_instance_id) || (savedInstanceId !== data.server_instance_id));
+        if (data && data.server_instance_id) {
+            try { localStorage.setItem('moecher_server_instance_id', String(data.server_instance_id)); } catch(e) {}
+        }
         const savedRep = localStorage.getItem('moecher_repetition_penalty');
-        if (data && data.repetition_penalty !== undefined && repPenaltySlider && (!savedRep || (data.server_instance_id && lastServerInstanceId && lastServerInstanceId !== data.server_instance_id))) {
+        if (data && data.repetition_penalty !== undefined && repPenaltySlider && (!savedRep || isNewServerInstance)) {
             repPenaltySlider.value = data.repetition_penalty;
             if (repPenaltyVal) repPenaltyVal.textContent = parseFloat(data.repetition_penalty).toFixed(2);
             try { localStorage.setItem('moecher_repetition_penalty', String(data.repetition_penalty)); } catch(e) {}
@@ -3127,6 +3132,11 @@ async function fetchBackendSystemPrompt() {
         } else if (data && data.repetition_penalty !== undefined && repPenaltySlider) {
             repPenaltySlider.value = data.repetition_penalty;
             if (repPenaltyVal) repPenaltyVal.textContent = parseFloat(data.repetition_penalty).toFixed(2);
+        }
+        const savedAntiLoop = localStorage.getItem('moecher_anti_loop_enabled');
+        if (data && data.anti_loop !== undefined && antiLoopEnabled && (savedAntiLoop === null || isNewServerInstance)) {
+            antiLoopEnabled.checked = !!data.anti_loop;
+            try { localStorage.setItem('moecher_anti_loop_enabled', String(!!data.anti_loop)); } catch(e) {}
         }
         if (data && data.system_prompt !== undefined) {
             if (systemPromptInput) {
@@ -5305,12 +5315,11 @@ async function sendMessage(options = {}) {
                 continue;
             }
 
-            // If the model in synthesis generated an unfulfilled preamble or truncated header but forgot to give the answer:
+            // If the model in synthesis generated an unfulfilled preamble after tool/search execution:
             const isUnfulfilledPreamble = !(zdbSettings && zdbSettings.enabled) && !turnZdbMetadata && (
-                ((turnRetrievedDocs.length > 0 || turnExecutedSearch) &&
+                (turnRetrievedDocs.length > 0 || turnExecutedSearch) &&
                 roundContent.trim().length < 140 &&
-                /(?:found it|got it|let me|i'll|i will|going to|one moment|allow me to)\s+(?:fetch|search|check|look|find|get)\b/i.test(roundContent)) ||
-                (round === 1 && roundContent.trim().length > 0 && roundContent.trim().length < 60 && !/[.!?]$/.test(roundContent.trim()) && !validToolCalls.length)
+                /(?:found it|got it|let me|i'll|i will|going to|one moment|allow me to)\s+(?:fetch|search|check|look|find|get)\b/i.test(roundContent)
             );
 
             if (isUnfulfilledPreamble && round < maxRounds - 1) {

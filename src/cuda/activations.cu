@@ -7545,12 +7545,11 @@ __global__ void mla_attention_fused_kernel(
     __syncthreads();
 
     // ── Step 3: Direct Dual-Cache Attention Scores (Q @ KV.T) ─────────────────
-    // Dual-tier compressed context partitioning:
-    // When pos < window (pos < 128): raw cache holds all tokens 0..pos. n_comp = 0.
-    // When pos >= window (pos >= 128): raw cache holds sliding window of last 128 tokens,
-    // and comp cache holds previous compressed history.
+    // In DeepSeek-V4.1 (official inference/model.py Attention.forward), every layer with
+    // compress_ratio > 0 concatenates window_kv (up to last 128 raw tokens) and
+    // compress_kv[:(pos + 1) // ratio] across all positions pos >= 0.
     int n_raw = (pos + 1 < window) ? (pos + 1) : window;
-    int n_comp = (pos + 1 > window && d_comp_count != nullptr && comp_kv != nullptr) ? *d_comp_count : 0;
+    int n_comp = (d_comp_count != nullptr && comp_kv != nullptr) ? *d_comp_count : 0;
     int cache_len = n_raw + n_comp;
     if (cache_len > max_cache_len) cache_len = max_cache_len;
     if (cache_len < 1) cache_len = 1;
@@ -7784,7 +7783,7 @@ __global__ void mla_attention_fused_batch_kernel(
 
     // ── Step 3: 128-Byte Cache-Line Coalesced Dual-Cache Attention Scores (Q @ KV.T)
     int n_raw = (pos + 1 < window) ? (pos + 1) : window;
-    int n_comp = (pos + 1 > window && d_comp_counts != nullptr && comp_kv != nullptr) ? d_comp_counts[m] : 0;
+    int n_comp = (d_comp_counts != nullptr && comp_kv != nullptr) ? d_comp_counts[m] : 0;
     int cache_len = n_raw + n_comp;
     if (cache_len > max_cache_len) cache_len = max_cache_len;
     if (cache_len < 1) cache_len = 1;
