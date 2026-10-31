@@ -254,9 +254,9 @@ def convert_deepseek_v41(raw_dir: Path, out_dir: Path, dry_run: bool = False):
             "swiglu_limit": 10.0,
             "scoring_func": "sqrtsoftplus",
             "expert_dtype": "fp4",
-            "max_seq_len": 65536,
-            "window_size": 4096,
-            "sliding_window": 4096
+            "max_seq_len": 1048576,
+            "window_size": 128,
+            "sliding_window": 128
         },
         "tokenizer": {
             "bos_token_id": 0,

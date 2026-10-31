@@ -7538,6 +7538,8 @@ __global__ void mla_attention_fused_kernel(
     __shared__ float s_q[512];
     __shared__ float s_out[512];
     __shared__ float s_red[32];
+    __shared__ int s_comp_indices[512];
+    __shared__ int s_num_comp;
 
     int lane = tid & 31;
     int warp = tid >> 5;
@@ -7599,7 +7601,62 @@ __global__ void mla_attention_fused_kernel(
     // compress_kv[:(pos + 1) // ratio] across all positions pos >= 0.
     int n_raw = (pos + 1 < window) ? (pos + 1) : window;
     int n_comp = (d_comp_count != nullptr && comp_kv != nullptr) ? *d_comp_count : 0;
-    int cache_len = n_raw + n_comp;
+    int use_comp_indices = (n_comp > 512 && comp_mask != nullptr) ? 1 : 0;
+    int eff_comp = n_comp;
+    if (use_comp_indices) {
+        if (tid == 0) s_num_comp = 0;
+        __syncthreads();
+        int n_words = n_comp >> 2;
+        const uint32_t* mask_u32 = reinterpret_cast<const uint32_t*>(comp_mask);
+        bool aligned4 = (((uintptr_t)comp_mask & 3u) == 0);
+        if (aligned4) {
+            for (int w_idx = tid; w_idx < n_words; w_idx += n_threads) {
+                uint32_t w = mask_u32[w_idx];
+                if (w != 0u) {
+                    int base_c = w_idx << 2;
+                    if (w & 0x000000ffu) { int idx = atomicAdd(&s_num_comp, 1); if (idx < 512) s_comp_indices[idx] = base_c + 0; }
+                    if (w & 0x0000ff00u) { int idx = atomicAdd(&s_num_comp, 1); if (idx < 512) s_comp_indices[idx] = base_c + 1; }
+                    if (w & 0x00ff0000u) { int idx = atomicAdd(&s_num_comp, 1); if (idx < 512) s_comp_indices[idx] = base_c + 2; }
+                    if (w & 0xff000000u) { int idx = atomicAdd(&s_num_comp, 1); if (idx < 512) s_comp_indices[idx] = base_c + 3; }
+                }
+            }
+            for (int c = (n_words << 2) + tid; c < n_comp; c += n_threads) {
+                if (comp_mask[c] != 0) {
+                    int idx = atomicAdd(&s_num_comp, 1);
+                    if (idx < 512) s_comp_indices[idx] = c;
+                }
+            }
+        } else {
+            for (int c = tid; c < n_comp; c += n_threads) {
+                if (comp_mask[c] != 0) {
+                    int idx = atomicAdd(&s_num_comp, 1);
+                    if (idx < 512) s_comp_indices[idx] = c;
+                }
+            }
+        }
+        __syncthreads();
+        eff_comp = s_num_comp < 512 ? s_num_comp : 512;
+        for (int idx = eff_comp + tid; idx < 512; idx += n_threads) {
+            s_comp_indices[idx] = 0x7fffffff;
+        }
+        __syncthreads();
+        for (int k = 2; k <= 512; k <<= 1) {
+            for (int j = k >> 1; j > 0; j >>= 1) {
+                int low_mask = j - 1;
+                int i = ((tid & ~low_mask) << 1) | (tid & low_mask);
+                int ij = i | j;
+                int a = s_comp_indices[i];
+                int b = s_comp_indices[ij];
+                bool asc = ((i & k) == 0);
+                if ((a > b) == asc) {
+                    s_comp_indices[i] = b;
+                    s_comp_indices[ij] = a;
+                }
+                __syncthreads();
+            }
+        }
+    }
+    int cache_len = n_raw + eff_comp;
     if (cache_len > max_cache_len) cache_len = max_cache_len;
     if (cache_len < 1) cache_len = 1;
 
@@ -7611,11 +7668,7 @@ __global__ void mla_attention_fused_kernel(
             int raw_slot = (raw_start + t) % window;
             kv_t = raw_kv + (size_t)raw_slot * head_dim;
         } else {
-            int comp_slot = t - n_raw;
-            if (n_comp > 512 && comp_mask != nullptr && comp_mask[comp_slot] == 0) {
-                scores[t] = -1e38f;
-                continue;
-            }
+            int comp_slot = use_comp_indices ? s_comp_indices[t - n_raw] : (t - n_raw);
             kv_t = comp_kv + (size_t)comp_slot * head_dim;
         }
         float dot = 0.0f;
@@ -7709,14 +7762,15 @@ __global__ void mla_attention_fused_kernel(
         sum0 += sc * kv_val.x;
         sum1 += sc * kv_val.y;
     }
-    int safe_comp = n_comp;
+    int safe_comp = eff_comp;
     if (n_raw + safe_comp > max_cache_len) safe_comp = max_cache_len - n_raw;
     if (safe_comp < 0) safe_comp = 0;
     #pragma unroll 4
     for (int t = 0; t < safe_comp; t++) {
         float sc = scores[n_raw + t];
         if (sc == 0.0f) continue;
-        const __nv_bfloat162* kv_pairs = reinterpret_cast<const __nv_bfloat162*>(comp_kv + (size_t)t * head_dim);
+        int comp_slot = use_comp_indices ? s_comp_indices[t] : t;
+        const __nv_bfloat162* kv_pairs = reinterpret_cast<const __nv_bfloat162*>(comp_kv + (size_t)comp_slot * head_dim);
         float2 kv_val = to_float2_bf162(kv_pairs[tid]);
         sum0 += sc * kv_val.x;
         sum1 += sc * kv_val.y;
@@ -7775,6 +7829,8 @@ __global__ void mla_attention_fused_batch_kernel(
     __shared__ float s_q[512];
     __shared__ float s_out[512];
     __shared__ float s_red[32];
+    __shared__ int s_comp_indices[512];
+    __shared__ int s_num_comp;
 
     int lane = tid & 31;
     int warp = tid >> 5;
@@ -7836,7 +7892,63 @@ __global__ void mla_attention_fused_batch_kernel(
     // ── Step 3: 128-Byte Cache-Line Coalesced Dual-Cache Attention Scores (Q @ KV.T)
     int n_raw = (pos + 1 < window) ? (pos + 1) : window;
     int n_comp = (d_comp_counts != nullptr && comp_kv != nullptr) ? d_comp_counts[m] : 0;
-    int cache_len = n_raw + n_comp;
+    const uint8_t* comp_mask_m = (comp_mask_batch != nullptr) ? (comp_mask_batch + (size_t)m * comp_mask_stride) : nullptr;
+    int use_comp_indices = (n_comp > 512 && comp_mask_m != nullptr) ? 1 : 0;
+    int eff_comp = n_comp;
+    if (use_comp_indices) {
+        if (tid == 0) s_num_comp = 0;
+        __syncthreads();
+        int n_words = n_comp >> 2;
+        const uint32_t* mask_u32 = reinterpret_cast<const uint32_t*>(comp_mask_m);
+        bool aligned4 = (((uintptr_t)comp_mask_m & 3u) == 0);
+        if (aligned4) {
+            for (int w_idx = tid; w_idx < n_words; w_idx += n_threads) {
+                uint32_t w = mask_u32[w_idx];
+                if (w != 0u) {
+                    int base_c = w_idx << 2;
+                    if (w & 0x000000ffu) { int idx = atomicAdd(&s_num_comp, 1); if (idx < 512) s_comp_indices[idx] = base_c + 0; }
+                    if (w & 0x0000ff00u) { int idx = atomicAdd(&s_num_comp, 1); if (idx < 512) s_comp_indices[idx] = base_c + 1; }
+                    if (w & 0x00ff0000u) { int idx = atomicAdd(&s_num_comp, 1); if (idx < 512) s_comp_indices[idx] = base_c + 2; }
+                    if (w & 0xff000000u) { int idx = atomicAdd(&s_num_comp, 1); if (idx < 512) s_comp_indices[idx] = base_c + 3; }
+                }
+            }
+            for (int c = (n_words << 2) + tid; c < n_comp; c += n_threads) {
+                if (comp_mask_m[c] != 0) {
+                    int idx = atomicAdd(&s_num_comp, 1);
+                    if (idx < 512) s_comp_indices[idx] = c;
+                }
+            }
+        } else {
+            for (int c = tid; c < n_comp; c += n_threads) {
+                if (comp_mask_m[c] != 0) {
+                    int idx = atomicAdd(&s_num_comp, 1);
+                    if (idx < 512) s_comp_indices[idx] = c;
+                }
+            }
+        }
+        __syncthreads();
+        eff_comp = s_num_comp < 512 ? s_num_comp : 512;
+        for (int idx = eff_comp + tid; idx < 512; idx += n_threads) {
+            s_comp_indices[idx] = 0x7fffffff;
+        }
+        __syncthreads();
+        for (int k = 2; k <= 512; k <<= 1) {
+            for (int j = k >> 1; j > 0; j >>= 1) {
+                int low_mask = j - 1;
+                int i = ((tid & ~low_mask) << 1) | (tid & low_mask);
+                int ij = i | j;
+                int a = s_comp_indices[i];
+                int b = s_comp_indices[ij];
+                bool asc = ((i & k) == 0);
+                if ((a > b) == asc) {
+                    s_comp_indices[i] = b;
+                    s_comp_indices[ij] = a;
+                }
+                __syncthreads();
+            }
+        }
+    }
+    int cache_len = n_raw + eff_comp;
     if (cache_len > max_cache_len) cache_len = max_cache_len;
     if (cache_len < 1) cache_len = 1;
 
@@ -7846,7 +7958,6 @@ __global__ void mla_attention_fused_batch_kernel(
     int vec_id = tid >> 3;      // 0..31
     int vec_lane = tid & 7;     // 0..7
     int n_vecs = n_threads >> 3; // 32
-    const uint8_t* comp_mask_m = (comp_mask_batch != nullptr) ? (comp_mask_batch + (size_t)m * comp_mask_stride) : nullptr;
 
     for (int t = vec_id; t < cache_len; t += n_vecs) {
         const __nv_bfloat16* kv_t = nullptr;
@@ -7856,11 +7967,7 @@ __global__ void mla_attention_fused_batch_kernel(
                  ? (raw_kv + (size_t)(tau % window) * head_dim)
                  : (batch_kv + (size_t)(tau - start_pos) * head_dim);
         } else {
-            int comp_slot = t - n_raw;
-            if (n_comp > 512 && comp_mask_m != nullptr && comp_mask_m[comp_slot] == 0) {
-                if (vec_lane == 0) scores[t] = -1e38f;
-                continue;
-            }
+            int comp_slot = use_comp_indices ? s_comp_indices[t - n_raw] : (t - n_raw);
             kv_t = comp_kv + (size_t)comp_slot * head_dim;
         }
         float dot = 0.0f;
@@ -7964,14 +8071,15 @@ __global__ void mla_attention_fused_batch_kernel(
         sum0 += sc * kv_val.x;
         sum1 += sc * kv_val.y;
     }
-    int safe_comp = n_comp;
+    int safe_comp = eff_comp;
     if (n_raw + safe_comp > max_cache_len) safe_comp = max_cache_len - n_raw;
     if (safe_comp < 0) safe_comp = 0;
     #pragma unroll 4
     for (int t = 0; t < safe_comp; t++) {
         float sc = scores[n_raw + t];
         if (sc == 0.0f) continue;
-        const __nv_bfloat162* kv_pairs = reinterpret_cast<const __nv_bfloat162*>(comp_kv + (size_t)t * head_dim);
+        int comp_slot = use_comp_indices ? s_comp_indices[t] : t;
+        const __nv_bfloat162* kv_pairs = reinterpret_cast<const __nv_bfloat162*>(comp_kv + (size_t)comp_slot * head_dim);
         float2 kv_val = to_float2_bf162(kv_pairs[tid]);
         sum0 += sc * kv_val.x;
         sum1 += sc * kv_val.y;
@@ -8252,7 +8360,8 @@ __global__ void compressor_device_step_kernel(
     __syncthreads();
 
     int comp_pos = pos + 1 - ratio;
-    if (comp_pos >= 65536) comp_pos = 65535;
+    int max_rope_pos = (max_comp > 0) ? (max_comp * ratio) : 1048576;
+    if (comp_pos >= max_rope_pos) comp_pos = max_rope_pos - 1;
     if (comp_pos < 0) comp_pos = 0;
     int half_rope = rope_dim / 2;
     int comp_idx = pos / ratio;
@@ -8611,7 +8720,8 @@ __global__ void compressor_device_batch_step_kernel(
         __syncthreads();
 
         int comp_pos = pos + 1 - ratio;
-        if (comp_pos >= 65536) comp_pos = 65535;
+        int max_rope_pos = (max_comp > 0) ? (max_comp * ratio) : 1048576;
+        if (comp_pos >= max_rope_pos) comp_pos = max_rope_pos - 1;
         if (comp_pos < 0) comp_pos = 0;
 
         // DeepSeek V4.1 Indexer Key Projection from pre-RoPE latent (s_normed)
@@ -8751,55 +8861,59 @@ __global__ void indexer_score_kernel(
     const float* __restrict__ weights,            // [n_heads]
     const int32_t* __restrict__ d_comp_count,
     int max_comp,
-    int n_heads)
+    int n_heads,
+    int top_k)
 {
     int n_comp = *d_comp_count;
-    int c = blockIdx.x;
-    if (c >= n_comp || c >= max_comp) return;
+    if (n_comp <= top_k) return;
+    if (n_comp > max_comp) n_comp = max_comp;
     int tid = threadIdx.x;
-
-    const __nv_bfloat16* kv_c = index_comp + (size_t)c * 128;
-    __shared__ float s_kv[128];
-    if (tid < 128) {
-        s_kv[tid] = __bfloat162float(kv_c[tid]);
-    }
-    __syncthreads();
-
-    float local_total = 0.0f;
-    for (int h = tid; h < n_heads; h += blockDim.x) {
-        const __nv_bfloat16* q_h = q + (size_t)h * 128;
-        float dot = 0.0f;
-        #pragma unroll 4
-        for (int d = 0; d < 128; d++) {
-            dot += s_kv[d] * __bfloat162float(q_h[d]);
-        }
-        if (dot > 0.0f) {
-            local_total += dot * weights[h];
-        }
-    }
-
-    #pragma unroll
-    for (int offset = 16; offset > 0; offset /= 2) {
-        local_total += __shfl_down_sync(0xffffffff, local_total, offset);
-    }
-
-    __shared__ float s_warp_scores[8];
     int lane = tid & 31;
     int warp = tid >> 5;
-    if (lane == 0) {
-        s_warp_scores[warp] = local_total;
-    }
-    __syncthreads();
+    __shared__ float s_kv[128];
+    __shared__ float s_warp_scores[8];
 
-    if (warp == 0) {
-        float val = (lane < (blockDim.x >> 5)) ? s_warp_scores[lane] : 0.0f;
+    for (int c = blockIdx.x; c < n_comp; c += gridDim.x) {
+        const __nv_bfloat16* kv_c = index_comp + (size_t)c * 128;
+        if (tid < 128) {
+            s_kv[tid] = __bfloat162float(kv_c[tid]);
+        }
+        __syncthreads();
+
+        float local_total = 0.0f;
+        for (int h = tid; h < n_heads; h += blockDim.x) {
+            const __nv_bfloat16* q_h = q + (size_t)h * 128;
+            float dot = 0.0f;
+            #pragma unroll 4
+            for (int d = 0; d < 128; d++) {
+                dot += s_kv[d] * __bfloat162float(q_h[d]);
+            }
+            if (dot > 0.0f) {
+                local_total += dot * weights[h];
+            }
+        }
+
         #pragma unroll
-        for (int offset = 4; offset > 0; offset /= 2) {
-            val += __shfl_down_sync(0xffffffff, val, offset);
+        for (int offset = 16; offset > 0; offset /= 2) {
+            local_total += __shfl_down_sync(0xffffffff, local_total, offset);
         }
+
         if (lane == 0) {
-            out_scores[c] = val;
+            s_warp_scores[warp] = local_total;
         }
+        __syncthreads();
+
+        if (warp == 0) {
+            float val = (lane < (blockDim.x >> 5)) ? s_warp_scores[lane] : 0.0f;
+            #pragma unroll
+            for (int offset = 4; offset > 0; offset /= 2) {
+                val += __shfl_down_sync(0xffffffff, val, offset);
+            }
+            if (lane == 0) {
+                out_scores[c] = val;
+            }
+        }
+        __syncthreads();
     }
 }
 
@@ -8956,8 +9070,11 @@ void indexer_score_and_mask_cuda(
     cudaStream_t stream,
     int n_heads)
 {
-    indexer_score_kernel<<<max_comp_entries, 128, 0, stream>>>(
-        out_scores, index_comp, q, weights, d_comp_count, max_comp_entries, n_heads);
+    int grid_blocks = (max_comp_entries < 4096) ? max_comp_entries : 4096;
+    if (grid_blocks > 0) {
+        indexer_score_kernel<<<grid_blocks, 128, 0, stream>>>(
+            out_scores, index_comp, q, weights, d_comp_count, max_comp_entries, n_heads, top_k);
+    }
 
     indexer_mask_topk_kernel<<<1, 256, 0, stream>>>(
         out_mask, out_scores, d_comp_count, max_comp_entries, top_k);
@@ -8971,60 +9088,64 @@ __global__ void indexer_score_batch_kernel(
     const int32_t* __restrict__ d_positions,      // [M]
     int ratio,
     int max_comp,
-    int n_heads)
+    int n_heads,
+    int top_k)
 {
-    int c = blockIdx.x;
     int m = blockIdx.y;
     int pos = d_positions[m];
     int n_comp = (pos + 1) / ratio;
-    if (c >= n_comp || c >= max_comp) return;
+    if (n_comp <= top_k) return;
+    if (n_comp > max_comp) n_comp = max_comp;
     int tid = threadIdx.x;
-
-    const __nv_bfloat16* kv_c = index_comp + (size_t)c * 128;
+    int lane = tid & 31;
+    int warp = tid >> 5;
     __shared__ float s_kv[128];
-    if (tid < 128) {
-        s_kv[tid] = __bfloat162float(kv_c[tid]);
-    }
-    __syncthreads();
+    __shared__ float s_warp_scores[8];
 
     const __nv_bfloat16* q = q_batch + (size_t)m * n_heads * 128;
     const float* weights = weights_batch + (size_t)m * n_heads;
 
-    float local_total = 0.0f;
-    for (int h = tid; h < n_heads; h += blockDim.x) {
-        const __nv_bfloat16* q_h = q + (size_t)h * 128;
-        float dot = 0.0f;
-        #pragma unroll 4
-        for (int d = 0; d < 128; d++) {
-            dot += s_kv[d] * __bfloat162float(q_h[d]);
+    for (int c = blockIdx.x; c < n_comp; c += gridDim.x) {
+        const __nv_bfloat16* kv_c = index_comp + (size_t)c * 128;
+        if (tid < 128) {
+            s_kv[tid] = __bfloat162float(kv_c[tid]);
         }
-        if (dot > 0.0f) {
-            local_total += dot * weights[h];
+        __syncthreads();
+
+        float local_total = 0.0f;
+        for (int h = tid; h < n_heads; h += blockDim.x) {
+            const __nv_bfloat16* q_h = q + (size_t)h * 128;
+            float dot = 0.0f;
+            #pragma unroll 4
+            for (int d = 0; d < 128; d++) {
+                dot += s_kv[d] * __bfloat162float(q_h[d]);
+            }
+            if (dot > 0.0f) {
+                local_total += dot * weights[h];
+            }
         }
-    }
 
-    #pragma unroll
-    for (int offset = 16; offset > 0; offset /= 2) {
-        local_total += __shfl_down_sync(0xffffffff, local_total, offset);
-    }
-
-    __shared__ float s_warp_scores[8];
-    int lane = tid & 31;
-    int warp = tid >> 5;
-    if (lane == 0) {
-        s_warp_scores[warp] = local_total;
-    }
-    __syncthreads();
-
-    if (warp == 0) {
-        float val = (lane < (blockDim.x >> 5)) ? s_warp_scores[lane] : 0.0f;
         #pragma unroll
-        for (int offset = 4; offset > 0; offset /= 2) {
-            val += __shfl_down_sync(0xffffffff, val, offset);
+        for (int offset = 16; offset > 0; offset /= 2) {
+            local_total += __shfl_down_sync(0xffffffff, local_total, offset);
         }
+
         if (lane == 0) {
-            out_scores_batch[(size_t)m * max_comp + c] = val;
+            s_warp_scores[warp] = local_total;
         }
+        __syncthreads();
+
+        if (warp == 0) {
+            float val = (lane < (blockDim.x >> 5)) ? s_warp_scores[lane] : 0.0f;
+            #pragma unroll
+            for (int offset = 4; offset > 0; offset /= 2) {
+                val += __shfl_down_sync(0xffffffff, val, offset);
+            }
+            if (lane == 0) {
+                out_scores_batch[(size_t)m * max_comp + c] = val;
+            }
+        }
+        __syncthreads();
     }
 }
 
@@ -9185,9 +9306,10 @@ void indexer_score_and_mask_batch_cuda(
     int n_heads)
 {
     if (M <= 0 || max_comp_entries <= 0) return;
-    dim3 grid(max_comp_entries, M);
+    int grid_x = (max_comp_entries < 4096) ? max_comp_entries : 4096;
+    dim3 grid(grid_x, M);
     indexer_score_batch_kernel<<<grid, 128, 0, stream>>>(
-        out_scores_batch, index_comp, q_batch, weights_batch, d_positions, ratio, max_comp_entries, n_heads);
+        out_scores_batch, index_comp, q_batch, weights_batch, d_positions, ratio, max_comp_entries, n_heads, top_k);
 
     indexer_mask_topk_batch_kernel<<<M, 256, 0, stream>>>(
         out_mask_batch, out_scores_batch, d_positions, ratio, max_comp_entries, top_k);

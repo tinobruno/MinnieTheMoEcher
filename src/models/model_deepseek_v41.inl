@@ -173,7 +173,7 @@
 
         // ── Single-Pass Mega-mHC Multi-Head Context Attention ────────────────
         float qk_scale = 1.0f / sqrtf((float)head_dim_val);
-        int max_combined = std::min(cfg_.max_seq_len + window + 2, 20610);
+        int max_combined = window + 512 + 2;
 
         const __nv_bfloat16* p_comp_kv = nullptr;
         const int32_t* p_d_comp_count = nullptr;
@@ -509,10 +509,15 @@
         int n_experts = cfg_.n_routed_experts > 0 ? cfg_.n_routed_experts : DEEPSEEK_V41_EXPERTS;
         int top_k = cfg_.num_experts_per_tok > 0 ? cfg_.num_experts_per_tok : DEEPSEEK_V41_ACTIVE_EXPERTS;
         float scale = 1.0f / sqrtf((float)head_dim_val);
-        int max_combined = std::min(cfg_.max_seq_len + window + 2, 20610);
-        int max_comp_stride = cfg_.max_seq_len + 2;
+        int max_combined = window + 512 + 2;
+        int max_comp_stride = ((std::min(total_tokens, cfg_.max_seq_len) + 2 + 3) & ~3);
 
         int max_super_m = std::max(chunk_size, 4096);
+        if (max_comp_stride > 65536) {
+            int cap_m = (int)((256ULL * 1024 * 1024) / (size_t)max_comp_stride);
+            cap_m = (cap_m / chunk_size) * chunk_size;
+            max_super_m = std::clamp(cap_m, chunk_size, 4096);
+        }
         std::vector<float> h_pre_mix_init((size_t)max_super_m * hc, 0.0f);
         for (int m = 0; m < max_super_m; m++) {
             h_pre_mix_init[(size_t)m * hc] = 1.0f;
@@ -531,19 +536,21 @@
 
         static uint8_t* s_d_idx_mask_super = nullptr;
         static size_t s_idx_mask_cap = 0;
-        size_t req_mask_cap = (size_t)max_super_m * max_comp_stride;
-        if (!s_d_idx_mask_super || s_idx_mask_cap < req_mask_cap) {
-            if (s_d_idx_mask_super) cudaFree(s_d_idx_mask_super);
-            s_idx_mask_cap = req_mask_cap;
-            CUDA_CHECK(cudaMalloc(&s_d_idx_mask_super, s_idx_mask_cap * sizeof(uint8_t)));
-        }
         static float* s_d_idx_scores_chunk = nullptr;
         static size_t s_idx_scores_cap = 0;
-        size_t req_scores_cap = (size_t)chunk_size * max_comp_stride;
-        if (!s_d_idx_scores_chunk || s_idx_scores_cap < req_scores_cap) {
-            if (s_d_idx_scores_chunk) cudaFree(s_d_idx_scores_chunk);
-            s_idx_scores_cap = req_scores_cap;
-            CUDA_CHECK(cudaMalloc(&s_d_idx_scores_chunk, s_idx_scores_cap * sizeof(float)));
+        if (total_tokens > 512) {
+            size_t req_mask_cap = (size_t)max_super_m * max_comp_stride;
+            if (!s_d_idx_mask_super || s_idx_mask_cap < req_mask_cap) {
+                if (s_d_idx_mask_super) cudaFree(s_d_idx_mask_super);
+                s_idx_mask_cap = req_mask_cap;
+                CUDA_CHECK(cudaMalloc(&s_d_idx_mask_super, s_idx_mask_cap * sizeof(uint8_t)));
+            }
+            size_t req_scores_cap = std::min((size_t)chunk_size * max_comp_stride, (size_t)64 * 1024 * 1024);
+            if (!s_d_idx_scores_chunk || s_idx_scores_cap < req_scores_cap) {
+                if (s_d_idx_scores_chunk) cudaFree(s_d_idx_scores_chunk);
+                s_idx_scores_cap = req_scores_cap;
+                CUDA_CHECK(cudaMalloc(&s_d_idx_scores_chunk, s_idx_scores_cap * sizeof(float)));
+            }
         }
 
         static cudaEvent_t s_pfev[14] = {nullptr};
@@ -831,9 +838,10 @@
                     int comp_mask_stride_val = 0;
                     if (is_compressed) {
                         int src_layer = (layer_id >= 20) ? 20 : ((layer_id >= 14) ? 14 : ((layer_id >= 8) ? 8 : 2));
-                        int max_comp_in_chunk = std::min((start + M) / ratio, max_comp_stride);
+                        int raw_comp_in_chunk = (start + M) / ratio;
                         int idx_topk = 512;
-                        if (max_comp_in_chunk > idx_topk && layers_[src_layer].indexer_comp_kv_cache.data) {
+                        if (raw_comp_in_chunk > idx_topk && layers_[src_layer].indexer_comp_kv_cache.data) {
+                            int max_comp_in_chunk = std::min((raw_comp_in_chunk + 3) & ~3, max_comp_stride);
                             uint8_t* chunk_mask_ptr = s_d_idx_mask_super + (size_t)sub_off * max_comp_stride;
                             if (lw.indexer_wq_b_w.data) {
                                 int idx_heads = 32;
@@ -868,19 +876,23 @@
                                     &beta_zero,
                                     idx_weights_batch, CUDA_R_32F, idx_heads,
                                     CUBLAS_COMPUTE_32F, CUBLAS_GEMM_DEFAULT));
-                                indexer_score_and_mask_batch_cuda(
-                                    chunk_mask_ptr,
-                                    s_d_idx_scores_chunk,
-                                    layers_[src_layer].indexer_comp_kv_cache.bf16(),
-                                    idx_q_batch,
-                                    idx_weights_batch,
-                                    chunk_pos_d,
-                                    M,
-                                    ratio,
-                                    max_comp_in_chunk,
-                                    idx_topk,
-                                    main_stream_,
-                                    idx_heads);
+                                int idx_sub_m = std::max(1, std::min(M, (int)(s_idx_scores_cap / (size_t)std::max(1, max_comp_in_chunk))));
+                                for (int m_off = 0; m_off < M; m_off += idx_sub_m) {
+                                    int cur_m = std::min(idx_sub_m, M - m_off);
+                                    indexer_score_and_mask_batch_cuda(
+                                        chunk_mask_ptr + (size_t)m_off * max_comp_in_chunk,
+                                        s_d_idx_scores_chunk,
+                                        layers_[src_layer].indexer_comp_kv_cache.bf16(),
+                                        idx_q_batch + (size_t)m_off * idx_heads * idx_head_dim,
+                                        idx_weights_batch + (size_t)m_off * idx_heads,
+                                        chunk_pos_d + m_off,
+                                        cur_m,
+                                        ratio,
+                                        max_comp_in_chunk,
+                                        idx_topk,
+                                        main_stream_,
+                                        idx_heads);
+                                }
                             }
                             p_comp_mask_batch = chunk_mask_ptr;
                             comp_mask_stride_val = max_comp_in_chunk;

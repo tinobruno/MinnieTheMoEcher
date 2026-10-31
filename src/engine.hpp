@@ -231,9 +231,12 @@ public:
             int ratio = cfg_.layer_compress_ratio(l);
             if (ratio > 0) {
                 layers_[l].comp_kv_count = 0;
-                if (layers_[l].comp_kv_cache.data)
-                    CUDA_CHECK(cudaMemset(layers_[l].comp_kv_cache.data, 0,
-                                           layers_[l].comp_kv_cache.size_bytes));
+                size_t active_comp_entries = !cached_tokens_.empty() ? (cached_tokens_.size() / (size_t)ratio + 4) : 0;
+                if (layers_[l].comp_kv_cache.data && active_comp_entries > 0) {
+                    size_t clear_bytes = std::min(layers_[l].comp_kv_cache.size_bytes,
+                                                  active_comp_entries * (size_t)cfg_.head_dim * sizeof(__nv_bfloat16));
+                    CUDA_CHECK(cudaMemset(layers_[l].comp_kv_cache.data, 0, clear_bytes));
+                }
                 if (layers_[l].comp_kv_state.data)
                     CUDA_CHECK(cudaMemset(layers_[l].comp_kv_state.data, 0,
                                            layers_[l].comp_kv_state.size_bytes));
@@ -246,9 +249,10 @@ public:
                     CUDA_CHECK(cudaMemcpy(layers_[l].comp_score_state.data, neg_inf.data(),
                                            neg_inf.size() * sizeof(float), cudaMemcpyHostToDevice));
                 }
-                if (layers_[l].indexer_comp_kv_cache.data) {
-                    CUDA_CHECK(cudaMemset(layers_[l].indexer_comp_kv_cache.data, 0,
-                                           layers_[l].indexer_comp_kv_cache.size_bytes));
+                if (layers_[l].indexer_comp_kv_cache.data && active_comp_entries > 0) {
+                    size_t clear_idx_bytes = std::min(layers_[l].indexer_comp_kv_cache.size_bytes,
+                                                      active_comp_entries * 128 * sizeof(__nv_bfloat16));
+                    CUDA_CHECK(cudaMemset(layers_[l].indexer_comp_kv_cache.data, 0, clear_idx_bytes));
                 }
                 if (ratio == 4) {
                     if (layers_[l].indexer_comp_kv_state.data)
@@ -1256,6 +1260,22 @@ public:
                 eff_seq_len = 16384;
             }
             cfg_.max_seq_len = eff_seq_len;
+        } else if (cfg_.is_deepseek_v41()) {
+            GpuCapabilities gpu_caps = detect_gpu_capabilities(0);
+            float eff_vram_gb = (max_vram_gb > 0.0f)
+                ? max_vram_gb
+                : (float)gpu_caps.total_vram_bytes / (1024.0f * 1024.0f * 1024.0f);
+            if (eff_vram_gb >= 48.0f && cfg_.max_seq_len < 1048576) {
+                LOG_INFO("DeepSeek-V4.1: High-VRAM GPU detected (%.1f GB). Enabling full 1M context (max_seq_len=1048576)",
+                         eff_vram_gb);
+                cfg_.max_seq_len = 1048576;
+            } else if (eff_vram_gb > 0.0f && eff_vram_gb < 28.0f && cfg_.max_seq_len > 65536) {
+                LOG_INFO("DeepSeek-V4.1: Constrained VRAM budget (%.1f GB). Defaulting max_seq_len to 65536 (pass --ctx to override)",
+                         eff_vram_gb);
+                cfg_.max_seq_len = 65536;
+            }
+        }
+        if (cfg_.is_deepseek()) {
             cfg_.max_compressed_entries = 0;
             for (int r : cfg_.compress_ratios) {
                 if (r > 0) {
@@ -1466,6 +1486,28 @@ public:
 
         // Allocate working buffers first
         alloc_buffers();
+
+        // Precompute RoPE frequencies BEFORE sizing expert cache so RoPE VRAM is accounted for
+        int rope_dim = cfg_.qk_rope_head_dim;
+        int rope_max_seq = std::max((int)MAX_SEQ_LEN, cfg_.max_seq_len + 16);
+        size_t freq_bytes = (size_t)rope_max_seq * (rope_dim / 2) * 2 * sizeof(float);
+
+        // Non-compressed layers: base=10000, NO YaRN (original_seq_len=0 disables it)
+        rope_freqs_.alloc(freq_bytes);
+        precompute_freqs_cuda(rope_freqs_.f32(), rope_max_seq, rope_dim,
+                              cfg_.rope_theta, 1.0f,
+                              0, cfg_.rope_beta_fast,
+                              cfg_.rope_beta_slow, main_stream_);
+
+        // Compressed layers: base=160000, with YaRN (factor=16)
+        rope_freqs_compressed_.alloc(freq_bytes);
+        precompute_freqs_cuda(rope_freqs_compressed_.f32(), rope_max_seq, rope_dim,
+                              cfg_.compress_rope_theta, cfg_.rope_factor,
+                              cfg_.original_seq_len, cfg_.rope_beta_fast,
+                              cfg_.rope_beta_slow, main_stream_);
+        CUDA_CHECK(cudaStreamSynchronize(main_stream_));
+        LOG_INFO("RoPE: non-compressed base=%.0f (no YaRN), compressed base=%.0f (YaRN factor=%.0f, max_seq=%d)",
+                 cfg_.rope_theta, cfg_.compress_rope_theta, cfg_.rope_factor, rope_max_seq);
 
         // Reserve VRAM: rest goes to expert cache
         size_t vram_free_after_dense;
@@ -1712,29 +1754,6 @@ public:
             LOG_INFO("Dense architecture active (0 routed experts). Bypassing expert cache.");
         }
 
-        // Precompute RoPE frequencies — two tables for non-compressed vs compressed layers
-        // DeepSeek-V4 reference: non-compressed layers use base freq without YaRN interpolation;
-        // compressed layers use compress_rope_theta (160000) with full YaRN.
-        int rope_dim = cfg_.qk_rope_head_dim;
-        size_t freq_bytes = MAX_SEQ_LEN * (rope_dim / 2) * 2 * sizeof(float);
-
-        // Non-compressed layers: base=10000, NO YaRN (original_seq_len=0 disables it)
-        rope_freqs_.alloc(freq_bytes);
-        precompute_freqs_cuda(rope_freqs_.f32(), MAX_SEQ_LEN, rope_dim,
-                              cfg_.rope_theta, 1.0f,
-                              0, cfg_.rope_beta_fast,
-                              cfg_.rope_beta_slow, main_stream_);
-
-        // Compressed layers: base=160000, with YaRN (factor=16)
-        rope_freqs_compressed_.alloc(freq_bytes);
-        precompute_freqs_cuda(rope_freqs_compressed_.f32(), MAX_SEQ_LEN, rope_dim,
-                              cfg_.compress_rope_theta, cfg_.rope_factor,
-                              cfg_.original_seq_len, cfg_.rope_beta_fast,
-                              cfg_.rope_beta_slow, main_stream_);
-        CUDA_CHECK(cudaStreamSynchronize(main_stream_));
-        LOG_INFO("RoPE: non-compressed base=%.0f (no YaRN), compressed base=%.0f (YaRN factor=%.0f)",
-                 cfg_.rope_theta, cfg_.compress_rope_theta, cfg_.rope_factor);
-
         if (!cfg_.compress_ratios.empty()) {
             LOG_INFO("Compress ratios loaded: %zu layers", cfg_.compress_ratios.size());
             LOG_INFO("  Layer 0: ratio=%d", cfg_.layer_compress_ratio(0));
@@ -1893,8 +1912,8 @@ public:
 
         // Priority 1: High-frequency normalization weights, sinks, router biases, RoPE tables
         pin_buffer(norm_weight_.data, norm_weight_.size_bytes);
-        pin_buffer(rope_freqs_.data, rope_freqs_.size_bytes);
-        pin_buffer(rope_freqs_compressed_.data, rope_freqs_compressed_.size_bytes);
+        pin_buffer(rope_freqs_.data, std::min(rope_freqs_.size_bytes, (size_t)4 * 1024 * 1024));
+        pin_buffer(rope_freqs_compressed_.data, std::min(rope_freqs_compressed_.size_bytes, (size_t)4 * 1024 * 1024));
         for (auto& lw : layers_) {
             pin_buffer(lw.attn_norm_w.data, lw.attn_norm_w.size_bytes);
             pin_buffer(lw.ffn_norm_w.data, lw.ffn_norm_w.size_bytes);
@@ -2383,9 +2402,16 @@ public:
                 if (!l_snap.snap_kv_cache.data) l_snap.snap_kv_cache.alloc(lw.kv_cache.size_bytes);
                 CUDA_CHECK(cudaMemcpyAsync(l_snap.snap_kv_cache.data, lw.kv_cache.data, lw.kv_cache.size_bytes, cudaMemcpyDeviceToDevice, main_stream_));
             }
+            int ratio = cfg_.layer_compress_ratio(l);
+            size_t active_comp_entries = (ratio > 0) ? (tokens.size() / (size_t)ratio + 4) : (tokens.size() + 4);
             if (lw.comp_kv_cache.data) {
-                if (!l_snap.snap_comp_kv_cache.data) l_snap.snap_comp_kv_cache.alloc(lw.comp_kv_cache.size_bytes);
-                CUDA_CHECK(cudaMemcpyAsync(l_snap.snap_comp_kv_cache.data, lw.comp_kv_cache.data, lw.comp_kv_cache.size_bytes, cudaMemcpyDeviceToDevice, main_stream_));
+                size_t active_comp_bytes = std::min(lw.comp_kv_cache.size_bytes,
+                                                    active_comp_entries * (size_t)cfg_.head_dim * sizeof(__nv_bfloat16));
+                if (active_comp_bytes == 0) active_comp_bytes = std::min(lw.comp_kv_cache.size_bytes, (size_t)4 * cfg_.head_dim * sizeof(__nv_bfloat16));
+                if (!l_snap.snap_comp_kv_cache.data || l_snap.snap_comp_kv_cache.size_bytes < active_comp_bytes) {
+                    l_snap.snap_comp_kv_cache.alloc(active_comp_bytes);
+                }
+                CUDA_CHECK(cudaMemcpyAsync(l_snap.snap_comp_kv_cache.data, lw.comp_kv_cache.data, active_comp_bytes, cudaMemcpyDeviceToDevice, main_stream_));
                 if (lw.d_comp_kv_count.data) {
                     CUDA_CHECK(cudaMemcpyAsync(&l_snap.comp_kv_count, lw.d_comp_kv_count.data, sizeof(int32_t), cudaMemcpyDeviceToHost, main_stream_));
                 } else {
@@ -2401,8 +2427,13 @@ public:
                 CUDA_CHECK(cudaMemcpyAsync(l_snap.snap_comp_score_state.data, lw.comp_score_state.data, lw.comp_score_state.size_bytes, cudaMemcpyDeviceToDevice, main_stream_));
             }
             if (lw.indexer_comp_kv_cache.data) {
-                if (!l_snap.snap_indexer_comp_kv_cache.data) l_snap.snap_indexer_comp_kv_cache.alloc(lw.indexer_comp_kv_cache.size_bytes);
-                CUDA_CHECK(cudaMemcpyAsync(l_snap.snap_indexer_comp_kv_cache.data, lw.indexer_comp_kv_cache.data, lw.indexer_comp_kv_cache.size_bytes, cudaMemcpyDeviceToDevice, main_stream_));
+                size_t active_idx_bytes = std::min(lw.indexer_comp_kv_cache.size_bytes,
+                                                   active_comp_entries * 128 * sizeof(__nv_bfloat16));
+                if (active_idx_bytes == 0) active_idx_bytes = std::min(lw.indexer_comp_kv_cache.size_bytes, (size_t)4 * 128 * sizeof(__nv_bfloat16));
+                if (!l_snap.snap_indexer_comp_kv_cache.data || l_snap.snap_indexer_comp_kv_cache.size_bytes < active_idx_bytes) {
+                    l_snap.snap_indexer_comp_kv_cache.alloc(active_idx_bytes);
+                }
+                CUDA_CHECK(cudaMemcpyAsync(l_snap.snap_indexer_comp_kv_cache.data, lw.indexer_comp_kv_cache.data, active_idx_bytes, cudaMemcpyDeviceToDevice, main_stream_));
             }
             if (lw.indexer_comp_kv_state.data) {
                 if (!l_snap.snap_indexer_comp_kv_state.data) l_snap.snap_indexer_comp_kv_state.alloc(lw.indexer_comp_kv_state.size_bytes);
@@ -2493,11 +2524,15 @@ public:
             if (lw.d_attn_cache_len.data) {
                 CUDA_CHECK(cudaMemcpyAsync(lw.d_attn_cache_len.data, &snap_attn_len, sizeof(int32_t), cudaMemcpyHostToDevice, main_stream_));
             }
+            int ratio = cfg_.layer_compress_ratio(l);
+            size_t active_comp_entries = (ratio > 0) ? (snap.tokens.size() / (size_t)ratio + 4) : (snap.tokens.size() + 4);
             if (lw.comp_kv_cache.data && l_snap.snap_comp_kv_cache.data) {
-                CUDA_CHECK(cudaMemcpyAsync(lw.comp_kv_cache.data, l_snap.snap_comp_kv_cache.data, lw.comp_kv_cache.size_bytes, cudaMemcpyDeviceToDevice, main_stream_));
+                size_t active_comp_bytes = std::min(l_snap.snap_comp_kv_cache.size_bytes,
+                                                    active_comp_entries * (size_t)cfg_.head_dim * sizeof(__nv_bfloat16));
+                if (active_comp_bytes == 0) active_comp_bytes = l_snap.snap_comp_kv_cache.size_bytes;
+                CUDA_CHECK(cudaMemcpyAsync(lw.comp_kv_cache.data, l_snap.snap_comp_kv_cache.data, active_comp_bytes, cudaMemcpyDeviceToDevice, main_stream_));
                 lw.comp_kv_count = l_snap.comp_kv_count;
                 if (lw.d_comp_kv_count.data) {
-                    int ratio = (l < (int)cfg_.compress_ratios.size()) ? cfg_.compress_ratios[l] : 0;
                     int32_t expected_comp = (ratio > 0) ? (snap_attn_len / ratio) : l_snap.comp_kv_count;
                     lw.comp_kv_count = expected_comp;
                     CUDA_CHECK(cudaMemcpyAsync(lw.d_comp_kv_count.data, &lw.comp_kv_count, sizeof(int32_t), cudaMemcpyHostToDevice, main_stream_));
@@ -2510,7 +2545,10 @@ public:
                 CUDA_CHECK(cudaMemcpyAsync(lw.comp_score_state.data, l_snap.snap_comp_score_state.data, lw.comp_score_state.size_bytes, cudaMemcpyDeviceToDevice, main_stream_));
             }
             if (lw.indexer_comp_kv_cache.data && l_snap.snap_indexer_comp_kv_cache.data) {
-                CUDA_CHECK(cudaMemcpyAsync(lw.indexer_comp_kv_cache.data, l_snap.snap_indexer_comp_kv_cache.data, lw.indexer_comp_kv_cache.size_bytes, cudaMemcpyDeviceToDevice, main_stream_));
+                size_t active_idx_bytes = std::min(l_snap.snap_indexer_comp_kv_cache.size_bytes,
+                                                   active_comp_entries * 128 * sizeof(__nv_bfloat16));
+                if (active_idx_bytes == 0) active_idx_bytes = l_snap.snap_indexer_comp_kv_cache.size_bytes;
+                CUDA_CHECK(cudaMemcpyAsync(lw.indexer_comp_kv_cache.data, l_snap.snap_indexer_comp_kv_cache.data, active_idx_bytes, cudaMemcpyDeviceToDevice, main_stream_));
             }
             if (lw.indexer_comp_kv_state.data && l_snap.snap_indexer_comp_kv_state.data) {
                 CUDA_CHECK(cudaMemcpyAsync(lw.indexer_comp_kv_state.data, l_snap.snap_indexer_comp_kv_state.data, lw.indexer_comp_kv_state.size_bytes, cudaMemcpyDeviceToDevice, main_stream_));
@@ -3225,7 +3263,7 @@ public:
         // Set per-request repetition penalty (only apply default if unset / <= 0.0f)
         if (repetition_penalty <= 0.0f) {
             repetition_penalty = cfg_.default_repetition_penalty > 0.0f ? cfg_.default_repetition_penalty :
-                                 ((cfg_.is_nemotron() || cfg_.is_deepseek_v41()) ? 1.05f : 1.0f);
+                                 (cfg_.is_nemotron() ? 1.05f : 1.0f);
         }
         current_rep_penalty_ = repetition_penalty;
 
@@ -6238,7 +6276,7 @@ public:
 
         LOG_INFO("Streaming %zu tokens through all %d transformer layers on GPU...", total_tokens, n_layers);
         for (size_t i = 0; i < total_tokens; i++) {
-            forward_token_eager(tokens[i], (int)(i % MAX_SEQ_LEN), false);
+            forward_token_eager(tokens[i], (int)(i % std::max(1, cfg_.max_seq_len)), false);
 
             if ((i + 1) % 1000 == 0 || i + 1 == total_tokens) {
                 auto now = std::chrono::steady_clock::now();
