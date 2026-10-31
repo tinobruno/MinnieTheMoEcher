@@ -15,6 +15,18 @@
         int mix_size = (2 + hc) * hc;
         int hc_dim = hc * dim;
 
+        // ── 0. Engram Memory Module (Layers 1 and 14) ────────────────────────
+        if (engram_loaded_ && (layer_id == 1 || layer_id == 14) && lw.engram_wkv_w.data) {
+            int e_idx = (layer_id == 1) ? 0 : 1;
+            const __nv_bfloat16* engram_emb = buf_engram_embed_.bf16() + (size_t)e_idx * 6144;
+            gemm_fp8_dequant(buf_engram_wkv_out_.bf16(), 1, 25600, 6144,
+                             engram_emb, (const uint8_t*)lw.engram_wkv_w.data,
+                             (const uint8_t*)lw.engram_wkv_s.data, 32, main_stream_);
+            engram_gated_residual_cuda(buf_hc_state_.bf16(), buf_engram_wkv_out_.bf16(),
+                                       lw.engram_q_weight.bf16(), lw.engram_k_weight.bf16(),
+                                       1, hc, dim, cfg_.rms_norm_eps, main_stream_);
+        }
+
         // ── 1. Attention Hyper-Connection Mixes from buf_hc_state_ ───────────
         // mixes = x_norm @ hc_attn_fn.T -> [mix_size]
         gemv_hc_pre_norm_cuda(buf_hc_mixes_.f32(), buf_hc_state_.bf16(), lw.hc_attn_fn.f32(),
@@ -161,21 +173,64 @@
 
         // ── Single-Pass Mega-mHC Multi-Head Context Attention ────────────────
         float qk_scale = 1.0f / sqrtf((float)head_dim_val);
-        int max_combined = 4096;
+        int max_combined = std::min(cfg_.max_seq_len + window + 2, 20610);
 
         const __nv_bfloat16* p_comp_kv = nullptr;
         const int32_t* p_d_comp_count = nullptr;
+        const uint8_t* p_comp_mask = nullptr;
         if (is_compressed) {
+            int ratio = cfg_.layer_compress_ratio(layer_id);
             int src_layer = (layer_id >= 20) ? 20 : ((layer_id >= 14) ? 14 : ((layer_id >= 8) ? 8 : 2));
             p_comp_kv = layers_[src_layer].comp_kv_cache.bf16();
             p_d_comp_count = layers_[src_layer].d_comp_kv_count.i32();
+
+            int idx_topk = 512;
+            bool need_indexer = (position < 0) || (((position + 1) / ratio) > idx_topk);
+            if (need_indexer && lw.indexer_wq_b_w.data && layers_[src_layer].indexer_comp_kv_cache.data) {
+                int idx_heads = 32;
+                int idx_head_dim = 128;
+                int max_comp = (position >= 0)
+                    ? std::min(cfg_.max_seq_len / ratio + 2, (position + 1) / ratio + 2)
+                    : (cfg_.max_seq_len / ratio + 2);
+                if (lw.indexer_wq_b_w.dtype == "fp4") {
+                    gemv_fp4_cuda(buf_indexer_q_.bf16(), buf_lora_.bf16(),
+                                  (const uint8_t*)lw.indexer_wq_b_w.data, (const uint8_t*)lw.indexer_wq_b_s.data,
+                                  idx_heads * idx_head_dim, q_lora, main_stream_);
+                } else if (lw.indexer_wq_b_w.dtype == "int4") {
+                    gemv_int4_cuda(buf_indexer_q_.bf16(), buf_lora_.bf16(),
+                                   (const uint8_t*)lw.indexer_wq_b_w.data, lw.indexer_wq_b_s.bf16(),
+                                   idx_heads * idx_head_dim, q_lora, main_stream_);
+                } else {
+                    gemm_fp8_dequant(buf_indexer_q_.bf16(), 1, idx_heads * idx_head_dim, q_lora,
+                                     buf_lora_.bf16(),
+                                     lw.indexer_wq_b_w.u8(), lw.indexer_wq_b_s.u8(), 32, main_stream_);
+                }
+                rope_device_pos_cuda(buf_indexer_q_.bf16(), idx_heads, idx_head_dim, rope_dim,
+                                     buf_input_pos_.i32(), layer_rope_freqs, false, main_stream_);
+                gemv_bf16_cuda(buf_indexer_weights_f32_.f32(), lw.indexer_weights_proj.bf16(),
+                               buf_hidden_.bf16(), idx_heads, dim, main_stream_);
+                indexer_score_and_mask_cuda(
+                    buf_indexer_mask_.u8(),
+                    buf_indexer_scores_.f32(),
+                    layers_[src_layer].indexer_comp_kv_cache.bf16(),
+                    buf_indexer_q_.bf16(),
+                    buf_indexer_weights_f32_.f32(),
+                    p_d_comp_count,
+                    max_comp,
+                    idx_topk,
+                    main_stream_,
+                    idx_heads);
+            }
+            if (need_indexer && layers_[src_layer].indexer_comp_kv_cache.data) {
+                p_comp_mask = buf_indexer_mask_.u8();
+            }
         }
 
         mla_attention_fused_cuda(
             buf_q_.bf16(), lw.kv_cache.bf16(), p_comp_kv, lw.attn_sink.f32(),
             buf_attn_out_.bf16(), buf_input_pos_.i32(), p_d_comp_count,
             layer_rope_freqs, max_combined, head_dim_val, rope_dim, qk_scale,
-            0.0f, nullptr, window, main_stream_
+            0.0f, p_comp_mask, window, main_stream_
         );
 
         // ── Grouped Output Projection wo_a + wo_b ─────────────────────────────
@@ -454,7 +509,8 @@
         int n_experts = cfg_.n_routed_experts > 0 ? cfg_.n_routed_experts : DEEPSEEK_V41_EXPERTS;
         int top_k = cfg_.num_experts_per_tok > 0 ? cfg_.num_experts_per_tok : DEEPSEEK_V41_ACTIVE_EXPERTS;
         float scale = 1.0f / sqrtf((float)head_dim_val);
-        int max_combined = 4096;
+        int max_combined = std::min(cfg_.max_seq_len + window + 2, 20610);
+        int max_comp_stride = cfg_.max_seq_len + 2;
 
         int max_super_m = std::max(chunk_size, 4096);
         std::vector<float> h_pre_mix_init((size_t)max_super_m * hc, 0.0f);
@@ -473,6 +529,23 @@
             CUDA_CHECK(cudaMalloc(&s_d_comp_counts, (size_t)s_comp_counts_cap * sizeof(int32_t)));
         }
 
+        static uint8_t* s_d_idx_mask_super = nullptr;
+        static size_t s_idx_mask_cap = 0;
+        size_t req_mask_cap = (size_t)max_super_m * max_comp_stride;
+        if (!s_d_idx_mask_super || s_idx_mask_cap < req_mask_cap) {
+            if (s_d_idx_mask_super) cudaFree(s_d_idx_mask_super);
+            s_idx_mask_cap = req_mask_cap;
+            CUDA_CHECK(cudaMalloc(&s_d_idx_mask_super, s_idx_mask_cap * sizeof(uint8_t)));
+        }
+        static float* s_d_idx_scores_chunk = nullptr;
+        static size_t s_idx_scores_cap = 0;
+        size_t req_scores_cap = (size_t)chunk_size * max_comp_stride;
+        if (!s_d_idx_scores_chunk || s_idx_scores_cap < req_scores_cap) {
+            if (s_d_idx_scores_chunk) cudaFree(s_d_idx_scores_chunk);
+            s_idx_scores_cap = req_scores_cap;
+            CUDA_CHECK(cudaMalloc(&s_d_idx_scores_chunk, s_idx_scores_cap * sizeof(float)));
+        }
+
         static cudaEvent_t s_pfev[14] = {nullptr};
         static bool s_pfev_init = false;
         if (!s_pfev_init) {
@@ -487,6 +560,17 @@
                       prefill_bufs_.buf_hidden.bf16(), prefill_bufs_.buf_hidden.bf16(),
                       1.0f, 0.0f, main_stream_);
             CUDA_CHECK(cudaStreamSynchronize(main_stream_));
+        }
+
+        if (engram_loaded_ && !engram_token_map_.empty()) {
+            if ((int)engram_compressed_cache_.size() < total_tokens + 64) {
+                engram_compressed_cache_.resize(total_tokens + 4096, engram_pad_id_);
+            }
+            for (int pos = 0; pos < total_tokens; pos++) {
+                int tid = prompt[pos];
+                engram_compressed_cache_[pos] = (tid >= 0 && tid < (int)engram_token_map_.size())
+                    ? engram_token_map_[tid] : engram_pad_id_;
+            }
         }
 
         for (int super_start = start_offset; super_start < total_tokens; super_start += max_super_m) {
@@ -585,6 +669,17 @@
 
                     bool do_prof = (start == super_start) && (layer_id == 0 || layer_id == 20 || layer_id == 39);
                     if (do_prof) CUDA_CHECK(cudaEventRecord(s_pfev[0], main_stream_));
+
+                    // ── 0. Engram Memory Module (Layers 1 and 14) ────────────────────────
+                    if (engram_loaded_ && (layer_id == 1 || layer_id == 14) && lw.engram_wkv_w.data) {
+                        prepare_engram_batch(layer_id, start, M);
+                        gemm_fp8_dequant(buf_engram_wkv_out_.bf16(), M, 25600, 6144,
+                                         buf_engram_embed_.bf16(), (const uint8_t*)lw.engram_wkv_w.data,
+                                         (const uint8_t*)lw.engram_wkv_s.data, 32, main_stream_);
+                        engram_gated_residual_cuda(chunk_hc_state, buf_engram_wkv_out_.bf16(),
+                                                   lw.engram_q_weight.bf16(), lw.engram_k_weight.bf16(),
+                                                   M, hc, dim, cfg_.rms_norm_eps, main_stream_);
+                    }
 
                     // ── 1. Attention Hyper-Connection Mixes from chunk_hc_state ──────────
                     gemv_hc_pre_norm_batch_cuda(prefill_bufs_.buf_hc_mixes.f32(),
@@ -725,7 +820,71 @@
                             rope_dim,
                             cfg_.rms_norm_eps,
                             (cfg_.max_seq_len / ratio + 2),
-                            main_stream_);
+                            main_stream_,
+                            lw.indexer_wk.data ? lw.indexer_wk.bf16() : nullptr,
+                            lw.indexer_k_norm.data ? lw.indexer_k_norm.bf16() : nullptr,
+                            lw.indexer_comp_kv_cache.data ? lw.indexer_comp_kv_cache.bf16() : nullptr);
+                    }
+
+                    // 1b. Batched DeepSeek V4.1 Indexer on index_source_layers (2, 8, 14, 20, 24, 28, 32, 36)
+                    const uint8_t* p_comp_mask_batch = nullptr;
+                    int comp_mask_stride_val = 0;
+                    if (is_compressed) {
+                        int src_layer = (layer_id >= 20) ? 20 : ((layer_id >= 14) ? 14 : ((layer_id >= 8) ? 8 : 2));
+                        int max_comp_in_chunk = std::min((start + M) / ratio, max_comp_stride);
+                        int idx_topk = 512;
+                        if (max_comp_in_chunk > idx_topk && layers_[src_layer].indexer_comp_kv_cache.data) {
+                            uint8_t* chunk_mask_ptr = s_d_idx_mask_super + (size_t)sub_off * max_comp_stride;
+                            if (lw.indexer_wq_b_w.data) {
+                                int idx_heads = 32;
+                                int idx_head_dim = 128;
+                                __nv_bfloat16* idx_q_batch = prefill_bufs_.buf_shared_down.bf16();
+                                float* idx_weights_batch = prefill_bufs_.buf_shared_gate.f32();
+                                if (lw.indexer_wq_b_w.dtype == "fp4") {
+                                    gemm_fp4_batch_cuda(idx_q_batch, prefill_bufs_.buf_lora.bf16(),
+                                                        (const uint8_t*)lw.indexer_wq_b_w.data, (const uint8_t*)lw.indexer_wq_b_s.data,
+                                                        idx_heads * idx_head_dim, q_lora, M, main_stream_);
+                                } else if (lw.indexer_wq_b_w.dtype == "int4") {
+                                    gemm_int4_dequant(idx_q_batch, M, idx_heads * idx_head_dim, q_lora,
+                                                     prefill_bufs_.buf_lora.bf16(),
+                                                     (const uint8_t*)lw.indexer_wq_b_w.data, lw.indexer_wq_b_s.bf16(), 32, main_stream_);
+                                } else {
+                                    gemm_fp8_dequant(idx_q_batch, M, idx_heads * idx_head_dim, q_lora,
+                                                     prefill_bufs_.buf_lora.bf16(),
+                                                     lw.indexer_wq_b_w.u8(), lw.indexer_wq_b_s.u8(), 32, main_stream_);
+                                }
+                                rope_device_pos_multihead_batch_cuda(
+                                    idx_q_batch, M, idx_heads, idx_head_dim, rope_dim,
+                                    chunk_pos_d, layer_rope_freqs, false, main_stream_);
+                                const float alpha_idx = 1.0f / 64.0f;
+                                const float beta_zero = 0.0f;
+                                CUBLAS_CHECK(cublasGemmEx(
+                                    cublas_handle_,
+                                    CUBLAS_OP_T, CUBLAS_OP_N,
+                                    idx_heads, M, dim,
+                                    &alpha_idx,
+                                    lw.indexer_weights_proj.bf16(), CUDA_R_16BF, dim,
+                                    prefill_bufs_.buf_hidden.bf16(), CUDA_R_16BF, dim,
+                                    &beta_zero,
+                                    idx_weights_batch, CUDA_R_32F, idx_heads,
+                                    CUBLAS_COMPUTE_32F, CUBLAS_GEMM_DEFAULT));
+                                indexer_score_and_mask_batch_cuda(
+                                    chunk_mask_ptr,
+                                    s_d_idx_scores_chunk,
+                                    layers_[src_layer].indexer_comp_kv_cache.bf16(),
+                                    idx_q_batch,
+                                    idx_weights_batch,
+                                    chunk_pos_d,
+                                    M,
+                                    ratio,
+                                    max_comp_in_chunk,
+                                    idx_topk,
+                                    main_stream_,
+                                    idx_heads);
+                            }
+                            p_comp_mask_batch = chunk_mask_ptr;
+                            comp_mask_stride_val = max_comp_in_chunk;
+                        }
                     }
 
                     // 2. Batched Flash-MLA Attention across all M tokens in parallel
@@ -749,7 +908,9 @@
                         scale,
                         0.0f,
                         window,
-                        main_stream_);
+                        main_stream_,
+                        p_comp_mask_batch,
+                        comp_mask_stride_val);
 
                     // 3. Store the trailing min(M, window) KV vectors into the 128-token sliding window ring buffer
                     int m_store_start = std::max(0, M - window);

@@ -996,7 +996,9 @@ void mla_attention_fused_batch_cuda(
     float scale,
     float q_norm_eps,
     int window = 128,
-    cudaStream_t stream = 0);
+    cudaStream_t stream = 0,
+    const uint8_t* comp_mask_batch = nullptr,
+    int comp_mask_stride = 0);
 
 void compressor_device_step_cuda(
     const int32_t* d_position,
@@ -1013,7 +1015,7 @@ void compressor_device_step_cuda(
     int head_dim,
     int rope_dim,
     float rms_norm_eps,
-    // Optional Indexer compressor parameters (for ratio == 4)
+    // Optional Indexer compressor parameters (for ratio == 4, or wk/k_norm for V4.1)
     const float* idx_proj_kv = nullptr,
     const float* idx_proj_gate = nullptr,
     float* idx_kv_state = nullptr,
@@ -1022,7 +1024,8 @@ void compressor_device_step_cuda(
     const __nv_bfloat16* idx_norm = nullptr,
     __nv_bfloat16* idx_comp_kv_cache = nullptr,
     int max_comp = 0,
-    cudaStream_t stream = 0);
+    cudaStream_t stream = 0,
+    const __nv_bfloat16* idx_wk = nullptr);
 
 void compressor_device_batch_step_cuda(
     const int32_t* d_positions,
@@ -1041,7 +1044,10 @@ void compressor_device_batch_step_cuda(
     int rope_dim,
     float rms_norm_eps,
     int max_comp = 0,
-    cudaStream_t stream = 0);
+    cudaStream_t stream = 0,
+    const __nv_bfloat16* idx_wk = nullptr,
+    const __nv_bfloat16* idx_k_norm = nullptr,
+    __nv_bfloat16* idx_comp_kv_cache = nullptr);
 
 void indexer_score_and_mask_cuda(
     uint8_t* out_mask,
@@ -1052,7 +1058,27 @@ void indexer_score_and_mask_cuda(
     const int32_t* d_comp_count,
     int max_comp_entries,
     int top_k = 512,
+    cudaStream_t stream = 0,
+    int n_heads = 64);
+
+void rope_device_pos_multihead_batch_cuda(
+    __nv_bfloat16* x, int M, int n_heads, int head_dim, int rope_dim,
+    const int32_t* d_positions, const float* freq_table, bool inverse,
     cudaStream_t stream = 0);
+
+void indexer_score_and_mask_batch_cuda(
+    uint8_t* out_mask_batch,
+    float* out_scores_batch,
+    const __nv_bfloat16* index_comp,
+    const __nv_bfloat16* q_batch,
+    const float* weights_batch,
+    const int32_t* d_positions,
+    int M,
+    int ratio,
+    int max_comp_entries,
+    int top_k = 512,
+    cudaStream_t stream = 0,
+    int n_heads = 32);
 
 void accumulate_expert_imatrix_cuda(
     float* gate_accum,             // [n_experts, hidden_dim]
@@ -1793,4 +1819,13 @@ void moe_iq2_xxs_binned_down_scaled_residual_batch_cuda(
     int top_k = 9,
     int n_experts = 496,
     size_t down_offset_bytes = 675840);
+
+void engram_gated_residual_cuda(
+    __nv_bfloat16* hc_state,
+    const __nv_bfloat16* kv,
+    const __nv_bfloat16* q_weight,
+    const __nv_bfloat16* k_weight,
+    int M, int hc_mult, int dim, float eps,
+    cudaStream_t stream = 0);
+
 

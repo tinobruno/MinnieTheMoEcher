@@ -42,9 +42,14 @@ __device__ __forceinline__ __nv_bfloat162 to_bf162_float2(const float2& v) {
 
 // FP8 E4M3 and E8M0 conversions (bitcast-based v2)
 __device__ __forceinline__ float fp8_e4m3_to_float_v2(uint8_t val) {
-    if (val == 0) return 0.0f;
+    uint32_t exp_mant = (uint32_t)(val & 0x7F);
+    if (exp_mant == 0) return 0.0f;
+    if (exp_mant < 8) {
+        float f = (float)exp_mant * (1.0f / 512.0f);
+        return (val & 0x80) ? -f : f;
+    }
     uint32_t sign = (uint32_t)(val & 0x80) << 24;
-    uint32_t body = ((uint32_t)(val & 0x7F) << 20) + 0x3C000000U;
+    uint32_t body = (exp_mant << 20) + 0x3C000000U;
     return __uint_as_float(sign | body);
 }
 
@@ -7399,6 +7404,50 @@ void rope_device_pos_batch_cuda(
         x, M, head_dim, rope_dim, d_positions, freq_table, inverse);
 }
 
+__global__ void rope_device_pos_multihead_batch_kernel(
+    __nv_bfloat16* __restrict__ x,
+    int M, int n_heads, int head_dim, int rope_dim,
+    const int32_t* __restrict__ d_positions,
+    const float* __restrict__ freq_table,
+    bool inverse)
+{
+    int h = blockIdx.x;
+    int m = blockIdx.y;
+    int pair_id = threadIdx.x;
+
+    if (m >= M || h >= n_heads || pair_id >= rope_dim / 2) return;
+
+    int position = d_positions[m];
+    int half_rope = rope_dim / 2;
+    size_t base_idx = ((size_t)m * n_heads + h) * head_dim + (head_dim - rope_dim) + 2 * pair_id;
+
+    float x0 = bf16_to_float(x[base_idx]);
+    float x1 = bf16_to_float(x[base_idx + 1]);
+
+    float cos_val = freq_table[position * half_rope * 2 + pair_id * 2];
+    float sin_val = freq_table[position * half_rope * 2 + pair_id * 2 + 1];
+
+    if (inverse) sin_val = -sin_val;
+
+    float y0 = x0 * cos_val - x1 * sin_val;
+    float y1 = x0 * sin_val + x1 * cos_val;
+
+    x[base_idx]     = float_to_bf16(y0);
+    x[base_idx + 1] = float_to_bf16(y1);
+}
+
+void rope_device_pos_multihead_batch_cuda(
+    __nv_bfloat16* x, int M, int n_heads, int head_dim, int rope_dim,
+    const int32_t* d_positions, const float* freq_table, bool inverse,
+    cudaStream_t stream)
+{
+    if (M <= 0 || n_heads <= 0) return;
+    int pairs = rope_dim / 2;
+    dim3 blocks(n_heads, M);
+    rope_device_pos_multihead_batch_kernel<<<blocks, pairs, 0, stream>>>(
+        x, M, n_heads, head_dim, rope_dim, d_positions, freq_table, inverse);
+}
+
 __global__ void store_kv_device_pos_kernel(
     __nv_bfloat16* __restrict__ kv_cache,
     const __nv_bfloat16* __restrict__ kv_val,
@@ -7563,7 +7612,7 @@ __global__ void mla_attention_fused_kernel(
             kv_t = raw_kv + (size_t)raw_slot * head_dim;
         } else {
             int comp_slot = t - n_raw;
-            if (comp_mask != nullptr && comp_mask[comp_slot] == 0) {
+            if (n_comp > 512 && comp_mask != nullptr && comp_mask[comp_slot] == 0) {
                 scores[t] = -1e38f;
                 continue;
             }
@@ -7666,6 +7715,7 @@ __global__ void mla_attention_fused_kernel(
     #pragma unroll 4
     for (int t = 0; t < safe_comp; t++) {
         float sc = scores[n_raw + t];
+        if (sc == 0.0f) continue;
         const __nv_bfloat162* kv_pairs = reinterpret_cast<const __nv_bfloat162*>(comp_kv + (size_t)t * head_dim);
         float2 kv_val = to_float2_bf162(kv_pairs[tid]);
         sum0 += sc * kv_val.x;
@@ -7709,7 +7759,9 @@ __global__ void mla_attention_fused_batch_kernel(
     int rope_dim,
     float scale,
     float q_norm_eps,
-    int window)
+    int window,
+    const uint8_t* __restrict__ comp_mask_batch,
+    int comp_mask_stride)
 {
     int h = blockIdx.x;
     int m = blockIdx.y;
@@ -7794,6 +7846,7 @@ __global__ void mla_attention_fused_batch_kernel(
     int vec_id = tid >> 3;      // 0..31
     int vec_lane = tid & 7;     // 0..7
     int n_vecs = n_threads >> 3; // 32
+    const uint8_t* comp_mask_m = (comp_mask_batch != nullptr) ? (comp_mask_batch + (size_t)m * comp_mask_stride) : nullptr;
 
     for (int t = vec_id; t < cache_len; t += n_vecs) {
         const __nv_bfloat16* kv_t = nullptr;
@@ -7804,6 +7857,10 @@ __global__ void mla_attention_fused_batch_kernel(
                  : (batch_kv + (size_t)(tau - start_pos) * head_dim);
         } else {
             int comp_slot = t - n_raw;
+            if (n_comp > 512 && comp_mask_m != nullptr && comp_mask_m[comp_slot] == 0) {
+                if (vec_lane == 0) scores[t] = -1e38f;
+                continue;
+            }
             kv_t = comp_kv + (size_t)comp_slot * head_dim;
         }
         float dot = 0.0f;
@@ -7913,6 +7970,7 @@ __global__ void mla_attention_fused_batch_kernel(
     #pragma unroll 4
     for (int t = 0; t < safe_comp; t++) {
         float sc = scores[n_raw + t];
+        if (sc == 0.0f) continue;
         const __nv_bfloat162* kv_pairs = reinterpret_cast<const __nv_bfloat162*>(comp_kv + (size_t)t * head_dim);
         float2 kv_val = to_float2_bf162(kv_pairs[tid]);
         sum0 += sc * kv_val.x;
@@ -7953,7 +8011,7 @@ void init_mla_dynamic_shared_memory() {
     if (cudaFuncGetAttributes(&attr, mla_attention_kernel) == cudaSuccess) {
         size_t max_allowed = (prop.sharedMemPerBlockOptin > attr.sharedSizeBytes) ?
                              (prop.sharedMemPerBlockOptin - attr.sharedSizeBytes) : 0;
-        if (max_allowed > 49152) {
+        if (max_allowed > 40960) {
             cudaFuncSetAttribute(mla_attention_kernel,
                                  cudaFuncAttributeMaxDynamicSharedMemorySize,
                                  (int)max_allowed);
@@ -7963,7 +8021,7 @@ void init_mla_dynamic_shared_memory() {
     if (cudaFuncGetAttributes(&attr, mla_attention_fused_kernel) == cudaSuccess) {
         size_t max_allowed = (prop.sharedMemPerBlockOptin > attr.sharedSizeBytes) ?
                              (prop.sharedMemPerBlockOptin - attr.sharedSizeBytes) : 0;
-        if (max_allowed > 49152) {
+        if (max_allowed > 40960) {
             cudaFuncSetAttribute(mla_attention_fused_kernel,
                                  cudaFuncAttributeMaxDynamicSharedMemorySize,
                                  (int)max_allowed);
@@ -7973,7 +8031,7 @@ void init_mla_dynamic_shared_memory() {
     if (cudaFuncGetAttributes(&attr, mla_attention_fused_batch_kernel) == cudaSuccess) {
         size_t max_allowed = (prop.sharedMemPerBlockOptin > attr.sharedSizeBytes) ?
                              (prop.sharedMemPerBlockOptin - attr.sharedSizeBytes) : 0;
-        if (max_allowed > 49152) {
+        if (max_allowed > 40960) {
             cudaFuncSetAttribute(mla_attention_fused_batch_kernel,
                                  cudaFuncAttributeMaxDynamicSharedMemorySize,
                                  (int)max_allowed);
@@ -8001,9 +8059,9 @@ void mla_attention_fused_cuda(
     cudaStream_t stream)
 {
     int n_threads = 256;
-    if (max_cache_len > 4096) max_cache_len = 4096;
+    if (max_cache_len > 20610) max_cache_len = 20610;
     size_t smem_bytes = max_cache_len * sizeof(float);
-    if (smem_bytes > 49152) {
+    if (smem_bytes > 40960) {
         init_mla_dynamic_shared_memory();
     }
     int n_heads = 64;
@@ -8035,20 +8093,23 @@ void mla_attention_fused_batch_cuda(
     float scale,
     float q_norm_eps,
     int window,
-    cudaStream_t stream)
+    cudaStream_t stream,
+    const uint8_t* comp_mask_batch,
+    int comp_mask_stride)
 {
     if (M <= 0) return;
     int n_threads = 256;
-    if (max_cache_len > 4096) max_cache_len = 4096;
+    if (max_cache_len > 20610) max_cache_len = 20610;
     size_t smem_bytes = max_cache_len * sizeof(float);
-    if (smem_bytes > 49152) {
+    if (smem_bytes > 40960) {
         init_mla_dynamic_shared_memory();
     }
     dim3 blocks(64, M);
     mla_attention_fused_batch_kernel<<<blocks, n_threads, smem_bytes, stream>>>(
         raw_q, raw_kv, batch_kv, comp_kv, attn_sink, out,
         d_positions, d_comp_counts, freq_table,
-        max_cache_len, head_dim, rope_dim, scale, q_norm_eps, window);
+        max_cache_len, head_dim, rope_dim, scale, q_norm_eps, window,
+        comp_mask_batch, comp_mask_stride);
     cudaError_t err = cudaGetLastError();
     if (err != cudaSuccess) {
         printf("[ERROR] mla_attention_fused_batch_kernel launch failed: %s\n", cudaGetErrorString(err));
@@ -8081,7 +8142,8 @@ __global__ void compressor_device_step_kernel(
     const float* __restrict__ idx_ape,
     const __nv_bfloat16* __restrict__ idx_norm,
     __nv_bfloat16* __restrict__ idx_comp_kv_cache,
-    int max_comp)
+    int max_comp,
+    const __nv_bfloat16* __restrict__ idx_wk)
 {
     int pos = *d_position;
     int pos_mod = pos % ratio;
@@ -8112,7 +8174,12 @@ __global__ void compressor_device_step_kernel(
 
     // 3. Check if compression boundary is reached
     bool should_compress = ((pos + 1) % ratio == 0);
-    if (!should_compress) return;
+    if (!should_compress) {
+        if (pos == 0 && threadIdx.x == 0) {
+            *d_comp_count = 0;
+        }
+        return;
+    }
 
     __shared__ float s_pooled[512];
     __shared__ float s_normed[512];
@@ -8184,11 +8251,82 @@ __global__ void compressor_device_step_kernel(
     }
     __syncthreads();
 
-    // 6. Attention RoPE (applied to tail rope_dim = 64)
     int comp_pos = pos + 1 - ratio;
     if (comp_pos >= 65536) comp_pos = 65535;
     if (comp_pos < 0) comp_pos = 0;
     int half_rope = rope_dim / 2;
+    int comp_idx = pos / ratio;
+
+    // 5b. DeepSeek V4.1 Indexer Key Projection from pre-RoPE latent (s_normed):
+    //     k = k_norm(wk(latent)), apply RoPE(comp_pos) to tail rope_dim=64, store to idx_comp_kv_cache
+    if (idx_wk != nullptr && idx_norm != nullptr && idx_comp_kv_cache != nullptr) {
+        const int idx_head_dim = 128;
+        __shared__ float s_idx_k[128];
+        __shared__ float s_idx_sq;
+        int r = threadIdx.x >> 1;   // 0..127
+        int sub = threadIdx.x & 1;  // 0..1
+        float dot = 0.0f;
+        const __nv_bfloat16* wk_row = idx_wk + (size_t)r * head_dim + sub * 256;
+        #pragma unroll 8
+        for (int k = 0; k < 256; k++) {
+            dot += bf16_to_float(wk_row[k]) * s_normed[sub * 256 + k];
+        }
+        dot += __shfl_xor_sync(0xffffffff, dot, 1);
+        if (sub == 0) {
+            s_idx_k[r] = dot;
+        }
+        __syncthreads();
+
+        float idx_thread_sq = 0.0f;
+        if (threadIdx.x < idx_head_dim) {
+            float v = s_idx_k[threadIdx.x];
+            idx_thread_sq = v * v;
+        }
+        #pragma unroll
+        for (int offset = 16; offset > 0; offset /= 2) {
+            idx_thread_sq += __shfl_down_sync(0xffffffff, idx_thread_sq, offset);
+        }
+        if (lane == 0) s_warp_sq[warp] = idx_thread_sq;
+        __syncthreads();
+        if (warp == 0) {
+            float val = (lane < 4) ? s_warp_sq[lane] : 0.0f;
+            #pragma unroll
+            for (int offset = 2; offset > 0; offset /= 2) {
+                val += __shfl_down_sync(0xffffffff, val, offset);
+            }
+            if (lane == 0) s_idx_sq = val;
+        }
+        __syncthreads();
+
+        float idx_rms_scale = rsqrtf(s_idx_sq / (float)idx_head_dim + rms_norm_eps);
+        if (threadIdx.x < idx_head_dim) {
+            int j = threadIdx.x;
+            s_idx_k[j] = s_idx_k[j] * idx_rms_scale * bf16_to_float(idx_norm[j]);
+        }
+        __syncthreads();
+
+        if (threadIdx.x < half_rope) {
+            int pair_id = threadIdx.x;
+            int base_idx = (idx_head_dim - rope_dim) + 2 * pair_id;
+            float x0 = s_idx_k[base_idx];
+            float x1 = s_idx_k[base_idx + 1];
+            float cos_val = rope_freqs_compressed[comp_pos * half_rope * 2 + pair_id * 2];
+            float sin_val = rope_freqs_compressed[comp_pos * half_rope * 2 + pair_id * 2 + 1];
+            s_idx_k[base_idx]     = x0 * cos_val - x1 * sin_val;
+            s_idx_k[base_idx + 1] = x0 * sin_val + x1 * cos_val;
+        }
+        __syncthreads();
+
+        if (threadIdx.x < idx_head_dim) {
+            if (max_comp <= 0 || comp_idx < max_comp) {
+                int j = threadIdx.x;
+                idx_comp_kv_cache[(size_t)comp_idx * idx_head_dim + j] = float_to_bf16(s_idx_k[j]);
+            }
+        }
+        __syncthreads();
+    }
+
+    // 6. Attention RoPE (applied to tail rope_dim = 64)
     if (threadIdx.x < half_rope) {
         int pair_id = threadIdx.x;
         int base_idx = (head_dim - rope_dim) + 2 * pair_id;
@@ -8202,7 +8340,6 @@ __global__ void compressor_device_step_kernel(
     __syncthreads();
 
     // 7. Store Attention Compressed Entry & Shift State
-    int comp_idx = *d_comp_count;
     if (max_comp <= 0 || comp_idx < max_comp) {
         for (int j = threadIdx.x; j < head_dim; j += blockDim.x) {
             comp_kv_cache[(size_t)comp_idx * head_dim + j] = float_to_bf16(s_normed[j]);
@@ -8299,11 +8436,11 @@ __global__ void compressor_device_step_kernel(
         __syncthreads();
     }
 
-    // 9. Increment Device Compressed Entry Counter
+    // 9. Update Device Compressed Entry Counter deterministically from pos
     if (threadIdx.x == 0) {
-        if (max_comp <= 0 || *d_comp_count < max_comp) {
-            *d_comp_count += 1;
-        }
+        int next_count = comp_idx + 1;
+        if (max_comp > 0 && next_count > max_comp) next_count = max_comp;
+        *d_comp_count = next_count;
     }
 }
 
@@ -8330,7 +8467,8 @@ void compressor_device_step_cuda(
     const __nv_bfloat16* idx_norm,
     __nv_bfloat16* idx_comp_kv_cache,
     int max_comp,
-    cudaStream_t stream)
+    cudaStream_t stream,
+    const __nv_bfloat16* idx_wk)
 {
     compressor_device_step_kernel<<<1, 256, 0, stream>>>(
         d_position, d_comp_count,
@@ -8341,7 +8479,8 @@ void compressor_device_step_cuda(
         idx_proj_kv, idx_proj_gate,
         idx_kv_state, idx_score_state, idx_ape, idx_norm,
         idx_comp_kv_cache,
-        max_comp);
+        max_comp,
+        idx_wk);
 }
 
 __global__ void compressor_device_batch_step_kernel(
@@ -8360,7 +8499,10 @@ __global__ void compressor_device_batch_step_kernel(
     int head_dim,
     int rope_dim,
     float rms_norm_eps,
-    int max_comp)
+    int max_comp,
+    const __nv_bfloat16* __restrict__ idx_wk,
+    const __nv_bfloat16* __restrict__ idx_k_norm,
+    __nv_bfloat16* __restrict__ idx_comp_kv_cache)
 {
     bool overlap = (ratio == 4);
     int coff = overlap ? 2 : 1;
@@ -8374,6 +8516,8 @@ __global__ void compressor_device_batch_step_kernel(
     __shared__ float s_warp_sq[8];
     __shared__ float s_sq_sum;
     __shared__ int s_comp_idx;
+    __shared__ float s_idx_k[128];
+    __shared__ float s_idx_sq;
 
     for (int m = 0; m < M; m++) {
         int pos = d_positions[m];
@@ -8390,7 +8534,12 @@ __global__ void compressor_device_batch_step_kernel(
         }
         __syncthreads();
 
-        if ((pos + 1) % ratio != 0) continue;
+        if ((pos + 1) % ratio != 0) {
+            if (pos == 0 && threadIdx.x == 0) {
+                *d_comp_count = 0;
+            }
+            continue;
+        }
 
         for (int j = threadIdx.x; j < head_dim; j += blockDim.x) {
             float max_score = -1e38f;
@@ -8453,9 +8602,84 @@ __global__ void compressor_device_batch_step_kernel(
         }
         __syncthreads();
 
+        int comp_idx = pos / ratio;
+        if (threadIdx.x == 0) {
+            int next_count = comp_idx + 1;
+            if (max_comp > 0 && next_count > max_comp) next_count = max_comp;
+            *d_comp_count = next_count;
+        }
+        __syncthreads();
+
         int comp_pos = pos + 1 - ratio;
         if (comp_pos >= 65536) comp_pos = 65535;
         if (comp_pos < 0) comp_pos = 0;
+
+        // DeepSeek V4.1 Indexer Key Projection from pre-RoPE latent (s_normed)
+        if (idx_wk != nullptr && idx_k_norm != nullptr && idx_comp_kv_cache != nullptr) {
+            const int idx_head_dim = 128;
+            int r = threadIdx.x >> 1;   // 0..127
+            int sub = threadIdx.x & 1;  // 0..1
+            float dot = 0.0f;
+            const __nv_bfloat16* wk_row = idx_wk + (size_t)r * head_dim + sub * 256;
+            #pragma unroll 8
+            for (int k = 0; k < 256; k++) {
+                dot += bf16_to_float(wk_row[k]) * s_normed[sub * 256 + k];
+            }
+            dot += __shfl_xor_sync(0xffffffff, dot, 1);
+            if (sub == 0) {
+                s_idx_k[r] = dot;
+            }
+            __syncthreads();
+
+            float idx_thread_sq = 0.0f;
+            if (threadIdx.x < idx_head_dim) {
+                float v = s_idx_k[threadIdx.x];
+                idx_thread_sq = v * v;
+            }
+            #pragma unroll
+            for (int offset = 16; offset > 0; offset /= 2) {
+                idx_thread_sq += __shfl_down_sync(0xffffffff, idx_thread_sq, offset);
+            }
+            if (lane == 0) s_warp_sq[warp] = idx_thread_sq;
+            __syncthreads();
+            if (warp == 0) {
+                float val = (lane < 4) ? s_warp_sq[lane] : 0.0f;
+                #pragma unroll
+                for (int offset = 2; offset > 0; offset /= 2) {
+                    val += __shfl_down_sync(0xffffffff, val, offset);
+                }
+                if (lane == 0) s_idx_sq = val;
+            }
+            __syncthreads();
+
+            float idx_rms_scale = rsqrtf(s_idx_sq / (float)idx_head_dim + rms_norm_eps);
+            if (threadIdx.x < idx_head_dim) {
+                int j = threadIdx.x;
+                s_idx_k[j] = s_idx_k[j] * idx_rms_scale * bf16_to_float(idx_k_norm[j]);
+            }
+            __syncthreads();
+
+            if (threadIdx.x < half_rope) {
+                int pair_id = threadIdx.x;
+                int base_idx = (idx_head_dim - rope_dim) + 2 * pair_id;
+                float x0 = s_idx_k[base_idx];
+                float x1 = s_idx_k[base_idx + 1];
+                float cos_val = rope_freqs_compressed[comp_pos * half_rope * 2 + pair_id * 2];
+                float sin_val = rope_freqs_compressed[comp_pos * half_rope * 2 + pair_id * 2 + 1];
+                s_idx_k[base_idx]     = x0 * cos_val - x1 * sin_val;
+                s_idx_k[base_idx + 1] = x0 * sin_val + x1 * cos_val;
+            }
+            __syncthreads();
+
+            if (threadIdx.x < idx_head_dim) {
+                if (max_comp <= 0 || comp_idx < max_comp) {
+                    int j = threadIdx.x;
+                    idx_comp_kv_cache[(size_t)comp_idx * idx_head_dim + j] = float_to_bf16(s_idx_k[j]);
+                }
+            }
+            __syncthreads();
+        }
+
         if (threadIdx.x < half_rope) {
             int pair_id = threadIdx.x;
             int base_idx = (head_dim - rope_dim) + 2 * pair_id;
@@ -8468,16 +8692,6 @@ __global__ void compressor_device_batch_step_kernel(
         }
         __syncthreads();
 
-        if (threadIdx.x == 0) {
-            int cur_idx = *d_comp_count;
-            s_comp_idx = cur_idx;
-            if (max_comp <= 0 || cur_idx < max_comp) {
-                *d_comp_count = cur_idx + 1;
-            }
-        }
-        __syncthreads();
-
-        int comp_idx = s_comp_idx;
         if (max_comp <= 0 || comp_idx < max_comp) {
             for (int j = threadIdx.x; j < head_dim; j += blockDim.x) {
                 comp_kv_cache[(size_t)comp_idx * head_dim + j] = float_to_bf16(s_normed[j]);
@@ -8511,7 +8725,10 @@ void compressor_device_batch_step_cuda(
     int rope_dim,
     float rms_norm_eps,
     int max_comp,
-    cudaStream_t stream)
+    cudaStream_t stream,
+    const __nv_bfloat16* idx_wk,
+    const __nv_bfloat16* idx_k_norm,
+    __nv_bfloat16* idx_comp_kv_cache)
 {
     if (M <= 0) return;
     compressor_device_batch_step_kernel<<<1, 256, 0, stream>>>(
@@ -8519,20 +8736,22 @@ void compressor_device_batch_step_cuda(
         proj_kv_batch, proj_gate_batch, M,
         comp_kv_state, comp_score_state, comp_ape, comp_norm,
         comp_kv_cache, rope_freqs_compressed,
-        ratio, head_dim, rope_dim, rms_norm_eps, max_comp);
+        ratio, head_dim, rope_dim, rms_norm_eps, max_comp,
+        idx_wk, idx_k_norm, idx_comp_kv_cache);
 }
 
 // ════════════════════════════════════════════════════════════════════════════════
-//  DeepSeek V4 Indexer Scoring and Top-K Selection (Device-Driven)
+//  DeepSeek V4 / V4.1 Indexer Scoring and Top-K Selection (Device-Driven)
 // ════════════════════════════════════════════════════════════════════════════════
 
 __global__ void indexer_score_kernel(
     float* __restrict__ out_scores,
     const __nv_bfloat16* __restrict__ index_comp, // [max_comp, 128]
-    const __nv_bfloat16* __restrict__ q,          // [64, 128]
-    const float* __restrict__ weights,            // [64]
+    const __nv_bfloat16* __restrict__ q,          // [n_heads, 128]
+    const float* __restrict__ weights,            // [n_heads]
     const int32_t* __restrict__ d_comp_count,
-    int max_comp)
+    int max_comp,
+    int n_heads)
 {
     int n_comp = *d_comp_count;
     int c = blockIdx.x;
@@ -8547,7 +8766,7 @@ __global__ void indexer_score_kernel(
     __syncthreads();
 
     float local_total = 0.0f;
-    for (int h = tid; h < 64; h += blockDim.x) {
+    for (int h = tid; h < n_heads; h += blockDim.x) {
         const __nv_bfloat16* q_h = q + (size_t)h * 128;
         float dot = 0.0f;
         #pragma unroll 4
@@ -8606,7 +8825,7 @@ __global__ void indexer_mask_topk_kernel(
         return;
     }
 
-    // 1. Parallel reduction across all threads to find min_val and max_val of scores
+    // 1. Parallel reduction across all threads to find min_val and max_val of scores in [0, n_comp)
     float local_min = 1e38f;
     float local_max = -1e38f;
     for (int i = tid; i < n_comp; i += n_threads) {
@@ -8650,9 +8869,9 @@ __global__ void indexer_mask_topk_kernel(
     float lo = s_min[0];
     float hi = s_max[0];
 
-    // 2. Parallel Binary Search for threshold T across all 256 threads (12 iterations = <0.5 us)
+    // 2. Parallel Binary Search for threshold T across all 256 threads in [0, n_comp)
     __shared__ int s_count[8];
-    for (int iter = 0; iter < 12; iter++) {
+    for (int iter = 0; iter < 20; iter++) {
         float mid = 0.5f * (lo + hi);
         int local_cnt = 0;
         for (int i = tid; i < n_comp; i += n_threads) {
@@ -8684,10 +8903,44 @@ __global__ void indexer_mask_topk_kernel(
         }
     }
 
-    // 3. Parallel write selection mask
+    // 3. Exact Top-K selection with tie-breaking (critical when many ReLU scores tie at 0.0f)
     float threshold = lo;
+    int strict_cnt = 0;
     for (int i = tid; i < n_comp; i += n_threads) {
-        out_mask[i] = (scores[i] >= threshold) ? 1 : 0;
+        if (scores[i] > threshold) strict_cnt++;
+    }
+    #pragma unroll
+    for (int offset = 16; offset > 0; offset /= 2) {
+        strict_cnt += __shfl_down_sync(0xffffffff, strict_cnt, offset);
+    }
+    if (lane == 0) s_count[warp] = strict_cnt;
+    __syncthreads();
+
+    __shared__ int s_tie_rem;
+    if (warp == 0) {
+        int n_warps = n_threads >> 5;
+        int total_strict = (lane < n_warps) ? s_count[lane] : 0;
+        #pragma unroll
+        for (int offset = 4; offset > 0; offset /= 2) {
+            total_strict += __shfl_down_sync(0xffffffff, total_strict, offset);
+        }
+        if (lane == 0) {
+            s_tie_rem = top_k - total_strict;
+        }
+    }
+    __syncthreads();
+
+    for (int i = tid; i < n_comp; i += n_threads) {
+        float sc = scores[i];
+        uint8_t keep = 0;
+        if (sc > threshold) {
+            keep = 1;
+        } else if (sc >= threshold) {
+            if (atomicSub(&s_tie_rem, 1) > 0) {
+                keep = 1;
+            }
+        }
+        out_mask[i] = keep;
     }
 }
 
@@ -8700,13 +8953,346 @@ void indexer_score_and_mask_cuda(
     const int32_t* d_comp_count,
     int max_comp_entries,
     int top_k,
-    cudaStream_t stream)
+    cudaStream_t stream,
+    int n_heads)
 {
     indexer_score_kernel<<<max_comp_entries, 128, 0, stream>>>(
-        out_scores, index_comp, q, weights, d_comp_count, max_comp_entries);
+        out_scores, index_comp, q, weights, d_comp_count, max_comp_entries, n_heads);
 
     indexer_mask_topk_kernel<<<1, 256, 0, stream>>>(
         out_mask, out_scores, d_comp_count, max_comp_entries, top_k);
+}
+
+__global__ void indexer_score_batch_kernel(
+    float* __restrict__ out_scores_batch,         // [M, max_comp]
+    const __nv_bfloat16* __restrict__ index_comp, // [max_comp, 128]
+    const __nv_bfloat16* __restrict__ q_batch,    // [M, n_heads, 128]
+    const float* __restrict__ weights_batch,      // [M, n_heads]
+    const int32_t* __restrict__ d_positions,      // [M]
+    int ratio,
+    int max_comp,
+    int n_heads)
+{
+    int c = blockIdx.x;
+    int m = blockIdx.y;
+    int pos = d_positions[m];
+    int n_comp = (pos + 1) / ratio;
+    if (c >= n_comp || c >= max_comp) return;
+    int tid = threadIdx.x;
+
+    const __nv_bfloat16* kv_c = index_comp + (size_t)c * 128;
+    __shared__ float s_kv[128];
+    if (tid < 128) {
+        s_kv[tid] = __bfloat162float(kv_c[tid]);
+    }
+    __syncthreads();
+
+    const __nv_bfloat16* q = q_batch + (size_t)m * n_heads * 128;
+    const float* weights = weights_batch + (size_t)m * n_heads;
+
+    float local_total = 0.0f;
+    for (int h = tid; h < n_heads; h += blockDim.x) {
+        const __nv_bfloat16* q_h = q + (size_t)h * 128;
+        float dot = 0.0f;
+        #pragma unroll 4
+        for (int d = 0; d < 128; d++) {
+            dot += s_kv[d] * __bfloat162float(q_h[d]);
+        }
+        if (dot > 0.0f) {
+            local_total += dot * weights[h];
+        }
+    }
+
+    #pragma unroll
+    for (int offset = 16; offset > 0; offset /= 2) {
+        local_total += __shfl_down_sync(0xffffffff, local_total, offset);
+    }
+
+    __shared__ float s_warp_scores[8];
+    int lane = tid & 31;
+    int warp = tid >> 5;
+    if (lane == 0) {
+        s_warp_scores[warp] = local_total;
+    }
+    __syncthreads();
+
+    if (warp == 0) {
+        float val = (lane < (blockDim.x >> 5)) ? s_warp_scores[lane] : 0.0f;
+        #pragma unroll
+        for (int offset = 4; offset > 0; offset /= 2) {
+            val += __shfl_down_sync(0xffffffff, val, offset);
+        }
+        if (lane == 0) {
+            out_scores_batch[(size_t)m * max_comp + c] = val;
+        }
+    }
+}
+
+__global__ void indexer_mask_topk_batch_kernel(
+    uint8_t* __restrict__ out_mask_batch,         // [M, max_comp]
+    const float* __restrict__ scores_batch,       // [M, max_comp]
+    const int32_t* __restrict__ d_positions,      // [M]
+    int ratio,
+    int max_comp,
+    int top_k)
+{
+    int m = blockIdx.x;
+    int pos = d_positions[m];
+    int n_comp = (pos + 1) / ratio;
+    if (n_comp <= 0) return;
+    int tid = threadIdx.x;
+    int n_threads = blockDim.x;
+    if (n_comp > max_comp) n_comp = max_comp;
+
+    uint8_t* out_mask = out_mask_batch + (size_t)m * max_comp;
+    const float* scores = scores_batch + (size_t)m * max_comp;
+
+    if (n_comp <= top_k) {
+        for (int i = tid; i < n_comp; i += n_threads) {
+            out_mask[i] = 1;
+        }
+        return;
+    }
+
+    float local_min = 1e38f;
+    float local_max = -1e38f;
+    for (int i = tid; i < n_comp; i += n_threads) {
+        float v = scores[i];
+        if (v < local_min) local_min = v;
+        if (v > local_max) local_max = v;
+    }
+
+    #pragma unroll
+    for (int offset = 16; offset > 0; offset /= 2) {
+        local_min = fminf(local_min, __shfl_down_sync(0xffffffff, local_min, offset));
+        local_max = fmaxf(local_max, __shfl_down_sync(0xffffffff, local_max, offset));
+    }
+
+    __shared__ float s_min[8];
+    __shared__ float s_max[8];
+    int lane = tid & 31;
+    int warp = tid >> 5;
+    if (lane == 0) {
+        s_min[warp] = local_min;
+        s_max[warp] = local_max;
+    }
+    __syncthreads();
+
+    if (warp == 0) {
+        int n_warps = n_threads >> 5;
+        local_min = (lane < n_warps) ? s_min[lane] : 1e38f;
+        local_max = (lane < n_warps) ? s_max[lane] : -1e38f;
+        #pragma unroll
+        for (int offset = 4; offset > 0; offset /= 2) {
+            local_min = fminf(local_min, __shfl_down_sync(0xffffffff, local_min, offset));
+            local_max = fmaxf(local_max, __shfl_down_sync(0xffffffff, local_max, offset));
+        }
+        if (lane == 0) {
+            s_min[0] = local_min;
+            s_max[0] = local_max;
+        }
+    }
+    __syncthreads();
+
+    float lo = s_min[0];
+    float hi = s_max[0];
+
+    __shared__ int s_count[8];
+    for (int iter = 0; iter < 20; iter++) {
+        float mid = 0.5f * (lo + hi);
+        int local_cnt = 0;
+        for (int i = tid; i < n_comp; i += n_threads) {
+            if (scores[i] >= mid) local_cnt++;
+        }
+
+        #pragma unroll
+        for (int offset = 16; offset > 0; offset /= 2) {
+            local_cnt += __shfl_down_sync(0xffffffff, local_cnt, offset);
+        }
+        if (lane == 0) s_count[warp] = local_cnt;
+        __syncthreads();
+
+        if (warp == 0) {
+            int n_warps = n_threads >> 5;
+            int total = (lane < n_warps) ? s_count[lane] : 0;
+            #pragma unroll
+            for (int offset = 4; offset > 0; offset /= 2) {
+                total += __shfl_down_sync(0xffffffff, total, offset);
+            }
+            if (lane == 0) s_count[0] = total;
+        }
+        __syncthreads();
+
+        if (s_count[0] >= top_k) {
+            lo = mid;
+        } else {
+            hi = mid;
+        }
+    }
+
+    float threshold = lo;
+    int strict_cnt = 0;
+    for (int i = tid; i < n_comp; i += n_threads) {
+        if (scores[i] > threshold) strict_cnt++;
+    }
+    #pragma unroll
+    for (int offset = 16; offset > 0; offset /= 2) {
+        strict_cnt += __shfl_down_sync(0xffffffff, strict_cnt, offset);
+    }
+    if (lane == 0) s_count[warp] = strict_cnt;
+    __syncthreads();
+
+    __shared__ int s_tie_rem;
+    if (warp == 0) {
+        int n_warps = n_threads >> 5;
+        int total_strict = (lane < n_warps) ? s_count[lane] : 0;
+        #pragma unroll
+        for (int offset = 4; offset > 0; offset /= 2) {
+            total_strict += __shfl_down_sync(0xffffffff, total_strict, offset);
+        }
+        if (lane == 0) {
+            s_tie_rem = top_k - total_strict;
+        }
+    }
+    __syncthreads();
+
+    for (int i = tid; i < n_comp; i += n_threads) {
+        float sc = scores[i];
+        uint8_t keep = 0;
+        if (sc > threshold) {
+            keep = 1;
+        } else if (sc >= threshold) {
+            if (atomicSub(&s_tie_rem, 1) > 0) {
+                keep = 1;
+            }
+        }
+        out_mask[i] = keep;
+    }
+}
+
+void indexer_score_and_mask_batch_cuda(
+    uint8_t* out_mask_batch,
+    float* out_scores_batch,
+    const __nv_bfloat16* index_comp,
+    const __nv_bfloat16* q_batch,
+    const float* weights_batch,
+    const int32_t* d_positions,
+    int M,
+    int ratio,
+    int max_comp_entries,
+    int top_k,
+    cudaStream_t stream,
+    int n_heads)
+{
+    if (M <= 0 || max_comp_entries <= 0) return;
+    dim3 grid(max_comp_entries, M);
+    indexer_score_batch_kernel<<<grid, 128, 0, stream>>>(
+        out_scores_batch, index_comp, q_batch, weights_batch, d_positions, ratio, max_comp_entries, n_heads);
+
+    indexer_mask_topk_batch_kernel<<<M, 256, 0, stream>>>(
+        out_mask_batch, out_scores_batch, d_positions, ratio, max_comp_entries, top_k);
+}
+
+// ════════════════════════════════════════════════════════════════════════════════
+//  DeepSeek-V4.1 Engram Gated Residual Kernel
+// ════════════════════════════════════════════════════════════════════════════════
+
+__global__ void engram_gated_residual_kernel(
+    __nv_bfloat16* __restrict__ hc_state,       // [M, hc_mult, dim]
+    const __nv_bfloat16* __restrict__ kv,       // [M, (hc_mult + 1) * dim]
+    const __nv_bfloat16* __restrict__ q_weight, // [hc_mult, dim]
+    const __nv_bfloat16* __restrict__ k_weight, // [hc_mult, dim]
+    int hc_mult,
+    int dim,
+    float eps)
+{
+    int c = blockIdx.x; // 0 .. hc_mult - 1
+    int m = blockIdx.y; // 0 .. M - 1
+    int tid = threadIdx.x;
+    int n_threads = blockDim.x;
+
+    __nv_bfloat16* h_mc = hc_state + ((size_t)m * hc_mult + c) * dim;
+    const __nv_bfloat16* k_mc = kv + ((size_t)m * (hc_mult + 1) + c) * dim;
+    const __nv_bfloat16* v_m  = kv + ((size_t)m * (hc_mult + 1) + hc_mult) * dim;
+    const __nv_bfloat16* qw_c = q_weight + (size_t)c * dim;
+    const __nv_bfloat16* kw_c = k_weight + (size_t)c * dim;
+
+    float local_h_sq = 0.0f;
+    float local_k_sq = 0.0f;
+    float local_dot  = 0.0f;
+
+    for (int d = tid; d < dim; d += n_threads) {
+        float hd = bf16_to_float(h_mc[d]);
+        float kd = bf16_to_float(k_mc[d]);
+        float wd = bf16_to_float(qw_c[d]) * bf16_to_float(kw_c[d]);
+        local_h_sq += hd * hd;
+        local_k_sq += kd * kd;
+        local_dot  += hd * wd * kd;
+    }
+
+    #pragma unroll
+    for (int offset = 16; offset > 0; offset /= 2) {
+        local_h_sq += __shfl_down_sync(0xffffffff, local_h_sq, offset);
+        local_k_sq += __shfl_down_sync(0xffffffff, local_k_sq, offset);
+        local_dot  += __shfl_down_sync(0xffffffff, local_dot, offset);
+    }
+
+    __shared__ float s_h_sq[8];
+    __shared__ float s_k_sq[8];
+    __shared__ float s_dot[8];
+    __shared__ float s_gate;
+
+    int lane = tid & 31;
+    int warp = tid >> 5;
+    if (lane == 0) {
+        s_h_sq[warp] = local_h_sq;
+        s_k_sq[warp] = local_k_sq;
+        s_dot[warp]  = local_dot;
+    }
+    __syncthreads();
+
+    if (warp == 0) {
+        int n_warps = n_threads >> 5;
+        float h_sq = (lane < n_warps) ? s_h_sq[lane] : 0.0f;
+        float k_sq = (lane < n_warps) ? s_k_sq[lane] : 0.0f;
+        float dot_sum = (lane < n_warps) ? s_dot[lane] : 0.0f;
+        #pragma unroll
+        for (int offset = 4; offset > 0; offset /= 2) {
+            h_sq    += __shfl_down_sync(0xffffffff, h_sq, offset);
+            k_sq    += __shfl_down_sync(0xffffffff, k_sq, offset);
+            dot_sum += __shfl_down_sync(0xffffffff, dot_sum, offset);
+        }
+        if (lane == 0) {
+            float inv_dim = 1.0f / (float)dim;
+            float rstd = rsqrtf(h_sq * inv_dim + eps) * rsqrtf(k_sq * inv_dim + eps);
+            float dot = dot_sum * rstd * sqrtf(inv_dim);
+            float abs_dot = fmaxf(fabsf(dot), 1e-6f);
+            float s = copysignf(sqrtf(abs_dot), dot);
+            s_gate = 1.0f / (1.0f + expf(-s));
+        }
+    }
+    __syncthreads();
+
+    float gate = s_gate;
+    for (int d = tid; d < dim; d += n_threads) {
+        float hd = bf16_to_float(h_mc[d]);
+        float vd = bf16_to_float(v_m[d]);
+        h_mc[d] = float_to_bf16(hd + gate * vd);
+    }
+}
+
+void engram_gated_residual_cuda(
+    __nv_bfloat16* hc_state,
+    const __nv_bfloat16* kv,
+    const __nv_bfloat16* q_weight,
+    const __nv_bfloat16* k_weight,
+    int M, int hc_mult, int dim, float eps,
+    cudaStream_t stream)
+{
+    if (M <= 0 || hc_mult <= 0 || dim <= 0) return;
+    dim3 grid(hc_mult, M);
+    engram_gated_residual_kernel<<<grid, 256, 0, stream>>>(
+        hc_state, kv, q_weight, k_weight, hc_mult, dim, eps);
 }
 
 

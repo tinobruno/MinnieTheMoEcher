@@ -246,10 +246,11 @@ public:
                     CUDA_CHECK(cudaMemcpy(layers_[l].comp_score_state.data, neg_inf.data(),
                                            neg_inf.size() * sizeof(float), cudaMemcpyHostToDevice));
                 }
+                if (layers_[l].indexer_comp_kv_cache.data) {
+                    CUDA_CHECK(cudaMemset(layers_[l].indexer_comp_kv_cache.data, 0,
+                                           layers_[l].indexer_comp_kv_cache.size_bytes));
+                }
                 if (ratio == 4) {
-                    if (layers_[l].indexer_comp_kv_cache.data)
-                        CUDA_CHECK(cudaMemset(layers_[l].indexer_comp_kv_cache.data, 0,
-                                               layers_[l].indexer_comp_kv_cache.size_bytes));
                     if (layers_[l].indexer_comp_kv_state.data)
                         CUDA_CHECK(cudaMemset(layers_[l].indexer_comp_kv_state.data, 0,
                                                layers_[l].indexer_comp_kv_state.size_bytes));
@@ -287,6 +288,9 @@ public:
             mtp_drafter_.reset_kv_cache(main_stream_);
         }
         cached_tokens_.clear();
+        if (!engram_compressed_cache_.empty()) {
+            std::fill(engram_compressed_cache_.begin(), engram_compressed_cache_.end(), engram_pad_id_);
+        }
         argmax_cache_valid_ = false;
     }
 
@@ -386,16 +390,24 @@ public:
         GPUTensor comp_kv_state;     // [coff * ratio, coff * head_dim] F32
         GPUTensor comp_score_state;  // [coff * ratio, coff * head_dim] F32
 
-        // Indexer (for layers with compress_ratio == 4)
+        // Indexer (for layers with compress_ratio == 4 or V4.1 index_source_layers)
         GPUTensor indexer_comp_wkv;
         GPUTensor indexer_comp_wgate;
         GPUTensor indexer_comp_ape;
         GPUTensor indexer_comp_norm;
+        GPUTensor indexer_wk;
+        GPUTensor indexer_k_norm;
         GPUTensor indexer_weights_proj;
         GPUTensor indexer_wq_b_w, indexer_wq_b_s;
         GPUTensor indexer_comp_kv_cache;  // [max_compressed_entries, 128] BF16
         GPUTensor indexer_comp_kv_state;     // [2 * ratio, 2 * 128] F32
         GPUTensor indexer_comp_score_state;  // [2 * ratio, 2 * 128] F32
+
+        // Engram (for DeepSeek-V4.1 engram_layer_ids = [1, 14])
+        GPUTensor engram_q_weight;    // [hc, hidden] BF16
+        GPUTensor engram_k_weight;    // [hc, hidden] BF16
+        GPUTensor engram_wkv_w;       // [hc * 5 / 4 * hidden, 24 * 256] FP8 E4M3
+        GPUTensor engram_wkv_s;       // [ceil(25600/32), ceil(6144/32)] E8M0
 
         // Gate
         GPUTensor gate_w;              // [n_experts, hidden] BF16
@@ -743,7 +755,301 @@ public:
     bool enable_batched_prefill_ = false;
     int prefill_chunk_size_ = 512;
 
+    // ── DeepSeek-V4.1 Engram Memory Module (Layers 1 and 14) ────────────────
+    bool engram_loaded_ = false;
+    int32_t engram_pad_id_ = 2;
+    std::vector<int32_t> engram_token_map_;        // [129280] compressed token ID lookup
+    std::vector<int32_t> engram_compressed_cache_; // [max_seq_len] compressed token IDs at each position
+    moecher::platform::DirectFileHandle engram_shard_files_[2]; // [0] -> Layer 1 (shard 47), [1] -> Layer 14 (shard 48)
+    uint64_t engram_weight_offsets_[2] = {664ULL, 672ULL};
+    uint64_t engram_scale_offsets_[2] = {98305579672ULL, 98308271264ULL};
+    int64_t engram_num_rows_[2] = {384006168LL, 384016682LL};
+
+    struct EngramRowCache {
+        static constexpr size_t NUM_SLOTS = 65536;
+        static constexpr size_t MASK = NUM_SLOTS - 1;
+        std::vector<int64_t> tags;
+        std::vector<__nv_bfloat16> data; // [NUM_SLOTS * 256]
+        void init() {
+            tags.assign(NUM_SLOTS, -1LL);
+            data.resize(NUM_SLOTS * 256);
+        }
+    };
+    EngramRowCache engram_row_cache_[2];
+
+    __nv_bfloat16* h_engram_embed_pinned_ = nullptr; // [512, 6144] BF16 pinned host buffer
+    GPUTensor buf_engram_embed_;                     // [512, 6144] BF16 device buffer
+    GPUTensor buf_engram_wkv_out_;                   // [512, 25600] BF16 device buffer
+
+    static inline __nv_bfloat16 engram_fp8_e4m3_to_bf16(uint8_t val, float scale) {
+        uint32_t sign = (val >> 7) & 1;
+        uint32_t exp  = (val >> 3) & 0xF;
+        uint32_t mant = val & 0x7;
+        float res;
+        if (exp == 0) {
+            res = ldexpf((float)mant, -9);
+        } else if (exp == 15 && mant == 7) {
+            res = 0.0f;
+        } else {
+            res = ldexpf(1.0f + (float)mant * 0.125f, (int)exp - 7);
+        }
+        res = (sign ? -res : res) * scale;
+        return __float2bfloat16(res);
+    }
+
+    static inline void compute_engram_hash_ids(int e_idx, int32_t c0, int32_t c1, int32_t c2, int32_t c3, int64_t out_ids[24]) {
+        static constexpr int64_t multipliers[2][4] = {
+            {76632096046245LL, 4839876093313LL, 35959672319349LL, 73987337458391LL},
+            {67716810739261LL, 51510806800915LL, 30921347202721LL, 82619226485591LL}
+        };
+        static constexpr int64_t primes[2][24] = {
+            {
+                16000057LL, 16000079LL, 16000081LL, 16000097LL, 16000121LL, 16000129LL, 16000133LL, 16000183LL,
+                16000189LL, 16000207LL, 16000211LL, 16000253LL, 16000277LL, 16000289LL, 16000307LL, 16000321LL,
+                16000339LL, 16000381LL, 16000393LL, 16000399LL, 16000403LL, 16000409LL, 16000447LL, 16000463LL
+            },
+            {
+                16000477LL, 16000487LL, 16000499LL, 16000507LL, 16000511LL, 16000573LL, 16000609LL, 16000627LL,
+                16000667LL, 16000669LL, 16000693LL, 16000697LL, 16000711LL, 16000729LL, 16000759LL, 16000769LL,
+                16000781LL, 16000799LL, 16000813LL, 16000819LL, 16000841LL, 16000877LL, 16000879LL, 16000889LL
+            }
+        };
+
+        int64_t t0 = (int64_t)c0 * multipliers[e_idx][0];
+        int64_t t1 = (int64_t)c1 * multipliers[e_idx][1];
+        int64_t t2 = (int64_t)c2 * multipliers[e_idx][2];
+        int64_t t3 = (int64_t)c3 * multipliers[e_idx][3];
+
+        int64_t mix2 = t0 ^ t1;
+        int64_t mix3 = mix2 ^ t2;
+        int64_t mix4 = mix3 ^ t3;
+
+        int64_t row_off = 0;
+        for (int h = 0; h < 8; h++) {
+            int64_t p = primes[e_idx][h];
+            int64_t rem = mix2 % p;
+            if (rem < 0) rem += p;
+            out_ids[h] = rem + row_off;
+            row_off += p;
+        }
+        for (int h = 8; h < 16; h++) {
+            int64_t p = primes[e_idx][h];
+            int64_t rem = mix3 % p;
+            if (rem < 0) rem += p;
+            out_ids[h] = rem + row_off;
+            row_off += p;
+        }
+        for (int h = 16; h < 24; h++) {
+            int64_t p = primes[e_idx][h];
+            int64_t rem = mix4 % p;
+            if (rem < 0) rem += p;
+            out_ids[h] = rem + row_off;
+            row_off += p;
+        }
+    }
+
+    void fetch_engram_row_bf16(int e_idx, int64_t row_id, __nv_bfloat16* dst_256) {
+        auto& cache = engram_row_cache_[e_idx];
+        size_t slot = (size_t)((uint64_t)row_id * 11400714819323198485ULL) & EngramRowCache::MASK;
+        if (cache.tags[slot] == row_id) {
+            memcpy(dst_256, &cache.data[slot * 256], 256 * sizeof(__nv_bfloat16));
+            return;
+        }
+
+        uint8_t raw_w[256];
+        uint8_t raw_s[8];
+        uint64_t w_off = engram_weight_offsets_[e_idx] + (uint64_t)row_id * 256ULL;
+        uint64_t s_off = engram_scale_offsets_[e_idx] + (uint64_t)row_id * 8ULL;
+
+        engram_shard_files_[e_idx].pread_exact(raw_w, 256, w_off);
+        engram_shard_files_[e_idx].pread_exact(raw_s, 8, s_off);
+
+        __nv_bfloat16* slot_ptr = &cache.data[slot * 256];
+        for (int g = 0; g < 8; g++) {
+            uint32_t s_bits = ((uint32_t)raw_s[g]) << 23;
+            float scale_f;
+            memcpy(&scale_f, &s_bits, sizeof(float));
+            const uint8_t* w_grp = raw_w + g * 32;
+            __nv_bfloat16* out_grp = slot_ptr + g * 32;
+            for (int j = 0; j < 32; j++) {
+                out_grp[j] = engram_fp8_e4m3_to_bf16(w_grp[j], scale_f);
+            }
+        }
+        cache.tags[slot] = row_id;
+        memcpy(dst_256, slot_ptr, 256 * sizeof(__nv_bfloat16));
+    }
+
+    void prepare_engram_step(int token_id, int position) {
+        if (!engram_loaded_) return;
+        if (position < 0) return;
+        if (position >= (int)engram_compressed_cache_.size()) {
+            engram_compressed_cache_.resize(position + 4096, engram_pad_id_);
+        }
+        int32_t c0 = (token_id >= 0 && token_id < (int)engram_token_map_.size())
+                     ? engram_token_map_[token_id] : engram_pad_id_;
+        engram_compressed_cache_[position] = c0;
+
+        int32_t c1 = (position >= 1) ? engram_compressed_cache_[position - 1] : engram_pad_id_;
+        int32_t c2 = (position >= 2) ? engram_compressed_cache_[position - 2] : engram_pad_id_;
+        int32_t c3 = (position >= 3) ? engram_compressed_cache_[position - 3] : engram_pad_id_;
+
+        for (int e_idx = 0; e_idx < 2; e_idx++) {
+            int64_t ids[24];
+            compute_engram_hash_ids(e_idx, c0, c1, c2, c3, ids);
+            __nv_bfloat16* dst = h_engram_embed_pinned_ + (size_t)e_idx * 6144;
+            for (int col = 0; col < 24; col++) {
+                fetch_engram_row_bf16(e_idx, ids[col], dst + col * 256);
+            }
+        }
+        CUDA_CHECK(cudaMemcpyAsync(buf_engram_embed_.bf16(), h_engram_embed_pinned_,
+                                   2 * 6144 * sizeof(__nv_bfloat16),
+                                   cudaMemcpyHostToDevice, main_stream_));
+    }
+
+    void prepare_engram_batch(int layer_id, int start_pos, int M) {
+        if (!engram_loaded_ || M <= 0) return;
+        int e_idx = (layer_id == 1) ? 0 : 1;
+        for (int m = 0; m < M; m++) {
+            int pos = start_pos + m;
+            int32_t c0 = (pos >= 0 && pos < (int)engram_compressed_cache_.size()) ? engram_compressed_cache_[pos] : engram_pad_id_;
+            int32_t c1 = (pos >= 1 && (pos - 1) < (int)engram_compressed_cache_.size()) ? engram_compressed_cache_[pos - 1] : engram_pad_id_;
+            int32_t c2 = (pos >= 2 && (pos - 2) < (int)engram_compressed_cache_.size()) ? engram_compressed_cache_[pos - 2] : engram_pad_id_;
+            int32_t c3 = (pos >= 3 && (pos - 3) < (int)engram_compressed_cache_.size()) ? engram_compressed_cache_[pos - 3] : engram_pad_id_;
+
+            int64_t ids[24];
+            compute_engram_hash_ids(e_idx, c0, c1, c2, c3, ids);
+            __nv_bfloat16* dst = h_engram_embed_pinned_ + (size_t)m * 6144;
+            for (int col = 0; col < 24; col++) {
+                fetch_engram_row_bf16(e_idx, ids[col], dst + col * 256);
+            }
+        }
+        CUDA_CHECK(cudaMemcpyAsync(buf_engram_embed_.bf16(), h_engram_embed_pinned_,
+                                   (size_t)M * 6144 * sizeof(__nv_bfloat16),
+                                   cudaMemcpyHostToDevice, main_stream_));
+    }
+
+    bool load_engram_deepseek_v41(const std::filesystem::path& base_dir) {
+        namespace fs = std::filesystem;
+        fs::path dense_bin_path = base_dir / "engram_dense.bin";
+        if (!fs::exists(dense_bin_path)) {
+            LOG_WARN("[Engram] %s not found; skipping Engram memory module.", dense_bin_path.string().c_str());
+            return false;
+        }
+
+        std::vector<fs::path> shard_dirs = {
+            fs::path("F:/models/deepseek_v41_raw"),
+            base_dir,
+            base_dir.parent_path() / "deepseek_v41_raw"
+        };
+        fs::path shard47_path, shard48_path;
+        for (const auto& d : shard_dirs) {
+            if (fs::exists(d / "model-00047-of-00048.safetensors") &&
+                fs::exists(d / "model-00048-of-00048.safetensors")) {
+                shard47_path = d / "model-00047-of-00048.safetensors";
+                shard48_path = d / "model-00048-of-00048.safetensors";
+                break;
+            }
+        }
+        if (shard47_path.empty() || shard48_path.empty()) {
+            LOG_WARN("[Engram] Raw safetensors shards 47/48 not found; skipping Engram memory module.");
+            return false;
+        }
+
+        if (!engram_shard_files_[0].open_read(shard47_path.string(), /*use_direct_io=*/false) ||
+            !engram_shard_files_[1].open_read(shard48_path.string(), /*use_direct_io=*/false)) {
+            LOG_ERROR("[Engram] Failed to open Engram safetensors shards.");
+            return false;
+        }
+
+        moecher::platform::DirectFileHandle dense_file;
+        if (!dense_file.open_read(dense_bin_path.string(), /*use_direct_io=*/false)) {
+            LOG_ERROR("[Engram] Failed to open %s", dense_bin_path.string().c_str());
+            return false;
+        }
+
+        // 1. Read token_map: [129280] int32_t (517,120 bytes)
+        engram_token_map_.resize(129280);
+        if (dense_file.pread_exact(engram_token_map_.data(), 129280 * sizeof(int32_t), 0) != (int64_t)(129280 * sizeof(int32_t))) {
+            LOG_ERROR("[Engram] Failed to read token_map from %s", dense_bin_path.string().c_str());
+            return false;
+        }
+        engram_pad_id_ = engram_token_map_[2]; // tokenizer pad_id == 2 -> compressed pad_id == 2
+
+        // 2. Read Layer 1 and Layer 14 dense projections (q_weight, k_weight, wkv.weight, wkv.scale)
+        const int layer_ids[2] = {1, 14};
+        uint64_t cur_off = 129280ULL * sizeof(int32_t);
+        std::vector<uint8_t> host_buf;
+
+        for (int e_idx = 0; e_idx < 2; e_idx++) {
+            int lid = layer_ids[e_idx];
+            auto& lw = layers_[lid];
+
+            // q_weight: [4, 5120] BF16 (40,960 bytes)
+            size_t q_bytes = 4ULL * 5120ULL * sizeof(__nv_bfloat16);
+            host_buf.resize(q_bytes);
+            dense_file.pread_exact(host_buf.data(), q_bytes, cur_off);
+            cur_off += q_bytes;
+            lw.engram_q_weight.alloc(q_bytes);
+            lw.engram_q_weight.dtype = "bf16";
+            lw.engram_q_weight.shape = {4, 5120};
+            CUDA_CHECK(cudaMemcpy(lw.engram_q_weight.data, host_buf.data(), q_bytes, cudaMemcpyHostToDevice));
+
+            // k_weight: [4, 5120] BF16 (40,960 bytes)
+            size_t k_bytes = 4ULL * 5120ULL * sizeof(__nv_bfloat16);
+            host_buf.resize(k_bytes);
+            dense_file.pread_exact(host_buf.data(), k_bytes, cur_off);
+            cur_off += k_bytes;
+            lw.engram_k_weight.alloc(k_bytes);
+            lw.engram_k_weight.dtype = "bf16";
+            lw.engram_k_weight.shape = {4, 5120};
+            CUDA_CHECK(cudaMemcpy(lw.engram_k_weight.data, host_buf.data(), k_bytes, cudaMemcpyHostToDevice));
+
+            // wkv.weight: [25600, 6144] F8_E4M3 (157,286,400 bytes)
+            size_t wkv_w_bytes = 25600ULL * 6144ULL * sizeof(uint8_t);
+            host_buf.resize(wkv_w_bytes);
+            dense_file.pread_exact(host_buf.data(), wkv_w_bytes, cur_off);
+            cur_off += wkv_w_bytes;
+            lw.engram_wkv_w.alloc(wkv_w_bytes);
+            lw.engram_wkv_w.dtype = "fp8";
+            lw.engram_wkv_w.shape = {25600, 6144};
+            CUDA_CHECK(cudaMemcpy(lw.engram_wkv_w.data, host_buf.data(), wkv_w_bytes, cudaMemcpyHostToDevice));
+
+            // wkv.scale: [800, 192] F8_E8M0 (153,600 bytes)
+            size_t wkv_s_bytes = 800ULL * 192ULL * sizeof(uint8_t);
+            host_buf.resize(wkv_s_bytes);
+            dense_file.pread_exact(host_buf.data(), wkv_s_bytes, cur_off);
+            cur_off += wkv_s_bytes;
+            lw.engram_wkv_s.alloc(wkv_s_bytes);
+            lw.engram_wkv_s.dtype = "e8m0";
+            lw.engram_wkv_s.shape = {800, 192};
+            CUDA_CHECK(cudaMemcpy(lw.engram_wkv_s.data, host_buf.data(), wkv_s_bytes, cudaMemcpyHostToDevice));
+        }
+
+        // 3. Allocate runtime Engram buffers (up to M=512 batch size for prefill sub-chunks)
+        int max_engram_m = 512;
+        if (!h_engram_embed_pinned_) {
+            CUDA_CHECK(cudaMallocHost(&h_engram_embed_pinned_, (size_t)max_engram_m * 6144 * sizeof(__nv_bfloat16)));
+        }
+        buf_engram_embed_.alloc((size_t)max_engram_m * 6144 * sizeof(__nv_bfloat16));
+        buf_engram_wkv_out_.alloc((size_t)max_engram_m * 25600 * sizeof(__nv_bfloat16));
+
+        engram_row_cache_[0].init();
+        engram_row_cache_[1].init();
+        engram_compressed_cache_.assign(std::max(cfg_.max_seq_len, 131072), engram_pad_id_);
+        engram_loaded_ = true;
+
+        LOG_INFO("[Engram] Loaded DeepSeek-V4.1 Engram Memory Module (Layers 1 & 14: 196.6B params mapped from %s & %s, 301 MB wkv on GPU)",
+                 shard47_path.filename().string().c_str(), shard48_path.filename().string().c_str());
+        return true;
+    }
+
     ~MoecherEngine() {
+        if (h_engram_embed_pinned_) {
+            cudaFreeHost(h_engram_embed_pinned_);
+            h_engram_embed_pinned_ = nullptr;
+        }
+        engram_shard_files_[0].close();
+        engram_shard_files_[1].close();
         if (h_prefill_tok_) {
             cudaFreeHost(h_prefill_tok_);
             h_prefill_tok_ = nullptr;
@@ -943,7 +1249,13 @@ public:
         // Parse config
         cfg_.from_json(manifest["model_config"]);
         if (max_seq_len_override > 0) {
-            cfg_.max_seq_len = max_seq_len_override;
+            int eff_seq_len = max_seq_len_override;
+            if (cfg_.is_deepseek_v41() && eff_seq_len < 16384) {
+                LOG_INFO("DeepSeek-V4.1: Expanding compressed KV capacity from --ctx %d to 16384 to accommodate thinking_budget (%d) + full response context (+26 MB VRAM)",
+                         eff_seq_len, cfg_.default_thinking_budget > 0 ? cfg_.default_thinking_budget : 4096);
+                eff_seq_len = 16384;
+            }
+            cfg_.max_seq_len = eff_seq_len;
             cfg_.max_compressed_entries = 0;
             for (int r : cfg_.compress_ratios) {
                 if (r > 0) {
@@ -1112,6 +1424,10 @@ public:
             !load_dense_tensors(dense_path, manifest["dense_tensors"])) {
             LOG_ERROR("Failed to load dense tensors from %s", dense_full.c_str());
             return false;
+        }
+
+        if (cfg_.is_deepseek_v41()) {
+            load_engram_deepseek_v41(base_dir);
         }
 
         // Load expert layout info safely (optional for dense models like Qwen)
@@ -1975,6 +2291,9 @@ public:
         if (cfg_.is_deepseek_v41()) {
             static const float id_mix[4] = {1.0f, 0.0f, 0.0f, 0.0f};
             CUDA_CHECK(cudaMemcpyAsync(buf_hc_pre_mix_.f32(), id_mix, hc * sizeof(float), cudaMemcpyHostToDevice, main_stream_));
+            if (engram_loaded_) {
+                prepare_engram_step(token_id, position);
+            }
         }
 
         // Override with vision tower embedding for image tokens
@@ -2163,6 +2482,7 @@ public:
     void restore_kv(const KVSnapshot& snap) {
         if (!snap.valid) return;
 
+        int32_t snap_attn_len = (int32_t)snap.tokens.size();
         for (int l = 0; l < cfg_.num_hidden_layers; l++) {
             auto& lw = layers_[l];
             const auto& l_snap = snap.layers[l];
@@ -2170,16 +2490,17 @@ public:
             if (lw.kv_cache.data && l_snap.snap_kv_cache.data) {
                 CUDA_CHECK(cudaMemcpyAsync(lw.kv_cache.data, l_snap.snap_kv_cache.data, lw.kv_cache.size_bytes, cudaMemcpyDeviceToDevice, main_stream_));
             }
+            if (lw.d_attn_cache_len.data) {
+                CUDA_CHECK(cudaMemcpyAsync(lw.d_attn_cache_len.data, &snap_attn_len, sizeof(int32_t), cudaMemcpyHostToDevice, main_stream_));
+            }
             if (lw.comp_kv_cache.data && l_snap.snap_comp_kv_cache.data) {
                 CUDA_CHECK(cudaMemcpyAsync(lw.comp_kv_cache.data, l_snap.snap_comp_kv_cache.data, lw.comp_kv_cache.size_bytes, cudaMemcpyDeviceToDevice, main_stream_));
                 lw.comp_kv_count = l_snap.comp_kv_count;
                 if (lw.d_comp_kv_count.data) {
-                    int32_t val = l_snap.comp_kv_count;
-                    CUDA_CHECK(cudaMemcpyAsync(lw.d_comp_kv_count.data, &val, sizeof(int32_t), cudaMemcpyHostToDevice, main_stream_));
-                }
-                if (lw.d_attn_cache_len.data) {
-                    int32_t val = (int32_t)snap.tokens.size();
-                    CUDA_CHECK(cudaMemcpyAsync(lw.d_attn_cache_len.data, &val, sizeof(int32_t), cudaMemcpyHostToDevice, main_stream_));
+                    int ratio = (l < (int)cfg_.compress_ratios.size()) ? cfg_.compress_ratios[l] : 0;
+                    int32_t expected_comp = (ratio > 0) ? (snap_attn_len / ratio) : l_snap.comp_kv_count;
+                    lw.comp_kv_count = expected_comp;
+                    CUDA_CHECK(cudaMemcpyAsync(lw.d_comp_kv_count.data, &lw.comp_kv_count, sizeof(int32_t), cudaMemcpyHostToDevice, main_stream_));
                 }
             }
             if (lw.comp_kv_state.data && l_snap.snap_comp_kv_state.data) {
@@ -2246,7 +2567,21 @@ public:
             mtp_drafter_.reset_kv_cache(main_stream_);
         }
 
+        CUDA_CHECK(cudaStreamSynchronize(main_stream_));
         cached_tokens_ = snap.tokens;
+        if (engram_loaded_ && !engram_token_map_.empty()) {
+            int max_seq = std::max(cfg_.max_seq_len, 131072);
+            if ((int)engram_compressed_cache_.size() < max_seq) {
+                engram_compressed_cache_.assign(max_seq, engram_pad_id_);
+            } else {
+                std::fill(engram_compressed_cache_.begin(), engram_compressed_cache_.end(), engram_pad_id_);
+            }
+            for (size_t i = 0; i < snap.tokens.size() && i < engram_compressed_cache_.size(); i++) {
+                int tid = snap.tokens[i];
+                engram_compressed_cache_[i] = (tid >= 0 && tid < (int)engram_token_map_.size())
+                    ? engram_token_map_[tid] : engram_pad_id_;
+            }
+        }
     }
 
     void restore_system_kv() {
@@ -2890,7 +3225,7 @@ public:
         // Set per-request repetition penalty (only apply default if unset / <= 0.0f)
         if (repetition_penalty <= 0.0f) {
             repetition_penalty = cfg_.default_repetition_penalty > 0.0f ? cfg_.default_repetition_penalty :
-                                 (cfg_.is_nemotron() ? 1.05f : 1.0f);
+                                 ((cfg_.is_nemotron() || cfg_.is_deepseek_v41()) ? 1.05f : 1.0f);
         }
         current_rep_penalty_ = repetition_penalty;
 
@@ -3070,7 +3405,7 @@ public:
         };
 
         int next_token = -1;
-        for (int t = 0; content_tokens_generated < max_tokens; t++) {
+        for (int t = 0; content_tokens_generated < max_tokens && position < cfg_.max_seq_len - 2; t++) {
             if (g_stop_requested.load()) {
                 LOG_WARN("Generation stopped by client stop request at step %d", t);
                 finish_reason = "stop";
@@ -3120,13 +3455,12 @@ public:
                     // In code/HTML/CSS generation, structural repetitions (buttons, rows, list items) are NORMAL.
                     int n_content = content_tokens_generated;
                     for (int L = 1; L <= 512; L++) {
-                        int min_cycles = (L == 1) ? 10 :
-                                         ((L == 2) ? 6 :
-                                         ((L <= 4) ? 4 :
-                                         ((L <= 8) ? 3 :
-                                         ((L <= 32) ? 3 : 2))));
+                        int min_cycles = (L == 1) ? 12 :
+                                         ((L == 2) ? 8 :
+                                         ((L <= 4) ? 5 :
+                                         ((L <= 16) ? 4 : 3)));
                         if (min_cycles * L > n_content) continue;
-                        int safety_floor = (L == 1) ? 10 : ((L == 2) ? 12 : 16);
+                        int safety_floor = (L == 1) ? 12 : ((L == 2) ? 16 : 24);
                         if (min_cycles * L < safety_floor) continue;
                         bool match = true;
                         const int* p_last = output_ids.data() + (n_out - L);
@@ -3167,9 +3501,9 @@ public:
                             loop_len = w_size;
                         }
                     } else if (content_tokens_generated >= 64) {
-                        // In content: healthy code unique count is 30-45 / 64, max_freq <= 10.
-                        // Repetitive syntax rambling drops unique count <= 18 or max_freq >= 20.
-                        if (unique_count <= 18 || max_freq >= 20) {
+                        // In content: code/HTML/shaders with repeated calls like g.addColorStop(0.x, 'rgba(255,255,255,0.x)')
+                        // naturally have 14-18 unique tokens in a 64-token window. Only halt on true token collapse.
+                        if (unique_count <= 8 || max_freq >= 28) {
                             LOG_WARN("[Anti-Loop] Attractor collapse detected during content generation (unique=%d/%d, max_freq=%d). Halting cleanly.",
                                      unique_count, w_size, max_freq);
                             loop_len = w_size;
@@ -4537,6 +4871,23 @@ private:
                     std::vector<float> neg_inf_idx(indexer_state_rows * indexer_proj_dim, -std::numeric_limits<float>::infinity());
                     CUDA_CHECK(cudaMemcpy(lw.indexer_comp_score_state.data, neg_inf_idx.data(),
                                            neg_inf_idx.size() * sizeof(float), cudaMemcpyHostToDevice));
+                } else if (load_tensor(lw.indexer_wk, prefix + ".attn.indexer.wk.weight")) {
+                    load_tensor(lw.indexer_k_norm, prefix + ".attn.indexer.k_norm.weight");
+                    int indexer_head_dim = 128;
+                    lw.indexer_comp_kv_cache.alloc((size_t)max_comp * indexer_head_dim * sizeof(__nv_bfloat16));
+                    CUDA_CHECK(cudaMemset(lw.indexer_comp_kv_cache.data, 0, lw.indexer_comp_kv_cache.size_bytes));
+                    LOG_INFO("  Layer %d: V4.1 indexer K-cache allocated (max_comp=%d)", l, max_comp);
+                }
+            }
+
+            // DeepSeek V4.1 Indexer query projections on index_source_layers (e.g. 2, 8, 14, 20, 24, 28, 32, 36)
+            if (ratio > 0 && ratio != 4) {
+                if (load_tensor(lw.indexer_weights_proj, prefix + ".attn.indexer.weights_proj.weight")) {
+                    if (!load_quant_tensor(lw.indexer_wq_b_w, lw.indexer_wq_b_s, prefix + ".attn.indexer.wq_b.weight")) {
+                        load_tensor(lw.indexer_wq_b_w, prefix + ".attn.indexer.wq_b.weight");
+                        load_tensor(lw.indexer_wq_b_s, prefix + ".attn.indexer.wq_b.scale");
+                    }
+                    LOG_INFO("  Layer %d: V4.1 indexer query loaded (owns_k=%d)", l, lw.indexer_wk.data ? 1 : 0);
                 }
             }
 
@@ -4859,7 +5210,7 @@ private:
         buf_comp_bf16_.alloc(head_dim_val * sizeof(__nv_bfloat16));  // compressed entry in BF16
 
         // Indexer buffers
-        int max_comp_entries = cfg_.max_compressed_entries > 0 ? cfg_.max_compressed_entries : 2048;
+        int max_comp_entries = std::max({cfg_.max_compressed_entries, cfg_.max_seq_len + 2, 2048});
         buf_indexer_q_.alloc(64 * 128 * sizeof(__nv_bfloat16));
         buf_indexer_weights_bf16_.alloc(64 * sizeof(__nv_bfloat16));
         buf_indexer_weights_f32_.alloc(64 * sizeof(float));
@@ -5064,7 +5415,7 @@ private:
         if (M == 1) {
             // Fused gemv for decoding
             gemv_fp8_cuda(C, A, weight, scale, N, K, block_size, stream);
-        } else if (M >= 128) {
+        } else if (M >= 128 && (size_t)N * K * sizeof(__nv_bfloat16) <= buf_dequant_.size_bytes) {
             // Fast vectorized 16-byte dequant into buf_dequant_ (0.038 ms) + Tensor Core cuBLAS GEMM (0.1 ms)
             // Achieving >350 TFLOPS on RTX PRO 6000 Ada/Blackwell
             fp8_dequant_cuda(buf_dequant_.bf16(), weight, scale, N, K, block_size, stream);
@@ -5591,10 +5942,11 @@ private:
             lw.indexer_comp_kv_state.f32(),
             lw.indexer_comp_score_state.f32(),
             lw.indexer_comp_ape.data ? lw.indexer_comp_ape.f32() : nullptr,
-            lw.indexer_comp_norm.bf16(),
+            lw.indexer_k_norm.data ? lw.indexer_k_norm.bf16() : lw.indexer_comp_norm.bf16(),
             lw.indexer_comp_kv_cache.bf16(),
             (cfg_.max_seq_len / ratio + 2),
-            main_stream_);
+            main_stream_,
+            lw.indexer_wk.data ? lw.indexer_wk.bf16() : nullptr);
     }
 
     void forward_compressor(int layer_id) {
