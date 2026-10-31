@@ -111,6 +111,96 @@
                 </div>
             </details>
 
+            <details class="stats-section kv-cache-section" id="kv-cache-details" open>
+                <summary>
+                    <div class="summary-title-row">
+                        <span>KV Cache &amp; Context</span>
+                        <div style="display: flex; align-items: center; gap: 6px;">
+                            <span id="kv-arch-badge" class="kv-arch-badge" title="KV Cache Architecture">MLA + Top-512</span>
+                            <span class="refresh-badge-btn" onclick="fetchKvCacheStatus(event)" title="Refresh KV Cache Telemetry">
+                                <span class="material-symbols-outlined refresh-icon">refresh</span>
+                            </span>
+                        </div>
+                    </div>
+                </summary>
+
+                <div class="stats-group kv-context-card">
+                    <div class="stats-group-title" style="display: flex; justify-content: space-between; align-items: center;">
+                        <div style="display: flex; align-items: center; gap: 6px;">
+                            <span class="material-symbols-outlined stat-icon">memory</span>
+                            <span>Context Window</span>
+                        </div>
+                        <span id="kv-usage-pct-badge" class="kv-usage-pct-badge" title="Percentage of maximum context capacity currently occupied">0.00%</span>
+                    </div>
+
+                    <div class="kv-progress-track" id="kv-progress-track" title="Context window utilization breakdown">
+                        <div class="kv-progress-seg seg-system" id="kv-bar-system" style="width: 0%;"></div>
+                        <div class="kv-progress-seg seg-cached" id="kv-bar-cached" style="width: 0%;"></div>
+                        <div class="kv-progress-seg seg-new" id="kv-bar-new" style="width: 0%;"></div>
+                    </div>
+
+                    <div class="kv-tokens-summary-row">
+                        <span class="kv-tokens-active"><b id="kv-active-tokens-val">0</b> tok used</span>
+                        <span class="kv-tokens-max">Max: <b id="kv-max-tokens-val">1,048,576</b></span>
+                    </div>
+
+                    <div class="kv-legend-row">
+                        <span class="kv-legend-chip" id="kv-chip-system" title="Pinned System Prompt + Tools KV Snapshot (0ms prefill)">
+                            <span class="kv-dot dot-system"></span>
+                            <span id="kv-leg-system">Sys: 0</span>
+                        </span>
+                        <span class="kv-legend-chip" id="kv-chip-cached" title="Reused Conversation Prefix Tokens">
+                            <span class="kv-dot dot-cached"></span>
+                            <span id="kv-leg-cached">Cached: 0</span>
+                        </span>
+                        <span class="kv-legend-chip" id="kv-chip-new" title="Newly Prefilled + Generated Tokens in Last Turn">
+                            <span class="kv-dot dot-new"></span>
+                            <span id="kv-leg-new">Delta: 0</span>
+                        </span>
+                    </div>
+
+                    <div class="stats-grid" style="margin-top: 10px;">
+                        <div class="stat-card" id="card-kv-allocated" title="Total VRAM pre-allocated for KV Cache and RoPE tables">
+                            <span class="stat-label">KV VRAM Size</span>
+                            <span class="stat-value" id="stat-kv-allocated">-</span>
+                            <span class="stat-sub" id="stat-kv-allocated-sub"></span>
+                        </div>
+                        <div class="stat-card" id="card-kv-active-bytes" title="VRAM bytes actively populated by current context tokens">
+                            <span class="stat-label">Active KV Data</span>
+                            <span class="stat-value" id="stat-kv-active-bytes">-</span>
+                            <span class="stat-sub" id="stat-kv-active-bytes-sub"></span>
+                        </div>
+                        <div class="stat-card" id="card-kv-hit-rate" title="Prompt prefix cache hit rate on the latest turn">
+                            <span class="stat-label">Prefix Hit Rate</span>
+                            <span class="stat-value" id="stat-kv-hit-rate">-</span>
+                            <span class="stat-sub" id="stat-kv-hit-rate-sub"></span>
+                        </div>
+                        <div class="stat-card" id="card-kv-attn-window" title="Local sliding window + sparse top-K compressed attention per decode step">
+                            <span class="stat-label">Attn Window</span>
+                            <span class="stat-value" id="stat-kv-attn-window">-</span>
+                            <span class="stat-sub" id="stat-kv-attn-window-sub"></span>
+                        </div>
+                        <div class="stat-card" id="card-kv-comp-entries" title="Active vs maximum compressed KV cache entries">
+                            <span class="stat-label">Compressed KV</span>
+                            <span class="stat-value" id="stat-kv-comp-entries">-</span>
+                            <span class="stat-sub" id="stat-kv-comp-entries-sub"></span>
+                        </div>
+                        <div class="stat-card" id="card-kv-snapshots" title="Pinned System and Rolling Turn KV Cache Snapshots">
+                            <span class="stat-label">KV Snapshots</span>
+                            <span class="stat-value" id="stat-kv-snapshots">-</span>
+                            <span class="stat-sub" id="stat-kv-snapshots-sub"></span>
+                        </div>
+                    </div>
+
+                    <div class="kv-actions-row">
+                        <button type="button" class="action-btn kv-reset-btn" onclick="resetKvCacheFromBox(event)" title="Flush conversation KV cache and restore pinned System Prefix">
+                            <span class="material-symbols-outlined" style="font-size: 16px;">restart_alt</span>
+                            <span>Flush / Reset KV Cache</span>
+                        </button>
+                    </div>
+                </div>
+            </details>
+
             <details class="stats-section expert-profile-section" id="expert-profile-details" open>
                 <summary>
                     <div class="summary-title-row">

@@ -981,7 +981,8 @@ void run_server(MoecherEngine& engine, int port, int default_thinking_budget, in
             {"status", "ok"},
             {"message", "KV cache reset successfully"},
             {"system_snapshot_restored", restored},
-            {"cached_tokens", engine.cached_tokens_.size()}
+            {"cached_tokens", engine.live_context_tokens_.load(std::memory_order_relaxed)},
+            {"kv_cache", engine.generate_kv_cache_status_json()}
         };
         res.set_content(body.dump(), "application/json");
     });
@@ -1004,9 +1005,16 @@ void run_server(MoecherEngine& engine, int port, int default_thinking_budget, in
         json body = {
             {"status", "ok"},
             {"system_snapshot_restored", restored},
-            {"cached_tokens", engine.cached_tokens_.size()}
+            {"cached_tokens", engine.live_context_tokens_.load(std::memory_order_relaxed)},
+            {"kv_cache", engine.generate_kv_cache_status_json()}
         };
         res.set_content(body.dump(), "application/json");
+    });
+
+    svr.Get("/api/kv/status", [&engine](const httplib::Request&, httplib::Response& res) {
+        res.set_header("Access-Control-Allow-Origin", "*");
+        json kv_status = engine.generate_kv_cache_status_json();
+        res.set_content(kv_status.dump(), "application/json");
     });
 
     svr.Options("/api/kv/reset", [](const httplib::Request&, httplib::Response& res) {
@@ -1329,7 +1337,8 @@ void run_server(MoecherEngine& engine, int port, int default_thinking_budget, in
             {"default_system_prompt", engine.get_model_default_system_prompt()},
             {"recommended_sampling", rec_sampling},
             {"active", true},
-            {"resources", sys_res}
+            {"resources", sys_res},
+            {"kv_cache", engine.generate_kv_cache_status_json()}
         };
         res.set_content(body.dump(), "application/json");
     });
@@ -2851,7 +2860,8 @@ void run_server(MoecherEngine& engine, int port, int default_thinking_budget, in
                                 {"decode_tps", engine.last_decode_tps_},
                                 {"prompt_tokens_details", {
                                     {"cached_tokens", engine.last_cached_tokens_}
-                                }}
+                                }},
+                                {"kv_cache", engine.generate_kv_cache_status_json()}
                             }}
                         };
                         sse = "data: " + finish.dump(-1, ' ', false, json::error_handler_t::replace) + "\n\n";

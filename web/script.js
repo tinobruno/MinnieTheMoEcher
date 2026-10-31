@@ -144,6 +144,7 @@ function updateStatsUI(lastStats) {
 }
 
 let isGenerating = false;
+let kvLivePollTimer = null;
 
 function setGeneratingState(generating) {
     isGenerating = generating;
@@ -152,6 +153,11 @@ function setGeneratingState(generating) {
     const micBtn = document.getElementById('mic-btn');
 
     if (generating) {
+        if (!kvLivePollTimer) {
+            kvLivePollTimer = setInterval(() => {
+                if (typeof fetchKvCacheStatus === 'function') fetchKvCacheStatus();
+            }, 1200);
+        }
         if (typeof terminateVoiceRecognition === 'function') {
             terminateVoiceRecognition();
         } else if (typeof stopVoiceRecognition === 'function') {
@@ -170,6 +176,10 @@ function setGeneratingState(generating) {
         if (inputBox) inputBox.classList.add('disabled');
         if (previewBtn) previewBtn.classList.add('hidden');
     } else {
+        if (kvLivePollTimer) {
+            clearInterval(kvLivePollTimer);
+            kvLivePollTimer = null;
+        }
         sendBtn.classList.remove('stop-mode');
         sendBtn.innerHTML = '<span class="material-symbols-outlined">send</span>';
         sendBtn.title = 'Send message';
@@ -371,7 +381,18 @@ sendBtn.addEventListener('click', () => {
 function clearChat() {
     stopGeneration();
     const apiBase = getApiBase();
-    fetch(`${apiBase}/api/kv/reset`, { method: 'POST' }).catch(() => { });
+    fetch(`${apiBase}/api/kv/reset`, { method: 'POST' })
+        .then(r => r.ok ? r.json() : null)
+        .then(d => {
+            if (d && d.kv_cache && typeof renderKvCacheStatusUI === 'function') {
+                renderKvCacheStatusUI(d.kv_cache);
+            } else if (typeof fetchKvCacheStatus === 'function') {
+                fetchKvCacheStatus();
+            }
+        })
+        .catch(() => {
+            if (typeof fetchKvCacheStatus === 'function') fetchKvCacheStatus();
+        });
     chatHistory = [];
     sessionStats = {
         totalTurns: 0,
@@ -4798,6 +4819,9 @@ async function sendMessage(options = {}) {
                                 if (data.usage.prompt_tokens_details && data.usage.prompt_tokens_details.cached_tokens !== undefined) {
                                     turnCachedTokens = data.usage.prompt_tokens_details.cached_tokens;
                                 }
+                                if (data.usage.kv_cache && typeof renderKvCacheStatusUI === 'function') {
+                                    renderKvCacheStatusUI(data.usage.kv_cache);
+                                }
                             }
 
                             if (data.zero_decode_bypass) {
@@ -5621,6 +5645,7 @@ async function sendMessage(options = {}) {
         }
         updateChatbarPreviewButtonVisibility();
         fetchExpertProfile();
+        if (typeof fetchKvCacheStatus === 'function') fetchKvCacheStatus();
         // Guaranteed cleanup: ensure input field never retains the sent prompt
         if (chatInput.value.trim() === text.trim()) {
             chatInput.value = '';
@@ -5841,6 +5866,321 @@ function initExpertProfileUI() {
 
     // Initial fetch
     fetchExpertProfile();
+    fetchKvCacheStatus();
+}
+
+// ════════════════════════════════════════════════════════════════════════════════
+//  KV Cache & Context Window Telemetry UI Handlers
+// ════════════════════════════════════════════════════════════════════════════════
+
+let currentKvCacheStatus = null;
+
+function formatKvBytes(bytes) {
+    if (bytes === undefined || bytes === null || isNaN(bytes) || bytes <= 0) return '0 B';
+    const gb = bytes / (1024 * 1024 * 1024);
+    if (gb >= 1.0) return `${gb.toFixed(2)} GB`;
+    const mb = bytes / (1024 * 1024);
+    if (mb >= 1.0) return `${mb.toFixed(1)} MB`;
+    const kb = bytes / 1024;
+    if (kb >= 1.0) return `${kb.toFixed(1)} KB`;
+    return `${bytes} B`;
+}
+
+function formatCompactCount(n) {
+    if (n === undefined || n === null || isNaN(n)) return '-';
+    if (n >= 1000000) {
+        const m = n / 1000000;
+        return (n === 1048576 || n === 1048578) ? '1M (1,048,576)' : `${m.toFixed(2)}M`;
+    }
+    return Number(n).toLocaleString();
+}
+
+async function fetchKvCacheStatus(event) {
+    if (event) {
+        event.stopPropagation();
+        event.preventDefault();
+    }
+    try {
+        const res = await fetch(`${getApiBase()}/api/kv/status`);
+        if (!res.ok) return;
+        const data = await res.json();
+        currentKvCacheStatus = data;
+        renderKvCacheStatusUI(data);
+    } catch (err) {
+        console.debug('Could not fetch KV cache status:', err);
+    }
+}
+
+async function resetKvCacheFromBox(event) {
+    if (event) {
+        event.stopPropagation();
+        event.preventDefault();
+    }
+    try {
+        const res = await fetch(`${getApiBase()}/api/kv/reset`, { method: 'POST' });
+        if (res.ok) {
+            const data = await res.json();
+            if (data && data.kv_cache) {
+                renderKvCacheStatusUI(data.kv_cache);
+            } else {
+                await fetchKvCacheStatus();
+            }
+            const restored = data && data.system_snapshot_restored;
+            showToast(
+                restored
+                    ? `KV Cache flushed — Pinned System Prefix (${(data.cached_tokens || 0).toLocaleString()} tok) restored.`
+                    : 'KV Cache flushed to 0 tokens.',
+                'success',
+                3000
+            );
+        }
+    } catch (err) {
+        console.warn('Failed to reset KV cache:', err);
+    }
+}
+
+function renderKvCacheStatusUI(data) {
+    if (!data) return;
+
+    const maxSeq = Math.max(1, data.max_seq_len || 65536);
+    const activeTok = data.active_tokens || 0;
+    const sysTok = data.system_snapshot_valid ? (data.system_snapshot_tokens || 0) : 0;
+    const lastCachedTok = data.last_cached_tokens || 0;
+    const lastEvalTok = data.last_evaluated_tokens || 0;
+    const lastCompTok = data.last_completion_tokens || 0;
+
+    // Breakdown of active tokens into System Prefix, Reused Conversation Prefix, and New Turn Delta
+    const segSysTok = Math.min(activeTok, sysTok);
+    const reusedTotal = Math.min(activeTok, Math.max(segSysTok, lastCachedTok));
+    const segCachedTok = Math.max(0, reusedTotal - segSysTok);
+    const segNewTok = Math.max(0, activeTok - segSysTok - segCachedTok);
+
+    const rawUsagePct = (100.0 * activeTok) / maxSeq;
+
+    // Badge: Architecture
+    const elArchBadge = document.getElementById('kv-arch-badge');
+    if (elArchBadge && data.kv_arch) {
+        if (data.kv_arch.includes('Shared KV Compressor')) {
+            elArchBadge.textContent = maxSeq >= 1000000 ? '1M MLA · Top-512' : 'MLA · Top-512';
+        } else if (data.kv_arch.includes('MLA')) {
+            elArchBadge.textContent = 'MLA · Top-512';
+        } else if (data.kv_arch.includes('Mamba-2')) {
+            elArchBadge.textContent = 'Mamba-2 + GQA';
+        } else if (data.kv_arch.includes('DeltaNet')) {
+            elArchBadge.textContent = 'DeltaNet + GQA';
+        } else {
+            elArchBadge.textContent = data.kv_dtype || 'GQA KV';
+        }
+        elArchBadge.title = `${data.kv_arch} (${data.kv_dtype || 'BF16'}, ${data.num_layers || 40} layers)`;
+    }
+
+    // Usage % Badge
+    const elUsageBadge = document.getElementById('kv-usage-pct-badge');
+    if (elUsageBadge) {
+        elUsageBadge.textContent = rawUsagePct < 0.01 && activeTok > 0
+            ? `${rawUsagePct.toFixed(3)}%`
+            : `${rawUsagePct.toFixed(2)}%`;
+        elUsageBadge.title = `${activeTok.toLocaleString()} / ${maxSeq.toLocaleString()} tokens used (${rawUsagePct.toFixed(4)}%)`;
+    }
+
+    // Segmented progress bar (use subtle visual floor when activeTok > 0 on 1M context so segments remain visible)
+    const visualTotalPct = activeTok > 0 ? Math.min(100, Math.max(rawUsagePct, Math.min(100, Math.log10(activeTok + 1) / Math.log10(maxSeq + 1) * 18))) : 0;
+    const elBarSys = document.getElementById('kv-bar-system');
+    const elBarCached = document.getElementById('kv-bar-cached');
+    const elBarNew = document.getElementById('kv-bar-new');
+    const elTrack = document.getElementById('kv-progress-track');
+
+    if (activeTok > 0) {
+        const sysShare = (segSysTok / activeTok) * visualTotalPct;
+        const cachedShare = (segCachedTok / activeTok) * visualTotalPct;
+        const newShare = (segNewTok / activeTok) * visualTotalPct;
+        if (elBarSys) elBarSys.style.width = `${sysShare.toFixed(2)}%`;
+        if (elBarCached) elBarCached.style.width = `${cachedShare.toFixed(2)}%`;
+        if (elBarNew) elBarNew.style.width = `${newShare.toFixed(2)}%`;
+    } else {
+        if (elBarSys) elBarSys.style.width = '0%';
+        if (elBarCached) elBarCached.style.width = '0%';
+        if (elBarNew) elBarNew.style.width = '0%';
+    }
+    if (elTrack) {
+        elTrack.title = `Active Context: ${activeTok.toLocaleString()} / ${maxSeq.toLocaleString()} tokens\n` +
+                        `• System Snapshot: ${segSysTok.toLocaleString()} tok\n` +
+                        `• Cached History: ${segCachedTok.toLocaleString()} tok\n` +
+                        `• Latest Turn Delta: ${segNewTok.toLocaleString()} tok`;
+    }
+
+    // Summary row & Legend
+    const elActiveVal = document.getElementById('kv-active-tokens-val');
+    const elMaxVal = document.getElementById('kv-max-tokens-val');
+    if (elActiveVal) elActiveVal.textContent = activeTok.toLocaleString();
+    if (elMaxVal) elMaxVal.textContent = maxSeq === 1048576 ? '1,048,576 (1M)' : maxSeq.toLocaleString();
+
+    const elLegSys = document.getElementById('kv-leg-system');
+    const elLegCached = document.getElementById('kv-leg-cached');
+    const elLegNew = document.getElementById('kv-leg-new');
+    if (elLegSys) elLegSys.textContent = `Sys: ${segSysTok.toLocaleString()}`;
+    if (elLegCached) elLegCached.textContent = `Cached: ${segCachedTok.toLocaleString()}`;
+    if (elLegNew) elLegNew.textContent = `Delta: +${segNewTok.toLocaleString()}`;
+
+    // Memory breakdown cards
+    const mem = data.memory || {};
+    const kvAlloc = mem.total_kv_allocated_bytes || 0;
+    const kvActive = mem.total_kv_active_bytes || 0;
+    const ropeAlloc = mem.rope_allocated_bytes || 0;
+    const rawAlloc = mem.raw_window_allocated_bytes || 0;
+    const rawActive = mem.raw_window_active_bytes || 0;
+    const compAlloc = mem.compressed_kv_allocated_bytes || 0;
+    const compActive = mem.compressed_kv_active_bytes || 0;
+    const idxAlloc = mem.indexer_kv_allocated_bytes || 0;
+    const idxActive = mem.indexer_kv_active_bytes || 0;
+    const snapAlloc = mem.snapshots_allocated_bytes || 0;
+
+    // Card 1: KV VRAM Size
+    const elAlloc = document.getElementById('stat-kv-allocated');
+    const elAllocSub = document.getElementById('stat-kv-allocated-sub');
+    const cardAlloc = document.getElementById('card-kv-allocated');
+    if (elAlloc) elAlloc.textContent = formatKvBytes(kvAlloc);
+    if (elAllocSub) {
+        elAllocSub.textContent = ropeAlloc > 0 ? `+${formatKvBytes(ropeAlloc)} RoPE` : `${data.num_layers || 40} layers`;
+    }
+    if (cardAlloc) {
+        cardAlloc.title =
+            `Total KV Cache VRAM Allocated: ${formatKvBytes(kvAlloc)}\n` +
+            `• Raw Window / GQA KV: ${formatKvBytes(rawAlloc)}\n` +
+            `• Compressed MLA KV: ${formatKvBytes(compAlloc)}\n` +
+            `• Top-K Indexer K-Cache: ${formatKvBytes(idxAlloc)}\n` +
+            `• RoPE Frequency Tables: ${formatKvBytes(ropeAlloc)}`;
+    }
+
+    // Card 2: Active KV Data
+    const elActiveBytes = document.getElementById('stat-kv-active-bytes');
+    const elActiveBytesSub = document.getElementById('stat-kv-active-bytes-sub');
+    const cardActiveBytes = document.getElementById('card-kv-active-bytes');
+    if (elActiveBytes) elActiveBytes.textContent = formatKvBytes(kvActive);
+    if (elActiveBytesSub) {
+        const memPct = kvAlloc > 0 ? ((100.0 * kvActive) / kvAlloc) : 0;
+        elActiveBytesSub.textContent = compActive > 0
+            ? `Win ${formatKvBytes(rawActive)} · Cmp ${formatKvBytes(compActive + idxActive)}`
+            : `${memPct.toFixed(1)}% of KV pool`;
+    }
+    if (cardActiveBytes) {
+        cardActiveBytes.title =
+            `Active Populated KV Data: ${formatKvBytes(kvActive)} / ${formatKvBytes(kvAlloc)}\n` +
+            `• Raw Sliding Window: ${formatKvBytes(rawActive)}\n` +
+            `• Compressed KV Entries: ${formatKvBytes(compActive)}\n` +
+            `• Indexer K-Cache Entries: ${formatKvBytes(idxActive)}`;
+    }
+
+    // Card 3: Prefix Hit Rate
+    const elHitRate = document.getElementById('stat-kv-hit-rate');
+    const elHitRateSub = document.getElementById('stat-kv-hit-rate-sub');
+    const cardHitRate = document.getElementById('card-kv-hit-rate');
+    const hitPct = data.cache_hit_pct || 0;
+    const lastPrompt = data.last_prompt_tokens || 0;
+    if (elHitRate) {
+        if (lastPrompt > 0) {
+            elHitRate.textContent = `${hitPct.toFixed(1)}%`;
+        } else if (sysTok > 0) {
+            elHitRate.textContent = 'Pinned';
+        } else {
+            elHitRate.textContent = '-';
+        }
+    }
+    if (elHitRateSub) {
+        if (lastPrompt > 0) {
+            elHitRateSub.textContent = `${lastCachedTok.toLocaleString()} / ${lastPrompt.toLocaleString()} tok`;
+        } else if (sysTok > 0) {
+            elHitRateSub.textContent = `${sysTok.toLocaleString()} sys tok ready`;
+        } else {
+            elHitRateSub.textContent = 'Cold cache';
+        }
+    }
+    if (cardHitRate) {
+        cardHitRate.title = lastPrompt > 0
+            ? `Last Turn Prefix Cache Hit Rate: ${hitPct.toFixed(1)}%\nReused from KV cache: ${lastCachedTok.toLocaleString()} tokens\nNewly evaluated: ${lastEvalTok.toLocaleString()} tokens\nTotal prompt: ${lastPrompt.toLocaleString()} tokens`
+            : `Pinned System Prefix ready (${sysTok.toLocaleString()} tokens)`;
+    }
+
+    // Card 4: Attention Window
+    const elAttnWin = document.getElementById('stat-kv-attn-window');
+    const elAttnWinSub = document.getElementById('stat-kv-attn-window-sub');
+    const cardAttnWin = document.getElementById('card-kv-attn-window');
+    const winSize = data.sliding_window || 0;
+    const topK = data.indexer_top_k || 0;
+    const maxAttended = data.max_attended_per_step || maxSeq;
+    if (elAttnWin) {
+        if (winSize > 0 && topK > 0) {
+            elAttnWin.textContent = `${winSize} + Top-${topK}`;
+        } else if (winSize > 0) {
+            elAttnWin.textContent = `${winSize.toLocaleString()} win`;
+        } else {
+            elAttnWin.textContent = 'Full Attn';
+        }
+    }
+    if (elAttnWinSub) {
+        if (winSize > 0 && topK > 0) {
+            const curAttended = Math.min(activeTok, winSize) + Math.min(data.active_compressed_entries || 0, topK);
+            elAttnWinSub.textContent = `${curAttended} / ${maxAttended} tok/step`;
+        } else {
+            elAttnWinSub.textContent = `${data.kv_dtype || 'BF16'}`;
+        }
+    }
+    if (cardAttnWin) {
+        cardAttnWin.title = winSize > 0 && topK > 0
+            ? `O(640) Sparse MLA Attention:\n• Local Sliding Window: ${winSize} exact tokens\n• Lightning Indexer Top-K: up to ${topK} compressed entries\n• Max attended tokens per decode step: ${maxAttended} (even at 1M context!)`
+            : `Attention Mode: ${data.kv_arch || 'Standard'}`;
+    }
+
+    // Card 5: Compressed KV Slots
+    const elCompEntries = document.getElementById('stat-kv-comp-entries');
+    const elCompEntriesSub = document.getElementById('stat-kv-comp-entries-sub');
+    const cardCompEntries = document.getElementById('card-kv-comp-entries');
+    const actComp = data.active_compressed_entries || 0;
+    const maxComp = data.max_compressed_entries || 0;
+    const compLayers = data.compressed_source_layers || 0;
+    if (elCompEntries) {
+        if (maxComp > 0) {
+            elCompEntries.textContent = `${actComp.toLocaleString()} / ${ maxComp >= 1000000 ? '1M' : maxComp.toLocaleString() }`;
+        } else {
+            elCompEntries.textContent = 'N/A (Dense)';
+        }
+    }
+    if (elCompEntriesSub) {
+        if (compLayers > 0) {
+            elCompEntriesSub.textContent = `${compLayers} shared groups (2×/1×)`;
+        } else {
+            elCompEntriesSub.textContent = 'Direct KV state';
+        }
+    }
+    if (cardCompEntries) {
+        cardCompEntries.title = maxComp > 0
+            ? `Compressed KV Cache Entries: ${actComp.toLocaleString()} active / ${maxComp.toLocaleString()} max per 1× group\nShared across ${compLayers} source compressor layers (${formatKvBytes(compAlloc + idxAlloc)} total)`
+            : 'No KV compression active for this model architecture';
+    }
+
+    // Card 6: KV Snapshots
+    const elSnaps = document.getElementById('stat-kv-snapshots');
+    const elSnapsSub = document.getElementById('stat-kv-snapshots-sub');
+    const cardSnaps = document.getElementById('card-kv-snapshots');
+    const hasSys = !!data.system_snapshot_valid;
+    const hasTurn = !!data.turn_snapshot_valid;
+    if (elSnaps) {
+        if (hasSys && hasTurn) elSnaps.textContent = 'Sys + Turn';
+        else if (hasSys) elSnaps.textContent = 'System Pinned';
+        else if (hasTurn) elSnaps.textContent = 'Turn Saved';
+        else elSnaps.textContent = 'None';
+    }
+    if (elSnapsSub) {
+        elSnapsSub.textContent = snapAlloc > 0
+            ? `${formatKvBytes(snapAlloc)} (${(data.turn_snapshot_tokens || sysTok).toLocaleString()} tok)`
+            : '0 B allocated';
+    }
+    if (cardSnaps) {
+        cardSnaps.title =
+            `Pinned KV Snapshots (${formatKvBytes(snapAlloc)} total):\n` +
+            `• System Snapshot: ${hasSys ? `${sysTok.toLocaleString()} tok (${formatKvBytes(data.system_snapshot_bytes || 0)})` : 'Inactive'}\n` +
+            `• Rolling Turn Snapshot: ${hasTurn ? `${(data.turn_snapshot_tokens || 0).toLocaleString()} tok (${formatKvBytes(data.turn_snapshot_bytes || 0)})` : 'Inactive'}`;
+    }
 }
 
 function downloadExpertProfileJson() {

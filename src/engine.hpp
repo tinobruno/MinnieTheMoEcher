@@ -200,6 +200,11 @@ public:
     
     // Prompt Prefix KV Cache Tracking
     std::vector<int> cached_tokens_;
+    std::atomic<size_t> live_context_tokens_{0};
+    std::atomic<size_t> system_snapshot_tokens_{0};
+    std::atomic<size_t> turn_snapshot_tokens_{0};
+    std::atomic<size_t> system_snapshot_bytes_{0};
+    std::atomic<size_t> turn_snapshot_bytes_{0};
 
     // Hardware Detection & Feature Gating
     GpuCapabilities gpu_caps_;
@@ -292,6 +297,7 @@ public:
             mtp_drafter_.reset_kv_cache(main_stream_);
         }
         cached_tokens_.clear();
+        live_context_tokens_.store(0, std::memory_order_relaxed);
         if (!engram_compressed_cache_.empty()) {
             std::fill(engram_compressed_cache_.begin(), engram_compressed_cache_.end(), engram_pad_id_);
         }
@@ -2502,6 +2508,22 @@ public:
 
         CUDA_CHECK(cudaStreamSynchronize(main_stream_));
         snap.valid = true;
+
+        size_t total_snap_bytes = snap.snap_hc_state.size_bytes + snap.snap_hc_after_attn.size_bytes + snap.snap_hc_pre_mix.size_bytes;
+        for (const auto& ls : snap.layers) {
+            total_snap_bytes += ls.snap_kv_cache.size_bytes + ls.snap_comp_kv_cache.size_bytes +
+                                ls.snap_comp_kv_state.size_bytes + ls.snap_comp_score_state.size_bytes +
+                                ls.snap_indexer_comp_kv_cache.size_bytes + ls.snap_indexer_comp_kv_state.size_bytes +
+                                ls.snap_indexer_comp_score_state.size_bytes + ls.snap_k_cache_gqa.size_bytes +
+                                ls.snap_v_cache_gqa.size_bytes + ls.snap_ssm_state.size_bytes + ls.snap_conv_state.size_bytes;
+        }
+        if (&snap == &system_kv_snapshot_) {
+            system_snapshot_tokens_.store(tokens.size(), std::memory_order_relaxed);
+            system_snapshot_bytes_.store(total_snap_bytes, std::memory_order_relaxed);
+        } else if (&snap == &turn_kv_snapshot_) {
+            turn_snapshot_tokens_.store(tokens.size(), std::memory_order_relaxed);
+            turn_snapshot_bytes_.store(total_snap_bytes, std::memory_order_relaxed);
+        }
     }
 
     void snapshot_system_kv(const std::vector<int>& tokens) {
@@ -2607,6 +2629,7 @@ public:
 
         CUDA_CHECK(cudaStreamSynchronize(main_stream_));
         cached_tokens_ = snap.tokens;
+        live_context_tokens_.store(snap.tokens.size(), std::memory_order_relaxed);
         if (engram_loaded_ && !engram_token_map_.empty()) {
             int max_seq = std::max(cfg_.max_seq_len, 131072);
             if ((int)engram_compressed_cache_.size() < max_seq) {
@@ -2696,6 +2719,7 @@ public:
                  prefix_tokens.size(), prefill_sec, prefill_tps);
 
         cached_tokens_ = prefix_tokens;
+        live_context_tokens_.store(prefix_tokens.size(), std::memory_order_relaxed);
         snapshot_system_kv(prefix_tokens);
     }
 
@@ -3205,6 +3229,7 @@ public:
         std::vector<int> history(prompt.begin(), prompt.end());
         int position = (int)prompt.size();
         prompt_token_count_ = (int)prompt.size();
+        live_context_tokens_.store(prompt.size(), std::memory_order_relaxed);
         std::string generated_text;
         std::string token_buffer;
 
@@ -3318,6 +3343,7 @@ public:
 
             output_ids.push_back(next_token);
             history.push_back(next_token);
+            live_context_tokens_.store(history.size(), std::memory_order_relaxed);
 
             // Enable tracking for all generated tokens produced by the model (excluding control & special tokens)
             track_current_token_ = !is_control_token(next_token);
@@ -4275,6 +4301,7 @@ public:
         }
 
         cached_tokens_ = history;
+        live_context_tokens_.store(history.size(), std::memory_order_relaxed);
         snapshot_kv(turn_kv_snapshot_, history);
         if (buf_mrope_pos_.data) {
             int h_mrope[2] = {-1, 0};
@@ -6600,6 +6627,147 @@ public:
         if (multi_score > max_score) { max_score = multi_score; best_cat = "Multilingual"; }
 
         return best_cat;
+    }
+
+    json generate_kv_cache_status_json() const {
+        size_t active_tok = live_context_tokens_.load(std::memory_order_relaxed);
+        bool sys_valid = system_kv_snapshot_.valid;
+        bool turn_valid = turn_kv_snapshot_.valid;
+        size_t sys_tok = sys_valid ? system_snapshot_tokens_.load(std::memory_order_relaxed) : 0;
+        size_t turn_tok = turn_valid ? turn_snapshot_tokens_.load(std::memory_order_relaxed) : 0;
+        size_t sys_snap_bytes = sys_valid ? system_snapshot_bytes_.load(std::memory_order_relaxed) : 0;
+        size_t turn_snap_bytes = turn_valid ? turn_snapshot_bytes_.load(std::memory_order_relaxed) : 0;
+
+        int max_seq = std::max(1, cfg_.max_seq_len);
+        int window = cfg_.sliding_window > 0 ? cfg_.sliding_window : (cfg_.window_size > 0 ? cfg_.window_size : 0);
+
+        size_t raw_kv_alloc = 0;
+        size_t raw_kv_active = 0;
+        size_t comp_kv_alloc = 0;
+        size_t comp_kv_active = 0;
+        size_t idx_kv_alloc = buf_indexer_scores_.size_bytes + buf_indexer_mask_.size_bytes;
+        size_t idx_kv_active = 0;
+        size_t ssm_alloc = 0;
+        size_t ssm_active = 0;
+
+        int comp_source_layers = 0;
+        int idx_source_layers = 0;
+        size_t active_comp_entries_max_layer = 0;
+        size_t max_comp_entries_max_layer = 0;
+
+        for (int l = 0; l < cfg_.num_hidden_layers && l < (int)layers_.size(); l++) {
+            const auto& lw = layers_[l];
+            if (lw.kv_cache.data) {
+                raw_kv_alloc += lw.kv_cache.size_bytes;
+                size_t win_tok = window > 0 ? std::min(active_tok, (size_t)window) : active_tok;
+                raw_kv_active += std::min(lw.kv_cache.size_bytes, win_tok * (size_t)cfg_.head_dim * sizeof(__nv_bfloat16));
+            }
+            if (lw.k_cache_gqa.data) {
+                size_t gqa_layer_alloc = lw.k_cache_gqa.size_bytes + lw.v_cache_gqa.size_bytes;
+                raw_kv_alloc += gqa_layer_alloc;
+                size_t bytes_per_tok = gqa_layer_alloc / (size_t)max_seq;
+                raw_kv_active += std::min(gqa_layer_alloc, active_tok * bytes_per_tok);
+            }
+            int ratio = cfg_.layer_compress_ratio(l);
+            if (lw.comp_kv_cache.data) {
+                comp_source_layers++;
+                comp_kv_alloc += lw.comp_kv_cache.size_bytes + lw.comp_kv_state.size_bytes + lw.comp_score_state.size_bytes;
+                size_t layer_comp_entries = (ratio > 0) ? (active_tok / (size_t)ratio) : active_tok;
+                size_t layer_max_entries = lw.comp_kv_cache.size_bytes / std::max<size_t>(1, (size_t)cfg_.head_dim * sizeof(__nv_bfloat16));
+                size_t clamped_entries = std::min(layer_comp_entries, layer_max_entries);
+                if (clamped_entries > active_comp_entries_max_layer) active_comp_entries_max_layer = clamped_entries;
+                if (layer_max_entries > max_comp_entries_max_layer) max_comp_entries_max_layer = layer_max_entries;
+                size_t act_b = std::min(lw.comp_kv_cache.size_bytes, layer_comp_entries * (size_t)cfg_.head_dim * sizeof(__nv_bfloat16));
+                if (active_tok > 0) act_b += lw.comp_kv_state.size_bytes + lw.comp_score_state.size_bytes;
+                comp_kv_active += act_b;
+            }
+            if (lw.indexer_comp_kv_cache.data) {
+                idx_source_layers++;
+                idx_kv_alloc += lw.indexer_comp_kv_cache.size_bytes + lw.indexer_comp_kv_state.size_bytes + lw.indexer_comp_score_state.size_bytes;
+                size_t layer_comp_entries = (ratio > 0) ? (active_tok / (size_t)ratio) : active_tok;
+                size_t act_b = std::min(lw.indexer_comp_kv_cache.size_bytes, layer_comp_entries * 128 * sizeof(__nv_bfloat16));
+                if (active_tok > 0) act_b += lw.indexer_comp_kv_state.size_bytes + lw.indexer_comp_score_state.size_bytes;
+                idx_kv_active += act_b;
+            }
+            if (lw.ssm_state.data || lw.conv_state.data) {
+                size_t s_b = lw.ssm_state.size_bytes + lw.conv_state.size_bytes;
+                ssm_alloc += s_b;
+                if (active_tok > 0) ssm_active += s_b;
+            }
+        }
+
+        size_t rope_alloc = rope_freqs_.size_bytes + rope_freqs_compressed_.size_bytes;
+        size_t total_kv_alloc = raw_kv_alloc + comp_kv_alloc + idx_kv_alloc + ssm_alloc;
+        size_t total_kv_active = raw_kv_active + comp_kv_active + idx_kv_active + ssm_active;
+
+        std::string kv_arch = "Standard GQA KV";
+        std::string kv_dtype = "BF16";
+        int indexer_top_k = 0;
+        int max_attended_per_step = max_seq;
+        if (cfg_.is_deepseek_v41()) {
+            kv_arch = "MLA + Shared KV Compressor + Top-512 Indexer";
+            kv_dtype = "BF16";
+            indexer_top_k = 512;
+            max_attended_per_step = (window > 0 ? window : 128) + 512;
+        } else if (cfg_.is_deepseek()) {
+            kv_arch = "MLA + KV Compressor + Top-512 Indexer";
+            kv_dtype = "BF16";
+            indexer_top_k = 512;
+            max_attended_per_step = (window > 0 ? window : 4096) + 512;
+        } else if (cfg_.is_nemotron()) {
+            kv_arch = "Hybrid Mamba-2 SSM + FP8 GQA KV";
+            kv_dtype = "FP8 E4M3 + FP32 SSM";
+        } else if (cfg_.architecture == ModelArch::QWEN) {
+            kv_arch = "Hybrid DeltaNet Linear + FP8 GQA KV";
+            kv_dtype = "FP8 E4M3 + BF16 SSM";
+        }
+
+        double hit_pct = (prompt_token_count_ > 0)
+            ? (100.0 * (double)last_cached_tokens_ / (double)prompt_token_count_)
+            : (sys_valid && active_tok == sys_tok && sys_tok > 0 ? 100.0 : 0.0);
+
+        json root = {
+            {"status", "ok"},
+            {"kv_arch", kv_arch},
+            {"kv_dtype", kv_dtype},
+            {"num_layers", cfg_.num_hidden_layers},
+            {"max_seq_len", max_seq},
+            {"sliding_window", window},
+            {"indexer_top_k", indexer_top_k},
+            {"max_attended_per_step", max_attended_per_step},
+            {"active_tokens", active_tok},
+            {"usage_pct", 100.0 * (double)active_tok / (double)max_seq},
+            {"system_snapshot_valid", sys_valid},
+            {"system_snapshot_tokens", sys_tok},
+            {"system_snapshot_bytes", sys_snap_bytes},
+            {"turn_snapshot_valid", turn_valid},
+            {"turn_snapshot_tokens", turn_tok},
+            {"turn_snapshot_bytes", turn_snap_bytes},
+            {"last_prompt_tokens", prompt_token_count_},
+            {"last_completion_tokens", completion_token_count_},
+            {"last_evaluated_tokens", last_prefill_tokens_},
+            {"last_cached_tokens", last_cached_tokens_},
+            {"cache_hit_pct", hit_pct},
+            {"compressed_source_layers", comp_source_layers},
+            {"indexer_source_layers", idx_source_layers},
+            {"active_compressed_entries", active_comp_entries_max_layer},
+            {"max_compressed_entries", max_comp_entries_max_layer},
+            {"memory", {
+                {"total_kv_allocated_bytes", total_kv_alloc},
+                {"total_kv_active_bytes", total_kv_active},
+                {"raw_window_allocated_bytes", raw_kv_alloc},
+                {"raw_window_active_bytes", raw_kv_active},
+                {"compressed_kv_allocated_bytes", comp_kv_alloc},
+                {"compressed_kv_active_bytes", comp_kv_active},
+                {"indexer_kv_allocated_bytes", idx_kv_alloc},
+                {"indexer_kv_active_bytes", idx_kv_active},
+                {"ssm_state_allocated_bytes", ssm_alloc},
+                {"ssm_state_active_bytes", ssm_active},
+                {"rope_allocated_bytes", rope_alloc},
+                {"snapshots_allocated_bytes", sys_snap_bytes + turn_snap_bytes}
+            }}
+        };
+        return root;
     }
 
     json generate_expert_profile_json() {
