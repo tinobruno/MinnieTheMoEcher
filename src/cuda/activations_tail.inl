@@ -2042,7 +2042,8 @@ __global__ void moe_nemotron_up_relu2_batch_kernel(
     const float* __restrict__ expert_scales,
     int M, int N, int K,
     int top_k = 6,
-    int n_experts = 128)
+    int n_experts = 128,
+    size_t up_s_offset = 0)
 {
     int row = blockIdx.x * blockDim.y + threadIdx.y;
     int k = blockIdx.y;
@@ -2062,7 +2063,7 @@ __global__ void moe_nemotron_up_relu2_batch_kernel(
 
     const uint8_t* exp_ptr = (const uint8_t*)expert_ptrs[eid];
     const uint8_t* up_w = exp_ptr;
-    const uint8_t* up_s = exp_ptr + (size_t)N * (K / 2);
+    const uint8_t* up_s = exp_ptr + (up_s_offset > 0 ? up_s_offset : (size_t)N * (K / 2));
     float scale_2 = expert_scales ? expert_scales[eid * 2 + 0] : 1.0f;
 
     int lane = threadIdx.x; // 0..31
@@ -2124,7 +2125,9 @@ __global__ void moe_nemotron_down_scaled_residual_batch_kernel(
     int M, int N, int K,
     int top_k = 6,
     int n_experts = 128,
-    int down_offset_padding = 0)
+    int down_offset_padding = 0,
+    size_t down_w_offset = 0,
+    size_t down_s_offset = 0)
 {
     int row = blockIdx.x * blockDim.y + threadIdx.y;
     int m = blockIdx.y;
@@ -2149,8 +2152,8 @@ __global__ void moe_nemotron_down_scaled_residual_batch_kernel(
         if (!ptr) continue;
 
         const uint8_t* exp_ptr = (const uint8_t*)ptr;
-        const uint8_t* down_w = exp_ptr + up_w_bytes + up_s_bytes + down_offset_padding;
-        const uint8_t* down_s = down_w + down_w_bytes;
+        const uint8_t* down_w = exp_ptr + (down_w_offset > 0 ? down_w_offset : (up_w_bytes + up_s_bytes + down_offset_padding));
+        const uint8_t* down_s = (down_s_offset > 0) ? (exp_ptr + down_s_offset) : (down_w + down_w_bytes);
         float scale_2 = expert_scales ? expert_scales[eid * 2 + 1] : 1.0f;
 
         const uint8_t* row_w = down_w + (size_t)row * (K / 2);
@@ -2288,7 +2291,8 @@ __global__ void moe_nemotron_binned_up_relu2_batch_kernel(
     const float* expert_scales,
     int M, int N, int K,
     int top_k = 6,
-    int n_experts = 128)
+    int n_experts = 128,
+    size_t up_s_offset = 0)
 {
     int row = blockIdx.x * blockDim.y + threadIdx.y;
     int eid = blockIdx.y;
@@ -2304,7 +2308,7 @@ __global__ void moe_nemotron_binned_up_relu2_batch_kernel(
 
     const uint8_t* exp_ptr = (const uint8_t*)expert_ptrs[eid];
     const uint8_t* up_w = exp_ptr;
-    const uint8_t* up_s = exp_ptr + (size_t)N * (K / 2);
+    const uint8_t* up_s = exp_ptr + (up_s_offset > 0 ? up_s_offset : (size_t)N * (K / 2));
     float scale_2 = expert_scales ? expert_scales[eid * 2 + 0] : 1.0f;
 
     int lane = threadIdx.x; // 0..31
@@ -2395,7 +2399,9 @@ __global__ void moe_nemotron_binned_down_scaled_residual_batch_kernel(
     int M, int N, int K,
     int top_k = 6,
     int n_experts = 128,
-    int down_offset_padding = 0)
+    int down_offset_padding = 0,
+    size_t down_w_offset = 0,
+    size_t down_s_offset = 0)
 {
     int r = blockIdx.x * blockDim.y + threadIdx.y;
     int row0 = r * 2;
@@ -2416,8 +2422,8 @@ __global__ void moe_nemotron_binned_down_scaled_residual_batch_kernel(
     size_t down_w_bytes = (size_t)N * (K / 2);
 
     const uint8_t* exp_ptr = (const uint8_t*)expert_ptrs[eid];
-    const uint8_t* down_w = exp_ptr + up_w_bytes + up_s_bytes + down_offset_padding;
-    const uint8_t* down_s = down_w + down_w_bytes;
+    const uint8_t* down_w = (down_w_offset > 0) ? (exp_ptr + down_w_offset) : (exp_ptr + up_w_bytes + up_s_bytes + down_offset_padding);
+    const uint8_t* down_s = (down_s_offset > 0) ? (exp_ptr + down_s_offset) : (down_w + down_w_bytes);
     float scale_2 = expert_scales ? expert_scales[eid * 2 + 1] : 1.0f;
 
     int lane = threadIdx.x; // 0..31
@@ -2556,19 +2562,20 @@ void moe_nemotron_up_relu2_batch_cuda(
     int M, int N, int K,
     cudaStream_t stream,
     int top_k,
-    int n_experts)
+    int n_experts,
+    size_t up_s_offset)
 {
     if (M > 1 && expert_offsets != nullptr) {
         dim3 threads(32, 4);
         dim3 blocks((N + 3) / 4, n_experts);
         moe_nemotron_binned_up_relu2_batch_kernel<<<blocks, threads, 0, stream>>>(
             gate_out, hidden_in, expert_offsets, expert_token_indices, expert_token_slots,
-            expert_ptrs, expert_scales, M, N, K, top_k, n_experts);
+            expert_ptrs, expert_scales, M, N, K, top_k, n_experts, up_s_offset);
     } else {
         dim3 threads(32, 4);
         dim3 blocks((N + 3) / 4, top_k, M);
         moe_nemotron_up_relu2_batch_kernel<<<blocks, threads, 0, stream>>>(
-            gate_out, hidden_in, topk_ids, expert_ptrs, expert_scales, M, N, K, top_k, n_experts);
+            gate_out, hidden_in, topk_ids, expert_ptrs, expert_scales, M, N, K, top_k, n_experts, up_s_offset);
     }
 }
 
@@ -2586,19 +2593,21 @@ void moe_nemotron_down_scaled_residual_batch_cuda(
     cudaStream_t stream,
     int top_k,
     int n_experts,
-    int down_offset_padding)
+    int down_offset_padding,
+    size_t down_w_offset,
+    size_t down_s_offset)
 {
     if (M > 1 && expert_offsets != nullptr) {
         dim3 threads(32, 4);
         dim3 blocks(((N / 2) + 3) / 4, n_experts);
         moe_nemotron_binned_down_scaled_residual_batch_kernel<<<blocks, threads, 0, stream>>>(
             hidden_out, gate_in, topk_weights, expert_offsets, expert_token_indices, expert_token_slots,
-            expert_ptrs, expert_scales, M, N, K, top_k, n_experts, down_offset_padding);
+            expert_ptrs, expert_scales, M, N, K, top_k, n_experts, down_offset_padding, down_w_offset, down_s_offset);
     } else {
         dim3 threads(32, 4);
         dim3 blocks((N + 3) / 4, M);
         moe_nemotron_down_scaled_residual_batch_kernel<<<blocks, threads, 0, stream>>>(
-            hidden_out, gate_in, topk_ids, topk_weights, expert_ptrs, expert_scales, M, N, K, top_k, n_experts, down_offset_padding);
+            hidden_out, gate_in, topk_ids, topk_weights, expert_ptrs, expert_scales, M, N, K, top_k, n_experts, down_offset_padding, down_w_offset, down_s_offset);
     }
 }
 
@@ -2749,6 +2758,16 @@ __global__ void moe_iq2_xxs_binned_up_relu2_batch_kernel(
     int top_k,
     int n_experts)
 {
+    int eid = blockIdx.y;
+    if (eid >= n_experts) return;
+
+    int start_idx = expert_offsets[eid];
+    int end_idx = expert_offsets[eid + 1];
+    int num_toks = end_idx - start_idx;
+
+    if (num_toks <= 0) return;
+    if (!expert_ptrs || !expert_ptrs[eid]) return;
+
     __shared__ uint64_t s_grid[256];
     __shared__ uint8_t s_signs[128];
 
@@ -2763,16 +2782,7 @@ __global__ void moe_iq2_xxs_binned_up_relu2_batch_kernel(
     __syncthreads();
 
     int row = blockIdx.x * blockDim.y + threadIdx.y;
-    int eid = blockIdx.y;
-
-    if (row >= N || eid >= n_experts) return;
-
-    int start_idx = expert_offsets[eid];
-    int end_idx = expert_offsets[eid + 1];
-    int num_toks = end_idx - start_idx;
-
-    if (num_toks <= 0) return;
-    if (!expert_ptrs || !expert_ptrs[eid]) return;
+    if (row >= N) return;
 
     const block_iq2_xxs* up_w = (const block_iq2_xxs*)expert_ptrs[eid];
     float scale_2 = expert_scales ? expert_scales[eid * 2 + 0] : 1.0f;
@@ -2894,6 +2904,16 @@ __global__ void moe_iq2_xxs_binned_down_scaled_residual_batch_kernel(
     int n_experts,
     size_t down_offset_bytes)
 {
+    int eid = blockIdx.y;
+    if (eid >= n_experts) return;
+
+    int start_idx = expert_offsets[eid];
+    int end_idx = expert_offsets[eid + 1];
+    int num_toks = end_idx - start_idx;
+
+    if (num_toks <= 0) return;
+    if (!expert_ptrs || !expert_ptrs[eid]) return;
+
     __shared__ uint64_t s_grid[256];
     __shared__ uint8_t s_signs[128];
 
@@ -2910,16 +2930,8 @@ __global__ void moe_iq2_xxs_binned_down_scaled_residual_batch_kernel(
     int r = blockIdx.x * blockDim.y + threadIdx.y;
     int row0 = r * 2;
     int row1 = row0 + 1;
-    int eid = blockIdx.y;
 
-    if (row0 >= N || eid >= n_experts) return;
-
-    int start_idx = expert_offsets[eid];
-    int end_idx = expert_offsets[eid + 1];
-    int num_toks = end_idx - start_idx;
-
-    if (num_toks <= 0) return;
-    if (!expert_ptrs || !expert_ptrs[eid]) return;
+    if (row0 >= N) return;
 
     const block_iq2_xxs* down_w = (const block_iq2_xxs*)((const uint8_t*)expert_ptrs[eid] + down_offset_bytes);
     float scale_2 = expert_scales ? expert_scales[eid * 2 + 1] : 1.0f;
@@ -3068,6 +3080,314 @@ void moe_iq2_xxs_binned_down_scaled_residual_batch_cuda(
     moe_iq2_xxs_binned_down_scaled_residual_batch_kernel<<<blocks, threads, 0, stream>>>(
         hidden_out, gate_in, topk_weights, expert_offsets, expert_token_indices, expert_token_slots,
         expert_ptrs, expert_scales, M, N, K, top_k, n_experts, down_offset_bytes);
+}
+
+__global__ void nvfp4_dequant_kernel(
+    __nv_bfloat16* __restrict__ out,
+    const uint8_t* __restrict__ weight,
+    const uint8_t* __restrict__ scale_fp8,
+    float scale_2,
+    int N, int K)
+{
+    int row = blockIdx.y * blockDim.y + threadIdx.y;
+    int g = blockIdx.x * 32 + threadIdx.x;
+    int num_groups = K / 16;
+    if (row >= N || g >= num_groups) return;
+
+    float s_val = fp8_e4m3_to_float_v2(scale_fp8[(size_t)row * num_groups + g]) * scale_2;
+    uint64_t w_packed = *(const uint64_t*)(weight + (size_t)row * (K / 2) + g * 8);
+    __nv_bfloat16* out_ptr = out + (size_t)row * K + g * 16;
+
+    #pragma unroll
+    for (int b = 0; b < 8; b++) {
+        uint8_t byte_val = (uint8_t)(w_packed >> (b * 8));
+        float2 w2 = fp4_e2m1_to_float2(byte_val);
+        out_ptr[b * 2 + 0] = __float2bfloat16(w2.x * s_val);
+        out_ptr[b * 2 + 1] = __float2bfloat16(w2.y * s_val);
+    }
+}
+
+void nvfp4_dequant_cuda(
+    __nv_bfloat16* out,
+    const uint8_t* weight,
+    const uint8_t* scale_fp8,
+    float scale_2,
+    int rows, int cols,
+    cudaStream_t stream)
+{
+    int num_groups = cols / 16;
+    dim3 threads(32, 4);
+    dim3 blocks((num_groups + 31) / 32, (rows + 3) / 4);
+    nvfp4_dequant_kernel<<<blocks, threads, 0, stream>>>(out, weight, scale_fp8, scale_2, rows, cols);
+}
+
+__launch_bounds__(128)
+__global__ void moe_iq2_xxs_up_relu2_m1_kernel(
+    __nv_bfloat16* __restrict__ gate_out,
+    const __nv_bfloat16* __restrict__ hidden_in,
+    const int32_t* __restrict__ topk_ids,
+    const void* const* __restrict__ expert_ptrs,
+    const float* __restrict__ expert_scales,
+    int N, int K,
+    int top_k,
+    int n_experts,
+    int M)
+{
+    int k = blockIdx.y;
+    int m = blockIdx.z;
+    if (k >= top_k || m >= M) return;
+
+    int row = blockIdx.x * blockDim.y + threadIdx.y;
+    int eid = topk_ids[m * top_k + k];
+    size_t out_idx = ((size_t)m * top_k + k) * N + row;
+
+    if (eid < 0 || eid >= n_experts || !expert_ptrs || !expert_ptrs[eid]) {
+        if (row < N && threadIdx.x == 0) {
+            gate_out[out_idx] = __float2bfloat16(0.0f);
+        }
+        return;
+    }
+
+    __shared__ uint64_t s_grid[256];
+    __shared__ uint8_t s_signs[128];
+
+    int tid = threadIdx.y * 32 + threadIdx.x;
+    if (tid < 128) {
+        s_signs[tid] = c_ksigns_iq2xs[tid];
+    }
+    s_grid[tid] = c_iq2xxs_grid[tid];
+    if (blockDim.y * 32 < 256) {
+        s_grid[tid + 128] = c_iq2xxs_grid[tid + 128];
+    }
+    __syncthreads();
+
+    if (row >= N) return;
+
+    const block_iq2_xxs* up_w = (const block_iq2_xxs*)expert_ptrs[eid];
+    float scale_2 = expert_scales ? expert_scales[eid * 2 + 0] : 1.0f;
+    const __nv_bfloat16* vec = hidden_in + (size_t)m * K;
+
+    int lane = threadIdx.x;
+    int n_blocks = K / 256;
+    const block_iq2_xxs* row_w = up_w + (size_t)row * n_blocks;
+
+    int l = lane / 8;
+    int j = lane % 8;
+    uint8_t kmask = 1 << j;
+
+    float acc = 0.0f;
+
+    for (int b = 0; b < n_blocks; b++) {
+        const block_iq2_xxs* blk = &row_w[b];
+        float d = __half2float(blk->d);
+        const uint16_t* qs = blk->qs;
+
+        #pragma unroll 4
+        for (int ib32 = 0; ib32 < 8; ib32++) {
+            uint32_t q0 = qs[ib32 * 4 + 0];
+            uint32_t q1 = qs[ib32 * 4 + 1];
+            uint32_t q2 = qs[ib32 * 4 + 2];
+            uint32_t q3 = qs[ib32 * 4 + 3];
+
+            uint32_t aux0 = q0 | (q1 << 16);
+            uint32_t aux1 = q2 | (q3 << 16);
+            float db = d * (0.5f + (aux1 >> 28)) * 0.25f;
+
+            uint8_t grid_idx = (aux0 >> (8 * l)) & 0xFF;
+            uint8_t sign_idx = (aux1 >> (7 * l)) & 0x7F;
+
+            uint64_t grid_val = s_grid[grid_idx];
+            uint8_t sign_val = s_signs[sign_idx];
+
+            uint8_t byte_val = (grid_val >> (8 * j)) & 0xFF;
+            float sign_mult = (sign_val & kmask) ? -1.0f : 1.0f;
+            float w = db * (float)byte_val * sign_mult;
+
+            int col_idx = (b << 8) + (ib32 << 5) + lane;
+            float a = __bfloat162float(vec[col_idx]);
+            acc = __fmaf_rn(w, a, acc);
+        }
+    }
+
+    #pragma unroll
+    for (int offset = 16; offset > 0; offset /= 2) {
+        acc += __shfl_down_sync(0xFFFFFFFF, acc, offset);
+    }
+
+    if (lane == 0) {
+        float r = acc * scale_2;
+        float r2 = (r > 0.0f) ? (r * r) : 0.0f;
+        gate_out[out_idx] = __float2bfloat16(r2);
+    }
+}
+
+void moe_iq2_xxs_up_relu2_m1_cuda(
+    __nv_bfloat16* gate_out,
+    const __nv_bfloat16* hidden_in,
+    const int32_t* topk_ids,
+    const void* const* expert_ptrs,
+    const float* expert_scales,
+    int N, int K,
+    cudaStream_t stream,
+    int top_k,
+    int n_experts,
+    int M)
+{
+    dim3 threads(32, 4);
+    dim3 blocks((N + 3) / 4, top_k, M);
+    moe_iq2_xxs_up_relu2_m1_kernel<<<blocks, threads, 0, stream>>>(
+        gate_out, hidden_in, topk_ids, expert_ptrs, expert_scales, N, K, top_k, n_experts, M);
+}
+
+__launch_bounds__(128)
+__global__ void moe_iq2_xxs_down_scaled_residual_m1_kernel(
+    __nv_bfloat16* __restrict__ hidden_out,
+    const __nv_bfloat16* __restrict__ gate_in,
+    const int32_t* __restrict__ topk_ids,
+    const float* __restrict__ topk_weights,
+    const void* const* __restrict__ expert_ptrs,
+    const float* __restrict__ expert_scales,
+    int N, int K,
+    int top_k,
+    int n_experts,
+    size_t down_offset_bytes,
+    int M)
+{
+    int k = blockIdx.y;
+    int m = blockIdx.z;
+    if (k >= top_k || m >= M) return;
+
+    int eid = topk_ids[m * top_k + k];
+    float weight = topk_weights ? topk_weights[m * top_k + k] : 1.0f;
+    if (eid < 0 || eid >= n_experts || weight == 0.0f || !expert_ptrs || !expert_ptrs[eid]) return;
+
+    __shared__ uint64_t s_grid[256];
+    __shared__ uint8_t s_signs[128];
+
+    int tid = threadIdx.y * 32 + threadIdx.x;
+    if (tid < 128) {
+        s_signs[tid] = c_ksigns_iq2xs[tid];
+    }
+    s_grid[tid] = c_iq2xxs_grid[tid];
+    if (blockDim.y * 32 < 256) {
+        s_grid[tid + 128] = c_iq2xxs_grid[tid + 128];
+    }
+    __syncthreads();
+
+    int r = blockIdx.x * blockDim.y + threadIdx.y;
+    int row0 = r * 2;
+    int row1 = row0 + 1;
+    if (row0 >= N) return;
+
+    const block_iq2_xxs* down_w = (const block_iq2_xxs*)((const uint8_t*)expert_ptrs[eid] + down_offset_bytes);
+    float scale_2 = expert_scales ? expert_scales[eid * 2 + 1] : 1.0f;
+    float sw = weight * scale_2;
+    const __nv_bfloat16* vec = gate_in + ((size_t)m * top_k + k) * K;
+
+    int lane = threadIdx.x;
+    int n_blocks = K / 256;
+    const block_iq2_xxs* row0_w = down_w + (size_t)row0 * n_blocks;
+    const block_iq2_xxs* row1_w = down_w + (size_t)row1 * n_blocks;
+
+    int l = lane / 8;
+    int j = lane % 8;
+    uint8_t kmask = 1 << j;
+
+    float acc0 = 0.0f;
+    float acc1 = 0.0f;
+
+    for (int b = 0; b < n_blocks; b++) {
+        const block_iq2_xxs* blk0 = &row0_w[b];
+        float d0 = __half2float(blk0->d);
+        const uint16_t* qs0 = blk0->qs;
+
+        const block_iq2_xxs* blk1 = &row1_w[b];
+        float d1 = __half2float(blk1->d);
+        const uint16_t* qs1 = blk1->qs;
+
+        #pragma unroll 4
+        for (int ib32 = 0; ib32 < 8; ib32++) {
+            uint32_t q0_0 = qs0[ib32 * 4 + 0];
+            uint32_t q1_0 = qs0[ib32 * 4 + 1];
+            uint32_t q2_0 = qs0[ib32 * 4 + 2];
+            uint32_t q3_0 = qs0[ib32 * 4 + 3];
+
+            uint32_t aux0_0 = q0_0 | (q1_0 << 16);
+            uint32_t aux1_0 = q2_0 | (q3_0 << 16);
+            float db0 = d0 * (0.5f + (aux1_0 >> 28)) * 0.25f;
+
+            uint8_t grid_idx0 = (aux0_0 >> (8 * l)) & 0xFF;
+            uint8_t sign_idx0 = (aux1_0 >> (7 * l)) & 0x7F;
+
+            uint64_t grid_val0 = s_grid[grid_idx0];
+            uint8_t sign_val0 = s_signs[sign_idx0];
+
+            uint8_t byte_val0 = (grid_val0 >> (8 * j)) & 0xFF;
+            float sign_mult0 = (sign_val0 & kmask) ? -1.0f : 1.0f;
+            float w0 = db0 * (float)byte_val0 * sign_mult0;
+
+            uint32_t q0_1 = qs1[ib32 * 4 + 0];
+            uint32_t q1_1 = qs1[ib32 * 4 + 1];
+            uint32_t q2_1 = qs1[ib32 * 4 + 2];
+            uint32_t q3_1 = qs1[ib32 * 4 + 3];
+
+            uint32_t aux0_1 = q0_1 | (q1_1 << 16);
+            uint32_t aux1_1 = q2_1 | (q3_1 << 16);
+            float db1 = d1 * (0.5f + (aux1_1 >> 28)) * 0.25f;
+
+            uint8_t grid_idx1 = (aux0_1 >> (8 * l)) & 0xFF;
+            uint8_t sign_idx1 = (aux1_1 >> (7 * l)) & 0x7F;
+
+            uint64_t grid_val1 = s_grid[grid_idx1];
+            uint8_t sign_val1 = s_signs[sign_idx1];
+
+            uint8_t byte_val1 = (grid_val1 >> (8 * j)) & 0xFF;
+            float sign_mult1 = (sign_val1 & kmask) ? -1.0f : 1.0f;
+            float w1 = db1 * (float)byte_val1 * sign_mult1;
+
+            int col_idx = (b << 8) + (ib32 << 5) + lane;
+            float a = __bfloat162float(vec[col_idx]);
+            acc0 = __fmaf_rn(w0, a, acc0);
+            acc1 = __fmaf_rn(w1, a, acc1);
+        }
+    }
+
+    #pragma unroll
+    for (int offset = 16; offset > 0; offset /= 2) {
+        acc0 += __shfl_down_sync(0xFFFFFFFF, acc0, offset);
+        acc1 += __shfl_down_sync(0xFFFFFFFF, acc1, offset);
+    }
+
+    if (lane == 0 && sw != 0.0f) {
+        float val0 = acc0 * sw;
+        float val1 = acc1 * sw;
+        if (row1 < N) {
+            __nv_bfloat162 v2 = __floats2bfloat162_rn(val0, val1);
+            atomicAdd((__nv_bfloat162*)&hidden_out[(size_t)m * N + row0], v2);
+        } else {
+            atomicAdd((__nv_bfloat16*)&hidden_out[(size_t)m * N + row0], __float2bfloat16(val0));
+        }
+    }
+}
+
+void moe_iq2_xxs_down_scaled_residual_m1_cuda(
+    __nv_bfloat16* hidden_out,
+    const __nv_bfloat16* gate_in,
+    const int32_t* topk_ids,
+    const float* topk_weights,
+    const void* const* expert_ptrs,
+    const float* expert_scales,
+    int N, int K,
+    cudaStream_t stream,
+    int top_k,
+    int n_experts,
+    size_t down_offset_bytes,
+    int M)
+{
+    dim3 threads(32, 4);
+    dim3 blocks(((N / 2) + 3) / 4, top_k, M);
+    moe_iq2_xxs_down_scaled_residual_m1_kernel<<<blocks, threads, 0, stream>>>(
+        hidden_out, gate_in, topk_ids, topk_weights, expert_ptrs, expert_scales, N, K, top_k, n_experts, down_offset_bytes, M);
 }
 
 

@@ -1,0 +1,41 @@
+{
+  "folder_id": "benchmarks_RTXPRO6000_96GB_9950X3D_64GB_DDR5_6000",
+  "gpu": {
+    "name": "NVIDIA RTX PRO 6000 Blackwell Max-Q Workstation Edition",
+    "architecture": "Blackwell (Compute Capability 12.0 / sm_120a)",
+    "vram_total_mb": 97887,
+    "vram_total_gb": 95.59,
+    "memory_type": "GDDR7 (512-bit ECC, ~1,800 GB/s)",
+    "driver_version": "591.86",
+    "cuda_version": "13.0"
+  },
+  "cpu": {
+    "name": "AMD Ryzen 9 9950X3D 16-Core Processor",
+    "cores": 16,
+    "threads": 32,
+    "architecture": "Zen 5 with 2nd-Gen AMD 3D V-Cache"
+  },
+  "motherboard": {
+    "manufacturer": "ASUSTeK COMPUTER INC.",
+    "product": "ProArt X870E-CREATOR WIFI",
+    "pcie": "PCIe 5.0 x16"
+  },
+  "ram": {
+    "total_gb": 64.0,
+    "configuration": "2x 32 GB DDR5 Dual-Channel",
+    "manufacturer": "Micron",
+    "part_number": "CP32G64C40U5B.M8B5",
+    "jedec_speed_mts": 5600,
+    "configured_speed_mts": 6000,
+    "pinned_l2_budget_gb": 42.0
+  },
+  "storage": {
+    "primary_model_drive": "F:\\ (Fanxiang S910MAX 4TB PCIe NVMe SSD)",
+    "other_drives": [
+      "WDC WDS100T2B0A-00SM50 (1TB)",
+      "Samsung SSD 860 EVO (1TB)",
+      "Samsung SSD 850 EVO (500GB)"
+    ]
+  },
+  "os": "Microsoft Windows 11 Pro 64-bit (WDDM 3.2)"
+}

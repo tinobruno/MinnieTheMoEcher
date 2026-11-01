@@ -1,0 +1,507 @@
+[2026-11-01 16:13:47] [INFO] === moecher starting ===
+[2026-11-01 16:13:47] [INFO] === v2.09 ===
+[2026-11-01 16:13:47] [INFO] Default thinking token budget: 4096
+[2026-11-01 16:13:47] [INFO] Operational mode: Chat (Dynamic intent gating: enabled)
+[2026-11-01 16:13:47] [INFO] Tool calling support: disabled
+[2026-11-01 16:13:47] [INFO] Max tool execution rounds: 10
+[2026-11-01 16:13:47] [INFO] Server-side tool execution: disabled (headless-browsing: disabled)
+[2026-11-01 16:13:47] [INFO] Workspace sandbox root: ./workspace (Write Allowed: NO)
+[2026-11-01 16:13:47] [INFO] Security: Host OS execution is DISABLED (Safe Mode). Pure inference active.
+[2026-11-01 16:13:47] [INFO] Speculative decoding: enabled (PLD: enabled, MTP: enabled, Tree MTP: disabled, tree_nodes=2, mtp_k=4)
+[2026-11-01 16:13:47] [INFO] Loading manifest: F:\Moecher\models\qwen3_8_27b_vision_13g\moecher_manifest.json
+[2026-11-01 16:13:47] [INFO] Model: 64 layers, 0 experts, 0 active, hidden=5120, dtype=none, max_seq_len=32768, sliding_window=128
+[2026-11-01 16:13:47] [INFO] BPETokenizer: Loading from F:\Moecher\models\qwen3_8_27b_vision_13g\tokenizer.json
+[2026-11-01 16:13:47] [INFO] Tokenizer loaded: 248077 vocab, 247587 merges, 33 special tokens
+[2026-11-01 16:13:47] [INFO] Hardware: NVIDIA RTX PRO 6000 Blackwell Max-Q Workstation Edition (Compute 12.0, 95.6 GB VRAM)
+[2026-11-01 16:13:47] [INFO] Hardware Capabilities: Ampere=0, Ada+=1, Blackwell+=1, FP8_TC=1, FP4=1, VRAM-Constrained=0
+[2026-11-01 16:13:47] [INFO] Blackwell Tensor Core Acceleration: DISABLED (SIMT Fallback / Non-FP4 Model)
+[2026-11-01 16:13:47] [INFO] Blackwell sm_120a Native FP8 Tensor Cores: ENABLED (cuBLASLt FP8_E4M3 Tensor Core Pipeline)
+[2026-11-01 16:13:47] [INFO] Persistent L2 Cache configured: 60.0 MB / 80.0 MB
+[2026-11-01 16:13:47] [INFO] VRAM: 93.7 GB free / 95.6 GB total
+[2026-11-01 16:13:47] [INFO] Loading dense tensors from F:\Moecher\models\qwen3_8_27b_vision_13g\attention_dense_layers.bin
+[2026-11-01 16:13:48] [INFO]   Loaded Qwen layer 10/64 (Linear Attention DeltaNet [INT3])
+[2026-11-01 16:13:48] [INFO]   Loaded Qwen layer 20/64 (Full GQA Attention [INT3])
+[2026-11-01 16:13:49] [INFO]   Loaded Qwen layer 30/64 (Linear Attention DeltaNet [INT3])
+[2026-11-01 16:13:49] [INFO]   Loaded Qwen layer 40/64 (Full GQA Attention [INT3])
+[2026-11-01 16:13:50] [INFO]   Loaded Qwen layer 50/64 (Linear Attention DeltaNet [INT3])
+[2026-11-01 16:13:50] [INFO]   Loaded Qwen layer 60/64 (Full GQA Attention [INT3])
+[2026-11-01 16:13:51] [INFO]   Loaded Qwen layer 64/64 (Full GQA Attention [INT3])
+[2026-11-01 16:13:51] [INFO] MTP: Loaded draft vocabulary (40000 tokens) and draft lm_head (390.6 MB BF16, 6.2x faster drafting!)
+[2026-11-01 16:13:51] [INFO] MTP Self-Drafter loaded: 1 transformer layer + full 248k vocab (shared lm_head) = 333.6 MB own VRAM
+[2026-11-01 16:13:52] [INFO] Dense tensors loaded
+[2026-11-01 16:13:52] [INFO] RoPE: non-compressed base=10000000 (no YaRN), compressed base=160000 (YaRN factor=16, max_seq=65536)
+[2026-11-01 16:13:52] [INFO] [Memory] Auto-allocated maximum available DRAM L2 cache: 0.0 GB (out of 49.8 GB free RAM, reserving 4.0 GB for OS/driver)
+[2026-11-01 16:13:52] [INFO] Expert L1 (VRAM) cache budget: 0.0 GB
+[2026-11-01 16:13:52] [INFO] Expert L2 (DRAM) cache budget: 0.0 GB
+[2026-11-01 16:13:52] [INFO] Dense architecture active (0 routed experts). Bypassing expert cache.
+[2026-11-01 16:13:52] [INFO] No compress_ratios found, using full window for all layers
+[2026-11-01 16:13:53] [INFO] Qwen 3.8 2B Neural Speculative Draft Model loaded successfully (24 layers, 1.7GB VRAM)!
+[2026-11-01 16:13:53] [INFO] [Vision] Vision configuration detected in manifest. Enabled on-demand Vision Tower (zero VRAM at startup; loads ~990 MB only when an image is processed).
+[2026-11-01 16:13:53] [INFO] Persistent L2 Cache: Pinned 9.26 MB / 60.00 MB budget (zero thrashing, 100% utilization)
+[2026-11-01 16:13:53] [INFO] Warming up and capturing CUDA Graph for decode acceleration...
+[2026-11-01 16:13:53] [INFO] CUDA Graph instantiated successfully! Decode speed accelerated.
+[2026-11-01 16:13:53] [INFO] Warming up and capturing Batched Target CUDA Graph (M=2)...
+[2026-11-01 16:13:53] [INFO] Batched Target CUDA Graph (M=2) instantiated successfully!
+[2026-11-01 16:13:53] [INFO] Warming up and capturing Batched Target CUDA Graph (M=3)...
+[2026-11-01 16:13:53] [INFO] Batched Target CUDA Graph (M=3) instantiated successfully!
+[2026-11-01 16:13:53] [INFO] Warming up and capturing Batched Target CUDA Graph (M=4)...
+[2026-11-01 16:13:53] [INFO] Batched Target CUDA Graph (M=4) instantiated successfully!
+[2026-11-01 16:13:53] [INFO] Warming up and capturing Batched Target CUDA Graph (M=5)...
+[2026-11-01 16:13:53] [INFO] Batched Target CUDA Graph (M=5) instantiated successfully!
+[2026-11-01 16:13:53] [INFO] Qwen 3.8 2B Single-Step Draft CUDA Graph instantiated successfully!
+[2026-11-01 16:13:53] [INFO] Qwen 3.8 2B Multi-Step Draft CUDA Graph (K=1) instantiated successfully!
+[2026-11-01 16:13:53] [INFO] Qwen 3.8 2B Multi-Step Draft CUDA Graph (K=2) instantiated successfully!
+[2026-11-01 16:13:54] [INFO] Qwen 3.8 2B Multi-Step Draft CUDA Graph (K=3) instantiated successfully!
+[2026-11-01 16:13:54] [INFO] Qwen 3.8 2B Multi-Step Draft CUDA Graph (K=4) instantiated successfully!
+[2026-11-01 16:13:54] [INFO] Qwen 3.8 2B Multi-Step Draft CUDA Graph (K=5) instantiated successfully!
+[2026-11-01 16:13:54] [INFO] Qwen 3.8 2B Multi-Step Draft CUDA Graph (K=6) instantiated successfully!
+[2026-11-01 16:13:54] [INFO] Qwen 3.8 2B Multi-Step Draft CUDA Graph (K=7) instantiated successfully!
+[2026-11-01 16:13:54] [INFO] Model loaded successfully
+[2026-11-01 16:13:54] [INFO] Rebuilding System KV Cache snapshot (27 tokens, 0 active tools)...
+[2026-11-01 16:13:54] [INFO] Prefill prefix progress: 0 / 27 tokens (chunk_m=27)...
+[2026-11-01 16:13:54] [INFO] [LAYER PROF L0 DeltaNet M=27] total: 60.35 ms | norm: 0.05 | attn_in: 55.21 | attn_core: 0.17 | attn_out: 1.74 | mlp_in: 2.24 | swiglu: 0.04 | mlp_down: 0.91
+[2026-11-01 16:13:54] [INFO] [LAYER PROF L3 GQA M=27] total: 2.23 ms | norm: 0.01 | attn_in: 1.14 | attn_core: 0.06 | attn_out: 0.08 | mlp_in: 0.66 | swiglu: 0.01 | mlp_down: 0.26
+[2026-11-01 16:13:54] [INFO] [PREFILL STATS] 27 prefix tokens pre-warmed in 0.196s -> 137.63 tok/s
+[2026-11-01 16:13:54] [INFO] Pinned System KV Cache snapshot created (27 tokens across 64 layers).
+[2026-11-01 16:13:54] [INFO] System KV Cache snapshot pinned successfully (27 tokens).
+[2026-11-01 16:13:54] [INFO] [Config] Loaded persistent server configuration from server_config.json (zdb_enabled=false, mode=chat, temp=0.70, rep_pen=1.05)
+[2026-11-01 16:13:54] [INFO] [Config] Reset server parameters on startup to model defaults: temp=0.70, rep_penalty=1.05, anti_loop=disabled
+[2026-11-01 16:13:54] [INFO] [Proxy] Forward Proxy (HTTP/HTTPS CONNECT) listening on 0.0.0.0:8002
+[2026-11-01 16:13:54] [INFO] Binding to 0.0.0.0:8001...
+[2026-11-01 16:13:54] [INFO] Server listening on port 8001
+[2026-11-01 16:13:54] [INFO] version 2.09
+[2026-11-01 16:13:54] [INFO] REQUEST: {"model": "qwen3_8_27b_vision_13g", "messages": [{"role": "user", "content": "Say Ready."}], "max_tokens": 8, "temperature": 0.0, "repetition_penalty": 1.0, "stream": true, "enable_thinking": false, "thinking": {"type": "disabled", "budget_tokens": 0}, "max_thinking_tokens": 0, "reasoning_effort": "none", "bypass_prefix_cache": true}
+[2026-11-01 16:13:54] [INFO] Reasoning effort: none, Thinking: disabled, Thinking budget: 0, Tools: 0, Anti-Loop: disabled, Stop-Words: 0, Server-Exec: disabled (client_tool_exec: false, headless: false), Max-Tool-Rounds: 10, Timeout: 60000ms, Bypass-Cache: true
+[2026-11-01 16:13:54] [INFO] RESPONSE (0ms)
+[2026-11-01 16:13:54] [INFO] STREAM PROMPT [round 1] (len=26, continuation=false, visual=none)
+[2026-11-01 16:13:54] [INFO] [KV CACHE] Bypass prefix cache requested: forcing cold full prefill of 26 tokens
+[2026-11-01 16:13:54] [INFO] [PREFILL PROFILE M=25] Total 64 layers: 117.17 ms (213.4 tok/s) | DeltaNet (48 layers): avg 1.85 ms (sum 88.8 ms) | GQA (16 layers): avg 1.77 ms (sum 28.4 ms)
+[2026-11-01 16:13:54] [INFO] [PREFILL STATS] 26 tokens evaluated in 0.134s -> 194.39 tok/s (prefix cached: 0 / 26, 0.0%)
+[2026-11-01 16:13:54] [WARN] Think tokens: start=248068 end=248069, EOS=248046 eos2=248046 user=128803 asst=128804, think_budget=0
+Ready[2026-11-01 16:13:54] [INFO] VERIFY TIMING: cycle=0 M=2 took 21.02ms (graph=1)
+[2026-11-01 16:13:54] [INFO] MTP DEBUG: cycle=0 k=0 pred=13 draft=248046 MISS
+.[2026-11-01 16:13:54] [INFO] VERIFY TIMING: cycle=1 M=2 took 19.66ms (graph=1)
+[2026-11-01 16:13:54] [INFO] MTP DEBUG: cycle=1 k=0 pred=248046 draft=248046 MATCH
+[2026-11-01 16:13:54] [WARN] Stop token hit: token=248046 (cfg_eos=248046, eos2=248046, im_end=248046) at step 2 (content: 2/8, think: 0/0)
+[2026-11-01 16:13:54] [INFO] [GENERATION STATS] 2 tokens in 0.043s -> 46.13 tok/s (Content: 2, Thinking: 0)
+[2026-11-01 16:13:54] [INFO] [SPECULATIVE STATS] 2 cycles | 2 drafted | 0 accepted (0.0% acceptance rate) | draft: 1.7ms total (0.86ms/c) | verify: 40.7ms total (20.34ms/c)
+[2026-11-01 16:13:54] [INFO] REQUEST: {"model": "qwen3_8_27b_vision_13g", "messages": [{"role": "user", "content": "Explain the difference between a mutex and a semaphore in two concise sentences."}], "max_tokens": 120, "temperature": 0.0, "repetition_penalty": 1.0, "stream": true, "enable_thinking": false, "thinking": {"type": "disabled", "budget_tokens": 0}, "max_thinking_tokens": 0, "reasoning_effort": "none", "bypass_prefix_cache": true}
+[2026-11-01 16:13:54] [INFO] Reasoning effort: none, Thinking: disabled, Thinking budget: 0, Tools: 0, Anti-Loop: disabled, Stop-Words: 0, Server-Exec: disabled (client_tool_exec: false, headless: false), Max-Tool-Rounds: 10, Timeout: 60000ms, Bypass-Cache: true
+[2026-11-01 16:13:54] [INFO] RESPONSE (0ms)
+[2026-11-01 16:13:54] [INFO] STREAM PROMPT [round 1] (len=38, continuation=false, visual=none)
+[2026-11-01 16:13:54] [INFO] [KV CACHE] Bypass prefix cache requested: forcing cold full prefill of 38 tokens
+[2026-11-01 16:13:54] [INFO] [PREFILL STATS] 38 tokens evaluated in 0.117s -> 324.37 tok/s (prefix cached: 0 / 38, 0.0%)
+[2026-11-01 16:13:54] [WARN] Think tokens: start=248068 end=248069, EOS=248046 eos2=248046 user=128803 asst=128804, think_budget=0
+
+A[2026-11-01 16:13:54] [INFO] VERIFY TIMING: cycle=0 M=2 took 20.40ms (graph=1)
+[2026-11-01 16:13:54] [INFO] MTP DEBUG: cycle=0 k=0 pred=29851 draft=29851 MATCH
+ mutex is[2026-11-01 16:13:54] [INFO] VERIFY TIMING: cycle=1 M=3 took 24.15ms (graph=1)
+[2026-11-01 16:13:54] [INFO] MTP DEBUG: cycle=1 k=0 pred=264 draft=264 MATCH
+ a[2026-11-01 16:13:54] [INFO] MTP DEBUG: cycle=1 k=1 pred=7620 draft=25896 MISS
+ binary[2026-11-01 16:13:54] [INFO] VERIFY TIMING: cycle=2 M=5 took 42.92ms (graph=1)
+[2026-11-01 16:13:54] [INFO] MTP DEBUG: cycle=2 k=0 pred=5128 draft=5128 MATCH
+ lock[2026-11-01 16:13:54] [INFO] MTP DEBUG: cycle=2 k=1 pred=421 draft=403 MISS
+ that[2026-11-01 16:13:55] [INFO] VERIFY TIMING: cycle=3 M=5 took 43.10ms (graph=1)
+[2026-11-01 16:13:55] [INFO] MTP DEBUG: cycle=3 k=0 pred=24546 draft=33972 MISS
+ ensures[2026-11-01 16:13:55] [INFO] VERIFY TIMING: cycle=4 M=2 took 20.58ms (graph=1)
+[2026-11-01 16:13:55] [INFO] MTP DEBUG: cycle=4 k=0 pred=1132 draft=1132 MATCH
+ only one thread can access a resource at a time, typically used to protect shared data. A semaphore is a counter-based mechanism that allows a specific number of threads to access a resource simultaneously, making it useful for managing access to pools of resources.[2026-11-01 16:13:55] [WARN] Stop token hit: token=248046 (cfg_eos=248046, eos2=248046, im_end=248046) at step 29 (content: 57/120, think: 0/0)
+[2026-11-01 16:13:55] [INFO] [GENERATION STATS] 57 tokens in 0.966s -> 58.99 tok/s (Content: 57, Thinking: 0)
+[2026-11-01 16:13:55] [INFO] [SPECULATIVE STATS] 29 cycles | 88 drafted | 28 accepted (31.8% acceptance rate) | draft: 70.5ms total (2.43ms/c) | verify: 890.4ms total (30.70ms/c)
+[2026-11-01 16:13:56] [INFO] REQUEST: {"model": "qwen3_8_27b_vision_13g", "messages": [{"role": "user", "content": "Write a clean Python function to calculate the nth Fibonacci number iteratively with type hints and docstring."}], "max_tokens": 320, "temperature": 0.0, "repetition_penalty": 1.0, "stream": true, "enable_thinking": false, "thinking": {"type": "disabled", "budget_tokens": 0}, "max_thinking_tokens": 0, "reasoning_effort": "none", "bypass_prefix_cache": true}
+[2026-11-01 16:13:56] [INFO] Reasoning effort: none, Thinking: disabled, Thinking budget: 0, Tools: 0, Anti-Loop: disabled, Stop-Words: 0, Server-Exec: disabled (client_tool_exec: false, headless: false), Max-Tool-Rounds: 10, Timeout: 60000ms, Bypass-Cache: true
+[2026-11-01 16:13:56] [INFO] RESPONSE (0ms)
+[2026-11-01 16:13:56] [INFO] STREAM PROMPT [round 1] (len=43, continuation=false, visual=none)
+[2026-11-01 16:13:56] [INFO] [KV CACHE] Bypass prefix cache requested: forcing cold full prefill of 43 tokens
+[2026-11-01 16:13:56] [INFO] [PREFILL STATS] 43 tokens evaluated in 0.091s -> 471.99 tok/s (prefix cached: 0 / 43, 0.0%)
+[2026-11-01 16:13:56] [WARN] Think tokens: start=248068 end=248069, EOS=248046 eos2=248046 user=128803 asst=128804, think_budget=0
+
+```[2026-11-01 16:13:56] [INFO] VERIFY TIMING: cycle=0 M=2 took 16.67ms (graph=1)
+[2026-11-01 16:13:56] [INFO] MTP DEBUG: cycle=0 k=0 pred=12305 draft=12305 MATCH
+python
+[2026-11-01 16:13:56] [INFO] VERIFY TIMING: cycle=1 M=3 took 20.89ms (graph=1)
+[2026-11-01 16:13:56] [INFO] MTP DEBUG: cycle=1 k=0 pred=727 draft=727 MATCH
+def[2026-11-01 16:13:56] [INFO] MTP DEBUG: cycle=1 k=1 pred=73111 draft=10724 MISS
+ fibonacci[2026-11-01 16:13:56] [INFO] VERIFY TIMING: cycle=2 M=5 took 35.96ms (graph=1)
+[2026-11-01 16:13:56] [INFO] MTP DEBUG: cycle=2 k=0 pred=1393 draft=1393 MATCH
+(n[2026-11-01 16:13:56] [INFO] MTP DEBUG: cycle=2 k=1 pred=25 draft=337 MISS
+:[2026-11-01 16:13:56] [INFO] VERIFY TIMING: cycle=3 M=5 took 36.05ms (graph=1)
+[2026-11-01 16:13:56] [INFO] MTP DEBUG: cycle=3 k=0 pred=514 draft=514 MATCH
+ int[2026-11-01 16:13:56] [INFO] MTP DEBUG: cycle=3 k=1 pred=8 draft=8 MATCH
+)[2026-11-01 16:13:56] [INFO] MTP DEBUG: cycle=3 k=2 pred=1411 draft=1411 MATCH
+ ->[2026-11-01 16:13:56] [INFO] MTP DEBUG: cycle=3 k=3 pred=514 draft=2972 MISS
+ int[2026-11-01 16:13:56] [INFO] VERIFY TIMING: cycle=4 M=5 took 36.18ms (graph=1)
+[2026-11-01 16:13:56] [INFO] MTP DEBUG: cycle=4 k=0 pred=25 draft=25 MATCH
+:[2026-11-01 16:13:56] [INFO] MTP DEBUG: cycle=4 k=1 pred=198 draft=198 MATCH
+
+[2026-11-01 16:13:56] [INFO] MTP DEBUG: cycle=4 k=2 pred=262 draft=262 MATCH
+   [2026-11-01 16:13:56] [INFO] MTP DEBUG: cycle=4 k=3 pred=4071 draft=4071 MATCH
+ """
+    Calculate the nth Fibonacci number iteratively.
+
+    The Fibonacci sequence is defined such that each number is the sum of
+    the two preceding ones, starting from 0 and 1. That is:
+        F(0) = 0, F(1) = 1, F(n) = F(n-1) + F(n-2) for n >= 2.
+
+    Args:
+        n: A non-negative integer representing the position in the Fibonacci sequence.
+
+    Returns:
+        The nth Fibonacci number.
+
+    Raises:
+        ValueError: If n is negative.
+    """
+    if n < 0:
+        raise ValueError("n must be a non-negative integer")
+    
+    if n == 0:
+        return 0
+    if n == 1:
+        return 1
+    
+    a, b = 0, 1
+    for _ in range(2, n + 1):
+        a, b = b, a + b
+    
+    return b
+```[2026-11-01 16:13:59] [WARN] Stop token hit: token=248046 (cfg_eos=248046, eos2=248046, im_end=248046) at step 72 (content: 234/320, think: 0/0)
+[2026-11-01 16:13:59] [INFO] [GENERATION STATS] 234 tokens in 2.855s -> 81.95 tok/s (Content: 234, Thinking: 0)
+[2026-11-01 16:13:59] [INFO] [SPECULATIVE STATS] 72 cycles | 258 drafted | 162 accepted (62.8% acceptance rate) | draft: 198.7ms total (2.76ms/c) | verify: 2641.2ms total (36.68ms/c)
+[2026-11-01 16:13:59] [INFO] REQUEST: {"model": "qwen3_8_27b_vision_13g", "messages": [{"role": "user", "content": "Write a clean, responsive single-file HTML calculator with modern styling and interactive JavaScript."}], "max_tokens": 1200, "temperature": 0.0, "repetition_penalty": 1.0, "stream": true, "enable_thinking": true, "thinking": {"type": "enabled", "budget_tokens": 200}, "max_thinking_tokens": 200, "reasoning_effort": "low", "bypass_prefix_cache": true}
+[2026-11-01 16:13:59] [INFO] Reasoning effort: low, Thinking: enabled, Thinking budget: 200, Tools: 0, Anti-Loop: disabled, Stop-Words: 0, Server-Exec: disabled (client_tool_exec: false, headless: false), Max-Tool-Rounds: 10, Timeout: 60000ms, Bypass-Cache: true
+[2026-11-01 16:13:59] [INFO] RESPONSE (1ms)
+[2026-11-01 16:13:59] [INFO] STREAM PROMPT [round 1] (len=37, continuation=false, visual=none)
+[2026-11-01 16:13:59] [INFO] [KV CACHE] Bypass prefix cache requested: forcing cold full prefill of 37 tokens
+[2026-11-01 16:13:59] [INFO] [PREFILL STATS] 37 tokens evaluated in 0.103s -> 360.64 tok/s (prefix cached: 0 / 37, 0.0%)
+[2026-11-01 16:13:59] [WARN] Think tokens: start=248068 end=248069, EOS=248046 eos2=248046 user=128803 asst=128804, think_budget=200
+
+Create a single-file HTML calculator with modern styling, responsive design, and interactive JS. Provide the complete code along with a brief explanation.
+
+
+[2026-11-01 16:14:00] [INFO] VERIFY TIMING: cycle=0 M=2 took 20.13ms (graph=1)
+[2026-11-01 16:14:00] [INFO] MTP DEBUG: cycle=0 k=0 pred=2 draft=2 MATCH
+# Modern[2026-11-01 16:14:00] [INFO] VERIFY TIMING: cycle=1 M=3 took 24.67ms (graph=1)
+[2026-11-01 16:14:00] [INFO] MTP DEBUG: cycle=1 k=0 pred=11000 draft=34835 MISS
+ Single[2026-11-01 16:14:00] [INFO] VERIFY TIMING: cycle=2 M=2 took 19.56ms (graph=1)
+[2026-11-01 16:14:00] [INFO] MTP DEBUG: cycle=2 k=0 pred=12 draft=2793 MISS
+-[2026-11-01 16:14:00] [INFO] VERIFY TIMING: cycle=3 M=2 took 21.51ms (graph=1)
+[2026-11-01 16:14:00] [INFO] MTP DEBUG: cycle=3 k=0 pred=1643 draft=1643 MATCH
+File HTML[2026-11-01 16:14:00] [INFO] VERIFY TIMING: cycle=4 M=3 took 25.29ms (graph=1)
+[2026-11-01 16:14:00] [INFO] MTP DEBUG: cycle=4 k=0 pred=34835 draft=34835 MATCH
+ Calculator[2026-11-01 16:14:00] [INFO] MTP DEBUG: cycle=4 k=1 pred=271 draft=34835 MISS
+
+
+Here's a complete, self-contained calculator with a sleek dark-mode design, keyboard support, and a fully responsive layout:
+
+```html
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>Calculator</title>
+  <style>
+    * {
+      margin: 0;
+      padding: 0;
+      box-sizing: border-box;
+    }
+
+    :root {
+      --bg: #1e1e2e;
+      --calc-bg: #181825;
+      --display-bg: #11111b;
+      --btn: #313244;
+      --btn-hover: #45475a;
+      --btn-op: #58775e;
+      --btn-eq: #89b4fa;
+      --text: #cdd6f4;
+      --text-dim: #7f849c;
+      --radius: 16px;
+    }
+
+    body {
+      font-family: "Segoe UI", system-ui, -apple-system, sans-serif;
+      background: var(--bg);
+      min-height: 100vh;
+      display: flex;
+      align-items: center;
+      justify-content: center;
+      padding: 16px;
+    }
+
+    .calculator {
+      width: 100%;
+      max-width: 340px;
+      background: var(--calc-bg);
+      border-radius: 24px;
+      padding: 20px;
+      box-shadow: 0 20px 50px rgba(0, 0, 0, 0.5);
+    }
+
+    /* ---------- Display ---------- */
+    .display {
+      background: var(--display-bg);
+      border-radius: var(--radius);
+      padding: 16px 18px;
+      margin-bottom: 18px;
+      text-align: right;
+      overflow: hidden;
+    }
+
+    .display .expression {
+      font-size: 1rem;
+      color: var(--text-dim);
+      min-height: 1.2em;
+      white-space: nowrap;
+      overflow: hidden;
+      text-overflow: ellipsis;
+    }
+
+    .display .result {
+      font-size: 2.2rem;
+      font-weight: 600;
+      color: var(--text);
+      margin-top: 4px;
+      white-space: nowrap;
+      overflow: hidden;
+      text-overflow: ellipsis;
+      transition: font-size 0.15s ease;
+    }
+
+    .display .result.shrink {
+      font-size: 1.4rem;
+    }
+
+    /* ---------- Buttons ---------- */
+    .buttons {
+      display: grid;
+      grid-template-columns: repeat(4, 1fr);
+      gap: 10px;
+    }
+
+    button {
+      border: none;
+      border-radius: var(--radius);
+      padding: 18px 0;
+      font-size: 1.15rem;
+      font-weight: 600;
+      color: var(--text);
+      background: var(--btn);
+      cursor: pointer;
+      transition: transform 0.1s ease, background 0.15s ease;
+      -webkit-tap-highlight-color: transparent;
+    }
+
+    button:hover {
+      background: var(--btn-hover);
+    }
+
+    button:active {
+      transform: scale(0.94);
+    }
+
+    button.op {
+      background: var(--btn-op);
+      color: #fff;
+    }
+
+    button.eq {
+      background: var(--btn-eq);
+      color: #11111b;
+    }
+
+    button.fn {
+      background: #45475a;
+      color: var(--text-dim);
+    }
+
+    /* ---------- Responsive tweaks ---------- */
+    @media (max-width: 380px) {
+      .calculator {
+        padding: 14px;
+        border-radius: 18px;
+      }
+      .buttons {
+        gap: 8px;
+      }
+      button {
+        padding: 14px 0;
+        font-size: 1rem;
+      }
+      .display .result {
+        font-size: 1.8rem;
+      }
+    }
+  </style>
+</head>
+<body>
+
+  <div class="calculator">
+    <div class="display">
+      <div class="expression" id="expression"></div>
+      <div class="result" id="result">0</div>
+    </div>
+
+    <div class="buttons">
+      <button class="fn" data-action="clear">AC</button>
+      <button class="fn" data-action="delete">⌫</button>
+      <button class="op" data-op="÷">÷</button>
+      <button class="op" data-op="×">×</button>
+
+      <button data-num="[2026-11-01 16:14:16] [INFO] [GENERATION STATS] 1229 tokens in 16.708s -> 73.56 tok/s (Content: 1200, Thinking: 28)
+[2026-11-01 16:14:16] [INFO] [SPECULATIVE STATS] 425 cycles | 1343 drafted | 771 accepted (57.4% acceptance rate) | draft: 1183.7ms total (2.79ms/c) | verify: 14874.4ms total (35.00ms/c)
+[2026-11-01 16:14:16] [INFO] REQUEST: {"model": "qwen3_8_27b_vision_13g", "messages": [{"role": "user", "content": "A bat and a ball cost $1.10 in total. The bat costs $1.00 more than the ball. How much does the ball cost? Show step-by-step logic."}], "max_tokens": 450, "temperature": 0.0, "repetition_penalty": 1.0, "stream": true, "enable_thinking": true, "thinking": {"type": "enabled", "budget_tokens": 500}, "max_thinking_tokens": 500, "reasoning_effort": "high", "bypass_prefix_cache": true}
+[2026-11-01 16:14:16] [INFO] Reasoning effort: high, Thinking: enabled, Thinking budget: 500, Tools: 0, Anti-Loop: disabled, Stop-Words: 0, Server-Exec: disabled (client_tool_exec: false, headless: false), Max-Tool-Rounds: 10, Timeout: 60000ms, Bypass-Cache: true
+[2026-11-01 16:14:16] [INFO] RESPONSE (0ms)
+[2026-11-01 16:14:16] [INFO] STREAM PROMPT [round 1] (len=61, continuation=false, visual=none)
+[2026-11-01 16:14:16] [INFO] [KV CACHE] Bypass prefix cache requested: forcing cold full prefill of 61 tokens
+[2026-11-01 16:14:16] [INFO] [PREFILL STATS] 61 tokens evaluated in 0.118s -> 517.77 tok/s (prefix cached: 0 / 61, 0.0%)
+[2026-11-01 16:14:16] [WARN] Think tokens: start=248068 end=248069, EOS=248046 eos2=248046 user=128803 asst=128804, think_budget=500
+
+The user is asking the classic bat and ball problem. Let me work through this carefully.
+
+The problem states:
+- A bat and a ball cost $1.10 in total.
+- The bat costs $1.00 more than the ball.
+- How much does the ball cost?
+
+Let me set up the equations:
+- Let the ball cost = x
+- The bat costs $1.00 more than the ball, so the bat costs = x + 1.00
+
+The total cost is $1.10:
+x + (x + 1.00) = 1.10
+2x + 1.00 = 1.10
+2x = 0.10
+x = 0.05
+
+So the ball costs $0.05 (5 cents), and the bat costs $1.05.
+
+Check: $1.05 + $0.05 = $1.10 ✓
+The bat ($1.05) costs $1.00 more than the ball ($0.05) ✓
+
+The common wrong answer is $0.05 for the ball and $1.00 for the bat, but that would make the bat only $0.95 more than the ball, not $1.00 more. Wait, actually the common wrong answer is that people say the ball is $0.05 and the bat is $1.00. But that's actually... let me check. If the ball is $0.05 and the bat is $1.00, then the bat costs $0.95 more than the ball, not $1.00 more. So that's the wrong answer. The correct answer is the ball is $0.05 and the bat is $1.05.
+
+Wait, let me re-examine. The common "trap" answer people give is: ball = $0.05, bat = $1.00. But that's wrong because the bat would only cost $0.95 more than the ball, not $1.00 more. The correct answer is ball = $0.05, bat = $1.05.
+
+So the ball costs $0.05 (5 cents).
+
+Let me present this with clear step-by-step logic.[2026-11-01 16:14:25] [WARN] [ThinkTransition] Thinking budget reached (504 thinking tokens). Closing </think> and starting content.
+Let[2026-11-01 16:14:25] [INFO] VERIFY TIMING: cycle=0 M=2 took 22.96ms (graph=1)
+[2026-11-01 16:14:25] [INFO] MTP DEBUG: cycle=0 k=0 pred=728 draft=728 MATCH
+ me define[2026-11-01 16:14:25] [INFO] VERIFY TIMING: cycle=1 M=3 took 26.72ms (graph=1)
+[2026-11-01 16:14:25] [INFO] MTP DEBUG: cycle=1 k=0 pred=7101 draft=279 MISS
+ variables[2026-11-01 16:14:25] [INFO] VERIFY TIMING: cycle=2 M=2 took 21.99ms (graph=1)
+[2026-11-01 16:14:25] [INFO] MTP DEBUG: cycle=2 k=0 pred=321 draft=321 MATCH
+ and solve[2026-11-01 16:14:25] [INFO] VERIFY TIMING: cycle=3 M=3 took 26.41ms (graph=1)
+[2026-11-01 16:14:25] [INFO] MTP DEBUG: cycle=3 k=0 pred=2923 draft=2923 MATCH
+ step[2026-11-01 16:14:25] [INFO] MTP DEBUG: cycle=3 k=1 pred=539 draft=539 MATCH
+ by step[2026-11-01 16:14:25] [INFO] VERIFY TIMING: cycle=4 M=5 took 44.77ms (graph=1)
+[2026-11-01 16:14:25] [INFO] MTP DEBUG: cycle=4 k=0 pred=13 draft=13 MATCH
+.[2026-11-01 16:14:25] [INFO] MTP DEBUG: cycle=4 k=1 pred=271 draft=271 MATCH
+
+
+[2026-11-01 16:14:25] [INFO] MTP DEBUG: cycle=4 k=2 pred=332 draft=9764 MISS
+**Step 1: Define the variables**
+
+Let the cost of the ball be **x** dollars.
+
+Since the bat costs $1.00 more than the ball, the bat costs **x + 1.00** dollars.
+
+**Step 2: Set up the equation**
+
+We know the total cost of both items is $1.10:
+
+x + (x + 1.00) = 1.10
+
+**Step 3: Simplify**
+
+2x + 1.00 = 1.10
+
+**Step 4: Solve for x**
+
+2x = 1.10 − 1.00
+2x = 0.10
+x = 0.05
+
+**Step 5: Verify**
+
+- Ball = $0.05
+- Bat = $0.05 + $1.00 = $1.05
+- Total: $1.05 + $0.05 = $1.10 ✓
+- The bat costs $1.00 more than the ball: $1.05 − $0.05 = $1.00 ✓
+
+**Answer: The ball costs $0.05 (5 cents).**
+
+> ⚠️ **Why this problem is tricky:** Most people instinctively answer "$0.05 for the ball and $1.00 for the bat." But that makes the bat only $0.95 more expensive than the ball, not the required $1.00. The bat actually costs **$1.05**, not $1.00.
+Let me work through this classic problem step by step.
+
+**Step 1: Define the variables**
+
+Let the cost of the ball be **x** dollars.
+Since the bat costs $1.00 more than the ball, the bat costs **x + 1.00** dollars.
+
+**Step 2: Set up the equation**
+
+We know the total cost of both items is $1[2026-11-01 16:14:31] [INFO] [GENERATION STATS] 955 tokens in 14.908s -> 64.06 tok/s (Content: 450, Thinking: 504)
+[2026-11-01 16:14:31] [INFO] [SPECULATIVE STATS] 157 cycles | 528 drafted | 289 accepted (54.7% acceptance rate) | draft: 486.8ms total (3.10ms/c) | verify: 5859.8ms total (37.32ms/c)
+[2026-11-01 16:14:32] [INFO] REQUEST: {"model": "qwen3_8_27b_vision_13g", "messages": [{"role": "user", "content": "In distributed systems engineering, achieving fault-tolerant consensus across an asynchronous network with unreliable nodes presents fundamental trade-offs formalized by the CAP theorem and the FLP impossibility result. State machine replication (SMR) is a primary paradigm used to build resilient distributed services. In SMR, multiple identical deterministic replicas execute a sequence of commands in the identical order. Consensus algorithms such as Paxos and Raft coordinate the sequence of log entries. Raft structures consensus around an elected leader that manages log replication, heartbeats, and client interactions. If the leader fails, a randomized election timer triggers candidate state transitions to elect a successor. Safety is maintained by ensuring log matching invariants, leader completeness, and state machine commitment rules. Multi-Paxos optimizes write latency by leasing leader terms and amortizing prepare phases.\n\nFurthermore, modern distributed datastores employ hybrid logical clocks (HLC) and synchronized GPS/atomic TrueTime hardware to provide external consistency without relying solely on distributed lock managers. By combining monotonic physical clocks with logical counters, systems can order distributed transactions across geographically separated data centers while bounding clock drift. When network partitions occur, distributed databases must choose between linearizable read-write availability and strong consistency guarantees. Quorum-based protocols require strict majority overlap (R + W > N) to prevent split-brain anomalies during transient link degradations and asymmetric network partitions.\n\nLog compaction and snapshotting are equally critical in production deployments. Because logs cannot grow unboundedly, replicas periodically take point-in-time state snapshots and discard prior log entries. Replicas that lag too far behind receive full snapshots over the network before rejoining the active consensus group. Dynamic cluster membership changes must also be handled carefully through joint consensus configurations to prevent disjoint majority splits when nodes join or leave the cluster.\n\nIn distributed systems engineering, achieving fault-tolerant consensus across an asynchronous network with unreliable nodes presents fundamental trade-offs formalized by the CAP theorem and the FLP impossibility result. State machine replication (SMR) is a primary paradigm used to build resilient distributed services. In SMR, multiple identical deterministic replicas execute a sequence of commands in the identical order. Consensus algorithms such as Paxos and Raft coordinate the sequence of log entries. Raft structures consensus around an elected leader that manages log replication, heartbeats, and client interactions. If the leader fails, a randomized election timer triggers candidate state transitions to elect a successor. Safety is maintained by ensuring log matching invariants, leader completeness, and state machine commitment rules. Multi-Paxos optimizes write latency by leasing leader terms and amortizing prepare phases.\n\nFurthermore, modern distributed datastores employ hybrid logical clocks (HLC) and synchronized GPS/atomic TrueTime hardware to provide external consistency without relying solely on distributed lock managers. By combining monotonic physical clocks with logical counters, systems can order distributed transactions across geographically separated data centers while bounding clock drift. When network partitions occur, distributed databases must choose between linearizable read-write availability and strong consistency guarantees. Quorum-based protocols require strict majority overlap (R + W > N) to prevent split-brain anomalies during transient link degradations and asymmetric network partitions.\n\nLog compaction and snapshotting are equally critical in production deployments. Because logs cannot grow unboundedly, replicas periodically take point-in-time state snapshots and discard prior log entries
+[2026-11-01 16:14:32] [INFO] Reasoning effort: none, Thinking: disabled, Thinking budget: 0, Tools: 0, Anti-Loop: disabled, Stop-Words: 0, Server-Exec: disabled (client_tool_exec: false, headless: false), Max-Tool-Rounds: 10, Timeout: 60000ms, Bypass-Cache: true
+[2026-11-01 16:14:32] [INFO] RESPONSE (0ms)
+[2026-11-01 16:14:32] [INFO] STREAM PROMPT [round 1] (len=1868, continuation=false, visual=none)
+[2026-11-01 16:14:32] [INFO] [KV CACHE] Bypass prefix cache requested: forcing cold full prefill of 1868 tokens
+[2026-11-01 16:14:33] [INFO] [PREFILL STATS] 1868 tokens evaluated in 1.237s -> 1509.87 tok/s (prefix cached: 0 / 1868, 0.0%)
+[2026-11-01 16:14:33] [WARN] Think tokens: start=248068 end=248069, EOS=248046 eos2=248046 user=128803 asst=128804, think_budget=0
+
+Based[2026-11-01 16:14:33] [INFO] VERIFY TIMING: cycle=0 M=2 took 26.79ms (graph=1)
+[2026-11-01 16:14:33] [INFO] MTP DEBUG: cycle=0 k=0 pred=383 draft=383 MATCH
+ on the[2026-11-01 16:14:33] [INFO] VERIFY TIMING: cycle=1 M=3 took 30.98ms (graph=1)
+[2026-11-01 16:14:33] [INFO] MTP DEBUG: cycle=1 k=0 pred=3766 draft=3766 MATCH
+ provided[2026-11-01 16:14:33] [INFO] MTP DEBUG: cycle=1 k=1 pred=1414 draft=1414 MATCH
+ text,[2026-11-01 16:14:33] [INFO] VERIFY TIMING: cycle=2 M=5 took 49.79ms (graph=1)
+[2026-11-01 16:14:33] [INFO] MTP DEBUG: cycle=2 k=0 pred=1532 draft=1532 MATCH
+ here[2026-11-01 16:14:33] [INFO] MTP DEBUG: cycle=2 k=1 pred=513 draft=513 MATCH
+ are[2026-11-01 16:14:33] [INFO] MTP DEBUG: cycle=2 k=2 pred=279 draft=279 MATCH
+ the[2026-11-01 16:14:33] [INFO] MTP DEBUG: cycle=2 k=3 pred=1328 draft=1328 MATCH
+ key mechanisms[2026-11-01 16:14:33] [INFO] VERIFY TIMING: cycle=3 M=5 took 49.14ms (graph=1)
+[2026-11-01 16:14:33] [INFO] MTP DEBUG: cycle=3 k=0 pred=1429 draft=364 MISS
+ used[2026-11-01 16:14:33] [INFO] VERIFY TIMING: cycle=4 M=2 took 25.95ms (graph=1)
+[2026-11-01 16:14:33] [INFO] MTP DEBUG: cycle=4 k=0 pred=539 draft=539 MATCH
+ by Raft and modern distributed consensus systems to guarantee safety, manage log growth, and maintain consistency:
+
+*   **Safety and Consistency via Leader-Centric Consensus and Quorums:** Raft ensures safety by maintaining log matching invariants, leader completeness, and state machine commitment rules through an elected leader that coordinates log replication and heartbeats. Modern datastores enhance consistency by using hybrid logical clocks (HLC) to order transactions across data centers and employing quorum-based protocols (where R + W > N) to prevent split-brain anomalies during network partitions.
+*   **Log Growth Management via Compaction and Snapshotting:** To prevent unbounded log growth, systems implement log compaction by periodically taking point-in-time state snapshots and discarding prior log entries. Replicas that lag behind the active consensus group are required to[2026-11-01 16:14:36] [INFO] [GENERATION STATS] 180 tokens in 3.654s -> 49.26 tok/s (Content: 180, Thinking: 0)
+[2026-11-01 16:14:36] [INFO] [SPECULATIVE STATS] 103 cycles | 220 drafted | 74 accepted (33.6% acceptance rate) | draft: 270.8ms total (2.63ms/c) | verify: 3308.2ms total (32.12ms/c)
+[2026-11-01 16:14:37] [INFO] REQUEST: {"model": "qwen3_8_27b_vision_13g", "messages": [{"role": "user", "content": "In distributed systems engineering, achieving fault-tolerant consensus across an asynchronous network with unreliable nodes presents fundamental trade-offs formalized by the CAP theorem and the FLP impossibility result. State machine replication (SMR) is a primary paradigm used to build resilient distributed services. In SMR, multiple identical deterministic replicas execute a sequence of commands in the identical order. Consensus algorithms such as Paxos and Raft coordinate the sequence of log entries. Raft structures consensus around an elected leader that manages log replication, heartbeats, and client interactions. If the leader fails, a randomized election timer triggers candidate state transitions to elect a successor. Safety is maintained by ensuring log matching invariants, leader completeness, and state machine commitment rules. Multi-Paxos optimizes write latency by leasing leader terms and amortizing prepare phases.\n\nFurthermore, modern distributed datastores employ hybrid logical clocks (HLC) and synchronized GPS/atomic TrueTime hardware to provide external consistency without relying solely on distributed lock managers. By combining monotonic physical clocks with logical counters, systems can order distributed transactions across geographically separated data centers while bounding clock drift. When network partitions occur, distributed databases must choose between linearizable read-write availability and strong consistency guarantees. Quorum-based protocols require strict majority overlap (R + W > N) to prevent split-brain anomalies during transient link degradations and asymmetric network partitions.\n\nLog compaction and snapshotting are equally critical in production deployments. Because logs cannot grow unboundedly, replicas periodically take point-in-time state snapshots and discard prior log entries. Replicas that lag too far behind receive full snapshots over the network before rejoining the active consensus group. Dynamic cluster membership changes must also be handled carefully through joint consensus configurations to prevent disjoint majority splits when nodes join or leave the cluster.\n\nIn distributed systems engineering, achieving fault-tolerant consensus across an asynchronous network with unreliable nodes presents fundamental trade-offs formalized by the CAP theorem and the FLP impossibility result. State machine replication (SMR) is a primary paradigm used to build resilient distributed services. In SMR, multiple identical deterministic replicas execute a sequence of commands in the identical order. Consensus algorithms such as Paxos and Raft coordinate the sequence of log entries. Raft structures consensus around an elected leader that manages log replication, heartbeats, and client interactions. If the leader fails, a randomized election timer triggers candidate state transitions to elect a successor. Safety is maintained by ensuring log matching invariants, leader completeness, and state machine commitment rules. Multi-Paxos optimizes write latency by leasing leader terms and amortizing prepare phases.\n\nFurthermore, modern distributed datastores employ hybrid logical clocks (HLC) and synchronized GPS/atomic TrueTime hardware to provide external consistency without relying solely on distributed lock managers. By combining monotonic physical clocks with logical counters, systems can order distributed transactions across geographically separated data centers while bounding clock drift. When network partitions occur, distributed databases must choose between linearizable read-write availability and strong consistency guarantees. Quorum-based protocols require strict majority overlap (R + W > N) to prevent split-brain anomalies during transient link degradations and asymmetric network partitions.\n\nLog compaction and snapshotting are equally critical in production deployments. Because logs cannot grow unboundedly, replicas periodically take point-in-time state snapshots and discard prior log entries
+[2026-11-01 16:14:37] [INFO] Reasoning effort: none, Thinking: disabled, Thinking budget: 0, Tools: 0, Anti-Loop: disabled, Stop-Words: 0, Server-Exec: disabled (client_tool_exec: false, headless: false), Max-Tool-Rounds: 10, Timeout: 60000ms, Bypass-Cache: true
+[2026-11-01 16:14:37] [INFO] RESPONSE (0ms)
+[2026-11-01 16:14:37] [INFO] STREAM PROMPT [round 1] (len=2923, continuation=false, visual=none)
+[2026-11-01 16:14:37] [INFO] [KV CACHE] Bypass prefix cache requested: forcing cold full prefill of 2923 tokens
+[2026-11-01 16:14:39] [INFO] [PREFILL STATS] 2923 tokens evaluated in 2.212s -> 1321.64 tok/s (prefix cached: 0 / 2923, 0.0%)
+[2026-11-01 16:14:39] [WARN] Think tokens: start=248068 end=248069, EOS=248046 eos2=248046 user=128803 asst=128804, think_budget=0
+
+The[2026-11-01 16:14:39] [INFO] VERIFY TIMING: cycle=0 M=2 took 29.74ms (graph=1)
+[2026-11-01 16:14:39] [INFO] MTP DEBUG: cycle=0 k=0 pred=6007 draft=6007 MATCH
+ core invariant[2026-11-01 16:14:39] [INFO] VERIFY TIMING: cycle=1 M=3 took 35.16ms (graph=1)
+[2026-11-01 16:14:39] [INFO] MTP DEBUG: cycle=1 k=0 pred=369 draft=369 MATCH
+ is[2026-11-01 16:14:39] [INFO] MTP DEBUG: cycle=1 k=1 pred=421 draft=4098 MISS
+ that[2026-11-01 16:14:39] [INFO] VERIFY TIMING: cycle=2 M=5 took 53.59ms (graph=1)
+[2026-11-01 16:14:39] [INFO] MTP DEBUG: cycle=2 k=0 pred=660 draft=5081 MISS
+ all[2026-11-01 16:14:39] [INFO] VERIFY TIMING: cycle=3 M=2 took 30.25ms (graph=1)
+[2026-11-01 16:14:39] [INFO] MTP DEBUG: cycle=3 k=0 pred=2397 draft=1528 MISS
+ non[2026-11-01 16:14:39] [INFO] VERIFY TIMING: cycle=4 M=2 took 30.15ms (graph=1)
+[2026-11-01 16:14:39] [INFO] MTP DEBUG: cycle=4 k=0 pred=2149 draft=1676 MISS
+-faulty replicas must apply the same sequence of commands in the same order, ensuring that their state machines remain identical and consistent.[2026-11-01 16:14:40] [WARN] Stop token hit: token=248046 (cfg_eos=248046, eos2=248046, im_end=248046) at step 19 (content: 33/64, think: 0/0)
+[2026-11-01 16:14:40] [INFO] [GENERATION STATS] 33 tokens in 0.707s -> 46.67 tok/s (Content: 33, Thinking: 0)
+[2026-11-01 16:14:40] [INFO] [SPECULATIVE STATS] 19 cycles | 38 drafted | 14 accepted (36.8% acceptance rate) | draft: 53.6ms total (2.82ms/c) | verify: 649.7ms total (34.20ms/c)
+[2026-11-01 16:14:40] [INFO] REQUEST: {"model": "qwen3_8_27b_vision_13g", "messages": [{"role": "user", "content": "Hi"}], "max_tokens": 2, "temperature": 0.0, "repetition_penalty": 1.0, "stream": true, "enable_thinking": false, "thinking": {"type": "disabled", "budget_tokens": 0}, "max_thinking_tokens": 0, "reasoning_effort": "none", "bypass_prefix_cache": true}
+[2026-11-01 16:14:40] [INFO] Reasoning effort: none, Thinking: disabled, Thinking budget: 0, Tools: 0, Anti-Loop: disabled, Stop-Words: 0, Server-Exec: disabled (client_tool_exec: false, headless: false), Max-Tool-Rounds: 10, Timeout: 60000ms, Bypass-Cache: true
+[2026-11-01 16:14:40] [INFO] RESPONSE (0ms)
+[2026-11-01 16:14:40] [INFO] STREAM PROMPT [round 1] (len=24, continuation=false, visual=none)
+[2026-11-01 16:14:40] [INFO] [KV CACHE] Bypass prefix cache requested: forcing cold full prefill of 24 tokens
+[2026-11-01 16:14:40] [INFO] [PREFILL STATS] 24 tokens evaluated in 0.130s -> 184.39 tok/s (prefix cached: 0 / 24, 0.0%)
+[2026-11-01 16:14:40] [WARN] Think tokens: start=248068 end=248069, EOS=248046 eos2=248046 user=128803 asst=128804, think_budget=0
+
+Hello[2026-11-01 16:14:40] [INFO] [GENERATION STATS] 2 tokens in 0.014s -> 140.39 tok/s (Content: 2, Thinking: 0)

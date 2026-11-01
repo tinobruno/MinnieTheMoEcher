@@ -1,0 +1,577 @@
+[2026-11-01 18:02:41] [INFO] === moecher starting ===
+[2026-11-01 18:02:41] [INFO] === v2.09 ===
+[2026-11-01 18:02:41] [INFO] Default thinking token budget: 4096
+[2026-11-01 18:02:41] [INFO] Operational mode: Chat (Dynamic intent gating: enabled)
+[2026-11-01 18:02:41] [INFO] Tool calling support: disabled
+[2026-11-01 18:02:41] [INFO] Max tool execution rounds: 10
+[2026-11-01 18:02:41] [INFO] Server-side tool execution: disabled (headless-browsing: disabled)
+[2026-11-01 18:02:41] [INFO] Workspace sandbox root: ./workspace (Write Allowed: NO)
+[2026-11-01 18:02:41] [INFO] Security: Host OS execution is DISABLED (Safe Mode). Pure inference active.
+[2026-11-01 18:02:41] [INFO] Speculative decoding: enabled (PLD: enabled, MTP: enabled, Tree MTP: disabled, tree_nodes=2, mtp_k=4)
+[2026-11-01 18:02:41] [INFO] Loading manifest: F:\Moecher\models\nemotron_3.5_bolt_24gb\moecher_manifest.json
+[2026-11-01 18:02:41] [INFO] Model: 88 layers, 496 experts, 9 active, hidden=4096, dtype=iq2_xxs, max_seq_len=65536, sliding_window=128
+[2026-11-01 18:02:41] [INFO] BPETokenizer: Loading from F:\Moecher\models\nemotron_3.5_bolt_24gb\tokenizer.json
+[2026-11-01 18:02:41] [INFO] Tokenizer loaded: 131072 vocab, 269443 merges, 1000 special tokens
+[2026-11-01 18:02:41] [INFO] Hardware: NVIDIA RTX PRO 6000 Blackwell Max-Q Workstation Edition (Compute 12.0, 95.6 GB VRAM)
+[2026-11-01 18:02:41] [INFO] Hardware Capabilities: Ampere=0, Ada+=1, Blackwell+=1, FP8_TC=1, FP4=1, VRAM-Constrained=0
+[2026-11-01 18:02:41] [INFO] Blackwell Tensor Core Acceleration: DISABLED (SIMT Fallback / Non-FP4 Model)
+[2026-11-01 18:02:41] [INFO] Blackwell sm_120a Native FP8 Tensor Cores: ENABLED (cuBLASLt FP8_E4M3 Tensor Core Pipeline)
+[2026-11-01 18:02:41] [INFO] Persistent L2 Cache configured: 60.0 MB / 80.0 MB
+[2026-11-01 18:02:41] [INFO] VRAM: 93.7 GB free / 95.6 GB total
+[2026-11-01 18:02:41] [INFO] Loading dense tensors from F:\Moecher\models\nemotron_3.5_bolt_24gb\attention_dense_layers.bin
+[2026-11-01 18:02:42] [INFO] Nemotron Layer 1 shared experts: up_w=0000001290E00000 up_s=0000000000000000 (s2=1.000000), down_w=0000001291400000 down_s=0000000000000000 (s2=1.000000)
+[2026-11-01 18:02:42] [INFO]   Loaded Nemotron layer 10/88 (type=Mamba-2 SSM)
+[2026-11-01 18:02:42] [INFO]   Loaded Nemotron layer 20/88 (type=MoE)
+[2026-11-01 18:02:42] [INFO]   Loaded Nemotron layer 30/88 (type=Mamba-2 SSM)
+[2026-11-01 18:02:42] [INFO]   Loaded Nemotron layer 40/88 (type=MoE)
+[2026-11-01 18:02:42] [INFO]   Loaded Nemotron layer 50/88 (type=Mamba-2 SSM)
+[2026-11-01 18:02:43] [INFO]   Loaded Nemotron layer 60/88 (type=MoE)
+[2026-11-01 18:02:43] [INFO]   Loaded Nemotron layer 70/88 (type=GQA Attention)
+[2026-11-01 18:02:43] [INFO]   Loaded Nemotron layer 80/88 (type=MoE)
+[2026-11-01 18:02:43] [INFO]   Loaded Nemotron layer 88/88 (type=MoE)
+[2026-11-01 18:02:43] [INFO] Dense tensors loaded
+[2026-11-01 18:02:43] [INFO] RoPE: non-compressed base=10000 (no YaRN), compressed base=160000 (YaRN factor=16, max_seq=65552)
+[2026-11-01 18:02:43] [INFO] [Memory] 100% of all experts fit in VRAM L1 cache (25.0 GB). DRAM L2 cache set to 0.0 GB (zero PCIe/SSD traffic)!
+[2026-11-01 18:02:43] [INFO] Expert L1 (VRAM) cache budget: 25.0 GB
+[2026-11-01 18:02:43] [INFO] Expert L2 (DRAM) cache budget: 0.0 GB
+[2026-11-01 18:02:43] [INFO] Expert I/O: DIRECT mode (FILE_FLAG_NO_BUFFERING / O_DIRECT NVMe DMA)
+[2026-11-01 18:02:43] [INFO] Expert L1 cache: 19840 slots (25.0 GB)
+[2026-11-01 18:02:43] [INFO] Preloading 19840/19840 experts into VRAM L1 cache...
+[2026-11-01 18:02:44] [INFO]   Preloaded 1000/19840 experts into VRAM...
+[2026-11-01 18:02:44] [INFO]   Preloaded 2000/19840 experts into VRAM...
+[2026-11-01 18:02:44] [INFO]   Preloaded 3000/19840 experts into VRAM...
+[2026-11-01 18:02:44] [INFO]   Preloaded 4000/19840 experts into VRAM...
+[2026-11-01 18:02:44] [INFO]   Preloaded 5000/19840 experts into VRAM...
+[2026-11-01 18:02:44] [INFO]   Preloaded 6000/19840 experts into VRAM...
+[2026-11-01 18:02:44] [INFO]   Preloaded 7000/19840 experts into VRAM...
+[2026-11-01 18:02:44] [INFO]   Preloaded 8000/19840 experts into VRAM...
+[2026-11-01 18:02:45] [INFO]   Preloaded 9000/19840 experts into VRAM...
+[2026-11-01 18:02:45] [INFO]   Preloaded 10000/19840 experts into VRAM...
+[2026-11-01 18:02:45] [INFO]   Preloaded 11000/19840 experts into VRAM...
+[2026-11-01 18:02:45] [INFO]   Preloaded 12000/19840 experts into VRAM...
+[2026-11-01 18:02:45] [INFO]   Preloaded 13000/19840 experts into VRAM...
+[2026-11-01 18:02:45] [INFO]   Preloaded 14000/19840 experts into VRAM...
+[2026-11-01 18:02:45] [INFO]   Preloaded 15000/19840 experts into VRAM...
+[2026-11-01 18:02:45] [INFO]   Preloaded 16000/19840 experts into VRAM...
+[2026-11-01 18:02:45] [INFO]   Preloaded 17000/19840 experts into VRAM...
+[2026-11-01 18:02:45] [INFO]   Preloaded 18000/19840 experts into VRAM...
+[2026-11-01 18:02:45] [INFO]   Preloaded 19000/19840 experts into VRAM...
+[2026-11-01 18:02:46] [INFO]   Preloaded 19840/19840 experts into VRAM...
+[2026-11-01 18:02:46] [INFO] Preload completed in 2.07 seconds
+[2026-11-01 18:02:46] [INFO] Loaded 39680 Nemotron expert scales from F:\Moecher\models\nemotron_3.5_bolt_24gb\expert_scales.bin
+[2026-11-01 18:02:46] [INFO] No compress_ratios found, using full window for all layers
+[2026-11-01 18:02:46] [INFO] [Vision Delegate] Found vision delegate manifest at: F:\Moecher\models\frankenstin/vision/moecher_manifest.json
+[2026-11-01 18:02:46] [INFO] [Vision Delegate] Sufficient VRAM available (60.6 GB free / 95.6 GB total). Loading vision delegate permanently into VRAM...
+[2026-11-01 18:02:46] [INFO] Loading manifest: F:\Moecher\models\frankenstin/vision/moecher_manifest.json
+[2026-11-01 18:02:46] [INFO] Model: 36 layers, 256 experts, 6 active, hidden=2048, dtype=fp4, max_seq_len=2048, sliding_window=128
+[2026-11-01 18:02:46] [INFO] BPETokenizer: Loading from F:\Moecher\models\frankenstin/vision\tokenizer.json
+[2026-11-01 18:02:46] [INFO] Tokenizer loaded: 151665 vocab, 151387 merges, 22 special tokens
+[2026-11-01 18:02:46] [INFO] Hardware: NVIDIA RTX PRO 6000 Blackwell Max-Q Workstation Edition (Compute 12.0, 95.6 GB VRAM)
+[2026-11-01 18:02:46] [INFO] Hardware Capabilities: Ampere=0, Ada+=1, Blackwell+=1, FP8_TC=1, FP4=1, VRAM-Constrained=0
+[2026-11-01 18:02:46] [INFO] MTP draft depth auto-configured: mtp_k=4 (VRAM-Constrained=0)
+[2026-11-01 18:02:46] [INFO] Blackwell Tensor Core Acceleration: DISABLED (SIMT Fallback / Non-FP4 Model)
+[2026-11-01 18:02:46] [INFO] Blackwell sm_120a Native FP8 Tensor Cores: ENABLED (cuBLASLt FP8_E4M3 Tensor Core Pipeline)
+[2026-11-01 18:02:46] [INFO] Persistent L2 Cache configured: 60.0 MB / 80.0 MB
+[2026-11-01 18:02:46] [INFO] VRAM: 60.4 GB free / 95.6 GB total
+[2026-11-01 18:02:46] [INFO] Loading dense tensors from F:\Moecher\models\frankenstin/vision\attention_dense_layers.bin
+[2026-11-01 18:02:46] [INFO]   Loaded Qwen layer 10/36 (Full GQA Attention [INT4])
+[2026-11-01 18:02:46] [INFO]   Loaded Qwen layer 20/36 (Full GQA Attention [INT4])
+[2026-11-01 18:02:46] [INFO]   Loaded Qwen layer 30/36 (Full GQA Attention [INT4])
+[2026-11-01 18:02:46] [INFO]   Loaded Qwen layer 36/36 (Full GQA Attention [INT4])
+[2026-11-01 18:02:47] [INFO] Dense tensors loaded
+[2026-11-01 18:02:47] [INFO] RoPE: non-compressed base=1000000 (no YaRN), compressed base=160000 (YaRN factor=16, max_seq=65536)
+[2026-11-01 18:02:47] [INFO] [Memory] 100% of all experts fit in VRAM L1 cache (0.0 GB). DRAM L2 cache set to 0.0 GB (zero PCIe/SSD traffic)!
+[2026-11-01 18:02:47] [INFO] Expert L1 (VRAM) cache budget: 0.0 GB
+[2026-11-01 18:02:47] [INFO] Expert L2 (DRAM) cache budget: 0.0 GB
+[2026-11-01 18:02:47] [INFO] Dense architecture active (0 routed experts). Bypassing expert cache.
+[2026-11-01 18:02:47] [INFO] No compress_ratios found, using full window for all layers
+[2026-11-01 18:02:47] [INFO] [Vision] Vision configuration detected in manifest. Enabled on-demand Vision Tower (zero VRAM at startup; loads ~990 MB only when an image is processed).
+[2026-11-01 18:02:47] [INFO] Persistent L2 Cache: Pinned 8.29 MB / 60.00 MB budget (zero thrashing, 100% utilization)
+[2026-11-01 18:02:47] [INFO] Warming up and capturing CUDA Graph for decode acceleration...
+[2026-11-01 18:02:47] [INFO] CUDA Graph instantiated successfully! Decode speed accelerated.
+[2026-11-01 18:02:47] [INFO] Model loaded successfully
+[2026-11-01 18:02:47] [INFO] [Vision Delegate] Vision delegate permanently resident in VRAM!
+[2026-11-01 18:02:47] [INFO] Persistent L2 Cache: Pinned 59.25 MB / 60.00 MB budget (zero thrashing, 100% utilization)
+[2026-11-01 18:02:47] [INFO] Warming up and capturing CUDA Graph for decode acceleration...
+[2026-11-01 18:02:47] [INFO] CUDA Graph instantiated successfully! Decode speed accelerated.
+[2026-11-01 18:02:47] [INFO] Warming up and capturing Batched Target CUDA Graph (M=2)...
+[2026-11-01 18:02:47] [INFO] Batched Target CUDA Graph (M=2) instantiated successfully!
+[2026-11-01 18:02:47] [INFO] Warming up and capturing Batched Target CUDA Graph (M=3)...
+[2026-11-01 18:02:47] [INFO] Batched Target CUDA Graph (M=3) instantiated successfully!
+[2026-11-01 18:02:47] [INFO] Warming up and capturing Batched Target CUDA Graph (M=4)...
+[2026-11-01 18:02:47] [INFO] Batched Target CUDA Graph (M=4) instantiated successfully!
+[2026-11-01 18:02:47] [INFO] Model loaded successfully
+[2026-11-01 18:02:47] [INFO] Rebuilding System KV Cache snapshot (31 tokens, 0 active tools)...
+[2026-11-01 18:02:47] [INFO] Nemotron Batched Prefill: 31 prompt tokens (start_offset=0, chunk_size=1024)...
+[2026-11-01 18:02:47] [INFO] [NEMOTRON BREAKDOWN M=31] Total: 160.36 ms (193.3 tok/s) | SSM: 101.92 ms | GQA: 2.22 ms | VRAM MoE (40 layers): 56.17 ms (1.40 ms/l) | DRAM MoE (0 layers): 0.00 ms (0.00 ms/l)
+[2026-11-01 18:02:47] [INFO]   [BOLT MOE SUB-STEP Layer 1 (VRAM) M=31] Router+LatentDown: 1.89 ms | Shared+DMA: 1.28 ms | UpProj: 0.83 ms | DownProj: 0.63 ms | LatentUp: 0.08 ms | Sum: 4.71 ms
+[2026-11-01 18:02:47] [INFO]   [BOLT MOE SUB-STEP Layer 10 (DRAM) M=31] Discover+Copy: 0.08 ms | Shared+DMA: 0.14 ms | UpProj: 0.63 ms | DownProj: 0.44 ms | LatentUp: 0.04 ms | Sum: 1.34 ms
+[2026-11-01 18:02:47] [INFO] Nemotron Batched Prefill completed: 31 tokens in 160.58 ms (193.1 tok/s, cold disk reads: 0)
+[2026-11-01 18:02:47] [INFO] [PREFILL STATS] 31 prefix tokens pre-warmed in 0.191s -> 162.71 tok/s
+[2026-11-01 18:02:47] [INFO] Pinned System KV Cache snapshot created (31 tokens across 88 layers).
+[2026-11-01 18:02:47] [INFO] System KV Cache snapshot pinned successfully (31 tokens).
+[2026-11-01 18:02:47] [INFO] [Config] Loaded persistent server configuration from server_config.json (zdb_enabled=false, mode=chat, temp=0.60, rep_pen=1.05)
+[2026-11-01 18:02:47] [INFO] [Config] Reset server parameters on startup to model defaults: temp=0.60, rep_penalty=1.05, anti_loop=disabled
+[2026-11-01 18:02:47] [INFO] [Proxy] Forward Proxy (HTTP/HTTPS CONNECT) listening on 0.0.0.0:8002
+[2026-11-01 18:02:47] [INFO] Binding to 0.0.0.0:8001...
+[2026-11-01 18:02:47] [INFO] Server listening on port 8001
+[2026-11-01 18:02:47] [INFO] version 2.09
+[2026-11-01 18:02:48] [INFO] REQUEST: {"model": "nemotron_3_5_bolt_24gb", "messages": [{"role": "user", "content": "Say Ready."}], "max_tokens": 8, "temperature": 0.0, "repetition_penalty": 1.0, "stream": true, "enable_thinking": false, "thinking": {"type": "disabled", "budget_tokens": 0}, "max_thinking_tokens": 0, "reasoning_effort": "none", "bypass_prefix_cache": true}
+[2026-11-01 18:02:48] [INFO] Reasoning effort: none, Thinking: disabled, Thinking budget: 0, Tools: 0, Anti-Loop: disabled, Stop-Words: 0, Server-Exec: disabled (client_tool_exec: false, headless: false), Max-Tool-Rounds: 10, Timeout: 60000ms, Bypass-Cache: true
+[2026-11-01 18:02:48] [INFO] RESPONSE (0ms)
+[2026-11-01 18:02:48] [INFO] STREAM PROMPT [round 1] (len=14, continuation=false, visual=none)
+[2026-11-01 18:02:48] [INFO] [KV CACHE] Bypass prefix cache requested: forcing cold full prefill of 14 tokens
+[2026-11-01 18:02:48] [INFO] Nemotron Batched Prefill: 14 prompt tokens (start_offset=0, chunk_size=1024)...
+[2026-11-01 18:02:48] [INFO] [NEMOTRON BREAKDOWN M=14] Total: 66.72 ms (209.8 tok/s) | SSM: 14.75 ms | GQA: 5.26 ms | VRAM MoE (40 layers): 46.69 ms (1.17 ms/l) | DRAM MoE (0 layers): 0.00 ms (0.00 ms/l)
+[2026-11-01 18:02:48] [INFO]   [BOLT MOE SUB-STEP Layer 1 (VRAM) M=14] Router+LatentDown: 0.72 ms | Shared+DMA: 0.32 ms | UpProj: 0.46 ms | DownProj: 0.33 ms | LatentUp: 0.08 ms | Sum: 1.90 ms
+[2026-11-01 18:02:48] [INFO]   [BOLT MOE SUB-STEP Layer 10 (DRAM) M=14] Discover+Copy: 0.13 ms | Shared+DMA: 0.32 ms | UpProj: 0.33 ms | DownProj: 0.22 ms | LatentUp: 0.07 ms | Sum: 1.07 ms
+[2026-11-01 18:02:48] [INFO] Nemotron Batched Prefill completed: 14 tokens in 68.38 ms (204.7 tok/s, cold disk reads: 0)
+[2026-11-01 18:02:48] [INFO] [PREFILL STATS] 14 tokens evaluated in 0.068s -> 204.69 tok/s (prefix cached: 0 / 14, 0.0%)
+[2026-11-01 18:02:48] [WARN] Think tokens: start=12 end=13, EOS=1 eos2=11 user=128803 asst=128804, think_budget=0
+Ready.[2026-11-01 18:02:48] [WARN] Stop token hit: token=11 (cfg_eos=1, eos2=11, im_end=11) at step 2 (content: 2/8, think: 0/0)
+[2026-11-01 18:02:48] [INFO] [GENERATION STATS] 2 tokens in 0.041s -> 49.03 tok/s (Content: 2, Thinking: 0)
+[2026-11-01 18:02:48] [INFO] REQUEST: {"model": "nemotron_3_5_bolt_24gb", "messages": [{"role": "user", "content": "Explain the difference between a mutex and a semaphore in two concise sentences."}], "max_tokens": 120, "temperature": 0.0, "repetition_penalty": 1.0, "stream": true, "enable_thinking": false, "thinking": {"type": "disabled", "budget_tokens": 0}, "max_thinking_tokens": 0, "reasoning_effort": "none", "bypass_prefix_cache": true}
+[2026-11-01 18:02:48] [INFO] Reasoning effort: none, Thinking: disabled, Thinking budget: 0, Tools: 0, Anti-Loop: disabled, Stop-Words: 0, Server-Exec: disabled (client_tool_exec: false, headless: false), Max-Tool-Rounds: 10, Timeout: 60000ms, Bypass-Cache: true
+[2026-11-01 18:02:48] [INFO] RESPONSE (0ms)
+[2026-11-01 18:02:48] [INFO] STREAM PROMPT [round 1] (len=27, continuation=false, visual=none)
+[2026-11-01 18:02:48] [INFO] [KV CACHE] Bypass prefix cache requested: forcing cold full prefill of 27 tokens
+[2026-11-01 18:02:48] [INFO] Nemotron Batched Prefill: 27 prompt tokens (start_offset=0, chunk_size=1024)...
+[2026-11-01 18:02:48] [INFO] [NEMOTRON BREAKDOWN M=27] Total: 107.88 ms (250.3 tok/s) | SSM: 54.28 ms | GQA: 2.11 ms | VRAM MoE (40 layers): 51.49 ms (1.29 ms/l) | DRAM MoE (0 layers): 0.00 ms (0.00 ms/l)
+[2026-11-01 18:02:48] [INFO]   [BOLT MOE SUB-STEP Layer 1 (VRAM) M=27] Router+LatentDown: 0.07 ms | Shared+DMA: 0.14 ms | UpProj: 0.68 ms | DownProj: 0.50 ms | LatentUp: 0.03 ms | Sum: 1.42 ms
+[2026-11-01 18:02:48] [INFO]   [BOLT MOE SUB-STEP Layer 10 (DRAM) M=27] Discover+Copy: 0.09 ms | Shared+DMA: 0.14 ms | UpProj: 0.49 ms | DownProj: 0.34 ms | LatentUp: 0.03 ms | Sum: 1.08 ms
+[2026-11-01 18:02:48] [INFO] Nemotron Batched Prefill completed: 27 tokens in 109.53 ms (246.5 tok/s, cold disk reads: 0)
+[2026-11-01 18:02:48] [INFO] [PREFILL STATS] 27 tokens evaluated in 0.110s -> 246.47 tok/s (prefix cached: 0 / 27, 0.0%)
+[2026-11-01 18:02:48] [WARN] Think tokens: start=12 end=13, EOS=1 eos2=11 user=128803 asst=128804, think_budget=0
+
+A mutex is a mutual exclusion lock that allows only one thread to access a resource at a time, ensuring exclusive access. A semaphore[2026-11-01 18:02:49] [INFO] VERIFY TIMING: cycle=0 M=4 took 38.01ms (graph=1)
+ is a[2026-11-01 18:02:49] [INFO] VERIFY TIMING: cycle=1 M=4 took 37.30ms (graph=1)
+ counter that allows[2026-11-01 18:02:49] [INFO] VERIFY TIMING: cycle=2 M=4 took 37.46ms (graph=1)
+ up to a specified number of threads to access[2026-11-01 18:02:49] [INFO] VERIFY TIMING: cycle=3 M=4 took 36.94ms (graph=1)
+ a resource concurrently, making it more flexible for managing shared resources.[2026-11-01 18:02:49] [WARN] Stop token hit: token=11 (cfg_eos=1, eos2=11, im_end=11) at step 52 (content: 54/120, think: 0/0)
+[2026-11-01 18:02:49] [INFO] [GENERATION STATS] 54 tokens in 1.189s -> 45.40 tok/s (Content: 54, Thinking: 0)
+[2026-11-01 18:02:49] [INFO] [SPECULATIVE STATS] 4 cycles | 12 drafted | 2 accepted (16.7% acceptance rate) | draft: 0.0ms total (0.00ms/c) | verify: 149.7ms total (37.43ms/c)
+[2026-11-01 18:02:50] [INFO] REQUEST: {"model": "nemotron_3_5_bolt_24gb", "messages": [{"role": "user", "content": "Write a clean Python function to calculate the nth Fibonacci number iteratively with type hints and docstring."}], "max_tokens": 320, "temperature": 0.0, "repetition_penalty": 1.0, "stream": true, "enable_thinking": false, "thinking": {"type": "disabled", "budget_tokens": 0}, "max_thinking_tokens": 0, "reasoning_effort": "none", "bypass_prefix_cache": true}
+[2026-11-01 18:02:50] [INFO] Reasoning effort: none, Thinking: disabled, Thinking budget: 0, Tools: 0, Anti-Loop: disabled, Stop-Words: 0, Server-Exec: disabled (client_tool_exec: false, headless: false), Max-Tool-Rounds: 10, Timeout: 60000ms, Bypass-Cache: true
+[2026-11-01 18:02:50] [INFO] RESPONSE (0ms)
+[2026-11-01 18:02:50] [INFO] STREAM PROMPT [round 1] (len=33, continuation=false, visual=none)
+[2026-11-01 18:02:50] [INFO] [KV CACHE] Bypass prefix cache requested: forcing cold full prefill of 33 tokens
+[2026-11-01 18:02:50] [INFO] Nemotron Batched Prefill: 33 prompt tokens (start_offset=0, chunk_size=1024)...
+[2026-11-01 18:02:50] [INFO] [NEMOTRON BREAKDOWN M=33] Total: 120.94 ms (272.9 tok/s) | SSM: 57.07 ms | GQA: 2.14 ms | VRAM MoE (40 layers): 61.71 ms (1.54 ms/l) | DRAM MoE (0 layers): 0.00 ms (0.00 ms/l)
+[2026-11-01 18:02:50] [INFO]   [BOLT MOE SUB-STEP Layer 1 (VRAM) M=33] Router+LatentDown: 1.44 ms | Shared+DMA: 0.89 ms | UpProj: 0.81 ms | DownProj: 0.58 ms | LatentUp: 0.03 ms | Sum: 3.74 ms
+[2026-11-01 18:02:50] [INFO]   [BOLT MOE SUB-STEP Layer 10 (DRAM) M=33] Discover+Copy: 0.09 ms | Shared+DMA: 0.14 ms | UpProj: 0.61 ms | DownProj: 0.43 ms | LatentUp: 0.04 ms | Sum: 1.32 ms
+[2026-11-01 18:02:50] [INFO] Nemotron Batched Prefill completed: 33 tokens in 122.60 ms (269.2 tok/s, cold disk reads: 0)
+[2026-11-01 18:02:50] [INFO] [PREFILL STATS] 33 tokens evaluated in 0.123s -> 269.13 tok/s (prefix cached: 0 / 33, 0.0%)
+[2026-11-01 18:02:50] [WARN] Think tokens: start=12 end=13, EOS=1 eos2=11 user=128803 asst=128804, think_budget=0
+
+Here is a clean[2026-11-01 18:02:50] [INFO] VERIFY TIMING: cycle=0 M=4 took 34.60ms (graph=1)
+, efficient implementation:
+
+```python
+def fibonacci(n: int) -> int:
+    """
+    Calculate the n[2026-11-01 18:02:50] [INFO] VERIFY TIMING: cycle=1 M=4 took 34.60ms (graph=1)
+th Fibonacci number[2026-11-01 18:02:50] [INFO] VERIFY TIMING: cycle=2 M=4 took 34.60ms (graph=1)
+ iteratively.
+
+    The Fibonacci sequence is defined as:
+        F(0) = 0, F([2026-11-01 18:02:51] [INFO] VERIFY TIMING: cycle=3 M=4 took 34.60ms (graph=1)
+1) =[2026-11-01 18:02:51] [INFO] VERIFY TIMING: cycle=4 M=4 took 34.62ms (graph=1)
+ 1
+        F(n) = F(n-1) + F(n-2) for n > 1
+
+    Args:
+        n: The index of the Fibonacci number to calculate. Must be non-negative.
+
+    Returns:
+        The nth Fibonacci number.
+
+    Raises:
+        ValueError: If n is negative.
+    """
+    if n < 0:
+        raise ValueError("n must be a non-negative integer")
+
+    if n == 0:
+        return 0
+    if n == 1:
+        return 1
+
+    a, b = 0, 1
+    for _ in range(2, n + 1):
+        a, b = b, a + b
+
+    return b
+```
+
+**Key features:**
+- **Time complexity:** O(n)
+- **Space complexity:** O(1)
+- **Type hints:** Clear `int` input and output types
+- **Docstring:** Documents the algorithm, arguments, return value, and error conditions
+- **Edge cases:** Handles `n = 0` and `n = 1` explicitly, and validates negative input
+
+**Example usage:**
+```python
+print(fibonacci(0))   # 0
+print(fibonacci(1))   #[2026-11-01 18:02:57] [INFO] [GENERATION STATS] 320 tokens in 6.824s -> 46.90 tok/s (Content: 320, Thinking: 0)
+[2026-11-01 18:02:57] [INFO] [SPECULATIVE STATS] 50 cycles | 150 drafted | 31 accepted (20.7% acceptance rate) | draft: 0.0ms total (0.00ms/c) | verify: 1790.7ms total (35.81ms/c)
+[2026-11-01 18:02:57] [INFO] REQUEST: {"model": "nemotron_3_5_bolt_24gb", "messages": [{"role": "user", "content": "Write a clean, responsive single-file HTML calculator with modern styling and interactive JavaScript."}], "max_tokens": 1200, "temperature": 0.0, "repetition_penalty": 1.0, "stream": true, "enable_thinking": true, "thinking": {"type": "enabled", "budget_tokens": 200}, "max_thinking_tokens": 200, "reasoning_effort": "low", "bypass_prefix_cache": true}
+[2026-11-01 18:02:57] [INFO] Reasoning effort: low, Thinking: enabled, Thinking budget: 200, Tools: 0, Anti-Loop: disabled, Stop-Words: 0, Server-Exec: disabled (client_tool_exec: false, headless: false), Max-Tool-Rounds: 10, Timeout: 60000ms, Bypass-Cache: true
+[2026-11-01 18:02:57] [INFO] RESPONSE (0ms)
+[2026-11-01 18:02:57] [INFO] STREAM PROMPT [round 1] (len=35, continuation=false, visual=none)
+[2026-11-01 18:02:57] [INFO] [KV CACHE] Bypass prefix cache requested: forcing cold full prefill of 35 tokens
+[2026-11-01 18:02:57] [INFO] Nemotron Batched Prefill: 35 prompt tokens (start_offset=0, chunk_size=1024)...
+[2026-11-01 18:02:57] [INFO] [NEMOTRON BREAKDOWN M=35] Total: 124.15 ms (281.9 tok/s) | SSM: 58.25 ms | GQA: 2.22 ms | VRAM MoE (40 layers): 63.67 ms (1.59 ms/l) | DRAM MoE (0 layers): 0.00 ms (0.00 ms/l)
+[2026-11-01 18:02:57] [INFO]   [BOLT MOE SUB-STEP Layer 1 (VRAM) M=35] Router+LatentDown: 0.07 ms | Shared+DMA: 0.15 ms | UpProj: 0.85 ms | DownProj: 0.61 ms | LatentUp: 0.03 ms | Sum: 1.71 ms
+[2026-11-01 18:02:57] [INFO]   [BOLT MOE SUB-STEP Layer 10 (DRAM) M=35] Discover+Copy: 0.09 ms | Shared+DMA: 0.14 ms | UpProj: 0.65 ms | DownProj: 0.45 ms | LatentUp: 0.03 ms | Sum: 1.36 ms
+[2026-11-01 18:02:57] [INFO] Nemotron Batched Prefill completed: 35 tokens in 126.28 ms (277.2 tok/s, cold disk reads: 0)
+[2026-11-01 18:02:57] [INFO] [PREFILL STATS] 35 tokens evaluated in 0.126s -> 277.14 tok/s (prefix cached: 0 / 35, 0.0%)
+[2026-11-01 18:02:57] [WARN] Think tokens: start=12 end=13, EOS=1 eos2=11 user=128803 asst=128804, think_budget=200
+
+The user wants a clean, responsive single-file HTML calculator with modern styling and interactive JavaScript. I should create a complete HTML file with embedded CSS and JavaScript. It should be responsive, modern looking, and fully functional.
+
+Key features:
+- Single file (HTML with embedded CSS and JS)
+- Clean modern styling
+- Responsive design
+- Basic calculator operations: add, subtract, multiply, divide
+- Clear, delete, equals functionality
+- Keyboard support ideally
+- Display screen and buttons
+
+Let me create a nice modern calculator with:
+- CSS Grid for layout
+- Responsive sizing
+- Modern color scheme
+- Smooth interactions
+- Display area
+- Numeric buttons and operation buttons
+- AC (clear), DEL (delete), = (equals)
+
+I'll make it a complete, working single-file solution.```html
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Modern Calculator</title>
+<style>
+  * {
+    box-sizing: border-box;
+    margin: 0;
+   [2026-11-01 18:03:02] [INFO] VERIFY TIMING: cycle=0 M=4 took 34.86ms (graph=1)
+ padding: [2026-11-01 18:03:02] [INFO] VERIFY TIMING: cycle=1 M=4 took 34.88ms (graph=1)
+0;
+  }
+
+  body {
+   [2026-11-01 18:03:02] [INFO] VERIFY TIMING: cycle=2 M=4 took 34.91ms (graph=1)
+ font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, Helvetica, Arial, sans-serif;
+   [2026-11-01 18:03:03] [INFO] VERIFY TIMING: cycle=3 M=4 took 37.71ms (graph=1)
+ background: linear-gradient(135deg, #667eea 0[2026-11-01 18:03:04] [INFO] VERIFY TIMING: cycle=4 M=4 took 38.42ms (graph=1)
+%, #764ba2 100%);
+    min-height: 100vh;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    padding: 20px;
+  }
+
+  .calculator {
+    background: #1e1e2e;
+    border-radius: 24px;
+    box-shadow: 0 20px 50px rgba(0,0,0,0.3);
+    width: 100%;
+    max-width: 400px;
+    overflow: hidden;
+    border: 1px solid rgba(255,255,255,0.1);
+  }
+
+  .display {
+    background: #2d2d3d;
+    padding: 24px;
+    text-align: right;
+    font-size: 32px;
+    font-weight: 300;
+    color: #ffffff;
+    min-height: 100px;
+    display: flex;
+    align-items: flex-end;
+    justify-content: flex-end;
+    overflow-x: auto;
+    border-bottom: 1px solid rgba(255,255,255,0.05);
+  }
+
+  .display .previous {
+    font-size: 14px;
+    color: #888;
+    margin-bottom: 4px;
+    min-height: 20px;
+  }
+
+  .display .current {
+    font-size: 32px;
+    font-weight: 300;
+    word-break: break-all;
+  }
+
+  .buttons {
+    display: grid;
+    grid-template-columns: repeat(4, 1fr);
+    gap: 10px;
+    padding: 20px;
+  }
+
+  .btn {
+    background: #38384c;
+    border: none;
+    color: #ffffff;
+    font-size: 20px;
+    font-weight: 400;
+    padding: 0;
+    height: 70px;
+    border-radius: 12px;
+    cursor: pointer;
+    transition: all 0.15s ease;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+  }
+
+  .btn:hover {
+    background: #48485c;
+    transform: translateY(-1px);
+  }
+
+  .btn:active {
+    transform: translateY(0);
+    background: #58586c;
+  }
+
+  .btn.operator {
+    background: #667eea;
+    font-weight: 600;
+  }
+
+  .btn.operator:hover {
+    background: #7a8bea;
+  }
+
+  .btn.operator:active {
+    background: #5a6eda;
+  }
+
+  .btn.equals {
+    background: #667eea;
+    grid-column: span 2;
+    font-weight: 600;
+  }
+
+  .btn.equals:hover {
+    background: #7a8bea;
+  }
+
+  .btn.clear {
+    background: #e74c3c;
+  }
+
+  .btn.clear:hover {
+    background: #f05a4a;
+  }
+
+  .btn.delete {
+    background: #38384c;
+    color: #888;
+  }
+
+  .btn.delete:hover {
+    background: #48485c;
+    color: #ffffff;
+  }
+
+  .btn.zero {
+    grid-column: span 2;
+  }
+
+  @media (max-width: 480px) {
+    .calculator {
+      max-width: 100%;
+      border-radius: 16px;
+    }
+    .display {
+      font-size: 24px;
+      padding: 16px;
+    }
+    .btn {
+      height: 55px;
+      font-size: 18px;
+    }
+    .buttons {
+      gap: 8px;
+      padding: 16px;
+    }
+  }
+
+  @media (max-width: 360px) {
+    .display {
+      font-size: 20px;
+    }
+    .btn {
+      height: 50px;
+      font-size: 16px;
+    }
+  }
+
+  /* Focus states for keyboard accessibility */
+  .btn:focus-visible {
+    outline: 2px solid #667eea;
+    outline-offset: 2px;
+  }
+</style>
+</head>
+<body>
+
+<div class="calculator">
+  <div class="display">
+    <div class="previous" id="previous"></div>
+    <div class="current" id="current">0</div>
+  </div>
+  <div class="buttons">
+    <button class="btn clear" onclick="clearAll()">AC</button>
+    <button class="btn delete" onclick="deleteNumber()">DEL</button>
+    <button class="btn operator" onclick="appendOperator('/')">�[2026-11-01 18:03:25] [INFO] [GENERATION STATS] 1370 tokens in 27.982s -> 48.96 tok/s (Content: 1200, Thinking: 169)
+[2026-11-01 18:03:25] [INFO] [SPECULATIVE STATS] 297 cycles | 877 drafted | 295 accepted (33.6% acceptance rate) | draft: 0.0ms total (0.00ms/c) | verify: 10968.4ms total (36.93ms/c)
+[2026-11-01 18:03:26] [INFO] REQUEST: {"model": "nemotron_3_5_bolt_24gb", "messages": [{"role": "user", "content": "A bat and a ball cost $1.10 in total. The bat costs $1.00 more than the ball. How much does the ball cost? Show step-by-step logic."}], "max_tokens": 450, "temperature": 0.0, "repetition_penalty": 1.0, "stream": true, "enable_thinking": true, "thinking": {"type": "enabled", "budget_tokens": 500}, "max_thinking_tokens": 500, "reasoning_effort": "high", "bypass_prefix_cache": true}
+[2026-11-01 18:03:26] [INFO] Reasoning effort: high, Thinking: enabled, Thinking budget: 500, Tools: 0, Anti-Loop: disabled, Stop-Words: 0, Server-Exec: disabled (client_tool_exec: false, headless: false), Max-Tool-Rounds: 10, Timeout: 60000ms, Bypass-Cache: true
+[2026-11-01 18:03:26] [INFO] RESPONSE (0ms)
+[2026-11-01 18:03:26] [INFO] STREAM PROMPT [round 1] (len=51, continuation=false, visual=none)
+[2026-11-01 18:03:26] [INFO] [KV CACHE] Bypass prefix cache requested: forcing cold full prefill of 51 tokens
+[2026-11-01 18:03:26] [INFO] Nemotron Batched Prefill: 51 prompt tokens (start_offset=0, chunk_size=1024)...
+[2026-11-01 18:03:26] [INFO] [NEMOTRON BREAKDOWN M=51] Total: 138.92 ms (367.1 tok/s) | SSM: 59.68 ms | GQA: 2.89 ms | VRAM MoE (40 layers): 76.34 ms (1.91 ms/l) | DRAM MoE (0 layers): 0.00 ms (0.00 ms/l)
+[2026-11-01 18:03:26] [INFO]   [BOLT MOE SUB-STEP Layer 1 (VRAM) M=51] Router+LatentDown: 0.13 ms | Shared+DMA: 1.68 ms | UpProj: 0.93 ms | DownProj: 0.67 ms | LatentUp: 0.03 ms | Sum: 3.44 ms
+[2026-11-01 18:03:26] [INFO]   [BOLT MOE SUB-STEP Layer 10 (DRAM) M=51] Discover+Copy: 0.08 ms | Shared+DMA: 0.15 ms | UpProj: 1.00 ms | DownProj: 0.51 ms | LatentUp: 0.03 ms | Sum: 1.78 ms
+[2026-11-01 18:03:26] [INFO] Nemotron Batched Prefill completed: 51 tokens in 140.68 ms (362.5 tok/s, cold disk reads: 0)
+[2026-11-01 18:03:26] [INFO] [PREFILL STATS] 51 tokens evaluated in 0.141s -> 362.48 tok/s (prefix cached: 0 / 51, 0.0%)
+[2026-11-01 18:03:26] [WARN] Think tokens: start=12 end=13, EOS=1 eos2=11 user=128803 asst=128804, think_budget=500
+
+The user is asking a classic math riddle. Let me solve it step by step.
+
+Let the cost of the ball be $x$.
+Then the cost of the bat is $x + $1.00.
+
+Total cost: $x + (x + 1.00) = 1.10$
+$2x + 1.00 = 1.10$
+$2x = 0.10$
+$x = 0.05$
+
+So the ball costs $0.05 (5 cents).
+The bat costs $1.05.
+
+Check: $1.05 + $0.05 = $1.10. Correct.
+Check: Bat costs $1.00 more than ball: $1.05 - $0.05 = $1.00. Correct.
+
+The intuitive but wrong answer is $0.10, but that would make the bat $1.10, totaling $1.20.
+
+I should show the step-by-step logic clearly.Let's solve this step by[2026-11-01 18:03:30] [INFO] VERIFY TIMING: cycle=0 M=4 took 37.87ms (graph=1)
+ step using algebra.
+
+**Step 1: Define variables**
+Let the cost[2026-11-01 18:03:31] [INFO] VERIFY TIMING: cycle=1 M=4 took 37.93ms (graph=1)
+ of the ball be[2026-11-01 18:03:31] [INFO] VERIFY TIMING: cycle=2 M=4 took 37.39ms (graph=1)
+ **$x$**.
+
+**Step[2026-11-01 18:03:31] [INFO] VERIFY TIMING: cycle=3 M=4 took 37.72ms (graph=1)
+ 2: Express the bat[2026-11-01 18:03:31] [INFO] VERIFY TIMING: cycle=4 M=4 took 37.90ms (graph=1)
+'s cost**
+The problem states the bat costs $1.00 more than the ball, so the bat costs **$x + $1.00**.
+
+**Step 3: Set up the equation**
+Together they cost $1.10:
+$$x + (x + 1.00) = 1.10$$
+
+**Step 4: Solve for x**
+Combine like terms:
+$$2x + 1.00 = 1.10$$
+
+Subtract $1.00 from both sides:
+$$2x = 0.10$$
+
+Divide by 2:
+$$x = 0.05$$
+
+**Answer:**
+The ball costs **$0.05** (5 cents).
+
+**Check:**
+- Ball: $0.05
+- Bat: $1.05 ($0.05 + $1.00)
+- Total: $1.10 ✓
+- Bat is $1.00 more than ball ✓
+
+*(The intuitive answer of $0.10 is incorrect—if the ball were $0.10, the bat would be $1.10, making the total $1.20.)*[2026-11-01 18:03:36] [WARN] Stop token hit: token=11 (cfg_eos=1, eos2=11, im_end=11) at step 456 (content: 293/450, think: 219/500)
+[2026-11-01 18:03:36] [INFO] [GENERATION STATS] 513 tokens in 10.740s -> 47.76 tok/s (Content: 293, Thinking: 219)
+[2026-11-01 18:03:36] [INFO] [SPECULATIVE STATS] 68 cycles | 204 drafted | 57 accepted (27.9% acceptance rate) | draft: 0.0ms total (0.00ms/c) | verify: 2487.4ms total (36.58ms/c)
+[2026-11-01 18:03:37] [INFO] REQUEST: {"model": "nemotron_3_5_bolt_24gb", "messages": [{"role": "user", "content": "In distributed systems engineering, achieving fault-tolerant consensus across an asynchronous network with unreliable nodes presents fundamental trade-offs formalized by the CAP theorem and the FLP impossibility result. State machine replication (SMR) is a primary paradigm used to build resilient distributed services. In SMR, multiple identical deterministic replicas execute a sequence of commands in the identical order. Consensus algorithms such as Paxos and Raft coordinate the sequence of log entries. Raft structures consensus around an elected leader that manages log replication, heartbeats, and client interactions. If the leader fails, a randomized election timer triggers candidate state transitions to elect a successor. Safety is maintained by ensuring log matching invariants, leader completeness, and state machine commitment rules. Multi-Paxos optimizes write latency by leasing leader terms and amortizing prepare phases.\n\nFurthermore, modern distributed datastores employ hybrid logical clocks (HLC) and synchronized GPS/atomic TrueTime hardware to provide external consistency without relying solely on distributed lock managers. By combining monotonic physical clocks with logical counters, systems can order distributed transactions across geographically separated data centers while bounding clock drift. When network partitions occur, distributed databases must choose between linearizable read-write availability and strong consistency guarantees. Quorum-based protocols require strict majority overlap (R + W > N) to prevent split-brain anomalies during transient link degradations and asymmetric network partitions.\n\nLog compaction and snapshotting are equally critical in production deployments. Because logs cannot grow unboundedly, replicas periodically take point-in-time state snapshots and discard prior log entries. Replicas that lag too far behind receive full snapshots over the network before rejoining the active consensus group. Dynamic cluster membership changes must also be handled carefully through joint consensus configurations to prevent disjoint majority splits when nodes join or leave the cluster.\n\nIn distributed systems engineering, achieving fault-tolerant consensus across an asynchronous network with unreliable nodes presents fundamental trade-offs formalized by the CAP theorem and the FLP impossibility result. State machine replication (SMR) is a primary paradigm used to build resilient distributed services. In SMR, multiple identical deterministic replicas execute a sequence of commands in the identical order. Consensus algorithms such as Paxos and Raft coordinate the sequence of log entries. Raft structures consensus around an elected leader that manages log replication, heartbeats, and client interactions. If the leader fails, a randomized election timer triggers candidate state transitions to elect a successor. Safety is maintained by ensuring log matching invariants, leader completeness, and state machine commitment rules. Multi-Paxos optimizes write latency by leasing leader terms and amortizing prepare phases.\n\nFurthermore, modern distributed datastores employ hybrid logical clocks (HLC) and synchronized GPS/atomic TrueTime hardware to provide external consistency without relying solely on distributed lock managers. By combining monotonic physical clocks with logical counters, systems can order distributed transactions across geographically separated data centers while bounding clock drift. When network partitions occur, distributed databases must choose between linearizable read-write availability and strong consistency guarantees. Quorum-based protocols require strict majority overlap (R + W > N) to prevent split-brain anomalies during transient link degradations and asymmetric network partitions.\n\nLog compaction and snapshotting are equally critical in production deployments. Because logs cannot grow unboundedly, replicas periodically take point-in-time state snapshots and discard prior log entries
+[2026-11-01 18:03:37] [INFO] Reasoning effort: none, Thinking: disabled, Thinking budget: 0, Tools: 0, Anti-Loop: disabled, Stop-Words: 0, Server-Exec: disabled (client_tool_exec: false, headless: false), Max-Tool-Rounds: 10, Timeout: 60000ms, Bypass-Cache: true
+[2026-11-01 18:03:37] [INFO] RESPONSE (1ms)
+[2026-11-01 18:03:37] [INFO] STREAM PROMPT [round 1] (len=1866, continuation=false, visual=none)
+[2026-11-01 18:03:37] [INFO] [KV CACHE] Bypass prefix cache requested: forcing cold full prefill of 1866 tokens
+[2026-11-01 18:03:37] [INFO] Nemotron Batched Prefill: 1866 prompt tokens (start_offset=0, chunk_size=1024)...
+[2026-11-01 18:03:38] [INFO] [NEMOTRON BREAKDOWN M=1024] Total: 865.78 ms (1182.7 tok/s) | SSM: 151.68 ms | GQA: 79.76 ms | VRAM MoE (40 layers): 634.32 ms (15.86 ms/l) | DRAM MoE (0 layers): 0.00 ms (0.00 ms/l)
+[2026-11-01 18:03:38] [INFO]   [BOLT MOE SUB-STEP Layer 1 (VRAM) M=1024] Router+LatentDown: 1.82 ms | Shared+DMA: 1.99 ms | UpProj: 7.31 ms | DownProj: 5.44 ms | LatentUp: 0.14 ms | Sum: 16.71 ms
+[2026-11-01 18:03:38] [INFO]   [BOLT MOE SUB-STEP Layer 10 (DRAM) M=1024] Discover+Copy: 0.17 ms | Shared+DMA: 0.38 ms | UpProj: 9.09 ms | DownProj: 6.37 ms | LatentUp: 0.06 ms | Sum: 16.06 ms
+[2026-11-01 18:03:38] [INFO] [NEMOTRON BREAKDOWN M=842] Total: 787.69 ms (1068.9 tok/s) | SSM: 127.92 ms | GQA: 168.23 ms | VRAM MoE (40 layers): 491.52 ms (12.29 ms/l) | DRAM MoE (0 layers): 0.00 ms (0.00 ms/l)
+[2026-11-01 18:03:38] [INFO]   [BOLT MOE SUB-STEP Layer 1 (VRAM) M=842] Router+LatentDown: 0.85 ms | Shared+DMA: 1.77 ms | UpProj: 6.15 ms | DownProj: 4.34 ms | LatentUp: 0.14 ms | Sum: 13.25 ms
+[2026-11-01 18:03:38] [INFO]   [BOLT MOE SUB-STEP Layer 10 (DRAM) M=842] Discover+Copy: 0.15 ms | Shared+DMA: 0.34 ms | UpProj: 6.91 ms | DownProj: 5.05 ms | LatentUp: 0.05 ms | Sum: 12.50 ms
+[2026-11-01 18:03:38] [INFO] Nemotron Batched Prefill completed: 1866 tokens in 1655.50 ms (1127.2 tok/s, cold disk reads: 0)
+[2026-11-01 18:03:38] [INFO] [PREFILL STATS] 1866 tokens evaluated in 1.656s -> 1127.14 tok/s (prefix cached: 0 / 1866, 0.0%)
+[2026-11-01 18:03:38] [WARN] Think tokens: start=12 end=13, EOS=1 eos2=11 user=128803 asst=128804, think_budget=0
+
+- **Safety via Leader Election and Log Invariants:** Raft[2026-11-01 18:03:39] [INFO] VERIFY TIMING: cycle=0 M=4 took 39.66ms (graph=1)
+ ensures safety through randomized leader elections, log matching invariants, and[2026-11-01 18:03:39] [INFO] VERIFY TIMING: cycle=1 M=4 took 40.24ms (graph=1)
+ leader completeness rules, guaranteeing that only one leader exists per term and committed entries are never lost.
+- **[2026-11-01 18:03:40] [INFO] VERIFY TIMING: cycle=2 M=4 took 39.69ms (graph=1)
+Log Growth Management:** To prevent unbounded log growth[2026-11-01 18:03:40] [INFO] VERIFY TIMING: cycle=3 M=4 took 40.03ms (graph=1)
+, systems use[2026-11-01 18:03:40] [INFO] VERIFY TIMING: cycle=4 M=4 took 40.16ms (graph=1)
+ periodic point-in-time snapshots and log compaction, allowing lagging replicas to rejoin the consensus group via snapshot transfer rather than replaying the entire history.
+- **Consistency and Membership:** Consistency is maintained using quorum-based protocols (R + W > N) to prevent split-brain during partitions, while dynamic membership changes are handled through joint consensus configurations to avoid disjoint majorities.[2026-11-01 18:03:42] [WARN] Stop token hit: token=11 (cfg_eos=1, eos2=11, im_end=11) at step 140 (content: 142/180, think: 0/0)
+[2026-11-01 18:03:42] [INFO] [GENERATION STATS] 142 tokens in 3.400s -> 41.77 tok/s (Content: 142, Thinking: 0)
+[2026-11-01 18:03:42] [INFO] [SPECULATIVE STATS] 6 cycles | 18 drafted | 2 accepted (11.1% acceptance rate) | draft: 0.0ms total (0.00ms/c) | verify: 237.0ms total (39.49ms/c)
+[2026-11-01 18:03:42] [INFO] REQUEST: {"model": "nemotron_3_5_bolt_24gb", "messages": [{"role": "user", "content": "In distributed systems engineering, achieving fault-tolerant consensus across an asynchronous network with unreliable nodes presents fundamental trade-offs formalized by the CAP theorem and the FLP impossibility result. State machine replication (SMR) is a primary paradigm used to build resilient distributed services. In SMR, multiple identical deterministic replicas execute a sequence of commands in the identical order. Consensus algorithms such as Paxos and Raft coordinate the sequence of log entries. Raft structures consensus around an elected leader that manages log replication, heartbeats, and client interactions. If the leader fails, a randomized election timer triggers candidate state transitions to elect a successor. Safety is maintained by ensuring log matching invariants, leader completeness, and state machine commitment rules. Multi-Paxos optimizes write latency by leasing leader terms and amortizing prepare phases.\n\nFurthermore, modern distributed datastores employ hybrid logical clocks (HLC) and synchronized GPS/atomic TrueTime hardware to provide external consistency without relying solely on distributed lock managers. By combining monotonic physical clocks with logical counters, systems can order distributed transactions across geographically separated data centers while bounding clock drift. When network partitions occur, distributed databases must choose between linearizable read-write availability and strong consistency guarantees. Quorum-based protocols require strict majority overlap (R + W > N) to prevent split-brain anomalies during transient link degradations and asymmetric network partitions.\n\nLog compaction and snapshotting are equally critical in production deployments. Because logs cannot grow unboundedly, replicas periodically take point-in-time state snapshots and discard prior log entries. Replicas that lag too far behind receive full snapshots over the network before rejoining the active consensus group. Dynamic cluster membership changes must also be handled carefully through joint consensus configurations to prevent disjoint majority splits when nodes join or leave the cluster.\n\nIn distributed systems engineering, achieving fault-tolerant consensus across an asynchronous network with unreliable nodes presents fundamental trade-offs formalized by the CAP theorem and the FLP impossibility result. State machine replication (SMR) is a primary paradigm used to build resilient distributed services. In SMR, multiple identical deterministic replicas execute a sequence of commands in the identical order. Consensus algorithms such as Paxos and Raft coordinate the sequence of log entries. Raft structures consensus around an elected leader that manages log replication, heartbeats, and client interactions. If the leader fails, a randomized election timer triggers candidate state transitions to elect a successor. Safety is maintained by ensuring log matching invariants, leader completeness, and state machine commitment rules. Multi-Paxos optimizes write latency by leasing leader terms and amortizing prepare phases.\n\nFurthermore, modern distributed datastores employ hybrid logical clocks (HLC) and synchronized GPS/atomic TrueTime hardware to provide external consistency without relying solely on distributed lock managers. By combining monotonic physical clocks with logical counters, systems can order distributed transactions across geographically separated data centers while bounding clock drift. When network partitions occur, distributed databases must choose between linearizable read-write availability and strong consistency guarantees. Quorum-based protocols require strict majority overlap (R + W > N) to prevent split-brain anomalies during transient link degradations and asymmetric network partitions.\n\nLog compaction and snapshotting are equally critical in production deployments. Because logs cannot grow unboundedly, replicas periodically take point-in-time state snapshots and discard prior log entries
+[2026-11-01 18:03:42] [INFO] Reasoning effort: none, Thinking: disabled, Thinking budget: 0, Tools: 0, Anti-Loop: disabled, Stop-Words: 0, Server-Exec: disabled (client_tool_exec: false, headless: false), Max-Tool-Rounds: 10, Timeout: 60000ms, Bypass-Cache: true
+[2026-11-01 18:03:42] [INFO] RESPONSE (0ms)
+[2026-11-01 18:03:42] [INFO] STREAM PROMPT [round 1] (len=2927, continuation=false, visual=none)
+[2026-11-01 18:03:42] [INFO] [KV CACHE] Bypass prefix cache requested: forcing cold full prefill of 2927 tokens
+[2026-11-01 18:03:42] [INFO] Nemotron Batched Prefill: 2927 prompt tokens (start_offset=0, chunk_size=1024)...
+[2026-11-01 18:03:43] [INFO] [NEMOTRON BREAKDOWN M=1024] Total: 869.35 ms (1177.9 tok/s) | SSM: 152.53 ms | GQA: 80.50 ms | VRAM MoE (40 layers): 636.30 ms (15.91 ms/l) | DRAM MoE (0 layers): 0.00 ms (0.00 ms/l)
+[2026-11-01 18:03:43] [INFO]   [BOLT MOE SUB-STEP Layer 1 (VRAM) M=1024] Router+LatentDown: 0.14 ms | Shared+DMA: 0.37 ms | UpProj: 7.36 ms | DownProj: 5.17 ms | LatentUp: 0.06 ms | Sum: 13.11 ms
+[2026-11-01 18:03:43] [INFO]   [BOLT MOE SUB-STEP Layer 10 (DRAM) M=1024] Discover+Copy: 0.16 ms | Shared+DMA: 0.38 ms | UpProj: 9.00 ms | DownProj: 6.73 ms | LatentUp: 0.06 ms | Sum: 16.34 ms
+[2026-11-01 18:03:44] [INFO] [NEMOTRON BREAKDOWN M=1024] Total: 935.66 ms (1094.4 tok/s) | SSM: 142.91 ms | GQA: 215.95 ms | VRAM MoE (40 layers): 576.78 ms (14.42 ms/l) | DRAM MoE (0 layers): 0.00 ms (0.00 ms/l)
+[2026-11-01 18:03:44] [INFO]   [BOLT MOE SUB-STEP Layer 1 (VRAM) M=1024] Router+LatentDown: 0.13 ms | Shared+DMA: 0.40 ms | UpProj: 7.34 ms | DownProj: 5.26 ms | LatentUp: 0.06 ms | Sum: 13.18 ms
+[2026-11-01 18:03:44] [INFO]   [BOLT MOE SUB-STEP Layer 10 (DRAM) M=1024] Discover+Copy: 0.16 ms | Shared+DMA: 0.38 ms | UpProj: 8.09 ms | DownProj: 5.91 ms | LatentUp: 0.06 ms | Sum: 14.59 ms
+[2026-11-01 18:03:45] [INFO] [NEMOTRON BREAKDOWN M=879] Total: 973.17 ms (903.2 tok/s) | SSM: 134.51 ms | GQA: 309.71 ms | VRAM MoE (40 layers): 528.93 ms (13.22 ms/l) | DRAM MoE (0 layers): 0.00 ms (0.00 ms/l)
+[2026-11-01 18:03:45] [INFO]   [BOLT MOE SUB-STEP Layer 1 (VRAM) M=879] Router+LatentDown: 0.12 ms | Shared+DMA: 0.46 ms | UpProj: 6.18 ms | DownProj: 4.42 ms | LatentUp: 0.05 ms | Sum: 11.23 ms
+[2026-11-01 18:03:45] [INFO]   [BOLT MOE SUB-STEP Layer 10 (DRAM) M=879] Discover+Copy: 0.16 ms | Shared+DMA: 0.35 ms | UpProj: 7.02 ms | DownProj: 5.15 ms | LatentUp: 0.05 ms | Sum: 12.73 ms
+[2026-11-01 18:03:45] [INFO] Nemotron Batched Prefill completed: 2927 tokens in 2780.52 ms (1052.7 tok/s, cold disk reads: 0)
+[2026-11-01 18:03:45] [INFO] [PREFILL STATS] 2927 tokens evaluated in 2.781s -> 1052.68 tok/s (prefix cached: 0 / 2927, 0.0%)
+[2026-11-01 18:03:45] [WARN] Think tokens: start=12 end=13, EOS=1 eos2=11 user=128803 asst=128804, think_budget=0
+
+The core invariant of distributed consensus[2026-11-01 18:03:45] [INFO] VERIFY TIMING: cycle=0 M=4 took 41.55ms (graph=1)
+ is that a majority of replicas must agree on the same ordered sequence of commands before any replica commits them to the state machine, ensuring that all non-faulty replicas execute identical operations in the same[2026-11-01 18:03:46] [INFO] VERIFY TIMING: cycle=1 M=4 took 38.48ms (graph=1)
+ order despite network partitions and node failures.[2026-11-01 18:03:46] [WARN] Stop token hit: token=11 (cfg_eos=1, eos2=11, im_end=11) at step 53 (content: 53/64, think: 0/0)
+[2026-11-01 18:03:46] [INFO] [GENERATION STATS] 53 tokens in 1.363s -> 38.89 tok/s (Content: 53, Thinking: 0)
+[2026-11-01 18:03:46] [INFO] [SPECULATIVE STATS] 2 cycles | 6 drafted | 0 accepted (0.0% acceptance rate) | draft: 0.0ms total (0.00ms/c) | verify: 80.0ms total (40.02ms/c)
+[2026-11-01 18:03:47] [INFO] REQUEST: {"model": "nemotron_3_5_bolt_24gb", "messages": [{"role": "user", "content": "Hi"}], "max_tokens": 2, "temperature": 0.0, "repetition_penalty": 1.0, "stream": true, "enable_thinking": false, "thinking": {"type": "disabled", "budget_tokens": 0}, "max_thinking_tokens": 0, "reasoning_effort": "none", "bypass_prefix_cache": true}
+[2026-11-01 18:03:47] [INFO] Reasoning effort: none, Thinking: disabled, Thinking budget: 0, Tools: 0, Anti-Loop: disabled, Stop-Words: 0, Server-Exec: disabled (client_tool_exec: false, headless: false), Max-Tool-Rounds: 10, Timeout: 60000ms, Bypass-Cache: true
+[2026-11-01 18:03:47] [INFO] RESPONSE (0ms)
+[2026-11-01 18:03:47] [INFO] STREAM PROMPT [round 1] (len=12, continuation=false, visual=none)
+[2026-11-01 18:03:47] [INFO] [KV CACHE] Bypass prefix cache requested: forcing cold full prefill of 12 tokens
+[2026-11-01 18:03:47] [INFO] Nemotron Batched Prefill: 12 prompt tokens (start_offset=0, chunk_size=1024)...
+[2026-11-01 18:03:47] [INFO] [NEMOTRON BREAKDOWN M=12] Total: 60.89 ms (197.1 tok/s) | SSM: 14.44 ms | GQA: 4.73 ms | VRAM MoE (40 layers): 41.67 ms (1.04 ms/l) | DRAM MoE (0 layers): 0.00 ms (0.00 ms/l)
+[2026-11-01 18:03:47] [INFO]   [BOLT MOE SUB-STEP Layer 1 (VRAM) M=12] Router+LatentDown: 0.11 ms | Shared+DMA: 0.30 ms | UpProj: 0.41 ms | DownProj: 0.29 ms | LatentUp: 0.07 ms | Sum: 1.19 ms
+[2026-11-01 18:03:47] [INFO]   [BOLT MOE SUB-STEP Layer 10 (DRAM) M=12] Discover+Copy: 0.13 ms | Shared+DMA: 0.30 ms | UpProj: 0.32 ms | DownProj: 0.20 ms | LatentUp: 0.07 ms | Sum: 1.01 ms
+[2026-11-01 18:03:47] [INFO] Nemotron Batched Prefill completed: 12 tokens in 62.64 ms (191.6 tok/s, cold disk reads: 0)
+[2026-11-01 18:03:47] [INFO] [PREFILL STATS] 12 tokens evaluated in 0.063s -> 191.53 tok/s (prefix cached: 0 / 12, 0.0%)
+[2026-11-01 18:03:47] [WARN] Think tokens: start=12 end=13, EOS=1 eos2=11 user=128803 asst=128804, think_budget=0
+
+Hello![2026-11-01 18:03:47] [INFO] [GENERATION STATS] 2 tokens in 0.021s -> 97.32 tok/s (Content: 2, Thinking: 0)

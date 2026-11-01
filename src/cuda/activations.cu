@@ -5724,9 +5724,38 @@ void gemv_q8_0_f32_cuda(
     gemv_q8_0_kernel<float, false><<<blocks, threads, 0, stream>>>(out, vec, weight, N, K);
 }
 
-template <bool Residual>
-__global__ void gemm_q8_0_batch_kernel(
+__global__ void q8_0_dequant_kernel(
     __nv_bfloat16* __restrict__ out,
+    const block_q8_0* __restrict__ weight,
+    int N, int K)
+{
+    int row = blockIdx.y;
+    int b = blockIdx.x * blockDim.y + threadIdx.y;
+    int lane = threadIdx.x;
+    int n_blocks = K / 32;
+    if (row >= N || b >= n_blocks) return;
+
+    const block_q8_0* blk = &weight[(size_t)row * n_blocks + b];
+    float d = __half2float(blk->d);
+    float w = (float)blk->qs[lane] * d;
+    out[(size_t)row * K + b * 32 + lane] = __float2bfloat16(w);
+}
+
+void q8_0_dequant_cuda(
+    __nv_bfloat16* out,
+    const block_q8_0* weight,
+    int rows, int cols,
+    cudaStream_t stream)
+{
+    int n_blocks = cols / 32;
+    dim3 threads(32, 4);
+    dim3 blocks((n_blocks + 3) / 4, rows);
+    q8_0_dequant_kernel<<<blocks, threads, 0, stream>>>(out, weight, rows, cols);
+}
+
+template <typename TOut, bool Residual>
+__global__ void gemm_q8_0_batch_kernel(
+    TOut* __restrict__ out,
     const __nv_bfloat16* __restrict__ vec,
     const block_q8_0* __restrict__ weight,
     int M, int N, int K)
@@ -5780,10 +5809,18 @@ __global__ void gemm_q8_0_batch_kernel(
             if (t >= active_m) break;
             int m = m_base + t;
             if constexpr (Residual) {
-                float cur = __bfloat162float(out[(size_t)m * N + row]);
-                out[(size_t)m * N + row] = __float2bfloat16(cur + acc[t]);
+                if constexpr (std::is_same_v<TOut, __nv_bfloat16>) {
+                    float cur = __bfloat162float(out[(size_t)m * N + row]);
+                    out[(size_t)m * N + row] = __float2bfloat16(cur + acc[t]);
+                } else {
+                    out[(size_t)m * N + row] = (TOut)(out[(size_t)m * N + row] + acc[t]);
+                }
             } else {
-                out[(size_t)m * N + row] = __float2bfloat16(acc[t]);
+                if constexpr (std::is_same_v<TOut, __nv_bfloat16>) {
+                    out[(size_t)m * N + row] = __float2bfloat16(acc[t]);
+                } else {
+                    out[(size_t)m * N + row] = (TOut)acc[t];
+                }
             }
         }
     }
@@ -5798,7 +5835,19 @@ void gemm_q8_0_batch_cuda(
 {
     dim3 threads(32, 4);
     dim3 blocks((N + 3) / 4, (M + 7) / 8);
-    gemm_q8_0_batch_kernel<false><<<blocks, threads, 0, stream>>>(out, vec, weight, M, N, K);
+    gemm_q8_0_batch_kernel<__nv_bfloat16, false><<<blocks, threads, 0, stream>>>(out, vec, weight, M, N, K);
+}
+
+void gemm_q8_0_f32_batch_cuda(
+    float* out,
+    const __nv_bfloat16* vec,
+    const block_q8_0* weight,
+    int M, int N, int K,
+    cudaStream_t stream)
+{
+    dim3 threads(32, 4);
+    dim3 blocks((N + 3) / 4, (M + 7) / 8);
+    gemm_q8_0_batch_kernel<float, false><<<blocks, threads, 0, stream>>>(out, vec, weight, M, N, K);
 }
 
 void gemm_q8_0_residual_batch_cuda(
@@ -5810,7 +5859,7 @@ void gemm_q8_0_residual_batch_cuda(
 {
     dim3 threads(32, 4);
     dim3 blocks((N + 3) / 4, (M + 7) / 8);
-    gemm_q8_0_batch_kernel<true><<<blocks, threads, 0, stream>>>(inout, vec, weight, M, N, K);
+    gemm_q8_0_batch_kernel<__nv_bfloat16, true><<<blocks, threads, 0, stream>>>(inout, vec, weight, M, N, K);
 }
 
 __global__ void iq2_xxs_dequant_kernel(
@@ -5818,33 +5867,49 @@ __global__ void iq2_xxs_dequant_kernel(
     const block_iq2_xxs* __restrict__ weight,
     int N, int K)
 {
-    int row = blockIdx.y;
-    int col_blk = blockIdx.x * blockDim.x + threadIdx.x;
+    __shared__ uint64_t s_grid[256];
+    __shared__ uint8_t s_signs[128];
+
+    int tid = threadIdx.y * 32 + threadIdx.x;
+    if (tid < 128) {
+        s_signs[tid] = c_ksigns_iq2xs[tid];
+    }
+    s_grid[tid] = c_iq2xxs_grid[tid];
+    if (blockDim.y * 32 < 256) {
+        s_grid[tid + 128] = c_iq2xxs_grid[tid + 128];
+    }
+    __syncthreads();
+
+    int row = blockIdx.y * blockDim.y + threadIdx.y;
+    int col_blk = blockIdx.x;
     int n_blocks = K / 256;
     if (row >= N || col_blk >= n_blocks) return;
 
-    const block_iq2_xxs* blk = &weight[row * n_blocks + col_blk];
-    float d = __half2float(blk->d);
-    __nv_bfloat16* out_row = out + row * K + col_blk * 256;
+    int lane = threadIdx.x;
+    int l = lane / 8;
+    int j = lane % 8;
+    uint8_t kmask = 1 << j;
 
+    const block_iq2_xxs* blk = &weight[(size_t)row * n_blocks + col_blk];
+    float d = __half2float(blk->d);
+    const uint16_t* qs = blk->qs;
+    __nv_bfloat16* out_row = out + (size_t)row * K + col_blk * 256;
+
+    #pragma unroll
     for (int ib32 = 0; ib32 < 8; ib32++) {
-        uint32_t aux0 = (uint32_t)blk->qs[ib32 * 4 + 0] | ((uint32_t)blk->qs[ib32 * 4 + 1] << 16);
-        uint32_t aux1 = (uint32_t)blk->qs[ib32 * 4 + 2] | ((uint32_t)blk->qs[ib32 * 4 + 3] << 16);
+        uint32_t aux0 = (uint32_t)qs[ib32 * 4 + 0] | ((uint32_t)qs[ib32 * 4 + 1] << 16);
+        uint32_t aux1 = (uint32_t)qs[ib32 * 4 + 2] | ((uint32_t)qs[ib32 * 4 + 3] << 16);
         float db = d * (0.5f + (aux1 >> 28)) * 0.25f;
 
-        for (int l = 0; l < 4; l++) {
-            uint8_t grid_idx = (aux0 >> (8 * l)) & 0xFF;
-            uint8_t sign_idx = (aux1 >> (7 * l)) & 0x7F;
-            uint64_t grid_val = c_iq2xxs_grid[grid_idx];
-            uint8_t sign_val = c_ksigns_iq2xs[sign_idx];
+        uint8_t grid_idx = (aux0 >> (8 * l)) & 0xFF;
+        uint8_t sign_idx = (aux1 >> (7 * l)) & 0x7F;
+        uint64_t grid_val = s_grid[grid_idx];
+        uint8_t sign_val = s_signs[sign_idx];
 
-            for (int j = 0; j < 8; j++) {
-                uint8_t byte_val = (grid_val >> (8 * j)) & 0xFF;
-                float sign_mult = (sign_val & c_kmask_iq2xs[j]) ? -1.0f : 1.0f;
-                float w = db * (float)byte_val * sign_mult;
-                out_row[ib32 * 32 + l * 8 + j] = __float2bfloat16(w);
-            }
-        }
+        uint8_t byte_val = (grid_val >> (8 * j)) & 0xFF;
+        float sign_mult = (sign_val & kmask) ? -1.0f : 1.0f;
+        float w = db * (float)byte_val * sign_mult;
+        out_row[(ib32 << 5) + lane] = __float2bfloat16(w);
     }
 }
 
@@ -5855,8 +5920,8 @@ void iq2_xxs_dequant_cuda(
     cudaStream_t stream)
 {
     int n_blocks = cols / 256;
-    dim3 threads(64, 1);
-    dim3 blocks((n_blocks + 63) / 64, rows);
+    dim3 threads(32, 4);
+    dim3 blocks(n_blocks, (rows + 3) / 4);
     iq2_xxs_dequant_kernel<<<blocks, threads, 0, stream>>>(out, weight, rows, cols);
 }
 

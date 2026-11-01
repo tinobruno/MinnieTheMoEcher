@@ -510,8 +510,21 @@ void gemv_q8_0_f32_cuda(
     int rows, int cols,
     cudaStream_t stream = 0);
 
+void q8_0_dequant_cuda(
+    __nv_bfloat16* out,
+    const block_q8_0* weight,
+    int rows, int cols,
+    cudaStream_t stream = 0);
+
 void gemm_q8_0_batch_cuda(
     __nv_bfloat16* out,
+    const __nv_bfloat16* vec,
+    const block_q8_0* weight,
+    int M, int N, int K,
+    cudaStream_t stream = 0);
+
+void gemm_q8_0_f32_batch_cuda(
+    float* out,
     const __nv_bfloat16* vec,
     const block_q8_0* weight,
     int M, int N, int K,
@@ -1749,7 +1762,8 @@ void moe_nemotron_up_relu2_batch_cuda(
     int M, int N, int K,
     cudaStream_t stream = 0,
     int top_k = 6,
-    int n_experts = 128);
+    int n_experts = 128,
+    size_t up_s_offset = 0);
 
 void moe_nemotron_down_scaled_residual_batch_cuda(
     __nv_bfloat16* hidden_out,
@@ -1765,7 +1779,9 @@ void moe_nemotron_down_scaled_residual_batch_cuda(
     cudaStream_t stream = 0,
     int top_k = 6,
     int n_experts = 128,
-    int down_offset_padding = 0);
+    int down_offset_padding = 0,
+    size_t down_w_offset = 0,
+    size_t down_s_offset = 0);
 
 void gemm_iq2_xxs_relu2_batch_cuda(
     __nv_bfloat16* out,
@@ -1808,6 +1824,40 @@ void moe_iq2_xxs_binned_down_scaled_residual_batch_cuda(
     int top_k = 9,
     int n_experts = 496,
     size_t down_offset_bytes = 675840);
+
+void nvfp4_dequant_cuda(
+    __nv_bfloat16* out,
+    const uint8_t* weight,
+    const uint8_t* scale_fp8,
+    float scale_2,
+    int rows, int cols,
+    cudaStream_t stream = 0);
+
+void moe_iq2_xxs_up_relu2_m1_cuda(
+    __nv_bfloat16* gate_out,
+    const __nv_bfloat16* hidden_in,
+    const int32_t* topk_ids,
+    const void* const* expert_ptrs,
+    const float* expert_scales,
+    int N, int K,
+    cudaStream_t stream = 0,
+    int top_k = 6,
+    int n_experts = 512,
+    int M = 1);
+
+void moe_iq2_xxs_down_scaled_residual_m1_cuda(
+    __nv_bfloat16* hidden_out,
+    const __nv_bfloat16* gate_in,
+    const int32_t* topk_ids,
+    const float* topk_weights,
+    const void* const* expert_ptrs,
+    const float* expert_scales,
+    int N, int K,
+    cudaStream_t stream = 0,
+    int top_k = 6,
+    int n_experts = 512,
+    size_t down_offset_bytes = 675840,
+    int M = 1);
 
 void engram_gated_residual_cuda(
     __nv_bfloat16* hc_state,

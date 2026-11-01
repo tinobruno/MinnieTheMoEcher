@@ -469,19 +469,19 @@
                     lw.conv1d_w.bf16(),
                     lw.conv_state.bf16(),
                     lw.conv_state.bf16(),
-                    (M > 1 && M <= 4) ? lw.conv_state_slots[0].bf16() : nullptr,
-                    (M > 2 && M <= 4) ? lw.conv_state_slots[1].bf16() : nullptr,
-                    (M > 3 && M <= 4) ? lw.conv_state_slots[2].bf16() : nullptr,
-                    (M > 4 && M <= 4) ? lw.conv_state_slots[3].bf16() : nullptr,
+                    (M > 1 && M <= 5) ? lw.conv_state_slots[0].bf16() : nullptr,
+                    (M > 2 && M <= 5) ? lw.conv_state_slots[1].bf16() : nullptr,
+                    (M > 3 && M <= 5) ? lw.conv_state_slots[2].bf16() : nullptr,
+                    (M > 4 && M <= 5) ? lw.conv_state_slots[3].bf16() : nullptr,
                     lw.A_log.bf16(),
                     lw.dt_bias.bf16(),
                     lw.linear_norm_w.bf16(),
                     lw.ssm_state.bf16(),
                     lw.ssm_state.bf16(),
-                    (M > 1 && M <= 4) ? lw.ssm_state_slots[0].bf16() : nullptr,
-                    (M > 2 && M <= 4) ? lw.ssm_state_slots[1].bf16() : nullptr,
-                    (M > 3 && M <= 4) ? lw.ssm_state_slots[2].bf16() : nullptr,
-                    (M > 4 && M <= 4) ? lw.ssm_state_slots[3].bf16() : nullptr,
+                    (M > 1 && M <= 5) ? lw.ssm_state_slots[0].bf16() : nullptr,
+                    (M > 2 && M <= 5) ? lw.ssm_state_slots[1].bf16() : nullptr,
+                    (M > 3 && M <= 5) ? lw.ssm_state_slots[2].bf16() : nullptr,
+                    (M > 4 && M <= 5) ? lw.ssm_state_slots[3].bf16() : nullptr,
                     16, 48, 128, M, main_stream_);
             }
 
@@ -1045,9 +1045,13 @@
         for (int m = 0; m <= 8; ++m) batch_graph_captured_[m] = false;
         return;
 #endif
-        if (cfg_.architecture != ModelArch::QWEN) return;
+        if (cfg_.architecture != ModelArch::QWEN && !(cfg_.is_nemotron() && expert_loader_.all_resident())) return;
         std::vector<int> target_batch_sizes;
-        if (gpu_caps_.is_vram_constrained) {
+        if (cfg_.is_nemotron()) {
+            for (int m = 2; m <= 4; ++m) {
+                target_batch_sizes.push_back(m);
+            }
+        } else if (gpu_caps_.is_vram_constrained) {
             int max_k = (mtp_k_ > 0) ? mtp_k_ : 1;
             int max_m = std::min(max_k + 1, 5);
             for (int m = 2; m <= max_m; ++m) {
@@ -1070,7 +1074,11 @@
 
             // Warmup
             for (int i = 0; i < 3; i++) {
-                forward_token_batch_qwen_device_body(0, M);
+                if (cfg_.is_nemotron()) {
+                    forward_token_batch_nemotron_device_body(0, M, /*do_compute_logits=*/false, /*compute_all_logits=*/true);
+                } else {
+                    forward_token_batch_qwen_device_body(0, M);
+                }
             }
             CUDA_CHECK(cudaStreamSynchronize(main_stream_));
 
@@ -1080,7 +1088,11 @@
                 continue;
             }
 
-            forward_token_batch_qwen_device_body(0, M);
+            if (cfg_.is_nemotron()) {
+                forward_token_batch_nemotron_device_body(0, M, /*do_compute_logits=*/false, /*compute_all_logits=*/true);
+            } else {
+                forward_token_batch_qwen_device_body(0, M);
+            }
 
             cudaError_t end_err = cudaStreamEndCapture(main_stream_, &batch_graph_[M]);
             if (end_err != cudaSuccess) {

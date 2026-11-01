@@ -514,6 +514,11 @@ public:
         n_layers_ = n_layers;
         n_experts_ = n_experts;
 
+        if ((block_size % 4096) != 0 && !use_buffered_io) {
+            LOG_INFO("ExpertLoader: block_size=%d is not 4096-byte sector aligned; automatically enabling BUFFERED/MMap I/O.", block_size);
+            use_buffered_io = true;
+        }
+
         use_buffered_io_ = use_buffered_io;
         bool use_direct = !use_buffered_io;
         if (!expert_file_.open_read(expert_bin_path, use_direct)) {

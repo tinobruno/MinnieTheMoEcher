@@ -1543,7 +1543,7 @@ public:
             cache_budget = total_experts_bytes;
         }
 
-        if (cfg_.is_nemotron() && !cfg_.is_nemotron_bolt()) {
+        if (cfg_.is_nemotron() && !cfg_.is_nemotron_bolt() && gpu_caps_.is_vram_constrained) {
             // Cap resident VRAM cache budget to exactly 11 complete layers (0..10) = 1,408 experts (7.73 GiB).
             // This leaves layers 11..22 (1,536 experts = 8.44 GiB) in pinned DRAM L2 cache.
             // With 4-buffer scratch buffer (512 slots = 2.81 GB) + dense weights (2.80 GB), total VRAM is 14.32 GB,
@@ -1582,13 +1582,16 @@ public:
                 size_t safe_avail = (avail > os_reserve) ? (avail - os_reserve) : 0;
                 size_t unresident_bytes = (total_experts_bytes > cache_budget) ? (total_experts_bytes - cache_budget) : 0;
 
-                if (cfg_.is_nemotron() && !cfg_.is_nemotron_bolt()) {
-                    dram_cache_budget = (size_t)12 * 128 * expert_block_size;
+                if (unresident_bytes == 0) {
+                    dram_cache_budget = 0;
+                    LOG_INFO("[Memory] 100%% of all experts fit in VRAM L1 cache (%.1f GB). DRAM L2 cache set to 0.0 GB (zero PCIe/SSD traffic)!",
+                             (double)total_experts_bytes / (1024.0 * 1024.0 * 1024.0));
+                } else if (cfg_.is_nemotron() && !cfg_.is_nemotron_bolt()) {
+                    dram_cache_budget = std::min(safe_avail, unresident_bytes);
                     LOG_INFO("[Memory] Auto-allocated %.1f GB DRAM L2 cache for Nemotron: 100%% of all 2,944 experts resident in memory (zero SSD disk reads)!",
                              (double)dram_cache_budget / (1024.0 * 1024.0 * 1024.0));
                 } else if (cfg_.is_nemotron_bolt()) {
-                    size_t bolt_remaining = (size_t)(expert_n_layers * expert_n_experts - 4978) * expert_block_size;
-                    dram_cache_budget = std::min(safe_avail, bolt_remaining);
+                    dram_cache_budget = std::min(safe_avail, unresident_bytes);
                     LOG_INFO("[Memory] Auto-allocated %.1f GB DRAM L2 cache for Nemotron Bolt (out of %.1f GB available physical RAM)",
                              (double)dram_cache_budget / (1024.0 * 1024.0 * 1024.0),
                              (double)avail / (1024.0 * 1024.0 * 1024.0));
@@ -1804,6 +1807,16 @@ public:
             std::filesystem::path full_p = base_dir / delegate_manifest_path;
             if (std::ifstream(full_p).good()) {
                 delegate_manifest_path = full_p.string();
+            } else {
+                std::filesystem::path parent_p = base_dir.parent_path() / delegate_manifest_path;
+                if (std::ifstream(parent_p).good()) {
+                    delegate_manifest_path = parent_p.string();
+                } else if (delegate_manifest_path.rfind("models/", 0) == 0 || delegate_manifest_path.rfind("models\\", 0) == 0) {
+                    std::filesystem::path stripped_p = base_dir.parent_path() / delegate_manifest_path.substr(7);
+                    if (std::ifstream(stripped_p).good()) {
+                        delegate_manifest_path = stripped_p.string();
+                    }
+                }
             }
             if (std::ifstream(delegate_manifest_path).good()) {
                 delegate_manifest_path_ = delegate_manifest_path;
@@ -1990,7 +2003,7 @@ public:
         return;
 #endif
         init_mla_dynamic_shared_memory();
-        if (cfg_.is_nemotron() || (!cfg_.is_qwen() && !expert_loader_.all_resident(cfg_.num_hidden_layers))) {
+        if (!cfg_.is_qwen() && !expert_loader_.all_resident()) {
             LOG_INFO("Running in eager mode for decode verification.");
             graph_captured_ = false;
             return;
@@ -2041,12 +2054,14 @@ public:
         graph_captured_ = true;
         LOG_INFO("CUDA Graph instantiated successfully! Decode speed accelerated.");
 
-        if (cfg_.architecture == ModelArch::QWEN) {
+        if (cfg_.architecture == ModelArch::QWEN || (cfg_.is_nemotron() && expert_loader_.all_resident())) {
             init_batch_cuda_graphs();
         }
         if (qwen_draft_.loaded_) {
             qwen_draft_.init_cuda_graph(main_stream_);
         }
+        reset_all_kv_caches();
+        CUDA_CHECK(cudaStreamSynchronize(main_stream_));
     }
 
     void init_batched_prefill() {

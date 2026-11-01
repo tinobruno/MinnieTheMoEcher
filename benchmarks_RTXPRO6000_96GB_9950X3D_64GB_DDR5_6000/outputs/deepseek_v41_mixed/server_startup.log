@@ -1,0 +1,1317 @@
+[2026-11-01 13:47:05] [INFO] === moecher starting ===
+[2026-11-01 13:47:05] [INFO] === v2.09 ===
+[2026-11-01 13:47:05] [INFO] Default thinking token budget: 4096
+[2026-11-01 13:47:05] [INFO] Operational mode: Chat (Dynamic intent gating: enabled)
+[2026-11-01 13:47:05] [INFO] Tool calling support: disabled
+[2026-11-01 13:47:05] [INFO] Max tool execution rounds: 10
+[2026-11-01 13:47:05] [INFO] Server-side tool execution: disabled (headless-browsing: disabled)
+[2026-11-01 13:47:05] [INFO] Workspace sandbox root: ./workspace (Write Allowed: NO)
+[2026-11-01 13:47:05] [INFO] Security: Host OS execution is DISABLED (Safe Mode). Pure inference active.
+[2026-11-01 13:47:05] [INFO] Speculative decoding: enabled (PLD: enabled, MTP: enabled, Tree MTP: disabled, tree_nodes=2, mtp_k=4)
+[2026-11-01 13:47:05] [INFO] Loading manifest: F:\Moecher\models\deepseek_v41_nvfp4\moecher_manifest_mixed.json
+[2026-11-01 13:47:05] [INFO] Model: 40 layers, 384 experts, 6 active, hidden=5120, dtype=mixed_nvfp4_iq2, max_seq_len=1048576, sliding_window=128
+[2026-11-01 13:47:05] [INFO] BPETokenizer: Loading from F:\Moecher\models\deepseek_v41_nvfp4\tokenizer.json
+[2026-11-01 13:47:05] [INFO] Tokenizer loaded: 129280 vocab, 127741 merges, 1283 special tokens
+[2026-11-01 13:47:05] [INFO] Hardware: NVIDIA RTX PRO 6000 Blackwell Max-Q Workstation Edition (Compute 12.0, 95.6 GB VRAM)
+[2026-11-01 13:47:05] [INFO] Hardware Capabilities: Ampere=0, Ada+=1, Blackwell+=1, FP8_TC=1, FP4=1, VRAM-Constrained=0
+[2026-11-01 13:47:05] [INFO] Blackwell Tensor Core Acceleration: ENABLED (Native sm_120a hardware FP4 mma.sync)
+[2026-11-01 13:47:05] [INFO] Blackwell sm_120a Native FP8 Tensor Cores: ENABLED (cuBLASLt FP8_E4M3 Tensor Core Pipeline)
+[2026-11-01 13:47:05] [INFO] Persistent L2 Cache configured: 60.0 MB / 80.0 MB
+[2026-11-01 13:47:05] [INFO] VRAM: 93.7 GB free / 95.6 GB total
+[2026-11-01 13:47:05] [INFO] Loading dense tensors from F:\Moecher\models\deepseek_v41_nvfp4\attention_dense_layers.bin
+[2026-11-01 13:47:08] [INFO]   Layer 2: compressor loaded (ratio=2, coff=1, max_comp=524290)
+[2026-11-01 13:47:08] [INFO]   Layer 2: V4.1 indexer K-cache allocated (max_comp=524290)
+[2026-11-01 13:47:08] [INFO]   Layer 2: V4.1 indexer query loaded (owns_k=1)
+[2026-11-01 13:47:09] [INFO]   Layer 8: compressor loaded (ratio=2, coff=1, max_comp=524290)
+[2026-11-01 13:47:09] [INFO]   Layer 8: V4.1 indexer K-cache allocated (max_comp=524290)
+[2026-11-01 13:47:09] [INFO]   Layer 8: V4.1 indexer query loaded (owns_k=1)
+[2026-11-01 13:47:09] [INFO]   Loaded layer 10/40
+[2026-11-01 13:47:10] [INFO]   Layer 14: compressor loaded (ratio=2, coff=1, max_comp=524290)
+[2026-11-01 13:47:10] [INFO]   Layer 14: V4.1 indexer K-cache allocated (max_comp=524290)
+[2026-11-01 13:47:10] [INFO]   Layer 14: V4.1 indexer query loaded (owns_k=1)
+[2026-11-01 13:47:11] [INFO]   Loaded layer 20/40
+[2026-11-01 13:47:11] [INFO]   Layer 20: compressor loaded (ratio=1, coff=1, max_comp=1048578)
+[2026-11-01 13:47:11] [INFO]   Layer 20: V4.1 indexer K-cache allocated (max_comp=1048578)
+[2026-11-01 13:47:11] [INFO]   Layer 20: V4.1 indexer query loaded (owns_k=1)
+[2026-11-01 13:47:12] [INFO]   Layer 24: V4.1 indexer query loaded (owns_k=0)
+[2026-11-01 13:47:12] [INFO]   Layer 28: V4.1 indexer query loaded (owns_k=0)
+[2026-11-01 13:47:13] [INFO]   Loaded layer 30/40
+[2026-11-01 13:47:13] [INFO]   Layer 32: V4.1 indexer query loaded (owns_k=0)
+[2026-11-01 13:47:13] [INFO]   Layer 36: V4.1 indexer query loaded (owns_k=0)
+[2026-11-01 13:47:14] [INFO]   Loaded layer 40/40
+[2026-11-01 13:47:14] [INFO] Dense tensors loaded
+[2026-11-01 13:47:14] [INFO] [Engram] Loaded DeepSeek-V4.1 Engram Memory Module (Layers 1 & 14: 196.6B params mapped from model-00047-of-00048.safetensors & model-00048-of-00048.safetensors, 301 MB wkv on GPU)
+[2026-11-01 13:47:14] [INFO] RoPE: non-compressed base=10000 (no YaRN), compressed base=160000 (YaRN factor=16, max_seq=1048592)
+[2026-11-01 13:47:14] [INFO] [Memory] Auto-allocated maximum available DRAM L2 cache: 44.3 GB (out of 48.3 GB free RAM, reserving 4.0 GB for OS/driver)
+[2026-11-01 13:47:14] [INFO] Expert L1 (VRAM) cache budget: 76.1 GB
+[2026-11-01 13:47:14] [INFO] Expert L2 (DRAM) cache budget: 44.3 GB
+[2026-11-01 13:47:14] [INFO] ══════════════════════════════════════════════════════════════════════
+[2026-11-01 13:47:14] [INFO] ExpertLoader: Initializing Mixed Quantization MoE (Approach A)
+[2026-11-01 13:47:14] [INFO]   Total Experts : 15360 (40 layers x 384)
+[2026-11-01 13:47:14] [INFO]   Hot Experts   : 3840 (67.24 GB) in NVFP4
+[2026-11-01 13:47:14] [INFO]   Cold Experts  : 11520 (106.79 GB) in IQ2_XXS + Q2_K
+[2026-11-01 13:47:14] [INFO]   Free VRAM     : 80.07 GB / Total VRAM: 95.59 GB
+[2026-11-01 13:47:14] [INFO] ══════════════════════════════════════════════════════════════════════
+[2026-11-01 13:47:14] [INFO] ExpertLoader: Hierarchical Mixed mode (Hot + Top Cold in VRAM L1, Next Top Cold in DRAM L2)
+[2026-11-01 13:47:15] [INFO] ExpertLoader: Loaded Cold expert frequency ranking from F:\Moecher\models\deepseek_v41_nvfp4\deepseek_v41_imatrix.dat.counts.json (240769 cold activations)
+[2026-11-01 13:47:15] [INFO] Allocated 6.33 GB VRAM L1 Cold Pool for Top-683 Cold Experts (zero PCIe DMA!)
+[2026-11-01 13:47:19] [INFO] Allocated 42.0 GB PINNED DRAM cache with cudaMallocHost (4530 cold slots)
+[2026-11-01 13:47:19] [INFO] Preloading 3840 Hot experts into VRAM (NVFP4)...
+[2026-11-01 13:47:22] [INFO]   Preloaded 500/3840 Hot experts into VRAM...
+[2026-11-01 13:47:23] [INFO]   Preloaded 1000/3840 Hot experts into VRAM...
+[2026-11-01 13:47:24] [INFO]   Preloaded 1500/3840 Hot experts into VRAM...
+[2026-11-01 13:47:24] [INFO]   Preloaded 2000/3840 Hot experts into VRAM...
+[2026-11-01 13:47:25] [INFO]   Preloaded 2500/3840 Hot experts into VRAM...
+[2026-11-01 13:47:26] [INFO]   Preloaded 3000/3840 Hot experts into VRAM...
+[2026-11-01 13:47:27] [INFO]   Preloaded 3500/3840 Hot experts into VRAM...
+[2026-11-01 13:47:27] [INFO]   Preloaded 3840/3840 Hot experts into VRAM...
+[2026-11-01 13:47:27] [INFO] Preloading 683 Top Cold experts into VRAM L1 (IQ2_XXS, 6.33 GB)...
+[2026-11-01 13:47:27] [INFO]   Preloaded 500/683 Cold experts into VRAM L1...
+[2026-11-01 13:47:28] [INFO]   Preloaded 683/683 Cold experts into VRAM L1...
+[2026-11-01 13:47:28] [INFO] ExpertLoader: Preloading 4530 Cold Experts into pinned DRAM L2 cache (42.0 GB static, 3530 dynamic slots reserved)...
+[2026-11-01 13:47:28] [INFO]   Preloaded 1000/4530 Cold experts into pinned DRAM L2...
+[2026-11-01 13:47:29] [INFO]   Preloaded 2000/4530 Cold experts into pinned DRAM L2...
+[2026-11-01 13:47:30] [INFO]   Preloaded 3000/4530 Cold experts into pinned DRAM L2...
+[2026-11-01 13:47:31] [INFO]   Preloaded 4000/4530 Cold experts into pinned DRAM L2...
+[2026-11-01 13:47:31] [INFO]   Preloaded 4530/4530 Cold experts into pinned DRAM L2...
+[2026-11-01 13:47:31] [INFO] ExpertLoader: Finished preloading 4530 Cold Experts into pinned DRAM L2 (1000 static pinned, 3530 dynamic warm)!
+[2026-11-01 13:47:31] [INFO] Mixed MoE Preload completed in 11.68 seconds (Hot VRAM: 3840, Cold VRAM: 683, Cold DRAM: 4530)
+[2026-11-01 13:47:31] [INFO] Compress ratios loaded: 43 layers
+[2026-11-01 13:47:31] [INFO]   Layer 0: ratio=0
+[2026-11-01 13:47:31] [INFO]   Layer 2: ratio=2
+[2026-11-01 13:47:31] [INFO]   Layer 3: ratio=2
+[2026-11-01 13:47:31] [INFO] Persistent L2 Cache: Pinned 59.01 MB / 60.00 MB budget (zero thrashing, 100% utilization)
+[2026-11-01 13:47:31] [INFO] Running in eager mode for decode verification.
+[2026-11-01 13:47:31] [INFO] [Prefill] Batched prefill enabled (chunk_size=512, allocated=2968.9 MB, mixed NVFP4+IQ2 mode with VRAM-staged MoE).
+[2026-11-01 13:47:31] [INFO] Model loaded successfully
+[2026-11-01 13:47:31] [INFO] Rebuilding System KV Cache snapshot (33 tokens, 0 active tools)...
+[2026-11-01 13:47:31] [INFO] [V4.1 LAYER 0 PROFILE M=33] Total: 120.34 ms | Attn_HC: 0.21 ms | QKV: 0.83 ms | Attn_Loop: 0.16 ms | Out: 0.90 ms | FFN_HC: 0.06 ms | Gate: 87.71 ms | Shared: 3.47 ms | Routed_MoE: 26.91 ms (DMA: 25.66, SwiGLU: 0.70, Down: 0.55) | Accum: 0.08 ms
+[2026-11-01 13:47:32] [INFO] [V4.1 LAYER 20 PROFILE M=33] Total: 24.16 ms | Attn_HC: 0.04 ms | QKV: 0.69 ms | Attn_Loop: 1.08 ms | Out: 0.83 ms | FFN_HC: 0.05 ms | Gate: 0.11 ms | Shared: 4.47 ms | Routed_MoE: 16.88 ms (DMA: 15.97, SwiGLU: 0.51, Down: 0.40) | Accum: 0.01 ms
+[2026-11-01 13:47:32] [INFO] [V4.1 LAYER 39 PROFILE M=33] Total: 29.30 ms | Attn_HC: 0.05 ms | QKV: 0.69 ms | Attn_Loop: 0.06 ms | Out: 0.83 ms | FFN_HC: 0.05 ms | Gate: 0.10 ms | Shared: 2.99 ms | Routed_MoE: 24.53 ms (DMA: 23.26, SwiGLU: 0.70, Down: 0.57) | Accum: 0.01 ms
+[2026-11-01 13:47:32] [INFO] [PREFILL STATS] 33 prompt tokens prefilled in 1.350s -> 24.44 tok/s (V4.1 batched chunk_size=512, offset=0)
+[2026-11-01 13:47:32] [INFO] [PREFILL I/O] Total cold expert disk reads: 726
+[2026-11-01 13:47:32] [INFO] [PREFILL STATS] 33 prefix tokens pre-warmed in 1.350s -> 24.44 tok/s
+[2026-11-01 13:47:32] [INFO] Pinned System KV Cache snapshot created (33 tokens across 40 layers).
+[2026-11-01 13:47:32] [INFO] System KV Cache snapshot pinned successfully (33 tokens).
+[2026-11-01 13:47:32] [INFO] [Config] Loaded persistent server configuration from server_config.json (zdb_enabled=false, mode=chat, temp=1.00, rep_pen=1.00)
+[2026-11-01 13:47:32] [INFO] [Config] Reset server parameters on startup to model defaults: temp=1.00, rep_penalty=1.00, anti_loop=disabled
+[2026-11-01 13:47:32] [INFO] [Proxy] Forward Proxy (HTTP/HTTPS CONNECT) listening on 0.0.0.0:8002
+[2026-11-01 13:47:32] [INFO] Binding to 0.0.0.0:8001...
+[2026-11-01 13:47:32] [INFO] Server listening on port 8001
+[2026-11-01 13:47:32] [INFO] version 2.09
+[2026-11-01 13:48:07] [INFO] REQUEST: {"model": "deepseek-v4.1-flash", "messages": [{"role": "system", "content": "You are a helpful assistant."}, {"role": "user", "content": "hello"}], "max_tokens": 20000, "temperature": 1, "repetition_penalty": 1, "stream": true, "enable_thinking": true, "thinking": {"type": "enabled", "budget_tokens": 4096}, "max_thinking_tokens": 4096, "reasoning_effort": "high", "enable_anti_loop": false, "anti_loop": false, "enable_spec": true, "enable_mtp": true, "mtp": true, "mtp_k": 4, "enable_tree_mtp": false, "tree_mtp": false, "tree_nodes": 2, "enable_pld": false, "pld": false, "execution_timeout_sec": 535, "workspace_boundary_enforced": true, "require_external_authorization": true, "authorized_paths": [], "max_tool_rounds": 10, "mode": "chat", "operational_mode": "chat", "intent_gating": true, "client_tool_execution": true, "client_context": {"user_agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/155.0.0.0 Safari/537.36", "languages": "en-US,en", "sec_ch_ua": "\"Google Chrome\";v=\"155\", \"Chromium\";v=\"155\", \"Not(A:Brand\";v=\"24\"", "mobile": "?0", "platform": "\"Windows\"", "cookies": "cpu_bucket=xlg; tz=Europe%2FParis; _octo=GH1.1.15069377.1788773315; _tccl_visitor=2192e119-9c0b-40c1-b43d-890e64da13da; preferred_color_mode=dark; li_alerts=e30=; _ga=GA1.1.301518687.1788956415; _ga_EH95TVW1ME=GS2.1.s1788956415$o1$g0$t1788956415$j60$l0$h0"}, "tools": []}
+[2026-11-01 13:48:07] [INFO] Reasoning effort: high, Thinking: enabled, Thinking budget: 4096, Tools: 0, Anti-Loop: disabled, Stop-Words: 0, Server-Exec: disabled (client_tool_exec: true, headless: false), Max-Tool-Rounds: 10, Timeout: 535000ms, Bypass-Cache: false
+[2026-11-01 13:48:07] [INFO] RESPONSE (13ms)
+[2026-11-01 13:48:07] [INFO] STREAM PROMPT [round 1] (len=12, continuation=false, visual=none)
+[2026-11-01 13:48:07] [INFO] System KV snapshot skipped: prompt size 12 < snapshot size 33
+[2026-11-01 13:48:07] [INFO] [V4.1 LAYER 0 PROFILE M=12] Total: 21.96 ms | Attn_HC: 0.04 ms | QKV: 0.27 ms | Attn_Loop: 0.02 ms | Out: 0.32 ms | FFN_HC: 0.03 ms | Gate: 1.99 ms | Shared: 0.97 ms | Routed_MoE: 18.30 ms (DMA: 17.70, SwiGLU: 0.34, Down: 0.26) | Accum: 0.01 ms
+[2026-11-01 13:48:07] [INFO] [V4.1 LAYER 20 PROFILE M=12] Total: 7.86 ms | Attn_HC: 0.04 ms | QKV: 0.28 ms | Attn_Loop: 0.41 ms | Out: 0.33 ms | FFN_HC: 0.03 ms | Gate: 0.11 ms | Shared: 1.91 ms | Routed_MoE: 4.75 ms (DMA: 4.38, SwiGLU: 0.22, Down: 0.15) | Accum: 0.01 ms
+[2026-11-01 13:48:08] [INFO] [V4.1 LAYER 39 PROFILE M=12] Total: 14.37 ms | Attn_HC: 0.03 ms | QKV: 0.65 ms | Attn_Loop: 0.03 ms | Out: 0.32 ms | FFN_HC: 0.03 ms | Gate: 0.34 ms | Shared: 1.53 ms | Routed_MoE: 11.41 ms (DMA: 10.88, SwiGLU: 0.31, Down: 0.22) | Accum: 0.01 ms
+[2026-11-01 13:48:08] [INFO] [PREFILL STATS] 12 prompt tokens prefilled in 0.501s -> 23.96 tok/s (V4.1 batched chunk_size=512, offset=0)
+[2026-11-01 13:48:08] [INFO] [PREFILL I/O] Total cold expert disk reads: 870
+[2026-11-01 13:48:08] [INFO] [PREFILL STATS] 12 tokens evaluated in 0.501s -> 23.95 tok/s (prefix cached: 0 / 12, 0.0%)
+[2026-11-01 13:48:08] [WARN] Think tokens: start=128821 end=128822, EOS=1 eos2=1 user=128803 asst=128804, think_budget=0
+Hello! 👋 How can I help you today?[2026-11-01 13:48:09] [WARN] Stop token hit: token=1 (cfg_eos=1, eos2=1, im_end=-1) at step 11 (content: 11/20000, think: 0/0)
+[2026-11-01 13:48:09] [INFO] [GENERATION STATS] 11 tokens in 0.997s -> 11.03 tok/s (Content: 11, Thinking: 0)
+[2026-11-01 13:48:16] [INFO] REQUEST: {"model": "deepseek-v4.1-flash", "messages": [{"role": "system", "content": "You are a helpful assistant."}, {"role": "user", "content": "hello"}, {"role": "assistant", "content": "Hello! 👋 How can I help you today?"}, {"role": "user", "content": "create an HTML calculator"}], "max_tokens": 20000, "temperature": 1, "repetition_penalty": 1, "stream": true, "enable_thinking": true, "thinking": {"type": "enabled", "budget_tokens": 4096}, "max_thinking_tokens": 4096, "reasoning_effort": "high", "enable_anti_loop": false, "anti_loop": false, "enable_spec": true, "enable_mtp": true, "mtp": true, "mtp_k": 4, "enable_tree_mtp": false, "tree_mtp": false, "tree_nodes": 2, "enable_pld": false, "pld": false, "execution_timeout_sec": 535, "workspace_boundary_enforced": true, "require_external_authorization": true, "authorized_paths": [], "max_tool_rounds": 10, "mode": "chat", "operational_mode": "chat", "intent_gating": true, "client_tool_execution": true, "client_context": {"user_agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/155.0.0.0 Safari/537.36", "languages": "en-US,en", "sec_ch_ua": "\"Google Chrome\";v=\"155\", \"Chromium\";v=\"155\", \"Not(A:Brand\";v=\"24\"", "mobile": "?0", "platform": "\"Windows\"", "cookies": "cpu_bucket=xlg; tz=Europe%2FParis; _octo=GH1.1.15069377.1788773315; _tccl_visitor=2192e119-9c0b-40c1-b43d-890e64da13da; preferred_color_mode=dark; li_alerts=e30=; _ga=GA1.1.301518687.1788956415; _ga_EH95TVW1ME=GS2.1.s1788956415$o1$g0$t1788956415$j60$l0$h0"}, "tools": []}
+[2026-11-01 13:48:16] [INFO] Reasoning effort: high, Thinking: enabled, Thinking budget: 4096, Tools: 0, Anti-Loop: disabled, Stop-Words: 0, Server-Exec: disabled (client_tool_exec: true, headless: false), Max-Tool-Rounds: 10, Timeout: 535000ms, Bypass-Cache: false
+[2026-11-01 13:48:16] [INFO] RESPONSE (0ms)
+[2026-11-01 13:48:16] [INFO] STREAM PROMPT [round 1] (len=31, continuation=true, visual=none)
+[2026-11-01 13:48:16] [INFO] Reusing KV Cache prefix of 23 tokens (skipping prefill 0..22, evaluating 23..30)
+[2026-11-01 13:48:16] [INFO] [V4.1 LAYER 0 PROFILE M=8] Total: 19.25 ms | Attn_HC: 0.04 ms | QKV: 0.19 ms | Attn_Loop: 0.02 ms | Out: 0.22 ms | FFN_HC: 0.03 ms | Gate: 0.16 ms | Shared: 0.92 ms | Routed_MoE: 17.66 ms (DMA: 17.20, SwiGLU: 0.27, Down: 0.19) | Accum: 0.01 ms
+[2026-11-01 13:48:17] [INFO] [V4.1 LAYER 20 PROFILE M=8] Total: 4.95 ms | Attn_HC: 0.03 ms | QKV: 0.19 ms | Attn_Loop: 0.30 ms | Out: 0.22 ms | FFN_HC: 0.03 ms | Gate: 0.36 ms | Shared: 1.18 ms | Routed_MoE: 2.63 ms (DMA: 2.35, SwiGLU: 0.16, Down: 0.12) | Accum: 0.01 ms
+[2026-11-01 13:48:17] [INFO] [V4.1 LAYER 39 PROFILE M=8] Total: 9.86 ms | Attn_HC: 0.03 ms | QKV: 0.19 ms | Attn_Loop: 0.04 ms | Out: 0.22 ms | FFN_HC: 0.03 ms | Gate: 0.47 ms | Shared: 0.93 ms | Routed_MoE: 7.94 ms (DMA: 7.58, SwiGLU: 0.21, Down: 0.15) | Accum: 0.01 ms
+[2026-11-01 13:48:17] [INFO] [PREFILL STATS] 8 prompt tokens prefilled in 0.519s -> 15.40 tok/s (V4.1 batched chunk_size=512, offset=23)
+[2026-11-01 13:48:17] [INFO] [PREFILL I/O] Total cold expert disk reads: 1385
+[2026-11-01 13:48:17] [INFO] [PREFILL STATS] 8 tokens evaluated in 0.519s -> 15.40 tok/s (prefix cached: 23 / 31, 74.2%)
+[2026-11-01 13:48:17] [WARN] Think tokens: start=128821 end=128822, EOS=1 eos2=1 user=128803 asst=128804, think_budget=4096
+
+The user wants an HTML calculator. I'll create a nice, functional calculator with HTML, CSS, and JavaScript all in one file. Let me design it well — modern look, dark theme or light theme, responsive, keyboard support maybe.
+
+Let me think about the features:
+- Display area
+- Buttons: digits 0-9, decimal point, operators + − × ÷, equals, clear (AC), delete/backspace maybe, percent maybe.
+- Keyboard support: typing numbers and operators.
+- Handle errors like division by zero.
+- Proper formatting of long numbers.
+
+Let me write clean code.
+
+Design: a centered calculator card, dark-ish gradient background, glassmorphism maybe. Buttons arranged in a grid. Display aligned right, large font.
+
+Layout grid 4 columns:
+Row 1: AC, ⌫ (or maybe C), % or nothing... Common layout:
+```
+AC  ⌫  %  ÷
+7 8 9 ×
+4 5 6 −
+1 2 3 +
+0 . = (maybe span 2)
+```
+The classic iPhone calculator layout:
+Row1: AC, +/-, %, ÷ — but +/- isn't necessary. I'll do:
+```
+AC   ⌫   %   ÷
+7    8   9   ×
+4    5   6   −
+1    2   3   +
+.    0   =   (equals maybe span?) 
+```
+Let me just do 0 span 2 and = span 1? Or ".", "0" span two, "="... Hmm.
+
+Simpler: 
+```
+AC ⌫ % ÷
+7 8 9 ×
+4 5 6 −
+1 2 3 +
+0 . = 
+```
+That's 5 rows with last row 3 buttons and one blank? Actually last row: 0 (span?), . , =. Let 0 span 1, . span 1, = span 1 — not spanning would look weird with 4-col grid leaving empty. I can make last row: 0 span 1, . span 1, = span 1, and make "+" ... no.
+
+Alternative iPhone layout: bottom row has "0" spanning 1, "=" spanning... Let me simply have 3 buttons in last row with grid-column arrangement: `0` grid-column span 1, `.` span 1, `=` span 1, plus one empty? Better: make the layout with 4 columns and last row: `0` span 2? Actually iPhone's layout is:
+```
+AC  +/-  %  ÷
+7 8 9 ×
+4 5 6 −
+1 2 3 +
+0(span3?) . =  — no, iPhone has 0 at left, . center? 
+```
+I'll skip +/-. Make last row 3 buttons: `0` span 1? Let's make `0` span 2 (like calculators often have wide zero), `.` 1, `=` 1? That gives 4 widths. Or `0` span 1, `.` 1, `=` span 2? Hmm.
+
+I'll do: last row: `0` (span 1), `.` (1), `=` (span 2) — equals prominent. Actually "=" span 2 looks nice. But iPhone has grid 4 and `0` spans 1, `.` 1, `=` 1... whatever.
+
+Let me choose:
+```
+AC  ⌫   %   ÷
+7   8   9   ×
+4   5   6   −
+1   2   3   +
+0   .   =   (span? )
+```
+
+Hmm 4 buttons: 0, ., =, and maybe `√`? No. Let's just fill: 0, ., =, and... no.
+
+Simplest arrangement with 4-col grid and last row having 0 span 2, . span 1, = span 1:
+```
+AC ⌫ % ÷
+7 8 9 ×
+4 5 6 −
+1 2 3 +
+0 (span2) . =
+```
+That's 4 items across two rows? Actually last row: 0 spans 2 cols (occupies cols 1-2), . col 3, = col 4. Nice. But `.` between 0 and = is odd. Hmm.
+
+Better common calculator layout:
+```
+AC  ⌫  ÷  ×? 
+```
+Nah. I'll do the classic simple: right column has operators stacked? I'll go with iPhone style:
+```
+AC  ⌫  %  ÷
+7   8  9  ×
+4   5  6  −
+1   2  3  +
+0   .  =  ...
+```
+Actually on iPhone: last row is `0` (left), `.` (center-left?), `=` ... with `+` above right. Buttons 0 spans... Let's not obsess. I'll use:
+```
+AC   ⌫   %   ÷
+7    8   9   ×
+4    5   6   −
+1    2   3   +
+0    .   =   ...
+```
+There are 4 cols; 0, ., = would fill 3 cells leaving one empty. To look balanced, make 0 span 2? That would make: 0 occupies 1-2, . occupies 3, = occupies 4. Total fills. Yes! `0` wide, `.`, `=` cute. I'll go that.
+
+Wait iPhone last row: `0` wide (spans 2?), `.`, `=`... I think iPhone's 0 is not wide. But standard calculators often wide 0. Fine.
+
+Actually iPhone calculator bottom row: `0`, `.`, `=` with equals above? Let me not.
+
+JavaSCript logic:
+
+State: `currentInput` string shown in display (the number being typed), `previousValue` / `operation`. Approach like classic:
+- Maintain `displayValue` string.
+- On digit: if we're entering a new number after operator, replace; else append.
+- On operator: store current value as operand, set pending operator, reset input for next.
+- On equals: compute.
+
+Let me use a simpler approach: `expression` logic with tokens? Too complex. I'll do standard two-operand chain calculator.
+
+Variables:
+```
+let current = '0'; // string representing displayed input
+let stored = null; // previous operand number
+let pendingOp = null; // operator
+let justCalculated = false; // whether result shown
+```
+
+Actually I'll implement:
+
+```js
+let displayValue = '0';
+let firstOperand = null;
+let operator = null;
+let waitingForSecondOperand = false; // when operator pressed, next digit starts new number
+```
+
+Functions:
+- `inputDigit(d)`: if waitingForSecondOperand -> displayValue = d, waiting=false; else append if not just result.
+- `inputDecimal()`: if waiting -> displayValue = '0.'; else if not contains '.' append '.'.
+- `handleOperator(op)`: 
+   - if operator already set and waitingForSecondOperand false: compute chained operation (e.g., user typed 5 + 3 * → performs 5+3 before *). Standard calculator does this. I'll implement.
+   - if firstOperand null: set firstOperand = displayValue, operator = op, waiting = true.
+   - else if operator set... compute.
+- `performCalculation()` using operator and firstOperand and displayValue as second operand.
+- `calculate()`: compute, display result, reset state with waitingForSecondOperand? after equals, set displayValue to result, firstOperand=null, operator=null, waitingForSecondOperand=true? So typing new digit after result replaces. Actually set waiting false but "justCalculated" flag. Simpler: after equals, firstOperand=null, operator=null, waitingForSecondOperand=true so any digit input replaces display. Hmm but then inputDigit sets displayValue = digit. Good.
+
+Clear: reset all to '0'.
+
+Backspace: remove last char; if resulting empty -> '0'.
+
+Percent: convert display to /100? On iPhone, % divides current by 100. I'll add percent maybe in place of ⌫? Keep both? Layout: AC ⌫ % ÷. That's 4 buttons fine.
+
+Formatting: avoid floating errors. Use rounding to maybe 12 significant digits and trim trailing zeros. Display max length: fit. Format function:
+
+```js
+function formatResult(num) {
+  if (!isFinite(num)) return 'Error';
+  // round to avoid FP artifacts
+  let s = parseFloat(num.toPrecision(12)).toString();
+  if (s.length > 14) maybe use exponential? 
+}
+```
+Actually numbers can be long; display overflow — can shrink font via JS or CSS. I'll just allow overflow hidden with smaller font when long via class? Could dynamically set font-size. Maybe simpler: display `Number` value using toLocaleString? Use `<div>` with overflow. Let me just format with `toPrecision` and handle.
+
+Better: formatResult returns string:
+```js
+const formatted = Number.isFinite(result) ? String(parseFloat(result.toPrecision(12))) : 'Error';
+```
+`parseFloat(result.toPrecision(12)).toString()` — e.g. 0.1+0.2 = 0.30000000000000004 → toPrecision(12) = "0.300000000000" → parseFloat → 0.3 → "0.3". Good.
+
+But 1/3 = 0.3333333333333333 → toPrecision(12) → 0.333333333333 → parseFloat maybe retains? toString "0.333333333333" length 14? Could overflow. Need display autosizing. I'll add CSS `font-size` clamp and use JS to shrink if length > 12? Could set `display.style.fontSize`. Keep simple: CSS `overflow:hidden; white-space:nowrap;` but maybe text overflow. Users will see huge numbers off-screen... Let's implement fitText: JS measure? unnecessary. Use CSS `font-size: clamp(1rem, 4vw, 3rem)` and `word-break`? maybe `text-overflow: clip`.
+
+I might do automatic shrink based on length: 
+```js
+function updateDisplay(text) {
+  display.textContent = text;
+  const len = text.length;
+  display.classList.toggle('small', len > 9);
+  display.classList.toggle('tiny', len > 13);
+}
+```
+CSS classes set font-size smaller. Good enough.
+
+Keyboard support: listen keydown; map digits, operators (+, -, *, /), Enter/=, Backspace, Escape for clear. Prevent default? Not needed.
+
+Operator keys mapping to symbols. Also 'x' maybe.
+
+Error handling: division by zero → Infinity → show "Error". If user presses operator after error, reset? Hmm handle. If displayValue not finite, reset to 0 maybe.
+
+Let me write full code.
+
+HTML structure:
+```html
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Calculator</title>
+<style>...</style>
+</head>
+<body>
+<div class="calculator">
+  <div class="display" id="display">0</div>
+  <div class="keys">
+    <button class="key action" data-action="clear">AC</button>
+    <button class="key action" data-action="backspace">⌫</button>
+    <button class="key action" data-action="percent">%</button>
+    <button class="key op" data-op="/">÷</button>
+    <button class="key num" data-num="7">7</button>
+    ...
+  </div>
+</div>
+<script>...</script>
+</body>
+</html>
+```
+
+Buttons: I'll use `button` with data attributes. For = use data-action="equals". Operators data-op +,− etc. Should store actual '−' char? Use internal mapping. Use symbols '+', '-', '*', '/'. Data attributes `data-op="+","-","*","/"`. Buttons text: `+`, `−`, `×`, `÷`.
+
+CSS grid: `grid-template-columns: repeat(4, 1fr);` gap.
+
+`.key.zero` grid-column: span 2. Wait if 0 spans 2 then layout: AC ⌫ % ÷ row1; then rows; last row 0(1-2), .(3), =(4) meaning = at col4 — consistent operators are right col; = in right? That's weird but works: 0 wide, dot col3, equals col4. Actually standard calculators have zero wide spanning 2 and equals right? Fine.
+
+Let's order last row: 0 (span2), '.', '=' — the = would occupy 4th. But right column top has ÷ × − +, then '=' under +. That's okay! The = under the + seems logical.
+
+Actually with grid flow, 0 span 2 occupies row's first two; . third; = fourth. Looks nice.
+
+Buttons height ~56px, responsive.
+
+Style:
+- body background: dark gradient (#0f... etc). Or light? I'll do a sleek dark gradient `#0b0f1a` to `#1f2937` plus subtle radial glow.
+- calculator: width min(360, 90vw)? Actually flexible. Card with background rgba white 0.03? glassmorphism with backdrop blur maybe. Border-radius 24px; box-shadow; padding 16-20px. 
+- display: background maybe dark, right aligned, large, monospaced? Use tabular-nums. min-height.
+- keys: buttons with background #... hover effects, active scale. Operator buttons accent color (e.g., orange gradient like iPhone), action buttons neutral gray. Numbers white-ish.
+
+I'll create visual: operators use orange background `linear-gradient(#ffb347,#f59e0b)`, numbers `rgba(255,255,255,0.08)`, action `rgba(255,255,255,0.04)` maybe grey.
+
+Display maybe with `font-variant-numeric: tabular-nums`.
+
+Let me consider light theme? Dark is stylish. Good.
+
+Now JavaScript:
+
+```js
+const display = document.getElementById('display');
+
+let displayValue = '0';
+let firstOperand = null;
+let operator = null;
+let waitingForSecondOperand = false;
+
+function updateDisplay(text) {
+  display.textContent = text;
+  // shrink long numbers
+  const len = text.length;
+  display.classList.toggle('small', len >= 10);
+  display.classList.toggle('tiny', len >= 14);
+  display.classList.toggle('error', text === 'Error');
+}
+
+function inputDigit(digit) {
+  if (waitingForSecondOperand) {
+    displayValue = digit;
+    waitingForSecondOperand = false;
+    firstOperand = null? // no, keep
+  } else {
+    displayValue = displayValue === '0' ? digit : displayValue + digit;
+  }
+  // limit digit length? maybe max 12? not needed.
+  updateDisplay(displayValue);
+}
+```
+
+But after equals we set waitingForSecondOperand = true in calculate(). Then inputDigit gives digit replacing result. Good. firstOperand reset too.
+
+inputDecimal:
+```js
+function inputDecimal() {
+  if (waitingForSecondOperand) {
+    displayValue = '0.';
+    waitingForSecondOperand = false;
+  } else if (!displayValue.includes('.')) {
+    displayValue += '.';
+  }
+  updateDisplay(displayValue);
+}
+```
+But if display is 'Error'? handle reset.
+
+handleOperator(op):
+```js
+function handleOperator(nextOperator) {
+  if (displayValue === 'Error') reset?
+  // If operator already exists and not waiting for new operand → compute pending operation
+  if (operator && !waitingForSecondOperand) {
+    const result = performCalculation();
+    if (!isFinite(result)) { reset to Error? } 
+    displayValue = formatResult(result);
+    firstOperand = result; // for chaining?
+    operator = nextOperator;
+    waitingForSecondOperand = true;
+    updateDisplay(displayValue);
+    return;
+  }
+
+  if (!firstOperand) {
+    firstOperand = Number(displayValue);  // parse
+    operator = nextOperator;
+    waitingForSecondOperand = true;
+    updateDisplay(displayValue); // keep showing typed number
+  } else {
+    // ??? 
+  }
+}
+```
+Hmm firstOperand null initially. When user types 5 +: firstOperand=5, operator='+', waiting=true, display still '5'. Then types 3: waiting false, display = '3'. Then + again: operator exists and !waiting → compute 5+3=8, displayValue='8', firstOperand=8? Actually the chained logic: with "5 + 3 +", perform 5+3=8, set firstOperand=8? then operator='+', waiting=true, display '8'. Then type 4 → display 4, on = compute 8+4=12. Good.
+
+But performCalculation uses firstOperand and displayValue:
+```js
+function performCalculation() {
+  const second = Number(displayValue);
+  let result;
+  switch(operator) {
+    case '+': result = firstOperand + second; break;
+    case '-': result = firstOperand - second; break;
+    case '*': result = firstOperand * second; break;
+    case '/': result = second === 0 ? Infinity? : firstOperand / second; break;
+  }
+  return result;
+}
+```
+Division by zero: second === 0 → maybe NaN? If show 'Error'. Should check. Actually if displayValue is 0, second=0 → Infinity/NaN? If firstOperand/0 = Infinity. Show Error. Could detect second===0 and set Error. Also if result not finite → Error.
+
+formatResult:
+```js
+function formatResult(num) {
+  if (!isFinite(num)) return 'Error';
+  // round to 12 significant digits and strip trailing zeros
+  const str = parseFloat(num.toPrecision(12)).toString();
+  return str;
+}
+```
+Hmm parseFloat of "-0"? okay.
+
+calculate():
+```js
+function calculate() {
+  if (!operator) return; // nothing to compute, maybe show current? if firstOperand null?
+  const result = performCalculation();
+  displayValue = formatResult(result);
+  updateDisplay(displayValue);
+  firstOperand = null;
+  operator = null;
+  waitingForSecondOperand = true; // next input replaces
+}
+```
+Wait after equals typing digit should replace displayValue via waiting=true. Good. But if result error displayValue='Error'; inputDigit sees waiting true → replaces. Good.
+
+But pressing operator after equals: waiting=true, firstOperand null → sets firstOperand = Number('Error') → issue. Need guard: if displayValue === 'Error' then reset.[2026-11-01 13:53:41] [WARN] [ThinkTransition] Thinking budget reached (4104 thinking tokens). Closing </think> and starting content.
+```html
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>HTML Calculator</title>
+<style>
+  * { box-sizing: border-box; }
+
+  body {
+    margin: 0;
+    min-height: 100vh;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, Helvetica, Arial, sans-serif;
+    background: radial-gradient(circle at 20% 10%, #1b2735, #090a0f 70%);
+    padding: 20px;
+  }
+
+  .calculator {
+    width: 100%;
+    max-width: 380px;
+    background: rgba(255,255,255,0.04);
+    border: 1px solid rgba(255,255,255,0.08);
+    border-radius: 28px;
+    padding: 20px;
+    box-shadow: 0 25px 60px rgba(0,0,0,0.6), inset 0 1px 0 rgba(255,255,255,0.05);
+    backdrop-filter: blur(12px);
+  }
+
+  .display {
+    background: rgba(0,0,0,0.35);
+    border: 1px solid rgba(255,255,255,0.05);
+    border-radius: 18px;
+    padding: 18px 16px;
+    margin-bottom: 16px;
+    min-height: 88px;
+    display: flex;
+    align-items: flex-end;
+    justify-content: flex-end;
+    color: #fff;
+    font-size: 48px;
+    font-weight: 300;
+    letter-spacing: 1px;
+    font-variant-numeric: tabular-nums;
+    overflow: hidden;
+    white-space: nowrap;
+    text-overflow: clip;
+  }
+
+  .display.small { font-size: 30px; }
+  .display.tiny  { font-size: 20px; }
+  .display.error { color: #ff6961; font-size: 32px; }
+
+  .keys {
+    display: grid;
+    grid-template-columns: repeat(4, 1fr);
+    gap: 10px;
+  }
+
+  button.key {
+    border: none;
+    border-radius: 16px;
+    padding: 22px 8px;
+    font-size: 22px;
+    font-weight: 500;
+    color: #fff;
+    cursor: pointer;
+    background: rgba(255,255,255,0.07);
+    transition: transform 0.08s ease, background 0.2s ease, box-shadow 0.2s ease;
+    -webkit-tap-highlight-color: transparent;
+    user-select: none;
+    box-shadow: inset 0 1px 0 rgba(255,255,255,0.10);
+  }
+
+  button.key:hover {
+    background: rgba(255,255,255,0.12);
+  }
+
+  button.key:active {
+    transform: scale(0.92);
+  }
+
+  .key.op {
+    background: linear-gradient(135deg, #ffb347, #f59e0b);
+    color: #1a1a1a;
+    box-shadow: 0 6px 16px rgba(245,158,11,0.25), inset 0 1px 0 rgba(255,255,255,0.35);
+  }
+  .key.op:hover { background: linear-gradient(135deg, #ffc26a, #fbbf24); }
+
+  .key.action {
+    background: rgba(255,255,255,0.03);
+    color: rgba(255,255,255,0.7);
+    font-size: 17px;
+  }
+  .key.action:hover { color: #fff; }
+
+  .key.equals {
+    background: linear-gradient(135deg, #ffb347, #f59e0b);
+    color: #1a1a1a;
+    box-shadow: 0 6px 16px rgba(245,158,11,0.25), inset 0 1px 0 rgba(255,255,255,0.35);
+  }
+
+  .key.zero {
+    grid-column: span 2;
+  }
+
+  @media (max-width: 420px) {
+    .calculator { padding: 14px; border-radius: 24px; }
+    .display { font-size: 40px; min-height: 76px; }
+    button.key { padding: 18px 8px; font-size: 20px; }
+  }
+</style>
+</head>
+<body>
+
+  <div class="calculator">
+    <div class="display" id="display">0</div>
+    <div class="keys">
+      <button class="key action" data-action="clear">AC</button>
+      <button class="key action" data-action="backspace">⌫</button>
+      <button class="key action" data-action="percent">%</button>
+      <button class="key op" data-op="/">÷</button>
+
+      <button class="key" data-num="7">7</button>
+      <button class="key" data-num="8">8</button>
+      <button class="key" data-num="9">9</button>
+      <button class="key op" data-op="*">×</button>
+
+      <button class="key" data-num="4">4</button>
+      <button class="key" data-num="5">5</button>
+      <button class="key" data-num="6">6</button>
+      <button class="key op" data-op="-">−</button>
+
+      <button class="key" data-num="1">1</button>
+      <button class="key" data-num="2">2</button>
+      <button class="key" data-num="3">3</button>
+      <button class="key op" data-op="+">+</button>
+
+      <button class="key zero" data-num="0">0</button>
+      <button class="key" data-action="decimal">.</button>
+      <button class="key equals" data-action="equals">=</button>
+    </div>
+  </div>
+
+<script>
+(function () {
+  const display = document.getElementById('display');
+
+  let displayValue = '0';
+  let firstOperand = null;
+  let operator = null;
+  let waitingForSecondOperand = false;
+
+  // ---------- Display helpers ----------
+  function updateDisplay(text) {
+    display.textContent = text;
+    const len = text.length;
+    display.classList.toggle('small', len >= 10);
+    display.classList.toggle('tiny', len >= 14);
+    display.classList.toggle('error', text === 'Error');
+  }
+
+  function formatResult(num) {
+    if (!Number.isFinite(num)) return 'Error';
+    // Round to 12 significant digits to hide floating point artifacts
+    const rounded = parseFloat(num.toPrecision(12));
+    return String(rounded);
+  }
+
+  function resetCalculator() {
+    displayValue = '0';
+    firstOperand = null;
+    operator = null;
+    waitingForSecondOperand = false;
+    updateDisplay(displayValue);
+  }
+
+  // ---------- Input handling ----------
+  function inputDigit(digit) {
+    if (displayValue === 'Error') {
+      resetCalculator();
+    }
+
+    if (waitingForSecondOperand) {
+      displayValue = digit;
+      waitingForSecondOperand = false;
+    } else {
+      displayValue = displayValue === '0' ? digit : displayValue + digit;
+    }
+
+    updateDisplay(displayValue);
+  }
+
+  function inputDecimal() {
+    if (displayValue === 'Error') {
+      resetCalculator();
+    }
+
+    if (waitingForSecondOperand) {
+      displayValue = '0.';
+      waitingForSecondOperand = false;
+    } else if (!displayValue.includes('.')) {
+      displayValue += '.';
+    }
+
+    updateDisplay(displayValue);
+  }
+
+  function handleOperator(nextOperator) {
+    if (displayValue === 'Error') {
+      resetCalculator();
+    }
+
+    // If there is already a pending operation and the second operand is
+    // ready, chain-calculate before applying the new operator.
+    if (operator && !waitingForSecondOperand) {
+      const result = performCalculation();
+      if (!Number.isFinite(result)) {
+        displayValue = 'Error';
+        firstOperand = null;
+        operator = null;
+        waitingForSecondOperand = false;
+        updateDisplay(displayValue);
+        return;
+      }
+      displayValue = formatResult(result);
+      firstOperand = Number(displayValue);
+      operator = nextOperator;
+      waitingForSecondOperand = true;
+      updateDisplay(displayValue);
+      return;
+    }
+
+    if (firstOperand === null) {
+      firstOperand = Number(displayValue);
+      operator = nextOperator;
+      waitingForSecondOperand = true;
+      // Keep showing the number currently typed
+      updateDisplay(displayValue);
+    }
+  }
+
+  function performCalculation() {
+    const secondOperand = Number(displayValue);
+    let result;
+
+    switch (operator) {
+      case '+': result = firstOperand + secondOperand; break;
+      case '-': result = firstOperand - secondOperand; break;
+      case '*': result = firstOperand * secondOperand; break;
+      case '/':
+        result = secondOperand === 0 ? NaN : firstOperand / secondOperand;
+        break;
+      default: return NaN;
+    }
+
+    return result;
+  }
+
+  function calculate() {
+    if (operator === null || firstOperand === null) return;
+
+    const result = performCalculation();
+    displayValue = formatResult(result);
+    updateDisplay(displayValue);
+
+    // After "=", the next input starts a fresh calculation
+    firstOperand = null;
+    operator = null;
+    waitingForSecondOperand = true;
+  }
+
+  function backspace() {
+    if (displayValue === 'Error') {
+      resetCalculator();
+      return;
+    }
+    if (waitingForSecondOperand) return; // nothing meaningful to delete
+
+    displayValue = displayValue.slice(0, -1);
+    if (displayValue === '' || displayValue === '-') {
+      displayValue = '0';
+    }
+    updateDisplay(displayValue);
+  }
+
+  function percent() {
+    const current = Number(displayValue);
+    if (!Number.isFinite(current)) {
+      resetCalculator();
+      return;
+    }
+    displayValue = formatResult(current / 100);
+    updateDisplay(displayValue);
+
+    // Percent effectively replaces the second operand
+    if (firstOperand !== null && operator !== null) {
+      // If percent pressed before "=", it acts as the second operand
+      waitingForSecondOperand = false;
+    }
+  }
+
+  // ---------- Button clicks ----------
+  document.querySelectorAll('button.key').forEach(btn => {
+    btn.addEventListener('click', () => {
+      const num = btn.dataset.num;
+      const opKey = btn.dataset.op;
+      const action = btn.dataset.action;
+
+      if (num !== undefined) inputDigit(num);
+      else if (opKey !== undefined) handleOperator(opKey);
+      else if (action === 'decimal') inputDecimal();
+      else if (action === 'equals') calculate();
+      else if (action === 'clear') resetCalculator();
+      else if (action === 'backspace') backspace();
+      else if (action === 'percent') percent();
+    });
+  });
+
+  // ---------- Keyboard support ----------
+  document.addEventListener('keydown', (e) => {
+    const key = e.key;
+    const lower = key.toLowerCase();
+
+    if (/[0-9]/.test(key)) {
+      inputDigit(key);
+    } else if (key === '.' || key === ',') {
+      inputDecimal();
+    } else if (key === '+' || key === '-') {
+      handleOperator(key);
+    } else if (key === '*' || lower === 'x') {
+      handleOperator('*');
+    } else if (key === '/') {
+      handleOperator('/');
+    } else if (key === '=' || key === 'Enter') {
+      calculate();
+    } else if (key === 'Backspace' || key === 'Delete') {
+      backspace();
+    } else if (key === 'Escape' || lower === 'c') {
+      resetCalculator();
+    } else if (key === '%') {
+      percent();
+    }
+  });
+
+  updateDisplay('0');
+})();
+</script>
+</body>
+</html>
+```[2026-11-01 13:56:44] [WARN] Stop token hit: token=1 (cfg_eos=1, eos2=1, im_end=-1) at step 6868 (content: 2763/20000, think: 4104/4096)
+[2026-11-01 13:56:44] [INFO] [GENERATION STATS] 6868 tokens in 507.387s -> 13.54 tok/s (Content: 2763, Thinking: 4104)
+[2026-11-01 15:34:44] [INFO] REQUEST: {"model": "deepseek_v41_mixed", "messages": [{"role": "user", "content": "Explain the difference between a mutex and a semaphore in two concise sentences."}], "max_tokens": 120, "temperature": 0.0, "repetition_penalty": 1.0, "stream": true, "enable_thinking": false, "thinking": {"type": "disabled", "budget_tokens": 0}, "max_thinking_tokens": 0, "reasoning_effort": "none", "bypass_prefix_cache": true}
+[2026-11-01 15:34:44] [INFO] Reasoning effort: none, Thinking: disabled, Thinking budget: 0, Tools: 0, Anti-Loop: disabled, Stop-Words: 0, Server-Exec: disabled (client_tool_exec: false, headless: false), Max-Tool-Rounds: 10, Timeout: 60000ms, Bypass-Cache: true
+[2026-11-01 15:34:44] [INFO] RESPONSE (1ms)
+[2026-11-01 15:34:44] [INFO] STREAM PROMPT [round 1] (len=27, continuation=false, visual=none)
+[2026-11-01 15:34:44] [INFO] [KV CACHE] Bypass prefix cache requested: forcing cold full prefill of 27 tokens
+[2026-11-01 15:34:45] [INFO] [V4.1 LAYER 0 PROFILE M=27] Total: 135.06 ms | Attn_HC: 0.19 ms | QKV: 0.63 ms | Attn_Loop: 0.03 ms | Out: 0.69 ms | FFN_HC: 0.05 ms | Gate: 1.18 ms | Shared: 1.75 ms | Routed_MoE: 130.54 ms (DMA: 129.23, SwiGLU: 0.74, Down: 0.57) | Accum: 0.01 ms
+[2026-11-01 15:34:46] [INFO] [V4.1 LAYER 20 PROFILE M=27] Total: 36.25 ms | Attn_HC: 0.04 ms | QKV: 0.57 ms | Attn_Loop: 0.88 ms | Out: 0.68 ms | FFN_HC: 0.04 ms | Gate: 0.12 ms | Shared: 2.42 ms | Routed_MoE: 31.48 ms (DMA: 30.58, SwiGLU: 0.48, Down: 0.42) | Accum: 0.01 ms
+[2026-11-01 15:34:47] [INFO] [V4.1 LAYER 39 PROFILE M=27] Total: 64.62 ms | Attn_HC: 0.04 ms | QKV: 0.57 ms | Attn_Loop: 0.04 ms | Out: 1.15 ms | FFN_HC: 0.04 ms | Gate: 0.66 ms | Shared: 2.92 ms | Routed_MoE: 59.19 ms (DMA: 57.96, SwiGLU: 0.70, Down: 0.53) | Accum: 0.01 ms
+[2026-11-01 15:34:47] [INFO] [PREFILL STATS] 27 prompt tokens prefilled in 2.689s -> 10.04 tok/s (V4.1 batched chunk_size=512, offset=0)
+[2026-11-01 15:34:47] [INFO] [PREFILL I/O] Total cold expert disk reads: 59301
+[2026-11-01 15:34:47] [INFO] [PREFILL STATS] 27 tokens evaluated in 2.689s -> 10.04 tok/s (prefix cached: 0 / 27, 0.0%)
+[2026-11-01 15:34:47] [WARN] Think tokens: start=128821 end=128822, EOS=1 eos2=1 user=128803 asst=128804, think_budget=0
+
+A mutex is a binary lock that ensures only one thread can access a shared resource at a time, enforcing mutual exclusion. A semaphore is a counter-based synchronization mechanism that can allow multiple threads to access a resource simultaneously, depending on its initial count.[2026-11-01 15:34:54] [WARN] Stop token hit: token=1 (cfg_eos=1, eos2=1, im_end=-1) at step 51 (content: 51/120, think: 0/0)
+[2026-11-01 15:34:54] [INFO] [GENERATION STATS] 51 tokens in 6.627s -> 7.70 tok/s (Content: 51, Thinking: 0)
+[2026-11-01 15:34:54] [INFO] REQUEST: {"model": "deepseek_v41_mixed", "messages": [{"role": "user", "content": "Write a clean Python function to calculate the nth Fibonacci number iteratively with type hints and docstring."}], "max_tokens": 220, "temperature": 0.0, "repetition_penalty": 1.0, "stream": true, "enable_thinking": false, "thinking": {"type": "disabled", "budget_tokens": 0}, "max_thinking_tokens": 0, "reasoning_effort": "none", "bypass_prefix_cache": true}
+[2026-11-01 15:34:54] [INFO] Reasoning effort: none, Thinking: disabled, Thinking budget: 0, Tools: 0, Anti-Loop: disabled, Stop-Words: 0, Server-Exec: disabled (client_tool_exec: false, headless: false), Max-Tool-Rounds: 10, Timeout: 60000ms, Bypass-Cache: true
+[2026-11-01 15:34:54] [INFO] RESPONSE (0ms)
+[2026-11-01 15:34:54] [INFO] STREAM PROMPT [round 1] (len=31, continuation=false, visual=none)
+[2026-11-01 15:34:54] [INFO] [KV CACHE] Bypass prefix cache requested: forcing cold full prefill of 31 tokens
+[2026-11-01 15:34:54] [INFO] [V4.1 LAYER 0 PROFILE M=31] Total: 36.38 ms | Attn_HC: 0.05 ms | QKV: 0.65 ms | Attn_Loop: 0.04 ms | Out: 0.79 ms | FFN_HC: 0.05 ms | Gate: 0.11 ms | Shared: 2.10 ms | Routed_MoE: 32.58 ms (DMA: 31.16, SwiGLU: 0.81, Down: 0.62) | Accum: 0.01 ms
+[2026-11-01 15:34:55] [INFO] [V4.1 LAYER 20 PROFILE M=31] Total: 29.52 ms | Attn_HC: 0.05 ms | QKV: 0.65 ms | Attn_Loop: 1.01 ms | Out: 1.17 ms | FFN_HC: 0.05 ms | Gate: 0.25 ms | Shared: 3.51 ms | Routed_MoE: 22.84 ms (DMA: 21.72, SwiGLU: 0.61, Down: 0.51) | Accum: 0.01 ms
+[2026-11-01 15:34:55] [INFO] [V4.1 LAYER 39 PROFILE M=31] Total: 26.00 ms | Attn_HC: 0.04 ms | QKV: 1.12 ms | Attn_Loop: 0.05 ms | Out: 0.79 ms | FFN_HC: 0.05 ms | Gate: 0.46 ms | Shared: 3.87 ms | Routed_MoE: 19.60 ms (DMA: 18.38, SwiGLU: 0.68, Down: 0.54) | Accum: 0.01 ms
+[2026-11-01 15:34:55] [INFO] [PREFILL STATS] 31 prompt tokens prefilled in 1.278s -> 24.26 tok/s (V4.1 batched chunk_size=512, offset=0)
+[2026-11-01 15:34:55] [INFO] [PREFILL I/O] Total cold expert disk reads: 60798
+[2026-11-01 15:34:55] [INFO] [PREFILL STATS] 31 tokens evaluated in 1.278s -> 24.26 tok/s (prefix cached: 0 / 31, 0.0%)
+[2026-11-01 15:34:55] [WARN] Think tokens: start=128821 end=128822, EOS=1 eos2=1 user=128803 asst=128804, think_budget=0
+
+Here's a clean Python function to calculate the nth Fibonacci number iteratively:
+
+```python
+def fibonacci(n: int) -> int:
+    """
+    Calculate the nth Fibonacci number iteratively.
+
+    The Fibonacci sequence is defined as:
+        F(0) = 0
+        F(1) = 1
+        F(n) = F(n-1) + F(n-2) for n >= 2
+
+    Args:
+        n: The index in the Fibonacci sequence (must be >= 0).
+
+    Returns:
+        The nth Fibonacci number.
+
+    Raises:
+        ValueError: If n is negative.
+    """
+    if n < 0:
+        raise ValueError("n must be a non-negative integer")
+
+    if n == 0:
+        return 0
+    if n == 1:
+        return 1
+
+    prev, curr = 0, 1
+    for _ in range(2, n + 1):
+        prev, curr = curr, prev + curr
+
+    return curr
+```
+
+**Key points:**
+
+- **Type hints**:[2026-11-01 15:35:13] [INFO] [GENERATION STATS] 220 tokens in 17.470s -> 12.59 tok/s (Content: 220, Thinking: 0)
+[2026-11-01 15:35:13] [INFO] REQUEST: {"model": "deepseek_v41_mixed", "messages": [{"role": "user", "content": "Write a clean, responsive single-file HTML calculator with modern styling and interactive JavaScript."}], "max_tokens": 600, "temperature": 0.0, "repetition_penalty": 1.0, "stream": true, "enable_thinking": true, "thinking": {"type": "enabled", "budget_tokens": 200}, "max_thinking_tokens": 200, "reasoning_effort": "low", "bypass_prefix_cache": true}
+[2026-11-01 15:35:13] [INFO] Reasoning effort: low, Thinking: enabled, Thinking budget: 200, Tools: 0, Anti-Loop: disabled, Stop-Words: 0, Server-Exec: disabled (client_tool_exec: false, headless: false), Max-Tool-Rounds: 10, Timeout: 60000ms, Bypass-Cache: true
+[2026-11-01 15:35:13] [INFO] RESPONSE (0ms)
+[2026-11-01 15:35:13] [INFO] STREAM PROMPT [round 1] (len=52, continuation=false, visual=none)
+[2026-11-01 15:35:13] [INFO] [KV CACHE] Bypass prefix cache requested: forcing cold full prefill of 52 tokens
+[2026-11-01 15:35:13] [INFO] [V4.1 LAYER 0 PROFILE M=52] Total: 60.56 ms | Attn_HC: 0.07 ms | QKV: 1.08 ms | Attn_Loop: 0.06 ms | Out: 1.65 ms | FFN_HC: 0.06 ms | Gate: 0.54 ms | Shared: 4.61 ms | Routed_MoE: 52.48 ms (DMA: 49.89, SwiGLU: 1.10, Down: 1.48) | Accum: 0.01 ms
+[2026-11-01 15:35:14] [INFO] [V4.1 LAYER 20 PROFILE M=52] Total: 23.46 ms | Attn_HC: 0.07 ms | QKV: 1.08 ms | Attn_Loop: 1.71 ms | Out: 1.32 ms | FFN_HC: 0.06 ms | Gate: 0.12 ms | Shared: 5.27 ms | Routed_MoE: 13.82 ms (DMA: 12.45, SwiGLU: 0.74, Down: 0.62) | Accum: 0.01 ms
+[2026-11-01 15:35:15] [INFO] [V4.1 LAYER 39 PROFILE M=52] Total: 42.40 ms | Attn_HC: 0.06 ms | QKV: 1.54 ms | Attn_Loop: 0.12 ms | Out: 1.78 ms | FFN_HC: 0.06 ms | Gate: 0.24 ms | Shared: 4.33 ms | Routed_MoE: 34.25 ms (DMA: 31.96, SwiGLU: 1.10, Down: 1.20) | Accum: 0.01 ms
+[2026-11-01 15:35:15] [INFO] [PREFILL STATS] 52 prompt tokens prefilled in 1.698s -> 30.62 tok/s (V4.1 batched chunk_size=512, offset=0)
+[2026-11-01 15:35:15] [INFO] [PREFILL I/O] Total cold expert disk reads: 64410
+[2026-11-01 15:35:15] [INFO] [PREFILL STATS] 52 tokens evaluated in 1.698s -> 30.62 tok/s (prefix cached: 0 / 52, 0.0%)
+[2026-11-01 15:35:15] [WARN] Think tokens: start=128821 end=128822, EOS=1 eos2=1 user=128803 asst=128804, think_budget=200
+
+The user wants a single-file HTML calculator with modern styling and interactive JavaScript. I need to write clean, responsive code. Let me build a nice calculator UI with display, buttons, keyboard support, and proper calculation logic.
+
+Let me design:
+- Modern dark/light theme, glassmorphism or clean card design
+- Responsive grid layout for buttons
+- Display showing current input and result
+- Support operators + - × ÷, decimal, %, clear, backspace, equals
+- Keyboard support
+- Handle edge cases like division by zero, multiple decimals, etc.
+
+Let me write the code carefully.
+
+Structure:
+```html
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Calculator</title>
+<style>...</style>
+</head>
+<body>
+<div class="calculator">
+  <div class="display">
+    <div class="expression"></div>
+[2026-11-01 15:35:29] [WARN] [ThinkTransition] Thinking budget reached (200 thinking tokens). Closing </think> and starting content.
+Here's a clean, responsive single-file calculator with modern styling and interactive JavaScript:
+
+```html
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Modern Calculator</title>
+<style>
+  :root {
+    --bg: #0f172a;
+    --card: #1e293b;
+    --display: #0b1220;
+    --btn: #334155;
+    --btn-hover: #475569;
+    --accent: #38bdf8;
+    --accent-hover: #0ea5e9;
+    --text: #f1f5f9;
+    --muted: #94a3b8;
+    --danger: #ef4444;
+    --radius: 16px;
+  }
+
+  * {
+    box-sizing: border-box;
+    margin: 0;
+    padding: 0;
+    font-family: 'Segoe UI', system-ui, -apple-system, sans-serif;
+  }
+
+  body {
+    min-height: 100vh;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    background: radial-gradient(circle at top left, #1e293b, #0f172a 60%);
+    padding: 16px;
+  }
+
+  .calculator {
+    width: 100%;
+    max-width: 360px;
+    background: var(--card);
+    border-radius: var(--radius);
+    padding: 20px;
+    box-shadow: 0 20px 50px rgba(0, 0, 0, 0.5), inset 0 1px 0 rgba(255,255,255,0.05);
+    border: 1px solid rgba(255,255,255,0.08);
+  }
+
+  .display {
+    background: var(--display);
+    border-radius: 12px;
+    padding: 16px;
+    margin-bottom: 20px;
+    text-align: right;
+    min-height: 90px;
+    display: flex;
+    flex-direction: column;
+    justify-content: flex-end;
+    overflow: hidden;
+    border: 1px solid rgba(255,255,255,0.05);
+  }
+
+  .expression {
+    font-size: 0.9rem;
+    color: var(--muted);
+    min-height: 20px;
+    word-break: break-all;
+    line-height: 1.4;
+  }
+
+  .result {
+    font-size: 2.2rem;
+    font-weight: 600;
+    color: var(--text);
+    word-break: break-all;
+    line-height: 1.2;
+    margin-top: 4px;
+  }
+
+  .keys {
+    display[2026-11-01 15:36:09] [INFO] [GENERATION STATS] 801 tokens in 54.275s -> 14.76 tok/s (Content: 600, Thinking: 200)
+[2026-11-01 15:36:09] [INFO] REQUEST: {"model": "deepseek_v41_mixed", "messages": [{"role": "user", "content": "A bat and a ball cost $1.10 in total. The bat costs $1.00 more than the ball. How much does the ball cost? Show step-by-step logic."}], "max_tokens": 450, "temperature": 0.0, "repetition_penalty": 1.0, "stream": true, "enable_thinking": true, "thinking": {"type": "enabled", "budget_tokens": 500}, "max_thinking_tokens": 500, "reasoning_effort": "high", "bypass_prefix_cache": true}
+[2026-11-01 15:36:09] [INFO] Reasoning effort: high, Thinking: enabled, Thinking budget: 500, Tools: 0, Anti-Loop: disabled, Stop-Words: 0, Server-Exec: disabled (client_tool_exec: false, headless: false), Max-Tool-Rounds: 10, Timeout: 60000ms, Bypass-Cache: true
+[2026-11-01 15:36:09] [INFO] RESPONSE (0ms)
+[2026-11-01 15:36:09] [INFO] STREAM PROMPT [round 1] (len=74, continuation=false, visual=none)
+[2026-11-01 15:36:09] [INFO] [KV CACHE] Bypass prefix cache requested: forcing cold full prefill of 74 tokens
+[2026-11-01 15:36:10] [INFO] [V4.1 LAYER 0 PROFILE M=74] Total: 68.90 ms | Attn_HC: 0.08 ms | QKV: 1.54 ms | Attn_Loop: 0.11 ms | Out: 1.88 ms | FFN_HC: 0.07 ms | Gate: 0.21 ms | Shared: 5.33 ms | Routed_MoE: 59.67 ms (DMA: 56.95, SwiGLU: 1.50, Down: 1.22) | Accum: 0.01 ms
+[2026-11-01 15:36:11] [INFO] [V4.1 LAYER 20 PROFILE M=74] Total: 39.45 ms | Attn_HC: 0.07 ms | QKV: 1.54 ms | Attn_Loop: 2.49 ms | Out: 1.89 ms | FFN_HC: 0.07 ms | Gate: 0.12 ms | Shared: 4.94 ms | Routed_MoE: 28.31 ms (DMA: 26.15, SwiGLU: 1.12, Down: 1.04) | Accum: 0.01 ms
+[2026-11-01 15:36:12] [INFO] [V4.1 LAYER 39 PROFILE M=74] Total: 59.53 ms | Attn_HC: 0.07 ms | QKV: 2.17 ms | Attn_Loop: 0.24 ms | Out: 2.19 ms | FFN_HC: 0.07 ms | Gate: 0.23 ms | Shared: 6.09 ms | Routed_MoE: 48.46 ms (DMA: 45.08, SwiGLU: 1.73, Down: 1.65) | Accum: 0.01 ms
+[2026-11-01 15:36:12] [INFO] [PREFILL STATS] 74 prompt tokens prefilled in 2.212s -> 33.46 tok/s (V4.1 batched chunk_size=512, offset=0)
+[2026-11-01 15:36:12] [INFO] [PREFILL I/O] Total cold expert disk reads: 72537
+[2026-11-01 15:36:12] [INFO] [PREFILL STATS] 74 tokens evaluated in 2.212s -> 33.46 tok/s (prefix cached: 0 / 74, 0.0%)
+[2026-11-01 15:36:12] [WARN] Think tokens: start=128821 end=128822, EOS=1 eos2=1 user=128803 asst=128804, think_budget=500
+
+We need answer classic trick. Need step-by-step logic. Need be careful: bat + ball = 1.10; bat = ball + 1.00. Let ball x, bat x+1. Total 2x+1=1.10 => 2x=0.10 => x=0.05. Ball costs $0.05. Bat $1.05. Many intuitive answer 0.10 wrong. Show logic. Need concise.Let the ball cost \(x\) dollars.
+
+- The bat costs \(1.00\) more than the ball, so the bat costs \(x + 1.00\).
+- Together they cost \(1.10\):
+
+\[
+x + (x + 1.00) = 1.10
+\]
+
+\[
+2x + 1.00 = 1.10
+\]
+
+\[
+2x = 0.10
+\]
+
+\[
+x = 0.05
+\]
+
+So the **ball costs $0.05**, and the **bat costs $1.05**. Their total is indeed $1.10.[2026-11-01 15:36:27] [WARN] Stop token hit: token=1 (cfg_eos=1, eos2=1, im_end=-1) at step 228 (content: 131/450, think: 96/500)
+[2026-11-01 15:36:27] [INFO] [GENERATION STATS] 228 tokens in 15.124s -> 15.08 tok/s (Content: 131, Thinking: 96)
+[2026-11-01 15:36:27] [INFO] REQUEST: {"model": "deepseek_v41_mixed", "messages": [{"role": "user", "content": "In distributed systems engineering, achieving fault-tolerant consensus across an asynchronous network with unreliable nodes presents fundamental trade-offs formalized by the CAP theorem and the FLP impossibility result. State machine replication (SMR) is a primary paradigm used to build resilient distributed services. In SMR, multiple identical deterministic replicas execute a sequence of commands in the identical order. Consensus algorithms such as Paxos and Raft coordinate the sequence of log entries. Raft structures consensus around an elected leader that manages log replication, heartbeats, and client interactions. If the leader fails, a randomized election timer triggers candidate state transitions to elect a successor. Safety is maintained by ensuring log matching invariants, leader completeness, and state machine commitment rules. Multi-Paxos optimizes write latency by leasing leader terms and amortizing prepare phases.\n\nFurthermore, modern distributed datastores employ hybrid logical clocks (HLC) and synchronized GPS/atomic TrueTime hardware to provide external consistency without relying solely on distributed lock managers. By combining monotonic physical clocks with logical counters, systems can order distributed transactions across geographically separated data centers while bounding clock drift. When network partitions occur, distributed databases must choose between linearizable read-write availability and strong consistency guarantees. Quorum-based protocols require strict majority overlap (R + W > N) to prevent split-brain anomalies during transient link degradations and asymmetric network partitions.\n\nLog compaction and snapshotting are equally critical in production deployments. Because logs cannot grow unboundedly, replicas periodically take point-in-time state snapshots and discard prior log entries. Replicas that lag too far behind receive full snapshots over the network before rejoining the active consensus group. Dynamic cluster membership changes must also be handled carefully through joint consensus configurations to prevent disjoint majority splits when nodes join or leave the cluster.\n\nIn distributed systems engineering, achieving fault-tolerant consensus across an asynchronous network with unreliable nodes presents fundamental trade-offs formalized by the CAP theorem and the FLP impossibility result. State machine replication (SMR) is a primary paradigm used to build resilient distributed services. In SMR, multiple identical deterministic replicas execute a sequence of commands in the identical order. Consensus algorithms such as Paxos and Raft coordinate the sequence of log entries. Raft structures consensus around an elected leader that manages log replication, heartbeats, and client interactions. If the leader fails, a randomized election timer triggers candidate state transitions to elect a successor. Safety is maintained by ensuring log matching invariants, leader completeness, and state machine commitment rules. Multi-Paxos optimizes write latency by leasing leader terms and amortizing prepare phases.\n\nFurthermore, modern distributed datastores employ hybrid logical clocks (HLC) and synchronized GPS/atomic TrueTime hardware to provide external consistency without relying solely on distributed lock managers. By combining monotonic physical clocks with logical counters, systems can order distributed transactions across geographically separated data centers while bounding clock drift. When network partitions occur, distributed databases must choose between linearizable read-write availability and strong consistency guarantees. Quorum-based protocols require strict majority overlap (R + W > N) to prevent split-brain anomalies during transient link degradations and asymmetric network partitions.\n\nLog compaction and snapshotting are equally critical in production deployments. Because logs cannot grow unboundedly, replicas periodically take point-in-time state snapshots and discard prior log entries. Re
+[2026-11-01 15:36:27] [INFO] Reasoning effort: none, Thinking: disabled, Thinking budget: 0, Tools: 0, Anti-Loop: disabled, Stop-Words: 0, Server-Exec: disabled (client_tool_exec: false, headless: false), Max-Tool-Rounds: 10, Timeout: 60000ms, Bypass-Cache: true
+[2026-11-01 15:36:27] [INFO] RESPONSE (0ms)
+[2026-11-01 15:36:27] [INFO] STREAM PROMPT [round 1] (len=1841, continuation=false, visual=none)
+[2026-11-01 15:36:27] [INFO] [KV CACHE] Bypass prefix cache requested: forcing cold full prefill of 1841 tokens
+[2026-11-01 15:36:27] [INFO] [V4.1 LAYER 0 PROFILE M=512] Total: 150.15 ms | Attn_HC: 0.29 ms | QKV: 10.25 ms | Attn_Loop: 2.09 ms | Out: 5.23 ms | FFN_HC: 0.30 ms | Gate: 0.62 ms | Shared: 10.90 ms | Routed_MoE: 120.45 ms (DMA: 103.29, SwiGLU: 8.52, Down: 8.64) | Accum: 0.04 ms
+[2026-11-01 15:36:36] [INFO] [V4.1 LAYER 20 PROFILE M=512] Total: 120.30 ms | Attn_HC: 0.29 ms | QKV: 0.29 ms | Attn_Loop: 26.57 ms | Out: 0.48 ms | FFN_HC: 0.30 ms | Gate: 0.22 ms | Shared: 15.11 ms | Routed_MoE: 76.98 ms (DMA: 58.11, SwiGLU: 9.05, Down: 9.83) | Accum: 0.05 ms
+[2026-11-01 15:36:41] [INFO] [V4.1 LAYER 39 PROFILE M=512] Total: 118.45 ms | Attn_HC: 0.29 ms | QKV: 0.28 ms | Attn_Loop: 6.76 ms | Out: 0.48 ms | FFN_HC: 0.30 ms | Gate: 0.26 ms | Shared: 10.71 ms | Routed_MoE: 99.33 ms (DMA: 83.05, SwiGLU: 8.05, Down: 8.23) | Accum: 0.04 ms
+[2026-11-01 15:36:41] [INFO] [PREFILL STATS] 1841 prompt tokens prefilled in 13.680s -> 134.57 tok/s (V4.1 batched chunk_size=512, offset=0)
+[2026-11-01 15:36:41] [INFO] [PREFILL I/O] Total cold expert disk reads: 78917
+[2026-11-01 15:36:41] [INFO] [PREFILL STATS] 1841 tokens evaluated in 13.681s -> 134.57 tok/s (prefix cached: 0 / 1841, 0.0%)
+[2026-11-01 15:36:41] [WARN] Think tokens: start=128821 end=128822, EOS=1 eos2=1 user=128803 asst=128804, think_budget=0
+
+- **Safety via leader election and invariants:** Raft elects a leader through randomized election timers and maintains safety through log matching, leader completeness, and state-machine commitment rules; Multi-Paxos amortizes prepare phases and leases leader terms to reduce write latency while preserving consensus safety.
+- **Consistency across partitions and time:** Modern datastores use hybrid logical clocks (HLC) and GPS/atomic TrueTime to provide external consistency and bound clock drift across data centers; quorum protocols enforce strict majority overlap (R + W > N) to avoid split-brain anomalies during partitions and link degradations.
+- **Bounded log growth and membership stability:** Replicas periodically snapshot point-in-time state and compact logs, sending full snapshots to lagging replicas before they rejoin consensus; dynamic membership changes use joint consensus configurations to prevent disjoint majority splits when nodes join or leave.[2026-11-01 15:36:56] [WARN] Stop token hit: token=1 (cfg_eos=1, eos2=1, im_end=-1) at step 179 (content: 179/180, think: 0/0)
+[2026-11-01 15:36:56] [INFO] [GENERATION STATS] 179 tokens in 15.247s -> 11.74 tok/s (Content: 179, Thinking: 0)
+[2026-11-01 15:36:56] [INFO] REQUEST: {"model": "deepseek_v41_mixed", "messages": [{"role": "user", "content": "In distributed systems engineering, achieving fault-tolerant consensus across an asynchronous network with unreliable nodes presents fundamental trade-offs formalized by the CAP theorem and the FLP impossibility result. State machine replication (SMR) is a primary paradigm used to build resilient distributed services. In SMR, multiple identical deterministic replicas execute a sequence of commands in the identical order. Consensus algorithms such as Paxos and Raft coordinate the sequence of log entries. Raft structures consensus around an elected leader that manages log replication, heartbeats, and client interactions. If the leader fails, a randomized election timer triggers candidate state transitions to elect a successor. Safety is maintained by ensuring log matching invariants, leader completeness, and state machine commitment rules. Multi-Paxos optimizes write latency by leasing leader terms and amortizing prepare phases.\n\nFurthermore, modern distributed datastores employ hybrid logical clocks (HLC) and synchronized GPS/atomic TrueTime hardware to provide external consistency without relying solely on distributed lock managers. By combining monotonic physical clocks with logical counters, systems can order distributed transactions across geographically separated data centers while bounding clock drift. When network partitions occur, distributed databases must choose between linearizable read-write availability and strong consistency guarantees. Quorum-based protocols require strict majority overlap (R + W > N) to prevent split-brain anomalies during transient link degradations and asymmetric network partitions.\n\nLog compaction and snapshotting are equally critical in production deployments. Because logs cannot grow unboundedly, replicas periodically take point-in-time state snapshots and discard prior log entries. Replicas that lag too far behind receive full snapshots over the network before rejoining the active consensus group. Dynamic cluster membership changes must also be handled carefully through joint consensus configurations to prevent disjoint majority splits when nodes join or leave the cluster.\n\nIn distributed systems engineering, achieving fault-tolerant consensus across an asynchronous network with unreliable nodes presents fundamental trade-offs formalized by the CAP theorem and the FLP impossibility result. State machine replication (SMR) is a primary paradigm used to build resilient distributed services. In SMR, multiple identical deterministic replicas execute a sequence of commands in the identical order. Consensus algorithms such as Paxos and Raft coordinate the sequence of log entries. Raft structures consensus around an elected leader that manages log replication, heartbeats, and client interactions. If the leader fails, a randomized election timer triggers candidate state transitions to elect a successor. Safety is maintained by ensuring log matching invariants, leader completeness, and state machine commitment rules. Multi-Paxos optimizes write latency by leasing leader terms and amortizing prepare phases.\n\nFurthermore, modern distributed datastores employ hybrid logical clocks (HLC) and synchronized GPS/atomic TrueTime hardware to provide external consistency without relying solely on distributed lock managers. By combining monotonic physical clocks with logical counters, systems can order distributed transactions across geographically separated data centers while bounding clock drift. When network partitions occur, distributed databases must choose between linearizable read-write availability and strong consistency guarantees. Quorum-based protocols require strict majority overlap (R + W > N) to prevent split-brain anomalies during transient link degradations and asymmetric network partitions.\n\nLog compaction and snapshotting are equally critical in production deployments. Because logs cannot grow unboundedly, replicas periodically take point-in-time state snapshots and discard prior log entries. Re
+[2026-11-01 15:36:56] [INFO] Reasoning effort: none, Thinking: disabled, Thinking budget: 0, Tools: 0, Anti-Loop: disabled, Stop-Words: 0, Server-Exec: disabled (client_tool_exec: false, headless: false), Max-Tool-Rounds: 10, Timeout: 60000ms, Bypass-Cache: true
+[2026-11-01 15:36:56] [INFO] RESPONSE (0ms)
+[2026-11-01 15:36:57] [INFO] STREAM PROMPT [round 1] (len=2886, continuation=false, visual=none)
+[2026-11-01 15:36:57] [INFO] [KV CACHE] Bypass prefix cache requested: forcing cold full prefill of 2886 tokens
+[2026-11-01 15:36:57] [INFO] [V4.1 LAYER 0 PROFILE M=512] Total: 127.70 ms | Attn_HC: 0.29 ms | QKV: 0.28 ms | Attn_Loop: 2.39 ms | Out: 0.48 ms | FFN_HC: 0.30 ms | Gate: 0.84 ms | Shared: 11.49 ms | Routed_MoE: 111.57 ms (DMA: 90.02, SwiGLU: 10.54, Down: 11.01) | Accum: 0.04 ms
+[2026-11-01 15:37:03] [INFO] [V4.1 LAYER 20 PROFILE M=512] Total: 108.40 ms | Attn_HC: 0.31 ms | QKV: 0.28 ms | Attn_Loop: 22.28 ms | Out: 0.48 ms | FFN_HC: 0.30 ms | Gate: 0.22 ms | Shared: 12.58 ms | Routed_MoE: 71.91 ms (DMA: 56.98, SwiGLU: 7.30, Down: 7.62) | Accum: 0.04 ms
+[2026-11-01 15:37:10] [INFO] [V4.1 LAYER 39 PROFILE M=512] Total: 114.50 ms | Attn_HC: 0.66 ms | QKV: 0.29 ms | Attn_Loop: 8.21 ms | Out: 0.88 ms | FFN_HC: 0.31 ms | Gate: 0.41 ms | Shared: 15.05 ms | Routed_MoE: 88.65 ms (DMA: 68.45, SwiGLU: 10.41, Down: 9.79) | Accum: 0.04 ms
+[2026-11-01 15:37:10] [INFO] [PREFILL STATS] 2886 prompt tokens prefilled in 13.433s -> 214.85 tok/s (V4.1 batched chunk_size=512, offset=0)
+[2026-11-01 15:37:10] [INFO] [PREFILL I/O] Total cold expert disk reads: 86040
+[2026-11-01 15:37:10] [INFO] [PREFILL STATS] 2886 tokens evaluated in 13.433s -> 214.85 tok/s (prefix cached: 0 / 2886, 0.0%)
+[2026-11-01 15:37:10] [WARN] Think tokens: start=128821 end=128822, EOS=1 eos2=1 user=128803 asst=128804, think_budget=0
+
+The core distributed consensus invariant is that all committed log entries must be identical across replicas in both content and order, ensuring deterministic state machine replication remains consistent despite leader failures, network partitions, and membership changes.[2026-11-01 15:37:15] [WARN] Stop token hit: token=1 (cfg_eos=1, eos2=1, im_end=-1) at step 41 (content: 41/64, think: 0/0)
+[2026-11-01 15:37:15] [INFO] [GENERATION STATS] 41 tokens in 5.378s -> 7.62 tok/s (Content: 41, Thinking: 0)
+[2026-11-01 15:39:46] [INFO] REQUEST: {"model": "deepseek_v41_mixed", "messages": [{"role": "user", "content": "Write a clean, responsive single-file HTML calculator with modern styling and interactive JavaScript."}], "max_tokens": 1200, "temperature": 0.0, "repetition_penalty": 1.0, "stream": true, "enable_thinking": true, "thinking": {"type": "enabled", "budget_tokens": 200}, "max_thinking_tokens": 200, "reasoning_effort": "low", "bypass_prefix_cache": true}
+[2026-11-01 15:39:46] [INFO] Reasoning effort: low, Thinking: enabled, Thinking budget: 200, Tools: 0, Anti-Loop: disabled, Stop-Words: 0, Server-Exec: disabled (client_tool_exec: false, headless: false), Max-Tool-Rounds: 10, Timeout: 60000ms, Bypass-Cache: true
+[2026-11-01 15:39:46] [INFO] RESPONSE (0ms)
+[2026-11-01 15:39:46] [INFO] STREAM PROMPT [round 1] (len=52, continuation=false, visual=none)
+[2026-11-01 15:39:46] [INFO] [KV CACHE] Bypass prefix cache requested: forcing cold full prefill of 52 tokens
+[2026-11-01 15:39:46] [INFO] [V4.1 LAYER 0 PROFILE M=52] Total: 203.98 ms | Attn_HC: 0.25 ms | QKV: 7.77 ms | Attn_Loop: 0.16 ms | Out: 9.36 ms | FFN_HC: 0.23 ms | Gate: 0.34 ms | Shared: 129.40 ms | Routed_MoE: 56.45 ms (DMA: 54.48, SwiGLU: 1.09, Down: 0.88) | Accum: 0.01 ms
+[2026-11-01 15:39:47] [INFO] [V4.1 LAYER 20 PROFILE M=52] Total: 26.97 ms | Attn_HC: 0.06 ms | QKV: 1.06 ms | Attn_Loop: 1.72 ms | Out: 1.29 ms | FFN_HC: 0.06 ms | Gate: 0.13 ms | Shared: 4.86 ms | Routed_MoE: 17.79 ms (DMA: 16.42, SwiGLU: 0.74, Down: 0.63) | Accum: 0.01 ms
+[2026-11-01 15:39:48] [INFO] [V4.1 LAYER 39 PROFILE M=52] Total: 45.51 ms | Attn_HC: 0.06 ms | QKV: 1.06 ms | Attn_Loop: 0.12 ms | Out: 1.66 ms | FFN_HC: 0.06 ms | Gate: 0.12 ms | Shared: 3.77 ms | Routed_MoE: 38.65 ms (DMA: 36.66, SwiGLU: 1.10, Down: 0.90) | Accum: 0.01 ms
+[2026-11-01 15:39:48] [INFO] [PREFILL STATS] 52 prompt tokens prefilled in 1.683s -> 30.90 tok/s (V4.1 batched chunk_size=512, offset=0)
+[2026-11-01 15:39:48] [INFO] [PREFILL I/O] Total cold expert disk reads: 88895
+[2026-11-01 15:39:48] [INFO] [PREFILL STATS] 52 tokens evaluated in 1.683s -> 30.90 tok/s (prefix cached: 0 / 52, 0.0%)
+[2026-11-01 15:39:48] [WARN] Think tokens: start=128821 end=128822, EOS=1 eos2=1 user=128803 asst=128804, think_budget=200
+
+The user wants a single-file HTML calculator with modern styling and interactive JavaScript. I need to write clean, responsive code. Let me build a nice calculator UI with display, buttons, keyboard support, and proper calculation logic.
+
+Let me design:
+- Modern dark/light theme, glassmorphism or clean card design
+- Responsive grid layout for buttons
+- Display showing current input and result
+- Support operators + - × ÷, decimal, %, clear, backspace, equals
+- Keyboard support
+- Handle edge cases like division by zero, multiple decimals, etc.
+
+Let me write the code carefully.
+
+Structure:
+```html
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Calculator</title>
+<style>...</style>
+</head>
+<body>
+<div class="calculator">
+  <div class="display">
+    <div class="expression"></div>
+[2026-11-01 15:40:00] [WARN] [ThinkTransition] Thinking budget reached (200 thinking tokens). Closing </think> and starting content.
+Here's a clean, responsive single-file calculator with modern styling and interactive JavaScript:
+
+```html
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Modern Calculator</title>
+<style>
+  :root {
+    --bg: #0f172a;
+    --card: #1e293b;
+    --display: #0b1220;
+    --btn: #334155;
+    --btn-hover: #475569;
+    --accent: #38bdf8;
+    --accent-hover: #0ea5e9;
+    --text: #f1f5f9;
+    --muted: #94a3b8;
+    --danger: #ef4444;
+    --radius: 16px;
+  }
+
+  * {
+    box-sizing: border-box;
+    margin: 0;
+    padding: 0;
+    font-family: 'Segoe UI', system-ui, -apple-system, sans-serif;
+  }
+
+  body {
+    min-height: 100vh;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    background: radial-gradient(circle at top left, #1e293b, #0f172a 60%);
+    padding: 16px;
+  }
+
+  .calculator {
+    width: 100%;
+    max-width: 360px;
+    background: var(--card);
+    border-radius: var(--radius);
+    padding: 20px;
+    box-shadow: 0 20px 50px rgba(0, 0, 0, 0.5), inset 0 1px 0 rgba(255,255,255,0.05);
+    border: 1px solid rgba(255,255,255,0.08);
+  }
+
+  .display {
+    background: var(--display);
+    border-radius: 12px;
+    padding: 16px;
+    margin-bottom: 20px;
+    text-align: right;
+    min-height: 90px;
+    display: flex;
+    flex-direction: column;
+    justify-content: flex-end;
+    overflow: hidden;
+    border: 1px solid rgba(255,255,255,0.05);
+  }
+
+  .expression {
+    font-size: 0.9rem;
+    color: var(--muted);
+    min-height: 20px;
+    word-break: break-all;
+    line-height: 1.4;
+  }
+
+  .result {
+    font-size: 2.2rem;
+    font-weight: 600;
+    color: var(--text);
+    word-break: break-all;
+    line-height: 1.2;
+    margin-top: 4px;
+  }
+
+  .keys {
+    display: grid;
+    grid-template-columns: repeat(4, 1fr);
+    gap: 10px;
+  }
+
+  button {
+    border: none;
+    background: var(--btn);
+    color: var(--text);
+    font-size: 1.1rem;
+    font-weight: 500;
+    padding: 16px 8px;
+    border-radius: 10px;
+    cursor: pointer;
+    transition: background 0.15s ease, transform 0.1s ease;
+    user-select: none;
+    -webkit-tap-highlight-color: transparent;
+  }
+
+  button:hover {
+    background: var(--btn-hover);
+  }
+
+  button:active {
+    transform: scale(0.95);
+  }
+
+  button.accent {
+    background: var(--accent);
+    color: #0f172a;
+    font-weight: 600;
+  }
+
+  button.accent:hover {
+    background: var(--accent-hover);
+  }
+
+  button.danger {
+    background: var(--danger);
+    color: #fff;
+  }
+
+  button.danger:hover {
+    background: #dc2626;
+  }
+
+  button.span-2 {
+    grid-column: span 2;
+  }
+
+  @media (max-width: 400px) {
+    .calculator { padding: 14px; }
+    button { padding: 14px 6px; font-size: 1rem; }
+    .result { font-size: 1.8rem; }
+  }
+</style>
+</head>
+<body>
+
+<div class="calculator">
+  <div class="display">
+    <div class="expression" id="expression"></div>
+    <div class="result" id="result">0</div>
+  </div>
+
+  <div class="keys">
+    <button class="danger" data-action="clear">AC</button>
+    <button data-action="backspace">⌫</button>
+    <button data-action="percent">%</button>
+    <button class="accent" data-action="divide">÷</button>
+
+    <button data-value="7">7</button>
+    <button data-value="8">8</button>
+    <button data-value="9">9</button>
+    <button class="accent" data-action="multiply">×</button>
+
+    <button data-value="4">4</button>
+    <button data-value="5">5</button>
+    <button data-value="6">6</button>
+    <button class="accent" data-action="subtract">−</button>
+
+    <button data-value="1">1</button>
+    <button data-value="2">2</button>
+    <button data-value="3">3</button>
+    <button class="accent" data-action="add">+</button>
+
+    <button[2026-11-01 15:41:12] [INFO] [GENERATION STATS] 1401 tokens in 84.167s -> 16.65 tok/s (Content: 1200, Thinking: 200)
+[2026-11-01 15:41:12] [INFO] REQUEST: {"model": "deepseek_v41_mixed", "messages": [{"role": "user", "content": "Hi"}], "max_tokens": 2, "temperature": 0.0, "repetition_penalty": 1.0, "stream": true, "enable_thinking": false, "thinking": {"type": "disabled", "budget_tokens": 0}, "max_thinking_tokens": 0, "reasoning_effort": "none", "bypass_prefix_cache": true}
+[2026-11-01 15:41:12] [INFO] Reasoning effort: none, Thinking: disabled, Thinking budget: 0, Tools: 0, Anti-Loop: disabled, Stop-Words: 0, Server-Exec: disabled (client_tool_exec: false, headless: false), Max-Tool-Rounds: 10, Timeout: 60000ms, Bypass-Cache: true
+[2026-11-01 15:41:12] [INFO] RESPONSE (0ms)
+[2026-11-01 15:41:12] [INFO] STREAM PROMPT [round 1] (len=12, continuation=false, visual=none)
+[2026-11-01 15:41:12] [INFO] [KV CACHE] Bypass prefix cache requested: forcing cold full prefill of 12 tokens
+[2026-11-01 15:41:12] [INFO] [V4.1 LAYER 0 PROFILE M=12] Total: 21.94 ms | Attn_HC: 0.05 ms | QKV: 0.27 ms | Attn_Loop: 0.02 ms | Out: 0.32 ms | FFN_HC: 0.03 ms | Gate: 0.11 ms | Shared: 0.88 ms | Routed_MoE: 20.24 ms (DMA: 19.66, SwiGLU: 0.34, Down: 0.25) | Accum: 0.01 ms
+[2026-11-01 15:41:12] [INFO] [V4.1 LAYER 20 PROFILE M=12] Total: 11.87 ms | Attn_HC: 0.03 ms | QKV: 0.27 ms | Attn_Loop: 0.40 ms | Out: 0.32 ms | FFN_HC: 0.03 ms | Gate: 0.13 ms | Shared: 1.47 ms | Routed_MoE: 9.20 ms (DMA: 8.83, SwiGLU: 0.22, Down: 0.15) | Accum: 0.01 ms
+[2026-11-01 15:41:12] [INFO] [V4.1 LAYER 39 PROFILE M=12] Total: 20.72 ms | Attn_HC: 0.03 ms | QKV: 0.27 ms | Attn_Loop: 0.02 ms | Out: 0.32 ms | FFN_HC: 0.03 ms | Gate: 0.11 ms | Shared: 1.53 ms | Routed_MoE: 18.39 ms (DMA: 17.83, SwiGLU: 0.32, Down: 0.24) | Accum: 0.01 ms
+[2026-11-01 15:41:12] [INFO] [PREFILL STATS] 12 prompt tokens prefilled in 0.613s -> 19.58 tok/s (V4.1 batched chunk_size=512, offset=0)
+[2026-11-01 15:41:12] [INFO] [PREFILL I/O] Total cold expert disk reads: 99496
+[2026-11-01 15:41:12] [INFO] [PREFILL STATS] 12 tokens evaluated in 0.613s -> 19.58 tok/s (prefix cached: 0 / 12, 0.0%)
+[2026-11-01 15:41:12] [WARN] Think tokens: start=128821 end=128822, EOS=1 eos2=1 user=128803 asst=128804, think_budget=0
+
+Hi
