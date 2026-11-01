@@ -1,3 +1,14 @@
+    // ── Standard sampling defaults for Nemotron models ──────────────────────
+    void apply_sampling_defaults_nemotron() {
+        if (cfg_.default_temperature < 0.0f) cfg_.default_temperature = 0.60f;
+        if (cfg_.default_top_p < 0.0f) cfg_.default_top_p = 0.95f;
+        if (cfg_.default_top_k < 0) cfg_.default_top_k = 1024;
+        if (cfg_.default_min_p < 0.0f) cfg_.default_min_p = 0.00f;
+        if (cfg_.default_repetition_penalty < 0.0f) cfg_.default_repetition_penalty = 1.05f;
+        if (cfg_.default_reasoning_effort.empty()) cfg_.default_reasoning_effort = "high";
+        if (cfg_.default_thinking_budget < 0) cfg_.default_thinking_budget = 4096;
+    }
+
     // ── Forward one layer (Nemotron 3.5 Lightning Hybrid Mamba-2 SSM + MoE) ─
     inline static cudaEvent_t s_moe_sub_ev[6] = {nullptr};
     inline static bool s_moe_sub_init = false;

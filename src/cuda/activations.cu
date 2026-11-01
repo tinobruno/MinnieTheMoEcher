@@ -11,6 +11,8 @@
 #include <cmath>
 #include <cfloat>
 #include <cstdio>
+#include <vector>
+#include <algorithm>
 
 // ════════════════════════════════════════════════════════════════════════════════
 //  Helpers
@@ -11598,25 +11600,139 @@ void sample_multinomial_f32_cuda(
     float temperature,
     float rand_val,
     float min_p,
-    cudaStream_t stream)
+    cudaStream_t stream,
+    int top_k,
+    float top_p)
 {
-    static float* s_d_block_maxes = nullptr;
-    static int32_t* s_d_block_indices = nullptr;
-    static float* s_d_block_sums = nullptr;
-    static float* s_d_global_max = nullptr;
-    static const int N_BLOCKS = 128;
-    if (!s_d_block_maxes) {
-        cudaMalloc(&s_d_block_maxes, N_BLOCKS * sizeof(float));
-        cudaMalloc(&s_d_block_indices, N_BLOCKS * sizeof(int32_t));
-        cudaMalloc(&s_d_block_sums, N_BLOCKS * sizeof(float));
-        cudaMalloc(&s_d_global_max, sizeof(float));
+    static float* s_h_logits = nullptr;
+    static int s_max_n = 0;
+    if (n > s_max_n) {
+        if (s_h_logits) cudaFreeHost(s_h_logits);
+        s_max_n = std::max(n, 262144);
+        cudaMallocHost(&s_h_logits, s_max_n * sizeof(float));
     }
-    argmax_f32_stage1_kernel<<<N_BLOCKS, 256, 0, stream>>>(s_d_block_maxes, s_d_block_indices, logits, n);
-    argmax_f32_stage2_kernel<<<1, 128, 0, stream>>>(out, s_d_global_max, s_d_block_maxes, s_d_block_indices, N_BLOCKS);
 
+    // Pull logits to pinned host memory for exact Top-K + Top-P + Min-P + Temperature sampling
+    cudaMemcpyAsync(s_h_logits, logits, n * sizeof(float), cudaMemcpyDeviceToHost, stream);
+    cudaStreamSynchronize(stream);
+
+    if (temperature < 1e-4f || top_k == 1) {
+        int best_idx = 0;
+        float best_val = -FLT_MAX;
+        for (int i = 0; i < n; i++) {
+            float v = s_h_logits[i];
+            if (!isnan(v) && v > best_val) {
+                best_val = v;
+                best_idx = i;
+            }
+        }
+        cudaMemcpyAsync(out, &best_idx, sizeof(int32_t), cudaMemcpyHostToDevice, stream);
+        return;
+    }
+
+    struct Candidate {
+        int id;
+        float val;
+    };
+
+    // Keep up to top_k candidates (default cap 2048 so full/top_p=1.0 sampling is not truncated to 40)
+    int eff_top_k = (top_k > 0) ? std::min(top_k, 2048) : 2048;
+    eff_top_k = std::min(eff_top_k, n);
+
+    // Min-heap of size eff_top_k to find largest eff_top_k elements in O(N) time
+    std::vector<Candidate> heap;
+    heap.reserve(eff_top_k);
+    auto cmp_min = [](const Candidate& a, const Candidate& b) {
+        return a.val > b.val; // min-heap (smallest at root)
+    };
+
+    float max_logit = -FLT_MAX;
+    int argmax_id = 0;
+    for (int i = 0; i < n; i++) {
+        float v = s_h_logits[i];
+        if (isnan(v) || v <= -1e20f) continue;
+        if (v > max_logit) {
+            max_logit = v;
+            argmax_id = i;
+        }
+        if ((int)heap.size() < eff_top_k) {
+            heap.push_back({i, v});
+            if ((int)heap.size() == eff_top_k) {
+                std::make_heap(heap.begin(), heap.end(), cmp_min);
+            }
+        } else if (v > heap.front().val) {
+            std::pop_heap(heap.begin(), heap.end(), cmp_min);
+            heap.back() = {i, v};
+            std::push_heap(heap.begin(), heap.end(), cmp_min);
+        }
+    }
+
+    if (heap.empty()) {
+        cudaMemcpyAsync(out, &argmax_id, sizeof(int32_t), cudaMemcpyHostToDevice, stream);
+        return;
+    }
+
+    // Sort candidates descending by logit value
+    std::sort(heap.begin(), heap.end(), [](const Candidate& a, const Candidate& b) {
+        return a.val > b.val;
+    });
+
+    // Apply temperature and compute unnormalized probabilities
     float inv_temp = 1.0f / fmaxf(temperature, 1e-4f);
-    logits_exp_sum_stage1_kernel<<<N_BLOCKS, 256, 0, stream>>>(s_d_block_sums, logits, n, inv_temp, s_d_global_max, min_p);
-    logits_sample_stage2_kernel<<<1, 128, 0, stream>>>(out, logits, s_d_block_sums, out, n, N_BLOCKS, rand_val);
+    float sum_p = 0.0f;
+    for (auto& c : heap) {
+        c.val = expf((c.val - max_logit) * inv_temp);
+        sum_p += c.val;
+    }
+
+    if (sum_p <= 0.0f || isnan(sum_p) || isinf(sum_p)) {
+        cudaMemcpyAsync(out, &argmax_id, sizeof(int32_t), cudaMemcpyHostToDevice, stream);
+        return;
+    }
+
+    // Normalize probabilities on the top-k candidates
+    for (auto& c : heap) {
+        c.val /= sum_p;
+    }
+
+    // Apply Min-P relative to the top token probability (heap[0].val)
+    float max_prob = heap[0].val;
+    float min_p_thresh = (min_p > 0.0f) ? (max_prob * min_p) : 0.0f;
+
+    // Apply Top-P (nucleus) and Min-P filtering
+    float eff_top_p = (top_p > 0.0f && top_p <= 1.0f) ? top_p : 1.0f;
+    float cum_p = 0.0f;
+    int cutoff = 0;
+    for (int i = 0; i < (int)heap.size(); i++) {
+        if (i > 0 && heap[i].val < min_p_thresh) {
+            break;
+        }
+        cum_p += heap[i].val;
+        cutoff = i + 1;
+        if (cum_p >= eff_top_p) {
+            break;
+        }
+    }
+    if (cutoff < 1) cutoff = 1;
+
+    // Sample from the filtered candidates [0 .. cutoff-1]
+    float filtered_sum = 0.0f;
+    for (int i = 0; i < cutoff; i++) {
+        filtered_sum += heap[i].val;
+    }
+
+    float target = rand_val * filtered_sum;
+    float running = 0.0f;
+    int sampled_id = heap[0].id;
+    for (int i = 0; i < cutoff; i++) {
+        running += heap[i].val;
+        if (running >= target) {
+            sampled_id = heap[i].id;
+            break;
+        }
+    }
+
+    cudaMemcpyAsync(out, &sampled_id, sizeof(int32_t), cudaMemcpyHostToDevice, stream);
 }
 
 // ── GPU-Native MoE Expert Activation Frequency Counter (CUDA Graph Compatible) ──

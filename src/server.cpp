@@ -62,8 +62,11 @@ struct ServerConfigState {
     float zdb_min_confidence = 0.70f;
     float zdb_max_top1_gap = 1.50f;
 
+    std::string operational_mode = "chat";
+    bool intent_gating = true;
+
     float temperature = 0.6f;
-    float repetition_penalty = -1.0f;
+    float repetition_penalty = 1.00f;
     std::string reasoning_effort = "medium";
     int thinking_budget = 4096;
     bool thinking_enabled = true;
@@ -81,6 +84,8 @@ struct ServerConfigState {
             {"zdb_auto_fallback", zdb_auto_fallback},
             {"zdb_min_confidence", zdb_min_confidence},
             {"zdb_max_top1_gap", zdb_max_top1_gap},
+            {"operational_mode", operational_mode},
+            {"intent_gating", intent_gating},
             {"temperature", temperature},
             {"repetition_penalty", repetition_penalty},
             {"reasoning_effort", reasoning_effort},
@@ -103,6 +108,17 @@ struct ServerConfigState {
         if (j.contains("zdb_auto_fallback") && j["zdb_auto_fallback"].is_boolean()) zdb_auto_fallback = j["zdb_auto_fallback"].get<bool>();
         if (j.contains("zdb_min_confidence") && j["zdb_min_confidence"].is_number()) zdb_min_confidence = j["zdb_min_confidence"].get<float>();
         if (j.contains("zdb_max_top1_gap") && j["zdb_max_top1_gap"].is_number()) zdb_max_top1_gap = j["zdb_max_top1_gap"].get<float>();
+        if (j.contains("operational_mode") && j["operational_mode"].is_string()) {
+            operational_mode = j["operational_mode"].get<std::string>();
+            intent_gating = (operational_mode == "chat");
+        } else if (j.contains("mode") && j["mode"].is_string()) {
+            operational_mode = j["mode"].get<std::string>();
+            intent_gating = (operational_mode == "chat");
+        }
+        if (j.contains("intent_gating") && j["intent_gating"].is_boolean()) {
+            intent_gating = j["intent_gating"].get<bool>();
+            operational_mode = intent_gating ? "chat" : "agentic";
+        }
         if (j.contains("temperature") && j["temperature"].is_number()) temperature = j["temperature"].get<float>();
         if (j.contains("repetition_penalty") && j["repetition_penalty"].is_number()) repetition_penalty = j["repetition_penalty"].get<float>();
         if (j.contains("reasoning_effort") && j["reasoning_effort"].is_string()) reasoning_effort = j["reasoning_effort"].get<std::string>();
@@ -128,9 +144,21 @@ static void load_server_config(const std::string& path = "server_config.json") {
         if (f.is_open()) {
             json j = json::parse(f);
             g_server_config.from_json(j);
-            LOG_INFO("[Config] Loaded persistent server configuration from %s (zdb_enabled=%s, temp=%.2f, rep_pen=%.2f)",
+            if (!g_intent_gating_cli_explicit) {
+                g_intent_gating = g_server_config.intent_gating;
+            } else {
+                g_server_config.intent_gating = g_intent_gating;
+                g_server_config.operational_mode = g_intent_gating ? "chat" : "agentic";
+            }
+            LOG_INFO("[Config] Loaded persistent server configuration from %s (zdb_enabled=%s, mode=%s, temp=%.2f, rep_pen=%.2f)",
                      path.c_str(), g_server_config.zdb_enabled ? "true" : "false",
+                     g_server_config.operational_mode.c_str(),
                      g_server_config.temperature, g_server_config.repetition_penalty);
+        } else {
+            if (g_intent_gating_cli_explicit) {
+                g_server_config.intent_gating = g_intent_gating;
+                g_server_config.operational_mode = g_intent_gating ? "chat" : "agentic";
+            }
         }
     } catch (const std::exception& e) {
         LOG_WARN("[Config] Could not parse %s: %s (using defaults)", path.c_str(), e.what());
@@ -407,15 +435,49 @@ static json prune_messages_to_fit(
         return pruned;
     }
 
-    LOG_WARN("[Context] Prompt length (%zu) exceeds context budget (%d). Pruning older turns...",
+    LOG_WARN("[Context] Prompt length (%zu) exceeds context budget (%d). Pruning older turns / truncating bulky tool returns...",
              test_prompt.size(), max_allowed_tokens);
 
-    bool has_system = (pruned[0].value("role", "") == "system");
-    size_t min_idx = has_system ? 1 : 0;
+    // Identify pinned header messages that must NEVER be evicted:
+    // Pinned: System prompt (if present) AND the initial User instruction.
+    size_t preserve_count = 0;
+    if (pruned.size() > 0 && pruned[0].value("role", "") == "system") preserve_count++;
+    if (pruned.size() > preserve_count && pruned[preserve_count].value("role", "") == "user") preserve_count++;
 
-    // Prune oldest non-system messages
-    while (pruned.size() > min_idx + 2) {
-        pruned.erase(min_idx);
+    // Step 1: Truncate oversized individual messages first (especially huge tool/scraping responses).
+    // This often frees thousands of tokens without evicting any conversation turns.
+    while (test_prompt.size() > (size_t)max_allowed_tokens) {
+        size_t largest_idx = 0;
+        size_t largest_len = 0;
+        for (size_t i = preserve_count; i < pruned.size(); i++) {
+            std::string content = get_message_content_string(pruned[i]);
+            if (content.size() > largest_len) {
+                largest_len = content.size();
+                largest_idx = i;
+            }
+        }
+        if (largest_len < 1000) break; // Don't truncate reasonably-sized messages in Step 1
+
+        std::string content = get_message_content_string(pruned[largest_idx]);
+        size_t keep_len = (content.size() * 2) / 3;
+        std::string notice = "\n[... Tool content truncated to fit context window ...]\n";
+        if (keep_len > notice.size()) {
+            pruned[largest_idx]["content"] = content.substr(0, keep_len - notice.size()) + notice;
+        } else {
+            pruned[largest_idx]["content"] = notice;
+        }
+        test_prompt = engine.apply_chat_template(pruned, enable_thinking, reasoning_effort, tools);
+    }
+
+    if (test_prompt.size() <= (size_t)max_allowed_tokens) {
+        LOG_INFO("[Context] Pruning complete via tool output truncation: retained %zu messages, prompt length %zu / %d",
+                 pruned.size(), test_prompt.size(), max_allowed_tokens);
+        return pruned;
+    }
+
+    // Step 2: Prune oldest intermediate turns between preserve_count and recent turns
+    while (pruned.size() > preserve_count + 2) {
+        pruned.erase(preserve_count);
         test_prompt = engine.apply_chat_template(pruned, enable_thinking, reasoning_effort, tools);
         if (test_prompt.size() <= (size_t)max_allowed_tokens) {
             LOG_INFO("[Context] Pruning complete: retained %zu messages, prompt length %zu / %d",
@@ -424,18 +486,18 @@ static json prune_messages_to_fit(
         }
     }
 
-    // If still too long, truncate oversized individual messages (e.g. huge file reads)
+    // Step 3: If still too long, aggressively truncate remaining non-pinned messages down to 300 chars
     while (test_prompt.size() > (size_t)max_allowed_tokens) {
         size_t largest_idx = 0;
         size_t largest_len = 0;
-        for (size_t i = min_idx; i < pruned.size(); i++) {
+        for (size_t i = preserve_count; i < pruned.size(); i++) {
             std::string content = get_message_content_string(pruned[i]);
             if (content.size() > largest_len) {
                 largest_len = content.size();
                 largest_idx = i;
             }
         }
-        if (largest_len < 300) break; // Cannot truncate safely further
+        if (largest_len < 300) break;
 
         std::string content = get_message_content_string(pruned[largest_idx]);
         size_t keep_len = (content.size() * 3) / 4;
@@ -867,6 +929,91 @@ static bool is_conversational_greeting(const std::string& text) {
             lower == "help" || lower == "test");
 }
 
+static std::string convert_write_tool_call_to_markdown(const moecher::tooling::ToolCall& tc) {
+    std::string path;
+    std::string content;
+    try {
+        json args = json::parse(tc.arguments);
+        path = args.value("path", "");
+        content = args.value("content", "");
+        if (content.empty() && args.contains("replacement_content")) {
+            content = args.value("replacement_content", "");
+        }
+    } catch (...) {
+        // Fallback robust string extraction for unclosed JSON
+        size_t ppos = tc.arguments.find("\"path\"");
+        if (ppos != std::string::npos) {
+            size_t c = tc.arguments.find(':', ppos);
+            if (c != std::string::npos) {
+                size_t q1 = tc.arguments.find('"', c);
+                if (q1 != std::string::npos) {
+                    size_t q2 = tc.arguments.find('"', q1 + 1);
+                    if (q2 != std::string::npos) path = tc.arguments.substr(q1 + 1, q2 - q1 - 1);
+                }
+            }
+        }
+        size_t cpos = tc.arguments.find("\"content\"");
+        if (cpos == std::string::npos) cpos = tc.arguments.find("\"replacement_content\"");
+        if (cpos != std::string::npos) {
+            size_t c = tc.arguments.find(':', cpos);
+            if (c != std::string::npos) {
+                size_t q1 = tc.arguments.find('"', c);
+                if (q1 != std::string::npos) {
+                    size_t q2 = tc.arguments.rfind('"');
+                    if (q2 != std::string::npos && q2 > q1) {
+                        content = tc.arguments.substr(q1 + 1, q2 - q1 - 1);
+                    } else {
+                        content = tc.arguments.substr(q1 + 1);
+                    }
+                    std::string unescaped;
+                    unescaped.reserve(content.size());
+                    for (size_t i = 0; i < content.size(); ++i) {
+                        if (content[i] == '\\' && i + 1 < content.size()) {
+                            char next = content[i + 1];
+                            if (next == 'n') { unescaped += '\n'; i++; }
+                            else if (next == 'r') { unescaped += '\r'; i++; }
+                            else if (next == 't') { unescaped += '\t'; i++; }
+                            else if (next == '"') { unescaped += '"'; i++; }
+                            else if (next == '\\') { unescaped += '\\'; i++; }
+                            else { unescaped += content[i]; }
+                        } else {
+                            unescaped += content[i];
+                        }
+                    }
+                    content = unescaped;
+                }
+            }
+        }
+    }
+    if (content.empty()) return "";
+
+    std::string lang = "text";
+    size_t dot = path.rfind('.');
+    if (dot != std::string::npos) {
+        std::string ext = path.substr(dot + 1);
+        for (char& c : ext) c = (char)std::tolower((unsigned char)c);
+        if (ext == "html" || ext == "htm") lang = "html";
+        else if (ext == "js" || ext == "mjs") lang = "javascript";
+        else if (ext == "ts" || ext == "tsx") lang = "typescript";
+        else if (ext == "css") lang = "css";
+        else if (ext == "py") lang = "python";
+        else if (ext == "cpp" || ext == "c" || ext == "h" || ext == "hpp") lang = "cpp";
+        else if (ext == "json") lang = "json";
+        else if (ext == "md") lang = "markdown";
+        else if (ext == "sh" || ext == "bash") lang = "bash";
+        else if (ext == "bat" || ext == "cmd") lang = "batch";
+        else if (ext == "ps1") lang = "powershell";
+        else lang = ext;
+    }
+
+    std::string md;
+    if (!path.empty()) {
+        md += "### `" + path + "`\n\n";
+    }
+    md += "```" + lang + "\n" + content + "\n```\n";
+    return md;
+}
+
 void run_server(MoecherEngine& engine, int port, int default_thinking_budget, int proxy_port, bool enable_forward_proxy, bool enable_system_proxy) {
     load_server_config("server_config.json");
     // Whenever the server is started, reset temp, repetition penalty, and anti-loop to proper model defaults
@@ -1031,6 +1178,8 @@ void run_server(MoecherEngine& engine, int port, int default_thinking_budget, in
             {"status", "ok"},
             {"server_instance_id", g_server_instance_id},
             {"tools_enabled", g_enable_tools},
+            {"operational_mode", g_intent_gating ? "chat" : "agentic"},
+            {"intent_gating", g_intent_gating},
             {"base_prompt", g_base_system_prompt},
             {"system_prompt", g_current_system_prompt},
             {"active_tools", g_enable_tools ? g_current_active_tools : json::array()},
@@ -1075,6 +1224,7 @@ void run_server(MoecherEngine& engine, int port, int default_thinking_budget, in
             {
                 std::lock_guard<std::mutex> lock(g_server_config_mutex);
                 g_server_config.from_json(patch);
+                g_intent_gating = g_server_config.intent_gating;
             }
             save_server_config("server_config.json");
 
@@ -1117,11 +1267,14 @@ void run_server(MoecherEngine& engine, int port, int default_thinking_budget, in
             {"status", "ok"},
             {"server_instance_id", g_server_instance_id},
             {"tools_enabled", g_enable_tools},
+            {"operational_mode", g_intent_gating ? "chat" : "agentic"},
+            {"intent_gating", g_intent_gating},
             {"base_prompt", g_base_system_prompt},
             {"system_prompt", g_current_system_prompt},
             {"active_tools", g_enable_tools ? g_current_active_tools : json::array()},
             {"temperature", g_server_config.temperature >= 0.0f ? g_server_config.temperature : 1.00f},
             {"repetition_penalty", g_server_config.repetition_penalty > 0.0f ? g_server_config.repetition_penalty : 1.00f},
+            {"anti_loop", engine.default_enable_anti_loop_},
             {"tokens_count", engine.system_kv_snapshot_.valid ? engine.system_kv_snapshot_.tokens.size() : 0}
         };
         res.set_content(body.dump(), "application/json");
@@ -1133,6 +1286,22 @@ void run_server(MoecherEngine& engine, int port, int default_thinking_budget, in
             json j = json::parse(req.body);
             std::string base_prompt = j.value("base_prompt", g_base_system_prompt);
             std::string custom_full_prompt = j.value("system_prompt", j.value("custom_system_prompt", ""));
+
+            if (j.contains("operational_mode") || j.contains("mode") || j.contains("intent_gating")) {
+                std::lock_guard<std::mutex> lock(g_server_config_mutex);
+                if (j.contains("operational_mode") && j["operational_mode"].is_string()) {
+                    g_server_config.operational_mode = j["operational_mode"].get<std::string>();
+                    g_server_config.intent_gating = (g_server_config.operational_mode == "chat");
+                } else if (j.contains("mode") && j["mode"].is_string()) {
+                    g_server_config.operational_mode = j["mode"].get<std::string>();
+                    g_server_config.intent_gating = (g_server_config.operational_mode == "chat");
+                }
+                if (j.contains("intent_gating") && j["intent_gating"].is_boolean()) {
+                    g_server_config.intent_gating = j["intent_gating"].get<bool>();
+                    g_server_config.operational_mode = g_server_config.intent_gating ? "chat" : "agentic";
+                }
+                g_intent_gating = g_server_config.intent_gating;
+            }
 
             json active_tools = json::array();
             if (g_enable_tools) {
@@ -1182,6 +1351,8 @@ void run_server(MoecherEngine& engine, int port, int default_thinking_budget, in
                 {"status", "ok"},
                 {"server_instance_id", g_server_instance_id},
                 {"tools_enabled", g_enable_tools},
+                {"operational_mode", g_intent_gating ? "chat" : "agentic"},
+                {"intent_gating", g_intent_gating},
                 {"base_prompt", g_base_system_prompt},
                 {"system_prompt", g_current_system_prompt},
                 {"active_tools", g_enable_tools ? g_current_active_tools : json::array()},
@@ -1544,13 +1715,17 @@ void run_server(MoecherEngine& engine, int port, int default_thinking_budget, in
             }
 
             auto& messages = request["messages"];
-            float temperature = request.value("temperature", 1.0f);
-            float top_p = request.value("top_p", 0.95f);
-            float min_p = request.value("min_p", engine.cfg_.is_deepseek() ? 0.0f : 0.05f);
-            int top_k = request.value("top_k", 1024);
+            nlohmann::json rec = engine.get_model_recommended_sampling();
+            float default_temp = (engine.cfg_.default_temperature >= 0.0f) ? engine.cfg_.default_temperature : rec.value("temperature", 1.0f);
+            float temperature = request.value("temperature", default_temp);
+            float default_top_p = (engine.cfg_.default_top_p > 0.0f) ? engine.cfg_.default_top_p : rec.value("top_p", 0.95f);
+            float top_p = request.value("top_p", default_top_p);
+            float default_min_p = (engine.cfg_.default_min_p >= 0.0f) ? engine.cfg_.default_min_p : (engine.cfg_.is_deepseek() ? 0.0f : 0.05f);
+            float min_p = request.value("min_p", default_min_p);
+            int default_top_k = (engine.cfg_.default_top_k > 0) ? engine.cfg_.default_top_k : rec.value("top_k", 1024);
+            int top_k = request.value("top_k", default_top_k);
             int max_tokens = request.value("max_tokens", 20000);
             bool stream = request.value("stream", false);
-            nlohmann::json rec = engine.get_model_recommended_sampling();
             float default_rep = g_server_config.repetition_penalty > 0.0f ? g_server_config.repetition_penalty :
                 (engine.cfg_.default_repetition_penalty > 0.0f ? engine.cfg_.default_repetition_penalty :
                 rec.value("repetition_penalty", 1.00f));
@@ -1580,7 +1755,8 @@ void run_server(MoecherEngine& engine, int port, int default_thinking_budget, in
                     messages.erase(0);
                 }
             }
-            std::string reasoning_effort = request.value("reasoning_effort", "high");
+            std::string default_effort = !engine.cfg_.default_reasoning_effort.empty() ? engine.cfg_.default_reasoning_effort : rec.value("reasoning_effort", std::string("high"));
+            std::string reasoning_effort = request.value("reasoning_effort", default_effort);
             bool enable_thinking = true;
             int max_thinking_tokens = default_thinking_budget;
 
@@ -1613,6 +1789,59 @@ void run_server(MoecherEngine& engine, int port, int default_thinking_budget, in
                 }
             }
 
+            bool enable_intent_gating = g_intent_gating;
+            if (request.contains("mode") && request["mode"].is_string()) {
+                enable_intent_gating = (request["mode"].get<std::string>() == "chat");
+            } else if (request.contains("operational_mode") && request["operational_mode"].is_string()) {
+                enable_intent_gating = (request["operational_mode"].get<std::string>() == "chat");
+            } else if (request.contains("intent_gating") && request["intent_gating"].is_boolean()) {
+                enable_intent_gating = request["intent_gating"].get<bool>();
+            }
+
+            bool has_file_intent = false;
+            if (!enable_intent_gating) {
+                // Agentic mode: intent verification is bypassed; tools are unconditionally active
+                has_file_intent = true;
+                LOG_INFO("[Operational Mode: Agentic] Dynamic intent gating bypassed. write_file/edit_file tools active.");
+            } else if (g_enable_tools && tools.is_array() && !tools.empty()) {
+                std::string latest_user_prompt = "";
+                if (messages.is_array()) {
+                    for (int i = (int)messages.size() - 1; i >= 0; --i) {
+                        if (messages[i].value("role", "") == "user") {
+                            latest_user_prompt = get_message_content_string(messages[i]);
+                            break;
+                        }
+                    }
+                }
+                has_file_intent = user_prompt_requests_filesystem_write(latest_user_prompt);
+                if (!has_file_intent) {
+                    json filtered_tools = json::array();
+                    bool removed_any = false;
+                    for (const auto& t : tools) {
+                        std::string tname = "";
+                        if (t.contains("function") && t["function"].contains("name")) {
+                            tname = t["function"]["name"].get<std::string>();
+                        } else if (t.contains("name")) {
+                            tname = t["name"].get<std::string>();
+                        }
+                        if (tname == "write_file" || tname == "edit_file") {
+                            removed_any = true;
+                            continue; // Withhold filesystem modification tools unless explicitly requested
+                        }
+                        filtered_tools.push_back(t);
+                    }
+                    if (removed_any) {
+                        LOG_INFO("[Tool Intent Arbiter] User prompt does not request filesystem/file creation ('%s'). Dynamic tool gating withheld write_file/edit_file (tools: %zu -> %zu).",
+                                 (latest_user_prompt.size() > 60 ? latest_user_prompt.substr(0, 60) + "..." : latest_user_prompt).c_str(),
+                                 tools.size(), filtered_tools.size());
+                        tools = filtered_tools;
+                    }
+                } else {
+                    LOG_INFO("[Tool Intent Arbiter] Explicit filesystem/file write intent detected in user prompt ('%s'). write_file/edit_file tools active.",
+                             (latest_user_prompt.size() > 60 ? latest_user_prompt.substr(0, 60) + "..." : latest_user_prompt).c_str());
+                }
+            }
+
             if (request.contains("enable_thinking") && request["enable_thinking"].is_boolean()) {
                 enable_thinking = request["enable_thinking"].get<bool>();
             }
@@ -1622,6 +1851,7 @@ void run_server(MoecherEngine& engine, int port, int default_thinking_budget, in
             engine.enable_mtp_ = engine.default_enable_mtp_;
             engine.mtp_k_ = engine.default_mtp_k_;
             engine.enable_spec_ = engine.default_enable_spec_;
+            engine.enable_pld_ = engine.default_enable_pld_;
             if (request.contains("enable_spec") && request["enable_spec"].is_boolean()) {
                 engine.enable_spec_ = request["enable_spec"].get<bool>();
             }
@@ -1629,6 +1859,11 @@ void run_server(MoecherEngine& engine, int port, int default_thinking_budget, in
                 engine.enable_mtp_ = request["enable_mtp"].get<bool>();
             } else if (request.contains("mtp") && request["mtp"].is_boolean()) {
                 engine.enable_mtp_ = request["mtp"].get<bool>();
+            }
+            if (request.contains("enable_pld") && request["enable_pld"].is_boolean()) {
+                engine.enable_pld_ = request["enable_pld"].get<bool>();
+            } else if (request.contains("pld") && request["pld"].is_boolean()) {
+                engine.enable_pld_ = request["pld"].get<bool>();
             }
             if (request.contains("mtp_k") && request["mtp_k"].is_number_integer()) {
                 int req_k = request["mtp_k"].get<int>();
@@ -1802,7 +2037,7 @@ void run_server(MoecherEngine& engine, int port, int default_thinking_budget, in
             if (request.contains("client_tool_execution") && request["client_tool_execution"].is_boolean()) {
                 client_tool_exec = request["client_tool_execution"].get<bool>();
             }
-            bool do_server_exec = g_server_exec && (!client_tool_exec || g_headless_browsing);
+            bool do_server_exec = g_server_exec && !client_tool_exec;
 
             int req_max_tool_rounds = g_max_tool_rounds;
             if (request.contains("max_tool_rounds") && request["max_tool_rounds"].is_number_integer()) {
@@ -1976,7 +2211,7 @@ void run_server(MoecherEngine& engine, int port, int default_thinking_budget, in
                 // SSE streaming
                 res.set_chunked_content_provider(
                     "text/event-stream",
-                    [&engine, messages, tools, max_tokens, temperature, req_id, repetition_penalty, enable_thinking, max_thinking_tokens, top_p, min_p, top_k, reasoning_effort, model_id, execution_timeout_ms, require_external_authorization, workspace_boundary_enforced, authorized_paths, do_server_exec, req_max_tool_rounds, busy_guard, send_sse_delta, bypass_prefix_cache, had_image_originally, stop_words](size_t offset, httplib::DataSink &sink) {
+                    [&engine, messages, tools, max_tokens, temperature, req_id, repetition_penalty, enable_thinking, max_thinking_tokens, top_p, min_p, top_k, reasoning_effort, model_id, execution_timeout_ms, require_external_authorization, workspace_boundary_enforced, authorized_paths, do_server_exec, req_max_tool_rounds, busy_guard, send_sse_delta, bypass_prefix_cache, had_image_originally, stop_words, has_file_intent](size_t offset, httplib::DataSink &sink) {
                         if (offset > 0) return false;
                         std::lock_guard<std::mutex> lock(g_engine_mutex);
 
@@ -2008,8 +2243,12 @@ void run_server(MoecherEngine& engine, int port, int default_thinking_budget, in
                         std::string last_completed_content;
                         std::vector<json> round_new_tool_msgs;
 
-                        int max_allowed_prompt = engine.cfg_.max_seq_len - max_tokens;
-                        if (max_allowed_prompt < 1024) max_allowed_prompt = engine.cfg_.max_seq_len - 256;
+                        // Reserve sufficient completion headroom so long conversations retain generation space
+                        int max_completion_cap = std::min(4096, (std::max)(1024, engine.cfg_.max_seq_len / 4));
+                        int completion_reserve = std::min(max_tokens, max_completion_cap);
+                        if (completion_reserve < 256) completion_reserve = 256;
+                        int max_allowed_prompt = engine.cfg_.max_seq_len - completion_reserve;
+                        if (max_allowed_prompt < 1024) max_allowed_prompt = (std::max)(512, engine.cfg_.max_seq_len - 256);
 
                         for (int round = 0; round < max_tool_rounds; round++) {
                             bool conv_has_image = false;
@@ -2108,7 +2347,29 @@ void run_server(MoecherEngine& engine, int port, int default_thinking_budget, in
 
                             auto last_kv_emit_time = std::chrono::steady_clock::now();
 
-                            engine.generate(prompt, max_tokens, temperature, [&](const std::string& text, bool is_reasoning) -> bool {
+                            bool is_tool_handling = (g_enable_tools && !tools.empty()) || (round > 0);
+                            if (!is_tool_handling) {
+                                for (const auto& m : current_messages) {
+                                    if (m.value("role", "") == "tool" || m.contains("tool_calls")) {
+                                        is_tool_handling = true;
+                                        break;
+                                    }
+                                }
+                            }
+
+                            bool saved_enable_spec = engine.enable_spec_;
+                            bool saved_enable_pld = engine.enable_pld_;
+                            bool saved_enable_mtp = engine.enable_mtp_;
+                            bool saved_enable_tree_mtp = engine.enable_tree_mtp_;
+                            if (is_tool_handling) {
+                                engine.enable_spec_ = false;
+                                engine.enable_pld_ = false;
+                                engine.enable_mtp_ = false;
+                                engine.enable_tree_mtp_ = false;
+                            }
+
+                            int eff_max_tokens = std::min(max_tokens, (std::max)(1, (int)(engine.cfg_.max_seq_len - prompt.size() - 1)));
+                            engine.generate(prompt, eff_max_tokens, temperature, [&](const std::string& text, bool is_reasoning) -> bool {
                                 if (g_stop_requested.load()) return false;
                                 if (text.empty()) return true;
 
@@ -2151,6 +2412,13 @@ void run_server(MoecherEngine& engine, int port, int default_thinking_budget, in
                             }, repetition_penalty, req_thinking, req_thinking_tokens, top_p, min_p, top_k,
                                d_vis_out, mm_prompt.visual_start_pos, mm_prompt.visual_num_tokens, eff_bypass_prefix_cache, stop_words);
 
+                            if (is_tool_handling) {
+                                engine.enable_spec_ = saved_enable_spec;
+                                engine.enable_pld_ = saved_enable_pld;
+                                engine.enable_mtp_ = saved_enable_mtp;
+                                engine.enable_tree_mtp_ = saved_enable_tree_mtp;
+                            }
+
                             if (d_vis_out != nullptr && engine.gpu_caps_.is_vram_constrained) {
                                 engine.unload_vision_tower();
                             }
@@ -2176,6 +2444,27 @@ void run_server(MoecherEngine& engine, int port, int default_thinking_budget, in
                             std::string clean_content;
                             std::vector<moecher::tooling::ToolCall> round_tool_calls;
                             moecher::tooling::extract_tool_calls(round_content, clean_content, round_tool_calls);
+                            if (round_tool_calls.empty() && req_thinking && !round_reasoning.empty()) {
+                                std::string clean_reasoning;
+                                moecher::tooling::extract_tool_calls(round_reasoning, clean_reasoning, round_tool_calls);
+                            }
+
+                            if (!has_file_intent && !round_tool_calls.empty()) {
+                                std::vector<moecher::tooling::ToolCall> remaining_tool_calls;
+                                for (const auto& tc : round_tool_calls) {
+                                    if (tc.name == "write_file" || tc.name == "edit_file") {
+                                        LOG_INFO("[Tool Intent Arbiter] Intercepted unauthorized/hallucinated %s without file intent. Converting to chat markdown.", tc.name.c_str());
+                                        std::string md = convert_write_tool_call_to_markdown(tc);
+                                        if (!md.empty()) {
+                                            if (!clean_content.empty() && clean_content.back() != '\n') clean_content += "\n\n";
+                                            clean_content += md;
+                                        }
+                                    } else {
+                                        remaining_tool_calls.push_back(tc);
+                                    }
+                                }
+                                round_tool_calls = remaining_tool_calls;
+                            }
 
                             if (round_tool_calls.empty()) {
                                 last_completed_content = clean_content;
@@ -2919,8 +3208,12 @@ void run_server(MoecherEngine& engine, int port, int default_thinking_budget, in
 
                 int max_tool_rounds = (do_server_exec && !tools.empty() && g_enable_tools) ? req_max_tool_rounds : 1;
 
-                int max_allowed_prompt = engine.cfg_.max_seq_len - max_tokens;
-                if (max_allowed_prompt < 1024) max_allowed_prompt = engine.cfg_.max_seq_len - 256;
+                // Reserve sufficient completion headroom so long conversations retain generation space
+                int max_completion_cap = std::min(4096, (std::max)(1024, engine.cfg_.max_seq_len / 4));
+                int completion_reserve = std::min(max_tokens, max_completion_cap);
+                if (completion_reserve < 256) completion_reserve = 256;
+                int max_allowed_prompt = engine.cfg_.max_seq_len - completion_reserve;
+                if (max_allowed_prompt < 1024) max_allowed_prompt = (std::max)(512, engine.cfg_.max_seq_len - 256);
 
                 for (int round = 0; round < max_tool_rounds; round++) {
                     bool conv_has_image = false;
@@ -2991,9 +3284,38 @@ void run_server(MoecherEngine& engine, int port, int default_thinking_budget, in
                     std::string response_text;
                     {
                         std::lock_guard<std::mutex> lock(g_engine_mutex);
-                        response_text = engine.generate(prompt, max_tokens, temperature, nullptr, repetition_penalty, req_thinking, req_thinking_tokens, top_p, min_p, top_k,
+                        bool is_tool_handling = (g_enable_tools && !tools.empty()) || (round > 0);
+                        if (!is_tool_handling) {
+                            for (const auto& m : current_messages) {
+                                if (m.value("role", "") == "tool" || m.contains("tool_calls")) {
+                                    is_tool_handling = true;
+                                    break;
+                                }
+                            }
+                        }
+
+                        bool saved_enable_spec = engine.enable_spec_;
+                        bool saved_enable_pld = engine.enable_pld_;
+                        bool saved_enable_mtp = engine.enable_mtp_;
+                        bool saved_enable_tree_mtp = engine.enable_tree_mtp_;
+                        if (is_tool_handling) {
+                            engine.enable_spec_ = false;
+                            engine.enable_pld_ = false;
+                            engine.enable_mtp_ = false;
+                            engine.enable_tree_mtp_ = false;
+                        }
+
+                        int eff_max_tokens = std::min(max_tokens, (std::max)(1, (int)(engine.cfg_.max_seq_len - prompt.size() - 1)));
+                        response_text = engine.generate(prompt, eff_max_tokens, temperature, nullptr, repetition_penalty, req_thinking, req_thinking_tokens, top_p, min_p, top_k,
                                                         d_vis_out, mm_prompt.visual_start_pos, mm_prompt.visual_num_tokens, eff_bypass_prefix_cache, stop_words);
                         finish_reason = engine.last_finish_reason_;
+
+                        if (is_tool_handling) {
+                            engine.enable_spec_ = saved_enable_spec;
+                            engine.enable_pld_ = saved_enable_pld;
+                            engine.enable_mtp_ = saved_enable_mtp;
+                            engine.enable_tree_mtp_ = saved_enable_tree_mtp;
+                        }
 
                         if (d_vis_out != nullptr && engine.gpu_caps_.is_vram_constrained) {
                             engine.unload_vision_tower();
@@ -3008,9 +3330,31 @@ void run_server(MoecherEngine& engine, int port, int default_thinking_budget, in
                     std::string clean_content;
                     std::vector<moecher::tooling::ToolCall> round_tool_calls;
                     moecher::tooling::extract_tool_calls(response_text, clean_content, round_tool_calls);
+                    if (round_tool_calls.empty() && req_thinking && !engine.last_reasoning_text_.empty()) {
+                        std::string clean_reasoning;
+                        moecher::tooling::extract_tool_calls(engine.last_reasoning_text_, clean_reasoning, round_tool_calls);
+                    }
+
+                    if (!has_file_intent && !round_tool_calls.empty()) {
+                        std::vector<moecher::tooling::ToolCall> remaining_tool_calls;
+                        for (const auto& tc : round_tool_calls) {
+                            if (tc.name == "write_file" || tc.name == "edit_file") {
+                                LOG_INFO("[Tool Intent Arbiter] Intercepted unauthorized/hallucinated %s without file intent. Converting to chat markdown.", tc.name.c_str());
+                                std::string md = convert_write_tool_call_to_markdown(tc);
+                                if (!md.empty()) {
+                                    if (!clean_content.empty() && clean_content.back() != '\n') clean_content += "\n\n";
+                                    clean_content += md;
+                                }
+                            } else {
+                                remaining_tool_calls.push_back(tc);
+                            }
+                        }
+                        round_tool_calls = remaining_tool_calls;
+                    }
 
                     if (round_tool_calls.empty()) {
                         final_response_text = clean_content;
+                        emitted_tool_calls.clear();
                         break;
                     }
 

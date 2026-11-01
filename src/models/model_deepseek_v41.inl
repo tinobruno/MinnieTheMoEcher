@@ -6,6 +6,17 @@
 //  Hierarchical 3-Level Cache: L1 VRAM (96GB) <-> L2 DRAM <-> L3 NVMe SSD (Direct I/O)
 // ════════════════════════════════════════════════════════════════════════════════
 
+    // ── Standard sampling defaults for DeepSeek-V4.1-Flash ──────────────────
+    void apply_sampling_defaults_deepseek_v41() {
+        if (cfg_.default_temperature < 0.0f) cfg_.default_temperature = 1.00f;
+        if (cfg_.default_top_p < 0.0f) cfg_.default_top_p = 1.00f;
+        if (cfg_.default_top_k < 0) cfg_.default_top_k = 2048;
+        if (cfg_.default_min_p < 0.0f) cfg_.default_min_p = 0.00f;
+        if (cfg_.default_repetition_penalty < 0.0f) cfg_.default_repetition_penalty = 1.00f;
+        if (cfg_.default_reasoning_effort.empty()) cfg_.default_reasoning_effort = "high";
+        if (cfg_.default_thinking_budget < 0) cfg_.default_thinking_budget = 4096;
+    }
+
     // ── Forward Layer DeepSeek V4.1 ──────────────────────────────────────────
 
     void forward_layer_deepseek_v41(int layer_id, int token_id, int position) {

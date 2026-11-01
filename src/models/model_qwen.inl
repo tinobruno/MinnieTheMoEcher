@@ -1,3 +1,14 @@
+    // ── Standard sampling defaults for Qwen models ──────────────────────────
+    void apply_sampling_defaults_qwen() {
+        if (cfg_.default_temperature < 0.0f) cfg_.default_temperature = 0.70f;
+        if (cfg_.default_top_p < 0.0f) cfg_.default_top_p = 0.80f;
+        if (cfg_.default_top_k < 0) cfg_.default_top_k = 20;
+        if (cfg_.default_min_p < 0.0f) cfg_.default_min_p = 0.00f;
+        if (cfg_.default_repetition_penalty < 0.0f) cfg_.default_repetition_penalty = 1.00f;
+        if (cfg_.default_reasoning_effort.empty()) cfg_.default_reasoning_effort = "medium";
+        if (cfg_.default_thinking_budget < 0) cfg_.default_thinking_budget = 4096;
+    }
+
     // ── Forward one layer (Qwen / Llama GQA + SwiGLU) ───────────────────────
 
     void forward_layer_qwen(int layer_id, int position) {
