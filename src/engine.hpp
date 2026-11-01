@@ -1420,13 +1420,12 @@ public:
         }
 
         if (model_requires_fp4 && !gpu_caps_.supports_fp4) {
-            LOG_ERROR("================================================================================");
-            LOG_ERROR("FATAL: Hardware Unsupported! Model requires NVIDIA Blackwell NVFP4 (SM 10.0+ / 12.0+)");
-            LOG_ERROR("Current GPU is '%s' (Compute %d.%d), which does not support hardware FP4.",
-                      gpu_caps_.device_name.c_str(), gpu_caps_.major, gpu_caps_.minor);
-            LOG_ERROR("Please use an INT4 or BF16 model on this GPU, or run on Blackwell hardware.");
-            LOG_ERROR("================================================================================");
-            return false;
+            LOG_WARN("================================================================================");
+            LOG_WARN("Non-Blackwell GPU detected: '%s' (Compute %d.%d).",
+                     gpu_caps_.device_name.c_str(), gpu_caps_.major, gpu_caps_.minor);
+            LOG_WARN("Hardware FP4 Tensor Cores (SM 10.0+ / 12.0+) are not available on this GPU.");
+            LOG_WARN("Falling back to high-speed SIMT LUT FP4/NVFP4 kernels + BF16 Tensor Core prefill.");
+            LOG_WARN("================================================================================");
         }
 
         cudaDeviceProp prop;

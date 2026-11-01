@@ -1332,11 +1332,17 @@
                                         cfg_.vocab_size, dim, main_stream_);
                 }
             } else if (head_weight_.dtype == "fp4") {
-                quantize_bf16_to_fp4_e2m1_cuda(buf_activation_fp4_.u8(), buf_activation_scale_.u8(),
-                                               buf_hidden_batch_.bf16(), M, dim, main_stream_);
-                gemm_fp4_f32_blackwell_tensorcore_cuda(buf_logits_batch_.f32(), buf_activation_fp4_.u8(), buf_activation_scale_.u8(),
-                                                       (const uint8_t*)head_weight_.data, (const uint8_t*)head_weight_scale_.data,
-                                                       cfg_.vocab_size, dim, M, main_stream_);
+                if (is_blackwell_tc_active_) {
+                    quantize_bf16_to_fp4_e2m1_cuda(buf_activation_fp4_.u8(), buf_activation_scale_.u8(),
+                                                   buf_hidden_batch_.bf16(), M, dim, main_stream_);
+                    gemm_fp4_f32_blackwell_tensorcore_cuda(buf_logits_batch_.f32(), buf_activation_fp4_.u8(), buf_activation_scale_.u8(),
+                                                           (const uint8_t*)head_weight_.data, (const uint8_t*)head_weight_scale_.data,
+                                                           cfg_.vocab_size, dim, M, main_stream_);
+                } else {
+                    gemm_fp4_f32_batch_cuda(buf_logits_batch_.f32(), buf_hidden_batch_.bf16(),
+                                             (const uint8_t*)head_weight_.data, (const uint8_t*)head_weight_scale_.data,
+                                             cfg_.vocab_size, dim, M, main_stream_);
+                }
             } else if (head_weight_.dtype == "q8_0" || head_weight_.dtype == "Q8_0" || head_weight_.dtype == "U8") {
                 if (M == 1) {
                     gemv_q8_0_f32_cuda(buf_logits_batch_.f32(),
