@@ -1560,6 +1560,108 @@ void register_agentic_routes(httplib::Server& svr) {
         res.status = 204;
     });
 
+    // ── Hybrid External LLM Provider Settings (Google Gemini, Claude, OpenAI) ───
+    svr.Get("/api/settings/llm_providers", [](const httplib::Request&, httplib::Response& res) {
+        auto llm_settings = moecher::tooling::get_llm_provider_settings();
+        res.set_header("Access-Control-Allow-Origin", "*");
+        res.set_content(llm_settings.dump(), "application/json");
+    });
+
+    svr.Post("/api/settings/llm_providers", [](const httplib::Request& req, httplib::Response& res) {
+        res.set_header("Access-Control-Allow-Origin", "*");
+        try {
+            json body = json::parse(req.body);
+            moecher::tooling::set_llm_provider_settings(body);
+            auto updated = moecher::tooling::get_llm_provider_settings();
+            updated["status"] = "ok";
+            res.set_content(updated.dump(), "application/json");
+        } catch (const std::exception& e) {
+            json err = {{"status", "error"}, {"message", e.what()}};
+            res.status = 400;
+            res.set_content(err.dump(), "application/json");
+        }
+    });
+
+    svr.Options("/api/settings/llm_providers", [](const httplib::Request&, httplib::Response& res) {
+        res.set_header("Access-Control-Allow-Origin", "*");
+        res.set_header("Access-Control-Allow-Methods", "GET, POST, OPTIONS");
+        res.set_header("Access-Control-Allow-Headers", "*");
+        res.status = 204;
+    });
+
+    svr.Post("/api/settings/llm_providers/test", [](const httplib::Request& req, httplib::Response& res) {
+        res.set_header("Access-Control-Allow-Origin", "*");
+        try {
+            json body = json::parse(req.body);
+            moecher::tooling::set_llm_provider_settings(body);
+            auto cur = moecher::tooling::get_llm_provider_settings();
+            std::string prov = body.value("provider", cur.value("llm_provider", "google"));
+            if (prov == "local") prov = "google";
+            std::string mod = body.value("model", "");
+            if (mod.empty()) {
+                if (prov == "google" || prov == "gemini") mod = cur.value("gemini_model", "gemini-2.5-flash");
+                else if (prov == "claude" || prov == "anthropic") mod = cur.value("claude_model", "claude-sonnet-4-20250514");
+                else if (prov == "openai") mod = cur.value("openai_model", "gpt-4o");
+            }
+            json test_res = moecher::tooling::test_external_llm_provider(prov, mod);
+            res.set_content(test_res.dump(), "application/json");
+        } catch (const std::exception& e) {
+            json err = {{"ok", false}, {"error", e.what()}};
+            res.status = 400;
+            res.set_content(err.dump(), "application/json");
+        }
+    });
+
+    svr.Options("/api/settings/llm_providers/test", [](const httplib::Request&, httplib::Response& res) {
+        res.set_header("Access-Control-Allow-Origin", "*");
+        res.set_header("Access-Control-Allow-Methods", "POST, OPTIONS");
+        res.set_header("Access-Control-Allow-Headers", "*");
+        res.status = 204;
+    });
+
+    // ── Sandboxed @google/gemini-cli OAuth Bridge Endpoints ────────────────────
+    svr.Get("/api/settings/gemini_cli/status", [](const httplib::Request&, httplib::Response& res) {
+        res.set_header("Access-Control-Allow-Origin", "*");
+        json st = moecher::tooling::get_gemini_cli_status_json();
+        res.set_content(st.dump(), "application/json");
+    });
+
+    svr.Post("/api/settings/gemini_cli/setup", [](const httplib::Request&, httplib::Response& res) {
+        res.set_header("Access-Control-Allow-Origin", "*");
+        std::string err;
+        bool ok = moecher::tooling::bootstrap_gemini_cli_runtime(&err);
+        json st = moecher::tooling::get_gemini_cli_status_json();
+        st["ok"] = ok;
+        if (!err.empty()) st["error"] = err;
+        res.set_content(st.dump(), "application/json");
+    });
+
+    svr.Post("/api/settings/gemini_cli/login", [](const httplib::Request&, httplib::Response& res) {
+        res.set_header("Access-Control-Allow-Origin", "*");
+        std::string auth_url, err;
+        bool ok = moecher::tooling::start_gemini_cli_oauth_login(&auth_url, &err);
+        json st = moecher::tooling::get_gemini_cli_status_json();
+        st["ok"] = ok;
+        st["auth_url"] = auth_url;
+        if (!err.empty()) st["error"] = err;
+        res.set_content(st.dump(), "application/json");
+    });
+
+    svr.Post("/api/settings/gemini_cli/logout", [](const httplib::Request&, httplib::Response& res) {
+        res.set_header("Access-Control-Allow-Origin", "*");
+        moecher::tooling::logout_gemini_cli_oauth();
+        json st = moecher::tooling::get_gemini_cli_status_json();
+        st["ok"] = true;
+        res.set_content(st.dump(), "application/json");
+    });
+
+    svr.Options(R"(/api/settings/gemini_cli/.*)", [](const httplib::Request&, httplib::Response& res) {
+        res.set_header("Access-Control-Allow-Origin", "*");
+        res.set_header("Access-Control-Allow-Methods", "GET, POST, OPTIONS");
+        res.set_header("Access-Control-Allow-Headers", "*");
+        res.status = 204;
+    });
+
     svr.Get("/api/settings/google_search", [](const httplib::Request&, httplib::Response& res) {
         auto creds = moecher::tooling::get_google_search_credentials();
         bool configured = !creds.first.empty() && !creds.second.empty();

@@ -8,7 +8,12 @@ Thank you for your interest in contributing to **MinnieTheMoEcher**! Whether you
 
 ---
 
-## 1. Core Principles & Philosophy: Static-Linked Modularity
+## 1. Core Principles & Philosophy: Rule #1 & Static-Linked Modularity
+
+> **RULE #1 — NO USER-INSTALLED DEPENDENCIES, NO INSTALLATIONS, NO BLOATWARE:**
+> The end user installs **only** the `moecher` executable (`moecher.exe` / `moecher`) and downloads model weights—period.
+> * Never ask the end user to manually install Node.js, Python, npm packages, or system bloatware.
+> * If a feature requires an external tool or runtime bridge, `moecher` must automatically download, sandbox, and manage it strictly inside a local workspace directory (e.g. `.moecher_runtime/`) with zero host OS pollution.
 
 MinnieTheMoEcher is engineered for high-throughput, low-latency bare-metal inference on **NVIDIA GPUs (CUDA sm_80–sm_120)** and **Apple Silicon (Metal Performance Shaders/Primitives)**. Every CPU microsecond and VRAM transaction is critical.
 

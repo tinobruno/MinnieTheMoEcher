@@ -4793,6 +4793,7 @@ async function sendMessage(options = {}) {
 
             const payload = {
                 model: currentModelId || "deepseek-v4-flash",
+                llm_provider: currentLlmProvider || "local",
                 messages: messagesToSend,
                 max_tokens: parseInt(tokensInput ? tokensInput.value : 20000, 10) || 20000,
                 temperature: parseFloat(tempSlider.value),
@@ -5584,6 +5585,7 @@ async function sendMessage(options = {}) {
                 const finalMessages = buildOptimizedMessagesPayload();
                 const finalPayload = {
                     model: currentModelId || "deepseek-v4-flash",
+                    llm_provider: currentLlmProvider || "local",
                     messages: finalMessages,
                     max_tokens: parseInt(tokensInput ? tokensInput.value : 20000, 10) || 20000,
                     temperature: parseFloat(tempSlider.value),
@@ -5709,6 +5711,22 @@ async function sendMessage(options = {}) {
                 zdbBadge.innerHTML = `<b>ZDB</b> | ${gateStr} | Winner: <b style="color: #f8fafc;">${escapeHtml(turnZdbMetadata.selected_choice || lastRoundContent)}</b> (${confPct}% conf) | 0 decodes | ${latMs}ms`;
                 mainContent.appendChild(zdbBadge);
             }
+        }
+
+        // Render per-message Backend Provenance Badge (Cloud API vs Local GPU)
+        if (!assistantMsgDiv.querySelector('.backend-provenance-badge')) {
+            const provBadge = document.createElement('div');
+            provBadge.className = 'backend-provenance-badge';
+            const isCloud = (currentLlmProvider && currentLlmProvider !== 'local');
+            const badgeColor = isCloud ? '#38bdf8' : '#4ade80';
+            const badgeBg = isCloud ? 'rgba(56, 189, 248, 0.10)' : 'rgba(34, 197, 94, 0.08)';
+            const badgeBorder = isCloud ? 'rgba(56, 189, 248, 0.32)' : 'rgba(34, 197, 94, 0.25)';
+            const iconName = isCloud ? 'cloud_done' : 'memory';
+            const modeLabel = isCloud ? 'CLOUD API' : 'LOCAL GPU';
+            const tpsStr = decodeTps > 0 ? `${decodeTps.toFixed(1)} tok/s` : '';
+            provBadge.style.cssText = `display: inline-flex; align-items: center; gap: 6px; padding: 3px 10px; margin-top: 8px; border-radius: 999px; font-size: 11px; font-weight: 600; background: ${badgeBg}; border: 1px solid ${badgeBorder}; color: ${badgeColor};`;
+            provBadge.innerHTML = `<span class="material-symbols-outlined" style="font-size: 14px;">${iconName}</span><span>${modeLabel}</span><span style="opacity:0.6;">•</span><span style="color: var(--text-primary); font-weight: 500;">${escapeHtml(currentModelName)}</span>${tpsStr ? `<span style="opacity:0.6;">•</span><span style="color: var(--text-secondary); font-weight: 400;">${tpsStr}</span>` : ''}`;
+            mainContent.appendChild(provBadge);
         }
 
         // Attach interactive message actions (Read aloud & Copy)
@@ -6340,11 +6358,563 @@ function initProxyServiceWorker() {
     }
 }
 
-// ── Model Selector & Dropdown ──────────────────────────────────────────────────
+// ── Model Selector, Hybrid Cloud APIs & Dropdown ──────────────────────────────
 
 let currentModelId = "deepseek-v4-flash";
 let currentModelName = "DeepSeek V4-Flash";
 let currentModelData = null;
+let localGpuModelData = null;
+let currentLlmProvider = "local";
+let selectedFormLlmProvider = "local";
+let llmProviderSettings = {
+    active_provider: "local",
+    google_auth_mode: "api_key",
+    gemini_cli_installed: false,
+    gemini_cli_authenticated: false,
+    gemini_cli_email: "",
+    gemini_model: "gemini-3.8-flash",
+    gemini_api_key_set: false,
+    gemini_api_key_masked: "",
+    claude_model: "claude-sonnet-4-20250514",
+    claude_api_key_set: false,
+    claude_api_key_masked: "",
+    openai_model: "gpt-4o",
+    openai_base_url: "https://api.openai.com/v1",
+    openai_api_key_set: false,
+    openai_api_key_masked: "",
+    hybrid_local_zdb: true
+};
+let selectedGoogleAuthMode = "api_key";
+let geminiCliPollTimer = null;
+
+function setGoogleAuthModeUI(mode) {
+    selectedGoogleAuthMode = (mode === 'gemini_cli') ? 'gemini_cli' : 'api_key';
+    llmProviderSettings.google_auth_mode = selectedGoogleAuthMode;
+    const btnApiKey = document.getElementById('google-auth-mode-apikey');
+    const btnCli = document.getElementById('google-auth-mode-cli');
+    const panelApiKey = document.getElementById('google-auth-panel-apikey');
+    const panelCli = document.getElementById('google-auth-panel-cli');
+    const isCli = (selectedGoogleAuthMode === 'gemini_cli');
+
+    if (btnApiKey) {
+        btnApiKey.style.borderColor = !isCli ? '#38bdf8' : 'rgba(255,255,255,0.14)';
+        btnApiKey.style.background = !isCli ? 'rgba(56, 189, 248, 0.18)' : 'rgba(255,255,255,0.04)';
+    }
+    if (btnCli) {
+        btnCli.style.borderColor = isCli ? '#38bdf8' : 'rgba(255,255,255,0.14)';
+        btnCli.style.background = isCli ? 'rgba(56, 189, 248, 0.18)' : 'rgba(255,255,255,0.04)';
+    }
+    if (panelApiKey) panelApiKey.style.display = !isCli ? '' : 'none';
+    if (panelCli) panelCli.style.display = isCli ? '' : 'none';
+}
+
+function updateGeminiCliBadgeUI() {
+    const badge = document.getElementById('gemini-cli-auth-badge');
+    const loginBtn = document.getElementById('gemini-cli-login-btn');
+    const logoutBtn = document.getElementById('gemini-cli-logout-btn');
+    const runtimePill = document.getElementById('gemini-cli-runtime-pill');
+    const urlBox = document.getElementById('gemini-cli-auth-url-box');
+
+    const authed = !!llmProviderSettings.gemini_cli_authenticated;
+    const email = llmProviderSettings.gemini_cli_email || '';
+    const installed = !!llmProviderSettings.gemini_cli_installed;
+
+    if (runtimePill) {
+        runtimePill.textContent = installed ? '✓ Runtime Ready' : 'Auto-Bootstrap';
+    }
+    if (badge) {
+        if (authed) {
+            badge.textContent = email ? `✓ Signed in (${email})` : '✓ Google Ultra Signed In';
+            badge.style.background = 'rgba(34, 197, 94, 0.16)';
+            badge.style.color = '#4ade80';
+            badge.style.borderColor = 'rgba(34, 197, 94, 0.35)';
+        } else {
+            badge.textContent = 'Not signed in';
+            badge.style.background = 'rgba(245, 158, 11, 0.16)';
+            badge.style.color = '#fbbf24';
+            badge.style.borderColor = 'rgba(245, 158, 11, 0.35)';
+        }
+    }
+    if (loginBtn) {
+        loginBtn.textContent = authed ? '🔄 Re-authenticate' : '⚡ Sign in with Google Ultra';
+    }
+    if (logoutBtn) {
+        logoutBtn.style.display = authed ? '' : 'none';
+    }
+    if (authed && urlBox) {
+        urlBox.style.display = 'none';
+    }
+}
+
+async function startGeminiCliOAuthLoginUI() {
+    setLlmProviderFormSelection('google');
+    setGoogleAuthModeUI('gemini_cli');
+    const loginBtn = document.getElementById('gemini-cli-login-btn');
+    const urlBox = document.getElementById('gemini-cli-auth-url-box');
+    const urlLink = document.getElementById('gemini-cli-auth-url-link');
+    if (loginBtn) {
+        loginBtn.disabled = true;
+        loginBtn.textContent = '⏳ Starting OAuth...';
+    }
+    showLlmProviderStatusBanner(true, 'Launching sandboxed @google/gemini-cli OAuth flow — check your browser...');
+
+    try {
+        const res = await fetch(`${getApiBase()}/api/settings/gemini_cli/login`, {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: '{}'
+        });
+        const data = await res.json();
+        if (loginBtn) {
+            loginBtn.disabled = false;
+            loginBtn.textContent = '⚡ Sign in with Google Ultra';
+        }
+        if (data && data.authenticated) {
+            await saveLlmProviderSettingsUI();
+            showLlmProviderStatusBanner(true, `✅ Signed in to Google Ultra${data.email ? ' as ' + data.email : ''}!`);
+            return;
+        }
+        if (data && data.auth_url) {
+            if (urlBox && urlLink) {
+                urlLink.href = data.auth_url;
+                urlBox.style.display = 'block';
+            }
+            showLlmProviderStatusBanner(true, '🌐 Google Sign-In opened in your browser! Complete sign-in there — Moecher will detect it automatically.');
+        } else if (data && data.error) {
+            showLlmProviderStatusBanner(false, `❌ OAuth launch error: ${data.error}`);
+            return;
+        }
+
+        if (geminiCliPollTimer) clearInterval(geminiCliPollTimer);
+        let attempts = 0;
+        geminiCliPollTimer = setInterval(async () => {
+            attempts++;
+            if (attempts > 90) {
+                clearInterval(geminiCliPollTimer);
+                geminiCliPollTimer = null;
+                return;
+            }
+            try {
+                const stRes = await fetch(`${getApiBase()}/api/settings/gemini_cli/status`);
+                if (!stRes.ok) return;
+                const st = await stRes.json();
+                if (st && st.authenticated) {
+                    clearInterval(geminiCliPollTimer);
+                    geminiCliPollTimer = null;
+                    llmProviderSettings.gemini_cli_authenticated = true;
+                    llmProviderSettings.gemini_cli_email = st.email || '';
+                    updateGeminiCliBadgeUI();
+                    await saveLlmProviderSettingsUI();
+                    showLlmProviderStatusBanner(true, `✅ Google Ultra OAuth connected${st.email ? ' (' + st.email + ')' : ''}!`);
+                    showToast(`Signed in to Google Ultra${st.email ? ' as ' + st.email : ''}`);
+                }
+            } catch {}
+        }, 2000);
+    } catch (e) {
+        if (loginBtn) {
+            loginBtn.disabled = false;
+            loginBtn.textContent = '⚡ Sign in with Google Ultra';
+        }
+        showLlmProviderStatusBanner(false, `Failed to start OAuth login: ${e.message}`);
+    }
+}
+
+async function logoutGeminiCliOAuthUI() {
+    if (geminiCliPollTimer) {
+        clearInterval(geminiCliPollTimer);
+        geminiCliPollTimer = null;
+    }
+    try {
+        await fetch(`${getApiBase()}/api/settings/gemini_cli/logout`, {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: '{}'
+        });
+        await fetchLlmProviderSettings();
+        showLlmProviderStatusBanner(true, 'Signed out of sandboxed Google Ultra OAuth session.');
+    } catch (e) {
+        showLlmProviderStatusBanner(false, `Logout error: ${e.message}`);
+    }
+}
+
+function toggleSecretInput(inputId) {
+    const el = document.getElementById(inputId);
+    if (!el) return;
+    el.type = (el.type === 'password') ? 'text' : 'password';
+}
+
+function setLlmProviderFormSelection(provider) {
+    selectedFormLlmProvider = provider || 'local';
+    ['local', 'google', 'claude', 'openai'].forEach(p => {
+        const btn = document.getElementById(`provider-pill-${p}`);
+        if (btn) {
+            const isSel = (p === selectedFormLlmProvider);
+            btn.classList.toggle('active', isSel);
+            btn.style.borderColor = isSel ? '#38bdf8' : 'rgba(255,255,255,0.14)';
+            btn.style.background = isSel ? 'rgba(56, 189, 248, 0.16)' : 'rgba(255,255,255,0.05)';
+        }
+    });
+}
+
+function openHybridCloudSettings(focusProvider) {
+    const dropdownEl = document.getElementById('model-dropdown');
+    const selectorEl = document.getElementById('model-selector');
+    if (dropdownEl) dropdownEl.classList.add('hidden');
+    if (selectorEl) selectorEl.classList.remove('open');
+
+    if (typeof settingsPanel !== 'undefined' && settingsPanel) {
+        settingsPanel.classList.remove('hidden');
+    } else {
+        const sp = document.getElementById('settings-panel');
+        if (sp) sp.classList.remove('hidden');
+    }
+    if (typeof switchSettingsTab === 'function') {
+        switchSettingsTab('general');
+    }
+    if (focusProvider) {
+        setLlmProviderFormSelection(focusProvider);
+    }
+    setTimeout(() => {
+        const card = document.getElementById('hybrid-cloud-settings-card');
+        if (card) card.scrollIntoView({ behavior: 'smooth', block: 'start' });
+        if (focusProvider === 'google') document.getElementById('gemini-api-key-input')?.focus();
+        else if (focusProvider === 'claude') document.getElementById('claude-api-key-input')?.focus();
+        else if (focusProvider === 'openai') document.getElementById('openai-api-key-input')?.focus();
+    }, 80);
+}
+
+function normalizeLlmProviderSettings(data) {
+    if (!data || typeof data !== 'object') return;
+    const active = data.llm_provider || data.active_provider || llmProviderSettings.active_provider || 'local';
+    const gAuthMode = data.google_auth_mode || llmProviderSettings.google_auth_mode || 'api_key';
+    const rawKeySet = !!(data.gemini_api_key_set || (data.gemini_api_key && data.gemini_api_key.length > 0));
+    const cliAuthed = !!data.gemini_cli_authenticated;
+    llmProviderSettings = Object.assign({}, llmProviderSettings, data, {
+        active_provider: active,
+        llm_provider: active,
+        google_auth_mode: gAuthMode,
+        gemini_cli_installed: !!data.gemini_cli_installed,
+        gemini_cli_authenticated: cliAuthed,
+        gemini_cli_email: data.gemini_cli_email || '',
+        gemini_api_key_set: rawKeySet,
+        gemini_configured: (gAuthMode === 'gemini_cli') ? cliAuthed : rawKeySet,
+        gemini_api_key_masked: data.gemini_api_key_masked || (data.gemini_api_key && data.gemini_api_key.length > 8 ? (data.gemini_api_key.slice(0, 4) + '...' + data.gemini_api_key.slice(-4)) : (data.gemini_api_key ? '****' : '')),
+        claude_api_key_set: !!(data.claude_configured || data.claude_api_key_set || (data.claude_api_key && data.claude_api_key.length > 0)),
+        claude_api_key_masked: data.claude_api_key_masked || (data.claude_api_key && data.claude_api_key.length > 8 ? (data.claude_api_key.slice(0, 4) + '...' + data.claude_api_key.slice(-4)) : (data.claude_api_key ? '****' : '')),
+        openai_api_key_set: !!(data.openai_configured || data.openai_api_key_set || (data.openai_api_key && data.openai_api_key.length > 0)),
+        openai_api_key_masked: data.openai_api_key_masked || (data.openai_api_key && data.openai_api_key.length > 8 ? (data.openai_api_key.slice(0, 4) + '...' + data.openai_api_key.slice(-4)) : (data.openai_api_key ? '****' : ''))
+    });
+}
+
+function syncLlmProviderSettingsUI() {
+    const p = llmProviderSettings.llm_provider || llmProviderSettings.active_provider || 'local';
+    currentLlmProvider = p;
+    setLlmProviderFormSelection(p);
+    setGoogleAuthModeUI(llmProviderSettings.google_auth_mode || 'api_key');
+    updateGeminiCliBadgeUI();
+
+    // Update Settings form inputs (preserve typed keys if user is currently editing)
+    const geminiKeyInput = document.getElementById('gemini-api-key-input');
+    if (geminiKeyInput && !geminiKeyInput.value) {
+        geminiKeyInput.placeholder = llmProviderSettings.gemini_api_key_set
+            ? `Saved (${llmProviderSettings.gemini_api_key_masked}) — paste new key to replace`
+            : 'AIzaSy... (paste Google AI Studio API key)';
+    }
+    const geminiModelInput = document.getElementById('gemini-model-input');
+    if (geminiModelInput && llmProviderSettings.gemini_model) {
+        geminiModelInput.value = llmProviderSettings.gemini_model;
+    }
+    const geminiPreset = document.getElementById('gemini-model-preset');
+    if (geminiPreset && llmProviderSettings.gemini_model) {
+        const hasOpt = Array.from(geminiPreset.options).some(o => o.value === llmProviderSettings.gemini_model);
+        geminiPreset.value = hasOpt ? llmProviderSettings.gemini_model : '';
+    }
+
+    const claudeKeyInput = document.getElementById('claude-api-key-input');
+    if (claudeKeyInput && !claudeKeyInput.value) {
+        claudeKeyInput.placeholder = llmProviderSettings.claude_api_key_set
+            ? `Saved (${llmProviderSettings.claude_api_key_masked}) — paste new key to replace`
+            : 'sk-ant-api03-...';
+    }
+    const claudeModelInput = document.getElementById('claude-model-input');
+    if (claudeModelInput && llmProviderSettings.claude_model) {
+        claudeModelInput.value = llmProviderSettings.claude_model;
+    }
+    const claudePreset = document.getElementById('claude-model-preset');
+    if (claudePreset && llmProviderSettings.claude_model) {
+        const hasOpt = Array.from(claudePreset.options).some(o => o.value === llmProviderSettings.claude_model);
+        claudePreset.value = hasOpt ? llmProviderSettings.claude_model : '';
+    }
+
+    const openaiKeyInput = document.getElementById('openai-api-key-input');
+    if (openaiKeyInput && !openaiKeyInput.value) {
+        openaiKeyInput.placeholder = llmProviderSettings.openai_api_key_set
+            ? `Saved (${llmProviderSettings.openai_api_key_masked}) — paste new key to replace`
+            : 'sk-proj-...';
+    }
+    const openaiModelInput = document.getElementById('openai-model-input');
+    if (openaiModelInput && llmProviderSettings.openai_model) {
+        openaiModelInput.value = llmProviderSettings.openai_model;
+    }
+    const openaiPreset = document.getElementById('openai-model-preset');
+    if (openaiPreset && llmProviderSettings.openai_model) {
+        const hasOpt = Array.from(openaiPreset.options).some(o => o.value === llmProviderSettings.openai_model);
+        openaiPreset.value = hasOpt ? llmProviderSettings.openai_model : '';
+    }
+    const openaiBaseInput = document.getElementById('openai-base-url-input');
+    if (openaiBaseInput && llmProviderSettings.openai_base_url) {
+        openaiBaseInput.value = llmProviderSettings.openai_base_url;
+    }
+
+    const hybridZdbCheckbox = document.getElementById('hybrid-local-zdb-enabled');
+    if (hybridZdbCheckbox) {
+        hybridZdbCheckbox.checked = (llmProviderSettings.hybrid_local_zdb !== false);
+    }
+
+    // Update Dropdown badges & tags
+    const updateKeyBadge = (badgeId, isSet, customLabel) => {
+        const el = document.getElementById(badgeId);
+        if (!el) return;
+        el.textContent = customLabel || (isSet ? 'API Key Ready' : 'Set API Key');
+        el.style.background = isSet ? 'rgba(34, 197, 94, 0.16)' : 'rgba(245, 158, 11, 0.16)';
+        el.style.color = isSet ? '#4ade80' : '#fbbf24';
+        el.style.borderColor = isSet ? 'rgba(34, 197, 94, 0.35)' : 'rgba(245, 158, 11, 0.35)';
+    };
+    const isGoogleCliMode = (llmProviderSettings.google_auth_mode === 'gemini_cli');
+    const googleReady = isGoogleCliMode ? !!llmProviderSettings.gemini_cli_authenticated : !!llmProviderSettings.gemini_api_key_set;
+    const googleBadgeText = isGoogleCliMode
+        ? (googleReady ? 'Ultra OAuth Ready' : 'Sign In Required')
+        : (googleReady ? 'API Key Ready' : 'Set API Key');
+    updateKeyBadge('dropdown-google-key-badge', googleReady, googleBadgeText);
+    updateKeyBadge('dropdown-claude-key-badge', !!llmProviderSettings.claude_api_key_set);
+    updateKeyBadge('dropdown-openai-key-badge', !!llmProviderSettings.openai_api_key_set);
+
+    const gTag = document.getElementById('dropdown-google-model-tag');
+    if (gTag) gTag.textContent = llmProviderSettings.gemini_model || 'gemini-3.8-flash';
+    const cTag = document.getElementById('dropdown-claude-model-tag');
+    if (cTag) cTag.textContent = llmProviderSettings.claude_model || 'claude-sonnet-4-20250514';
+    const oTag = document.getElementById('dropdown-openai-model-tag');
+    if (oTag) oTag.textContent = llmProviderSettings.openai_model || 'gpt-4o';
+
+    // Highlight active card in dropdown
+    const cardMap = {
+        local: document.getElementById('model-item-card'),
+        google: document.getElementById('dropdown-provider-google'),
+        claude: document.getElementById('dropdown-provider-claude'),
+        openai: document.getElementById('dropdown-provider-openai')
+    };
+    const checkMap = {
+        local: document.getElementById('dropdown-local-check'),
+        google: document.getElementById('dropdown-google-check'),
+        claude: document.getElementById('dropdown-claude-check'),
+        openai: document.getElementById('dropdown-openai-check')
+    };
+    Object.keys(cardMap).forEach(k => {
+        if (cardMap[k]) cardMap[k].classList.toggle('active', k === p);
+        if (checkMap[k]) checkMap[k].style.display = (k === p) ? '' : 'none';
+    });
+
+    // Update topbar model name, cloud/local pill indicator & active model ID
+    const modelNameEl = document.getElementById('model-name');
+    const selectorEl = document.getElementById('model-selector');
+    const isCloud = (p === 'google' || p === 'claude' || p === 'openai');
+    if (p === 'google') {
+        currentModelId = llmProviderSettings.gemini_model || 'gemini-3.8-flash';
+        currentModelName = `Google Gemini (${currentModelId})`;
+        currentModelHasVision = true;
+    } else if (p === 'claude') {
+        currentModelId = llmProviderSettings.claude_model || 'claude-sonnet-4-20250514';
+        currentModelName = `Anthropic Claude (${currentModelId})`;
+        currentModelHasVision = true;
+    } else if (p === 'openai') {
+        currentModelId = llmProviderSettings.openai_model || 'gpt-4o';
+        currentModelName = `OpenAI (${currentModelId})`;
+        currentModelHasVision = true;
+    } else if (localGpuModelData) {
+        currentModelId = localGpuModelData.id;
+        currentModelName = localGpuModelData.display_name || localGpuModelData.name || localGpuModelData.id;
+        currentModelHasVision = (localGpuModelData.has_vision === true || localGpuModelData.has_vision === 'true');
+    }
+    if (modelNameEl) {
+        const pillBadge = isCloud
+            ? `<span style="display:inline-flex;align-items:center;gap:3px;padding:1px 6px;margin-right:6px;border-radius:4px;font-size:10px;font-weight:700;background:rgba(56,189,248,0.18);color:#38bdf8;border:1px solid rgba(56,189,248,0.4);">☁️ CLOUD</span>`
+            : `<span style="display:inline-flex;align-items:center;gap:3px;padding:1px 6px;margin-right:6px;border-radius:4px;font-size:10px;font-weight:700;background:rgba(34,197,94,0.15);color:#4ade80;border:1px solid rgba(34,197,94,0.35);">⚡ LOCAL</span>`;
+        modelNameEl.innerHTML = `${pillBadge}${escapeHtml(currentModelName)}`;
+    }
+    if (selectorEl) {
+        selectorEl.style.borderColor = isCloud ? 'rgba(56, 189, 248, 0.5)' : '';
+        selectorEl.style.boxShadow = isCloud ? '0 0 12px rgba(56, 189, 248, 0.18)' : '';
+    }
+    updateVisionUploadVisibility();
+}
+
+async function fetchLlmProviderSettings() {
+    try {
+        const res = await fetch(`${getApiBase()}/api/settings/llm_providers`);
+        if (!res.ok) return;
+        const data = await res.json();
+        if (data && typeof data === 'object') {
+            normalizeLlmProviderSettings(data);
+            syncLlmProviderSettingsUI();
+        }
+    } catch (e) {
+        console.debug('[LLM Providers] Could not fetch provider settings:', e);
+    }
+}
+
+async function selectActiveLlmProvider(provider) {
+    const p = provider || 'local';
+    const googleReady = (llmProviderSettings.google_auth_mode === 'gemini_cli')
+        ? !!llmProviderSettings.gemini_cli_authenticated
+        : !!llmProviderSettings.gemini_api_key_set;
+    if (p === 'google' && !googleReady) {
+        showToast('Please configure Google Gemini API key or sign in with Google Ultra OAuth.');
+        openHybridCloudSettings('google');
+        return;
+    }
+    if (p === 'claude' && !llmProviderSettings.claude_api_key_set) {
+        showToast('Please enter your Anthropic Claude API key to activate Hybrid Cloud mode.');
+        openHybridCloudSettings('claude');
+        return;
+    }
+    if (p === 'openai' && !llmProviderSettings.openai_api_key_set) {
+        showToast('Please enter your OpenAI API key to activate Hybrid Cloud mode.');
+        openHybridCloudSettings('openai');
+        return;
+    }
+
+    try {
+        const res = await fetch(`${getApiBase()}/api/settings/llm_providers`, {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ llm_provider: p, active_provider: p })
+        });
+        if (res.ok) {
+            await fetchLlmProviderSettings();
+            const dropdownEl = document.getElementById('model-dropdown');
+            const selectorEl = document.getElementById('model-selector');
+            if (dropdownEl) dropdownEl.classList.add('hidden');
+            if (selectorEl) selectorEl.classList.remove('open');
+            showToast(`Switched active backend to ${currentModelName}`);
+        }
+    } catch (e) {
+        showToast(`Failed to switch provider: ${e.message}`);
+    }
+}
+
+function showLlmProviderStatusBanner(ok, message) {
+    const banner = document.getElementById('llm-provider-status-msg');
+    if (!banner) return;
+    banner.style.display = 'block';
+    banner.style.background = ok ? 'rgba(34, 197, 94, 0.14)' : 'rgba(239, 68, 68, 0.15)';
+    banner.style.border = ok ? '1px solid rgba(34, 197, 94, 0.4)' : '1px solid rgba(239, 68, 68, 0.4)';
+    banner.style.color = ok ? '#4ade80' : '#f87171';
+    banner.textContent = message;
+}
+
+async function saveLlmProviderSettingsUI() {
+    const geminiKey = document.getElementById('gemini-api-key-input')?.value.trim() || '';
+    const geminiModel = document.getElementById('gemini-model-input')?.value.trim() || 'gemini-3.8-flash';
+    const claudeKey = document.getElementById('claude-api-key-input')?.value.trim() || '';
+    const claudeModel = document.getElementById('claude-model-input')?.value.trim() || 'claude-sonnet-4-20250514';
+    const openaiKey = document.getElementById('openai-api-key-input')?.value.trim() || '';
+    const openaiModel = document.getElementById('openai-model-input')?.value.trim() || 'gpt-4o';
+    const openaiBaseUrl = document.getElementById('openai-base-url-input')?.value.trim() || 'https://api.openai.com/v1';
+    const hybridLocalZdb = document.getElementById('hybrid-local-zdb-enabled')?.checked !== false;
+
+    // Auto-select provider if user just pasted an API key while form was still on 'local'
+    let targetProvider = selectedFormLlmProvider || 'local';
+    if (targetProvider === 'local') {
+        if (geminiKey || selectedGoogleAuthMode === 'gemini_cli') targetProvider = 'google';
+        else if (claudeKey) targetProvider = 'claude';
+        else if (openaiKey) targetProvider = 'openai';
+    }
+    setLlmProviderFormSelection(targetProvider);
+
+    const payload = {
+        llm_provider: targetProvider,
+        active_provider: targetProvider,
+        google_auth_mode: selectedGoogleAuthMode || 'api_key',
+        gemini_model: geminiModel,
+        claude_model: claudeModel,
+        openai_model: openaiModel,
+        openai_base_url: openaiBaseUrl,
+        hybrid_local_zdb: hybridLocalZdb
+    };
+    if (geminiKey) payload.gemini_api_key = geminiKey;
+    if (claudeKey) payload.claude_api_key = claudeKey;
+    if (openaiKey) payload.openai_api_key = openaiKey;
+
+    try {
+        const res = await fetch(`${getApiBase()}/api/settings/llm_providers`, {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify(payload)
+        });
+        const data = await res.json();
+        if (!res.ok) {
+            showLlmProviderStatusBanner(false, data.error || `HTTP ${res.status}`);
+            return;
+        }
+        if (geminiKey) document.getElementById('gemini-api-key-input').value = '';
+        if (claudeKey) document.getElementById('claude-api-key-input').value = '';
+        if (openaiKey) document.getElementById('openai-api-key-input').value = '';
+        await fetchLlmProviderSettings();
+        showLlmProviderStatusBanner(true, `Saved! Active provider: ${currentModelName}`);
+        showToast(`Active provider set to ${currentModelName}`);
+    } catch (e) {
+        showLlmProviderStatusBanner(false, `Failed to save settings: ${e.message}`);
+    }
+}
+
+async function testLlmProviderConnectionUI(provider) {
+    setLlmProviderFormSelection(provider);
+    showLlmProviderStatusBanner(true, `Testing ${provider.toUpperCase()} connection...`);
+    // Save any newly typed key/model first so the backend has it
+    const geminiKey = document.getElementById('gemini-api-key-input')?.value.trim() || '';
+    const geminiModel = document.getElementById('gemini-model-input')?.value.trim() || 'gemini-2.5-flash';
+    const claudeKey = document.getElementById('claude-api-key-input')?.value.trim() || '';
+    const claudeModel = document.getElementById('claude-model-input')?.value.trim() || 'claude-sonnet-4-20250514';
+    const openaiKey = document.getElementById('openai-api-key-input')?.value.trim() || '';
+    const openaiModel = document.getElementById('openai-model-input')?.value.trim() || 'gpt-4o';
+    const openaiBaseUrl = document.getElementById('openai-base-url-input')?.value.trim() || 'https://api.openai.com/v1';
+
+    const saveBody = {
+        llm_provider: provider,
+        active_provider: provider,
+        google_auth_mode: selectedGoogleAuthMode || 'api_key',
+        gemini_model: geminiModel,
+        claude_model: claudeModel,
+        openai_model: openaiModel,
+        openai_base_url: openaiBaseUrl
+    };
+    if (geminiKey) saveBody.gemini_api_key = geminiKey;
+    if (claudeKey) saveBody.claude_api_key = claudeKey;
+    if (openaiKey) saveBody.openai_api_key = openaiKey;
+
+    try {
+        await fetch(`${getApiBase()}/api/settings/llm_providers`, {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify(saveBody)
+        });
+        const modelForTest = (provider === 'google') ? geminiModel : (provider === 'claude' ? claudeModel : openaiModel);
+        const res = await fetch(`${getApiBase()}/api/settings/llm_providers/test`, {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ provider, model: modelForTest })
+        });
+        const data = await res.json();
+        await fetchLlmProviderSettings();
+        if (data && data.ok) {
+            showLlmProviderStatusBanner(true, `✅ ${provider.toUpperCase()} (${data.model}) connected in ${Math.round(data.latency_ms || 0)}ms — Reply: "${(data.reply || '').trim()}"`);
+        } else {
+            showLlmProviderStatusBanner(false, `❌ ${provider.toUpperCase()} error: ${data.error || 'Connection failed'}`);
+        }
+    } catch (e) {
+        showLlmProviderStatusBanner(false, `❌ Connection test error: ${e.message}`);
+    }
+}
 
 async function initModelSelector() {
     const selectorEl = document.getElementById('model-selector');
@@ -6378,31 +6948,23 @@ async function initModelSelector() {
             const res = await fetch(`${getApiBase()}/v1/models`);
             if (!res.ok) throw new Error(`HTTP ${res.status}`);
             const data = await res.json();
+            if (data && data.llm_providers) {
+                normalizeLlmProviderSettings(data.llm_providers);
+            }
             if (data && data.data && data.data.length > 0) {
-                const active = data.data.find(m => m.active) || data.data[0];
-                if (active) {
-                    currentModelId = active.id;
-                    currentModelName = active.display_name || active.name || active.id;
-                    currentModelData = active;
-
-                    modelNameEl.textContent = currentModelName;
-                    if (dropdownModelName) dropdownModelName.textContent = currentModelName;
-                    if (dropdownModelId) dropdownModelId.textContent = active.id;
-                    if (dropdownModelArch && active.architecture) dropdownModelArch.textContent = active.architecture;
-                    if (dropdownModelCtx && active.max_context_length) {
-                        dropdownModelCtx.textContent = `${Number(active.max_context_length).toLocaleString()} ctx`;
+                const localEntry = data.data.find(m => m.provider === 'local') || data.data[0];
+                const active = data.data.find(m => m.active) || localEntry;
+                if (localEntry) {
+                    localGpuModelData = localEntry;
+                    if (dropdownModelName) dropdownModelName.textContent = localEntry.display_name || localEntry.name || localEntry.id;
+                    if (dropdownModelId) dropdownModelId.textContent = localEntry.id;
+                    if (dropdownModelArch && localEntry.architecture) dropdownModelArch.textContent = localEntry.architecture;
+                    if (dropdownModelCtx && localEntry.max_context_length) {
+                        dropdownModelCtx.textContent = `${Number(localEntry.max_context_length).toLocaleString()} ctx`;
                     }
-                    currentModelHasVision = (active.has_vision === true || active.has_vision === 'true');
-                    updateVisionUploadVisibility();
-
-                    // If system prompt input is empty or matches previous default placeholder, update to active model's default
-                    if (systemPromptInput && (!systemPromptInput.value || systemPromptInput.value === "You are a helpful assistant." || systemPromptInput.value.trim() === "")) {
-                        systemPromptInput.value = (active.default_system_prompt !== undefined) ? active.default_system_prompt : "";
-                    }
-
-                    // Update Vision capabilities badge
+                    const localHasVision = (localEntry.has_vision === true || localEntry.has_vision === 'true');
                     if (dropdownVisionBadge && dropdownVisionText) {
-                        if (currentModelHasVision) {
+                        if (localHasVision) {
                             dropdownVisionBadge.className = 'model-badge-vision enabled';
                             dropdownVisionText.textContent = 'Vision Enabled';
                             dropdownVisionBadge.title = 'Multimodal visual perception and OCR enabled';
@@ -6412,9 +6974,16 @@ async function initModelSelector() {
                             dropdownVisionBadge.title = 'Text-only model profile';
                         }
                     }
+                    if (systemPromptInput && (!systemPromptInput.value || systemPromptInput.value === "You are a helpful assistant." || systemPromptInput.value.trim() === "")) {
+                        systemPromptInput.value = (localEntry.default_system_prompt !== undefined) ? localEntry.default_system_prompt : "";
+                    }
+                }
+                if (active) {
+                    currentModelData = active;
+                    syncLlmProviderSettingsUI();
 
                     // Update System Resources (VRAM, RAM, SSD)
-                    let resources = active.resources || data.resources;
+                    let resources = (localEntry && localEntry.resources) || active.resources || data.resources;
                     if (!resources) {
                         try {
                             const sysRes = await fetch(`${getApiBase()}/api/system/resources`);

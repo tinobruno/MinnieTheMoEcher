@@ -16,6 +16,9 @@
 #include <mutex>
 #include <unordered_set>
 #include <unordered_map>
+#include <functional>
+#include <atomic>
+#include <thread>
 #include <regex>
 #include <nlohmann/json.hpp>
 #include "logging.hpp"
@@ -101,6 +104,89 @@ inline std::string g_searxng_url = "https://searx.be";
 inline std::string g_google_search_api_key = "";
 inline std::string g_google_search_cx = "";
 inline bool g_fast_media_search = true;
+
+// ── Hybrid External LLM Provider Configuration (Google Gemini, Claude, OpenAI) ──
+inline std::string g_llm_provider = "local"; // "local", "google", "claude", "openai"
+inline std::string g_google_auth_mode = "api_key"; // "api_key" or "gemini_cli"
+inline std::string g_gemini_api_key = "";
+inline std::string g_gemini_model = "gemini-3.8-flash";
+inline std::string g_claude_api_key = "";
+inline std::string g_claude_model = "claude-sonnet-4-20250514";
+inline std::string g_openai_api_key = "";
+inline std::string g_openai_model = "gpt-4o";
+inline std::string g_openai_base_url = "https://api.openai.com/v1/chat/completions";
+inline bool g_hybrid_local_zdb = true;
+
+inline bool is_gemini_cli_runtime_installed() {
+    namespace fs = std::filesystem;
+#if defined(_WIN32) || defined(_WIN64)
+    return fs::exists(".moecher_runtime/agy/agy.exe");
+#else
+    return fs::exists(".moecher_runtime/agy/agy");
+#endif
+}
+
+inline bool is_gemini_cli_oauth_authenticated(std::string* out_email = nullptr) {
+    if (out_email) out_email->clear();
+    namespace fs = std::filesystem;
+    bool has_token = false;
+
+    // 1. Check Antigravity CLI state in USERPROFILE/.gemini/antigravity-cli or .gemini/antigravity
+    const char* user_prof = std::getenv("USERPROFILE");
+    if (!user_prof) user_prof = std::getenv("HOME");
+    if (user_prof && strlen(user_prof) > 0) {
+        fs::path up(user_prof);
+        if (fs::exists(up / ".gemini" / "antigravity-cli" / "jetski_state.pbtxt") ||
+            fs::exists(up / ".gemini" / "antigravity" / "antigravity_state.pbtxt")) {
+            has_token = true;
+        }
+    }
+
+    // 2. Also check sandboxed .moecher_runtime/home/.gemini/oauth_creds.json
+    if (fs::exists(".moecher_runtime/home/.gemini/oauth_creds.json")) {
+        try {
+            std::ifstream f(".moecher_runtime/home/.gemini/oauth_creds.json");
+            if (f.is_open()) {
+                json j = json::parse(f);
+                if ((j.contains("refresh_token") && j["refresh_token"].is_string() && !j["refresh_token"].get<std::string>().empty()) ||
+                    (j.contains("access_token") && j["access_token"].is_string() && !j["access_token"].get<std::string>().empty())) {
+                    has_token = true;
+                }
+            }
+        } catch (...) {}
+    }
+
+    if (has_token && out_email) {
+        try {
+            std::ifstream af(".moecher_runtime/home/.gemini/google_accounts.json");
+            if (af.is_open()) {
+                json aj = json::parse(af);
+                if (aj.contains("active") && aj["active"].is_string()) {
+                    *out_email = aj["active"].get<std::string>();
+                }
+            }
+        } catch (...) {}
+        if (out_email->empty() && user_prof) {
+            fs::path up(user_prof);
+            if (fs::exists(up / ".gemini" / "google_accounts.json")) {
+                try {
+                    std::ifstream gaf(up / ".gemini" / "google_accounts.json");
+                    if (gaf.is_open()) {
+                        json gaj = json::parse(gaf);
+                        if (gaj.contains("active") && gaj["active"].is_string()) {
+                            *out_email = gaj["active"].get<std::string>();
+                        }
+                    }
+                } catch (...) {}
+            }
+        }
+        if (out_email->empty()) {
+            *out_email = "Google AI Ultra (agy)";
+        }
+    }
+    return has_token;
+}
+
 inline bool g_config_loaded = false;
 
 inline void load_config_from_disk() {
@@ -132,6 +218,18 @@ inline void load_config_from_disk() {
     if (!env_cx) env_cx = std::getenv("GOOGLE_CX");
     if (env_cx && strlen(env_cx) > 0) g_google_search_cx = env_cx;
 
+    const char* env_gemini = std::getenv("GEMINI_API_KEY");
+    if (!env_gemini) env_gemini = std::getenv("GOOGLE_GENAI_API_KEY");
+    if (!env_gemini) env_gemini = std::getenv("GOOGLE_API_KEY");
+    if (env_gemini && strlen(env_gemini) > 0) g_gemini_api_key = env_gemini;
+
+    const char* env_claude = std::getenv("ANTHROPIC_API_KEY");
+    if (!env_claude) env_claude = std::getenv("CLAUDE_API_KEY");
+    if (env_claude && strlen(env_claude) > 0) g_claude_api_key = env_claude;
+
+    const char* env_openai = std::getenv("OPENAI_API_KEY");
+    if (env_openai && strlen(env_openai) > 0) g_openai_api_key = env_openai;
+
     // 2. Check config file .moecher_config.json
     try {
         std::ifstream f(".moecher_config.json");
@@ -140,26 +238,56 @@ inline void load_config_from_disk() {
             if (j.contains("search_provider") && j["search_provider"].is_string()) {
                 g_search_provider = j["search_provider"].get<std::string>();
             }
-            if (j.contains("tavily_api_key") && j["tavily_api_key"].is_string() && g_tavily_api_key.empty()) {
+            if (j.contains("tavily_api_key") && j["tavily_api_key"].is_string() && !j["tavily_api_key"].get<std::string>().empty()) {
                 g_tavily_api_key = j["tavily_api_key"].get<std::string>();
             }
-            if (j.contains("brave_api_key") && j["brave_api_key"].is_string() && g_brave_api_key.empty()) {
+            if (j.contains("brave_api_key") && j["brave_api_key"].is_string() && !j["brave_api_key"].get<std::string>().empty()) {
                 g_brave_api_key = j["brave_api_key"].get<std::string>();
             }
             if (j.contains("fast_media_search") && j["fast_media_search"].is_boolean()) {
                 g_fast_media_search = j["fast_media_search"].get<bool>();
             }
-            if (j.contains("serper_api_key") && j["serper_api_key"].is_string() && g_serper_api_key.empty()) {
+            if (j.contains("serper_api_key") && j["serper_api_key"].is_string() && !j["serper_api_key"].get<std::string>().empty()) {
                 g_serper_api_key = j["serper_api_key"].get<std::string>();
             }
             if (j.contains("searxng_url") && j["searxng_url"].is_string()) {
                 g_searxng_url = j["searxng_url"].get<std::string>();
             }
-            if (j.contains("google_search_api_key") && j["google_search_api_key"].is_string() && g_google_search_api_key.empty()) {
+            if (j.contains("google_search_api_key") && j["google_search_api_key"].is_string() && !j["google_search_api_key"].get<std::string>().empty()) {
                 g_google_search_api_key = j["google_search_api_key"].get<std::string>();
             }
-            if (j.contains("google_search_cx") && j["google_search_cx"].is_string() && g_google_search_cx.empty()) {
+            if (j.contains("google_search_cx") && j["google_search_cx"].is_string() && !j["google_search_cx"].get<std::string>().empty()) {
                 g_google_search_cx = j["google_search_cx"].get<std::string>();
+            }
+            if (j.contains("llm_provider") && j["llm_provider"].is_string()) {
+                g_llm_provider = j["llm_provider"].get<std::string>();
+            }
+            if (j.contains("google_auth_mode") && j["google_auth_mode"].is_string() && !j["google_auth_mode"].get<std::string>().empty()) {
+                g_google_auth_mode = j["google_auth_mode"].get<std::string>();
+            }
+            if (j.contains("gemini_api_key") && j["gemini_api_key"].is_string() && !j["gemini_api_key"].get<std::string>().empty()) {
+                g_gemini_api_key = j["gemini_api_key"].get<std::string>();
+            }
+            if (j.contains("gemini_model") && j["gemini_model"].is_string() && !j["gemini_model"].get<std::string>().empty()) {
+                g_gemini_model = j["gemini_model"].get<std::string>();
+            }
+            if (j.contains("claude_api_key") && j["claude_api_key"].is_string() && !j["claude_api_key"].get<std::string>().empty()) {
+                g_claude_api_key = j["claude_api_key"].get<std::string>();
+            }
+            if (j.contains("claude_model") && j["claude_model"].is_string() && !j["claude_model"].get<std::string>().empty()) {
+                g_claude_model = j["claude_model"].get<std::string>();
+            }
+            if (j.contains("openai_api_key") && j["openai_api_key"].is_string() && !j["openai_api_key"].get<std::string>().empty()) {
+                g_openai_api_key = j["openai_api_key"].get<std::string>();
+            }
+            if (j.contains("openai_model") && j["openai_model"].is_string() && !j["openai_model"].get<std::string>().empty()) {
+                g_openai_model = j["openai_model"].get<std::string>();
+            }
+            if (j.contains("openai_base_url") && j["openai_base_url"].is_string() && !j["openai_base_url"].get<std::string>().empty()) {
+                g_openai_base_url = j["openai_base_url"].get<std::string>();
+            }
+            if (j.contains("hybrid_local_zdb") && j["hybrid_local_zdb"].is_boolean()) {
+                g_hybrid_local_zdb = j["hybrid_local_zdb"].get<bool>();
             }
         }
     } catch (...) {}
@@ -182,11 +310,112 @@ inline void save_config_to_disk() {
         j["google_search_api_key"] = g_google_search_api_key;
         j["google_search_cx"] = g_google_search_cx;
         j["fast_media_search"] = g_fast_media_search;
+        j["llm_provider"] = g_llm_provider;
+        j["google_auth_mode"] = g_google_auth_mode;
+        j["gemini_api_key"] = g_gemini_api_key;
+        j["gemini_model"] = g_gemini_model;
+        j["claude_api_key"] = g_claude_api_key;
+        j["claude_model"] = g_claude_model;
+        j["openai_api_key"] = g_openai_api_key;
+        j["openai_model"] = g_openai_model;
+        j["openai_base_url"] = g_openai_base_url;
+        j["hybrid_local_zdb"] = g_hybrid_local_zdb;
         std::ofstream wf(".moecher_config.json");
         if (wf.is_open()) {
             wf << j.dump(2);
         }
     } catch (...) {}
+}
+
+inline void set_llm_provider_settings(const json& body) {
+    load_config_from_disk();
+    {
+        std::lock_guard<std::mutex> lock(g_config_mutex);
+        std::string p_val = "";
+        if (body.contains("llm_provider") && body["llm_provider"].is_string()) {
+            p_val = body["llm_provider"].get<std::string>();
+        } else if (body.contains("active_provider") && body["active_provider"].is_string()) {
+            p_val = body["active_provider"].get<std::string>();
+        }
+        if (!p_val.empty()) {
+            if (p_val == "anthropic") p_val = "claude";
+            if (p_val == "gemini") p_val = "google";
+            g_llm_provider = p_val;
+        }
+        if (body.contains("google_auth_mode") && body["google_auth_mode"].is_string()) {
+            std::string mode = body["google_auth_mode"].get<std::string>();
+            if (mode == "api_key" || mode == "gemini_cli") {
+                g_google_auth_mode = mode;
+            }
+        }
+        if (body.contains("gemini_api_key") && body["gemini_api_key"].is_string() && !body["gemini_api_key"].get<std::string>().empty()) {
+            g_gemini_api_key = body["gemini_api_key"].get<std::string>();
+        }
+        if (body.contains("gemini_model") && body["gemini_model"].is_string() && !body["gemini_model"].get<std::string>().empty()) {
+            g_gemini_model = body["gemini_model"].get<std::string>();
+        }
+        if (body.contains("claude_api_key") && body["claude_api_key"].is_string() && !body["claude_api_key"].get<std::string>().empty()) {
+            g_claude_api_key = body["claude_api_key"].get<std::string>();
+        }
+        if (body.contains("claude_model") && body["claude_model"].is_string() && !body["claude_model"].get<std::string>().empty()) {
+            g_claude_model = body["claude_model"].get<std::string>();
+        }
+        if (body.contains("openai_api_key") && body["openai_api_key"].is_string() && !body["openai_api_key"].get<std::string>().empty()) {
+            g_openai_api_key = body["openai_api_key"].get<std::string>();
+        }
+        if (body.contains("openai_model") && body["openai_model"].is_string() && !body["openai_model"].get<std::string>().empty()) {
+            g_openai_model = body["openai_model"].get<std::string>();
+        }
+        if (body.contains("openai_base_url") && body["openai_base_url"].is_string() && !body["openai_base_url"].get<std::string>().empty()) {
+            g_openai_base_url = body["openai_base_url"].get<std::string>();
+        }
+        if (body.contains("hybrid_local_zdb") && body["hybrid_local_zdb"].is_boolean()) {
+            g_hybrid_local_zdb = body["hybrid_local_zdb"].get<bool>();
+        }
+    }
+    save_config_to_disk();
+}
+
+inline std::string mask_secret_key(const std::string& k) {
+    if (k.empty()) return "";
+    if (k.size() <= 8) return "****";
+    return k.substr(0, 4) + "..." + k.substr(k.size() - 4);
+}
+
+inline json get_llm_provider_settings() {
+    load_config_from_disk();
+    std::lock_guard<std::mutex> lock(g_config_mutex);
+    json j;
+    std::string active = g_llm_provider.empty() ? "local" : g_llm_provider;
+    std::string auth_mode = g_google_auth_mode.empty() ? "api_key" : g_google_auth_mode;
+    std::string cli_email;
+    bool cli_installed = is_gemini_cli_runtime_installed();
+    bool cli_authed = is_gemini_cli_oauth_authenticated(&cli_email);
+
+    j["llm_provider"] = active;
+    j["active_provider"] = active;
+    j["google_auth_mode"] = auth_mode;
+    j["gemini_cli_installed"] = cli_installed;
+    j["gemini_cli_authenticated"] = cli_authed;
+    j["gemini_cli_email"] = cli_email;
+    j["gemini_api_key"] = g_gemini_api_key;
+    j["gemini_configured"] = (auth_mode == "gemini_cli") ? cli_authed : (!g_gemini_api_key.empty());
+    j["gemini_api_key_set"] = !g_gemini_api_key.empty();
+    j["gemini_api_key_masked"] = mask_secret_key(g_gemini_api_key);
+    j["gemini_model"] = g_gemini_model.empty() ? "gemini-3.8-flash" : g_gemini_model;
+    j["claude_api_key"] = g_claude_api_key;
+    j["claude_configured"] = !g_claude_api_key.empty();
+    j["claude_api_key_set"] = !g_claude_api_key.empty();
+    j["claude_api_key_masked"] = mask_secret_key(g_claude_api_key);
+    j["claude_model"] = g_claude_model.empty() ? "claude-sonnet-4-20250514" : g_claude_model;
+    j["openai_api_key"] = g_openai_api_key;
+    j["openai_configured"] = !g_openai_api_key.empty();
+    j["openai_api_key_set"] = !g_openai_api_key.empty();
+    j["openai_api_key_masked"] = mask_secret_key(g_openai_api_key);
+    j["openai_model"] = g_openai_model.empty() ? "gpt-4o" : g_openai_model;
+    j["openai_base_url"] = g_openai_base_url.empty() ? "https://api.openai.com/v1/chat/completions" : g_openai_base_url;
+    j["hybrid_local_zdb"] = g_hybrid_local_zdb;
+    return j;
 }
 
 inline void set_search_settings(
@@ -4203,6 +4432,1431 @@ inline void extract_tool_calls(
         }
     }
     out_clean_content = scrub_dsml_and_tool_tags(out_clean_content);
+}
+
+// ════════════════════════════════════════════════════════════════════════════════
+//  Hybrid External Cloud LLM Streaming Client (Google Gemini, Anthropic Claude, OpenAI)
+// ════════════════════════════════════════════════════════════════════════════════
+
+struct ExternalLLMStats {
+    size_t prompt_tokens = 0;
+    size_t completion_tokens = 0;
+    double prefill_sec = 0.0;
+    double prefill_tps = 0.0;
+    double decode_sec = 0.0;
+    double decode_tps = 0.0;
+    std::string finish_reason = "stop";
+    std::string full_content;
+    std::string full_reasoning;
+    std::vector<ToolCall> native_tool_calls;
+    bool ok = false;
+    std::string error_message;
+};
+
+inline bool resolve_external_provider_for_model(
+    const std::string& requested_model,
+    const std::string& requested_provider,
+    const std::string& local_model_id,
+    std::string& out_provider,
+    std::string& out_model_id
+) {
+    load_config_from_disk();
+    std::lock_guard<std::mutex> lock(g_config_mutex);
+
+    std::string req_p = requested_provider;
+    for (auto& c : req_p) c = (char)std::tolower((unsigned char)c);
+    if (req_p == "local") {
+        out_provider = "local";
+        out_model_id = local_model_id;
+        return false;
+    }
+
+    std::string req_m = requested_model;
+    std::string lower_m = req_m;
+    for (auto& c : lower_m) c = (char)std::tolower((unsigned char)c);
+
+    // Explicit provider in request
+    if (req_p == "google" || req_p == "gemini") {
+        out_provider = "google";
+        if (req_m.rfind("google/", 0) == 0) req_m = req_m.substr(7);
+        out_model_id = (!req_m.empty() && req_m != local_model_id) ? req_m : (g_gemini_model.empty() ? "gemini-2.5-flash" : g_gemini_model);
+        return true;
+    }
+    if (req_p == "claude" || req_p == "anthropic") {
+        out_provider = "claude";
+        if (req_m.rfind("anthropic/", 0) == 0) req_m = req_m.substr(10);
+        if (req_m.rfind("claude/", 0) == 0) req_m = req_m.substr(7);
+        out_model_id = (!req_m.empty() && req_m != local_model_id) ? req_m : (g_claude_model.empty() ? "claude-sonnet-4-20250514" : g_claude_model);
+        return true;
+    }
+    if (req_p == "openai") {
+        out_provider = "openai";
+        if (req_m.rfind("openai/", 0) == 0) req_m = req_m.substr(7);
+        out_model_id = (!req_m.empty() && req_m != local_model_id) ? req_m : (g_openai_model.empty() ? "gpt-4o" : g_openai_model);
+        return true;
+    }
+
+    // Check model ID prefixes
+    if (lower_m.rfind("google/", 0) == 0 || lower_m.rfind("gemini-", 0) == 0) {
+        out_provider = "google";
+        out_model_id = (lower_m.rfind("google/", 0) == 0) ? req_m.substr(7) : req_m;
+        return true;
+    }
+    if (lower_m.rfind("anthropic/", 0) == 0 || lower_m.rfind("claude/", 0) == 0 || lower_m.rfind("claude-", 0) == 0) {
+        out_provider = "claude";
+        if (lower_m.rfind("anthropic/", 0) == 0) out_model_id = req_m.substr(10);
+        else if (lower_m.rfind("claude/", 0) == 0) out_model_id = req_m.substr(7);
+        else out_model_id = req_m;
+        return true;
+    }
+    if (lower_m.rfind("openai/", 0) == 0 || lower_m.rfind("gpt-", 0) == 0 || lower_m.rfind("chatgpt-", 0) == 0 ||
+        lower_m == "o1" || lower_m.rfind("o1-", 0) == 0 || lower_m == "o3" || lower_m.rfind("o3-", 0) == 0 ||
+        lower_m == "o4" || lower_m.rfind("o4-", 0) == 0) {
+        out_provider = "openai";
+        out_model_id = (lower_m.rfind("openai/", 0) == 0) ? req_m.substr(7) : req_m;
+        return true;
+    }
+
+    // Otherwise check persistent server-level active provider
+    if (g_llm_provider == "google" || g_llm_provider == "gemini") {
+        out_provider = "google";
+        out_model_id = g_gemini_model.empty() ? "gemini-2.5-flash" : g_gemini_model;
+        return true;
+    }
+    if (g_llm_provider == "claude" || g_llm_provider == "anthropic") {
+        out_provider = "claude";
+        out_model_id = g_claude_model.empty() ? "claude-sonnet-4-20250514" : g_claude_model;
+        return true;
+    }
+    if (g_llm_provider == "openai") {
+        out_provider = "openai";
+        out_model_id = g_openai_model.empty() ? "gpt-4o" : g_openai_model;
+        return true;
+    }
+
+    out_provider = "local";
+    out_model_id = local_model_id;
+    return false;
+}
+
+inline bool stream_https_post(
+    const std::string& url,
+    const std::vector<std::pair<std::string, std::string>>& headers,
+    const std::string& body,
+    std::function<bool(const std::string& line)> on_line,
+    int* out_status_code = nullptr,
+    std::string* out_error_body = nullptr,
+    int timeout_ms = 120000
+) {
+    if (out_status_code) *out_status_code = 0;
+    if (out_error_body) out_error_body->clear();
+
+#if defined(_WIN32) || defined(_WIN64)
+    int wlen = MultiByteToWideChar(CP_UTF8, 0, url.c_str(), -1, NULL, 0);
+    if (wlen <= 0) return false;
+    std::vector<wchar_t> wurl(wlen);
+    MultiByteToWideChar(CP_UTF8, 0, url.c_str(), -1, wurl.data(), wlen);
+
+    URL_COMPONENTS url_comp;
+    ZeroMemory(&url_comp, sizeof(url_comp));
+    url_comp.dwStructSize = sizeof(url_comp);
+    url_comp.dwHostNameLength = (DWORD)-1;
+    url_comp.dwUrlPathLength = (DWORD)-1;
+    url_comp.dwExtraInfoLength = (DWORD)-1;
+
+    if (!WinHttpCrackUrl(wurl.data(), (DWORD)(wurl.size() - 1), 0, &url_comp)) {
+        if (out_error_body) *out_error_body = "Invalid URL: " + url;
+        return false;
+    }
+
+    std::wstring w_host(url_comp.lpszHostName, url_comp.dwHostNameLength);
+    std::wstring w_path(url_comp.lpszUrlPath, url_comp.dwUrlPathLength);
+    if (url_comp.dwExtraInfoLength > 0) {
+        w_path += std::wstring(url_comp.lpszExtraInfo, url_comp.dwExtraInfoLength);
+    }
+    if (w_path.empty()) w_path = L"/";
+
+    bool is_https = (url_comp.nScheme == INTERNET_SCHEME_HTTPS);
+    INTERNET_PORT port = url_comp.nPort;
+
+    HINTERNET h_session = WinHttpOpen(L"Moecher-Hybrid/1.0",
+                                      WINHTTP_ACCESS_TYPE_DEFAULT_PROXY,
+                                      WINHTTP_NO_PROXY_NAME,
+                                      WINHTTP_NO_PROXY_BYPASS, 0);
+    if (!h_session) {
+        if (out_error_body) *out_error_body = "WinHttpOpen failed";
+        return false;
+    }
+
+    WinHttpSetTimeouts(h_session, 15000, 15000, 30000, timeout_ms);
+
+    HINTERNET h_connect = WinHttpConnect(h_session, w_host.c_str(), port, 0);
+    if (!h_connect) {
+        WinHttpCloseHandle(h_session);
+        if (out_error_body) *out_error_body = "Failed to connect to host";
+        return false;
+    }
+
+    DWORD open_flags = is_https ? WINHTTP_FLAG_SECURE : 0;
+    HINTERNET h_request = WinHttpOpenRequest(h_connect, L"POST", w_path.c_str(),
+                                             NULL, WINHTTP_NO_REFERER,
+                                             WINHTTP_DEFAULT_ACCEPT_TYPES, open_flags);
+    if (!h_request) {
+        WinHttpCloseHandle(h_connect);
+        WinHttpCloseHandle(h_session);
+        if (out_error_body) *out_error_body = "WinHttpOpenRequest failed";
+        return false;
+    }
+
+    for (const auto& kv : headers) {
+        std::string h_str = kv.first + ": " + kv.second + "\r\n";
+        int hwlen = MultiByteToWideChar(CP_UTF8, 0, h_str.c_str(), -1, NULL, 0);
+        if (hwlen > 0) {
+            std::vector<wchar_t> whdr(hwlen);
+            MultiByteToWideChar(CP_UTF8, 0, h_str.c_str(), -1, whdr.data(), hwlen);
+            WinHttpAddRequestHeaders(h_request, whdr.data(), (DWORD)-1L, WINHTTP_ADDREQ_FLAG_ADD | WINHTTP_ADDREQ_FLAG_REPLACE);
+        }
+    }
+
+    BOOL b_results = WinHttpSendRequest(h_request,
+                                        WINHTTP_NO_ADDITIONAL_HEADERS, 0,
+                                        (LPVOID)body.data(), (DWORD)body.size(),
+                                        (DWORD)body.size(), 0);
+    if (b_results) {
+        b_results = WinHttpReceiveResponse(h_request, NULL);
+    }
+
+    if (!b_results) {
+        DWORD err = GetLastError();
+        if (out_error_body) *out_error_body = "HTTPS request failed (WinHTTP error " + std::to_string(err) + ")";
+        WinHttpCloseHandle(h_request);
+        WinHttpCloseHandle(h_connect);
+        WinHttpCloseHandle(h_session);
+        return false;
+    }
+
+    DWORD status_code = 0;
+    DWORD status_size = sizeof(status_code);
+    WinHttpQueryHeaders(h_request,
+                        WINHTTP_QUERY_STATUS_CODE | WINHTTP_QUERY_FLAG_NUMBER,
+                        WINHTTP_HEADER_NAME_BY_INDEX,
+                        &status_code, &status_size, WINHTTP_NO_HEADER_INDEX);
+    if (out_status_code) *out_status_code = (int)status_code;
+
+    std::string line_buf;
+    char read_buf[8192];
+    DWORD bytes_read = 0;
+    bool aborted = false;
+
+    while (WinHttpReadData(h_request, read_buf, sizeof(read_buf), &bytes_read) && bytes_read > 0) {
+        if (status_code < 200 || status_code >= 300) {
+            if (out_error_body) out_error_body->append(read_buf, bytes_read);
+        } else {
+            line_buf.append(read_buf, bytes_read);
+            size_t nl_pos = 0;
+            while ((nl_pos = line_buf.find('\n')) != std::string::npos) {
+                std::string line = line_buf.substr(0, nl_pos);
+                if (!line.empty() && line.back() == '\r') line.pop_back();
+                line_buf.erase(0, nl_pos + 1);
+                if (on_line && !on_line(line)) {
+                    aborted = true;
+                    break;
+                }
+            }
+            if (aborted) break;
+        }
+    }
+
+    if (!aborted && status_code >= 200 && status_code < 300 && !line_buf.empty()) {
+        if (!line_buf.empty() && line_buf.back() == '\r') line_buf.pop_back();
+        if (on_line) on_line(line_buf);
+    }
+
+    WinHttpCloseHandle(h_request);
+    WinHttpCloseHandle(h_connect);
+    WinHttpCloseHandle(h_session);
+    return (status_code >= 200 && status_code < 300);
+#else
+    // POSIX fallback via curl streaming
+    std::string cmd = "curl -s -S -N -w \"\\n__HTTP_STATUS__:%{http_code}\" -X POST ";
+    for (const auto& kv : headers) {
+        std::string h = kv.first + ": " + kv.second;
+        std::string esc = "'";
+        for (char c : h) {
+            if (c == '\'') esc += "'\\''";
+            else esc += c;
+        }
+        esc += "'";
+        cmd += "-H " + esc + " ";
+    }
+    // Write body to temp file to avoid shell arg limits
+    std::string tmp_body = "/tmp/moecher_req_" + std::to_string(std::chrono::steady_clock::now().time_since_epoch().count()) + ".json";
+    {
+        std::ofstream tf(tmp_body, std::ios::binary);
+        tf << body;
+    }
+    std::string esc_url = "'";
+    for (char c : url) {
+        if (c == '\'') esc_url += "'\\''";
+        else esc_url += c;
+    }
+    esc_url += "'";
+    cmd += "--data-binary @" + tmp_body + " " + esc_url + " 2>&1";
+
+    FILE* pipe = popen(cmd.c_str(), "r");
+    if (!pipe) {
+        std::remove(tmp_body.c_str());
+        return false;
+    }
+    char buf[4096];
+    std::string line_buf;
+    int status_code = 200;
+    std::string all_captured;
+    while (fgets(buf, sizeof(buf), pipe) != nullptr) {
+        std::string s(buf);
+        if (s.rfind("__HTTP_STATUS__:", 0) == 0) {
+            status_code = std::atoi(s.substr(16).c_str());
+            continue;
+        }
+        all_captured += s;
+        while (!s.empty() && (s.back() == '\n' || s.back() == '\r')) s.pop_back();
+        if (on_line && !on_line(s)) break;
+    }
+    pclose(pipe);
+    std::remove(tmp_body.c_str());
+    if (out_status_code) *out_status_code = status_code;
+    if (status_code < 200 || status_code >= 300) {
+        if (out_error_body) *out_error_body = all_captured;
+        return false;
+    }
+    return true;
+#endif
+}
+
+inline void extract_msg_text_and_images(
+    const json& msg,
+    std::string& out_text,
+    std::vector<std::pair<std::string, std::string>>& out_images
+) {
+    out_text.clear();
+    out_images.clear();
+
+    if (msg.contains("content")) {
+        if (msg["content"].is_string()) {
+            out_text = msg["content"].get<std::string>();
+        } else if (msg["content"].is_array()) {
+            for (const auto& part : msg["content"]) {
+                if (!part.is_object()) continue;
+                std::string ptype = part.value("type", "");
+                if (ptype == "text" && part.contains("text") && part["text"].is_string()) {
+                    if (!out_text.empty()) out_text += "\n";
+                    out_text += part["text"].get<std::string>();
+                } else if (ptype == "image_url" && part.contains("image_url")) {
+                    std::string data_url;
+                    if (part["image_url"].is_object()) data_url = part["image_url"].value("url", "");
+                    else if (part["image_url"].is_string()) data_url = part["image_url"].get<std::string>();
+                    if (data_url.rfind("data:", 0) == 0) {
+                        size_t semi = data_url.find(";base64,");
+                        if (semi != std::string::npos) {
+                            std::string mime = data_url.substr(5, semi - 5);
+                            std::string b64 = data_url.substr(semi + 8);
+                            if (mime.empty()) mime = "image/jpeg";
+                            out_images.push_back({mime, b64});
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    // Serialize assistant tool_calls into canonical <tool_call> tags so multi-turn history
+    // works uniformly across Gemini, Claude, OpenAI, and Local models without signature errors.
+    if (msg.contains("tool_calls") && msg["tool_calls"].is_array()) {
+        for (const auto& tc : msg["tool_calls"]) {
+            std::string fn_name;
+            std::string fn_args = "{}";
+            if (tc.contains("function") && tc["function"].is_object()) {
+                fn_name = tc["function"].value("name", "");
+                if (tc["function"].contains("arguments")) {
+                    if (tc["function"]["arguments"].is_string()) {
+                        fn_args = tc["function"]["arguments"].get<std::string>();
+                    } else {
+                        fn_args = tc["function"]["arguments"].dump();
+                    }
+                }
+            } else {
+                fn_name = tc.value("name", "");
+                if (tc.contains("arguments")) {
+                    if (tc["arguments"].is_string()) fn_args = tc["arguments"].get<std::string>();
+                    else fn_args = tc["arguments"].dump();
+                }
+            }
+            if (!fn_name.empty()) {
+                json parsed_args = json::object();
+                try { parsed_args = json::parse(fn_args); } catch (...) {}
+                json call_obj = {
+                    {"name", fn_name},
+                    {"arguments", parsed_args}
+                };
+                if (!out_text.empty() && out_text.back() != '\n') out_text += "\n";
+                out_text += "<tool_call>\n" + call_obj.dump() + "\n</tool_call>";
+            }
+        }
+    }
+}
+
+inline std::mutex g_gemini_cli_mutex;
+#if defined(_WIN32) || defined(_WIN64)
+inline HANDLE g_gemini_login_process = NULL;
+#endif
+
+inline void ensure_gemini_cli_sandbox_files() {
+    namespace fs = std::filesystem;
+    try {
+        fs::create_directories(".moecher_runtime/home/.gemini");
+        fs::create_directories(".moecher_runtime/workdir");
+
+        std::string settings_path = ".moecher_runtime/home/.gemini/settings.json";
+        json sj = {
+            {"security", {{"auth", {{"selectedType", "oauth-personal"}}}}},
+            {"tools", {{"core", json::array()}}}
+        };
+        if (fs::exists(settings_path)) {
+            try {
+                std::ifstream rf(settings_path);
+                if (rf.is_open()) {
+                    json existing = json::parse(rf);
+                    if (existing.is_object()) {
+                        existing["security"]["auth"]["selectedType"] = "oauth-personal";
+                        existing["tools"]["core"] = json::array();
+                        sj = existing;
+                    }
+                }
+            } catch (...) {}
+        }
+        {
+            std::ofstream wf(settings_path);
+            if (wf.is_open()) wf << sj.dump(2);
+        }
+
+        std::string helper_path = ".moecher_runtime/login_helper.mjs";
+        if (!fs::exists(helper_path)) {
+            std::ofstream hf(helper_path);
+            if (hf.is_open()) {
+                hf << "import fs from 'node:fs';\n"
+                   << "import path from 'node:path';\n"
+                   << "import { EventEmitter } from 'node:events';\n"
+                   << "import { fileURLToPath, pathToFileURL } from 'node:url';\n\n"
+                   << "const __dirname = path.dirname(fileURLToPath(import.meta.url));\n"
+                   << "const homeDir = process.env.GEMINI_CLI_HOME || path.join(__dirname, 'home');\n"
+                   << "const geminiDir = path.join(homeDir, '.gemini');\n"
+                   << "fs.mkdirSync(geminiDir, { recursive: true });\n"
+                   << "const pendingUrlFile = path.join(geminiDir, 'pending_auth_url.txt');\n\n"
+                   << "process.env.GEMINI_CLI_NO_RELAUNCH = 'true';\n"
+                   << "process.stdin.isTTY = true;\n"
+                   << "process.stdin.setRawMode = () => process.stdin;\n\n"
+                   << "function captureAuthUrl(str) {\n"
+                   << "  if (!str || typeof str !== 'string') return;\n"
+                   << "  const m = str.match(/https:\\/\\/accounts\\.google\\.com\\/o\\/oauth2\\/[^\\s\"'\\^]+/);\n"
+                   << "  if (m) {\n"
+                   << "    const cleanUrl = m[0].replace(/\\^&/g, '&');\n"
+                   << "    try { fs.writeFileSync(pendingUrlFile, cleanUrl, 'utf8'); } catch {}\n"
+                   << "  }\n"
+                   << "}\n\n"
+                   << "const origEmit = EventEmitter.prototype.emit;\n"
+                   << "EventEmitter.prototype.emit = function(event, ...args) {\n"
+                   << "  if (args && args[0] && typeof args[0] === 'object' && args[0].message) {\n"
+                   << "    captureAuthUrl(String(args[0].message));\n"
+                   << "  }\n"
+                   << "  return origEmit.apply(this, [event, ...args]);\n"
+                   << "};\n\n"
+                   << "const origStdoutWrite = process.stdout.write.bind(process.stdout);\n"
+                   << "process.stdout.write = (chunk, encoding, cb) => {\n"
+                   << "  const s = typeof chunk === 'string' ? chunk : chunk.toString();\n"
+                   << "  captureAuthUrl(s);\n"
+                   << "  if (s.includes('Do you want to continue?')) {\n"
+                   << "    setTimeout(() => { process.stdin.emit('data', Buffer.from('y\\r\\n')); }, 50);\n"
+                   << "  }\n"
+                   << "  return origStdoutWrite(chunk, encoding, cb);\n"
+                   << "};\n\n"
+                   << "const origStderrWrite = process.stderr.write.bind(process.stderr);\n"
+                   << "process.stderr.write = (chunk, encoding, cb) => {\n"
+                   << "  const s = typeof chunk === 'string' ? chunk : chunk.toString();\n"
+                   << "  captureAuthUrl(s);\n"
+                   << "  return origStderrWrite(chunk, encoding, cb);\n"
+                   << "};\n\n"
+                   << "const bundleDir = path.join(__dirname, 'gemini-cli', 'node_modules', '@google', 'gemini-cli', 'bundle');\n"
+                   << "await import(pathToFileURL(path.join(bundleDir, 'gemini.js')).href);\n";
+            }
+        }
+    } catch (...) {}
+}
+
+inline bool bootstrap_gemini_cli_runtime(std::string* out_error = nullptr) {
+    if (is_gemini_cli_runtime_installed()) {
+        ensure_gemini_cli_sandbox_files();
+        return true;
+    }
+    std::lock_guard<std::mutex> lock(g_gemini_cli_mutex);
+    if (is_gemini_cli_runtime_installed()) {
+        ensure_gemini_cli_sandbox_files();
+        return true;
+    }
+
+    namespace fs = std::filesystem;
+    try {
+        fs::create_directories(".moecher_runtime/agy");
+        fs::create_directories(".moecher_runtime/home/.gemini");
+        fs::create_directories(".moecher_runtime/workdir");
+    } catch (...) {}
+
+#if defined(_WIN32) || defined(_WIN64)
+    if (!fs::exists(".moecher_runtime/agy/agy.exe")) {
+        std::string ps_agy =
+            "powershell -NoProfile -ExecutionPolicy Bypass -Command \""
+            "$ErrorActionPreference = 'Stop'; "
+            "[Net.ServicePointManager]::SecurityProtocol = [Net.SecurityProtocolType]::Tls12; "
+            "$m = Invoke-RestMethod -Uri 'https://antigravity-cli-auto-updater-974169037036.us-central1.run.app/manifests/windows_amd64.json'; "
+            "Invoke-WebRequest -Uri $m.url -OutFile '.moecher_runtime\\agy\\agy.exe'\"";
+        execute_system_command(ps_agy, 180000);
+    }
+#endif
+
+    ensure_gemini_cli_sandbox_files();
+    bool ok = is_gemini_cli_runtime_installed();
+    if (!ok && out_error) {
+        *out_error = "Failed to download standalone agy.exe into .moecher_runtime/agy/";
+    }
+    return ok;
+}
+
+inline bool start_gemini_cli_oauth_login(std::string* out_auth_url = nullptr, std::string* out_error = nullptr) {
+    if (out_auth_url) out_auth_url->clear();
+    if (out_error) out_error->clear();
+
+    if (!bootstrap_gemini_cli_runtime(out_error)) {
+        return false;
+    }
+
+    namespace fs = std::filesystem;
+    std::string pending_file = ".moecher_runtime/home/.gemini/pending_auth_url.txt";
+    try {
+        if (fs::exists(pending_file)) fs::remove(pending_file);
+    } catch (...) {}
+
+#if defined(_WIN32) || defined(_WIN64)
+    {
+        std::lock_guard<std::mutex> lock(g_gemini_cli_mutex);
+        if (g_gemini_login_process != NULL) {
+            TerminateProcess(g_gemini_login_process, 1);
+            CloseHandle(g_gemini_login_process);
+            g_gemini_login_process = NULL;
+        }
+
+        std::string abs_home = fs::absolute(".moecher_runtime/home").string();
+        std::string abs_node = fs::absolute(".moecher_runtime/node/node.exe").string();
+        std::string abs_helper = fs::absolute(".moecher_runtime/login_helper.mjs").string();
+        std::string abs_workdir = fs::absolute(".moecher_runtime/workdir").string();
+
+        _putenv_s("GEMINI_CLI_HOME", abs_home.c_str());
+        _putenv_s("GEMINI_CLI_NO_RELAUNCH", "true");
+
+        std::string cmd_str = "\"" + abs_node + "\" \"" + abs_helper + "\" -p \"Reply READY\" -o stream-json";
+        int wlen = MultiByteToWideChar(CP_UTF8, 0, cmd_str.c_str(), -1, NULL, 0);
+        std::vector<wchar_t> wcmd(wlen);
+        MultiByteToWideChar(CP_UTF8, 0, cmd_str.c_str(), -1, wcmd.data(), wlen);
+
+        int wd_len = MultiByteToWideChar(CP_UTF8, 0, abs_workdir.c_str(), -1, NULL, 0);
+        std::vector<wchar_t> wdir(wd_len);
+        MultiByteToWideChar(CP_UTF8, 0, abs_workdir.c_str(), -1, wdir.data(), wd_len);
+
+        STARTUPINFOW si;
+        ZeroMemory(&si, sizeof(si));
+        si.cb = sizeof(si);
+        PROCESS_INFORMATION pi;
+        ZeroMemory(&pi, sizeof(pi));
+
+        if (!CreateProcessW(NULL, wcmd.data(), NULL, NULL, FALSE, CREATE_NO_WINDOW, NULL, wdir.data(), &si, &pi)) {
+            if (out_error) *out_error = "Failed to spawn sandboxed node.exe for OAuth login";
+            return false;
+        }
+        CloseHandle(pi.hThread);
+        g_gemini_login_process = pi.hProcess;
+    }
+
+    // Poll up to 8 seconds for pending_auth_url.txt or existing authentication
+    for (int i = 0; i < 50; ++i) {
+        std::this_thread::sleep_for(std::chrono::milliseconds(160));
+        if (fs::exists(pending_file)) {
+            try {
+                std::ifstream pf(pending_file);
+                std::string url_line;
+                if (pf.is_open() && std::getline(pf, url_line)) {
+                    while (!url_line.empty() && (url_line.back() == '\r' || url_line.back() == '\n' || url_line.back() == ' ')) {
+                        url_line.pop_back();
+                    }
+                    if (!url_line.empty()) {
+                        if (out_auth_url) *out_auth_url = url_line;
+                        return true;
+                    }
+                }
+            } catch (...) {}
+        }
+        if (is_gemini_cli_oauth_authenticated()) {
+            return true;
+        }
+    }
+    if (out_error) *out_error = "Timed out waiting for OAuth URL from @google/gemini-cli";
+    return false;
+#else
+    if (out_error) *out_error = "Sandboxed gemini-cli OAuth helper currently implemented for Windows";
+    return false;
+#endif
+}
+
+inline void logout_gemini_cli_oauth() {
+    namespace fs = std::filesystem;
+#if defined(_WIN32) || defined(_WIN64)
+    {
+        std::lock_guard<std::mutex> lock(g_gemini_cli_mutex);
+        if (g_gemini_login_process != NULL) {
+            TerminateProcess(g_gemini_login_process, 1);
+            CloseHandle(g_gemini_login_process);
+            g_gemini_login_process = NULL;
+        }
+    }
+#endif
+    try {
+        if (fs::exists(".moecher_runtime/home/.gemini/oauth_creds.json")) {
+            fs::remove(".moecher_runtime/home/.gemini/oauth_creds.json");
+        }
+        if (fs::exists(".moecher_runtime/home/.gemini/google_accounts.json")) {
+            fs::remove(".moecher_runtime/home/.gemini/google_accounts.json");
+        }
+        if (fs::exists(".moecher_runtime/home/.gemini/pending_auth_url.txt")) {
+            fs::remove(".moecher_runtime/home/.gemini/pending_auth_url.txt");
+        }
+    } catch (...) {}
+}
+
+inline json get_gemini_cli_status_json() {
+    load_config_from_disk();
+    std::string email;
+    bool installed = is_gemini_cli_runtime_installed();
+    bool authed = is_gemini_cli_oauth_authenticated(&email);
+    std::string pending_url;
+    namespace fs = std::filesystem;
+    if (!authed && fs::exists(".moecher_runtime/home/.gemini/pending_auth_url.txt")) {
+        try {
+            std::ifstream pf(".moecher_runtime/home/.gemini/pending_auth_url.txt");
+            if (pf.is_open()) {
+                std::getline(pf, pending_url);
+                while (!pending_url.empty() && (pending_url.back() == '\r' || pending_url.back() == '\n' || pending_url.back() == ' ')) {
+                    pending_url.pop_back();
+                }
+            }
+        } catch (...) {}
+    }
+    std::string auth_mode;
+    {
+        std::lock_guard<std::mutex> lock(g_config_mutex);
+        auth_mode = g_google_auth_mode.empty() ? "api_key" : g_google_auth_mode;
+    }
+    return json{
+        {"status", "ok"},
+        {"installed", installed},
+        {"authenticated", authed},
+        {"email", email},
+        {"google_auth_mode", auth_mode},
+        {"pending_auth_url", pending_url}
+    };
+}
+
+inline std::string parse_api_error_message(const std::string& raw_err, int status_code) {
+    if (raw_err.empty()) {
+        return "HTTP " + std::to_string(status_code);
+    }
+    try {
+        json j = json::parse(raw_err);
+        if (j.is_array() && !j.empty() && j[0].is_object() && j[0].contains("error")) {
+            j = j[0];
+        }
+        if (j.contains("error")) {
+            if (j["error"].is_object() && j["error"].contains("message") && j["error"]["message"].is_string()) {
+                return j["error"]["message"].get<std::string>();
+            }
+            if (j["error"].is_string()) {
+                return j["error"].get<std::string>();
+            }
+        }
+        if (j.contains("message") && j["message"].is_string()) {
+            return j["message"].get<std::string>();
+        }
+    } catch (...) {}
+    return (raw_err.size() > 400) ? (raw_err.substr(0, 400) + "...") : raw_err;
+}
+
+inline ExternalLLMStats stream_external_llm_chat(
+    const std::string& provider,
+    const std::string& model_id,
+    const json& messages,
+    const std::string& tools_system_suffix,
+    int max_tokens,
+    float temperature,
+    bool enable_thinking,
+    int thinking_budget,
+    std::function<bool(const std::string& text, bool is_reasoning)> on_delta
+) {
+    load_config_from_disk();
+    ExternalLLMStats stats;
+
+    std::string gemini_key, google_auth_mode, claude_key, openai_key, openai_url;
+    {
+        std::lock_guard<std::mutex> lock(g_config_mutex);
+        gemini_key = g_gemini_api_key;
+        google_auth_mode = g_google_auth_mode.empty() ? "api_key" : g_google_auth_mode;
+        claude_key = g_claude_api_key;
+        openai_key = g_openai_api_key;
+        openai_url = g_openai_base_url.empty() ? "https://api.openai.com/v1/chat/completions" : g_openai_base_url;
+    }
+
+    auto t_start = std::chrono::steady_clock::now();
+    auto t_first_token = t_start;
+    bool got_first_token = false;
+
+    auto record_first_token = [&]() {
+        if (!got_first_token) {
+            got_first_token = true;
+            t_first_token = std::chrono::steady_clock::now();
+        }
+    };
+
+    // Extract system prompt & normalize conversation turns
+    std::string sys_prompt = "";
+    struct NormalizedTurn {
+        std::string role; // "user" or "assistant"
+        std::string text;
+        std::vector<std::pair<std::string, std::string>> images;
+    };
+    std::vector<NormalizedTurn> turns;
+
+    if (messages.is_array()) {
+        for (const auto& msg : messages) {
+            std::string role = msg.value("role", "user");
+            std::string txt;
+            std::vector<std::pair<std::string, std::string>> imgs;
+            extract_msg_text_and_images(msg, txt, imgs);
+
+            if (role == "system") {
+                if (!sys_prompt.empty() && !txt.empty()) sys_prompt += "\n\n";
+                sys_prompt += txt;
+                continue;
+            }
+            if (role == "tool") {
+                txt = "<tool_response>\n" + txt + "\n</tool_response>";
+                role = "user";
+            } else if (role != "assistant") {
+                role = "user";
+            }
+
+            if (txt.empty() && imgs.empty()) continue;
+
+            if (!turns.empty() && turns.back().role == role) {
+                if (!turns.back().text.empty() && !txt.empty()) turns.back().text += "\n\n";
+                turns.back().text += txt;
+                for (const auto& im : imgs) turns.back().images.push_back(im);
+            } else {
+                turns.push_back({role, txt, imgs});
+            }
+        }
+    }
+
+    // Ensure system prompt includes canonical <tools> / <tool_call> instructions when tools are active
+    if (!tools_system_suffix.empty()) {
+        // Strip any existing local model tool section (e.g. DeepSeek ## Tools or # Tools) before appending canonical XML tools prompt
+        size_t tpos = sys_prompt.find("\n\n# Tools");
+        if (tpos == std::string::npos) tpos = sys_prompt.find("# Tools");
+        if (tpos == std::string::npos) tpos = sys_prompt.find("\n\n## Tools");
+        if (tpos == std::string::npos) tpos = sys_prompt.find("## Tools");
+        if (tpos == std::string::npos) tpos = sys_prompt.find("<tools>");
+        if (tpos != std::string::npos) {
+            sys_prompt = sys_prompt.substr(0, tpos);
+        }
+        sys_prompt += tools_system_suffix;
+    }
+
+    if (turns.empty()) {
+        turns.push_back({"user", "Hello", {}});
+    }
+
+    // ── 1. GOOGLE GEMINI API / SANDBOXED GEMINI-CLI OAUTH ───────────────────────
+    if (provider == "google" || provider == "gemini") {
+        std::string clean_model = model_id;
+        if (clean_model.rfind("models/", 0) == 0) clean_model = clean_model.substr(7);
+        if (clean_model.empty()) clean_model = "gemini-3.8-flash";
+
+        if (google_auth_mode == "gemini_cli") {
+            if (!is_gemini_cli_runtime_installed() || !is_gemini_cli_oauth_authenticated()) {
+                stats.error_message = "⚠️ **Google Ultra OAuth Sign-In Required**\n\nPlease click **⚡ Sign in with Google Ultra** in **Settings → Hybrid Cloud APIs** (or switch back to **🔑 AI Studio API Key** mode).";
+                if (on_delta) on_delta(stats.error_message, false);
+                stats.full_content = stats.error_message;
+                return stats;
+            }
+
+            ensure_gemini_cli_sandbox_files();
+
+            // Map model identifiers to Antigravity CLI (agy.exe) Google AI Ultra model IDs
+            std::string cli_model = clean_model;
+            if (clean_model == "gemini-3.8-flash" || clean_model == "gemini-3.5-flash" ||
+                clean_model == "gemini-2.5-flash" || clean_model == "gemini-3-flash-preview") {
+                cli_model = enable_thinking ? "gemini-3.8-flash-high" : "gemini-3.8-flash-low";
+            } else if (clean_model == "gemini-3.8-flash-lite" || clean_model == "gemini-3.5-flash-lite" || clean_model == "gemini-3.1-flash-lite") {
+                cli_model = "gemini-3.8-flash-low";
+            } else if (clean_model == "gemini-4-argon" || clean_model == "gemini-2.5-pro" ||
+                       clean_model == "gemini-3-pro-preview" || clean_model == "gemini-3.8-pro-preview") {
+                cli_model = enable_thinking ? "gemini-4-argon-high" : "gemini-4-argon-medium";
+            }
+
+            std::string full_stdin =
+                "[IMPORTANT RUNTIME RULE: Do NOT invoke any internal CLI tools (such as view_file, list_dir, run_command, search_web, etc.). "
+                "Respond directly in plain text/Markdown, or emit <tool_call> XML tags ONLY if explicitly instructed in [System Instructions] below.]\n\n";
+            if (!sys_prompt.empty()) {
+                full_stdin += "[System Instructions]\n" + sys_prompt + "\n[/System Instructions]\n\n";
+            }
+            if (turns.size() > 1) {
+                full_stdin += "[Conversation History]\n";
+                for (size_t i = 0; i + 1 < turns.size(); ++i) {
+                    std::string r_label = (turns[i].role == "assistant") ? "Assistant" : "User";
+                    full_stdin += "[" + r_label + "]:\n" + turns[i].text + "\n\n";
+                }
+                full_stdin += "[/Conversation History]\n\n";
+            }
+            if (!turns.empty()) {
+                full_stdin += "[User]:\n" + turns.back().text + "\n";
+            }
+
+#if defined(_WIN32) || defined(_WIN64)
+            namespace fs = std::filesystem;
+            std::string abs_agy = fs::absolute(".moecher_runtime/agy/agy.exe").string();
+            std::string abs_workdir = fs::absolute(".moecher_runtime/workdir").string();
+
+            SECURITY_ATTRIBUTES sa;
+            ZeroMemory(&sa, sizeof(sa));
+            sa.nLength = sizeof(SECURITY_ATTRIBUTES);
+            sa.bInheritHandle = TRUE;
+            sa.lpSecurityDescriptor = NULL;
+
+            HANDLE hStdinRd = NULL, hStdinWr = NULL;
+            HANDLE hStdoutRd = NULL, hStdoutWr = NULL;
+
+            if (!CreatePipe(&hStdinRd, &hStdinWr, &sa, 0) || !SetHandleInformation(hStdinWr, HANDLE_FLAG_INHERIT, 0)) {
+                stats.error_message = "⚠️ **Google Ultra Bridge Error:** Failed to create stdin pipe.";
+                if (on_delta) on_delta(stats.error_message, false);
+                stats.full_content = stats.error_message;
+                return stats;
+            }
+            if (!CreatePipe(&hStdoutRd, &hStdoutWr, &sa, 0) || !SetHandleInformation(hStdoutRd, HANDLE_FLAG_INHERIT, 0)) {
+                CloseHandle(hStdinRd);
+                CloseHandle(hStdinWr);
+                stats.error_message = "⚠️ **Google Ultra Bridge Error:** Failed to create stdout pipe.";
+                if (on_delta) on_delta(stats.error_message, false);
+                stats.full_content = stats.error_message;
+                return stats;
+            }
+
+            std::string cmd_str = "\"" + abs_agy + "\" --model " + cli_model + " --input-format stream-json --output-format stream-json --disable-slash-commands --print=\"\"";
+            int wlen = MultiByteToWideChar(CP_UTF8, 0, cmd_str.c_str(), -1, NULL, 0);
+            std::vector<wchar_t> wcmd(wlen);
+            MultiByteToWideChar(CP_UTF8, 0, cmd_str.c_str(), -1, wcmd.data(), wlen);
+
+            int wd_len = MultiByteToWideChar(CP_UTF8, 0, abs_workdir.c_str(), -1, NULL, 0);
+            std::vector<wchar_t> wdir(wd_len);
+            MultiByteToWideChar(CP_UTF8, 0, abs_workdir.c_str(), -1, wdir.data(), wd_len);
+
+            STARTUPINFOW si;
+            ZeroMemory(&si, sizeof(si));
+            si.cb = sizeof(si);
+            si.dwFlags = STARTF_USESTDHANDLES;
+            si.hStdInput = hStdinRd;
+            si.hStdOutput = hStdoutWr;
+            si.hStdError = hStdoutWr;
+
+            PROCESS_INFORMATION pi;
+            ZeroMemory(&pi, sizeof(pi));
+
+            BOOL spawned = CreateProcessW(NULL, wcmd.data(), NULL, NULL, TRUE, CREATE_NO_WINDOW, NULL, wdir.data(), &si, &pi);
+            CloseHandle(hStdinRd);
+            CloseHandle(hStdoutWr);
+
+            if (!spawned) {
+                CloseHandle(hStdinWr);
+                CloseHandle(hStdoutRd);
+                stats.error_message = "⚠️ **Google Ultra Bridge Error:** Failed to launch sandboxed agy.exe.";
+                if (on_delta) on_delta(stats.error_message, false);
+                stats.full_content = stats.error_message;
+                return stats;
+            }
+
+            json stdin_event = {
+                {"event", "user"},
+                {"message", {{"content", full_stdin}}}
+            };
+            std::string stdin_payload = stdin_event.dump(-1, ' ', false, json::error_handler_t::replace) + "\n";
+
+            std::thread writer_thread([hStdinWr, stdin_payload]() {
+                size_t total_written = 0;
+                while (total_written < stdin_payload.size()) {
+                    DWORD chunk = (DWORD)std::min<size_t>(65536, stdin_payload.size() - total_written);
+                    DWORD written = 0;
+                    if (!WriteFile(hStdinWr, stdin_payload.data() + total_written, chunk, &written, NULL) || written == 0) {
+                        break;
+                    }
+                    total_written += written;
+                }
+                CloseHandle(hStdinWr);
+            });
+
+            std::string line_buf;
+            std::string cli_err_msg;
+            std::string diag_lines;
+            char read_buf[4096];
+            DWORD bytes_read = 0;
+            bool aborted = false;
+
+            auto process_cli_line = [&](std::string line) -> bool {
+                while (!line.empty() && (line.back() == '\r' || line.back() == '\n')) line.pop_back();
+                if (line.empty()) return true;
+                if (line.front() == '{') {
+                    try {
+                        json j = json::parse(line);
+                        std::string ev_type = j.value("event", j.value("type", ""));
+                        if (ev_type == "step_update" && j.contains("step_update") && j["step_update"].is_object()) {
+                            const auto& su = j["step_update"];
+                            if (su.value("step_type", "") == "agent_response") {
+                                if (su.contains("thinking_delta") && su["thinking_delta"].is_string()) {
+                                    std::string th = su["thinking_delta"].get<std::string>();
+                                    if (!th.empty()) {
+                                        record_first_token();
+                                        stats.full_reasoning += th;
+                                        if (on_delta && !on_delta(th, true)) return false;
+                                    }
+                                }
+                                if (su.contains("text_delta") && su["text_delta"].is_string()) {
+                                    std::string txt = su["text_delta"].get<std::string>();
+                                    if (!txt.empty()) {
+                                        record_first_token();
+                                        stats.full_content += txt;
+                                        if (on_delta && !on_delta(txt, false)) return false;
+                                    }
+                                }
+                                if (su.contains("usage") && su["usage"].is_object()) {
+                                    const auto& u = su["usage"];
+                                    stats.prompt_tokens = u.value("input_tokens", stats.prompt_tokens);
+                                    stats.completion_tokens = u.value("output_tokens", stats.completion_tokens) + u.value("thinking_tokens", (size_t)0);
+                                }
+                            }
+                        } else if (ev_type == "result" && j.contains("result") && j["result"].is_object()) {
+                            const auto& res_obj = j["result"];
+                            if (res_obj.contains("usage") && res_obj["usage"].is_object()) {
+                                const auto& u = res_obj["usage"];
+                                stats.prompt_tokens = u.value("input_tokens", stats.prompt_tokens);
+                                stats.completion_tokens = u.value("output_tokens", stats.completion_tokens) + u.value("thinking_tokens", (size_t)0);
+                            }
+                            if (res_obj.value("status", "") == "ERROR") {
+                                cli_err_msg = res_obj.value("error", "Antigravity CLI error");
+                            } else if (stats.full_content.empty() && res_obj.contains("response") && res_obj["response"].is_string()) {
+                                std::string resp_txt = res_obj["response"].get<std::string>();
+                                if (!resp_txt.empty()) {
+                                    record_first_token();
+                                    stats.full_content = resp_txt;
+                                    if (on_delta && !on_delta(resp_txt, false)) return false;
+                                }
+                            }
+                        }
+                        return true;
+                    } catch (...) {}
+                }
+                if (diag_lines.size() < 1200) {
+                    if (!diag_lines.empty()) diag_lines += "\n";
+                    diag_lines += line;
+                }
+                return true;
+            };
+
+            while (ReadFile(hStdoutRd, read_buf, sizeof(read_buf), &bytes_read, NULL) && bytes_read > 0) {
+                line_buf.append(read_buf, bytes_read);
+                size_t nl_pos = 0;
+                while ((nl_pos = line_buf.find('\n')) != std::string::npos) {
+                    std::string line = line_buf.substr(0, nl_pos);
+                    line_buf.erase(0, nl_pos + 1);
+                    if (!process_cli_line(line)) {
+                        aborted = true;
+                        TerminateProcess(pi.hProcess, 1);
+                        break;
+                    }
+                }
+                if (aborted) break;
+            }
+            if (!aborted && !line_buf.empty()) {
+                process_cli_line(line_buf);
+            }
+
+            if (writer_thread.joinable()) writer_thread.join();
+            WaitForSingleObject(pi.hProcess, 3000);
+            CloseHandle(hStdoutRd);
+            CloseHandle(pi.hProcess);
+            CloseHandle(pi.hThread);
+
+            if (stats.full_content.empty() && (!cli_err_msg.empty() || !diag_lines.empty())) {
+                std::string msg = "⚠️ **Google Ultra (gemini-cli) Error:** " + (!cli_err_msg.empty() ? cli_err_msg : diag_lines);
+                if (on_delta) on_delta(msg, false);
+                stats.full_content = msg;
+                stats.error_message = msg;
+                return stats;
+            }
+#endif
+        } else {
+            if (gemini_key.empty()) {
+                stats.error_message = "⚠️ **Google Gemini API Key Required**\n\nPlease enter your Google AI Studio API Key in **Settings → Hybrid Cloud APIs** (or switch to **🌐 Google Ultra OAuth** mode).";
+                if (on_delta) on_delta(stats.error_message, false);
+                stats.full_content = stats.error_message;
+                return stats;
+            }
+
+            std::string url = "https://generativelanguage.googleapis.com/v1beta/models/" + clean_model + ":streamGenerateContent?alt=sse&key=" + gemini_key;
+
+        auto build_gemini_payload = [&](bool with_thinking_cfg) -> json {
+            json payload = json::object();
+            if (!sys_prompt.empty()) {
+                payload["systemInstruction"] = {
+                    {"parts", json::array({{{"text", sys_prompt}}})}
+                };
+            }
+            json contents = json::array();
+            for (const auto& t : turns) {
+                json parts = json::array();
+                for (const auto& im : t.images) {
+                    parts.push_back({
+                        {"inlineData", {
+                            {"mimeType", im.first},
+                            {"data", im.second}
+                        }}
+                    });
+                }
+                if (!t.text.empty() || parts.empty()) {
+                    parts.push_back({{"text", t.text.empty() ? " " : t.text}});
+                }
+                contents.push_back({
+                    {"role", (t.role == "assistant") ? "model" : "user"},
+                    {"parts", parts}
+                });
+            }
+            payload["contents"] = contents;
+
+            int eff_max = std::clamp(max_tokens, 256, 65536);
+            json gen_cfg = {
+                {"temperature", temperature},
+                {"maxOutputTokens", eff_max}
+            };
+            if (with_thinking_cfg) {
+                std::string lm = clean_model;
+                for (auto& c : lm) c = (char)std::tolower((unsigned char)c);
+                bool supports_thinking = (lm.find("2.5") != std::string::npos || lm.find("3.") != std::string::npos ||
+                                          lm.find("3-") != std::string::npos || lm.find("4.") != std::string::npos ||
+                                          lm.find("4-") != std::string::npos || lm.find("thinking") != std::string::npos);
+                if (supports_thinking) {
+                    if (enable_thinking) {
+                        json t_cfg = {{"includeThoughts", true}};
+                        if (thinking_budget >= 128 && thinking_budget <= 24576) {
+                            t_cfg["thinkingBudget"] = thinking_budget;
+                        }
+                        gen_cfg["thinkingConfig"] = t_cfg;
+                    } else if (lm.find("pro") == std::string::npos) {
+                        // Flash models allow thinkingBudget: 0 when thinking is disabled
+                        gen_cfg["thinkingConfig"] = {{"thinkingBudget", 0}};
+                    }
+                }
+            }
+            payload["generationConfig"] = gen_cfg;
+            return payload;
+        };
+
+        auto handle_gemini_sse_line = [&](const std::string& line) -> bool {
+            if (line.rfind("data:", 0) != 0) return true;
+            std::string data_str = line.substr(5);
+            while (!data_str.empty() && data_str.front() == ' ') data_str.erase(0, 1);
+            if (data_str.empty() || data_str == "[DONE]") return true;
+
+            try {
+                json j = json::parse(data_str);
+                if (j.contains("usageMetadata") && j["usageMetadata"].is_object()) {
+                    const auto& um = j["usageMetadata"];
+                    stats.prompt_tokens = um.value("promptTokenCount", stats.prompt_tokens);
+                    size_t cand_tok = um.value("candidatesTokenCount", 0);
+                    size_t thought_tok = um.value("thoughtsTokenCount", 0);
+                    if (cand_tok + thought_tok > 0) {
+                        stats.completion_tokens = cand_tok + thought_tok;
+                    }
+                }
+                if (j.contains("candidates") && j["candidates"].is_array() && !j["candidates"].empty()) {
+                    const auto& cand = j["candidates"][0];
+                    if (cand.contains("content") && cand["content"].is_object() &&
+                        cand["content"].contains("parts") && cand["content"]["parts"].is_array()) {
+                        for (const auto& part : cand["content"]["parts"]) {
+                            bool is_thought = part.value("thought", false);
+                            if (part.contains("text") && part["text"].is_string()) {
+                                std::string txt = part["text"].get<std::string>();
+                                if (!txt.empty()) {
+                                    record_first_token();
+                                    if (is_thought) {
+                                        stats.full_reasoning += txt;
+                                        if (on_delta && !on_delta(txt, true)) return false;
+                                    } else {
+                                        stats.full_content += txt;
+                                        if (on_delta && !on_delta(txt, false)) return false;
+                                    }
+                                }
+                            }
+                            if (part.contains("functionCall") && part["functionCall"].is_object()) {
+                                record_first_token();
+                                std::string fn_name = part["functionCall"].value("name", "");
+                                json fn_args = part["functionCall"].value("args", json::object());
+                                if (!fn_name.empty()) {
+                                    json call_obj = {{"name", fn_name}, {"arguments", fn_args}};
+                                    std::string tc_xml = "\n<tool_call>\n" + call_obj.dump() + "\n</tool_call>\n";
+                                    stats.full_content += tc_xml;
+                                    if (on_delta && !on_delta(tc_xml, false)) return false;
+                                }
+                            }
+                        }
+                    }
+                }
+            } catch (...) {}
+            return true;
+        };
+
+        int status_code = 0;
+        std::string err_body;
+        std::vector<std::pair<std::string, std::string>> headers = {
+            {"Content-Type", "application/json"}
+        };
+
+        json req_payload = build_gemini_payload(true);
+        bool ok = stream_https_post(url, headers, req_payload.dump(-1, ' ', false, json::error_handler_t::replace),
+                                    handle_gemini_sse_line, &status_code, &err_body);
+        if (!ok && status_code == 400 && (err_body.find("thinking") != std::string::npos || err_body.find("Thinking") != std::string::npos)) {
+            // Automatic fallback without thinkingConfig if model does not support thinking parameters
+            err_body.clear();
+            req_payload = build_gemini_payload(false);
+            ok = stream_https_post(url, headers, req_payload.dump(-1, ' ', false, json::error_handler_t::replace),
+                                   handle_gemini_sse_line, &status_code, &err_body);
+        }
+
+        if (!ok) {
+            std::string msg = "⚠️ **Google Gemini API Error (" + std::to_string(status_code) + "):** " + parse_api_error_message(err_body, status_code);
+            if (on_delta) on_delta(msg, false);
+            stats.full_content += msg;
+            stats.error_message = msg;
+            return stats;
+        }
+        } // end else (api_key mode)
+    }
+    // ── 2. ANTHROPIC CLAUDE API ─────────────────────────────────────────────────
+    else if (provider == "claude" || provider == "anthropic") {
+        if (claude_key.empty()) {
+            stats.error_message = "⚠️ **Anthropic Claude API Key Required**\n\nPlease enter your Anthropic API Key (`sk-ant-...`) in **Settings → Hybrid Cloud APIs** (or click the Model Selector dropdown above → **Configure API Keys**).";
+            if (on_delta) on_delta(stats.error_message, false);
+            stats.full_content = stats.error_message;
+            return stats;
+        }
+
+        std::string clean_model = model_id.empty() ? "claude-sonnet-4-20250514" : model_id;
+        std::string url = "https://api.anthropic.com/v1/messages";
+
+        // Ensure first turn is user role for Anthropic
+        if (turns.front().role != "user") {
+            turns.insert(turns.begin(), {"user", "Continue.", {}});
+        }
+
+        auto build_claude_payload = [&](bool with_thinking_cfg) -> json {
+            json payload = json::object();
+            payload["model"] = clean_model;
+            payload["stream"] = true;
+            if (!sys_prompt.empty()) {
+                payload["system"] = sys_prompt;
+            }
+            json claude_msgs = json::array();
+            for (const auto& t : turns) {
+                if (t.images.empty()) {
+                    claude_msgs.push_back({
+                        {"role", t.role},
+                        {"content", t.text.empty() ? " " : t.text}
+                    });
+                } else {
+                    json content_arr = json::array();
+                    for (const auto& im : t.images) {
+                        content_arr.push_back({
+                            {"type", "image"},
+                            {"source", {
+                                {"type", "base64"},
+                                {"media_type", im.first},
+                                {"data", im.second}
+                            }}
+                        });
+                    }
+                    if (!t.text.empty()) {
+                        content_arr.push_back({
+                            {"type", "text"},
+                            {"text", t.text}
+                        });
+                    }
+                    claude_msgs.push_back({
+                        {"role", t.role},
+                        {"content", content_arr}
+                    });
+                }
+            }
+            payload["messages"] = claude_msgs;
+
+            int eff_max = std::clamp(max_tokens, 256, 8192);
+            if (with_thinking_cfg && enable_thinking && thinking_budget >= 1024 &&
+                (clean_model.find("3-7") != std::string::npos || clean_model.find("-4") != std::string::npos)) {
+                int b_tok = std::clamp(thinking_budget, 1024, 16384);
+                eff_max = std::max(eff_max, b_tok + 4096);
+                payload["max_tokens"] = eff_max;
+                payload["temperature"] = 1.0f; // Required by Anthropic when extended thinking is enabled
+                payload["thinking"] = {
+                    {"type", "enabled"},
+                    {"budget_tokens", b_tok}
+                };
+            } else {
+                payload["max_tokens"] = eff_max;
+                payload["temperature"] = std::clamp(temperature, 0.0f, 1.0f);
+            }
+            return payload;
+        };
+
+        auto handle_claude_sse_line = [&](const std::string& line) -> bool {
+            if (line.rfind("data:", 0) != 0) return true;
+            std::string data_str = line.substr(5);
+            while (!data_str.empty() && data_str.front() == ' ') data_str.erase(0, 1);
+            if (data_str.empty() || data_str == "[DONE]") return true;
+
+            try {
+                json j = json::parse(data_str);
+                std::string ev_type = j.value("type", "");
+                if (ev_type == "message_start" && j.contains("message") && j["message"].contains("usage")) {
+                    stats.prompt_tokens = j["message"]["usage"].value("input_tokens", stats.prompt_tokens);
+                } else if (ev_type == "content_block_delta" && j.contains("delta") && j["delta"].is_object()) {
+                    std::string dtype = j["delta"].value("type", "");
+                    if (dtype == "thinking_delta" && j["delta"].contains("thinking") && j["delta"]["thinking"].is_string()) {
+                        std::string txt = j["delta"]["thinking"].get<std::string>();
+                        if (!txt.empty()) {
+                            record_first_token();
+                            stats.full_reasoning += txt;
+                            if (on_delta && !on_delta(txt, true)) return false;
+                        }
+                    } else if (dtype == "text_delta" && j["delta"].contains("text") && j["delta"]["text"].is_string()) {
+                        std::string txt = j["delta"]["text"].get<std::string>();
+                        if (!txt.empty()) {
+                            record_first_token();
+                            stats.full_content += txt;
+                            if (on_delta && !on_delta(txt, false)) return false;
+                        }
+                    }
+                } else if (ev_type == "message_delta" && j.contains("usage") && j["usage"].is_object()) {
+                    stats.completion_tokens = j["usage"].value("output_tokens", stats.completion_tokens);
+                }
+            } catch (...) {}
+            return true;
+        };
+
+        std::vector<std::pair<std::string, std::string>> headers = {
+            {"Content-Type", "application/json"},
+            {"x-api-key", claude_key},
+            {"anthropic-version", "2023-06-01"}
+        };
+
+        int status_code = 0;
+        std::string err_body;
+        json req_payload = build_claude_payload(true);
+        bool ok = stream_https_post(url, headers, req_payload.dump(-1, ' ', false, json::error_handler_t::replace),
+                                    handle_claude_sse_line, &status_code, &err_body);
+        if (!ok && status_code == 400 && err_body.find("thinking") != std::string::npos) {
+            err_body.clear();
+            req_payload = build_claude_payload(false);
+            ok = stream_https_post(url, headers, req_payload.dump(-1, ' ', false, json::error_handler_t::replace),
+                                   handle_claude_sse_line, &status_code, &err_body);
+        }
+
+        if (!ok) {
+            std::string msg = "⚠️ **Anthropic Claude API Error (" + std::to_string(status_code) + "):** " + parse_api_error_message(err_body, status_code);
+            if (on_delta) on_delta(msg, false);
+            stats.full_content += msg;
+            stats.error_message = msg;
+            return stats;
+        }
+    }
+    // ── 3. OPENAI (AND OPENAI-COMPATIBLE) API ───────────────────────────────────
+    else if (provider == "openai") {
+        if (openai_key.empty()) {
+            stats.error_message = "⚠️ **OpenAI API Key Required**\n\nPlease enter your OpenAI API Key (`sk-...`) in **Settings → Hybrid Cloud APIs** (or click the Model Selector dropdown above → **Configure API Keys**).";
+            if (on_delta) on_delta(stats.error_message, false);
+            stats.full_content = stats.error_message;
+            return stats;
+        }
+
+        std::string clean_model = model_id.empty() ? "gpt-4o" : model_id;
+        bool is_o_series = (clean_model == "o1" || clean_model.rfind("o1-", 0) == 0 ||
+                            clean_model == "o3" || clean_model.rfind("o3-", 0) == 0 ||
+                            clean_model == "o4" || clean_model.rfind("o4-", 0) == 0);
+
+        json oai_msgs = json::array();
+        if (!sys_prompt.empty()) {
+            oai_msgs.push_back({
+                {"role", is_o_series ? "developer" : "system"},
+                {"content", sys_prompt}
+            });
+        }
+        for (const auto& t : turns) {
+            if (t.images.empty()) {
+                oai_msgs.push_back({
+                    {"role", t.role},
+                    {"content", t.text.empty() ? " " : t.text}
+                });
+            } else {
+                json content_arr = json::array();
+                if (!t.text.empty()) {
+                    content_arr.push_back({{"type", "text"}, {"text", t.text}});
+                }
+                for (const auto& im : t.images) {
+                    content_arr.push_back({
+                        {"type", "image_url"},
+                        {"image_url", {{"url", "data:" + im.first + ";base64," + im.second}}}
+                    });
+                }
+                oai_msgs.push_back({
+                    {"role", t.role},
+                    {"content", content_arr}
+                });
+            }
+        }
+
+        int eff_max = std::clamp(max_tokens, 256, 16384);
+        json payload = {
+            {"model", clean_model},
+            {"messages", oai_msgs},
+            {"stream", true},
+            {"stream_options", {{"include_usage", true}}}
+        };
+        if (is_o_series) {
+            payload["max_completion_tokens"] = eff_max;
+        } else {
+            payload["max_tokens"] = eff_max;
+            payload["temperature"] = temperature;
+        }
+
+        auto handle_openai_sse_line = [&](const std::string& line) -> bool {
+            if (line.rfind("data:", 0) != 0) return true;
+            std::string data_str = line.substr(5);
+            while (!data_str.empty() && data_str.front() == ' ') data_str.erase(0, 1);
+            if (data_str.empty() || data_str == "[DONE]") return true;
+
+            try {
+                json j = json::parse(data_str);
+                if (j.contains("usage") && j["usage"].is_object()) {
+                    stats.prompt_tokens = j["usage"].value("prompt_tokens", stats.prompt_tokens);
+                    stats.completion_tokens = j["usage"].value("completion_tokens", stats.completion_tokens);
+                }
+                if (j.contains("choices") && j["choices"].is_array() && !j["choices"].empty()) {
+                    const auto& choice = j["choices"][0];
+                    if (choice.contains("delta") && choice["delta"].is_object()) {
+                        const auto& delta = choice["delta"];
+                        if (delta.contains("reasoning_content") && delta["reasoning_content"].is_string()) {
+                            std::string txt = delta["reasoning_content"].get<std::string>();
+                            if (!txt.empty()) {
+                                record_first_token();
+                                stats.full_reasoning += txt;
+                                if (on_delta && !on_delta(txt, true)) return false;
+                            }
+                        }
+                        if (delta.contains("content") && delta["content"].is_string()) {
+                            std::string txt = delta["content"].get<std::string>();
+                            if (!txt.empty()) {
+                                record_first_token();
+                                stats.full_content += txt;
+                                if (on_delta && !on_delta(txt, false)) return false;
+                            }
+                        }
+                    }
+                }
+            } catch (...) {}
+            return true;
+        };
+
+        std::vector<std::pair<std::string, std::string>> headers = {
+            {"Content-Type", "application/json"},
+            {"Authorization", "Bearer " + openai_key}
+        };
+
+        int status_code = 0;
+        std::string err_body;
+        bool ok = stream_https_post(openai_url, headers, payload.dump(-1, ' ', false, json::error_handler_t::replace),
+                                    handle_openai_sse_line, &status_code, &err_body);
+        if (!ok && status_code == 400 && err_body.find("stream_options") != std::string::npos) {
+            err_body.clear();
+            payload.erase("stream_options");
+            ok = stream_https_post(openai_url, headers, payload.dump(-1, ' ', false, json::error_handler_t::replace),
+                                   handle_openai_sse_line, &status_code, &err_body);
+        }
+
+        if (!ok) {
+            std::string msg = "⚠️ **OpenAI API Error (" + std::to_string(status_code) + "):** " + parse_api_error_message(err_body, status_code);
+            if (on_delta) on_delta(msg, false);
+            stats.full_content += msg;
+            stats.error_message = msg;
+            return stats;
+        }
+    }
+
+    auto t_end = std::chrono::steady_clock::now();
+    if (!got_first_token) t_first_token = t_end;
+
+    stats.prefill_sec = std::max(0.001, std::chrono::duration<double>(t_first_token - t_start).count());
+    stats.decode_sec = std::max(0.001, std::chrono::duration<double>(t_end - t_first_token).count());
+
+    if (stats.prompt_tokens == 0) {
+        size_t total_chars = sys_prompt.size();
+        for (const auto& t : turns) total_chars += t.text.size();
+        stats.prompt_tokens = std::max<size_t>(1, (total_chars + 3) / 4);
+    }
+    if (stats.completion_tokens == 0) {
+        size_t out_chars = stats.full_content.size() + stats.full_reasoning.size();
+        stats.completion_tokens = std::max<size_t>(1, (out_chars + 3) / 4);
+    }
+
+    stats.prefill_tps = (double)stats.prompt_tokens / stats.prefill_sec;
+    stats.decode_tps = (double)stats.completion_tokens / stats.decode_sec;
+    stats.ok = true;
+    return stats;
+}
+
+inline json test_external_llm_provider(const std::string& provider, const std::string& model_id) {
+    auto t0 = std::chrono::steady_clock::now();
+    json test_msgs = json::array({
+        {{"role", "user"}, {"content", "Reply with the single word: READY"}}
+    });
+    auto stats = stream_external_llm_chat(provider, model_id, test_msgs, "", 32, 0.0f, false, 0, nullptr);
+    auto t1 = std::chrono::steady_clock::now();
+    int latency_ms = (int)std::chrono::duration_cast<std::chrono::milliseconds>(t1 - t0).count();
+    return json{
+        {"ok", stats.ok},
+        {"provider", provider},
+        {"model", model_id},
+        {"latency_ms", latency_ms},
+        {"reply", stats.full_content},
+        {"error", stats.error_message}
+    };
 }
 
 } // namespace tooling

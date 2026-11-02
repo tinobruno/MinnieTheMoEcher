@@ -5,7 +5,12 @@
 
 ---
 
-## 1. Architectural Philosophy: Static-Linked Modularity
+## 1. Architectural Philosophy: Rule #1 & Static-Linked Modularity
+
+> **RULE #1 — NO USER-INSTALLED DEPENDENCIES, NO INSTALLATIONS, NO BLOATWARE:**
+> The end user installs **only** the `moecher` executable (`moecher.exe` / `moecher`) and downloads model weights—period.
+> * Never require the end user to manually install Node.js, Python, npm packages, Docker, or third-party runtimes on their operating system.
+> * Whenever `moecher` needs an external tool, bridge, or runtime (e.g. MCP servers or CLI bridges), `moecher` must **provision, isolate, and execute it automatically inside a sandboxed local workspace subfolder (e.g. `.moecher_runtime/`)** without touching the host OS `PATH`, Windows Registry, or requiring Administrator privileges.
 
 MinnieTheMoEcher is engineered for bare-metal high-throughput inference (CUDA sm_80–sm_120 and Apple Silicon Metal). Every CPU microsecond and GPU memory transaction is critical.
 

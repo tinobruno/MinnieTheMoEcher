@@ -732,7 +732,13 @@
                 <section id="philosophy">
                     <div class="section-header">
                         <span class="section-num">01</span>
-                        <h2 class="section-title">Architectural Philosophy: Static-Linked Modularity</h2>
+                        <h2 class="section-title">Architectural Philosophy: Rule #1 &amp; Static-Linked Modularity</h2>
+                    </div>
+                    <div style="margin-bottom: 20px; padding: 16px 20px; border-radius: var(--radius-md); background: rgba(56, 189, 248, 0.08); border: 1px solid rgba(56, 189, 248, 0.35);">
+                        <div style="font-weight: 800; color: var(--cyan); margin-bottom: 6px; font-size: 14px; letter-spacing: 0.02em;">⚡ RULE #1 — NO USER-INSTALLED DEPENDENCIES, NO INSTALLATIONS, NO BLOATWARE</div>
+                        <p style="color: var(--text-main); font-size: 14px; margin: 0;">
+                            The end user installs <strong>only</strong> the <code>moecher</code> executable (<code>moecher.exe</code> / <code>moecher</code>) and downloads model weights—period. Never require the end user to manually install Node.js, Python, npm packages, or system bloatware. Whenever <code>moecher</code> requires an external tool, bridge, or runtime, <code>moecher</code> must provision, isolate, and execute it automatically inside a sandboxed local workspace subfolder (e.g. <code>.moecher_runtime/</code>) with zero host OS pollution.
+                        </p>
                     </div>
                     <p style="margin-bottom: 16px; color: var(--text-secondary);">
                         MinnieTheMoEcher is engineered for high-throughput bare-metal inference on NVIDIA CUDA (sm_80–sm_120) and Apple Silicon Metal. In ultra-low latency inference, every CPU microsecond and memory transaction directly impacts TTFT and ITL.

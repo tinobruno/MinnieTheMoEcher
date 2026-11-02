@@ -8,11 +8,219 @@
 #include "mcp_client.hpp"
 #include "tool_exec.hpp"
 #include <filesystem>
+#include <fstream>
+#include <iostream>
+#include <set>
+#include <algorithm>
 #if defined(_WIN32) || defined(_WIN64)
 #include <windows.h>
 #include <timeapi.h>
 #pragma comment(lib, "winmm.lib")
 #endif
+
+namespace {
+
+struct DiscoveredModel {
+    std::string manifest_path;
+    std::string display_name;
+    std::string architecture;
+    std::string expert_dtype;
+    int num_layers = 0;
+    int n_experts = 0;
+    int max_seq_len = 0;
+    bool has_vision = false;
+    double total_weights_gb = 0.0;
+};
+
+static std::string resolve_manifest_bin_path(const std::filesystem::path& base_dir, const std::string& rel_or_abs) {
+    if (rel_or_abs.empty()) return "";
+    std::error_code ec;
+    std::filesystem::path p(rel_or_abs);
+    if (std::filesystem::exists(p, ec) && std::filesystem::is_regular_file(p, ec)) return p.string();
+    auto full = base_dir / p;
+    if (std::filesystem::exists(full, ec) && std::filesystem::is_regular_file(full, ec)) return full.string();
+    auto rel_root = base_dir / ".." / ".." / p;
+    if (std::filesystem::exists(rel_root, ec) && std::filesystem::is_regular_file(rel_root, ec)) return rel_root.string();
+    return "";
+}
+
+static bool inspect_model_manifest(const std::filesystem::path& manifest_file, DiscoveredModel& out) {
+    std::error_code ec;
+    if (!std::filesystem::exists(manifest_file, ec) || !std::filesystem::is_regular_file(manifest_file, ec)) {
+        return false;
+    }
+    std::string fname = manifest_file.filename().string();
+    if (fname.rfind("moecher_manifest", 0) != 0 || manifest_file.extension() != ".json") {
+        return false;
+    }
+
+    std::ifstream ifs(manifest_file);
+    if (!ifs.is_open()) return false;
+    json j;
+    try {
+        ifs >> j;
+    } catch (...) {
+        return false;
+    }
+    if (!j.is_object() || !j.contains("model_config") || !j["model_config"].is_object()) {
+        return false;
+    }
+
+    auto base_dir = manifest_file.parent_path();
+    const auto& mc = j["model_config"];
+
+    std::string dense_bin = j.value("dense_bin", "");
+    std::string dense_resolved = resolve_manifest_bin_path(base_dir, dense_bin);
+    if (dense_resolved.empty()) {
+        return false; // Weight file not present on disk
+    }
+
+    uint64_t total_bytes = std::filesystem::file_size(dense_resolved, ec);
+    int n_routed = mc.value("n_routed_experts", 0);
+    std::string edtype = mc.value("expert_dtype", "");
+
+    if (n_routed > 0 && edtype == "mixed_nvfp4_iq2") {
+        std::string cold_p, hot_p;
+        if (j.contains("expert_bins") && j["expert_bins"].is_object()) {
+            if (j["expert_bins"].contains("cold") && j["expert_bins"]["cold"].is_object()) {
+                cold_p = resolve_manifest_bin_path(base_dir, j["expert_bins"]["cold"].value("path", ""));
+            }
+            if (j["expert_bins"].contains("hot") && j["expert_bins"]["hot"].is_object()) {
+                hot_p = resolve_manifest_bin_path(base_dir, j["expert_bins"]["hot"].value("path", ""));
+            }
+        }
+        if (cold_p.empty() && hot_p.empty()) return false;
+        if (!cold_p.empty()) total_bytes += std::filesystem::file_size(cold_p, ec);
+        if (!hot_p.empty()) total_bytes += std::filesystem::file_size(hot_p, ec);
+    } else if (n_routed > 0) {
+        std::string exp_bin = j.value("expert_bin", "");
+        if (!exp_bin.empty()) {
+            std::string exp_resolved = resolve_manifest_bin_path(base_dir, exp_bin);
+            if (exp_resolved.empty()) return false;
+            total_bytes += std::filesystem::file_size(exp_resolved, ec);
+        }
+    }
+
+    std::string name = mc.value("model_name", "");
+    if (name.empty()) name = mc.value("model_id", "");
+    if (name.empty()) {
+        name = base_dir.filename().string();
+        if (name.empty() || name == ".") name = "DeepSeek-V4-Flash";
+    }
+
+    // Distinguish manifest variants in the same folder (e.g., moecher_manifest_mixed.json, moecher_manifest_24gb.json)
+    std::string stem = manifest_file.stem().string();
+    const std::string prefix = "moecher_manifest_";
+    if (stem.rfind(prefix, 0) == 0 && stem.size() > prefix.size()) {
+        std::string variant = stem.substr(prefix.size());
+        if (name.find(variant) == std::string::npos) {
+            name += " [" + variant + "]";
+        }
+    }
+
+    out.manifest_path = manifest_file.lexically_normal().string();
+    out.display_name = name;
+    out.architecture = mc.value("architecture", "deepseek_v4");
+    out.expert_dtype = edtype.empty() ? (n_routed > 0 ? "iq2" : "dense") : edtype;
+    out.num_layers = mc.value("num_hidden_layers", 0);
+    out.n_experts = n_routed;
+    out.max_seq_len = mc.value("max_seq_len", mc.value("original_seq_len", 32768));
+    out.has_vision = mc.value("has_vision", false) || j.contains("visual_config") || mc.contains("vision_config") ||
+                     std::filesystem::exists(base_dir / "vision" / "moecher_manifest.json", ec);
+    out.total_weights_gb = (double)total_bytes / (1024.0 * 1024.0 * 1024.0);
+    return true;
+}
+
+static std::vector<DiscoveredModel> discover_available_models(const char* argv0) {
+    std::vector<std::filesystem::path> search_roots;
+    std::error_code ec;
+
+    auto add_root = [&](const std::filesystem::path& p) {
+        if (!p.empty() && std::filesystem::exists(p, ec) && std::filesystem::is_directory(p, ec)) {
+            search_roots.push_back(p);
+        }
+    };
+
+    std::filesystem::path cwd = std::filesystem::current_path(ec);
+    add_root(cwd);
+    add_root(cwd / "models");
+    add_root(cwd / ".." / "models");
+    add_root(cwd / ".." / ".." / "models");
+    add_root(cwd / ".." / "Moecher" / "models");
+    add_root(cwd / ".." / ".." / "Moecher" / "models");
+
+    if (argv0 && argv0[0]) {
+        std::filesystem::path exe_dir = std::filesystem::path(argv0).parent_path();
+        if (!exe_dir.empty()) {
+            add_root(exe_dir);
+            add_root(exe_dir / "models");
+            add_root(exe_dir / ".." / "models");
+            add_root(exe_dir / ".." / "Moecher" / "models");
+        }
+    }
+
+    if (const char* env_dir = std::getenv("MOECHER_MODELS_DIR")) {
+        if (env_dir[0]) add_root(std::filesystem::path(env_dir));
+    }
+
+#if defined(_WIN32) || defined(_WIN64)
+    for (const char* drive : {"C:", "D:", "E:", "F:", "G:"}) {
+        add_root(std::filesystem::path(std::string(drive) + "/Moecher/models"));
+        add_root(std::filesystem::path(std::string(drive) + "/models"));
+    }
+#endif
+
+    std::set<std::string> seen_canonical;
+    std::vector<DiscoveredModel> models;
+
+    auto try_add_manifest = [&](const std::filesystem::path& mf) {
+        std::error_code c_ec;
+        auto canon = std::filesystem::weakly_canonical(mf, c_ec);
+        std::string key = c_ec ? mf.lexically_normal().string() : canon.string();
+#if defined(_WIN32) || defined(_WIN64)
+        std::transform(key.begin(), key.end(), key.begin(), [](unsigned char c) { return (char)std::tolower(c); });
+#endif
+        if (seen_canonical.count(key)) return;
+        DiscoveredModel dm;
+        if (inspect_model_manifest(mf, dm)) {
+            seen_canonical.insert(key);
+            models.push_back(std::move(dm));
+        }
+    };
+
+    for (const auto& root : search_roots) {
+        for (const auto& entry : std::filesystem::directory_iterator(root, std::filesystem::directory_options::skip_permission_denied, ec)) {
+            if (entry.is_regular_file(ec)) {
+                try_add_manifest(entry.path());
+            } else if (entry.is_directory(ec)) {
+                std::string dname = entry.path().filename().string();
+                if (!dname.empty() && (dname[0] == '.' || dname == "build" || dname == "src" || dname == "web" || dname == "third_party")) {
+                    continue;
+                }
+                for (const auto& sub : std::filesystem::directory_iterator(entry.path(), std::filesystem::directory_options::skip_permission_denied, ec)) {
+                    if (sub.is_regular_file(ec)) {
+                        try_add_manifest(sub.path());
+                    } else if (sub.is_directory(ec)) {
+                        for (const auto& sub2 : std::filesystem::directory_iterator(sub.path(), std::filesystem::directory_options::skip_permission_denied, ec)) {
+                            if (sub2.is_regular_file(ec)) {
+                                try_add_manifest(sub2.path());
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    std::sort(models.begin(), models.end(), [](const DiscoveredModel& a, const DiscoveredModel& b) {
+        if (a.display_name != b.display_name) return a.display_name < b.display_name;
+        return a.manifest_path < b.manifest_path;
+    });
+
+    return models;
+}
+
+} // namespace
 
 int main(int argc, char** argv) {
     // Low-latency active spin-wait on CUDA stream completions (eliminates OS sleep latency)
@@ -65,11 +273,13 @@ int main(int argc, char** argv) {
     int mtp_k = 4;
     bool enable_anti_loop = false;
     bool enable_vision = true;
+    bool manifest_explicit = false;
+    bool spec_explicit = false;
 
     for (int i = 1; i < argc; i++) {
         if (std::string(argv[i]) == "--help" || std::string(argv[i]) == "-h") {
             printf("Usage: %s [options]\n", argv[0]);
-            printf("  --manifest, -m <path>       Path to moecher_manifest.json\n");
+            printf("  --manifest, -m <path>       Path to moecher_manifest.json (omit to choose interactively)\n");
             printf("  --port, -p <port>           Server port (default: %d)\n", port);
             printf("  --proxy-port, -pp <port>    Proxy port (default: %d)\n", proxy_port);
             printf("  --max-vram, -V <gb>         Max VRAM budget in GB\n");
@@ -95,8 +305,9 @@ int main(int argc, char** argv) {
             printf("  --no-intent-gating          Disable dynamic intent gating (agentic mode)\n");
             printf("  --help, -h                  Show this help message\n");
             return 0;
-        } else if ((std::string(argv[i]) == "--manifest" || std::string(argv[i]) == "-m") && i + 1 < argc) {
+        } else if ((std::string(argv[i]) == "--manifest" || std::string(argv[i]) == "-m" || std::string(argv[i]) == "--model") && i + 1 < argc) {
             manifest_path = argv[++i];
+            manifest_explicit = true;
         } else if ((std::string(argv[i]) == "--port" || std::string(argv[i]) == "-p") && i + 1 < argc) {
             port = std::stoi(argv[++i]);
         } else if ((std::string(argv[i]) == "--proxy-port" || std::string(argv[i]) == "-pp") && i + 1 < argc) {
@@ -133,28 +344,37 @@ int main(int argc, char** argv) {
             benchmark_mode = true;
         } else if (std::string(argv[i]) == "--no-pld" || std::string(argv[i]) == "--disable-pld") {
             enable_pld = false;
+            spec_explicit = true;
         } else if (std::string(argv[i]) == "--pld" || std::string(argv[i]) == "--enable-pld") {
             enable_pld = true;
+            spec_explicit = true;
         } else if (std::string(argv[i]) == "--no-mtp" || std::string(argv[i]) == "--disable-mtp") {
             enable_mtp = false;
+            spec_explicit = true;
         } else if (std::string(argv[i]) == "--no-tree-mtp" || std::string(argv[i]) == "--disable-tree-mtp") {
             enable_tree_mtp = false;
+            spec_explicit = true;
         } else if (std::string(argv[i]) == "--tree-mtp" || std::string(argv[i]) == "--enable-tree-mtp") {
             enable_tree_mtp = true;
+            spec_explicit = true;
         } else if ((std::string(argv[i]) == "--tree-nodes" || std::string(argv[i]) == "--tree-branches") && i + 1 < argc) {
             tree_nodes = std::clamp(std::stoi(argv[++i]), 1, 4);
+            spec_explicit = true;
         } else if ((std::string(argv[i]) == "--mtp-k" || std::string(argv[i]) == "--mtp-depth") && i + 1 < argc) {
             mtp_k = std::stoi(argv[++i]);
+            spec_explicit = true;
         } else if (std::string(argv[i]) == "--no-vision" || std::string(argv[i]) == "--disable-vision") {
             enable_vision = false;
         } else if (std::string(argv[i]) == "--no-spec" || std::string(argv[i]) == "--disable-spec") {
             enable_spec = false;
+            spec_explicit = true;
         } else if (std::string(argv[i]) == "--anti-loop" || std::string(argv[i]) == "--enable-anti-loop") {
             enable_anti_loop = true;
         } else if (std::string(argv[i]) == "--no-anti-loop" || std::string(argv[i]) == "--disable-anti-loop") {
             enable_anti_loop = false;
         } else if ((std::string(argv[i]) == "--pld-tokens" || std::string(argv[i]) == "--pld-draft-tokens") && i + 1 < argc) {
             pld_draft_tokens = std::stoi(argv[++i]);
+            spec_explicit = true;
         } else if (std::string(argv[i]) == "--log-experts") {
             g_log_experts = true;
         } else if (std::string(argv[i]) == "--no-log-tokens") {
@@ -231,6 +451,99 @@ int main(int argc, char** argv) {
         } else if (std::string(argv[i]) == "--intent-gating" || std::string(argv[i]) == "--enable-intent-gating") {
             g_intent_gating = true;
             g_intent_gating_cli_explicit = true;
+        } else if (argv[i][0] != '-') {
+            manifest_path = argv[i];
+            manifest_explicit = true;
+        }
+    }
+
+    // If a directory was passed to -m, look for moecher_manifest.json inside it
+    {
+        std::error_code ec;
+        std::filesystem::path mp(manifest_path);
+        if (manifest_explicit && std::filesystem::exists(mp, ec) && std::filesystem::is_directory(mp, ec)) {
+            if (std::filesystem::exists(mp / "moecher_manifest.json", ec)) {
+                manifest_path = (mp / "moecher_manifest.json").string();
+            } else {
+                for (const auto& entry : std::filesystem::directory_iterator(mp, ec)) {
+                    if (entry.is_regular_file(ec) && entry.path().filename().string().rfind("moecher_manifest", 0) == 0 && entry.path().extension() == ".json") {
+                        manifest_path = entry.path().string();
+                        break;
+                    }
+                }
+            }
+        }
+    }
+
+    // Interactive model selector when launched without --manifest / -m
+    if (!manifest_explicit) {
+        auto models = discover_available_models(argc > 0 ? argv[0] : nullptr);
+        if (!models.empty()) {
+            printf("\n");
+            printf("====================================================================================================\n");
+            printf("  MinnieTheMoEcher v%s — Available Local Models\n", MOECHER_VERSION);
+            printf("====================================================================================================\n");
+            printf("  #    %-44s %-28s %-10s %s\n", "Model Name", "Architecture / Quant", "Weights", "Vision");
+            printf("----------------------------------------------------------------------------------------------------\n");
+            for (size_t idx = 0; idx < models.size(); ++idx) {
+                const auto& m = models[idx];
+                std::string arch_quant = m.architecture + " (" + m.expert_dtype + ")";
+                printf(" [%2zu]  %-44.44s %-28.28s %6.1f GB   %s\n",
+                       idx + 1,
+                       m.display_name.c_str(),
+                       arch_quant.c_str(),
+                       m.total_weights_gb,
+                       m.has_vision ? "Yes" : "No");
+                printf("       -> %s\n", m.manifest_path.c_str());
+            }
+            printf("====================================================================================================\n");
+            size_t chosen_idx = 0;
+            while (true) {
+                printf("Select a model to launch [1-%zu] (press Enter for [1], or 'q' to quit): ", models.size());
+                fflush(stdout);
+
+                std::string line;
+                if (!std::getline(std::cin, line)) {
+                    return 0;
+                }
+                // Strip UTF-8 BOM if present and trim whitespace
+                if (line.size() >= 3 && (unsigned char)line[0] == 0xEF && (unsigned char)line[1] == 0xBB && (unsigned char)line[2] == 0xBF) {
+                    line.erase(0, 3);
+                }
+                while (!line.empty() && ((unsigned char)line.back() <= ' ')) line.pop_back();
+                size_t start_pos = 0;
+                while (start_pos < line.size() && ((unsigned char)line[start_pos] <= ' ')) start_pos++;
+                line = line.substr(start_pos);
+
+                if (line == "q" || line == "Q" || line == "quit" || line == "exit") {
+                    printf("Exiting.\n");
+                    return 0;
+                }
+
+                if (line.empty()) {
+                    chosen_idx = 0;
+                    break;
+                }
+                try {
+                    int val = std::stoi(line);
+                    if (val >= 1 && (size_t)val <= models.size()) {
+                        chosen_idx = (size_t)(val - 1);
+                        break;
+                    }
+                } catch (...) {}
+                printf("[WARN] Invalid selection '%s' (please enter a number between 1 and %zu, or 'q' to quit).\n", line.c_str(), models.size());
+            }
+
+            const auto& selected = models[chosen_idx];
+            manifest_path = selected.manifest_path;
+            printf("\n[INFO] Selected [%zu]: %s (%s)\n\n", chosen_idx + 1, selected.display_name.c_str(), manifest_path.c_str());
+
+            // Apply model-specific recommended speculative decoding defaults unless explicitly passed on CLI
+            if (!spec_explicit && selected.architecture == "deepseek_v41") {
+                enable_spec = false;
+                enable_pld = false;
+                enable_mtp = false;
+            }
         }
     }
 

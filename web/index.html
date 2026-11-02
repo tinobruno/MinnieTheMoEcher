@@ -283,13 +283,13 @@
                     <div class="model-dropdown hidden" id="model-dropdown">
                         <div class="model-dropdown-header">
                             <span class="material-symbols-outlined header-icon">memory</span>
-                            <span>Active Model Profile</span>
+                            <span>Local GPU Engine</span>
                         </div>
-                        <div class="model-item active" id="model-item-card">
+                        <div class="model-item active" id="model-item-card" onclick="selectActiveLlmProvider('local')" style="cursor: pointer;">
                             <div class="model-item-main">
                                 <div class="model-item-title-row">
                                     <span class="model-item-title" id="dropdown-model-name">DeepSeek V4-Flash</span>
-                                    <span class="model-badge-active"><span class="badge-dot"></span>Loaded</span>
+                                    <span class="model-badge-active" id="dropdown-local-badge"><span class="badge-dot"></span>Loaded</span>
                                     <span class="model-badge-vision enabled" id="dropdown-model-vision" title="Multimodal vision capabilities">
                                         <span class="material-symbols-outlined vision-icon">visibility</span>
                                         <span id="dropdown-vision-text">Vision Enabled</span>
@@ -324,7 +324,58 @@
                                     </div>
                                 </div>
                             </div>
-                            <span class="material-symbols-outlined check-icon">check_circle</span>
+                            <span class="material-symbols-outlined check-icon" id="dropdown-local-check">check_circle</span>
+                        </div>
+
+                        <div class="model-dropdown-header" style="margin-top: 8px; border-top: 1px solid rgba(255,255,255,0.07); padding-top: 10px; display: flex; justify-content: space-between; align-items: center;">
+                            <div style="display: flex; align-items: center; gap: 6px;">
+                                <span class="material-symbols-outlined header-icon" style="color: #38bdf8;">cloud_sync</span>
+                                <span>Hybrid Cloud APIs (External Wrapper)</span>
+                            </div>
+                            <button type="button" onclick="event.stopPropagation(); openHybridCloudSettings();" style="background: rgba(56, 189, 248, 0.14); color: #38bdf8; border: 1px solid rgba(56, 189, 248, 0.35); border-radius: 6px; padding: 2px 8px; font-size: 11px; font-weight: 600; cursor: pointer; display: inline-flex; align-items: center; gap: 4px;">
+                                <span class="material-symbols-outlined" style="font-size: 13px;">key</span>API Keys
+                            </button>
+                        </div>
+                        <div id="hybrid-providers-dropdown-list" style="display: flex; flex-direction: column; gap: 6px; margin-top: 4px;">
+                            <div class="model-item" id="dropdown-provider-google" onclick="selectActiveLlmProvider('google')" style="cursor: pointer; padding: 9px 12px;">
+                                <div class="model-item-main">
+                                    <div class="model-item-title-row">
+                                        <span class="model-item-title">Google Gemini</span>
+                                        <span class="meta-tag" id="dropdown-google-key-badge" style="font-size: 10px;">Set API Key</span>
+                                    </div>
+                                    <div class="model-item-meta" style="margin-top: 3px;">
+                                        <span class="meta-tag" id="dropdown-google-model-tag">gemini-3.8-flash</span>
+                                        <span class="meta-tag">Local Tools + 3D + Vision</span>
+                                    </div>
+                                </div>
+                                <span class="material-symbols-outlined check-icon" id="dropdown-google-check" style="display: none;">check_circle</span>
+                            </div>
+                            <div class="model-item" id="dropdown-provider-claude" onclick="selectActiveLlmProvider('claude')" style="cursor: pointer; padding: 9px 12px;">
+                                <div class="model-item-main">
+                                    <div class="model-item-title-row">
+                                        <span class="model-item-title">Anthropic Claude</span>
+                                        <span class="meta-tag" id="dropdown-claude-key-badge" style="font-size: 10px;">Set API Key</span>
+                                    </div>
+                                    <div class="model-item-meta" style="margin-top: 3px;">
+                                        <span class="meta-tag" id="dropdown-claude-model-tag">claude-sonnet-4-20250514</span>
+                                        <span class="meta-tag">Local Tools + 3D + Vision</span>
+                                    </div>
+                                </div>
+                                <span class="material-symbols-outlined check-icon" id="dropdown-claude-check" style="display: none;">check_circle</span>
+                            </div>
+                            <div class="model-item" id="dropdown-provider-openai" onclick="selectActiveLlmProvider('openai')" style="cursor: pointer; padding: 9px 12px;">
+                                <div class="model-item-main">
+                                    <div class="model-item-title-row">
+                                        <span class="model-item-title">OpenAI / Compatible</span>
+                                        <span class="meta-tag" id="dropdown-openai-key-badge" style="font-size: 10px;">Set API Key</span>
+                                    </div>
+                                    <div class="model-item-meta" style="margin-top: 3px;">
+                                        <span class="meta-tag" id="dropdown-openai-model-tag">gpt-4o</span>
+                                        <span class="meta-tag">Local Tools + 3D + Vision</span>
+                                    </div>
+                                </div>
+                                <span class="material-symbols-outlined check-icon" id="dropdown-openai-check" style="display: none;">check_circle</span>
+                            </div>
                         </div>
                     </div>
                 </div>
@@ -920,6 +971,196 @@
                 <!-- Tab 1: General & Inference Settings -->
                 <div class="settings-tab-pane active" id="settings-tab-general">
                     <div class="settings-scroll-area">
+                        <!-- Hybrid Cloud APIs (External Wrapper) Card -->
+                        <div class="agentic-card" id="hybrid-cloud-settings-card" style="border: 1px solid rgba(56, 189, 248, 0.28); margin-bottom: 14px;">
+                            <div class="agentic-card-header">
+                                <span class="material-symbols-outlined agentic-card-icon" style="color: #38bdf8;">cloud_sync</span>
+                                <div class="agentic-card-title-group">
+                                    <h4>Hybrid Cloud APIs (Google, Claude, OpenAI)</h4>
+                                    <p class="agentic-subtitle">Route chat &amp; reasoning to external cloud APIs while keeping Moecher's local tools, 3D Studio, MCP servers, and GPU ZDB</p>
+                                </div>
+                            </div>
+
+                            <div class="setting-item" style="margin-top: 10px;">
+                                <label style="margin-bottom: 6px; display: block;">Active Backend Provider</label>
+                                <div style="display: grid; grid-template-columns: repeat(2, 1fr); gap: 6px;" id="llm-provider-pill-group">
+                                    <button type="button" class="provider-pill-btn active" id="provider-pill-local" onclick="setLlmProviderFormSelection('local')" style="padding: 8px 10px; border-radius: 8px; border: 1px solid rgba(255,255,255,0.14); background: rgba(255,255,255,0.05); color: var(--text-primary); cursor: pointer; font-size: 12px; font-weight: 600; display: flex; align-items: center; gap: 6px;">
+                                        <span class="material-symbols-outlined" style="font-size: 16px; color: #22c55e;">memory</span>
+                                        <span>Local GPU</span>
+                                    </button>
+                                    <button type="button" class="provider-pill-btn" id="provider-pill-google" onclick="setLlmProviderFormSelection('google')" style="padding: 8px 10px; border-radius: 8px; border: 1px solid rgba(255,255,255,0.14); background: rgba(255,255,255,0.05); color: var(--text-primary); cursor: pointer; font-size: 12px; font-weight: 600; display: flex; align-items: center; gap: 6px;">
+                                        <span class="material-symbols-outlined" style="font-size: 16px; color: #38bdf8;">auto_awesome</span>
+                                        <span>Google Gemini</span>
+                                    </button>
+                                    <button type="button" class="provider-pill-btn" id="provider-pill-claude" onclick="setLlmProviderFormSelection('claude')" style="padding: 8px 10px; border-radius: 8px; border: 1px solid rgba(255,255,255,0.14); background: rgba(255,255,255,0.05); color: var(--text-primary); cursor: pointer; font-size: 12px; font-weight: 600; display: flex; align-items: center; gap: 6px;">
+                                        <span class="material-symbols-outlined" style="font-size: 16px; color: #f59e0b;">psychology_alt</span>
+                                        <span>Anthropic Claude</span>
+                                    </button>
+                                    <button type="button" class="provider-pill-btn" id="provider-pill-openai" onclick="setLlmProviderFormSelection('openai')" style="padding: 8px 10px; border-radius: 8px; border: 1px solid rgba(255,255,255,0.14); background: rgba(255,255,255,0.05); color: var(--text-primary); cursor: pointer; font-size: 12px; font-weight: 600; display: flex; align-items: center; gap: 6px;">
+                                        <span class="material-symbols-outlined" style="font-size: 16px; color: #a855f7;">bolt</span>
+                                        <span>OpenAI</span>
+                                    </button>
+                                </div>
+                            </div>
+
+                            <!-- Google Gemini Settings Box -->
+                            <div id="provider-config-google" onclick="setLlmProviderFormSelection('google')" onfocusin="setLlmProviderFormSelection('google')" style="margin-top: 10px; padding: 10px; border-radius: 8px; background: rgba(56, 189, 248, 0.06); border: 1px solid rgba(56, 189, 248, 0.2);">
+                                <div style="display: flex; justify-content: space-between; align-items: center; margin-bottom: 8px;">
+                                    <strong style="font-size: 12px; color: #38bdf8;">Google Gemini (AI Studio / Google Ultra OAuth)</strong>
+                                    <span id="gemini-cli-runtime-pill" style="font-size: 10px; padding: 2px 6px; border-radius: 4px; background: rgba(56, 189, 248, 0.14); color: #38bdf8; border: 1px solid rgba(56, 189, 248, 0.3);">Sandboxed</span>
+                                </div>
+
+                                <!-- Auth Mode Toggle -->
+                                <div style="display: grid; grid-template-columns: 1fr 1fr; gap: 6px; margin-bottom: 10px;">
+                                    <button type="button" id="google-auth-mode-apikey" onclick="setGoogleAuthModeUI('api_key')" style="padding: 6px 8px; border-radius: 6px; border: 1px solid #38bdf8; background: rgba(56, 189, 248, 0.18); color: var(--text-primary); font-size: 11px; font-weight: 600; cursor: pointer;">
+                                        🔑 AI Studio API Key
+                                    </button>
+                                    <button type="button" id="google-auth-mode-cli" onclick="setGoogleAuthModeUI('gemini_cli')" style="padding: 6px 8px; border-radius: 6px; border: 1px solid rgba(255,255,255,0.14); background: rgba(255,255,255,0.04); color: var(--text-primary); font-size: 11px; font-weight: 600; cursor: pointer;">
+                                        🌐 Google Ultra OAuth
+                                    </button>
+                                </div>
+
+                                <!-- Sub-panel A: AI Studio API Key -->
+                                <div id="google-auth-panel-apikey" class="setting-item" style="margin-bottom: 8px;">
+                                    <div style="display: flex; justify-content: space-between; align-items: center; margin-bottom: 4px;">
+                                        <label style="font-size: 11px; margin: 0;">Gemini API Key</label>
+                                        <a href="https://aistudio.google.com/app/apikey" target="_blank" rel="noopener" style="font-size: 11px; color: #38bdf8; text-decoration: underline;">Get API Key ↗</a>
+                                    </div>
+                                    <div style="display: flex; gap: 6px;">
+                                        <input type="password" id="gemini-api-key-input" class="text-input" placeholder="AIzaSy... (saved locally in .moecher_config.json)" style="flex: 1; font-family: monospace; font-size: 12px;">
+                                        <button type="button" onclick="toggleSecretInput('gemini-api-key-input')" class="secondary-btn" style="padding: 4px 8px; font-size: 11px;" title="Show/Hide Key">👁</button>
+                                    </div>
+                                </div>
+
+                                <!-- Sub-panel B: Google Ultra OAuth (Sandboxed gemini-cli) -->
+                                <div id="google-auth-panel-cli" style="display: none; margin-bottom: 10px; padding: 8px; border-radius: 6px; background: rgba(15, 23, 42, 0.45); border: 1px solid rgba(56, 189, 248, 0.25);">
+                                    <div style="display: flex; justify-content: space-between; align-items: center; gap: 8px; flex-wrap: wrap;">
+                                        <div style="display: flex; align-items: center; gap: 6px;">
+                                            <span id="gemini-cli-auth-badge" style="font-size: 11px; font-weight: 600; padding: 2px 8px; border-radius: 999px; background: rgba(245, 158, 11, 0.16); color: #fbbf24; border: 1px solid rgba(245, 158, 11, 0.35);">Not signed in</span>
+                                        </div>
+                                        <div style="display: flex; gap: 6px;">
+                                            <button type="button" id="gemini-cli-login-btn" onclick="startGeminiCliOAuthLoginUI()" style="background: linear-gradient(135deg, #0284c7, #2563eb); color: #fff; border: 1px solid rgba(56, 189, 248, 0.5); border-radius: 6px; padding: 5px 10px; font-size: 11px; font-weight: 600; cursor: pointer;">
+                                                ⚡ Sign in with Google Ultra
+                                            </button>
+                                            <button type="button" id="gemini-cli-logout-btn" onclick="logoutGeminiCliOAuthUI()" style="display: none; background: rgba(239, 68, 68, 0.15); color: #f87171; border: 1px solid rgba(239, 68, 68, 0.35); border-radius: 6px; padding: 5px 8px; font-size: 11px; font-weight: 600; cursor: pointer;">
+                                                Sign Out
+                                            </button>
+                                        </div>
+                                    </div>
+                                    <div id="gemini-cli-auth-url-box" style="display: none; margin-top: 8px; padding: 6px 8px; border-radius: 5px; background: rgba(56, 189, 248, 0.1); border: 1px dashed rgba(56, 189, 248, 0.4); font-size: 11px; color: var(--text-secondary);">
+                                        🌐 Waiting for Google Sign-In in your browser...
+                                        <a id="gemini-cli-auth-url-link" href="#" target="_blank" rel="noopener" style="color: #38bdf8; font-weight: 600; text-decoration: underline; margin-left: 4px;">Open Sign-In Page ↗</a>
+                                    </div>
+                                    <div style="margin-top: 6px; font-size: 10.5px; color: var(--text-secondary); line-height: 1.35;">
+                                        Uses official standalone <code>agy.exe</code> in <code>.moecher_runtime/agy/</code> (unlocks Google AI Ultra <code>gemini-3.8-flash</code> &amp; <code>gemini-4-argon</code> in ~1.6s with zero system dependencies).
+                                    </div>
+                                </div>
+
+                                <div class="setting-item" style="margin-bottom: 8px;">
+                                    <label style="font-size: 11px;">Gemini / Google Ultra Model ID</label>
+                                    <div style="display: flex; gap: 6px;">
+                                        <select id="gemini-model-preset" class="select-input" onchange="if(this.value) document.getElementById('gemini-model-input').value = this.value;" style="width: 48%; font-size: 12px;">
+                                            <option value="gemini-3.8-flash">gemini-3.8-flash (Latest Fast + Thinking)</option>
+                                            <option value="gemini-3.8-flash-low">gemini-3.8-flash-low (Ultra Instant ~1.6s)</option>
+                                            <option value="gemini-3.8-flash-high">gemini-3.8-flash-high (Ultra Deep Thinking)</option>
+                                            <option value="gemini-4-argon-high">gemini-4-argon-high (Gemini 4 Argon High)</option>
+                                            <option value="gemini-4-argon-medium">gemini-4-argon-medium (Gemini 4 Argon Medium)</option>
+                                            <option value="claude-opus-5-5-high">claude-opus-5-5-high (Claude Opus 5.5 via Ultra)</option>
+                                            <option value="claude-sonnet-5-5-high">claude-sonnet-5-5-high (Claude Sonnet 5.5 via Ultra)</option>
+                                            <option value="gemini-2.5-pro">gemini-2.5-pro (AI Studio Pro)</option>
+                                            <option value="">Custom Model ID...</option>
+                                        </select>
+                                        <input type="text" id="gemini-model-input" class="text-input" value="gemini-3.8-flash" placeholder="gemini-3.8-flash" style="flex: 1; font-family: monospace; font-size: 12px;">
+                                    </div>
+                                </div>
+                                <div style="display: flex; justify-content: flex-end; gap: 6px;">
+                                    <button type="button" onclick="testLlmProviderConnectionUI('google')" style="background: rgba(56, 189, 248, 0.15); color: #38bdf8; border: 1px solid rgba(56, 189, 248, 0.4); border-radius: 6px; padding: 5px 10px; font-size: 11px; font-weight: 600; cursor: pointer;">Test Google Connection</button>
+                                </div>
+                            </div>
+
+                            <!-- Anthropic Claude Settings Box -->
+                            <div id="provider-config-claude" onclick="setLlmProviderFormSelection('claude')" onfocusin="setLlmProviderFormSelection('claude')" style="margin-top: 10px; padding: 10px; border-radius: 8px; background: rgba(245, 158, 11, 0.06); border: 1px solid rgba(245, 158, 11, 0.2);">
+                                <div style="display: flex; justify-content: space-between; align-items: center; margin-bottom: 6px;">
+                                    <strong style="font-size: 12px; color: #f59e0b;">Anthropic Claude API</strong>
+                                    <a href="https://console.anthropic.com/settings/keys" target="_blank" rel="noopener" style="font-size: 11px; color: #f59e0b; text-decoration: underline;">Get API Key ↗</a>
+                                </div>
+                                <div class="setting-item" style="margin-bottom: 8px;">
+                                    <label style="font-size: 11px;">Claude API Key</label>
+                                    <div style="display: flex; gap: 6px;">
+                                        <input type="password" id="claude-api-key-input" class="text-input" placeholder="sk-ant-api03-..." style="flex: 1; font-family: monospace; font-size: 12px;">
+                                        <button type="button" onclick="toggleSecretInput('claude-api-key-input')" class="secondary-btn" style="padding: 4px 8px; font-size: 11px;" title="Show/Hide Key">👁</button>
+                                    </div>
+                                </div>
+                                <div class="setting-item" style="margin-bottom: 8px;">
+                                    <label style="font-size: 11px;">Claude Model ID</label>
+                                    <div style="display: flex; gap: 6px;">
+                                        <select id="claude-model-preset" class="select-input" onchange="if(this.value) document.getElementById('claude-model-input').value = this.value;" style="width: 48%; font-size: 12px;">
+                                            <option value="claude-sonnet-4-20250514">claude-sonnet-4-20250514</option>
+                                            <option value="claude-opus-4-20250514">claude-opus-4-20250514</option>
+                                            <option value="claude-3-7-sonnet-latest">claude-3-7-sonnet-latest</option>
+                                            <option value="claude-3-5-haiku-latest">claude-3-5-haiku-latest</option>
+                                            <option value="">Custom Model ID...</option>
+                                        </select>
+                                        <input type="text" id="claude-model-input" class="text-input" value="claude-sonnet-4-20250514" placeholder="claude-sonnet-4-20250514" style="flex: 1; font-family: monospace; font-size: 12px;">
+                                    </div>
+                                </div>
+                                <div style="display: flex; justify-content: flex-end; gap: 6px;">
+                                    <button type="button" onclick="testLlmProviderConnectionUI('claude')" style="background: rgba(245, 158, 11, 0.15); color: #f59e0b; border: 1px solid rgba(245, 158, 11, 0.4); border-radius: 6px; padding: 5px 10px; font-size: 11px; font-weight: 600; cursor: pointer;">Test Claude Connection</button>
+                                </div>
+                            </div>
+
+                            <!-- OpenAI Settings Box -->
+                            <div id="provider-config-openai" onclick="setLlmProviderFormSelection('openai')" onfocusin="setLlmProviderFormSelection('openai')" style="margin-top: 10px; padding: 10px; border-radius: 8px; background: rgba(168, 85, 247, 0.06); border: 1px solid rgba(168, 85, 247, 0.2);">
+                                <div style="display: flex; justify-content: space-between; align-items: center; margin-bottom: 6px;">
+                                    <strong style="font-size: 12px; color: #a855f7;">OpenAI / OpenAI-Compatible API</strong>
+                                    <a href="https://platform.openai.com/api-keys" target="_blank" rel="noopener" style="font-size: 11px; color: #a855f7; text-decoration: underline;">Get API Key ↗</a>
+                                </div>
+                                <div class="setting-item" style="margin-bottom: 8px;">
+                                    <label style="font-size: 11px;">OpenAI API Key</label>
+                                    <div style="display: flex; gap: 6px;">
+                                        <input type="password" id="openai-api-key-input" class="text-input" placeholder="sk-proj-..." style="flex: 1; font-family: monospace; font-size: 12px;">
+                                        <button type="button" onclick="toggleSecretInput('openai-api-key-input')" class="secondary-btn" style="padding: 4px 8px; font-size: 11px;" title="Show/Hide Key">👁</button>
+                                    </div>
+                                </div>
+                                <div class="setting-item" style="margin-bottom: 8px;">
+                                    <label style="font-size: 11px;">OpenAI Model ID</label>
+                                    <div style="display: flex; gap: 6px;">
+                                        <select id="openai-model-preset" class="select-input" onchange="if(this.value) document.getElementById('openai-model-input').value = this.value;" style="width: 48%; font-size: 12px;">
+                                            <option value="gpt-4o">gpt-4o</option>
+                                            <option value="gpt-4.1">gpt-4.1</option>
+                                            <option value="o3-mini">o3-mini</option>
+                                            <option value="gpt-4o-mini">gpt-4o-mini</option>
+                                            <option value="">Custom Model ID...</option>
+                                        </select>
+                                        <input type="text" id="openai-model-input" class="text-input" value="gpt-4o" placeholder="gpt-4o" style="flex: 1; font-family: monospace; font-size: 12px;">
+                                    </div>
+                                </div>
+                                <div class="setting-item" style="margin-bottom: 8px;">
+                                    <label style="font-size: 11px;">Base URL (OpenAI / OpenRouter / Groq / DeepSeek)</label>
+                                    <input type="text" id="openai-base-url-input" class="text-input" value="https://api.openai.com/v1" placeholder="https://api.openai.com/v1" style="font-family: monospace; font-size: 12px;">
+                                </div>
+                                <div style="display: flex; justify-content: flex-end; gap: 6px;">
+                                    <button type="button" onclick="testLlmProviderConnectionUI('openai')" style="background: rgba(168, 85, 247, 0.15); color: #a855f7; border: 1px solid rgba(168, 85, 247, 0.4); border-radius: 6px; padding: 5px 10px; font-size: 11px; font-weight: 600; cursor: pointer;">Test OpenAI Connection</button>
+                                </div>
+                            </div>
+
+                            <div class="setting-item" style="margin-top: 10px;">
+                                <label class="checkbox-label" title="Keep local GPU Zero Decode Bypass (ZDB) active for instant System 1 classification, escalating to the Cloud API on fallback">
+                                    <input type="checkbox" id="hybrid-local-zdb-enabled" checked>
+                                    Hybrid Local ZDB (System 1 on Local GPU → System 2 Cloud API)
+                                </label>
+                            </div>
+
+                            <div id="llm-provider-status-msg" style="display: none; margin-top: 8px; padding: 8px 10px; border-radius: 6px; font-size: 11.5px; line-height: 1.4;"></div>
+
+                            <div style="margin-top: 10px; display: flex; justify-content: flex-end; gap: 8px;">
+                                <button type="button" onclick="saveLlmProviderSettingsUI()" style="background: linear-gradient(135deg, #0284c7, #2563eb); color: #fff; border: none; border-radius: 7px; padding: 7px 14px; font-size: 12px; font-weight: 600; cursor: pointer; display: inline-flex; align-items: center; gap: 6px;">
+                                    <span class="material-symbols-outlined" style="font-size: 16px;">save</span>
+                                    Save &amp; Activate Provider
+                                </button>
+                            </div>
+                        </div>
+
                         <!-- Inference & Model Parameters Card -->
                         <div class="agentic-card">
                             <div class="agentic-card-header">
