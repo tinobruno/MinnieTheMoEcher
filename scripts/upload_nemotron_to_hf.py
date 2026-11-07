@@ -8,6 +8,7 @@ Usage:
 
 import os
 import sys
+import time
 import argparse
 from pathlib import Path
 from huggingface_hub import HfApi
@@ -36,64 +37,81 @@ def format_size(bytes_val: int) -> str:
 def upload(repo_id: str, model_dir: Path, token: str = None, private: bool = False):
     api = HfApi(token=token)
     
-    print("=================================================================")
-    print(f"  Target Hugging Face Repo: {repo_id}")
-    print(f"  Source Model Directory:   {model_dir}")
-    print("=================================================================\n")
+    print("=================================================================", flush=True)
+    print(f"  Target Hugging Face Repo: {repo_id}", flush=True)
+    print(f"  Source Model Directory:   {model_dir}", flush=True)
+    print("=================================================================\n", flush=True)
 
-    print("[1/4] Checking Hugging Face authentication...")
+    print("[1/4] Checking Hugging Face authentication...", flush=True)
     try:
         user_info = api.whoami()
-        print(f"  Authenticated as: {user_info.get('name')} ({user_info.get('fullname', '')})")
+        print(f"  Authenticated as: {user_info.get('name')} ({user_info.get('fullname', '')})", flush=True)
     except Exception as e:
-        print(f"\n[ERROR] Authentication failed: {e}")
-        print("\nPlease supply a valid Hugging Face write token:")
-        print("  - Command line: python scripts/upload_nemotron_to_hf.py --token <hf_token>")
-        print("  - Or environment variable: set HF_TOKEN=<hf_token>")
-        print("  - Or run: huggingface-cli login")
+        print(f"\n[ERROR] Authentication failed: {e}", flush=True)
+        print("\nPlease supply a valid Hugging Face write token:", flush=True)
+        print("  - Command line: python scripts/upload_nemotron_to_hf.py --token <hf_token>", flush=True)
+        print("  - Or environment variable: set HF_TOKEN=<hf_token>", flush=True)
+        print("  - Or run: huggingface-cli login", flush=True)
         return False
 
-    print(f"\n[2/4] Verifying local files in {model_dir}...")
+    print(f"\n[2/4] Verifying local files in {model_dir}...", flush=True)
     total_bytes = 0
     for filename in FILES_TO_UPLOAD:
         local_path = model_dir / filename
         if not local_path.exists():
-            print(f"  [ERROR] Required file not found: {local_path}")
+            print(f"  [ERROR] Required file not found: {local_path}", flush=True)
             return False
         sz = local_path.stat().st_size
         total_bytes += sz
-        print(f"  - {filename:<28} ({format_size(sz)})")
-    print(f"  Total package payload: {format_size(total_bytes)}")
+        print(f"  - {filename:<28} ({format_size(sz)})", flush=True)
+    print(f"  Total package payload: {format_size(total_bytes)}", flush=True)
 
-    print(f"\n[3/4] Ensuring repository exists: {repo_id}...")
+    print(f"\n[3/4] Ensuring repository exists: {repo_id}...", flush=True)
     try:
         api.create_repo(repo_id=repo_id, repo_type="model", private=private, exist_ok=True)
-        print(f"  Repository ready: https://huggingface.co/{repo_id}")
+        print(f"  Repository ready: https://huggingface.co/{repo_id}", flush=True)
     except Exception as e:
-        print(f"  [WARN] create_repo warning/error: {e}")
+        print(f"  [WARN] create_repo warning/error: {e}", flush=True)
 
-    print(f"\n[4/4] Uploading files to {repo_id}...")
+    try:
+        existing_files = set(api.list_repo_files(repo_id=repo_id))
+    except Exception:
+        existing_files = set()
+
+    print(f"\n[4/4] Uploading files to {repo_id}...", flush=True)
     for idx, filename in enumerate(FILES_TO_UPLOAD, 1):
         local_path = model_dir / filename
         sz = local_path.stat().st_size
-        print(f"  [{idx}/{len(FILES_TO_UPLOAD)}] Uploading {filename} ({format_size(sz)})...")
-        try:
-            api.upload_file(
-                path_or_fileobj=str(local_path),
-                path_in_repo=filename,
-                repo_id=repo_id,
-                repo_type="model",
-                commit_message=f"Upload {filename} for {repo_id}"
-            )
-            print(f"      -> Successfully uploaded {filename}")
-        except Exception as e:
-            print(f"      [ERROR] Failed to upload {filename}: {e}")
-            return False
+        if filename in existing_files and filename != "README.md":
+            print(f"  [{idx}/{len(FILES_TO_UPLOAD)}] [SKIP] {filename} already present on Hugging Face.", flush=True)
+            continue
+        print(f"  [{idx}/{len(FILES_TO_UPLOAD)}] Uploading {filename} ({format_size(sz)})...", flush=True)
+        max_retries = 5
+        for attempt in range(1, max_retries + 1):
+            try:
+                t0 = time.time()
+                api.upload_file(
+                    path_or_fileobj=str(local_path),
+                    path_in_repo=filename,
+                    repo_id=repo_id,
+                    repo_type="model",
+                    commit_message=f"Upload {filename} for {repo_id}"
+                )
+                elapsed = time.time() - t0
+                speed_mb = (sz / (1024 * 1024)) / (elapsed if elapsed > 0 else 1)
+                print(f"      -> Successfully uploaded {filename} in {elapsed:.1f}s ({speed_mb:.1f} MB/s)", flush=True)
+                break
+            except Exception as e:
+                print(f"      [WARN] Attempt {attempt}/{max_retries} failed for {filename}: {e}", flush=True)
+                if attempt == max_retries:
+                    print(f"      [ERROR] Failed to upload {filename}: {e}", flush=True)
+                    return False
+                time.sleep(min(30, 2 ** attempt))
 
-    print("\n=================================================================")
-    print("  ALL NEMOTRON PACKAGE FILES UPLOADED SUCCESSFULLY!")
-    print(f"  Model URL: https://huggingface.co/{repo_id}")
-    print("=================================================================\n")
+    print("\n=================================================================", flush=True)
+    print("  ALL NEMOTRON PACKAGE FILES UPLOADED SUCCESSFULLY!", flush=True)
+    print(f"  Model URL: https://huggingface.co/{repo_id}", flush=True)
+    print("=================================================================\n", flush=True)
     return True
 
 def main():
