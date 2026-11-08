@@ -3240,9 +3240,13 @@ async function fetchBackendSystemPrompt() {
             setOperationalMode(localMode, true);
         }
         const savedInstanceId = localStorage.getItem('moecher_server_instance_id');
-        const isNewServerInstance = data && data.server_instance_id && ((lastServerInstanceId && lastServerInstanceId !== data.server_instance_id) || (savedInstanceId !== data.server_instance_id));
+        const savedModelId = localStorage.getItem('moecher_active_model_id');
+        const isNewServerInstance = data && ((data.server_instance_id && ((lastServerInstanceId && lastServerInstanceId !== data.server_instance_id) || (savedInstanceId !== data.server_instance_id))) || (data.model_id && savedModelId !== data.model_id));
         if (data && data.server_instance_id) {
             try { localStorage.setItem('moecher_server_instance_id', String(data.server_instance_id)); } catch(e) {}
+        }
+        if (data && data.model_id) {
+            try { localStorage.setItem('moecher_active_model_id', String(data.model_id)); } catch(e) {}
         }
         const savedTemp = localStorage.getItem('moecher_temperature');
         if (data && data.temperature !== undefined && tempSlider && (!savedTemp || isNewServerInstance)) {
@@ -3262,11 +3266,35 @@ async function fetchBackendSystemPrompt() {
             repPenaltySlider.value = data.repetition_penalty;
             if (repPenaltyVal) repPenaltyVal.textContent = parseFloat(data.repetition_penalty).toFixed(2);
         }
+        const savedEffort = localStorage.getItem('moecher_reasoning_effort');
+        if (data && data.reasoning_effort !== undefined && reasoningEffort && (!savedEffort || isNewServerInstance)) {
+            reasoningEffort.value = data.reasoning_effort;
+            try { localStorage.setItem('moecher_reasoning_effort', String(data.reasoning_effort)); } catch(e) {}
+        }
+        const savedBudget = localStorage.getItem('moecher_thinking_budget');
+        if (data && data.thinking_budget !== undefined && thinkingBudget && (!savedBudget || isNewServerInstance)) {
+            thinkingBudget.value = data.thinking_budget;
+            try { localStorage.setItem('moecher_thinking_budget', String(data.thinking_budget)); } catch(e) {}
+        }
+        const savedThinking = localStorage.getItem('moecher_thinking_enabled');
+        if (data && data.thinking_enabled !== undefined && thinkingEnabled && (savedThinking === null || isNewServerInstance)) {
+            thinkingEnabled.checked = !!data.thinking_enabled;
+            try { localStorage.setItem('moecher_thinking_enabled', String(!!data.thinking_enabled)); } catch(e) {}
+        }
         const savedAntiLoop = localStorage.getItem('moecher_anti_loop_enabled');
         const savedCpuExp = localStorage.getItem('moecher_cpu_experts_enabled');
-        if (data && data.cpu_experts !== undefined && cpuExpertsEnabled && (savedCpuExp === null || isNewServerInstance)) {
-            cpuExpertsEnabled.checked = !!data.cpu_experts;
-            try { localStorage.setItem('moecher_cpu_experts_enabled', String(!!data.cpu_experts)); } catch(e) {}
+        if (data && cpuExpertsEnabled) {
+            if (data.supports_cpu_experts === false) {
+                cpuExpertsEnabled.checked = false;
+                cpuExpertsEnabled.disabled = true;
+                try { localStorage.setItem('moecher_cpu_experts_enabled', 'false'); } catch(e) {}
+            } else {
+                cpuExpertsEnabled.disabled = false;
+                if (data.cpu_experts !== undefined && (savedCpuExp === null || isNewServerInstance)) {
+                    cpuExpertsEnabled.checked = !!data.cpu_experts;
+                    try { localStorage.setItem('moecher_cpu_experts_enabled', String(!!data.cpu_experts)); } catch(e) {}
+                }
+            }
         }
         if (data && data.anti_loop !== undefined && antiLoopEnabled && (savedAntiLoop === null || isNewServerInstance)) {
             antiLoopEnabled.checked = !!data.anti_loop;

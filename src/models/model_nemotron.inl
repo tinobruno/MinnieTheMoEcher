@@ -1,12 +1,14 @@
-    // ── Standard sampling defaults for Nemotron models ──────────────────────
+    // ── Official NVIDIA recommended defaults for Nemotron 3.5 / Bolt models ──
     void apply_sampling_defaults_nemotron() {
+        if (cfg_.bos_token_id == 0) cfg_.bos_token_id = 1;   // <s>
+        if (cfg_.eos_token_id == 1) cfg_.eos_token_id = 11;  // <|im_end|> (with </s>=2 as eos2_id)
         if (cfg_.default_temperature < 0.0f) cfg_.default_temperature = 0.60f;
         if (cfg_.default_top_p < 0.0f) cfg_.default_top_p = 0.95f;
-        if (cfg_.default_top_k < 0) cfg_.default_top_k = 1024;
-        if (cfg_.default_min_p < 0.0f) cfg_.default_min_p = 0.00f;
-        if (cfg_.default_repetition_penalty < 0.0f) cfg_.default_repetition_penalty = 1.05f;
-        if (cfg_.default_reasoning_effort.empty()) cfg_.default_reasoning_effort = "high";
-        if (cfg_.default_thinking_budget < 0) cfg_.default_thinking_budget = 4096;
+        if (cfg_.default_top_k < 0) cfg_.default_top_k = 64;
+        if (cfg_.default_min_p < 0.0f) cfg_.default_min_p = 0.02f;
+        if (cfg_.default_repetition_penalty < 0.0f) cfg_.default_repetition_penalty = 1.00f;
+        if (cfg_.default_reasoning_effort.empty()) cfg_.default_reasoning_effort = "medium";
+        if (cfg_.default_thinking_budget < 0) cfg_.default_thinking_budget = 2048;
     }
 
     // ── Forward one layer (Nemotron 3.5 Lightning Hybrid Mamba-2 SSM + MoE) ─
@@ -1467,18 +1469,22 @@
                  remaining_tokens, ms, tok_per_sec, (unsigned long long)expert_loader_.cold_disk_reads_.load());
     }
 
-    // ── Nemotron-3.5 Protocol, Parameters & Chat Templating ───────────────────
+    // ── Nemotron-3.5 Protocol, Parameters & Chat Templating (NVIDIA Official) ─
 
     std::string get_default_system_prompt_nemotron() const {
-        return "You are a helpful, respectful and honest assistant.";
+        return "You are a helpful assistant.";
     }
 
     nlohmann::json get_recommended_sampling_nemotron() const {
         return {
             {"temperature", 0.6f},
-            {"repetition_penalty", 1.05f},
+            {"top_p", 0.95f},
+            {"top_k", 64},
+            {"min_p", 0.02f},
+            {"repetition_penalty", 1.00f},
             {"reasoning_effort", "medium"},
             {"thinking_budget", 2048},
+            {"thinking_enabled", true},
             {"anti_loop", false}
         };
     }
@@ -1490,14 +1496,22 @@
         const nlohmann::json& tools = nlohmann::json(),
         bool model_has_vision = false) const
     {
+        (void)model_has_vision;
         MultimodalPrompt out;
         std::vector<int> result;
 
         int IM_START = tokenizer_.get_token_id("<|im_start|>");
-        if (IM_START < 0) IM_START = 151644;
+        if (IM_START < 0) IM_START = 10;
 
         int IM_END = tokenizer_.get_token_id("<|im_end|>");
-        if (IM_END < 0) IM_END = 151645;
+        if (IM_END < 0) IM_END = 11;
+
+        auto trim_str = [](const std::string& s) -> std::string {
+            size_t a = s.find_first_not_of(" \t\r\n");
+            if (a == std::string::npos) return "";
+            size_t b = s.find_last_not_of(" \t\r\n");
+            return s.substr(a, b - a + 1);
+        };
 
         bool has_system = (!messages.empty() && messages[0].value("role", "") == "system");
         std::string sys_content = "";
@@ -1505,26 +1519,61 @@
             sys_content = get_message_content_string(messages[0]);
         }
 
-        // Tools schema
+        // Format tools using NVIDIA's official XML <tools><function>...</function></tools> template
         std::string tools_prompt = "";
-        if (!tools.is_null() && !tools.empty()) {
-            tools_prompt = "\n# Tools\nYou have access to the following tools:\n" + tools.dump() + "\n";
+        if (!tools.is_null() && tools.is_array() && !tools.empty()) {
+            tools_prompt = "# Tools\n\nYou have access to the following functions:\n\n<tools>";
+            for (const auto& t_item : tools) {
+                const nlohmann::json& fn = (t_item.is_object() && t_item.contains("function")) ? t_item["function"] : t_item;
+                if (!fn.is_object()) continue;
+                std::string fn_name = fn.value("name", "");
+                if (fn_name.empty()) continue;
+                tools_prompt += "\n<function>\n<name>" + fn_name + "</name>";
+                if (fn.contains("description") && fn["description"].is_string()) {
+                    tools_prompt += "\n<description>" + trim_str(fn["description"].get<std::string>()) + "</description>";
+                }
+                tools_prompt += "\n<parameters>";
+                if (fn.contains("parameters") && fn["parameters"].is_object()) {
+                    const auto& params = fn["parameters"];
+                    if (params.contains("properties") && params["properties"].is_object()) {
+                        for (auto it = params["properties"].begin(); it != params["properties"].end(); ++it) {
+                            tools_prompt += "\n<parameter>\n<name>" + it.key() + "</name>";
+                            if (it.value().is_object()) {
+                                if (it.value().contains("type") && it.value()["type"].is_string()) {
+                                    tools_prompt += "\n<type>" + it.value()["type"].get<std::string>() + "</type>";
+                                }
+                                if (it.value().contains("description") && it.value()["description"].is_string()) {
+                                    tools_prompt += "\n<description>" + trim_str(it.value()["description"].get<std::string>()) + "</description>";
+                                }
+                                if (it.value().contains("enum")) {
+                                    tools_prompt += "\n<enum>" + it.value()["enum"].dump() + "</enum>";
+                                }
+                            }
+                            tools_prompt += "\n</parameter>";
+                        }
+                    }
+                    if (params.contains("required") && params["required"].is_array()) {
+                        tools_prompt += "\n<required>" + params["required"].dump() + "</required>";
+                    }
+                }
+                tools_prompt += "\n</parameters>\n</function>";
+            }
+            tools_prompt += "\n</tools>\n\nIf you choose to call a function ONLY reply in the following format with NO suffix:\n\n<tool_call>\n<function=example_function_name>\n<parameter=example_parameter_1>\nvalue_1\n</parameter>\n<parameter=example_parameter_2>\nThis is the value for the second parameter\nthat can span\nmultiple lines\n</parameter>\n</function>\n</tool_call>\n\n<IMPORTANT>\nReminder:\n- Function calls MUST follow the specified format: an inner <function=...></function> block must be nested within <tool_call></tool_call> XML tags\n- Required parameters MUST be specified\n- You may provide optional reasoning for your function call in natural language BEFORE the function call, but NOT after\n- If there is no function call available, answer the question like normal with your current knowledge and do not tell the user about function calls\n</IMPORTANT>";
         }
 
+        // Per official chat_template.jinja (lines 85-140), always emit <|im_start|>system...<|im_end|>
         std::string full_sys = sys_content;
         if (!tools_prompt.empty()) {
-            if (full_sys.empty()) full_sys = "You are a helpful assistant.";
+            if (!full_sys.empty()) full_sys += "\n\n";
             full_sys += tools_prompt;
         }
 
-        if (!full_sys.empty()) {
-            result.push_back(IM_START);
-            auto sys_role = tokenizer_.encode("system\n" + full_sys);
-            result.insert(result.end(), sys_role.begin(), sys_role.end());
-            result.push_back(IM_END);
-            auto nl_enc = tokenizer_.encode("\n");
-            result.insert(result.end(), nl_enc.begin(), nl_enc.end());
-        }
+        result.push_back(IM_START);
+        auto sys_role = tokenizer_.encode("system\n" + full_sys);
+        result.insert(result.end(), sys_role.begin(), sys_role.end());
+        result.push_back(IM_END);
+        auto nl_enc = tokenizer_.encode("\n");
+        result.insert(result.end(), nl_enc.begin(), nl_enc.end());
 
         int last_user_idx = -1;
         for (int i = 0; i < (int)messages.size(); i++) {
@@ -1540,10 +1589,9 @@
 
             if (role == "tool" || role == "function") {
                 result.push_back(IM_START);
-                auto user_role = tokenizer_.encode("user\n<tool_response>\n" + content + "\n</tool_response>");
+                auto user_role = tokenizer_.encode("user\n<tool_response>\n" + content + "\n</tool_response>\n");
                 result.insert(result.end(), user_role.begin(), user_role.end());
                 result.push_back(IM_END);
-                auto nl_enc = tokenizer_.encode("\n");
                 result.insert(result.end(), nl_enc.begin(), nl_enc.end());
                 continue;
             }
@@ -1560,14 +1608,31 @@
             }
 
             if (role == "assistant") {
-                if (messages[i].contains("reasoning_content") && messages[i]["reasoning_content"].is_string()) {
-                    std::string r_content = messages[i]["reasoning_content"].get<std::string>();
-                    if (!r_content.empty()) {
-                        body = "<think>\n" + r_content + "\n</think>\n" + body;
+                // Per official chat_template.jinja (truncate_history_thinking = True by default):
+                // For prior assistant turns before last_user_idx, strip reasoning_content / <think> blocks
+                // and prepend <think></think> to prevent old thoughts from polluting Mamba-2 SSM state.
+                bool is_historical_turn = (last_user_idx >= 0 && (int)i < last_user_idx);
+                if (is_historical_turn) {
+                    size_t th_end = body.find("</think>");
+                    if (th_end != std::string::npos) {
+                        body = body.substr(th_end + 8);
+                    }
+                    body = trim_str(body);
+                    if (!body.empty()) {
+                        body = "<think></think>" + body;
                     }
                 } else {
-                    if (body.find("<think>") == std::string::npos && body.find("</think>") == std::string::npos) {
-                        body = "<think></think>" + body;
+                    if (messages[i].contains("reasoning_content") && messages[i]["reasoning_content"].is_string()) {
+                        std::string r_content = trim_str(messages[i]["reasoning_content"].get<std::string>());
+                        if (!r_content.empty()) {
+                            body = "<think>\n" + r_content + "</think>" + trim_str(body);
+                        } else if (body.find("<think>") == std::string::npos && body.find("</think>") == std::string::npos) {
+                            body = "<think></think>" + trim_str(body);
+                        }
+                    } else {
+                        if (body.find("<think>") == std::string::npos && body.find("</think>") == std::string::npos) {
+                            body = "<think></think>" + trim_str(body);
+                        }
                     }
                 }
             }
@@ -1575,7 +1640,6 @@
             auto enc = tokenizer_.encode(body);
             result.insert(result.end(), enc.begin(), enc.end());
             result.push_back(IM_END);
-            auto nl_enc = tokenizer_.encode("\n");
             result.insert(result.end(), nl_enc.begin(), nl_enc.end());
         }
 

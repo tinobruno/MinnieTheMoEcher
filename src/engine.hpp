@@ -1272,6 +1272,10 @@ public:
 
         // Parse config
         cfg_.from_json(manifest["model_config"]);
+        if (!cfg_.is_qwen4_exp()) {
+            enable_cpu_experts_ = false;
+            default_enable_cpu_experts_ = false;
+        }
         if (cfg_.is_deepseek_v41()) apply_sampling_defaults_deepseek_v41();
         else if (cfg_.is_deepseek()) apply_sampling_defaults_deepseek();
         else if (cfg_.is_nemotron()) apply_sampling_defaults_nemotron();
@@ -3313,6 +3317,7 @@ public:
         int eos2_id = tokenizer_.get_token_id("<|end_of_sentence|>");
         if (eos2_id < 0) eos2_id = tokenizer_.get_token_id("<｜end of sentence｜>");
         if (eos2_id < 0) eos2_id = tokenizer_.get_token_id("<｜end\xe2\x96\x81of\xe2\x96\x81sentence｜>");
+        if (eos2_id < 0) eos2_id = tokenizer_.get_token_id("</s>");
         int im_end_id = tokenizer_.get_token_id("<|im_end|>");
         if (im_end_id >= 0 && eos2_id < 0) eos2_id = im_end_id;
 
@@ -3323,25 +3328,6 @@ public:
 
         LOG_WARN("Think tokens: start=%d end=%d, EOS=%d eos2=%d user=%d asst=%d, think_budget=%d",
                  think_start_id, think_end_id, cfg_.eos_token_id, eos2_id, user_id, asst_id, max_thinking_tokens);
-
-        // Refusal opening tokens to suppress at the start of content generation
-        std::vector<int> refusal_start_tokens;
-        auto add_refusal_phrase = [&](const std::string& phrase) {
-            auto enc = tokenizer_.encode(phrase);
-            if (!enc.empty()) refusal_start_tokens.push_back(enc[0]);
-            auto enc_sp = tokenizer_.encode(" " + phrase);
-            if (!enc_sp.empty()) refusal_start_tokens.push_back(enc_sp[0]);
-        };
-        add_refusal_phrase("I'm sorry");
-        add_refusal_phrase("I cannot");
-        add_refusal_phrase("I can't");
-        add_refusal_phrase("Sorry");
-        add_refusal_phrase("Unfortunately");
-        add_refusal_phrase("As an AI");
-        add_refusal_phrase("I am unable");
-        add_refusal_phrase("I apologize");
-        std::sort(refusal_start_tokens.begin(), refusal_start_tokens.end());
-        refusal_start_tokens.erase(std::unique(refusal_start_tokens.begin(), refusal_start_tokens.end()), refusal_start_tokens.end());
 
         // Track whether we are inside a <think> block
         // DeepSeek V3/V4 and Nemotron thinking mode: the chat template appends <think> to the prompt,
@@ -3358,8 +3344,7 @@ public:
 
         // Set per-request repetition penalty (only apply default if unset / <= 0.0f)
         if (repetition_penalty <= 0.0f) {
-            repetition_penalty = cfg_.default_repetition_penalty > 0.0f ? cfg_.default_repetition_penalty :
-                                 (cfg_.is_nemotron() ? 1.05f : 1.0f);
+            repetition_penalty = cfg_.default_repetition_penalty > 0.0f ? cfg_.default_repetition_penalty : 1.0f;
         }
         current_rep_penalty_ = repetition_penalty;
 
@@ -3450,7 +3435,7 @@ public:
             }
 
             std::string token_text = tokenizer_.decode({next_token});
-            int min_thinking_tokens = cfg_.is_nemotron() ? std::min(48, max_thinking_tokens > 0 ? max_thinking_tokens : 48) : 1;
+            int min_thinking_tokens = 1;
             if (in_think_block && thinking_tokens_generated >= min_thinking_tokens && (token_text.find("</think>") != std::string::npos || (token_buffer + token_text).find("</think>") != std::string::npos)) {
                 in_think_block = false;
                 think_block_ended = true;
@@ -3563,7 +3548,7 @@ public:
             if (on_token) {
                 on_token("", false); // Signal end of reasoning to stream consumer
             }
-            if (!cfg_.is_deepseek_v41()) {
+            if (!cfg_.is_deepseek_v41() && !cfg_.is_nemotron()) {
                 std::vector<int> transition_tokens = tokenizer_.encode("\n\n");
                 for (int tok_id : transition_tokens) {
                     track_current_token_ = false; // Synthetic transition tokens not tracked
@@ -3784,14 +3769,14 @@ public:
                     if (im_end_id >= 0) {
                         CUDA_CHECK(cudaMemcpyAsync(buf_logits_.f32() + im_end_id, &neg_inf, sizeof(float), cudaMemcpyHostToDevice, main_stream_));
                     }
-                    int min_thinking_tokens = cfg_.is_nemotron() ? std::min(48, max_thinking_tokens > 0 ? max_thinking_tokens : 48) : 1;
+                    int min_thinking_tokens = 1;
                     if (thinking_tokens_generated < min_thinking_tokens && think_end_id >= 0) {
                         CUDA_CHECK(cudaMemcpyAsync(buf_logits_.f32() + think_end_id, &neg_inf, sizeof(float), cudaMemcpyHostToDevice, main_stream_));
                     }
                     argmax_cache_valid_ = false;
                 }
-                // Suppress refusal and premature stop at the start of content generation
-                if (content_tokens_generated < 16 && think_block_ended && enable_thinking) {
+                // Prevent empty content right after </think> (only at token 0 of content)
+                if (content_tokens_generated == 0 && think_block_ended && enable_thinking) {
                     float neg_inf = -1e9f;
                     if (cfg_.eos_token_id >= 0) {
                         CUDA_CHECK(cudaMemcpyAsync(buf_logits_.f32() + cfg_.eos_token_id, &neg_inf, sizeof(float), cudaMemcpyHostToDevice, main_stream_));
@@ -3801,11 +3786,6 @@ public:
                     }
                     if (im_end_id >= 0) {
                         CUDA_CHECK(cudaMemcpyAsync(buf_logits_.f32() + im_end_id, &neg_inf, sizeof(float), cudaMemcpyHostToDevice, main_stream_));
-                    }
-                    for (int r_tok : refusal_start_tokens) {
-                        if (r_tok >= 0) {
-                            CUDA_CHECK(cudaMemcpyAsync(buf_logits_.f32() + r_tok, &neg_inf, sizeof(float), cudaMemcpyHostToDevice, main_stream_));
-                        }
                     }
                     argmax_cache_valid_ = false;
                 }
@@ -6149,8 +6129,8 @@ public:
             CUDA_CHECK(cudaMalloc(&d_rep_hist, MAX_REP_HIST * sizeof(int32_t)));
         }
         int hist_len = (int)history.size();
-        int min_content_lookback = std::max(0, content_start_idx - 256);
-        int start_idx = is_reasoning ? 0 : min_content_lookback;
+        int prompt_base = std::max(0, prompt_token_count_);
+        int start_idx = is_reasoning ? prompt_base : std::max(prompt_base, content_start_idx);
         int available = std::max(0, hist_len - start_idx);
         int n_penalize = std::min(available, MAX_REP_HIST);
         if (n_penalize > 0) {

@@ -294,7 +294,7 @@ static std::vector<int> build_continuation_prompt(
                 auto u_enc = tok.encode("user\n<tool_response>\n" + content + "\n</tool_response>");
                 result.insert(result.end(), u_enc.begin(), u_enc.end());
             } else {
-                if (engine.cfg_.is_nemotron() && enable_thinking && reasoning_effort != "none") {
+                if (engine.cfg_.is_nemotron() && enable_thinking && (reasoning_effort == "efficient" || reasoning_effort == "medium" || reasoning_effort == "low")) {
                     content += "\n\n{reasoning effort: efficient}";
                 }
                 auto u_enc = tok.encode("user\n" + content);
@@ -378,6 +378,19 @@ static bool check_and_build_continuation(
     }
     if (!engine.turn_kv_snapshot_.valid || engine.turn_kv_snapshot_.tokens.empty()) {
         return false;
+    }
+    if (engine.cfg_.is_nemotron()) {
+        // Official Nemotron chat_template.jinja sets truncate_history_thinking = True:
+        // prior assistant turns must have their <think>...</think> stripped to <think></think>
+        // so old reasoning traces do not pollute the Mamba-2 SSM recurrent state across turns.
+        int think_id = engine.tokenizer_.get_token_id("<think>");
+        int think_end_id = engine.tokenizer_.get_token_id("</think>");
+        const auto& snap_toks = engine.turn_kv_snapshot_.tokens;
+        for (size_t i = 0; i + 1 < snap_toks.size(); i++) {
+            if (snap_toks[i] == think_id && snap_toks[i + 1] != think_end_id) {
+                return false;
+            }
+        }
     }
     if (last_conv_messages.empty() || current_messages.size() <= last_conv_messages.size()) {
         return false;
@@ -1024,14 +1037,25 @@ void run_server(MoecherEngine& engine, int port, int default_thinking_budget, in
     nlohmann::json rec_sampling = engine.get_model_recommended_sampling();
     float model_default_temp = rec_sampling.value("temperature", engine.cfg_.default_temperature >= 0.0f ? engine.cfg_.default_temperature : 0.0f);
     float model_default_rep = rec_sampling.value("repetition_penalty", engine.cfg_.default_repetition_penalty > 0.0f ? engine.cfg_.default_repetition_penalty : 1.00f);
+    std::string model_default_effort = rec_sampling.value("reasoning_effort", !engine.cfg_.default_reasoning_effort.empty() ? engine.cfg_.default_reasoning_effort : std::string("high"));
+    int model_default_budget = rec_sampling.value("thinking_budget", engine.cfg_.default_thinking_budget >= 0 ? engine.cfg_.default_thinking_budget : default_thinking_budget);
+    bool model_thinking_enabled = (model_default_effort != "none" && model_default_budget > 0);
     bool model_anti_loop = rec_sampling.value("anti_loop", false);
     g_server_config.temperature = model_default_temp;
     g_server_config.repetition_penalty = model_default_rep;
+    g_server_config.reasoning_effort = model_default_effort;
+    g_server_config.thinking_budget = model_default_budget > 0 ? model_default_budget : 2048;
+    g_server_config.thinking_enabled = model_thinking_enabled;
+    g_server_config.cpu_experts = engine.cfg_.is_qwen4_exp() ? engine.default_enable_cpu_experts_ : false;
+    engine.enable_cpu_experts_ = g_server_config.cpu_experts;
+    engine.default_enable_cpu_experts_ = g_server_config.cpu_experts;
     engine.enable_anti_loop_ = model_anti_loop;
     engine.default_enable_anti_loop_ = model_anti_loop;
     save_server_config("server_config.json");
-    LOG_INFO("[Config] Reset server parameters on startup to model defaults: temp=%.2f, rep_penalty=%.2f, anti_loop=%s",
-             g_server_config.temperature, g_server_config.repetition_penalty, model_anti_loop ? "enabled" : "disabled");
+    LOG_INFO("[Config] Reset server parameters on startup to model defaults: temp=%.2f, rep_penalty=%.2f, effort=%s, budget=%d, anti_loop=%s",
+             g_server_config.temperature, g_server_config.repetition_penalty,
+             g_server_config.reasoning_effort.c_str(), g_server_config.thinking_budget,
+             model_anti_loop ? "enabled" : "disabled");
     httplib::Server svr;
     svr.set_tcp_nodelay(true);
     svr.set_payload_max_length(64 * 1024 * 1024); // 64 MB
@@ -1178,9 +1202,12 @@ void run_server(MoecherEngine& engine, int port, int default_thinking_budget, in
     // ── System Prompt & Tool Configuration Endpoints ────────────────────────
     svr.Get("/api/system/prompt", [&engine](const httplib::Request&, httplib::Response& res) {
         res.set_header("Access-Control-Allow-Origin", "*");
+        nlohmann::json rec = engine.get_model_recommended_sampling();
         json body = {
             {"status", "ok"},
             {"server_instance_id", g_server_instance_id},
+            {"model_id", engine.get_model_id()},
+            {"is_nemotron", engine.cfg_.is_nemotron()},
             {"tools_enabled", g_enable_tools},
             {"operational_mode", g_intent_gating ? "chat" : "agentic"},
             {"intent_gating", g_intent_gating},
@@ -1189,8 +1216,15 @@ void run_server(MoecherEngine& engine, int port, int default_thinking_budget, in
             {"active_tools", g_enable_tools ? g_current_active_tools : json::array()},
             {"temperature", g_server_config.temperature >= 0.0f ? g_server_config.temperature : 1.00f},
             {"repetition_penalty", g_server_config.repetition_penalty > 0.0f ? g_server_config.repetition_penalty : 1.00f},
+            {"top_p", engine.cfg_.default_top_p > 0.0f ? engine.cfg_.default_top_p : rec.value("top_p", 0.95f)},
+            {"top_k", engine.cfg_.default_top_k > 0 ? engine.cfg_.default_top_k : rec.value("top_k", 1024)},
+            {"min_p", engine.cfg_.default_min_p >= 0.0f ? engine.cfg_.default_min_p : rec.value("min_p", 0.0f)},
+            {"reasoning_effort", g_server_config.reasoning_effort},
+            {"thinking_budget", g_server_config.thinking_budget},
+            {"thinking_enabled", g_server_config.thinking_enabled},
             {"anti_loop", engine.default_enable_anti_loop_},
-            {"cpu_experts", engine.default_enable_cpu_experts_},
+            {"supports_cpu_experts", engine.cfg_.is_qwen4_exp()},
+            {"cpu_experts", engine.cfg_.is_qwen4_exp() ? engine.default_enable_cpu_experts_ : false},
             {"tokens_count", engine.system_kv_snapshot_.valid ? engine.system_kv_snapshot_.tokens.size() : 0}
         };
         res.set_content(body.dump(), "application/json");
@@ -1282,7 +1316,8 @@ void run_server(MoecherEngine& engine, int port, int default_thinking_budget, in
             {"temperature", g_server_config.temperature >= 0.0f ? g_server_config.temperature : 1.00f},
             {"repetition_penalty", g_server_config.repetition_penalty > 0.0f ? g_server_config.repetition_penalty : 1.00f},
             {"anti_loop", engine.default_enable_anti_loop_},
-            {"cpu_experts", engine.default_enable_cpu_experts_},
+            {"supports_cpu_experts", engine.cfg_.is_qwen4_exp()},
+            {"cpu_experts", engine.cfg_.is_qwen4_exp() ? engine.default_enable_cpu_experts_ : false},
             {"tokens_count", engine.system_kv_snapshot_.valid ? engine.system_kv_snapshot_.tokens.size() : 0}
         };
         res.set_content(body.dump(), "application/json");
