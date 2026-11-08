@@ -5045,6 +5045,15 @@ private:
                 } else {
                     num_slots = 4;
                 }
+                if (cfg_.architecture == ModelArch::QWEN && gpu_caps_.is_vram_constrained && num_slots > 1) {
+                    size_t cur_free_vram = 0, cur_total_vram = 0;
+                    cudaMemGetInfo(&cur_free_vram, &cur_total_vram);
+                    if (cur_free_vram < 1600ULL * 1024 * 1024) {
+                        num_slots = 1;
+                        mtp_k_ = 1;
+                        default_mtp_k_ = 1;
+                    }
+                }
                 for (int s = 0; s < num_slots; s++) {
                     target_ssm_slots_[s].alloc(n_linear * ssm_bytes_per_layer);
                     target_conv_slots_[s].alloc(n_linear * conv_bytes_per_layer);

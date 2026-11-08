@@ -277,7 +277,7 @@ int main(int argc, char** argv) {
     std::string batched_prefill_mode = "auto";
     int prefill_chunk_size = 512;
     int max_seq_len_override = 0;
-    int mtp_k = 4;
+    int mtp_k = 0; // 0 = auto (1 on 16GB GPUs, 4 on >=24GB GPUs)
     bool enable_anti_loop = false;
     bool enable_cpu_experts = true;
     bool enable_vision = true;
