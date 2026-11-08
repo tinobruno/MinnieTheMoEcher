@@ -6599,7 +6599,17 @@ async function logoutGeminiCliOAuthUI() {
 function toggleSecretInput(inputId) {
     const el = document.getElementById(inputId);
     if (!el) return;
-    el.type = (el.type === 'password') ? 'text' : 'password';
+    if (el.classList.contains('masked-api-key')) {
+        if (el.classList.contains('revealed')) {
+            el.classList.remove('revealed');
+            el.style.webkitTextSecurity = 'disc';
+        } else {
+            el.classList.add('revealed');
+            el.style.webkitTextSecurity = 'none';
+        }
+    } else {
+        el.type = (el.type === 'password') ? 'text' : 'password';
+    }
 }
 
 function setLlmProviderFormSelection(provider) {
@@ -6615,6 +6625,18 @@ function setLlmProviderFormSelection(provider) {
     });
 }
 
+function toggleHybridCloudCard(forceExpand) {
+    const body = document.getElementById('hybrid-cloud-card-body');
+    const chevron = document.getElementById('hybrid-cloud-card-chevron');
+    if (!body) return;
+    const isCurrentlyHidden = (body.style.display === 'none');
+    const shouldExpand = (typeof forceExpand === 'boolean') ? forceExpand : isCurrentlyHidden;
+    body.style.display = shouldExpand ? '' : 'none';
+    if (chevron) {
+        chevron.textContent = shouldExpand ? 'expand_less' : 'expand_more';
+    }
+}
+
 function openHybridCloudSettings(focusProvider) {
     const dropdownEl = document.getElementById('model-dropdown');
     const selectorEl = document.getElementById('model-selector');
@@ -6623,13 +6645,18 @@ function openHybridCloudSettings(focusProvider) {
 
     if (typeof settingsPanel !== 'undefined' && settingsPanel) {
         settingsPanel.classList.remove('hidden');
+        settingsPanel.classList.remove('collapsed');
     } else {
         const sp = document.getElementById('settings-panel');
-        if (sp) sp.classList.remove('hidden');
+        if (sp) {
+            sp.classList.remove('hidden');
+            sp.classList.remove('collapsed');
+        }
     }
     if (typeof switchSettingsTab === 'function') {
         switchSettingsTab('general');
     }
+    toggleHybridCloudCard(true);
     if (focusProvider) {
         setLlmProviderFormSelection(focusProvider);
     }

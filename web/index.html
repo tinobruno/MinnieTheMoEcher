@@ -973,14 +973,16 @@
                     <div class="settings-scroll-area">
                         <!-- Hybrid Cloud APIs (External Wrapper) Card -->
                         <div class="agentic-card" id="hybrid-cloud-settings-card" style="border: 1px solid rgba(56, 189, 248, 0.28); margin-bottom: 14px;">
-                            <div class="agentic-card-header">
+                            <div class="agentic-card-header" onclick="toggleHybridCloudCard()" style="cursor: pointer; user-select: none;">
                                 <span class="material-symbols-outlined agentic-card-icon" style="color: #38bdf8;">cloud_sync</span>
-                                <div class="agentic-card-title-group">
+                                <div class="agentic-card-title-group" style="flex: 1;">
                                     <h4>Hybrid Cloud APIs (Google, Claude, OpenAI)</h4>
                                     <p class="agentic-subtitle">Route chat &amp; reasoning to external cloud APIs while keeping Moecher's local tools, 3D Studio, MCP servers, and GPU ZDB</p>
                                 </div>
+                                <span class="material-symbols-outlined" id="hybrid-cloud-card-chevron" style="color: var(--text-secondary); font-size: 20px; transition: transform 0.2s ease;">expand_more</span>
                             </div>
 
+                            <div id="hybrid-cloud-card-body" style="display: none;">
                             <div class="setting-item" style="margin-top: 10px;">
                                 <label style="margin-bottom: 6px; display: block;">Active Backend Provider</label>
                                 <div style="display: grid; grid-template-columns: repeat(2, 1fr); gap: 6px;" id="llm-provider-pill-group">
@@ -1027,7 +1029,7 @@
                                         <a href="https://aistudio.google.com/app/apikey" target="_blank" rel="noopener" style="font-size: 11px; color: #38bdf8; text-decoration: underline;">Get API Key ↗</a>
                                     </div>
                                     <div style="display: flex; gap: 6px;">
-                                        <input type="password" id="gemini-api-key-input" class="text-input" placeholder="AIzaSy... (saved locally in .moecher_config.json)" style="flex: 1; font-family: monospace; font-size: 12px;">
+                                        <input type="text" id="gemini-api-key-input" class="text-input masked-api-key" placeholder="AIzaSy... (saved locally in .moecher_config.json)" autocomplete="off" autocorrect="off" autocapitalize="off" spellcheck="false" data-lpignore="true" data-1p-ignore="true" style="flex: 1; font-family: monospace; font-size: 12px;">
                                         <button type="button" onclick="toggleSecretInput('gemini-api-key-input')" class="secondary-btn" style="padding: 4px 8px; font-size: 11px;" title="Show/Hide Key">👁</button>
                                     </div>
                                 </div>
@@ -1087,7 +1089,7 @@
                                 <div class="setting-item" style="margin-bottom: 8px;">
                                     <label style="font-size: 11px;">Claude API Key</label>
                                     <div style="display: flex; gap: 6px;">
-                                        <input type="password" id="claude-api-key-input" class="text-input" placeholder="sk-ant-api03-..." style="flex: 1; font-family: monospace; font-size: 12px;">
+                                        <input type="text" id="claude-api-key-input" class="text-input masked-api-key" placeholder="sk-ant-api03-..." autocomplete="off" autocorrect="off" autocapitalize="off" spellcheck="false" data-lpignore="true" data-1p-ignore="true" style="flex: 1; font-family: monospace; font-size: 12px;">
                                         <button type="button" onclick="toggleSecretInput('claude-api-key-input')" class="secondary-btn" style="padding: 4px 8px; font-size: 11px;" title="Show/Hide Key">👁</button>
                                     </div>
                                 </div>
@@ -1118,7 +1120,7 @@
                                 <div class="setting-item" style="margin-bottom: 8px;">
                                     <label style="font-size: 11px;">OpenAI API Key</label>
                                     <div style="display: flex; gap: 6px;">
-                                        <input type="password" id="openai-api-key-input" class="text-input" placeholder="sk-proj-..." style="flex: 1; font-family: monospace; font-size: 12px;">
+                                        <input type="text" id="openai-api-key-input" class="text-input masked-api-key" placeholder="sk-proj-..." autocomplete="off" autocorrect="off" autocapitalize="off" spellcheck="false" data-lpignore="true" data-1p-ignore="true" style="flex: 1; font-family: monospace; font-size: 12px;">
                                         <button type="button" onclick="toggleSecretInput('openai-api-key-input')" class="secondary-btn" style="padding: 4px 8px; font-size: 11px;" title="Show/Hide Key">👁</button>
                                     </div>
                                 </div>
@@ -1158,6 +1160,7 @@
                                     <span class="material-symbols-outlined" style="font-size: 16px;">save</span>
                                     Save &amp; Activate Provider
                                 </button>
+                            </div>
                             </div>
                         </div>
 
