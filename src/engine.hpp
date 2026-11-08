@@ -3,6 +3,8 @@
 #include "common.hpp"
 #include "logging.hpp"
 #include "activations.cuh"
+#include "cuda/qwen4_kernels.cuh"
+#include "cpu/cpu_moe_experts.hpp"
 #include "expert_loader.hpp"
 #include "speculative.hpp"
 #include "tokenizer.hpp"
@@ -49,6 +51,7 @@ public:
         if (cfg_.is_nemotron()) {
             return cfg_.is_nemotron_bolt() ? "nemotron-3.5-bolt" : "nemotron-3.5-flash";
         }
+        if (cfg_.is_qwen4_exp()) { return "qwen3.8-flash-next"; }
         if (cfg_.architecture == ModelArch::QWEN2) {
             return "qwen2.5-vl-3b";
         }
@@ -75,6 +78,7 @@ public:
         if (cfg_.is_nemotron()) {
             return cfg_.is_nemotron_bolt() ? "Nemotron 3.5 Bolt" : "Nemotron 3.5 Flash";
         }
+        if (cfg_.is_qwen4_exp()) { return "Qwen 3.8 Flash-Next (GSQ-RCO-IQ1_M)"; }
         if (cfg_.architecture == ModelArch::QWEN2) {
             return "Qwen 2.5 VL 3B";
         }
@@ -198,6 +202,8 @@ public:
     bool default_enable_spec_ = true;
     bool enable_anti_loop_ = false;
     bool default_enable_anti_loop_ = false;
+    bool enable_cpu_experts_ = true;
+    bool default_enable_cpu_experts_ = true;
     
     // Prompt Prefix KV Cache Tracking
     std::vector<int> cached_tokens_;
@@ -213,6 +219,13 @@ public:
     const GpuCapabilities& gpu_capabilities() const { return gpu_caps_; }
 
     void reset_all_kv_caches() {
+        if (cfg_.is_qwen4_exp()) {
+            reset_state_qwen4_exp();
+            cached_tokens_.clear();
+            live_context_tokens_.store(0, std::memory_order_relaxed);
+            argmax_cache_valid_ = false;
+            return;
+        }
         for (int l = 0; l < cfg_.num_hidden_layers; l++) {
             if (layers_[l].kv_cache.data) {
                 CUDA_CHECK(cudaMemset(layers_[l].kv_cache.data, 0,
@@ -1262,7 +1275,7 @@ public:
         if (cfg_.is_deepseek_v41()) apply_sampling_defaults_deepseek_v41();
         else if (cfg_.is_deepseek()) apply_sampling_defaults_deepseek();
         else if (cfg_.is_nemotron()) apply_sampling_defaults_nemotron();
-        else if (cfg_.is_qwen()) apply_sampling_defaults_qwen();
+        else if (cfg_.is_qwen() || cfg_.is_qwen4_exp()) apply_sampling_defaults_qwen();
         if (max_seq_len_override > 0) {
             int eff_seq_len = max_seq_len_override;
             if (cfg_.is_deepseek_v41() && eff_seq_len < 16384) {
@@ -1446,6 +1459,21 @@ public:
         CUDA_CHECK(cudaMemGetInfo(&initial_vram_free, &vram_total));
         LOG_INFO("VRAM: %.1f GB free / %.1f GB total",
                  initial_vram_free / (1024.0 * 1024.0 * 1024.0), vram_total / (1024.0 * 1024.0 * 1024.0));
+
+        if (cfg_.is_qwen4_exp()) {
+            enable_batched_prefill_ = false;
+            enable_spec_ = false;
+            default_enable_spec_ = false;
+            enable_mtp_ = false;
+            default_enable_mtp_ = false;
+            enable_pld_ = false;
+            default_enable_pld_ = false;
+            if (!load_qwen4_exp(manifest, base_dir, max_vram_gb, dram_cache_gb)) return false;
+            expert_freq_counts_.assign((size_t)cfg_.num_hidden_layers * cfg_.n_routed_experts, 0);
+            expert_token_counts_.resize(cfg_.num_hidden_layers);
+            for (int l = 0; l < cfg_.num_hidden_layers; l++) expert_token_counts_[l].resize(cfg_.n_routed_experts);
+            return true;
+        }
 
         // Load dense tensors from attention_dense_layers.bin
         std::string dense_path = manifest["dense_bin"].get<std::string>();
@@ -2247,6 +2275,10 @@ public:
     }
 
     void forward_token_device_body(int token_id, int position, bool do_compute_logits = true) {
+        if (cfg_.is_qwen4_exp()) {
+            forward_token_qwen4_exp(token_id, position, do_compute_logits);
+            return;
+        }
         int dim = cfg_.hidden_size;
         int hc = cfg_.hc_mult;
 
@@ -2415,7 +2447,7 @@ public:
     KVSnapshot turn_kv_snapshot_;
 
     void snapshot_kv(KVSnapshot& snap, const std::vector<int>& tokens) {
-        if (tokens.empty()) return;
+        if (tokens.empty() || cfg_.is_qwen4_exp()) return;
         snap.tokens = tokens;
         snap.layers.resize(cfg_.num_hidden_layers);
 
@@ -2552,7 +2584,7 @@ public:
     }
 
     void restore_kv(const KVSnapshot& snap) {
-        if (!snap.valid) return;
+        if (!snap.valid || cfg_.is_qwen4_exp()) return;
 
         int32_t snap_attn_len = (int32_t)snap.tokens.size();
         for (int l = 0; l < cfg_.num_hidden_layers; l++) {
@@ -6043,13 +6075,15 @@ public:
 
 #include "models/model_deepseek_v41.inl"
 
+#include "models/model_qwen4.inl"
+
     // ── Model-Specific Protocol & Chat Templating Dispatchers ────────────────
 
     std::string get_model_default_system_prompt() const {
         if (cfg_.is_deepseek_v41()) return get_default_system_prompt_deepseek_v41();
         if (cfg_.is_deepseek()) return get_default_system_prompt_deepseek_v4();
         if (cfg_.is_nemotron()) return get_default_system_prompt_nemotron();
-        if (cfg_.is_qwen()) return get_default_system_prompt_qwen();
+        if (cfg_.is_qwen() || cfg_.is_qwen4_exp()) return get_default_system_prompt_qwen();
         return "";
     }
 
@@ -6057,7 +6091,7 @@ public:
         if (cfg_.is_deepseek_v41()) return get_recommended_sampling_deepseek_v41();
         if (cfg_.is_deepseek()) return get_recommended_sampling_deepseek_v4();
         if (cfg_.is_nemotron()) return get_recommended_sampling_nemotron();
-        if (cfg_.is_qwen()) return get_recommended_sampling_qwen();
+        if (cfg_.is_qwen() || cfg_.is_qwen4_exp()) return get_recommended_sampling_qwen();
         return {
             {"temperature", cfg_.default_temperature},
             {"repetition_penalty", cfg_.default_repetition_penalty},
@@ -6082,7 +6116,7 @@ public:
         if (cfg_.is_nemotron()) {
             return format_chat_prompt_nemotron(messages, enable_thinking, reasoning_effort, tools, model_has_vision);
         }
-        if (cfg_.is_qwen()) {
+        if (cfg_.is_qwen() || cfg_.is_qwen4_exp()) {
             return format_chat_prompt_qwen(messages, enable_thinking, reasoning_effort, tools, model_has_vision);
         }
         return format_chat_prompt_deepseek_v4(messages, enable_thinking, reasoning_effort, tools, model_has_vision);
@@ -6625,6 +6659,38 @@ public:
             }
         }
 
+        if (cfg_.is_qwen4_exp() && qwen4_state_ && qwen4_state_->loaded) {
+            const auto& st = *qwen4_state_;
+            const size_t clamped_tok = std::min<size_t>(active_tok, (size_t)max_seq);
+            const size_t max_blocks  = ((size_t)max_seq + 3) / 4;
+            const size_t act_blocks  = (clamped_tok + 3) / 4;
+            for (const auto& lw : st.layers) {
+                if (lw.is_qsa) {
+                    const size_t kv_layer_alloc = 2 * (size_t)max_seq * 512 * sizeof(uint16_t);
+                    const size_t kv_layer_act   = 2 * clamped_tok * 512 * sizeof(uint16_t);
+                    raw_kv_alloc  += kv_layer_alloc;
+                    raw_kv_active += kv_layer_act;
+
+                    idx_source_layers++;
+                    const size_t idx_layer_alloc = (max_blocks * 128 + 4 * 128 + 128) * sizeof(float);
+                    const size_t idx_layer_act   = (act_blocks * 128 + (active_tok > 0 ? (4 * 128 + 128) : 0)) * sizeof(float);
+                    idx_kv_alloc  += idx_layer_alloc;
+                    idx_kv_active += idx_layer_act;
+                } else {
+                    const size_t s_b = (3 * 10240 + 48 * 128 * 128) * sizeof(float);
+                    ssm_alloc += s_b;
+                    if (active_tok > 0) ssm_active += s_b;
+                }
+            }
+            if (st.has_ple) {
+                const size_t ple_b = 9 * 10240 * sizeof(float);
+                ssm_alloc += ple_b;
+                if (active_tok > 0) ssm_active += ple_b;
+            }
+            active_comp_entries_max_layer = act_blocks;
+            max_comp_entries_max_layer    = max_blocks;
+        }
+
         size_t rope_alloc = rope_freqs_.size_bytes + rope_freqs_compressed_.size_bytes;
         size_t total_kv_alloc = raw_kv_alloc + comp_kv_alloc + idx_kv_alloc + ssm_alloc;
         size_t total_kv_active = raw_kv_active + comp_kv_active + idx_kv_active + ssm_active;
@@ -6649,6 +6715,11 @@ public:
         } else if (cfg_.architecture == ModelArch::QWEN) {
             kv_arch = "Hybrid DeltaNet Linear + FP8 GQA KV";
             kv_dtype = "FP8 E4M3 + BF16 SSM";
+        } else if (cfg_.is_qwen4_exp()) {
+            kv_arch = "Hybrid 36x GDN Linear + 12x QSA Top-2048 Indexer";
+            kv_dtype = "BF16 QSA + FP32 GDN";
+            indexer_top_k = 2048;
+            max_attended_per_step = 2051;
         }
 
         double hit_pct = (prompt_token_count_ > 0)

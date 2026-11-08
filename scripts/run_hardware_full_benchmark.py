@@ -122,6 +122,18 @@ MODELS = [
         "extra_args": []
     },
     {
+        "id": "qwen3_8_flash_next",
+        "name": "Qwen 3.8 Flash-Next (GSQ-RCO-IQ1_M) — 512 Experts Hybrid GDN + QSA",
+        "short_name": "Qwen 3.8 Flash-Next",
+        "architecture": "Qwen 3.8 Hybrid MoE (48L: 36 Gated DeltaNet + 12 QSA Sparse Attention, 512 Routed Experts Top-10)",
+        "params": "80B-Class MoE / ~3B Active",
+        "quant": "3.44 GB BF16/Q8/Q6 Dense + 14.37 GB IQ2_XXS Routed Experts (17.81 GB Total)",
+        "disk_gb": 17.81,
+        "tier_mode": "100% VRAM Resident on 96GB / Per-Expert Hot-Cold L1+L2 Split on 16GB",
+        "manifest": r"E:\dev\MinnieTheMoEcher\models\qwen3.8_flash_next\moecher_manifest.json" if Path(r"E:\dev\MinnieTheMoEcher\models\qwen3.8_flash_next\moecher_manifest.json").exists() else r"F:\Moecher\models\qwen3.8_flash_next\moecher_manifest.json",
+        "extra_args": ["--ctx", "16384"]
+    },
+    {
         "id": "qwen3_8_27b_q4",
         "name": "Qwen 3.8 27B Dense — Q4_K / BF16",
         "short_name": "Qwen 3.8 27B Q4",

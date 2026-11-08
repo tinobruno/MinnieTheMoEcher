@@ -70,6 +70,7 @@ struct ServerConfigState {
     std::string reasoning_effort = "medium";
     int thinking_budget = 4096;
     bool thinking_enabled = true;
+    bool cpu_experts = true;
     int max_tokens = 4096;
 
     std::vector<std::string> active_tools = {
@@ -91,6 +92,7 @@ struct ServerConfigState {
             {"reasoning_effort", reasoning_effort},
             {"thinking_budget", thinking_budget},
             {"thinking_enabled", thinking_enabled},
+            {"cpu_experts", cpu_experts},
             {"max_tokens", max_tokens},
             {"active_tools", active_tools}
         };
@@ -123,7 +125,9 @@ struct ServerConfigState {
         if (j.contains("repetition_penalty") && j["repetition_penalty"].is_number()) repetition_penalty = j["repetition_penalty"].get<float>();
         if (j.contains("reasoning_effort") && j["reasoning_effort"].is_string()) reasoning_effort = j["reasoning_effort"].get<std::string>();
         if (j.contains("thinking_budget") && j["thinking_budget"].is_number_integer()) thinking_budget = j["thinking_budget"].get<int>();
-        if (j.contains("thinking_enabled") && j["thinking_enabled"].is_boolean()) thinking_enabled = j["thinking_enabled"].get<bool>();
+        if (j.contains("thinking_enabled") && j["thinking_enabled"].is_boolean()) thinking_enabled = j["thinking_enabled"].is_boolean() ? j["thinking_enabled"].get<bool>() : true;
+        if (j.contains("cpu_experts") && j["cpu_experts"].is_boolean()) cpu_experts = j["cpu_experts"].get<bool>();
+        if (j.contains("enable_cpu_experts") && j["enable_cpu_experts"].is_boolean()) cpu_experts = j["enable_cpu_experts"].get<bool>();
         if (j.contains("max_tokens") && j["max_tokens"].is_number_integer()) max_tokens = j["max_tokens"].get<int>();
         if (j.contains("active_tools") && j["active_tools"].is_array()) {
             active_tools.clear();
@@ -191,7 +195,7 @@ void rebuild_system_prefix(
     if (!custom_full_prompt.empty()) {
         full_prompt_text = custom_full_prompt;
     } else {
-        bool is_qwen = (engine.cfg_.architecture == ModelArch::QWEN || engine.cfg_.architecture == ModelArch::NEMOTRON_35);
+        bool is_qwen = (engine.cfg_.architecture == ModelArch::QWEN || engine.cfg_.is_qwen4_exp() || engine.cfg_.architecture == ModelArch::NEMOTRON_35);
         if (g_enable_tools && !resolved_tools.empty()) {
             full_prompt_text = base_prompt + build_dynamic_tools_prompt(resolved_tools, is_qwen);
         } else {
@@ -237,7 +241,7 @@ void rebuild_system_prefix(
 
     std::vector<int> prompt = engine.apply_chat_template(default_messages, true, "high", resolved_tools);
 
-    bool is_chatml = (engine.cfg_.architecture == ModelArch::QWEN || engine.cfg_.architecture == ModelArch::QWEN2 || engine.cfg_.architecture == ModelArch::NEMOTRON_35);
+    bool is_chatml = (engine.cfg_.architecture == ModelArch::QWEN || engine.cfg_.architecture == ModelArch::QWEN2 || engine.cfg_.is_qwen4_exp() || engine.cfg_.architecture == ModelArch::NEMOTRON_35);
     int user_start = is_chatml
                          ? engine.tokenizer_.get_token_id("<|im_start|>")
                          : engine.tokenizer_.get_token_id("<｜User｜>");
@@ -275,7 +279,7 @@ static std::vector<int> build_continuation_prompt(
     const auto& tok = engine.tokenizer_;
     std::vector<int> result = engine.turn_kv_snapshot_.tokens;
 
-    bool is_chatml = (engine.cfg_.architecture == ModelArch::QWEN || engine.cfg_.architecture == ModelArch::QWEN2 || engine.cfg_.architecture == ModelArch::NEMOTRON_35);
+    bool is_chatml = (engine.cfg_.architecture == ModelArch::QWEN || engine.cfg_.architecture == ModelArch::QWEN2 || engine.cfg_.is_qwen4_exp() || engine.cfg_.architecture == ModelArch::NEMOTRON_35);
     if (is_chatml) {
         int IM_START = tok.get_token_id("<|im_start|>");
         int IM_END = tok.get_token_id("<|im_end|>");
@@ -1186,6 +1190,7 @@ void run_server(MoecherEngine& engine, int port, int default_thinking_budget, in
             {"temperature", g_server_config.temperature >= 0.0f ? g_server_config.temperature : 1.00f},
             {"repetition_penalty", g_server_config.repetition_penalty > 0.0f ? g_server_config.repetition_penalty : 1.00f},
             {"anti_loop", engine.default_enable_anti_loop_},
+            {"cpu_experts", engine.default_enable_cpu_experts_},
             {"tokens_count", engine.system_kv_snapshot_.valid ? engine.system_kv_snapshot_.tokens.size() : 0}
         };
         res.set_content(body.dump(), "application/json");
@@ -1224,6 +1229,8 @@ void run_server(MoecherEngine& engine, int port, int default_thinking_budget, in
             {
                 std::lock_guard<std::mutex> lock(g_server_config_mutex);
                 g_server_config.from_json(patch);
+                engine.enable_cpu_experts_ = g_server_config.cpu_experts;
+                engine.default_enable_cpu_experts_ = g_server_config.cpu_experts;
                 g_intent_gating = g_server_config.intent_gating;
             }
             save_server_config("server_config.json");
@@ -1275,6 +1282,7 @@ void run_server(MoecherEngine& engine, int port, int default_thinking_budget, in
             {"temperature", g_server_config.temperature >= 0.0f ? g_server_config.temperature : 1.00f},
             {"repetition_penalty", g_server_config.repetition_penalty > 0.0f ? g_server_config.repetition_penalty : 1.00f},
             {"anti_loop", engine.default_enable_anti_loop_},
+            {"cpu_experts", engine.default_enable_cpu_experts_},
             {"tokens_count", engine.system_kv_snapshot_.valid ? engine.system_kv_snapshot_.tokens.size() : 0}
         };
         res.set_content(body.dump(), "application/json");
@@ -1452,11 +1460,13 @@ void run_server(MoecherEngine& engine, int port, int default_thinking_budget, in
             ? "Hybrid Mamba-2 SSM + GQA Attention + Sparse MoE (NVFP4)"
             : (engine.cfg_.is_deepseek_v41()
                 ? "Sparse MoE (15,360 Experts) + Single-Pass Mega-mHC (NVFP4)"
-                : ((engine.cfg_.architecture == ModelArch::QWEN)
-                    ? "DeltaNet Linear Attention + MTP Speculative Decoding"
+                : (engine.cfg_.is_qwen4_exp()
+                    ? "Hybrid GDN + Query-Sparse Attention + 256-Expert MoE + 131K PLE N-Gram"
+                    : ((engine.cfg_.architecture == ModelArch::QWEN)
+                        ? "DeltaNet Linear Attention + MTP Speculative Decoding"
                     : (model_id.find("coder") != std::string::npos
                         ? "MoE Coder (64 Experts)"
-                        : "Sparse MoE (11,008 Experts) + MLA Latent Attention")));
+                        : "Sparse MoE (11,008 Experts) + MLA Latent Attention"))));
         json sys_res = get_system_resource_telemetry();
         json rec_sampling = engine.get_model_recommended_sampling();
         json llm_cfg = moecher::tooling::get_llm_provider_settings();
@@ -1556,11 +1566,13 @@ void run_server(MoecherEngine& engine, int port, int default_thinking_budget, in
             ? "Hybrid Mamba-2 SSM + GQA Attention + Sparse MoE (NVFP4)"
             : (engine.cfg_.is_deepseek_v41()
                 ? "Sparse MoE (15,360 Experts) + Single-Pass Mega-mHC (NVFP4)"
-                : ((engine.cfg_.architecture == ModelArch::QWEN)
-                    ? "DeltaNet Linear Attention + MTP Speculative Decoding"
+                : (engine.cfg_.is_qwen4_exp()
+                    ? "Hybrid GDN + Query-Sparse Attention + 256-Expert MoE + 131K PLE N-Gram"
+                    : ((engine.cfg_.architecture == ModelArch::QWEN)
+                        ? "DeltaNet Linear Attention + MTP Speculative Decoding"
                     : (model_id.find("coder") != std::string::npos
                         ? "MoE Coder (64 Experts)"
-                        : "Sparse MoE (11,008 Experts) + MLA Latent Attention")));
+                        : "Sparse MoE (11,008 Experts) + MLA Latent Attention"))));
         json sys_res = get_system_resource_telemetry();
         json rec_sampling = engine.get_model_recommended_sampling();
         json llm_cfg = moecher::tooling::get_llm_provider_settings();
@@ -1953,6 +1965,14 @@ void run_server(MoecherEngine& engine, int port, int default_thinking_budget, in
                 engine.enable_anti_loop_ = request["enable_anti_loop"].get<bool>();
             } else if (request.contains("anti_loop") && request["anti_loop"].is_boolean()) {
                 engine.enable_anti_loop_ = request["anti_loop"].get<bool>();
+            }
+            engine.enable_cpu_experts_ = engine.default_enable_cpu_experts_;
+            if (request.contains("enable_cpu_experts") && request["enable_cpu_experts"].is_boolean()) {
+                engine.enable_cpu_experts_ = request["enable_cpu_experts"].get<bool>();
+            } else if (request.contains("cpu_experts") && request["cpu_experts"].is_boolean()) {
+                engine.enable_cpu_experts_ = request["cpu_experts"].get<bool>();
+            }
+            if (false) {
             }
 
             if (reasoning_effort == "none") {

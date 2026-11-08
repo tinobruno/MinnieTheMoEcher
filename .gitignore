@@ -44,6 +44,7 @@ cookie_jar.json
 # Scratch scripts & temporary test files
 /*.html
 !ARTICLE_*.html
+!BENCHMARK_*.html
 !DINO_*.html
 !WHITE_PAPER_*.html
 !DEVELOPER_GUIDE.html

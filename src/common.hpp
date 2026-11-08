@@ -66,17 +66,18 @@ static constexpr int DEEPSEEK_V41_MOE_INTERMEDIATE = 2304;
 //  Model Config (from manifest)
 // ════════════════════════════════════════════════════════════════════════════════
 
-enum class ModelArch { DEEPSEEK_V4, DEEPSEEK_V41, QWEN, QWEN2, NEMOTRON_35 };
+enum class ModelArch { DEEPSEEK_V4, DEEPSEEK_V41, QWEN, QWEN2, QWEN4_EXP, NEMOTRON_35 };
 
 struct ModelConfig {
     ModelArch architecture = ModelArch::DEEPSEEK_V4;
     bool is_qwen() const { return architecture == ModelArch::QWEN || architecture == ModelArch::QWEN2; }
+    bool is_qwen4_exp() const { return architecture == ModelArch::QWEN4_EXP; }
     bool is_nemotron() const { return architecture == ModelArch::NEMOTRON_35; }
     bool is_nemotron_bolt() const { return is_nemotron() && (moe_latent_size > 0 || num_hidden_layers > 60); }
     bool is_deepseek() const { return architecture == ModelArch::DEEPSEEK_V4 || architecture == ModelArch::DEEPSEEK_V41; }
     bool is_deepseek_v4() const { return architecture == ModelArch::DEEPSEEK_V4; }
     bool is_deepseek_v41() const { return architecture == ModelArch::DEEPSEEK_V41; }
-    bool has_recurrent_state() const { return is_deepseek() || is_nemotron() || architecture == ModelArch::QWEN; }
+    bool has_recurrent_state() const { return is_deepseek() || is_nemotron() || architecture == ModelArch::QWEN || is_qwen4_exp(); }
     std::string model_name = "";
     std::string model_id = "";
     int vocab_size = 129280;
@@ -212,6 +213,9 @@ struct ModelConfig {
                        arch_str == "deepseek_v41" || arch_str == "deepseek-v4.1" || arch_str == "deepseek_v4.1" || arch_str == "DeepseekV41ForCausalLM") {
                 architecture = ModelArch::DEEPSEEK_V41;
                 n_hash_layers = 0;
+            } else if (arch_str == "qwen4exp" || arch_str == "qwen4_exp" || arch_str == "Qwen4ExpForCausalLM" ||
+                       model_id.find("flash-next") != std::string::npos || model_id.find("flash_next") != std::string::npos) {
+                architecture = ModelArch::QWEN4_EXP;
             } else if (model_id.find("qwen3") != std::string::npos || model_name.find("Qwen 3") != std::string::npos ||
                        arch_str == "qwen3" || j.value("vocab_size", 0) == 248320 || j.value("num_hidden_layers", 0) == 64) {
                 architecture = ModelArch::QWEN;

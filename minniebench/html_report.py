@@ -34,6 +34,7 @@ def generate_html_report(results, gpu_info, output_path=None):
     radar_datasets = []
 
     palette = {
+        "Qwen 3.8 Flash-Next (GSQ-RCO-IQ1_M)": {"color": "#06b6d4", "fill": "rgba(6, 182, 212, 0.2)"},
         "Qwen 3.8 27B Vision 13G": {"color": "#38bdf8", "fill": "rgba(56, 189, 248, 0.2)"},
         "Nemotron 3.5 Bolt (24GB Profile)": {"color": "#a855f7", "fill": "rgba(168, 85, 247, 0.2)"},
         "Nemotron 3.5 Lightning (30B-A3B)": {"color": "#10b981", "fill": "rgba(16, 185, 129, 0.2)"},
@@ -43,6 +44,14 @@ def generate_html_report(results, gpu_info, output_path=None):
 
     # Model use cases mapping
     recommendations = {
+        "Qwen 3.8 Flash-Next (GSQ-RCO-IQ1_M)": {
+            "badge": "Top Hybrid MoE Speed",
+            "badge_color": "cyan",
+            "icon": "bolt",
+            "headline": "Best for High-Speed MoE Reasoning & Long Context (16K BF16)",
+            "verdict": "~20.2 - 22.8 tok/s decode, ~340 tok/s prefill on 16GB GPU. 48-layer Hybrid Gated DeltaNet + QSA Top-2048 Sparse Attention with 512 routed experts (245 Hot in VRAM + 267 Cold in Pinned DDR5 via zero-CPU async DMA).",
+            "radar": [94, 95, 92, 88, 98]
+        },
         "Qwen 3.8 27B Vision 13G": {
             "badge": "Top Coding & Fast Dev",
             "badge_color": "sky",

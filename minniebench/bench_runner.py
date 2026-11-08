@@ -45,6 +45,14 @@ except ImportError:
 # ── Candidate Models to Test ────────────────────────────────────────────────
 CANDIDATE_MODELS = [
     {
+        "name": "Qwen 3.8 Flash-Next (GSQ-RCO-IQ1_M)",
+        "id": "Qwen3.8-Flash-Next-GSQ-RCO-IQ1_M",
+        "manifest": r"E:\dev\MinnieTheMoEcher\models\qwen3.8_flash_next\moecher_manifest.json",
+        "flags": ["--ctx", "16384", "--no-cpu-experts"],
+        "expected_type": "Hybrid Gated DeltaNet (36L) + QSA Sparse Attention (12L) + 512 Routed MoE Experts (Top-10)",
+        "expected_vram": "9.8 GB VRAM (245 Hot Experts) + 9.2 GB Pinned DDR5 (267 Cold Experts)"
+    },
+    {
         "name": "Qwen 3.8 27B Vision 13G",
         "id": "qwen3.8-27B-Vision-13G",
         "manifest": r"E:\moecher\models\qwen3_8_27b_vision_13g\moecher_manifest.json",

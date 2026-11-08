@@ -118,6 +118,7 @@ else()
         src/zdb.cpp
         src/cuda/activations.cu
         src/cuda/vision_kernels.cu
+        src/cuda/qwen4_kernels.cu
     )
     if(WIN32)
         list(APPEND MOECHER_SOURCES src/moecher.rc)

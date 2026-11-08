@@ -71,11 +71,18 @@ static bool inspect_model_manifest(const std::filesystem::path& manifest_file, D
 
     std::string dense_bin = j.value("dense_bin", "");
     std::string dense_resolved = resolve_manifest_bin_path(base_dir, dense_bin);
-    if (dense_resolved.empty()) {
+    uint64_t total_bytes = 0;
+    if (!dense_resolved.empty()) {
+        total_bytes = std::filesystem::file_size(dense_resolved, ec);
+    } else if (j.contains("gguf_shard1")) {
+        std::string s1 = resolve_manifest_bin_path(base_dir, j.value("gguf_shard1", ""));
+        if (s1.empty()) return false;
+        total_bytes += std::filesystem::file_size(s1, ec);
+        std::string s2 = resolve_manifest_bin_path(base_dir, j.value("gguf_shard2", ""));
+        if (!s2.empty()) total_bytes += std::filesystem::file_size(s2, ec);
+    } else {
         return false; // Weight file not present on disk
     }
-
-    uint64_t total_bytes = std::filesystem::file_size(dense_resolved, ec);
     int n_routed = mc.value("n_routed_experts", 0);
     std::string edtype = mc.value("expert_dtype", "");
 
@@ -272,6 +279,7 @@ int main(int argc, char** argv) {
     int max_seq_len_override = 0;
     int mtp_k = 4;
     bool enable_anti_loop = false;
+    bool enable_cpu_experts = true;
     bool enable_vision = true;
     bool manifest_explicit = false;
     bool spec_explicit = false;
@@ -297,6 +305,8 @@ int main(int argc, char** argv) {
             printf("  --tools / --no-tools        Enable or disable tool calling schemas (default: disabled)\n");
             printf("  --budget <tokens>           Default thinking budget tokens\n");
             printf("  --anti-loop                 Enable n-gram repetition loop detector & breaker (default: disabled)\n");
+            printf("  --cpu-experts, --cpu-moe    Enable Hybrid CPU MoE expert evaluation for L2/L2.5 misses (default: enabled)\n");
+            printf("  --no-cpu-experts            Disable Hybrid CPU MoE expert evaluation (DMA all misses to GPU)\n");
             printf("  --max-tool-rounds <n>       Max sequential tool execution rounds per turn (default: %d)\n", g_max_tool_rounds);
             printf("  --mode <chat|agentic>       Operational mode: 'chat' (dynamic intent gating) or 'agentic' (unrestricted tools, default: chat)\n");
             printf("  --chat-mode                 Enable chat mode with dynamic intent gating (outputs code in chat by default)\n");
@@ -372,6 +382,10 @@ int main(int argc, char** argv) {
             enable_anti_loop = true;
         } else if (std::string(argv[i]) == "--no-anti-loop" || std::string(argv[i]) == "--disable-anti-loop") {
             enable_anti_loop = false;
+        } else if (std::string(argv[i]) == "--cpu-experts" || std::string(argv[i]) == "--enable-cpu-experts" || std::string(argv[i]) == "--cpu-moe") {
+            enable_cpu_experts = true;
+        } else if (std::string(argv[i]) == "--no-cpu-experts" || std::string(argv[i]) == "--disable-cpu-experts" || std::string(argv[i]) == "--no-cpu-moe") {
+            enable_cpu_experts = false;
         } else if ((std::string(argv[i]) == "--pld-tokens" || std::string(argv[i]) == "--pld-draft-tokens") && i + 1 < argc) {
             pld_draft_tokens = std::stoi(argv[++i]);
             spec_explicit = true;
@@ -382,6 +396,9 @@ int main(int argc, char** argv) {
         } else if (std::string(argv[i]) == "--quiet" || std::string(argv[i]) == "-q") {
             g_quiet = true;
             g_log_tokens = false;
+        } else if (std::string(argv[i]) == "--verbose" || std::string(argv[i]) == "-v" || std::string(argv[i]) == "--no-quiet" || std::string(argv[i]) == "--log-tokens") {
+            g_quiet = false;
+            g_log_tokens = true;
         } else if (std::string(argv[i]) == "--buffered-io") {
             buffered_io = true;
         } else if (std::string(argv[i]) == "--track" ||
@@ -587,6 +604,8 @@ int main(int argc, char** argv) {
     engine.default_enable_spec_ = enable_spec;
     engine.enable_anti_loop_ = enable_anti_loop;
     engine.default_enable_anti_loop_ = enable_anti_loop;
+    engine.enable_cpu_experts_ = enable_cpu_experts;
+    engine.default_enable_cpu_experts_ = enable_cpu_experts;
     engine.enable_vision_ = enable_vision;
     LOG_INFO("Speculative decoding: %s (PLD: %s, MTP: %s, Tree MTP: %s, tree_nodes=%d, mtp_k=%d)",
              enable_spec ? "enabled" : "disabled",

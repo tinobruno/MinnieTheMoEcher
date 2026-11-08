@@ -8,8 +8,8 @@
 std::mutex g_log_mutex;
 std::ofstream g_log_file;
 bool g_log_experts = false;
-bool g_log_tokens = true;
-bool g_quiet = false;
+bool g_log_tokens = false;
+bool g_quiet = true;
 bool g_server_ready = false;
 bool g_track_experts = false;
 bool g_track_reset = false;

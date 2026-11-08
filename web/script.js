@@ -335,6 +335,26 @@ if (thinkingBudget) {
 }
 
 const antiLoopEnabled = document.getElementById('anti-loop-enabled');
+const cpuExpertsEnabled = document.getElementById('cpu-experts-enabled');
+try {
+    const savedCpuExp = localStorage.getItem('moecher_cpu_experts_enabled');
+    if (savedCpuExp !== null && cpuExpertsEnabled) {
+        cpuExpertsEnabled.checked = (savedCpuExp === 'true');
+    } else if (cpuExpertsEnabled) {
+        cpuExpertsEnabled.checked = true;
+    }
+} catch (e) {}
+if (cpuExpertsEnabled) {
+    cpuExpertsEnabled.addEventListener('change', (e) => {
+        const val = !!e.target.checked;
+        try { localStorage.setItem('moecher_cpu_experts_enabled', String(val)); } catch (err) {}
+        fetch('/api/system/config', {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ cpu_experts: val })
+        }).catch(() => {});
+    });
+}
 try {
     const savedAntiLoop = localStorage.getItem('moecher_anti_loop_enabled');
     if (savedAntiLoop !== null && antiLoopEnabled) {
@@ -3243,6 +3263,11 @@ async function fetchBackendSystemPrompt() {
             if (repPenaltyVal) repPenaltyVal.textContent = parseFloat(data.repetition_penalty).toFixed(2);
         }
         const savedAntiLoop = localStorage.getItem('moecher_anti_loop_enabled');
+        const savedCpuExp = localStorage.getItem('moecher_cpu_experts_enabled');
+        if (data && data.cpu_experts !== undefined && cpuExpertsEnabled && (savedCpuExp === null || isNewServerInstance)) {
+            cpuExpertsEnabled.checked = !!data.cpu_experts;
+            try { localStorage.setItem('moecher_cpu_experts_enabled', String(!!data.cpu_experts)); } catch(e) {}
+        }
         if (data && data.anti_loop !== undefined && antiLoopEnabled && (savedAntiLoop === null || isNewServerInstance)) {
             antiLoopEnabled.checked = !!data.anti_loop;
             try { localStorage.setItem('moecher_anti_loop_enabled', String(!!data.anti_loop)); } catch(e) {}
@@ -4808,6 +4833,8 @@ async function sendMessage(options = {}) {
                 reasoning_effort: isThinking ? (reasoningEffort ? reasoningEffort.value : "high") : "none",
                 enable_anti_loop: (antiLoopEnabled ? antiLoopEnabled.checked : false),
                 anti_loop: (antiLoopEnabled ? antiLoopEnabled.checked : false),
+                enable_cpu_experts: (cpuExpertsEnabled ? cpuExpertsEnabled.checked : true),
+                cpu_experts: (cpuExpertsEnabled ? cpuExpertsEnabled.checked : true),
                 enable_spec: speculativeSettings.enableMtp || speculativeSettings.enablePld,
                 enable_mtp: speculativeSettings.enableMtp,
                 mtp: speculativeSettings.enableMtp,
@@ -6101,6 +6128,8 @@ function renderKvCacheStatusUI(data) {
             elArchBadge.textContent = maxSeq >= 1000000 ? '1M MLA · Top-512' : 'MLA · Top-512';
         } else if (data.kv_arch.includes('MLA')) {
             elArchBadge.textContent = 'MLA · Top-512';
+        } else if (data.kv_arch.includes('QSA')) {
+            elArchBadge.textContent = 'GDN + QSA BF16';
         } else if (data.kv_arch.includes('Mamba-2')) {
             elArchBadge.textContent = 'Mamba-2 + GQA';
         } else if (data.kv_arch.includes('DeltaNet')) {
@@ -6248,6 +6277,8 @@ function renderKvCacheStatusUI(data) {
     if (elAttnWin) {
         if (winSize > 0 && topK > 0) {
             elAttnWin.textContent = `${winSize} + Top-${topK}`;
+        } else if (topK > 0) {
+            elAttnWin.textContent = `Top-${topK} QSA`;
         } else if (winSize > 0) {
             elAttnWin.textContent = `${winSize.toLocaleString()} win`;
         } else {

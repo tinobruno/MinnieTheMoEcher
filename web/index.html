@@ -1235,6 +1235,17 @@
                             </div>
 
                             <div class="setting-item">
+                                <label class="checkbox-label" title="Evaluate L1 VRAM missed MoE experts (L2 Pinned / L2.5 Unpinned RAM) in-place on the CPU using AVX2 in parallel with GPU L1-hit experts">
+                                    <input type="checkbox" id="cpu-experts-enabled" checked>
+                                    Hybrid CPU Expert Offload (L2/L2.5 Misses)
+                                </label>
+                            </div>
+                            <div style="display:none;"><label>
+                                    Anti-Loop Repetition Detector
+                                </label>
+                            </div>
+
+                            <div class="setting-item">
                                 <label class="checkbox-label" title="Enable model to fetch and read content from web URLs (fetch_url)">
                                     <input type="checkbox" id="web-retrieval-enabled" checked>
                                     Web Retrieval
