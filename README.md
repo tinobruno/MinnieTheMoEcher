@@ -1,10 +1,91 @@
+<p align="center">
+  <img src="graphics/moecher_header_banner.jpg" alt="MinnieTheMoEcher — Bare-Metal Agentic AI Runtime" width="100%" style="border-radius: 12px;">
+</p>
+
 # MinnieTheMoECher
+### The Bare-Metal, Self-Contained Agentic AI Runtime for NVIDIA GPUs & Apple Silicon
+
+Most local AI tools stop at token generation. **MinnieTheMoEcher (`moecher`) is a complete, self-contained AI operating runtime** engineered from the ground up in bare-metal C++, CUDA, and Apple Metal. 
+
+Compile once, launch a single zero-dependency binary, and unlock the entire spectrum of modern AI directly on your own silicon—with zero cloud lock-in, zero Python environment fragility, and zero runtime bloat:
+
+- **Autonomous Coding & Live Workbench**: Full-repository reasoning, multi-file refactoring, and an integrated HTML/JS/CSS **Canvas Workbench** for instant interactive execution.
+- **Security-First Local Agency**: Native file-system engineering, sandboxed shell execution, live web research, and **Model Context Protocol (MCP)** tool orchestration—strictly disabled by default and explicitly capability-gated at startup.
+- **Omnimodal Creative Studio**: A unified local pipeline for long-form **content authoring**, **image generation & editing**, **neural audio & voice synthesis**, **video production**, and **interactive 3D model creation**.
+- **From White Paper to Silicon**: `moecher` follows a relentless engineering roadmap aimed at building the most complete local AI runtime in existence. It serves as the primary testbed where original research architectures described in our white papers are continuously brought to life—including **[Zero Decode Bypass (ZDB)](Articles/ARTICLE_FOLLOWUP_ZERO_DECODE_BYPASS.md)** *(System 1 non-autoregressive inference)*, **AI Metacognition & Hybrid System 1/2 Arbitration**, **FrankensTin Vision Delegation**, and **Asynchronous Double-Buffered MoE DMA**.
+
+---
+
+## Quick Start in 3 Steps (Windows, Linux & macOS)
+
+`moecher` compiles into a single self-contained executable (`moecher.exe` / `moecher`) with the full Web UI embedded directly inside the binary. On first launch, if no local models are present in `./models/`, `moecher` opens an **Interactive First-Run Model Downloader** to fetch pre-quantized weights directly from Hugging Face.
+
+### 🪟 Windows (NVIDIA CUDA)
+Run in **PowerShell**:
+```powershell
+git clone https://github.com/tinobruno/MinnieTheMoEcher.git
+cd MinnieTheMoEcher
+.\install.ps1
+```
+Launch the runtime (select or download a model interactively, then open `http://localhost:8001`):
+```powershell
+.\moecher.exe
+```
+
+### 🐧 Linux (NVIDIA CUDA)
+Run in your terminal:
+```bash
+git clone https://github.com/tinobruno/MinnieTheMoEcher.git
+cd MinnieTheMoEcher
+chmod +x install.sh && ./install.sh
+```
+Launch the runtime and open `http://localhost:8001`:
+```bash
+./moecher
+```
+
+### 🍏 macOS (Apple Silicon Metal)
+On macOS 15.0+ (Apple M-series Unified Memory), `install.sh` automatically detects `Darwin` and builds the native Apple Metal + Hardware MPP backend:
+```bash
+git clone https://github.com/tinobruno/MinnieTheMoEcher.git
+cd MinnieTheMoEcher
+chmod +x install.sh && ./install.sh
+```
+Launch the runtime and open `http://localhost:8001`:
+```bash
+./moecher
+```
+
+> [!TIP]
+> **Enabling Local Agentic Capabilities**: By default, `moecher` starts in a read-safe conversational and creative mode. To grant the runtime local agentic permissions (workspace file read/write/edit, headless web browsing, or host shell execution), pass the explicit capability flags at startup:
+> `moecher --agentic-mode --tools --allow-file-write --allow-host-exec --headless-browsing`
+
+---
+
+### 📦 Creating the Standalone Windows GUI Installer (`Moecher-Setup.exe`)
+
+To package `moecher.exe`, its embedded Web UI, desktop/Start-Menu launchers, and the interactive Hugging Face model selector into a redistributable Windows setup wizard (`dist\Moecher-Setup.exe`):
+
+1. Ensure `moecher.exe` is compiled (`.\install.ps1` or `.\build_fast.bat`) and [Inno Setup 6](https://jrsoftware.org/isdl.php) (`ISCC.exe`) is installed.
+2. Run the installer builder script from **PowerShell**:
+   ```powershell
+   .\installer\build_installer.ps1
+   ```
+3. Alternatively, to build a self-extracting 7-Zip standalone installer without Inno Setup:
+   ```powershell
+   .\installer\build_7z_installer.ps1
+   ```
+The resulting `dist\Moecher-Setup.exe` (~15–40 MB) includes a custom **Hardware & Memory Configuration** wizard page (VRAM & DRAM L2 cache limits) and 1-click component checkboxes to download *Qwen 3.8 27B Vision*, *NVIDIA Nemotron 3.5 Lightning/Bolt*, or *DeepSeek V4/V4.1 Flash* during installation.
+
+---
+
+## Architecture & Engine Overview
 
 Bare-metal C++/CUDA and Apple Metal inference engine for **NVIDIA Nemotron 3.5 Bolt & Lightning**, **Qwen 3.8 27B**, and **DeepSeek V4-Flash** (284B total / 13B active) featuring ultra-fast **Multi-Token Prediction (MTP) Speculative Decoding** reaching **~98 tok/s** on NVIDIA GPUs, **143.3 - 172.0 tok/s prefill** on Apple Silicon (M6), and **asynchronous double-buffered MoE DMA** achieving **13.5 tok/s decode** on sub-$500 consumer GPUs.
 
 **Key features**:
 - **NVIDIA Nemotron 3.5 Bolt & Lightning Support**: Native bare-metal execution of hybrid Mamba-2 SSM + GQA Attention + LatentMoE (496 routed experts/layer, top-9 routing) running 100% in-memory across VRAM L1 + Pinned Host DRAM L2 on consumer hardware (RTX 5060 Ti 16GB). Outperforms `llama.cpp`'s MoE cache by **3.86x** (13.51 tok/s vs 3.50 tok/s) with 0% CPU core burn.
-- **Native Apple Silicon Metal Backend & Hardware MPP Tiled Prefill Engine**: High-performance bare-metal Apple Metal implementation utilizing Apple's native `<metal_tensor>` and `<MetalPerformancePrimitives/MetalPerformancePrimitives.h>` (`mpp::tensor_ops::matmul2d`). Features on-the-fly threadgroup SRAM tile dequantization (`threadgroup bfloat s_w[64][32]`), eliminating 48 GB of intermediate DRAM dequantization traffic and delivering **143.3 to 172.0 tok/s prefill** (2.67x faster than Apple MLX) and **11.27 to 11.38 tok/s decode** with 95.1% memory bus saturation (146.0 GB/s) on Apple M6. See [README.METAL.md](README.METAL.md) and [WHITEPAPER.md](whitepaper/WHITEPAPER.md).
+- **Native Apple Silicon Metal Backend & Hardware MPP Tiled Prefill Engine**: High-performance bare-metal Apple Metal implementation utilizing Apple's native `<metal_tensor>` and `<MetalPerformancePrimitives/MetalPerformancePrimitives.h>` (`mpp::tensor_ops::matmul2d`). Features on-the-fly threadgroup SRAM tile dequantization (`threadgroup bfloat s_w[64][32]`), eliminating 48 GB of intermediate DRAM dequantization traffic and delivering **143.3 to 172.0 tok/s prefill** (2.67x faster than Apple MLX) and **11.27 to 11.38 tok/s decode** with 95.1% memory bus saturation (146.0 GB/s) on Apple M6. See [README.METAL.md](docs/README.METAL.md) and [WHITEPAPER.md](whitepaper/WHITEPAPER.md).
 - **Ultra-Fast MTP Speculative Decoding Engine (~98 tok/s)**: Native target-model Multi-Token Prediction (MTP) self-drafting with a compact 40,000-token draft vocabulary and BF16 projection head, yielding 62–74% token acceptance with only ~1.18 ms draft latency on RTX PRO 6000 Blackwell.
 - **Batched Shared-Memory DeltaNet Recurrence**: Fused `deltanet_ssm_batch_kernel` keeping head recurrence in 32 KB on-chip shared memory across verification steps, completely eliminating intermediate VRAM roundtrips and 360 redundant D2D memory copies.
 - **Prompt-Lookup Speculative Decoding (PLD)**: Zero-overhead candidate proposal via n-gram prompt matching for recurring code, templates, and patterns.
@@ -14,8 +95,8 @@ Bare-metal C++/CUDA and Apple Metal inference engine for **NVIDIA Nemotron 3.5 B
 - **O_DIRECT SSD Offloading + Pinned DRAM L2 Cache**: Seamless fallback to stream experts from NVMe / DRAM on consumer GPUs (e.g. RTX 3090 24GB).
 - **Cross-Architecture Multi-Model Support**: Safe runtime architectural gating seamlessly running Mamba-2 SSM + LatentMoE (Nemotron), DeltaNet Transformer (Qwen 3.8), and Sparse MoE + MLA (DeepSeek V4 Flash) on the same unified bare-metal engine.
 - **FrankensTin Vision & Sub-Model Visual Delegation**: High-speed, lightweight vision delegation architecture running native Qwen2.5-VL ViT (32 blocks, 4 full-attention + 28 window-attention blocks) and INT4 delegate decoder in **~3.3 GB VRAM**. Plug-and-play compatible with **any** quantized DeepSeek V4-Flash or Nemotron model, providing 100% accurate OCR and multimodal visual perception with zero fine-tuning of base weights.
-- **Zero Decode Bypass (ZDB) System 1 Non-Autoregressive Engine**: Sub-100ms structured decision making, routing, and classification bypassing 100% of memory-bandwidth-bound decode loops (`completion_tokens = 0`). Delivers **6.5x to 20.3x speedups** over standard autoregressive decoding. See [BENCHMARK_ZERO_DECODE_BYPASS.md](BENCHMARK_ZERO_DECODE_BYPASS.md) and [ARTICLE_FOLLOWUP_ZERO_DECODE_BYPASS.md](ARTICLE_FOLLOWUP_ZERO_DECODE_BYPASS.md).
-- **Static-Linked Modular Architecture & Zero-Dependency Philosophy (Rule #1)**: The end user simply runs a single executable (`moecher.exe` / `moecher`) and selects or downloads a model—no manual installations, no runtime dependencies, and no system bloatware. Any optional auxiliary tools or bridges are automatically provisioned and sandboxed inside the local workspace by `moecher` itself. Clean, decoupled translation units and `.inl` model passes allow multiple developers and AI agents to work in parallel without git merge conflicts, dynamic loading penalties, or IPC overhead. See [DEVELOPER_GUIDE.md](DEVELOPER_GUIDE.md).
+- **Zero Decode Bypass (ZDB) System 1 Non-Autoregressive Engine**: Sub-100ms structured decision making, routing, and classification bypassing 100% of memory-bandwidth-bound decode loops (`completion_tokens = 0`). Delivers **6.5x to 20.3x speedups** over standard autoregressive decoding. See [BENCHMARK_ZERO_DECODE_BYPASS.md](benchmarks/BENCHMARK_ZERO_DECODE_BYPASS.md) and [ARTICLE_FOLLOWUP_ZERO_DECODE_BYPASS.md](Articles/ARTICLE_FOLLOWUP_ZERO_DECODE_BYPASS.md).
+- **Static-Linked Modular Architecture & Zero-Dependency Philosophy (Rule #1)**: The end user simply runs a single executable (`moecher.exe` / `moecher`) and selects or downloads a model—no manual installations, no runtime dependencies, and no system bloatware. Any optional auxiliary tools or bridges are automatically provisioned and sandboxed inside the local workspace by `moecher` itself. Clean, decoupled translation units and `.inl` model passes allow multiple developers and AI agents to work in parallel without git merge conflicts, dynamic loading penalties, or IPC overhead. See [RULES.md](RULES.md) and [DEVELOPER_GUIDE.md](docs/DEVELOPER_GUIDE.md).
 - **Modern Web UI & Interactive Chat Client**: Full-featured Gemini-styled web interface with live HTML sandbox workbench, real-time reasoning traces, stop generation, ZDB quick toggle, and live TTFT/throughput telemetry.
 
 ---
@@ -101,7 +182,7 @@ flowchart TD
 
 ### Apple Silicon (Apple Mac mini, Apple M6, 24 GB Unified Memory, macOS 15+)
 
-Comprehensive GuideLLM v0.3.1 benchmark suite (see [BENCHMARKS.md](BENCHMARKS.md) and [WHITEPAPER.md](whitepaper/WHITEPAPER.md)):
+Comprehensive GuideLLM v0.3.1 benchmark suite (see [BENCHMARKS.md](benchmarks/BENCHMARKS.md) and [WHITEPAPER.md](whitepaper/WHITEPAPER.md)):
 
 #### GuideLLM Suite A (prompt_tokens=64, output_tokens=128, samples=4)
 
@@ -158,9 +239,9 @@ Benchmark conducted on **NVIDIA GeForce RTX 5060 Ti 16GB (Blackwell `sm_120a`) +
 | **llama.cpp (Full Offload `-ngl 88`)** | Stalled | **< 1.00 tok/s** | 9% GPU Util (20W) | WDDM 3.x shared memory driver paging thrash over PCIe bus. |
 
 > 📊 **Interactive Analysis & Publication Assets**:  
-> - 📄 **[LinkedIn Article Hub](linkedin_article.html)**: Publication draft with 1-click Unicode-bold formatted copy button and live feed preview.  
-> - 🎬 **[Kai-Style 1080p Video Player](kai_style_video.html)**: Interactive video viewer analyzing the 23:17 cache miss bottleneck.  
-> - 🎥 **[Download 1080p MP4 Video](kai_style_moe_benchmark.mp4)**: Full video presentation with Microsoft Azure Neural Voice narration (`en-US-ChristopherNeural`).
+> - 📄 **[LinkedIn Article Hub](Articles/linkedin_article.html)**: Publication draft with 1-click Unicode-bold formatted copy button and live feed preview.  
+> - 🎬 **[Kai-Style 1080p Video Player](presentations/kai_style_video.html)**: Interactive video viewer analyzing the 23:17 cache miss bottleneck.  
+> - 🎥 **[Download 1080p MP4 Video](presentations/kai_style_moe_benchmark.mp4)**: Full video presentation with Microsoft Azure Neural Voice narration (`en-US-ChristopherNeural`).
 
 ---
 
@@ -190,11 +271,37 @@ Depending on the prompt context and active features, you may observe generation 
 * **To run at full 100+ tok/s**: In the Web UI, open the **Agentic & Tools** settings tab and toggle off Web/Local tools (or send `"tools": []` via API). The prompt length drops from 3,156 tokens down to ~20 tokens, immediately unlocking full **100–112 tok/s** speed.
 * **Prefill Speed**: While decoding scales with active KV cache size, prefix evaluation is instantaneous (**0 ms prefill latency**) because the 3,145-token tooling prefix is pre-warmed and stored in a **Pinned System KV Cache snapshot** at startup (prefilled at **~181 tok/s**).
 
-> 📖 **Engineering & Research Journal**: For deep technical breakdowns, mathematical analyses, and root-cause post-mortems of every bug and optimization, see [tinobruno-journal.md](tinobruno-journal.md).
+> 📖 **Engineering & Research Journal**: For deep technical breakdowns, mathematical analyses, and root-cause post-mortems of every bug and optimization, see [DEVELOPMENT_JOURNAL.md](docs/notes/DEVELOPMENT_JOURNAL.md).
 
 ---
 
 ## Setup Guide
+
+### Option A: 1-Command Pre-Quantized Model Download (Recommended)
+
+When you launch `./moecher` (`.\moecher.exe`) for the first time with no local models, it automatically opens an interactive menu to download pre-quantized models from Hugging Face into `./models/`. You can also download any model package directly via [`scripts/download_model.py`](scripts/download_model.py):
+
+```bash
+# Qwen 3.8 27B Vision (13GB/16GB GPU & Apple Silicon Mode):
+python scripts/download_model.py --model qwen_13g
+
+# NVIDIA Nemotron 3.5 Lightning (30B-A3B NVFP4 + FrankensTin Vision):
+python scripts/download_model.py --model nemotron
+
+# NVIDIA Nemotron 3.5 Bolt (74B-A9B NVFP4 16GB/24GB Hybrid):
+python scripts/download_model.py --model nemotron_bolt
+
+# Qwen 3.8 27B INT4 with MTP Speculative Decoding:
+python scripts/download_model.py --model qwen
+
+# DeepSeek V4 Flash IQ2 (Standard) or Q4 (8GB GPU Mode):
+python scripts/download_model.py --model deepseek
+python scripts/download_model.py --model deepseek_q4
+```
+
+---
+
+### Option B: Custom Safetensors Conversion & Quantization Pipeline (Advanced)
 
 ### Step 1: Download DeepSeek-V4-Flash
 
@@ -277,10 +384,10 @@ Options:
 #### 1. NVIDIA Nemotron 3.5 Bolt (74B Total / 9B Active) — 16GB / 24GB Consumer GPUs
 ```bash
 # Automated download & zero-copy preparation (Windows):
-download_nemotron_bolt_24gb.bat
+scripts\launchers\download_nemotron_bolt_24gb.bat
 
 # One-click launch (Windows):
-start_nemotron_bolt_24gb.bat
+scripts\launchers\start_nemotron_bolt_24gb.bat
 
 # Or run directly via CLI (Windows / Linux):
 ./build/moecher --manifest models/nemotron_3.5_bolt_24gb/moecher_manifest.json --port 8001
@@ -292,7 +399,7 @@ start_nemotron_bolt_24gb.bat
 #### 2. NVIDIA Nemotron 3.5 Lightning (14.8B Total / 3.8B Active)
 ```bash
 # One-click launch (Windows):
-start_nemotron.bat
+scripts\launchers\start_nemotron.bat
 
 # Or via CLI (Windows / Linux):
 ./build/moecher --manifest models/nemotron_3.5_lightning/moecher_manifest.json --port 8001
@@ -314,7 +421,7 @@ start_nemotron.bat
 # On macOS (Apple M-Series / M6):
 ./build/moecher --manifest moecher_manifest.json --port 8001
 ```
-*Note: Automatically engages the native Apple Metal backend utilizing `<metal_tensor>` and `MetalPerformancePrimitives` (`mpp::tensor_ops::matmul2d`). Features on-the-fly threadgroup SRAM tile dequantization, yielding **143.3 to 172.0 tok/s prefill** and **11.38 tok/s decode** with 95.1% memory bus saturation (146.0 GB/s) on Apple M6. See [README.METAL.md](README.METAL.md).*
+*Note: Automatically engages the native Apple Metal backend utilizing `<metal_tensor>` and `MetalPerformancePrimitives` (`mpp::tensor_ops::matmul2d`). Features on-the-fly threadgroup SRAM tile dequantization, yielding **143.3 to 172.0 tok/s prefill** and **11.38 tok/s decode** with 95.1% memory bus saturation (146.0 GB/s) on Apple M6. See [README.METAL.md](docs/README.METAL.md).*
 
 #### 5. FrankensTin Vision V4 (DeepSeek-V4 Flash MoE + Qwen2.5-VL Vision Delegate)
 ```bash
@@ -344,7 +451,7 @@ start_nemotron.bat
 ### 1. Web UI (Gemini-Themed Modern Chat & Live HTML Workbench)
 
 Moecher comes with a built-in modern web interface with rich reasoning telemetry and a dedicated HTML testing workbench:
-- Open [`web/index.html`](file:///home/tinobruno/minniethemoecher/web/index.html) in your browser (or host via `python3 -m http.server 8080 --directory web`).
+- Navigate to `http://localhost:8001` in your browser once `moecher` is running (all [`web/`](web/index.html) assets are compiled directly into the `moecher` binary).
 - **Features**:
   - **Resizable HTML Preview & Test Panel**:
     - **Live Sandboxed Execution**: Run interactive HTML, CSS, JavaScript, WebGL, Canvas, and SVG applications generated by Moecher in a safe sandbox.
@@ -366,13 +473,13 @@ Connect to the server via terminal:
 
 ```bash
 # Standard interactive chat:
-python3 chat.py
+python3 scripts/chat.py
 
 # Display reasoning trace in terminal:
-python3 chat.py --show-reasoning --temperature 0.6
+python3 scripts/chat.py --show-reasoning --temperature 0.6
 
 # Custom budget and parameters:
-python3 chat.py --url http://localhost:8001 --max-tokens 2048 --temperature 0.6 --thinking-budget 8192
+python3 scripts/chat.py --url http://localhost:8001 --max-tokens 2048 --temperature 0.6 --thinking-budget 8192
 ```
 
 ### 3. OpenAI-Compatible API
@@ -463,7 +570,7 @@ print(f"Route to: {router.decision} in {router.total_ms:.1f}ms")
 | **Security Risk Audit** | 4 | **287.7 ms** | 1,870.4 ms | **6.50x** | `HIGH` (88.4%) |
 
 *With prefix caching active, hardware engine latency drops to **91.82 ms** (91.6 ms prefill + 0.22 ms slicing).*  
-*Detailed analysis: [BENCHMARK_ZERO_DECODE_BYPASS.md](BENCHMARK_ZERO_DECODE_BYPASS.md) and [ARTICLE_FOLLOWUP_ZERO_DECODE_BYPASS.md](ARTICLE_FOLLOWUP_ZERO_DECODE_BYPASS.md).*
+*Detailed analysis: [BENCHMARK_ZERO_DECODE_BYPASS.md](benchmarks/BENCHMARK_ZERO_DECODE_BYPASS.md) and [ARTICLE_FOLLOWUP_ZERO_DECODE_BYPASS.md](Articles/ARTICLE_FOLLOWUP_ZERO_DECODE_BYPASS.md).*
 
 ---
 
@@ -525,7 +632,7 @@ print(f"Route to: {router.decision} in {router.total_ms:.1f}ms")
 - **SIMD-Reduced DeltaNet A/B Projections (`deltanet_in_proj_ab_batch_kernel`)**: Vectorized projection head evaluation using SIMD horizontal reduction (`simd_sum`), reducing projection time from 1.75 ms to 0.178 ms per layer (9.8x speedup) and shaving 75 ms per prefill pass across all 48 DeltaNet layers.
 - **Fused SwiGLU Metal Pipeline**: Point-wise vectorization of SiLU activation and multiplication with memory barrier synchronization, eliminating redundant DRAM activation passes.
 - **Zero-Copy Unified Memory Architecture**: Replaced PCIe staging buffers and mirror allocations with `MTLResourceStorageModeShared`, allowing zero-copy sharing between host runtime and GPU compute pipelines.
-- **Documentation & Whitepaper**: Published comprehensive technical specification in [WHITEPAPER.md](whitepaper/WHITEPAPER.md), Apple Silicon user manual in [README.METAL.md](README.METAL.md), and full benchmark matrix in [BENCHMARKS.md](BENCHMARKS.md).
+- **Documentation & Whitepaper**: Published comprehensive technical specification in [WHITEPAPER.md](whitepaper/WHITEPAPER.md), Apple Silicon user manual in [README.METAL.md](docs/README.METAL.md), and full benchmark matrix in [BENCHMARKS.md](benchmarks/BENCHMARKS.md).
 
 ### v2.09 — Ampere-Gated Architecture, 4-Slot Speculative Rollback & Sliced KV Snapshotting
 - **Dynamic Hardware Capability Gating (`GpuCapabilities`)**: Added runtime GPU capability detection and gating ensuring 100% stability on Ampere architectures (RTX 3080/3090, CC 8.0/8.6). Bypasses unsupported hardware FP8 Tensor Core / FP4 paths and provides clean fallback paths.

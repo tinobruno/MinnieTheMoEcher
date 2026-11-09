@@ -1,0 +1,1130 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>MinnieTheMoEcher vs. Strata: Running Qwen3.8-Flash-Next on a 16 GB Consumer GPU — Tino Bruno</title>
+    <link rel="preconnect" href="https://fonts.googleapis.com">
+    <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+    <link href="https://fonts.googleapis.com/css2?family=Plus+Jakarta+Sans:ital,wght@0,300;0,400;0,500;0,600;0,700;0,800;1,400&family=Newsreader:ital,opsz,wght@0,6..72,400;0,6..72,500;0,6..72,600;1,6..72,400;1,6..72,500&family=JetBrains+Mono:wght@400;500;600;700&display=swap" rel="stylesheet">
+    <style>
+        :root {
+            --bg: #080c14;
+            --surface: #0f172a;
+            --surface-card: #131d35;
+            --surface-hover: #1c2948;
+            --border: #233358;
+            --border-highlight: #3b5080;
+            --text-primary: #f1f5f9;
+            --text-secondary: #94a3b8;
+            --text-muted: #64748b;
+            --accent-purple: #a855f7;
+            --accent-purple-glow: rgba(168, 85, 247, 0.25);
+            --accent-cyan: #38bdf8;
+            --accent-cyan-glow: rgba(56, 189, 248, 0.25);
+            --accent-green: #22c55e;
+            --accent-amber: #f59e0b;
+            --accent-red: #ef4444;
+            --radius-sm: 8px;
+            --radius-md: 14px;
+            --radius-lg: 20px;
+            --font-body: 'Newsreader', Georgia, serif;
+            --font-sans: 'Plus Jakarta Sans', -apple-system, BlinkMacSystemFont, sans-serif;
+            --font-mono: 'JetBrains Mono', monospace;
+            --content-width: 920px;
+        }
+
+        [data-theme="light"] {
+            --bg: #f8fafc;
+            --surface: #ffffff;
+            --surface-card: #f1f5f9;
+            --surface-hover: #e2e8f0;
+            --border: #cbd5e1;
+            --border-highlight: #94a3b8;
+            --text-primary: #0f172a;
+            --text-secondary: #334155;
+            --text-muted: #64748b;
+            --accent-purple: #7e22ce;
+            --accent-purple-glow: rgba(126, 34, 206, 0.15);
+            --accent-cyan: #0284c7;
+            --accent-cyan-glow: rgba(2, 132, 199, 0.15);
+        }
+
+        * {
+            box-sizing: border-box;
+            margin: 0;
+            padding: 0;
+        }
+
+        body {
+            background-color: var(--bg);
+            color: var(--text-primary);
+            font-family: var(--font-body);
+            font-size: 1.22rem;
+            line-height: 1.78;
+            -webkit-font-smoothing: antialiased;
+            text-rendering: optimizeLegibility;
+            transition: background-color 0.3s ease, color 0.3s ease;
+            background-image:
+                radial-gradient(circle at 12% 15%, rgba(56, 189, 248, 0.07) 0%, transparent 40%),
+                radial-gradient(circle at 88% 80%, rgba(168, 85, 247, 0.07) 0%, transparent 45%);
+        }
+
+        /* Top Navigation Bar */
+        .top-nav {
+            position: sticky;
+            top: 0;
+            z-index: 100;
+            background: rgba(8, 12, 20, 0.85);
+            backdrop-filter: blur(16px);
+            -webkit-backdrop-filter: blur(16px);
+            border-bottom: 1px solid var(--border);
+            padding: 12px 24px;
+            display: flex;
+            align-items: center;
+            justify-content: space-between;
+            flex-wrap: wrap;
+            gap: 12px;
+        }
+
+        [data-theme="light"] .top-nav {
+            background: rgba(255, 255, 255, 0.9);
+        }
+
+        .nav-brand {
+            font-family: var(--font-sans);
+            font-weight: 800;
+            font-size: 0.98rem;
+            display: flex;
+            align-items: center;
+            gap: 10px;
+            color: var(--text-primary);
+            text-decoration: none;
+        }
+
+        .nav-brand .badge {
+            background: linear-gradient(135deg, #38bdf8, #a855f7);
+            color: #060911;
+            font-size: 0.72rem;
+            font-weight: 800;
+            padding: 3px 9px;
+            border-radius: 6px;
+            letter-spacing: 0.5px;
+            text-transform: uppercase;
+        }
+
+        .nav-actions {
+            display: flex;
+            align-items: center;
+            gap: 8px;
+            flex-wrap: wrap;
+        }
+
+        .nav-btn {
+            font-family: var(--font-sans);
+            font-size: 0.82rem;
+            font-weight: 600;
+            padding: 7px 13px;
+            border-radius: var(--radius-sm);
+            background: var(--surface);
+            border: 1px solid var(--border);
+            color: var(--text-primary);
+            cursor: pointer;
+            display: inline-flex;
+            align-items: center;
+            gap: 6px;
+            text-decoration: none;
+            transition: all 0.2s ease;
+        }
+
+        .nav-btn:hover {
+            border-color: var(--accent-cyan);
+            background: var(--surface-hover);
+        }
+
+        .nav-btn.primary {
+            background: linear-gradient(135deg, #38bdf8, #2563eb);
+            color: #ffffff;
+            border: none;
+            box-shadow: 0 4px 14px var(--accent-cyan-glow);
+        }
+
+        .nav-btn.primary:hover {
+            filter: brightness(1.1);
+            transform: translateY(-1px);
+        }
+
+        .nav-btn.purple {
+            background: linear-gradient(135deg, #a855f7, #7c3aed);
+            color: #ffffff;
+            border: none;
+            box-shadow: 0 4px 14px var(--accent-purple-glow);
+        }
+
+        /* Article Container */
+        .article-container {
+            max-width: var(--content-width);
+            margin: 0 auto;
+            padding: 56px 24px 100px 24px;
+        }
+
+        /* Meta Tags */
+        .article-meta-tags {
+            font-family: var(--font-sans);
+            display: flex;
+            align-items: center;
+            gap: 10px;
+            margin-bottom: 22px;
+            flex-wrap: wrap;
+        }
+
+        .tag-pill {
+            font-size: 0.73rem;
+            font-weight: 700;
+            text-transform: uppercase;
+            letter-spacing: 0.8px;
+            padding: 4px 12px;
+            border-radius: 20px;
+            background: rgba(168, 85, 247, 0.15);
+            color: #d8b4fe;
+            border: 1px solid rgba(168, 85, 247, 0.35);
+        }
+
+        .tag-pill.cyan {
+            background: rgba(56, 189, 248, 0.15);
+            color: #7dd3fc;
+            border-color: rgba(56, 189, 248, 0.35);
+        }
+
+        .tag-pill.emerald {
+            background: rgba(34, 197, 94, 0.15);
+            color: #86efac;
+            border-color: rgba(34, 197, 94, 0.35);
+        }
+
+        .tag-pill.amber {
+            background: rgba(245, 158, 11, 0.15);
+            color: #fcd34d;
+            border-color: rgba(245, 158, 11, 0.35);
+        }
+
+        .article-title {
+            font-family: var(--font-sans);
+            font-size: 2.65rem;
+            font-weight: 800;
+            line-height: 1.18;
+            letter-spacing: -0.03em;
+            color: var(--text-primary);
+            margin-bottom: 20px;
+        }
+
+        .article-subtitle {
+            font-family: var(--font-sans);
+            font-size: 1.25rem;
+            font-weight: 400;
+            line-height: 1.55;
+            color: var(--text-secondary);
+            margin-bottom: 32px;
+        }
+
+        /* Author Box */
+        .author-box {
+            display: flex;
+            align-items: center;
+            justify-content: space-between;
+            flex-wrap: wrap;
+            gap: 16px;
+            padding: 18px 0;
+            border-top: 1px solid var(--border);
+            border-bottom: 1px solid var(--border);
+            margin-bottom: 42px;
+            font-family: var(--font-sans);
+        }
+
+        .author-left {
+            display: flex;
+            align-items: center;
+            gap: 14px;
+        }
+
+        .author-avatar {
+            width: 54px;
+            height: 54px;
+            border-radius: 50%;
+            background: linear-gradient(135deg, #38bdf8, #a855f7);
+            display: flex;
+            align-items: center;
+            justify-content: center;
+            font-weight: 800;
+            font-size: 1.2rem;
+            color: #090d16;
+            box-shadow: 0 4px 14px var(--accent-cyan-glow);
+            flex-shrink: 0;
+        }
+
+        .author-name {
+            font-weight: 700;
+            font-size: 1.05rem;
+            color: var(--text-primary);
+        }
+
+        .author-title {
+            font-size: 0.84rem;
+            color: var(--text-secondary);
+        }
+
+        .reading-time {
+            font-size: 0.78rem;
+            color: var(--text-muted);
+            font-family: var(--font-mono);
+        }
+
+        /* Hero KPI Banner */
+        .hero-kpi-grid {
+            display: grid;
+            grid-template-columns: repeat(4, 1fr);
+            gap: 14px;
+            margin: 32px 0 44px 0;
+            font-family: var(--font-sans);
+        }
+
+        @media (max-width: 768px) {
+            .hero-kpi-grid {
+                grid-template-columns: repeat(2, 1fr);
+            }
+            .article-title {
+                font-size: 2rem;
+            }
+        }
+
+        .kpi-card {
+            background: var(--surface-card);
+            border: 1px solid var(--border);
+            border-radius: var(--radius-md);
+            padding: 18px;
+            position: relative;
+            overflow: hidden;
+        }
+
+        .kpi-card::before {
+            content: "";
+            position: absolute;
+            top: 0;
+            left: 0;
+            width: 4px;
+            height: 100%;
+            background: var(--accent-cyan);
+        }
+
+        .kpi-card.emerald::before { background: var(--accent-green); }
+        .kpi-card.purple::before { background: var(--accent-purple); }
+        .kpi-card.amber::before { background: var(--accent-amber); }
+
+        .kpi-label {
+            font-size: 0.72rem;
+            font-weight: 700;
+            text-transform: uppercase;
+            letter-spacing: 0.06em;
+            color: var(--text-secondary);
+        }
+
+        .kpi-value {
+            font-family: var(--font-mono);
+            font-size: 1.65rem;
+            font-weight: 800;
+            color: var(--text-primary);
+            margin: 6px 0 4px 0;
+        }
+
+        .kpi-sub {
+            font-size: 0.76rem;
+            color: var(--accent-cyan);
+            font-family: var(--font-mono);
+        }
+
+        .kpi-card.emerald .kpi-sub { color: var(--accent-green); }
+        .kpi-card.purple .kpi-sub { color: #d8b4fe; }
+        .kpi-card.amber .kpi-sub { color: var(--accent-amber); }
+
+        /* Headings & Paragraphs */
+        h2 {
+            font-family: var(--font-sans);
+            font-size: 1.75rem;
+            font-weight: 800;
+            letter-spacing: -0.02em;
+            color: var(--text-primary);
+            margin: 52px 0 18px 0;
+            line-height: 1.28;
+            display: flex;
+            align-items: center;
+            gap: 12px;
+        }
+
+        h2::before {
+            content: "";
+            display: inline-block;
+            width: 5px;
+            height: 1.15em;
+            background: linear-gradient(180deg, var(--accent-cyan), var(--accent-purple));
+            border-radius: 3px;
+            flex-shrink: 0;
+        }
+
+        h3 {
+            font-family: var(--font-sans);
+            font-size: 1.32rem;
+            font-weight: 700;
+            color: var(--text-primary);
+            margin: 34px 0 14px 0;
+        }
+
+        p {
+            margin-bottom: 22px;
+            color: var(--text-primary);
+        }
+
+        ul, ol {
+            margin: 0 0 24px 24px;
+        }
+
+        li {
+            margin-bottom: 10px;
+        }
+
+        strong {
+            font-weight: 700;
+            color: var(--text-primary);
+        }
+
+        code {
+            font-family: var(--font-mono);
+            font-size: 0.86em;
+            background: rgba(56, 189, 248, 0.12);
+            color: var(--accent-cyan);
+            padding: 2px 6px;
+            border-radius: 5px;
+        }
+
+        blockquote {
+            font-family: var(--font-sans);
+            font-size: 1.1rem;
+            font-style: italic;
+            background: var(--surface-card);
+            border-left: 4px solid var(--accent-purple);
+            padding: 20px 24px;
+            border-radius: 0 var(--radius-md) var(--radius-md) 0;
+            margin: 28px 0;
+            color: var(--text-primary);
+        }
+
+        /* Tables */
+        .table-wrapper {
+            overflow-x: auto;
+            margin: 28px 0 36px 0;
+            border-radius: var(--radius-md);
+            border: 1px solid var(--border);
+            background: var(--surface-card);
+        }
+
+        table {
+            width: 100%;
+            border-collapse: collapse;
+            font-family: var(--font-sans);
+            font-size: 0.88rem;
+        }
+
+        th {
+            background: rgba(15, 23, 42, 0.85);
+            color: var(--text-secondary);
+            font-weight: 700;
+            text-transform: uppercase;
+            font-size: 0.73rem;
+            letter-spacing: 0.05em;
+            padding: 13px 15px;
+            text-align: left;
+            border-bottom: 1px solid var(--border);
+        }
+
+        [data-theme="light"] th {
+            background: #e2e8f0;
+            color: #1e293b;
+        }
+
+        td {
+            padding: 12px 15px;
+            border-bottom: 1px solid rgba(255, 255, 255, 0.05);
+            color: var(--text-primary);
+        }
+
+        [data-theme="light"] td {
+            border-bottom: 1px solid #cbd5e1;
+        }
+
+        tr:last-child td {
+            border-bottom: none;
+        }
+
+        tr.highlight-row td {
+            background: rgba(56, 189, 248, 0.08);
+            font-weight: 600;
+        }
+
+        .mono-val {
+            font-family: var(--font-mono);
+            font-weight: 700;
+        }
+
+        .text-cyan { color: var(--accent-cyan); }
+        .text-green { color: var(--accent-green); }
+        .text-purple { color: #c084fc; }
+        .text-amber { color: var(--accent-amber); }
+        .text-red { color: var(--accent-red); }
+
+        /* Architecture Diagram / Code Box */
+        .arch-diagram {
+            background: #060911;
+            border: 1px solid var(--border-highlight);
+            border-radius: var(--radius-md);
+            padding: 22px 24px;
+            margin: 26px 0;
+            font-family: var(--font-mono);
+            font-size: 0.82rem;
+            line-height: 1.6;
+            color: #e2e8f0;
+            overflow-x: auto;
+            white-space: pre;
+        }
+
+        /* Visual Bar Chart Card */
+        .chart-card {
+            background: var(--surface-card);
+            border: 1px solid var(--border);
+            border-radius: var(--radius-md);
+            padding: 24px;
+            margin: 30px 0;
+            font-family: var(--font-sans);
+        }
+
+        .chart-card-title {
+            font-size: 0.95rem;
+            font-weight: 800;
+            text-transform: uppercase;
+            letter-spacing: 0.05em;
+            color: var(--accent-cyan);
+            margin-bottom: 18px;
+            display: flex;
+            justify-content: space-between;
+            align-items: center;
+            flex-wrap: wrap;
+            gap: 8px;
+        }
+
+        .bar-row {
+            margin-bottom: 15px;
+        }
+
+        .bar-label {
+            display: flex;
+            justify-content: space-between;
+            font-size: 0.85rem;
+            margin-bottom: 6px;
+            gap: 12px;
+        }
+
+        .bar-track {
+            height: 20px;
+            background: rgba(255, 255, 255, 0.06);
+            border-radius: 10px;
+            overflow: hidden;
+        }
+
+        [data-theme="light"] .bar-track {
+            background: #cbd5e1;
+        }
+
+        .bar-fill {
+            height: 100%;
+            border-radius: 10px;
+        }
+
+        .bar-cyan { background: linear-gradient(90deg, #0ea5e9, #38bdf8); }
+        .bar-emerald { background: linear-gradient(90deg, #10b981, #34d399); }
+        .bar-purple { background: linear-gradient(90deg, #8b5cf6, #c084fc); }
+        .bar-amber { background: linear-gradient(90deg, #d97706, #fbbf24); }
+        .bar-red { background: linear-gradient(90deg, #dc2626, #f87171); }
+
+        /* LinkedIn Post Hub Section */
+        .linkedin-hub {
+            margin-top: 64px;
+            padding-top: 44px;
+            border-top: 2px solid var(--border);
+            font-family: var(--font-sans);
+        }
+
+        .hub-grid {
+            display: grid;
+            grid-template-columns: 1fr 420px;
+            gap: 24px;
+            margin-top: 24px;
+            align-items: start;
+        }
+
+        @media (max-width: 900px) {
+            .hub-grid {
+                grid-template-columns: 1fr;
+            }
+        }
+
+        .post-editor-box {
+            background: var(--surface-card);
+            border: 1px solid var(--border);
+            border-radius: var(--radius-md);
+            padding: 22px;
+        }
+
+        .post-text-area {
+            font-family: var(--font-sans);
+            font-size: 0.92rem;
+            line-height: 1.65;
+            color: var(--text-primary);
+            white-space: pre-wrap;
+            background: rgba(8, 12, 20, 0.6);
+            border: 1px solid var(--border);
+            border-radius: var(--radius-sm);
+            padding: 18px;
+            max-height: 540px;
+            overflow-y: auto;
+        }
+
+        [data-theme="light"] .post-text-area {
+            background: #ffffff;
+        }
+
+        .linkedin-mockup {
+            background: #1b1f23;
+            border: 1px solid #30363d;
+            border-radius: 12px;
+            box-shadow: 0 12px 36px rgba(0, 0, 0, 0.45);
+            overflow: hidden;
+            color: #e6edf3;
+        }
+
+        .linkedin-header {
+            padding: 14px 16px;
+            display: flex;
+            gap: 12px;
+            align-items: center;
+            border-bottom: 1px solid #282e33;
+        }
+
+        .linkedin-content {
+            padding: 16px;
+            font-size: 0.86rem;
+            line-height: 1.55;
+            max-height: 440px;
+            overflow-y: auto;
+            white-space: pre-wrap;
+        }
+
+        .linkedin-footer {
+            padding: 10px 16px;
+            border-top: 1px solid #282e33;
+            display: flex;
+            justify-content: space-around;
+            color: #8c98a4;
+            font-size: 0.8rem;
+            font-weight: 600;
+        }
+
+        .toast {
+            position: fixed;
+            bottom: 28px;
+            right: 28px;
+            background: #10b981;
+            color: #ffffff;
+            font-family: var(--font-sans);
+            font-size: 0.9rem;
+            font-weight: 700;
+            padding: 12px 22px;
+            border-radius: 10px;
+            box-shadow: 0 10px 28px rgba(0, 0, 0, 0.5);
+            transform: translateY(100px);
+            opacity: 0;
+            transition: all 0.3s ease;
+            z-index: 999;
+        }
+
+        .toast.show {
+            transform: translateY(0);
+            opacity: 1;
+        }
+    </style>
+</head>
+<body>
+
+    <!-- Top Navigation Bar -->
+    <nav class="top-nav">
+        <a href="#" class="nav-brand">
+            <span class="badge">Minnie v2.09</span>
+            <span>Qwen3.8-Flash-Next (54.4 GiB) vs. Strata • LinkedIn Article & Post Hub</span>
+        </a>
+        <div class="nav-actions">
+            <a href="../benchmarks/BENCHMARK_MINNIE_VS_STRATA.md" class="nav-btn" target="_blank">📄 Raw Markdown (.md)</a>
+            <button class="nav-btn" onclick="toggleTheme()">🌓 Theme</button>
+            <button class="nav-btn purple" onclick="copyFullArticleMarkdown()">📋 Copy Article Markdown</button>
+            <button class="nav-btn primary" onclick="copyLinkedInFeedPost()">⚡ Copy LinkedIn Post (1-Click)</button>
+        </div>
+    </nav>
+
+    <!-- Main Article Container -->
+    <article class="article-container" id="fullArticleBody">
+
+        <div class="article-meta-tags">
+            <span class="tag-pill cyan">Qwen3.8-Flash-Next (54.4 GiB)</span>
+            <span class="tag-pill emerald">RTX 5060 Ti 16GB GDDR7</span>
+            <span class="tag-pill">32GB DDR5 Windows 11</span>
+            <span class="tag-pill amber">MinnieTheMoEcher vs. Strata</span>
+        </div>
+
+        <h1 class="article-title">
+            MinnieTheMoEcher vs. Strata: Running 125B+ Qwen3.8-Flash-Next on a 16 GB Consumer GPU (6.0× Faster Out-of-the-Box)
+        </h1>
+
+        <p class="article-subtitle">
+            How MinnieTheMoEcher beats Strata out-of-the-box by 6.0× (20.74 tok/s vs. 3.42 tok/s), why we had to write an external Windows kernel VirtualAlloc script just to give Strata a fair second chance (20.26 tok/s), and why CPU expert decoding yields only a trivial ~3.4% speedup while risking overall system responsiveness.
+        </p>
+
+        <div class="author-box">
+            <div class="author-left">
+                <div class="author-avatar">TB</div>
+                <div>
+                    <div class="author-name">Tino Bruno</div>
+                    <div class="author-title">AI Architect & High-Performance Compute Engineer • Author of MinnieTheMoEcher</div>
+                </div>
+            </div>
+            <div class="reading-time">7 MIN READ • BARE-METAL BENCHMARK & SOURCE ANALYSIS</div>
+        </div>
+
+        <!-- Hero KPI Summary Cards -->
+        <div class="hero-kpi-grid">
+            <div class="kpi-card">
+                <div class="kpi-label">Minnie (--cpu-experts)</div>
+                <div class="kpi-value">20.74 tok/s</div>
+                <div class="kpi-sub">6.0× vs Stock Strata (3.42 t/s)</div>
+            </div>
+            <div class="kpi-card emerald">
+                <div class="kpi-label">Minnie (Pure GPU Mode)</div>
+                <div class="kpi-value">20.06 tok/s</div>
+                <div class="kpi-sub">97% Speed • 0% CPU Load</div>
+            </div>
+            <div class="kpi-card purple">
+                <div class="kpi-label">Strata (+ External Hack)</div>
+                <div class="kpi-value">20.26 tok/s</div>
+                <div class="kpi-sub">76s Load (vs Minnie 18s)</div>
+            </div>
+            <div class="kpi-card amber">
+                <div class="kpi-label">CPU Offload Net Gain</div>
+                <div class="kpi-value">+3.4%</div>
+                <div class="kpi-sub">-26% (14.72 t/s) if Overused!</div>
+            </div>
+        </div>
+
+        <p>
+            <strong>Executive Summary:</strong> When running the massive <strong>Qwen3.8-Flash-Next (<code>GSQ-RCO-IQ1_M</code>, 54.4 GiB total footprint)</strong> on a mainstream consumer Windows PC (<strong>NVIDIA RTX 5060 Ti 16 GB + 32 GB DDR5 RAM</strong>), <strong>MinnieTheMoEcher (<code>moecher.exe</code>) is 6.0× faster out-of-the-box than Strata (<code>20.74 tok/s</code> vs. <code>3.42 tok/s</code>)</strong>.
+        </p>
+
+        <p>
+            Even after we reverse-engineered Strata's C++ source code, discovered why its heavily advertised <em>"Zero-Config Hardware Planner"</em> fails on Windows, and wrote an external <code>VirtualAlloc</code> memory-balloon script to give Strata a fair second chance (<code>20.26 tok/s</code>), <strong>MinnieTheMoEcher still beats Strata in both pure GPU mode (<code>20.06 tok/s</code>, 4.2× faster startup) and hybrid mode (<code>20.74 tok/s</code>)</strong>.
+        </p>
+
+        <p>
+            Most importantly, our controlled hardware experiments prove a critical architectural lesson for local MoE inference: <strong>offloading MoE expert computation to the CPU yields only a trivial ~3.4% decode speedup (<code>20.06</code> → <code>20.74 tok/s</code>) when surgically constrained—and actually slows inference down by 26% (<code>14.72 tok/s</code>) if overused—while burning 8–12 CPU cores and risking overall PC responsiveness.</strong>
+        </p>
+
+        <h2>1. The Head-to-Head Benchmark Results</h2>
+
+        <p>
+            All benchmarks were executed on the exact same hardware and deterministic greedy prompt:
+        </p>
+        <ul>
+            <li><strong>Model:</strong> <code>ISTA-DASLab/Qwen3.8-Flash-Next-GSQ-RCO-Coder-GGUF</code> (<code>IQ1_M</code>, 48 layers, 256 routed experts/layer, Top-10 active, <code>27.58 GiB</code> Transformer/MoE shard + <code>26.82 GiB</code> PLE N-gram table = <strong><code>54.40 GiB</code> total</strong>)</li>
+            <li><strong>GPU:</strong> NVIDIA GeForce RTX 5060 Ti (<code>16 GB</code> GDDR7, Blackwell <code>sm_120</code>, <code>896 GB/s</code> bandwidth)</li>
+            <li><strong>System RAM:</strong> 32 GB DDR5 (Windows 11 WDDM, ~12 GB Pinned RAM hardware limit)</li>
+            <li><strong>Prompt:</strong> <code>"Write a fast C++ function to check if an integer is prime."</code> (<code>37</code> prompt tokens, <code>128</code> generated tokens, <code>temp = 0.0</code> greedy, thinking disabled)</li>
+        </ul>
+
+        <div class="table-wrapper">
+            <table>
+                <thead>
+                    <tr>
+                        <th>Rank</th>
+                        <th>Engine & Configuration</th>
+                        <th>Decode Speed</th>
+                        <th>Latency / Tok</th>
+                        <th>Prefill Speed</th>
+                        <th>Load Time</th>
+                        <th>Works Out-of-the-Box?</th>
+                    </tr>
+                </thead>
+                <tbody>
+                    <tr class="highlight-row">
+                        <td class="mono-val text-cyan">🥇 1</td>
+                        <td><strong>MinnieTheMoEcher (<code>--cpu-experts</code>)</strong></td>
+                        <td class="mono-val text-cyan">20.74 tok/s</td>
+                        <td class="mono-val">48.2 ms</td>
+                        <td class="mono-val text-cyan">27.31 tok/s</td>
+                        <td class="mono-val text-green">~18.0 s</td>
+                        <td><strong class="text-green">Yes (Zero Config)</strong></td>
+                    </tr>
+                    <tr>
+                        <td class="mono-val text-purple">🥈 2</td>
+                        <td><strong>Strata <code>v0.1.58</code> (Tuned + External Pagefile Hack)</strong></td>
+                        <td class="mono-val text-purple">20.26 tok/s</td>
+                        <td class="mono-val">49.4 ms</td>
+                        <td class="mono-val">27.37 tok/s</td>
+                        <td class="mono-val text-amber">~76.0 s</td>
+                        <td><span class="text-amber">No (Requires external VirtualAlloc script + env var)</span></td>
+                    </tr>
+                    <tr class="highlight-row">
+                        <td class="mono-val text-green">🥉 3</td>
+                        <td><strong>MinnieTheMoEcher (<code>--no-cpu-experts</code>, Pure GPU)</strong></td>
+                        <td class="mono-val text-green">20.06 tok/s</td>
+                        <td class="mono-val">49.8 ms</td>
+                        <td class="mono-val text-green">25.87 tok/s</td>
+                        <td class="mono-val text-green">~18.0 s</td>
+                        <td><strong class="text-green">Yes (Zero Config • 0% CPU Load)</strong></td>
+                    </tr>
+                    <tr>
+                        <td class="mono-val">4</td>
+                        <td><strong>MinnieTheMoEcher (Aggressive CPU: 2 Misses/Layer)</strong></td>
+                        <td class="mono-val text-amber">14.72 tok/s</td>
+                        <td class="mono-val">67.9 ms</td>
+                        <td class="mono-val">12.98 tok/s</td>
+                        <td class="mono-val">~18.0 s</td>
+                        <td>Illustrates CPU bottleneck & L1 LRU cache starvation</td>
+                    </tr>
+                    <tr>
+                        <td class="mono-val">5</td>
+                        <td><strong>Strata <code>v0.1.58</code> (<code>STRATA_RESIDENT_HEADROOM_GIB=0.2</code>)</strong></td>
+                        <td class="mono-val text-amber">8.59 tok/s</td>
+                        <td class="mono-val">116.4 ms</td>
+                        <td class="mono-val">5.70 tok/s</td>
+                        <td class="mono-val">~51.0 s</td>
+                        <td><span class="text-amber">No (Undocumented env var; reads 282 MB/tok from SSD)</span></td>
+                    </tr>
+                    <tr>
+                        <td class="mono-val text-red">6</td>
+                        <td><strong>Strata <code>v0.1.58</code> (Stock <code>--resident-experts</code>)</strong></td>
+                        <td class="mono-val text-red">3.42 tok/s</td>
+                        <td class="mono-val">292.8 ms</td>
+                        <td class="mono-val">5.40 tok/s</td>
+                        <td class="mono-val">~45.0 s</td>
+                        <td><span class="text-red">Default Windows Experience — 6.0× slower than Minnie</span></td>
+                    </tr>
+                </tbody>
+            </table>
+        </div>
+
+        <!-- Visual Comparison Bars -->
+        <div class="chart-card">
+            <div class="chart-card-title">
+                <span>Autoregressive Decode Speed Comparison (tok/s)</span>
+                <span style="font-family: var(--font-mono); font-size: 0.78rem; color: var(--text-secondary);">Qwen3.8-Flash-Next (54.4 GiB) on RTX 5060 Ti 16GB</span>
+            </div>
+
+            <div class="bar-row">
+                <div class="bar-label">
+                    <span><strong>🥇 MinnieTheMoEcher (--cpu-experts, Surgical Tail Offload — Out-of-the-Box)</strong></span>
+                    <span class="mono-val text-cyan">20.74 tok/s (18s load)</span>
+                </div>
+                <div class="bar-track"><div class="bar-fill bar-cyan" style="width: 100%;"></div></div>
+            </div>
+
+            <div class="bar-row">
+                <div class="bar-label">
+                    <span><strong>🥈 Strata v0.1.58 (Rescued via External VirtualAlloc Pagefile Script + Env Override)</strong></span>
+                    <span class="mono-val text-purple">20.26 tok/s (76s load)</span>
+                </div>
+                <div class="bar-track"><div class="bar-fill bar-purple" style="width: 97.7%;"></div></div>
+            </div>
+
+            <div class="bar-row">
+                <div class="bar-label">
+                    <span><strong>🥉 MinnieTheMoEcher (--no-cpu-experts, Pure GPU Mode — Out-of-the-Box, 0 CPU Load)</strong></span>
+                    <span class="mono-val text-green">20.06 tok/s (18s load)</span>
+                </div>
+                <div class="bar-track"><div class="bar-fill bar-emerald" style="width: 96.7%;"></div></div>
+            </div>
+
+            <div class="bar-row">
+                <div class="bar-label">
+                    <span><strong>MinnieTheMoEcher (Aggressive CPU Offload: Up to 2 Misses/Layer — L1 LRU Starved)</strong></span>
+                    <span class="mono-val text-amber">14.72 tok/s</span>
+                </div>
+                <div class="bar-track"><div class="bar-fill bar-amber" style="width: 71.0%;"></div></div>
+            </div>
+
+            <div class="bar-row">
+                <div class="bar-label">
+                    <span><strong>Strata v0.1.58 (With STRATA_RESIDENT_HEADROOM_GIB=0.2 Override Only)</strong></span>
+                    <span class="mono-val text-amber">8.59 tok/s</span>
+                </div>
+                <div class="bar-track"><div class="bar-fill bar-amber" style="width: 41.4%;"></div></div>
+            </div>
+
+            <div class="bar-row" style="margin-bottom: 0;">
+                <div class="bar-label">
+                    <span><strong>Strata v0.1.58 (Stock Out-of-the-Box --resident-experts — 367.7 MB/tok SSD Thrashing)</strong></span>
+                    <span class="mono-val text-red">3.42 tok/s</span>
+                </div>
+                <div class="bar-track"><div class="bar-fill bar-red" style="width: 16.5%;"></div></div>
+            </div>
+        </div>
+
+        <h2>2. How Strata's "Zero-Config Planner" Failed on Windows (And How We Gave It a Second Chance)</h2>
+
+        <p>
+            Strata gained traction online for claiming a <em>"Zero-Config Hardware Planner"</em> that automatically budgets VRAM, System RAM, and SSD storage. Yet when we ran stock <code>strata.exe</code> on our 16 GB VRAM + 32 GB RAM Windows PC, it crawled at <strong><code>3.42 tok/s</code></strong>—reading <strong><code>367.7 MB per token</code> (<code>47.1 GB</code> over 128 tokens)</strong> from the SSD despite <code>15.7 GiB</code> of physical DDR5 RAM sitting completely free.
+        </p>
+
+        <p>
+            Instead of stopping there and declaring an easy 6× victory, we inspected Strata's C++ source code (<code>src/core/expert_source.cpp</code>) to understand why it failed and give Strata a second chance.
+        </p>
+
+        <h3>The Bug Inside Strata's Memory Planner</h3>
+        <p>
+            In <code>FileExpertSource</code>, before allocating host RAM for the experts that do not fit in VRAM (<code>~14.5 GiB</code>), Strata queries the Windows kernel via <code>GlobalMemoryStatusEx()</code> and computes:
+        </p>
+
+        <div class="arch-diagram">// Strata's check BEFORE allocating RAM (src/core/expert_source.cpp):
+const uint64_t available = std::min(physical_free, ullAvailPageFile);
+const uint64_t budget    = available > headroom_bytes ? available - headroom_bytes : 0;
+if (bytes > budget) return false; // Refuses to use RAM and falls back to SSD mmap!</div>
+
+        <p>
+            On Windows, the default virtual memory setting is <strong>"Automatically manage paging file size for all drives"</strong>. Under this setting:
+        </p>
+        <ol>
+            <li><code>MEMORYSTATUSEX::ullAvailPageFile</code> does <strong>not</strong> report the maximum size to which Windows can grow <code>pagefile.sys</code>. It only reports the remaining commit charge inside the <em>currently allocated</em> <code>pagefile.sys</code>.</li>
+            <li>Windows only expands <code>pagefile.sys</code> lazily when a process actually invokes <code>VirtualAlloc</code> or <code>malloc</code>.</li>
+            <li>Because CUDA's WDDM allocations (<code>~9 GiB</code> of VRAM + dense weights) also reserve system commit charge, <code>ullAvailPageFile</code> temporarily reads <code>~2.5–4.2 GiB</code> right after GPU initialization—even though <code>15.7 GiB</code> of physical RAM is completely free!</li>
+            <li>Because Strata checks <code>ullAvailPageFile</code> <strong>before</strong> calling <code>malloc</code>—and aborts if it looks too small—Windows is never triggered to expand <code>pagefile.sys</code>. Strata concludes the machine is out of memory, refuses to allocate a single byte of RAM, and falls back to thrashing the SSD at <strong><code>3.42 tok/s</code></strong>.</li>
+        </ol>
+
+        <p>
+            Even when we set Strata's internal override <code>STRATA_RESIDENT_HEADROOM_GIB=0.2</code>, Strata only locked <code>3.09 GiB</code> of experts in RAM and ran at <strong><code>8.59 tok/s</code></strong>.
+        </p>
+
+        <h3>The External Trick We Wrote to Rescue Strata</h3>
+        <p>
+            Because Windows immediately shrinks its dynamic commit limit as soon as a helper process exits, simply running a pre-allocation script <em>before</em> <code>strata.exe</code> did not work either. To force Strata into its full in-RAM mode, we had to write a <strong>background PowerShell job that repeatedly injected <code>16 GiB</code> <code>VirtualAlloc(MEM_COMMIT)</code> calls via Python <code>ctypes</code> every 5 seconds while <code>strata.exe</code> was booting</strong>, timed to inflate <code>ullAvailPageFile</code> at the exact moment <code>strata.exe</code> executed its safety check.
+        </p>
+
+        <p>
+            Only with that external kernel commit-balloon trick running alongside <code>strata.exe</code> did Strata load all <code>15.69 GiB</code> of off-VRAM experts into RAM and reach <strong><code>20.26 tok/s</code></strong> (after a <strong><code>76-second</code> startup time</strong>).
+        </p>
+
+        <p>
+            By contrast, <strong>MinnieTheMoEcher (<code>moecher.exe</code>)</strong> allocates its L2 Pinned and L2.5 Unpinned expert pools directly, allowing Windows to expand its commit limit naturally on demand. It starts up in <strong><code>18 seconds</code></strong> (4.2× faster than Strata) and hits <strong><code>20.06 – 20.74 tok/s</code> right out of the box with zero hacks</strong>.
+        </p>
+
+        <h2>3. Architectural Deep Dive: Why MinnieTheMoEcher Wins</h2>
+
+        <p>
+            In the <strong>MinnieTheMoEcher</strong> architecture for <code>Qwen3.8-Flash-Next</code>, the model is separated into native pre-packed binary tiers:
+        </p>
+
+        <ul>
+            <li><strong><code>resident.bin</code> (<code>2.76 GiB</code>):</strong> All dense/resident weights (Embeddings, 36 Gated DeltaNet linear attention layers, 12 Qwen Sparse Attention layers, 4-stream Hyper-Connection norms/projections, Routers, Shared Experts, Layer-1 PLE projections, and the <code>Q6_K</code> Output Head). Uploaded 100% into VRAM at startup and immediately unmapped.</li>
+            <li><strong><code>experts.bin</code> (<code>23.42 GiB</code>, 12,288 contiguous <code>[Gate | Up | Down]</code> expert blobs) + <code>expert_freq.bin</code>:</strong>
+                <ul>
+                    <li><strong>Tier 1a — Static Hot L1 VRAM (<code>~7.5 GiB</code>, ~3,916 experts):</strong> The empirically hottest experts across all 48 layers (with a guaranteed per-layer floor) live permanently in GDDR7 VRAM (<code>896 GB/s</code>).</li>
+                    <li><strong>Tier 1b — Dynamic LRU L1 VRAM (<code>1.65 GiB</code>, 864 slots = 18 slots/layer):</strong> Pre-warmed at startup and dynamically updated on every token using O(1) per-layer LRU tables. Because autoregressive generation has strong <strong>temporal locality</strong> (consecutive tokens in code or prose activate nearly the same experts for 5–15 tokens in a row), <strong>Tier 1a + Tier 1b achieve a <code>77.3% – 78.3%</code> L1 VRAM hit rate</strong>!</li>
+                    <li><strong>Tier 2 — L2 Pinned Host RAM (<code>10.00 GiB</code>, 5,226 warm experts):</strong> Stored in page-locked <code>cudaMallocHost</code> memory (safely below Windows WDDM's 12 GB pinned ceiling) for zero-copy asynchronous PCIe DMA (<code>st.copy_stream</code>) overlapped with GPU L1-Hit compute.</li>
+                    <li><strong>Tier 2.5 — L2.5 Unpinned Host RAM (<code>~5.9 GiB</code>, ~3,146 coldest experts):</strong> Stored in standard physical DDR5 RAM (<code>std::malloc</code>), completely bypassing the Windows WDDM pinned-memory limit with <strong>zero SSD reads (<code>0.0 MB/tok</code>)</strong>.</li>
+                    <li><strong>Tier 3 — L3 NVMe SSD Fallback:</strong> Only used on machines with <code>&lt; 32 GB</code> system RAM; on 32 GB+ systems, <code>experts.bin</code> is closed right after startup.</li>
+                </ul>
+            </li>
+        </ul>
+
+        <h2>4. The Truth About CPU Expert Computing: Trivial Gains vs. System Responsiveness Risks</h2>
+
+        <p>
+            A central claim of hybrid engines like Strata is that computing VRAM-missed MoE experts on the CPU in system RAM is a major breakthrough. To test this scientifically inside <code>MinnieTheMoEcher</code>, we built a lock-free <strong>AVX2 + F16C + FMA CPU MoE Expert Pool</strong> supporting all 16 GGML/GSQ quantization formats (<code>IQ1_M</code>, <code>IQ2_XXS</code>, <code>IQ2_XS</code>, <code>IQ2_S</code>, <code>IQ3_XXS</code>, <code>IQ3_S</code>, <code>IQ4_NL</code>, <code>IQ4_XS</code>, <code>Q2_0</code>, <code>Q4_K</code>, <code>Q5_K</code>, <code>Q6_K</code>, etc.) and tested three regimes:
+        </p>
+
+        <h3>Regime A: Pure GPU Execution (<code>--no-cpu-experts</code>) → <code>20.06 tok/s</code></h3>
+        <p>
+            All 10 routed experts per layer are computed on the GPU. The ~7.8 experts already in L1 VRAM execute immediately on <code>main_stream_</code> (<code>~25 µs</code>), while the ~2.2 missed experts are streamed over PCIe into the <strong>L1 Dynamic LRU VRAM cache</strong> on <code>st.copy_stream</code>. Result: <strong><code>20.06 tok/s</code> decode (<code>49.8 ms/token</code>)</strong>, with minimal CPU usage, leaving the PC completely cool, quiet, and responsive.
+        </p>
+
+        <h3>Regime B: Aggressive CPU Offload (Up to 2 Misses/Layer on CPU) → <code>14.72 tok/s</code> (26% SLOWER!)</h3>
+        <p>
+            When we let the CPU compute <code>15.2%</code> of experts (up to 2 misses per layer), decode speed <strong>dropped from <code>20.06 tok/s</code> down to <code>14.72 tok/s</code></strong>! Why does heavy CPU compute hurt a fast MoE engine?
+        </p>
+        <ol>
+            <li><strong>It Starves the L1 Dynamic LRU VRAM Cache:</strong> In a true dynamic-LRU MoE engine like <code>MinnieTheMoEcher</code>, streaming a missed expert over PCIe to the GPU doesn't just compute it for token <code>t</code>—it <strong>caches that expert in L1 VRAM (<code>896 GB/s</code>) for tokens <code>t+1, t+2, t+3</code></strong>. When the CPU computes that expert in RAM instead, the expert never enters VRAM. On our benchmark, aggressive CPU offload caused the L1 VRAM hit rate to <strong>drop from <code>78.3%</code> down to <code>72.8%</code></strong>, creating <strong>4,356 extra cache misses</strong>!</li>
+            <li><strong>OS Scheduler & WDDM Preemption Jitter:</strong> Running 48 layer synchronizations per token across 10–12 CPU threads means that if Windows or the NVIDIA WDDM driver preempts even a single CPU thread for <code>300 µs</code> to handle desktop UI, browser tabs, or audio, the entire inference pipeline stalls waiting for the CPU.</li>
+            <li><strong>CPU Saturation:</strong> Hammering all DDR5 channels and 10+ AVX2 cores continuously at <code>100%</code> utilization turns the CPU into a space heater and introduces noticeable lag into other applications running on the PC.</li>
+        </ol>
+
+        <h3>Regime C: Surgical CPU Tail-Miss Offload (<code>--cpu-experts</code>) → <code>20.74 tok/s</code> (+3.4% Decode Gain)</h3>
+        <p>
+            To make CPU offload net-positive, we restricted scheduling so that warm <code>L2 Pinned RAM</code> misses are <strong>never</strong> intercepted by the CPU (preserving L1 Dynamic LRU VRAM caching), and <strong>only a single cold <code>L2.5 Unpinned RAM</code> tail miss (<code>orig_k &gt;= 7</code> when <code>n_misses &gt;= 2</code>)</strong> is computed by the CPU AVX2 pool while the PCIe bus is already busy transferring a higher-priority miss.
+        </p>
+
+        <blockquote>
+            "Even with lock-free work-unit completion counters, zero-copy mapped output fusion, and surgical tail-only scheduling (2.1% of experts computed on CPU), CPU expert decoding only adds +0.68 tok/s (20.06 → 20.74 tok/s, a ~3.4% decode improvement). Meanwhile, pure GPU mode (--no-cpu-experts at 20.06 tok/s) achieves 97% of the speed without spinning up 10 AVX2 worker threads—preserving full system responsiveness."
+        </blockquote>
+
+        <!-- LinkedIn Feed Post Copy & Preview Hub -->
+        <section class="linkedin-hub">
+            <h2>5. Ready-to-Publish LinkedIn Feed Post (1-Click Unicode Bold)</h2>
+            <p>
+                Use the button below to copy the formatted LinkedIn feed post with automatic Unicode bold headers, or click <strong>Copy Article Markdown</strong> in the top bar for LinkedIn Articles.
+            </p>
+
+            <div class="hub-grid">
+                <div class="post-editor-box">
+                    <div style="display: flex; justify-content: space-between; align-items: center; margin-bottom: 14px; flex-wrap: wrap; gap: 10px;">
+                        <span style="font-weight: 700; font-size: 0.95rem;">📄 LinkedIn Feed Post Draft</span>
+                        <div style="display: flex; gap: 8px;">
+                            <button class="nav-btn" onclick="copyPlainPost()">Copy Plain</button>
+                            <button class="nav-btn primary" onclick="copyLinkedInFeedPost()">⚡ Copy 1-Click for LinkedIn</button>
+                        </div>
+                    </div>
+                    <div class="post-text-area" id="linkedinPostRaw">How fast can a consumer *16 GB GPU + 32 GB RAM Windows PC* run the massive *Qwen3.8-Flash-Next (54.4 GiB total footprint, 12,288 routed experts)*—and does offloading MoE experts to the CPU actually help?
+
+We ran a head-to-head bare-metal benchmark comparing *MinnieTheMoEcher v2.09* against *Strata v0.1.58* on an *NVIDIA RTX 5060 Ti 16 GB GDDR7 + 32 GB DDR5* system.
+
+Right out of the box, *MinnieTheMoEcher is 6.0× faster than Strata (20.74 tok/s vs. 3.42 tok/s)*.
+
+Even after we reverse-engineered Strata's C++ source code, found a critical Windows pagefile bug in its "Zero-Config Hardware Planner", and wrote an external kernel *VirtualAlloc* memory-balloon script to give Strata a fair second chance (*20.26 tok/s*), *MinnieTheMoEcher still beats Strata in both pure GPU mode (20.06 tok/s, 4.2× faster load) and hybrid mode (20.74 tok/s)*!
+
+━━━━━━━━━━━━━━━━━━━━━
+📊 *THE SCORECARD: Qwen3.8-Flash-Next (GSQ-RCO-IQ1_M, 54.4 GiB)*
+━━━━━━━━━━━━━━━━━━━━━
+
+🥇 *MinnieTheMoEcher (--cpu-experts, Surgical Tail Offload):*
+• *20.74 tok/s* decode | *27.31 tok/s* prefill | *~18s* startup (Works Out-of-the-Box!)
+
+🥈 *Strata v0.1.58 (Rescued with our External VirtualAlloc Pagefile Hack):*
+• *20.26 tok/s* decode | *27.37 tok/s* prefill | *~76s* startup (Requires external script + env override)
+
+🥉 *MinnieTheMoEcher (--no-cpu-experts, Pure GPU Mode):*
+• *20.06 tok/s* decode | *25.87 tok/s* prefill | *~18s* startup (0% CPU load, 100% desktop responsiveness!)
+
+4️⃣ *MinnieTheMoEcher (Aggressive CPU: 2 Misses/Layer):*
+• *14.72 tok/s* decode (26% SLOWER — proves how heavy CPU offload starves the GPU's L1 LRU cache!)
+
+5️⃣ *Strata v0.1.58 (STRATA_RESIDENT_HEADROOM_GIB=0.2 only):*
+• *8.59 tok/s* decode | *5.70 tok/s* prefill (Still reads 282.5 MB/tok from SSD)
+
+6️⃣ *Strata v0.1.58 (Stock Out-of-the-Box --resident-experts):*
+• *3.42 tok/s* decode | *5.40 tok/s* prefill (367.7 MB/tok SSD thrashing — 6.0× slower than Minnie!)
+
+━━━━━━━━━━━━━━━━━━━━━
+🔧 *3 KEY ENGINEERING TAKEAWAYS*
+━━━━━━━━━━━━━━━━━━━━━
+
+1️⃣ *Why We Had to Write an External Script to Rescue Strata on Windows:*
+Before allocating RAM, Strata checks std::min(physical_free, ullAvailPageFile). Under Windows' default "Automatically manage paging file size", ullAvailPageFile only reports remaining space in the *current* pagefile.sys, which Windows only expands lazily when VirtualAlloc/malloc is actually called! Because Strata aborts before calling malloc, Windows never expands pagefile.sys, and Strata refuses to use 15.7 GiB of free RAM. We had to run an external background loop injecting 16 GiB VirtualAlloc calls while strata.exe booted just to let Strata use RAM!
+
+2️⃣ *Per-Expert Static Hot L1 + Dynamic LRU L1 VRAM Caching (78% Hit Rate at 896 GB/s):*
+Minnie packs resident weights into resident.bin (2.76 GiB) and all 12,288 experts into contiguous [Gate|Up|Down] blobs in experts.bin (23.42 GiB). By combining 3,916 Static Hot experts (7.49 GiB) + 864 Dynamic LRU slots (1.65 GiB) in VRAM, Minnie serves *77.3%–78.3% of all routed experts directly from GDDR7 VRAM at 896 GB/s*, while keeping the rest in L2 Pinned (10.0 GiB) and L2.5 Unpinned (5.9 GiB) RAM with *0 SSD reads*.
+
+3️⃣ *The Truth About CPU Expert Decoding (~3.4% Trivial Gain vs. System Responsiveness):*
+Computing missed experts on the CPU means those experts never get DMA-streamed into the GPU's *Dynamic L1 LRU VRAM cache* for tokens t+1, t+2, t+3. When we offloaded 2 misses/layer to the CPU, L1 VRAM hits dropped from 78.3% to 72.8% and speed fell to *14.72 tok/s*! Even when surgically restricted to a single cold L2.5 tail miss (2.1% of experts), CPU compute only adds *+0.68 tok/s (+3.4%, 20.06 → 20.74 tok/s)* while burning 10 AVX2 CPU threads and risking OS/desktop responsiveness.
+
+Do you prefer squeezing out an extra ~3% with hybrid CPU threads, or running 100% on GPU at 20.06 tok/s with a cool, silent CPU? Let's discuss below! 👇
+
+#LLM #CUDA #LocalAI #Qwen #MoE #NVIDIA #Blackwell #SystemsEngineering #CPlusPlus #HighPerformanceComputing</div>
+                </div>
+
+                <!-- Live LinkedIn Feed Card Mockup -->
+                <div class="linkedin-mockup">
+                    <div class="linkedin-header">
+                        <div class="author-avatar" style="width: 44px; height: 44px; font-size: 1rem;">TB</div>
+                        <div>
+                            <div style="font-weight: 700; font-size: 0.92rem; color: #fff;">Tino Bruno</div>
+                            <div style="font-size: 0.74rem; color: #8c98a4;">AI Architect & High-Performance Compute Engineer • 1st</div>
+                            <div style="font-size: 0.68rem; color: #64748b;">Just now • 🌐</div>
+                        </div>
+                    </div>
+                    <div class="linkedin-content" id="linkedinFeedPreview"></div>
+                    <div class="linkedin-footer">
+                        <span>👍 Like</span>
+                        <span>💬 Comment</span>
+                        <span>🔄 Repost</span>
+                        <span>📤 Send</span>
+                    </div>
+                </div>
+            </div>
+        </section>
+
+    </article>
+
+    <div class="toast" id="toast">✓ Copied to clipboard!</div>
+
+    <script>
+        function toUnicodeBold(str) {
+            const boldMap = {
+                'A':'𝗔','B':'𝗕','C':'𝗖','D':'𝗗','E':'𝗘','F':'𝗙','G':'𝗚','H':'𝗛','I':'𝗜','J':'𝗝','K':'𝗞','L':'𝗟','M':'𝗠',
+                'N':'𝗡','O':'𝗢','P':'𝗣','Q':'𝗤','R':'𝗥','S':'𝗦','T':'𝗧','U':'𝗨','V':'𝗩','W':'𝗪','X':'𝗫','Y':'𝗬','Z':'𝗭',
+                'a':'𝗮','b':'𝗯','c':'𝗰','d':'𝗱','e':'𝗲','f':'𝗳','g':'𝗴','h':'𝗵','i':'𝗶','j':'𝗷','k':'𝗸','l':'𝗹','m':'𝗺',
+                'n':'𝗻','o':'𝗼','p':'𝗽','q':'𝗾','r':'𝗿','s':'𝘀','t':'𝘁','u':'𝘂','v':'𝘃','w':'𝘄','x':'𝘅','y':'𝘆','z':'𝘇',
+                '0':'𝟬','1':'𝟭','2':'𝟮','3':'𝟯','4':'𝟰','5':'𝟱','6':'𝟲','7':'𝟳','8':'𝟴','9':'𝟵'
+            };
+            return str.split('').map(c => boldMap[c] || c).join('');
+        }
+
+        function formatForLinkedIn(raw) {
+            return raw.replace(/\*([^*]+)\*/g, (m, p1) => toUnicodeBold(p1));
+        }
+
+        const rawPost = document.getElementById('linkedinPostRaw').innerText;
+        document.getElementById('linkedinFeedPreview').innerText = formatForLinkedIn(rawPost);
+
+        function showToast(msg) {
+            const t = document.getElementById('toast');
+            t.innerText = msg;
+            t.classList.add('show');
+            setTimeout(() => t.classList.remove('show'), 2800);
+        }
+
+        function copyText(text, msg) {
+            navigator.clipboard.writeText(text).then(() => {
+                showToast(msg);
+            }).catch(() => {
+                const ta = document.createElement('textarea');
+                ta.value = text;
+                document.body.appendChild(ta);
+                ta.select();
+                document.execCommand('copy');
+                document.body.removeChild(ta);
+                showToast(msg);
+            });
+        }
+
+        function copyLinkedInFeedPost() {
+            const formatted = formatForLinkedIn(document.getElementById('linkedinPostRaw').innerText);
+            copyText(formatted, '✓ LinkedIn Post (with Unicode Bold) copied!');
+        }
+
+        function copyPlainPost() {
+            const plain = document.getElementById('linkedinPostRaw').innerText.replace(/\*/g, '');
+            copyText(plain, '✓ Plain text post copied!');
+        }
+
+        function copyFullArticleMarkdown() {
+            const text = document.getElementById('fullArticleBody').innerText;
+            copyText(text, '✓ Full article text copied!');
+        }
+
+        function toggleTheme() {
+            const current = document.documentElement.getAttribute('data-theme');
+            document.documentElement.setAttribute('data-theme', current === 'light' ? 'dark' : 'light');
+        }
+    </script>
+</body>
+</html>

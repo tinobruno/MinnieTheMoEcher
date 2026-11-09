@@ -23,10 +23,13 @@ tools/extract_vit_features
 *.patch
 *.diff
 /models/
+!models/deepseek_v4_flash/manifest.json
+!models/deepseek_v4_flash/quant_config.json
 bin_bck/
 manifest_bck/
 offload/
 scratch/
+workspace/
 dump*
 
 # Log files & debug dumps
@@ -36,6 +39,8 @@ debug/
 src_backups/
 *.out
 *.txt
+!LICENSE.txt
+!Articles/*.txt
 *.jsonl
 .moecher_*
 server_config.json
@@ -43,24 +48,14 @@ cookie_jar.json
 
 # Scratch scripts & temporary test files
 /*.html
-!ARTICLE_*.html
-!BENCHMARK_*.html
-!DINO_*.html
-!WHITE_PAPER_*.html
-!DEVELOPER_GUIDE.html
-!linkedin_article.html
-!kai_style_video.html
-!nemotron_bolt_article.html
-!nemotron_bolt_video.html
-neural_audio/
-neural_scenes/
-bolt_neural_audio/
-bolt_neural_scenes/
-scene_clips/
-voice_clips/
+presentations/*_audio/
+presentations/*_scenes/
+presentations/*_frames/
+presentations/scene_clips/
+presentations/voice_clips/
 scratch_*
-check_gpu.py
 test_*
+!tests/manual/test_*.py
 !tests/test_metal.cpp
 !tests/test_security_sandboxing.cpp
 !tests/test_nemotron_ssm.cu

@@ -318,7 +318,7 @@ int main(int argc, char** argv) {
         } else if ((std::string(argv[i]) == "--manifest" || std::string(argv[i]) == "-m" || std::string(argv[i]) == "--model") && i + 1 < argc) {
             manifest_path = argv[++i];
             manifest_explicit = true;
-        } else if ((std::string(argv[i]) == "--port" || std::string(argv[i]) == "-p") && i + 1 < argc) {
+        } else if ((std::string(argv[i]) == "--port" || std::string(argv[i]) == "-p" || std::string(argv[i]) == "--server") && i + 1 < argc) {
             port = std::stoi(argv[++i]);
         } else if ((std::string(argv[i]) == "--proxy-port" || std::string(argv[i]) == "-pp") && i + 1 < argc) {
             proxy_port = std::stoi(argv[++i]);
@@ -412,14 +412,14 @@ int main(int argc, char** argv) {
             g_track_experts = true;
         } else if (std::string(argv[i]) == "--no-tools" || std::string(argv[i]) == "--disable-tools") {
             g_enable_tools = false;
-        } else if (std::string(argv[i]) == "--tools" || std::string(argv[i]) == "--enable-tools") {
+        } else if (std::string(argv[i]) == "--tools" || std::string(argv[i]) == "--enable-tools" || std::string(argv[i]) == "--allow-ReadFile") {
             g_enable_tools = true;
-        } else if (std::string(argv[i]) == "--allow-host-exec" || std::string(argv[i]) == "--unsafe-server-tools" || std::string(argv[i]) == "--server-exec") {
+        } else if (std::string(argv[i]) == "--allow-host-exec" || std::string(argv[i]) == "--unsafe-server-tools" || std::string(argv[i]) == "--server-exec" || std::string(argv[i]) == "--allow-Shell") {
             g_server_exec = true;
             g_enable_tools = true;
         } else if (std::string(argv[i]) == "--no-server-exec" || std::string(argv[i]) == "--disable-server-exec") {
             g_server_exec = false;
-        } else if (std::string(argv[i]) == "--allow-file-write" || std::string(argv[i]) == "--enable-file-write") {
+        } else if (std::string(argv[i]) == "--allow-file-write" || std::string(argv[i]) == "--enable-file-write" || std::string(argv[i]) == "--allow-WriteFile" || std::string(argv[i]) == "--allow-EditFile") { g_enable_tools = true;
             g_allow_file_write = true;
         } else if (std::string(argv[i]) == "--workspace" && i + 1 < argc) {
             g_workspace_root = argv[++i];
@@ -495,6 +495,82 @@ int main(int argc, char** argv) {
     // Interactive model selector when launched without --manifest / -m
     if (!manifest_explicit) {
         auto models = discover_available_models(argc > 0 ? argv[0] : nullptr);
+        if (models.empty()) {
+            struct DownloadablePkg {
+                const char* key;
+                const char* title;
+                const char* size_label;
+            };
+            static const DownloadablePkg kPackages[] = {
+                {"qwen_13g",      "Qwen 3.8 27B Vision (13GB/16GB GPU & Apple Silicon)", "~13.8 GB"},
+                {"nemotron",      "NVIDIA Nemotron 3.5 Lightning (30B-A3B NVFP4 + Vision)", "~21.6 GB"},
+                {"nemotron_bolt", "NVIDIA Nemotron 3.5 Bolt (74B-A9B NVFP4 16GB/24GB)", "~67.5 GB"},
+                {"qwen",          "Qwen 3.8 27B INT4 with MTP Speculative Decoding", "~19.1 GB"},
+                {"deepseek",      "DeepSeek V4 Flash IQ2 Standard", "~81.4 GB"},
+                {"deepseek_q4",   "DeepSeek V4 Flash Q4 (8GB GPU Mode)", "~78.8 GB"},
+            };
+            constexpr size_t kNumPkgs = sizeof(kPackages) / sizeof(kPackages[0]);
+            printf("\n");
+            printf("====================================================================================================\n");
+            printf("  MinnieTheMoEcher v%s — First-Run Setup (No Local Models Found)\n", MOECHER_VERSION);
+            printf("====================================================================================================\n");
+            printf("  Select a pre-quantized model package to download from Hugging Face into ./models/:\n");
+            printf("----------------------------------------------------------------------------------------------------\n");
+            for (size_t idx = 0; idx < kNumPkgs; ++idx) {
+                printf(" [%2zu]  %-58s %s%s\n",
+                       idx + 1,
+                       kPackages[idx].title,
+                       kPackages[idx].size_label,
+                       idx == 0 ? "  [Recommended]" : "");
+            }
+            printf("====================================================================================================\n");
+            printf("Select a model to download [1-%zu] (press Enter for [1], or 'q' to quit): ", kNumPkgs);
+            fflush(stdout);
+
+            std::string dl_line;
+            if (!std::getline(std::cin, dl_line)) {
+                return 0;
+            }
+            while (!dl_line.empty() && ((unsigned char)dl_line.back() <= ' ')) dl_line.pop_back();
+            size_t sp = 0;
+            while (sp < dl_line.size() && ((unsigned char)dl_line[sp] <= ' ')) sp++;
+            dl_line = dl_line.substr(sp);
+            if (dl_line == "q" || dl_line == "Q" || dl_line == "quit" || dl_line == "exit") {
+                return 0;
+            }
+            size_t dl_idx = 0;
+            if (!dl_line.empty()) {
+                try {
+                    int v = std::stoi(dl_line);
+                    if (v >= 1 && (size_t)v <= kNumPkgs) dl_idx = (size_t)(v - 1);
+                } catch (...) {}
+            }
+            const char* model_key = kPackages[dl_idx].key;
+            printf("\n[INFO] Downloading model package '%s' (%s)...\n", model_key, kPackages[dl_idx].title);
+            std::error_code ec;
+            std::string dl_cmd;
+#if defined(_WIN32) || defined(_WIN64)
+            if (std::filesystem::exists("scripts/download_model.py", ec)) {
+                dl_cmd = std::string("python scripts\\download_model.py --model ") + model_key;
+            } else if (std::filesystem::exists("download_model.ps1", ec)) {
+                dl_cmd = std::string("powershell -ExecutionPolicy Bypass -File download_model.ps1 -Model ") + model_key;
+            } else if (std::filesystem::exists("installer/download_model.ps1", ec)) {
+                dl_cmd = std::string("powershell -ExecutionPolicy Bypass -File installer\\download_model.ps1 -Model ") + model_key + " -DestDir models";
+            }
+#else
+            if (std::filesystem::exists("scripts/download_model.py", ec)) {
+                dl_cmd = std::string("python3 scripts/download_model.py --model ") + model_key;
+            }
+#endif
+            if (!dl_cmd.empty()) {
+                int rc = std::system(dl_cmd.c_str());
+                if (rc != 0) {
+                    LOG_ERROR("Model download command exited with code %d", rc);
+                    return 1;
+                }
+                models = discover_available_models(argc > 0 ? argv[0] : nullptr);
+            }
+        }
         if (!models.empty()) {
             printf("\n");
             printf("====================================================================================================\n");

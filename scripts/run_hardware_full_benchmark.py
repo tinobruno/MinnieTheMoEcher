@@ -22,7 +22,7 @@ if sys.stderr and hasattr(sys.stderr, "reconfigure"):
     sys.stderr.reconfigure(encoding="utf-8", errors="replace")
 
 ROOT_DIR = Path(r"f:\dev\MinnieTheMoEcher")
-OUTPUT_DIR = ROOT_DIR / "benchmarks_RTXPRO6000_96GB_9950X3D_64GB_DDR5_6000"
+OUTPUT_DIR = ROOT_DIR / "benchmarks" / "benchmarks_RTXPRO6000_96GB_9950X3D_64GB_DDR5_6000"
 OUTPUTS_SUBDIR = OUTPUT_DIR / "outputs"
 SERVER_URL = "http://127.0.0.1:8001"
 MOECHER_EXE = ROOT_DIR / "moecher.exe"

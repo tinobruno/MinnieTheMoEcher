@@ -13,7 +13,7 @@ if not exist build (
     cmake -B build -G Ninja ^
         -DCMAKE_BUILD_TYPE=Release ^
         -DCMAKE_CUDA_COMPILER="C:/Program Files/NVIDIA GPU Computing Toolkit/CUDA/v13.3/bin/nvcc.exe" ^
-        -DCMAKE_CUDA_ARCHITECTURES="86;89;90;100;120"
+        -DCMAKE_CUDA_ARCHITECTURES="86;89;90;120a"
     if %errorlevel% neq 0 exit /b 1
 )
 

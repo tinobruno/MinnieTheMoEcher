@@ -6,20 +6,39 @@ Downloads optimized model packages from Hugging Face directly into models/
 Supports resume, chunked download, and progress indication.
 
 Usage:
-    python scripts/download_model.py --model nemotron
     python scripts/download_model.py --model qwen_13g
+    python scripts/download_model.py --model nemotron
+    python scripts/download_model.py --model nemotron_bolt
     python scripts/download_model.py --model qwen
     python scripts/download_model.py --model deepseek
+    python scripts/download_model.py --model deepseek_q4
 """
 
 import os
 import sys
 import time
+import shutil
 import argparse
 import urllib.request
 import urllib.error
 
 MODELS = {
+    "qwen_13g": {
+        "name": "Qwen 3.8 27B Vision (13GB/16GB GPU & Apple Silicon Mode)",
+        "repo": "TinoBruno/moecher-qwen-3.8-27b-vision-13g",
+        "dir": "qwen3_8_27b_vision_13g",
+        "files": [
+            "moecher_manifest.json",
+            "tokenizer.json",
+            "draft_vocab_ids.bin",
+            "draft_vocab_ids.json",
+            "draft_vocab_ids_mapping.json",
+            "draft_vocab_ids_reverse.bin",
+            "draft_lm_head_int8.bin",
+            "draft_lm_head_int8_bf16.bin",
+            "attention_dense_layers.bin",
+        ],
+    },
     "nemotron": {
         "name": "NVIDIA Nemotron 3.5 Lightning (30B-A3B NVFP4) + FrankensTin Vision",
         "repo": "TinoBruno/moecher-nemotron-3.5-lightning-vision",
@@ -47,20 +66,22 @@ MODELS = {
             ],
         },
     },
-    "qwen_13g": {
-        "name": "Qwen 3.8 27B Vision (13GB GPU Mode)",
-        "repo": "TinoBruno/moecher-qwen-3.8-27b-vision-13g",
-        "dir": "qwen3_8_27b_vision_13g",
+    "nemotron_bolt": {
+        "name": "NVIDIA Nemotron 3.5 Bolt (74B-A9B NVFP4 — 16GB Hybrid / 24GB Resident)",
+        "repo": "TinoBruno/moecher-nemotron-3.5-bolt-nvfp4",
+        "dir": "nemotron_3.5_bolt",
         "files": [
-            "moecher_manifest.json",
+            "moecher_manifest_16gb.json",
+            "moecher_manifest_24gb.json",
             "tokenizer.json",
-            "draft_vocab_ids.bin",
-            "draft_vocab_ids.json",
-            "draft_vocab_ids_mapping.json",
-            "draft_vocab_ids_reverse.bin",
-            "draft_lm_head_int8.bin",
-            "draft_lm_head_int8_bf16.bin",
+            "tokenizer_config.json",
+            "chat_template.jinja",
+            "expert_scales.bin",
+            "expert_freq.bin",
+            "expert_profile.json",
             "attention_dense_layers.bin",
+            "expert_weights.bin.001",
+            "expert_weights.bin.002",
         ],
     },
     "qwen": {
@@ -83,6 +104,17 @@ MODELS = {
             "moecher_manifest.json",
             "tokenizer.json",
             "attention_dense_layers.bin",
+            "moe_experts_iq2.bin",
+        ],
+    },
+    "deepseek_q4": {
+        "name": "DeepSeek V4 Flash Q4 (8GB GPU Mode)",
+        "repo": "TinoBruno/moecher-deepseek-v4-flash-q4",
+        "dir": "deepseek_v4_flash_q4",
+        "files": [
+            "moecher_manifest.json",
+            "tokenizer.json",
+            "attention_dense_layers_q4.bin",
             "moe_experts_iq2.bin",
         ],
     },
@@ -117,13 +149,11 @@ def download_file(repo, filename, target_dir):
     if token:
         headers["Authorization"] = f"Bearer {token}"
 
-    # Get remote size
     req = urllib.request.Request(url, method="HEAD", headers=headers)
     try:
         with urllib.request.urlopen(req) as resp:
             total_size = int(resp.headers.get("Content-Length", 0))
     except Exception as e:
-        # If file already exists locally, keep it rather than hard failing on offline/gated
         if os.path.exists(out_path) and os.path.getsize(out_path) > 0:
             print(f"[FOUND] {filename} already present locally ({format_bytes(os.path.getsize(out_path))})")
             return True
@@ -150,7 +180,7 @@ def download_file(repo, filename, target_dir):
 
     print(f"Downloading {filename} ({format_bytes(total_size)})...")
     req = urllib.request.Request(url, headers=headers)
-    chunk_size = 4 * 1024 * 1024 # 4MB chunks
+    chunk_size = 4 * 1024 * 1024
     start_time = time.time()
     last_print = start_time
 
@@ -173,7 +203,7 @@ def download_file(repo, filename, target_dir):
         print(f"\nError downloading {filename}: {e}")
         return False
 
-    os.rename(temp_path, out_path)
+    os.replace(temp_path, out_path)
     print(f"[DONE] {filename} verified ({format_bytes(downloaded)})\n")
     return True
 
@@ -182,8 +212,8 @@ def main():
     parser.add_argument(
         "--model", "-m",
         choices=list(MODELS.keys()),
-        default="nemotron",
-        help="Model package to download (default: nemotron)"
+        default="qwen_13g",
+        help="Model package to download (default: qwen_13g)"
     )
     parser.add_argument(
         "--dest-dir", "-d",
@@ -209,11 +239,29 @@ def main():
     print("=================================================================\n")
 
     for f in cfg["files"]:
+        if f in ("expert_weights.bin.001", "expert_weights.bin.002"):
+            assembled = os.path.join(dest_dir, "expert_weights.bin")
+            if os.path.exists(assembled) and os.path.getsize(assembled) > 0:
+                print(f"[SKIP] expert_weights.bin already assembled ({format_bytes(os.path.getsize(assembled))})")
+                continue
         if not download_file(cfg["repo"], f, dest_dir):
             print(f"\n[ERROR] Failed to download {f}")
             sys.exit(1)
 
-    # Automatically install multimodal vision delegate by default if specified
+    if args.model == "nemotron_bolt":
+        p1 = os.path.join(dest_dir, "expert_weights.bin.001")
+        p2 = os.path.join(dest_dir, "expert_weights.bin.002")
+        target = os.path.join(dest_dir, "expert_weights.bin")
+        if os.path.exists(p1) and os.path.exists(p2) and not os.path.exists(target):
+            print("Assembling expert_weights.bin from split parts...")
+            with open(target, "wb") as out_f:
+                for part in (p1, p2):
+                    with open(part, "rb") as in_f:
+                        shutil.copyfileobj(in_f, out_f, length=16 * 1024 * 1024)
+            os.remove(p1)
+            os.remove(p2)
+            print(f"[DONE] expert_weights.bin assembled ({format_bytes(os.path.getsize(target))})\n")
+
     if "delegate" in cfg and not args.skip_vision:
         del_cfg = cfg["delegate"]
         del_dest = os.path.join(base_models_dir, del_cfg["dir"])
