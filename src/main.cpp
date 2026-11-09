@@ -502,12 +502,13 @@ int main(int argc, char** argv) {
                 const char* size_label;
             };
             static const DownloadablePkg kPackages[] = {
-                {"qwen_13g",      "Qwen 3.8 27B Vision (13GB/16GB GPU & Apple Silicon)", "~13.8 GB"},
-                {"nemotron",      "NVIDIA Nemotron 3.5 Lightning (30B-A3B NVFP4 + Vision)", "~21.6 GB"},
-                {"nemotron_bolt", "NVIDIA Nemotron 3.5 Bolt (74B-A9B NVFP4 16GB/24GB)", "~67.5 GB"},
-                {"qwen",          "Qwen 3.8 27B INT4 with MTP Speculative Decoding", "~19.1 GB"},
-                {"deepseek",      "DeepSeek V4 Flash IQ2 Standard", "~81.4 GB"},
-                {"deepseek_q4",   "DeepSeek V4 Flash Q4 (8GB GPU Mode)", "~78.8 GB"},
+                {"qwen_13g",        "Qwen 3.8 27B Vision (13GB/16GB GPU & Apple Silicon)", "~13.8 GB"},
+                {"qwen_flash_next", "Qwen 3.8 Flash-Next (GSQ-RCO-IQ1_M 16GB/24GB Hybrid)", "~55.2 GB"},
+                {"nemotron",        "NVIDIA Nemotron 3.5 Lightning (30B-A3B NVFP4 + Vision)", "~21.6 GB"},
+                {"nemotron_bolt",   "NVIDIA Nemotron 3.5 Bolt (74B-A9B NVFP4 16GB/24GB)", "~67.5 GB"},
+                {"qwen",            "Qwen 3.8 27B INT4 with MTP Speculative Decoding", "~19.1 GB"},
+                {"deepseek",        "DeepSeek V4 Flash IQ2 Standard", "~81.4 GB"},
+                {"deepseek_q4",     "DeepSeek V4 Flash Q4 (8GB GPU Mode)", "~78.8 GB"},
             };
             constexpr size_t kNumPkgs = sizeof(kPackages) / sizeof(kPackages[0]);
             printf("\n");

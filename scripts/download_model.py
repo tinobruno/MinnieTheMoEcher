@@ -23,6 +23,25 @@ import urllib.request
 import urllib.error
 
 MODELS = {
+    "qwen_flash_next": {
+        "name": "Qwen 3.8 Flash-Next (GSQ-RCO-IQ1_M — 16GB/24GB GPU Hybrid)",
+        "repo": "TinoBruno/moecher-qwen-3.8-flash-next",
+        "dir": "qwen3.8_flash_next",
+        "files": [
+            "moecher_manifest.json",
+            "tokenizer.json",
+            "tokenizer_config.json",
+            "config.json",
+            "generation_config.json",
+            "rco-allocation.txt",
+            "imatrix.dat.counts.json",
+            "expert_freq.bin",
+            "mmproj-Qwen3.8-Flash-Next-BF16.gguf",
+            "resident.bin",
+            "experts.bin",
+            "Qwen3.8-Flash-Next-GSQ-RCO-IQ1_M-00002-of-00002.gguf",
+        ],
+    },
     "qwen_13g": {
         "name": "Qwen 3.8 27B Vision (13GB/16GB GPU & Apple Silicon Mode)",
         "repo": "TinoBruno/moecher-qwen-3.8-27b-vision-13g",

@@ -4,7 +4,7 @@
 
 param (
     [Parameter(Mandatory=$true)]
-    [ValidateSet("qwen", "qwen_13g", "deepseek", "deepseek_q4", "nemotron", "nemotron_bolt", "both")]
+    [ValidateSet("qwen", "qwen_13g", "qwen_flash_next", "deepseek", "deepseek_q4", "nemotron", "nemotron_bolt", "both")]
     [string]$Model,
 
     [string]$DestDir = "",
@@ -67,6 +67,24 @@ $ModelConfigs = @{
             "attention_dense_layers_q4.bin",
             "draft_vocab_ids.bin",
             "draft_lm_head_int8_bf16.bin"
+        )
+    }
+    "qwen_flash_next" = @{
+        "Repo"  = "$Username/moecher-qwen-3.8-flash-next"
+        "Dir"   = (Join-Path $DestDir "qwen3.8_flash_next")
+        "Files" = @(
+            "moecher_manifest.json",
+            "tokenizer.json",
+            "tokenizer_config.json",
+            "config.json",
+            "generation_config.json",
+            "rco-allocation.txt",
+            "imatrix.dat.counts.json",
+            "expert_freq.bin",
+            "mmproj-Qwen3.8-Flash-Next-BF16.gguf",
+            "resident.bin",
+            "experts.bin",
+            "Qwen3.8-Flash-Next-GSQ-RCO-IQ1_M-00002-of-00002.gguf"
         )
     }
     "qwen_13g" = @{
