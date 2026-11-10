@@ -583,7 +583,7 @@ bool load_qwen4_exp(
                 std::fread(&fe, 4, 1, fp_f) == 1 &&
                 std::fread(&ftok, 8, 1, fp_f) == 1 &&
                 fl == n_layers && fe == n_experts) {
-                std::fread(exp_freq.data(), sizeof(uint32_t), total_experts, fp_f);
+                (void)std::fread(exp_freq.data(), sizeof(uint32_t), total_experts, fp_f);
                 LOG_INFO("[Qwen4Exp] Loaded empirical per-expert routing profile (%d x %d = %d experts) from %s",
                          fl, fe, total_experts, freq_bin_path.filename().string().c_str());
             }
@@ -823,7 +823,11 @@ bool load_qwen4_exp(
     for (int l = 0; l < n_layers; ++l) {
         auto& lw = st.layers[l];
         const size_t eb = lw.expert_blob_bytes;
+#if defined(_WIN32)
         _fseeki64(st.experts_fp, (int64_t)lw.layer_file_offset, SEEK_SET);
+#else
+        fseeko(st.experts_fp, (off_t)lw.layer_file_offset, SEEK_SET);
+#endif
 
         for (int e = 0; e < n_experts; ++e) {
             const uint8_t tier = exp_tier[l * n_experts + e];
@@ -844,7 +848,11 @@ bool load_qwen4_exp(
                     return false;
                 }
             } else {
+#if defined(_WIN32)
                 _fseeki64(st.experts_fp, (int64_t)eb, SEEK_CUR);
+#else
+                fseeko(st.experts_fp, (off_t)eb, SEEK_CUR);
+#endif
             }
         }
 
@@ -1318,8 +1326,12 @@ void forward_token_qwen4_exp(int token_id, int position, bool do_compute_logits 
                 } else if (st.experts_fp != nullptr) {
                     st.stat_l3_ssd_reads++;
                     uint8_t* bounce = st.h_bounce_exp + (size_t)gm * st.max_expert_blob_bytes;
+#if defined(_WIN32)
                     _fseeki64(st.experts_fp, (int64_t)(lw.layer_file_offset + (uint64_t)eid * eb), SEEK_SET);
-                    std::fread(bounce, 1, eb, st.experts_fp);
+#else
+                    fseeko(st.experts_fp, (off_t)(lw.layer_file_offset + (uint64_t)eid * eb), SEEK_SET);
+#endif
+                    (void)std::fread(bounce, 1, eb, st.experts_fp);
                     CUDA_CHECK(cudaMemcpyAsync(
                         gpu_miss_dst_vram[gm], bounce, eb, cudaMemcpyHostToDevice, st.copy_stream));
                 }

@@ -283,11 +283,14 @@ int main(int argc, char** argv) {
     bool enable_vision = true;
     bool manifest_explicit = false;
     bool spec_explicit = false;
+    bool force_download = false;
+    std::string download_model_key = "";
 
     for (int i = 1; i < argc; i++) {
         if (std::string(argv[i]) == "--help" || std::string(argv[i]) == "-h") {
             printf("Usage: %s [options]\n", argv[0]);
             printf("  --manifest, -m <path>       Path to moecher_manifest.json (omit to choose interactively)\n");
+            printf("  --download, -d [model_key]  Open interactive model downloader (or download specific model key)\n");
             printf("  --port, -p <port>           Server port (default: %d)\n", port);
             printf("  --proxy-port, -pp <port>    Proxy port (default: %d)\n", proxy_port);
             printf("  --max-vram, -V <gb>         Max VRAM budget in GB\n");
@@ -318,6 +321,11 @@ int main(int argc, char** argv) {
         } else if ((std::string(argv[i]) == "--manifest" || std::string(argv[i]) == "-m" || std::string(argv[i]) == "--model") && i + 1 < argc) {
             manifest_path = argv[++i];
             manifest_explicit = true;
+        } else if (std::string(argv[i]) == "--download" || std::string(argv[i]) == "-d" || std::string(argv[i]) == "--download-model") {
+            force_download = true;
+            if (i + 1 < argc && argv[i + 1][0] != '-') {
+                download_model_key = argv[++i];
+            }
         } else if ((std::string(argv[i]) == "--port" || std::string(argv[i]) == "-p" || std::string(argv[i]) == "--server") && i + 1 < argc) {
             port = std::stoi(argv[++i]);
         } else if ((std::string(argv[i]) == "--proxy-port" || std::string(argv[i]) == "-pp") && i + 1 < argc) {
@@ -493,9 +501,8 @@ int main(int argc, char** argv) {
     }
 
     // Interactive model selector when launched without --manifest / -m
-    if (!manifest_explicit) {
-        auto models = discover_available_models(argc > 0 ? argv[0] : nullptr);
-        if (models.empty()) {
+    if (!manifest_explicit || force_download) {
+        auto run_interactive_downloader = [&](const std::string& preset_key) -> bool {
             struct DownloadablePkg {
                 const char* key;
                 const char* title;
@@ -511,68 +518,96 @@ int main(int argc, char** argv) {
                 {"deepseek_q4",     "DeepSeek V4 Flash Q4 (8GB GPU Mode)", "~78.8 GB"},
             };
             constexpr size_t kNumPkgs = sizeof(kPackages) / sizeof(kPackages[0]);
-            printf("\n");
-            printf("====================================================================================================\n");
-            printf("  MinnieTheMoEcher v%s — First-Run Setup (No Local Models Found)\n", MOECHER_VERSION);
-            printf("====================================================================================================\n");
-            printf("  Select a pre-quantized model package to download from Hugging Face into ./models/:\n");
-            printf("----------------------------------------------------------------------------------------------------\n");
-            for (size_t idx = 0; idx < kNumPkgs; ++idx) {
-                printf(" [%2zu]  %-58s %s%s\n",
-                       idx + 1,
-                       kPackages[idx].title,
-                       kPackages[idx].size_label,
-                       idx == 0 ? "  [Recommended]" : "");
-            }
-            printf("====================================================================================================\n");
-            printf("Select a model to download [1-%zu] (press Enter for [1], or 'q' to quit): ", kNumPkgs);
-            fflush(stdout);
 
-            std::string dl_line;
-            if (!std::getline(std::cin, dl_line)) {
-                return 0;
+            std::string chosen_key = preset_key;
+            std::string chosen_title = preset_key;
+
+            if (chosen_key.empty()) {
+                printf("\n");
+                printf("====================================================================================================\n");
+                printf("  MinnieTheMoEcher v%s — Model Downloader (Hugging Face -> ./models/)\n", MOECHER_VERSION);
+                printf("====================================================================================================\n");
+                printf("  Select a pre-quantized model package to download from Hugging Face into ./models/:\n");
+                printf("----------------------------------------------------------------------------------------------------\n");
+                for (size_t idx = 0; idx < kNumPkgs; ++idx) {
+                    printf(" [%2zu]  %-58s %s%s\n",
+                           idx + 1,
+                           kPackages[idx].title,
+                           kPackages[idx].size_label,
+                           idx == 0 ? "  [Recommended]" : "");
+                }
+                printf("====================================================================================================\n");
+                printf("Select a model to download [1-%zu] (press Enter for [1], or 'q' to cancel): ", kNumPkgs);
+                fflush(stdout);
+
+                std::string dl_line;
+                if (!std::getline(std::cin, dl_line)) {
+                    return false;
+                }
+                while (!dl_line.empty() && ((unsigned char)dl_line.back() <= ' ')) dl_line.pop_back();
+                size_t sp = 0;
+                while (sp < dl_line.size() && ((unsigned char)dl_line[sp] <= ' ')) sp++;
+                dl_line = dl_line.substr(sp);
+                if (dl_line == "q" || dl_line == "Q" || dl_line == "quit" || dl_line == "exit") {
+                    return false;
+                }
+                size_t dl_idx = 0;
+                if (!dl_line.empty()) {
+                    try {
+                        int v = std::stoi(dl_line);
+                        if (v >= 1 && (size_t)v <= kNumPkgs) dl_idx = (size_t)(v - 1);
+                    } catch (...) {}
+                }
+                chosen_key = kPackages[dl_idx].key;
+                chosen_title = kPackages[dl_idx].title;
+            } else {
+                for (size_t idx = 0; idx < kNumPkgs; ++idx) {
+                    if (chosen_key == kPackages[idx].key) {
+                        chosen_title = kPackages[idx].title;
+                        break;
+                    }
+                }
             }
-            while (!dl_line.empty() && ((unsigned char)dl_line.back() <= ' ')) dl_line.pop_back();
-            size_t sp = 0;
-            while (sp < dl_line.size() && ((unsigned char)dl_line[sp] <= ' ')) sp++;
-            dl_line = dl_line.substr(sp);
-            if (dl_line == "q" || dl_line == "Q" || dl_line == "quit" || dl_line == "exit") {
-                return 0;
-            }
-            size_t dl_idx = 0;
-            if (!dl_line.empty()) {
-                try {
-                    int v = std::stoi(dl_line);
-                    if (v >= 1 && (size_t)v <= kNumPkgs) dl_idx = (size_t)(v - 1);
-                } catch (...) {}
-            }
-            const char* model_key = kPackages[dl_idx].key;
-            printf("\n[INFO] Downloading model package '%s' (%s)...\n", model_key, kPackages[dl_idx].title);
+
+            printf("\n[INFO] Downloading model package '%s' (%s)...\n", chosen_key.c_str(), chosen_title.c_str());
             std::error_code ec;
             std::string dl_cmd;
 #if defined(_WIN32) || defined(_WIN64)
             if (std::filesystem::exists("scripts/download_model.py", ec)) {
-                dl_cmd = std::string("python scripts\\download_model.py --model ") + model_key;
+                dl_cmd = std::string("python scripts\\download_model.py --model ") + chosen_key;
             } else if (std::filesystem::exists("download_model.ps1", ec)) {
-                dl_cmd = std::string("powershell -ExecutionPolicy Bypass -File download_model.ps1 -Model ") + model_key;
+                dl_cmd = std::string("powershell -ExecutionPolicy Bypass -File download_model.ps1 -Model ") + chosen_key;
             } else if (std::filesystem::exists("installer/download_model.ps1", ec)) {
-                dl_cmd = std::string("powershell -ExecutionPolicy Bypass -File installer\\download_model.ps1 -Model ") + model_key + " -DestDir models";
+                dl_cmd = std::string("powershell -ExecutionPolicy Bypass -File installer\\download_model.ps1 -Model ") + chosen_key + " -DestDir models";
             }
 #else
             if (std::filesystem::exists("scripts/download_model.py", ec)) {
-                dl_cmd = std::string("python3 scripts/download_model.py --model ") + model_key;
+                dl_cmd = std::string("python3 scripts/download_model.py --model ") + chosen_key;
             }
 #endif
             if (!dl_cmd.empty()) {
                 int rc = std::system(dl_cmd.c_str());
                 if (rc != 0) {
                     LOG_ERROR("Model download command exited with code %d", rc);
-                    return 1;
+                    return false;
                 }
-                models = discover_available_models(argc > 0 ? argv[0] : nullptr);
+                return true;
+            }
+            LOG_ERROR("Download script 'scripts/download_model.py' not found.");
+            return false;
+        };
+
+        auto models = discover_available_models(argc > 0 ? argv[0] : nullptr);
+        if (models.empty() || force_download) {
+            if (!run_interactive_downloader(download_model_key) && models.empty()) {
+                return 0;
+            }
+            models = discover_available_models(argc > 0 ? argv[0] : nullptr);
+            if (manifest_explicit) {
+                models.clear();
             }
         }
-        if (!models.empty()) {
+        while (!models.empty()) {
             printf("\n");
             printf("====================================================================================================\n");
             printf("  MinnieTheMoEcher v%s — Available Local Models\n", MOECHER_VERSION);
@@ -592,8 +627,9 @@ int main(int argc, char** argv) {
             }
             printf("====================================================================================================\n");
             size_t chosen_idx = 0;
+            bool re_discover = false;
             while (true) {
-                printf("Select a model to launch [1-%zu] (press Enter for [1], or 'q' to quit): ", models.size());
+                printf("Select a model to launch [1-%zu] (Enter=[1], 'd' to download more models, 'q' to quit): ", models.size());
                 fflush(stdout);
 
                 std::string line;
@@ -613,6 +649,12 @@ int main(int argc, char** argv) {
                     printf("Exiting.\n");
                     return 0;
                 }
+                if (line == "d" || line == "D" || line == "download") {
+                    run_interactive_downloader("");
+                    models = discover_available_models(argc > 0 ? argv[0] : nullptr);
+                    re_discover = true;
+                    break;
+                }
 
                 if (line.empty()) {
                     chosen_idx = 0;
@@ -625,7 +667,10 @@ int main(int argc, char** argv) {
                         break;
                     }
                 } catch (...) {}
-                printf("[WARN] Invalid selection '%s' (please enter a number between 1 and %zu, or 'q' to quit).\n", line.c_str(), models.size());
+                printf("[WARN] Invalid selection '%s' (please enter 1-%zu, 'd' to download, or 'q' to quit).\n", line.c_str(), models.size());
+            }
+            if (re_discover) {
+                continue;
             }
 
             const auto& selected = models[chosen_idx];
@@ -638,6 +683,7 @@ int main(int argc, char** argv) {
                 enable_pld = false;
                 enable_mtp = false;
             }
+            break;
         }
     }
 

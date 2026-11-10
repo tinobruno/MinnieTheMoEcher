@@ -38,6 +38,10 @@
 #include <windows.h>
 #endif
 
+#if !defined(_MSC_VER) && !defined(__forceinline)
+#define __forceinline inline __attribute__((always_inline))
+#endif
+
 namespace moecher {
 namespace cpu_moe {
 
