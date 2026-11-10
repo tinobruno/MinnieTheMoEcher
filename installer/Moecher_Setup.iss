@@ -43,7 +43,7 @@ Name: "dl_qwen_13g"; Description: "Download Qwen 3.8 27B Vision - 16GB GPU Mode 
 Name: "dl_qwen"; Description: "Download Qwen 3.8 27B INT4 with MTP Speculative Decoding (~19.1 GB) from Hugging Face"; Types: custom
 Name: "dl_deepseek"; Description: "Download DeepSeek V4 Flash IQ2 - Standard (~81.4 GB) from Hugging Face"; Types: custom
 Name: "dl_deepseek_q4"; Description: "Download DeepSeek V4 Flash Q4 - 8GB GPU Mode (~78.8 GB) from Hugging Face"; Types: custom
-Name: "dl_deepseek_v41"; Description: "Download DeepSeek V4.1-Flash (552B/14B Active) NVFP4 (~280 GB) - 96GB Blackwell/Ada"; Types: custom
+Name: "dl_deepseek_v41"; Description: "Download DeepSeek V4.1-Flash (552B/14B Active) Mixed NVFP4+IQ2 (~184.8 GB) - 96GB Workstation"; Types: custom
 
 [Tasks]
 Name: "desktopicon"; Description: "{cm:CreateDesktopIcon}"; GroupDescription: "{cm:AdditionalIcons}"; Flags: unchecked
@@ -227,6 +227,11 @@ begin
     if WizardIsComponentSelected('dl_deepseek_q4') then
     begin
       Exec('powershell.exe', '-ExecutionPolicy Bypass -File "' + AppDir + '\download_model.ps1" -Model deepseek_q4 -DestDir "' + AppDir + '\models"', AppDir, SW_SHOWNORMAL, ewWaitUntilTerminated, ResultCode);
+    end;
+
+    if WizardIsComponentSelected('dl_deepseek_v41') then
+    begin
+      Exec('powershell.exe', '-ExecutionPolicy Bypass -File "' + AppDir + '\download_model.ps1" -Model deepseek_v41_mixed -DestDir "' + AppDir + '\models"', AppDir, SW_SHOWNORMAL, ewWaitUntilTerminated, ResultCode);
     end;
   end;
 end;

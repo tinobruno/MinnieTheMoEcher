@@ -128,6 +128,26 @@ public:
     std::vector<int> layer_dram_dyn_end_;
     std::vector<uint8_t> expert_type_map_host_;
     GPUTensor expert_type_map_gpu_;
+    bool hot_file_compacted_ = false;
+    bool cold_file_compacted_ = false;
+    std::vector<int32_t> hot_compact_rank_;
+    std::vector<int32_t> cold_compact_rank_;
+
+    inline int64_t get_hot_file_offset(int64_t global_idx) const {
+        if (hot_file_compacted_ && global_idx >= 0 && global_idx < (int64_t)hot_compact_rank_.size()) {
+            int32_t r = hot_compact_rank_[global_idx];
+            if (r >= 0) return (int64_t)r * hot_block_size_;
+        }
+        return global_idx * hot_block_size_;
+    }
+
+    inline int64_t get_cold_file_offset(int64_t global_idx) const {
+        if (cold_file_compacted_ && global_idx >= 0 && global_idx < (int64_t)cold_compact_rank_.size()) {
+            int32_t r = cold_compact_rank_[global_idx];
+            if (r >= 0) return (int64_t)r * cold_block_size_;
+        }
+        return global_idx * cold_block_size_;
+    }
 
     const uint8_t* expert_type_map_gpu() const {
         return expert_type_map_gpu_.u8();
@@ -384,7 +404,7 @@ public:
                 dslot.is_ready.store(false, std::memory_order_release);
                 dram_key_to_slot_[key] = evict_dram;
 
-                int64_t file_offset = is_mixed_ ? ((int64_t)key * cold_block_size_) : ((int64_t)key * expert_block_size_);
+                int64_t file_offset = is_mixed_ ? get_cold_file_offset(key) : ((int64_t)key * expert_block_size_);
                 size_t cur_block_size = is_mixed_ ? cold_block_size_ : expert_block_size_;
                 void* dst_ptr = dslot.gpu_data;
 
@@ -424,7 +444,7 @@ public:
             staging_idx_ = (staging_idx_ + 1) % NUM_STAGING_BUFFERS;
             lock.unlock();
             auto& stage = staging_ring_[stage_idx];
-            int64_t file_offset = is_mixed_ ? ((int64_t)key * cold_block_size_) : ((int64_t)key * expert_block_size_);
+            int64_t file_offset = is_mixed_ ? get_cold_file_offset(key) : ((int64_t)key * expert_block_size_);
             size_t cur_block_size = is_mixed_ ? cold_block_size_ : expert_block_size_;
             if (is_mixed_) {
                 if (expert_mmap_cold_.is_open() && (size_t)(file_offset + cur_block_size) <= expert_mmap_cold_.size()) {
@@ -697,16 +717,31 @@ public:
         }
         mf.close();
 
+        hot_compact_rank_.assign(total_experts, -1);
+        cold_compact_rank_.assign(total_experts, -1);
         int total_hot = 0;
         int total_cold = 0;
         for (int i = 0; i < total_experts; i++) {
-            if (expert_type_map_host_[i] == 1) total_hot++;
-            else total_cold++;
+            if (expert_type_map_host_[i] == 1) {
+                hot_compact_rank_[i] = total_hot++;
+            } else {
+                cold_compact_rank_[i] = total_cold++;
+            }
         }
 
         size_t hot_bytes = (size_t)total_hot * hot_block_size;
         size_t cold_bytes = (size_t)total_cold * cold_block_size;
         size_t total_bytes = hot_bytes + cold_bytes;
+
+        uint64_t hot_disk_size = 0, cold_disk_size = 0;
+        try { hot_disk_size = std::filesystem::file_size(hot_bin_path); } catch (...) {}
+        try { cold_disk_size = std::filesystem::file_size(cold_bin_path); } catch (...) {}
+        hot_file_compacted_ = (hot_disk_size > 0 && hot_disk_size <= (uint64_t)hot_bytes + 65536ULL);
+        cold_file_compacted_ = (cold_disk_size > 0 && cold_disk_size <= (uint64_t)cold_bytes + 65536ULL);
+        if (hot_file_compacted_ || cold_file_compacted_) {
+            LOG_INFO("ExpertLoader: Compacted expert binary layout active (hot_compacted=%d, cold_compacted=%d)",
+                     (int)hot_file_compacted_, (int)cold_file_compacted_);
+        }
 
         size_t free_vram = 0, total_vram = 0;
         cudaMemGetInfo(&free_vram, &total_vram);
@@ -1786,7 +1821,7 @@ public:
                 for (int idx = start_idx; idx < end_idx; idx++) {
                     int i = hot_indices[idx];
                     void* dst = flat_vram_ptrs_[i];
-                    int64_t file_offset = (int64_t)i * hot_block_size_;
+                    int64_t file_offset = get_hot_file_offset(i);
                     int64_t bytes = expert_file_hot_.pread_exact(stage_ptr, hot_block_size_, file_offset);
                     if (bytes == hot_block_size_) {
                         CUDA_CHECK(cudaMemcpyAsync(dst, stage_ptr, hot_block_size_, cudaMemcpyHostToDevice, stream));
@@ -1850,7 +1885,7 @@ public:
                     for (int idx = start_idx; idx < end_idx; idx++) {
                         int i = cold_vram_targets_[idx];
                         void* dst = cold_vram_ptrs_[i];
-                        int64_t file_offset = (int64_t)i * cold_block_size_;
+                        int64_t file_offset = get_cold_file_offset(i);
                         int64_t bytes = expert_file_cold_.pread_exact(stage_ptr, cold_block_size_, file_offset);
                         if (bytes == cold_block_size_) {
                             CUDA_CHECK(cudaMemcpyAsync(dst, stage_ptr, cold_block_size_, cudaMemcpyHostToDevice, stream));
@@ -1899,7 +1934,7 @@ public:
                         int global_idx = cold_dram_targets_[slot];
                         int l = global_idx / n_experts_;
                         int e = global_idx % n_experts_;
-                        int64_t file_offset = (int64_t)global_idx * cold_block_size_;
+                        int64_t file_offset = get_cold_file_offset(global_idx);
                         void* dst = dram_cache_slots_[slot].gpu_data;
 
                         int64_t bytes = 0;
