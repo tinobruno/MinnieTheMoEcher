@@ -7,11 +7,14 @@ Supports resume, chunked download, and progress indication.
 
 Usage:
     python scripts/download_model.py --model qwen_13g
+    python scripts/download_model.py --model qwen_flash_next
     python scripts/download_model.py --model nemotron
+    python scripts/download_model.py --model nemotron_bolt_24gb
     python scripts/download_model.py --model nemotron_bolt
     python scripts/download_model.py --model qwen
     python scripts/download_model.py --model deepseek
     python scripts/download_model.py --model deepseek_q4
+    python scripts/download_model.py --model deepseek_v41
 """
 
 import os
@@ -85,6 +88,20 @@ MODELS = {
             ],
         },
     },
+    "nemotron_bolt_24gb": {
+        "name": "NVIDIA Nemotron 3.5 Bolt 24GB (74B-A9B IQ2_XXS — 16GB/24GB GPU)",
+        "repo": "TinoBruno/moecher-nemotron-3.5-bolt-24gb",
+        "dir": "nemotron_3.5_bolt_24gb",
+        "files": [
+            "moecher_manifest.json",
+            "tokenizer.json",
+            "tokenizer_config.json",
+            "chat_template.jinja",
+            "expert_scales.bin",
+            "attention_dense_layers.bin",
+            "expert_weights.bin",
+        ],
+    },
     "nemotron_bolt": {
         "name": "NVIDIA Nemotron 3.5 Bolt (74B-A9B NVFP4 — 16GB Hybrid / 24GB Resident)",
         "repo": "TinoBruno/moecher-nemotron-3.5-bolt-nvfp4",
@@ -137,7 +154,25 @@ MODELS = {
             "moe_experts_iq2.bin",
         ],
     },
+    "deepseek_v41": {
+        "name": "DeepSeek V4.1-Flash (552B/14B Mixed NVFP4+IQ2 — 96GB GPU / 64GB RAM)",
+        "repo": "TinoBruno/moecher-deepseek-v4.1-flash-mixed",
+        "dir": "deepseek_v41_nvfp4",
+        "files": [
+            "moecher_manifest.json",
+            "moecher_manifest_mixed.json",
+            "tokenizer.json",
+            "tokenizer_config.json",
+            "mixed_expert_map.bin",
+            "deepseek_v41_imatrix.dat.counts.json",
+            "engram_dense.bin",
+            "attention_dense_layers.bin",
+            "moe_experts_hot.bin",
+            "moe_experts_iq2.bin",
+        ],
+    },
 }
+MODELS["deepseek_v41_mixed"] = MODELS["deepseek_v41"]
 
 def format_bytes(n):
     if n >= 1024 * 1024 * 1024:

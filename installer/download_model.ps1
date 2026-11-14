@@ -4,7 +4,7 @@
 
 param (
     [Parameter(Mandatory=$true)]
-    [ValidateSet("qwen", "qwen_13g", "qwen_flash_next", "deepseek", "deepseek_q4", "nemotron", "nemotron_bolt", "both")]
+    [ValidateSet("qwen", "qwen_13g", "qwen_flash_next", "deepseek", "deepseek_q4", "deepseek_v41", "deepseek_v41_mixed", "nemotron", "nemotron_bolt", "nemotron_bolt_24gb", "both")]
     [string]$Model,
 
     [string]$DestDir = "",
@@ -30,6 +30,19 @@ if (-not $DestDir -or $DestDir.Trim() -eq "") {
 $DestDir = [System.IO.Path]::GetFullPath($DestDir)
 
 $ModelConfigs = @{
+    "nemotron_bolt_24gb" = @{
+        "Repo"  = "$Username/moecher-nemotron-3.5-bolt-24gb"
+        "Dir"   = (Join-Path $DestDir "nemotron_3.5_bolt_24gb")
+        "Files" = @(
+            "moecher_manifest.json",
+            "tokenizer.json",
+            "tokenizer_config.json",
+            "chat_template.jinja",
+            "expert_scales.bin",
+            "attention_dense_layers.bin",
+            "expert_weights.bin"
+        )
+    }
     "nemotron_bolt" = @{
         "Repo"  = "$Username/moecher-nemotron-3.5-bolt-nvfp4"
         "Dir"   = (Join-Path $DestDir "nemotron_3.5_bolt")
@@ -122,7 +135,24 @@ $ModelConfigs = @{
             "moe_experts_iq2.bin"
         )
     }
+    "deepseek_v41" = @{
+        "Repo"  = "$Username/moecher-deepseek-v4.1-flash-mixed"
+        "Dir"   = (Join-Path $DestDir "deepseek_v41_nvfp4")
+        "Files" = @(
+            "moecher_manifest.json",
+            "moecher_manifest_mixed.json",
+            "tokenizer.json",
+            "tokenizer_config.json",
+            "mixed_expert_map.bin",
+            "deepseek_v41_imatrix.dat.counts.json",
+            "engram_dense.bin",
+            "attention_dense_layers.bin",
+            "moe_experts_hot.bin",
+            "moe_experts_iq2.bin"
+        )
+    }
 }
+$ModelConfigs["deepseek_v41_mixed"] = $ModelConfigs["deepseek_v41"]
 
 function Download-HuggingFaceFile {
     param (

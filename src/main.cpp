@@ -87,6 +87,13 @@ static bool inspect_model_manifest(const std::filesystem::path& manifest_file, D
     std::string edtype = mc.value("expert_dtype", "");
 
     if (n_routed > 0 && edtype == "mixed_nvfp4_iq2") {
+        if (fname == "moecher_manifest_mixed.json") {
+            auto default_mf = base_dir / "moecher_manifest.json";
+            if (std::filesystem::exists(default_mf, ec) &&
+                std::filesystem::file_size(default_mf, ec) == std::filesystem::file_size(manifest_file, ec)) {
+                return false; // Avoid duplicate entry when moecher_manifest.json is already the mixed manifest
+            }
+        }
         std::string cold_p, hot_p;
         if (j.contains("expert_bins") && j["expert_bins"].is_object()) {
             if (j["expert_bins"].contains("cold") && j["expert_bins"]["cold"].is_object()) {
@@ -509,13 +516,15 @@ int main(int argc, char** argv) {
                 const char* size_label;
             };
             static const DownloadablePkg kPackages[] = {
-                {"qwen_13g",        "Qwen 3.8 27B Vision (13GB/16GB GPU & Apple Silicon)", "~13.8 GB"},
-                {"qwen_flash_next", "Qwen 3.8 Flash-Next (GSQ-RCO-IQ1_M 16GB/24GB Hybrid)", "~55.2 GB"},
-                {"nemotron",        "NVIDIA Nemotron 3.5 Lightning (30B-A3B NVFP4 + Vision)", "~21.6 GB"},
-                {"nemotron_bolt",   "NVIDIA Nemotron 3.5 Bolt (74B-A9B NVFP4 16GB/24GB)", "~67.5 GB"},
-                {"qwen",            "Qwen 3.8 27B INT4 with MTP Speculative Decoding", "~19.1 GB"},
-                {"deepseek",        "DeepSeek V4 Flash IQ2 Standard", "~81.4 GB"},
-                {"deepseek_q4",     "DeepSeek V4 Flash Q4 (8GB GPU Mode)", "~78.8 GB"},
+                {"qwen_13g",           "Qwen 3.8 27B Vision (13GB/16GB GPU & Apple Silicon)", "~13.8 GB"},
+                {"qwen_flash_next",    "Qwen 3.8 Flash-Next (GSQ-RCO-IQ1_M 16GB/24GB Hybrid)", "~55.2 GB"},
+                {"nemotron",           "NVIDIA Nemotron 3.5 Lightning (30B-A3B NVFP4 + Vision)", "~21.6 GB"},
+                {"nemotron_bolt_24gb", "NVIDIA Nemotron 3.5 Bolt 24GB (74B-A9B IQ2_XXS 16GB/24GB)", "~30.0 GB"},
+                {"nemotron_bolt",      "NVIDIA Nemotron 3.5 Bolt (74B-A9B NVFP4 16GB/24GB)", "~67.5 GB"},
+                {"qwen",               "Qwen 3.8 27B INT4 with MTP Speculative Decoding", "~19.1 GB"},
+                {"deepseek",           "DeepSeek V4 Flash IQ2 Standard", "~81.4 GB"},
+                {"deepseek_q4",        "DeepSeek V4 Flash Q4 (8GB GPU Mode)", "~78.8 GB"},
+                {"deepseek_v41",       "DeepSeek V4.1-Flash (552B-A14B Mixed NVFP4+IQ2 96GB GPU)", "~184.8 GB"},
             };
             constexpr size_t kNumPkgs = sizeof(kPackages) / sizeof(kPackages[0]);
 

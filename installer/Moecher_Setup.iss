@@ -37,13 +37,15 @@ Name: "custom"; Description: "Custom Installation"; Flags: iscustom
 
 [Components]
 Name: "core"; Description: "Moecher Engine Core & Web UI (~40 MB)"; Types: full custom; Flags: fixed
+Name: "dl_nemotron_bolt_24gb"; Description: "Download NVIDIA Nemotron 3.5 Bolt 24GB 74B-A9B IQ2_XXS (~30.0 GB) - 16GB/24GB GPU"; Types: custom
 Name: "dl_nemotron_bolt"; Description: "Download NVIDIA Nemotron 3.5 Bolt 74B-A9B NVFP4 (~67.5 GB) from Hugging Face"; Types: custom
 Name: "dl_nemotron"; Description: "Download NVIDIA Nemotron 3.5 Lightning 30B-A3B NVFP4 (~21.6 GB) from Hugging Face"; Types: full custom
 Name: "dl_qwen_13g"; Description: "Download Qwen 3.8 27B Vision - 16GB GPU Mode (~13.8 GB) from Hugging Face"; Types: full custom
+Name: "dl_qwen_flash_next"; Description: "Download Qwen 3.8 Flash-Next GSQ-RCO-IQ1_M (~55.2 GB) - 16GB/24GB GPU Hybrid"; Types: custom
 Name: "dl_qwen"; Description: "Download Qwen 3.8 27B INT4 with MTP Speculative Decoding (~19.1 GB) from Hugging Face"; Types: custom
 Name: "dl_deepseek"; Description: "Download DeepSeek V4 Flash IQ2 - Standard (~81.4 GB) from Hugging Face"; Types: custom
 Name: "dl_deepseek_q4"; Description: "Download DeepSeek V4 Flash Q4 - 8GB GPU Mode (~78.8 GB) from Hugging Face"; Types: custom
-Name: "dl_deepseek_v41"; Description: "Download DeepSeek V4.1-Flash (552B/14B Active) NVFP4 (~280 GB) - 96GB Blackwell/Ada"; Types: custom
+Name: "dl_deepseek_v41"; Description: "Download DeepSeek V4.1-Flash (552B/14B Active) Mixed NVFP4+IQ2 (~184.8 GB) - 96GB GPU"; Types: custom
 
 [Tasks]
 Name: "desktopicon"; Description: "{cm:CreateDesktopIcon}"; GroupDescription: "{cm:AdditionalIcons}"; Flags: unchecked
@@ -199,6 +201,11 @@ begin
     SaveStringToFile(AppDir + '\start_deepseek_q4_server.bat', DeepSeekQ4BatContent, False);
     
     // Trigger model downloads for selected components
+    if WizardIsComponentSelected('dl_nemotron_bolt_24gb') then
+    begin
+      Exec('powershell.exe', '-ExecutionPolicy Bypass -File "' + AppDir + '\download_model.ps1" -Model nemotron_bolt_24gb -DestDir "' + AppDir + '\models"', AppDir, SW_SHOWNORMAL, ewWaitUntilTerminated, ResultCode);
+    end;
+
     if WizardIsComponentSelected('dl_nemotron_bolt') then
     begin
       Exec('powershell.exe', '-ExecutionPolicy Bypass -File "' + AppDir + '\download_model.ps1" -Model nemotron_bolt -DestDir "' + AppDir + '\models"', AppDir, SW_SHOWNORMAL, ewWaitUntilTerminated, ResultCode);
@@ -214,6 +221,11 @@ begin
       Exec('powershell.exe', '-ExecutionPolicy Bypass -File "' + AppDir + '\download_model.ps1" -Model qwen_13g -DestDir "' + AppDir + '\models"', AppDir, SW_SHOWNORMAL, ewWaitUntilTerminated, ResultCode);
     end;
 
+    if WizardIsComponentSelected('dl_qwen_flash_next') then
+    begin
+      Exec('powershell.exe', '-ExecutionPolicy Bypass -File "' + AppDir + '\download_model.ps1" -Model qwen_flash_next -DestDir "' + AppDir + '\models"', AppDir, SW_SHOWNORMAL, ewWaitUntilTerminated, ResultCode);
+    end;
+
     if WizardIsComponentSelected('dl_qwen') then
     begin
       Exec('powershell.exe', '-ExecutionPolicy Bypass -File "' + AppDir + '\download_model.ps1" -Model qwen -DestDir "' + AppDir + '\models"', AppDir, SW_SHOWNORMAL, ewWaitUntilTerminated, ResultCode);
@@ -227,6 +239,11 @@ begin
     if WizardIsComponentSelected('dl_deepseek_q4') then
     begin
       Exec('powershell.exe', '-ExecutionPolicy Bypass -File "' + AppDir + '\download_model.ps1" -Model deepseek_q4 -DestDir "' + AppDir + '\models"', AppDir, SW_SHOWNORMAL, ewWaitUntilTerminated, ResultCode);
+    end;
+
+    if WizardIsComponentSelected('dl_deepseek_v41') then
+    begin
+      Exec('powershell.exe', '-ExecutionPolicy Bypass -File "' + AppDir + '\download_model.ps1" -Model deepseek_v41 -DestDir "' + AppDir + '\models"', AppDir, SW_SHOWNORMAL, ewWaitUntilTerminated, ResultCode);
     end;
   end;
 end;
