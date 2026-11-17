@@ -902,6 +902,9 @@
     cudaGraphExec_t batch_graph_exec_[9] = {nullptr};
 
     void forward_token_batch_qwen_device_body(int position, int M, bool compute_logits = true, bool is_tree = false) {
+        if (num_gpus_ > 1 && active_pp_dev_ != 0) {
+            set_active_pp_device(0);
+        }
         int dim = cfg_.hidden_size;
         // 1. Embedding lookup for M tokens
         if (embed_weight_.dtype == "fp4") {
@@ -937,6 +940,17 @@
             int n_delta_net = 0;
             int n_gqa = 0;
             for (int layer = 0; layer < cfg_.num_hidden_layers; layer++) {
+                if (num_gpus_ > 1 && layer == pp_split_layer_) {
+                    pp_copy_d2d(pp_peer_.buf_hidden_batch_.data, 1, buf_hidden_batch_.data, 0, (size_t)M * dim * sizeof(__nv_bfloat16));
+                    pp_copy_d2d(pp_peer_.buf_input_pos_batch_.data, 1, buf_input_pos_batch_.data, 0, (size_t)M * sizeof(int32_t));
+                    pp_copy_d2d(pp_peer_.buf_input_tokens_batch_.data, 1, buf_input_tokens_batch_.data, 0, (size_t)M * sizeof(int32_t));
+                    pp_copy_d2d(pp_peer_.buf_mrope_pos_.data, 1, buf_mrope_pos_.data, 0, 2 * sizeof(int32_t));
+                    if (is_tree) {
+                        pp_copy_d2d(pp_peer_.buf_tree_ancestor_mask_.data, 1, buf_tree_ancestor_mask_.data, 0, (size_t)M * sizeof(uint64_t));
+                        pp_copy_d2d(pp_peer_.buf_tree_parent_indices_.data, 1, buf_tree_parent_indices_.data, 0, (size_t)M * sizeof(int32_t));
+                    }
+                    set_active_pp_device(1);
+                }
                 auto tl0 = std::chrono::high_resolution_clock::now();
                 forward_layer_qwen_batch(layer, position, M, is_tree);
                 cudaStreamSynchronize(main_stream_);
@@ -956,8 +970,24 @@
                      M, total_ms, M / (total_ms / 1000.0f), n_delta_net, t_delta_net / std::max(1, n_delta_net), t_delta_net, n_gqa, t_gqa / std::max(1, n_gqa), t_gqa);
         } else {
             for (int layer = 0; layer < cfg_.num_hidden_layers; layer++) {
+                if (num_gpus_ > 1 && layer == pp_split_layer_) {
+                    pp_copy_d2d(pp_peer_.buf_hidden_batch_.data, 1, buf_hidden_batch_.data, 0, (size_t)M * dim * sizeof(__nv_bfloat16));
+                    pp_copy_d2d(pp_peer_.buf_input_pos_batch_.data, 1, buf_input_pos_batch_.data, 0, (size_t)M * sizeof(int32_t));
+                    pp_copy_d2d(pp_peer_.buf_input_tokens_batch_.data, 1, buf_input_tokens_batch_.data, 0, (size_t)M * sizeof(int32_t));
+                    pp_copy_d2d(pp_peer_.buf_mrope_pos_.data, 1, buf_mrope_pos_.data, 0, 2 * sizeof(int32_t));
+                    if (is_tree) {
+                        pp_copy_d2d(pp_peer_.buf_tree_ancestor_mask_.data, 1, buf_tree_ancestor_mask_.data, 0, (size_t)M * sizeof(uint64_t));
+                        pp_copy_d2d(pp_peer_.buf_tree_parent_indices_.data, 1, buf_tree_parent_indices_.data, 0, (size_t)M * sizeof(int32_t));
+                    }
+                    set_active_pp_device(1);
+                }
                 forward_layer_qwen_batch(layer, position, M, is_tree);
             }
+        }
+
+        if (num_gpus_ > 1 && active_pp_dev_ == 1) {
+            pp_copy_d2d(pp_peer_.buf_hidden_batch_.data, 0, buf_hidden_batch_.data, 1, (size_t)M * dim * sizeof(__nv_bfloat16));
+            set_active_pp_device(0);
         }
 
         if (!compute_logits) return;
@@ -1045,6 +1075,7 @@
         for (int m = 0; m <= 8; ++m) batch_graph_captured_[m] = false;
         return;
 #endif
+        if (num_gpus_ > 1) return;
         if (cfg_.architecture != ModelArch::QWEN && !(cfg_.is_nemotron() && expert_loader_.all_resident())) return;
         std::vector<int> target_batch_sizes;
         if (cfg_.is_nemotron()) {
@@ -1164,26 +1195,38 @@
     }
 
     inline void checkpoint_target_state() {
-        if (target_ssm_pool_.data && target_ssm_slots_[0].data) {
-            CUDA_CHECK(cudaMemcpyAsync(target_ssm_slots_[0].data, target_ssm_pool_.data, target_ssm_pool_.size_bytes, cudaMemcpyDeviceToDevice, main_stream_));
-            CUDA_CHECK(cudaMemcpyAsync(target_conv_slots_[0].data, target_conv_pool_.data, target_conv_pool_.size_bytes, cudaMemcpyDeviceToDevice, main_stream_));
+        for (int dev = 0; dev < num_gpus_; dev++) {
+            if (num_gpus_ > 1) set_active_pp_device(dev);
+            if (target_ssm_pool_.data && target_ssm_slots_[0].data) {
+                CUDA_CHECK(cudaMemcpyAsync(target_ssm_slots_[0].data, target_ssm_pool_.data, target_ssm_pool_.size_bytes, cudaMemcpyDeviceToDevice, main_stream_));
+                CUDA_CHECK(cudaMemcpyAsync(target_conv_slots_[0].data, target_conv_pool_.data, target_conv_pool_.size_bytes, cudaMemcpyDeviceToDevice, main_stream_));
+            }
         }
+        if (num_gpus_ > 1) set_active_pp_device(0);
     }
 
     inline void restore_target_state() {
-        if (target_ssm_pool_.data && target_ssm_slots_[0].data) {
-            CUDA_CHECK(cudaMemcpyAsync(target_ssm_pool_.data, target_ssm_slots_[0].data, target_ssm_pool_.size_bytes, cudaMemcpyDeviceToDevice, main_stream_));
-            CUDA_CHECK(cudaMemcpyAsync(target_conv_pool_.data, target_conv_slots_[0].data, target_conv_pool_.size_bytes, cudaMemcpyDeviceToDevice, main_stream_));
+        for (int dev = 0; dev < num_gpus_; dev++) {
+            if (num_gpus_ > 1) set_active_pp_device(dev);
+            if (target_ssm_pool_.data && target_ssm_slots_[0].data) {
+                CUDA_CHECK(cudaMemcpyAsync(target_ssm_pool_.data, target_ssm_slots_[0].data, target_ssm_pool_.size_bytes, cudaMemcpyDeviceToDevice, main_stream_));
+                CUDA_CHECK(cudaMemcpyAsync(target_conv_pool_.data, target_conv_slots_[0].data, target_conv_pool_.size_bytes, cudaMemcpyDeviceToDevice, main_stream_));
+            }
         }
+        if (num_gpus_ > 1) set_active_pp_device(0);
     }
 
     inline void commit_target_state_slot(int slot_idx) {
         if (slot_idx < 0 || slot_idx >= 8) return;
         if (!enable_tree_mtp_ && slot_idx >= 4) return;
-        if (target_ssm_pool_.data && target_ssm_slots_[slot_idx].data) {
-            CUDA_CHECK(cudaMemcpyAsync(target_ssm_pool_.data, target_ssm_slots_[slot_idx].data, target_ssm_pool_.size_bytes, cudaMemcpyDeviceToDevice, main_stream_));
-            CUDA_CHECK(cudaMemcpyAsync(target_conv_pool_.data, target_conv_slots_[slot_idx].data, target_conv_pool_.size_bytes, cudaMemcpyDeviceToDevice, main_stream_));
+        for (int dev = 0; dev < num_gpus_; dev++) {
+            if (num_gpus_ > 1) set_active_pp_device(dev);
+            if (target_ssm_pool_.data && target_ssm_slots_[slot_idx].data) {
+                CUDA_CHECK(cudaMemcpyAsync(target_ssm_pool_.data, target_ssm_slots_[slot_idx].data, target_ssm_pool_.size_bytes, cudaMemcpyDeviceToDevice, main_stream_));
+                CUDA_CHECK(cudaMemcpyAsync(target_conv_pool_.data, target_conv_slots_[slot_idx].data, target_conv_pool_.size_bytes, cudaMemcpyDeviceToDevice, main_stream_));
+            }
         }
+        if (num_gpus_ > 1) set_active_pp_device(0);
     }
 
     inline void compact_tree_kv_all_gqa_layers(const int* winning_slots, int pos_base, int L) {
@@ -1197,23 +1240,28 @@
         }
         if (!needs_compact) return;
 
-        CUDA_CHECK(cudaMemcpyAsync(buf_tree_winning_slots_.i32(), winning_slots, L * sizeof(int32_t), cudaMemcpyHostToDevice, main_stream_));
         int n_kv_heads = cfg_.num_key_value_heads;
         int head_dim = cfg_.head_dim;
-        for (int layer = 0; layer < cfg_.num_hidden_layers; layer++) {
-            auto& lw = layers_[layer];
-            if (!lw.is_linear_attn) {
-                compact_tree_kv_cache_cuda(
-                    lw.k_cache_gqa.u8(),
-                    lw.v_cache_gqa.u8(),
-                    buf_tree_winning_slots_.i32(),
-                    pos_base,
-                    L,
-                    n_kv_heads,
-                    head_dim,
-                    main_stream_);
+        for (int dev = 0; dev < num_gpus_; dev++) {
+            if (num_gpus_ > 1) set_active_pp_device(dev);
+            CUDA_CHECK(cudaMemcpyAsync(buf_tree_winning_slots_.i32(), winning_slots, L * sizeof(int32_t), cudaMemcpyHostToDevice, main_stream_));
+            for (int layer = 0; layer < cfg_.num_hidden_layers; layer++) {
+                if (num_gpus_ > 1 && layer_device(layer) != dev) continue;
+                auto& lw = layers_[layer];
+                if (!lw.is_linear_attn) {
+                    compact_tree_kv_cache_cuda(
+                        lw.k_cache_gqa.u8(),
+                        lw.v_cache_gqa.u8(),
+                        buf_tree_winning_slots_.i32(),
+                        pos_base,
+                        L,
+                        n_kv_heads,
+                        head_dim,
+                        main_stream_);
+                }
             }
         }
+        if (num_gpus_ > 1) set_active_pp_device(0);
     }
 
     // ── Qwen Protocol, Parameters & Chat Templating ───────────────────────────

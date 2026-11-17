@@ -1201,6 +1201,9 @@
     }
 
     void forward_token_batch_nemotron_device_body(int position, int M, bool do_compute_logits = false, bool compute_all_logits = false) {
+        if (num_gpus_ > 1 && active_pp_dev_ != 0) {
+            set_active_pp_device(0);
+        }
         int dim = cfg_.hidden_size;
 
         // 1. Embedding lookup for M tokens
@@ -1226,10 +1229,10 @@
             }
         }
 
-        // 2. Process all layers with profiling (only for prefill M > 4)
+        // 2. Process all layers with profiling (only for prefill M > 4 on single GPU)
         bool is_prefill = (M > 4);
         if (is_prefill) expert_loader_.set_in_prefill(true);
-        if (M > 4) {
+        if (M > 4 && num_gpus_ == 1) {
             cudaStreamSynchronize(main_stream_);
             auto t_layers_start = std::chrono::high_resolution_clock::now();
             static cudaEvent_t s_layer_events[128] = {nullptr};
@@ -1285,11 +1288,23 @@
                      n_dram_moe, ms_dram_moe, n_dram_moe > 0 ? (ms_dram_moe / n_dram_moe) : 0.0f);
         } else {
             for (int layer = 0; layer < cfg_.num_hidden_layers; layer++) {
+                if (num_gpus_ > 1 && layer == pp_split_layer_) {
+                    pp_copy_d2d(pp_peer_.buf_hidden_batch_.data, 1, buf_hidden_batch_.data, 0, (size_t)M * dim * sizeof(__nv_bfloat16));
+                    pp_copy_d2d(pp_peer_.buf_input_pos_batch_.data, 1, buf_input_pos_batch_.data, 0, (size_t)M * sizeof(int32_t));
+                    pp_copy_d2d(pp_peer_.buf_input_tokens_batch_.data, 1, buf_input_tokens_batch_.data, 0, (size_t)M * sizeof(int32_t));
+                    pp_copy_d2d(pp_peer_.buf_mrope_pos_.data, 1, buf_mrope_pos_.data, 0, 2 * sizeof(int32_t));
+                    set_active_pp_device(1);
+                }
                 forward_layer_nemotron_batch(layer, position, M);
             }
         }
 
-        if (M > 4 && s_moe_sub_init) {
+        if (num_gpus_ > 1 && active_pp_dev_ == 1) {
+            pp_copy_d2d(pp_peer_.buf_hidden_batch_.data, 0, buf_hidden_batch_.data, 1, (size_t)M * dim * sizeof(__nv_bfloat16));
+            set_active_pp_device(0);
+        }
+
+        if (M > 4 && num_gpus_ == 1 && s_moe_sub_init) {
             float t_p0 = 0, t_p1 = 0, t_p2 = 0, t_p3 = 0, t_p4 = 0;
             cudaEventElapsedTime(&t_p0, s_moe_sub_ev[0], s_moe_sub_ev[1]);
             cudaEventElapsedTime(&t_p1, s_moe_sub_ev[1], s_moe_sub_ev[2]);

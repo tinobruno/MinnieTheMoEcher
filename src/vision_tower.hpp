@@ -90,6 +90,234 @@ public:
     bool is_loaded() const { return is_loaded_; }
     const __nv_bfloat16* merge_fc1_output() const { return d_merge_fc1_; }
 
+    bool alloc_vram_or_managed(void*& ptr, size_t bytes) {
+        cudaError_t err = cudaMalloc(&ptr, bytes);
+        if (err != cudaSuccess) {
+            cudaGetLastError();
+            err = cudaMallocManaged(&ptr, bytes);
+            if (err != cudaSuccess) {
+                cudaGetLastError();
+                return false;
+            }
+        }
+        allocated_ptrs_.push_back(ptr);
+        return true;
+    }
+
+    bool load_from_mmproj_gguf(
+        const std::string& gguf_path,
+        cublasHandle_t cublas_handle,
+        cudaStream_t stream = 0,
+        int output_dim = 2560)
+    {
+        cublas_handle_ = cublas_handle;
+        stream_ = stream;
+
+        is_qwen25_ = false;
+        num_blocks_ = 27;
+        embed_dim_ = 1152;
+        num_heads_ = 16;
+        head_dim_ = 72;
+        mlp_intermediate_ = 4304;
+        patch_size_ = 16;
+        temporal_size_ = 2;
+        image_size_ = 768;
+        num_patches_ = 2304;
+        merged_patches_ = 576;
+        merger_in_dim_ = 4608;
+        output_dim_ = (output_dim > 0) ? output_dim : 2560;
+
+        moecher::platform::MemoryMappedFile mm_mmap;
+        if (!mm_mmap.open_read(gguf_path)) {
+            std::cerr << "[Vision] Error: failed to open mmproj GGUF: " << gguf_path << std::endl;
+            return false;
+        }
+        const uint8_t* base = static_cast<const uint8_t*>(mm_mmap.data());
+        const size_t file_size = mm_mmap.size();
+        if (file_size < 24 || std::memcmp(base, "GGUF", 4) != 0) {
+            std::cerr << "[Vision] Error: invalid GGUF magic in " << gguf_path << std::endl;
+            return false;
+        }
+
+        size_t pos = 4;
+        auto rd_u32 = [&]() -> uint32_t { uint32_t v; std::memcpy(&v, base + pos, 4); pos += 4; return v; };
+        auto rd_u64 = [&]() -> uint64_t { uint64_t v; std::memcpy(&v, base + pos, 8); pos += 8; return v; };
+        auto rd_str = [&]() -> std::string {
+            uint64_t len = rd_u64();
+            std::string s(reinterpret_cast<const char*>(base + pos), (size_t)len);
+            pos += (size_t)len;
+            return s;
+        };
+        auto skip_val = [&](auto& self, uint32_t vtype) -> void {
+            switch (vtype) {
+                case 0: case 1: case 7: pos += 1; break;
+                case 2: case 3:         pos += 2; break;
+                case 4: case 5: case 6: pos += 4; break;
+                case 10: case 11: case 12: pos += 8; break;
+                case 8: { uint64_t len = rd_u64(); pos += (size_t)len; break; }
+                case 9: {
+                    uint32_t etype = rd_u32();
+                    uint64_t cnt   = rd_u64();
+                    for (uint64_t i = 0; i < cnt; ++i) self(self, etype);
+                    break;
+                }
+                default: break;
+            }
+        };
+
+        (void)rd_u32(); // version
+        uint64_t n_tensors = rd_u64();
+        uint64_t n_kv      = rd_u64();
+        size_t alignment   = 32;
+
+        for (uint64_t i = 0; i < n_kv; ++i) {
+            std::string k = rd_str();
+            uint32_t vt = rd_u32();
+            if (k == "general.alignment" && vt == 4) {
+                alignment = rd_u32();
+            } else {
+                skip_val(skip_val, vt);
+            }
+        }
+
+        struct GgufTensorMeta {
+            uint64_t n_elems = 1;
+            uint32_t ggml_type = 0;
+            uint64_t rel_offset = 0;
+            const uint8_t* ptr = nullptr;
+        };
+        std::unordered_map<std::string, GgufTensorMeta> tmap;
+        tmap.reserve((size_t)n_tensors);
+
+        for (uint64_t i = 0; i < n_tensors; ++i) {
+            std::string name = rd_str();
+            uint32_t n_dims  = rd_u32();
+            uint64_t ne = 1;
+            for (uint32_t d = 0; d < n_dims; ++d) {
+                ne *= rd_u64();
+            }
+            uint32_t gtype = rd_u32();
+            uint64_t roff  = rd_u64();
+            tmap[name] = GgufTensorMeta{ne, gtype, roff, nullptr};
+        }
+
+        const size_t data_offset = (pos + alignment - 1) & ~(alignment - 1);
+        for (auto& kv : tmap) {
+            kv.second.ptr = base + data_offset + kv.second.rel_offset;
+        }
+
+        std::vector<__nv_bfloat16> host_conv_buf;
+        auto load_gguf_bf16 = [&](__nv_bfloat16*& dev_ptr, const std::string& name) -> bool {
+            auto it = tmap.find(name);
+            if (it == tmap.end()) {
+                std::cerr << "[Vision] Error: GGUF tensor missing: " << name << std::endl;
+                return false;
+            }
+            const auto& tm = it->second;
+            const size_t out_bytes = (size_t)tm.n_elems * sizeof(__nv_bfloat16);
+            void* raw_dev = nullptr;
+            if (!alloc_vram_or_managed(raw_dev, out_bytes)) {
+                std::cerr << "[Vision] Error: VRAM allocation failed for " << name << std::endl;
+                return false;
+            }
+            dev_ptr = static_cast<__nv_bfloat16*>(raw_dev);
+
+            if (tm.ggml_type == 30) { // BF16
+                cudaMemcpyAsync(dev_ptr, tm.ptr, out_bytes, cudaMemcpyHostToDevice, stream_);
+            } else if (tm.ggml_type == 0) { // F32 -> BF16
+                host_conv_buf.resize((size_t)tm.n_elems);
+                const float* src_f32 = reinterpret_cast<const float*>(tm.ptr);
+                for (size_t i = 0; i < (size_t)tm.n_elems; ++i) {
+                    host_conv_buf[i] = __float2bfloat16(src_f32[i]);
+                }
+                cudaMemcpyAsync(dev_ptr, host_conv_buf.data(), out_bytes, cudaMemcpyHostToDevice, stream_);
+                cudaStreamSynchronize(stream_);
+            } else {
+                std::cerr << "[Vision] Error: unsupported ggml_type=" << tm.ggml_type << " for " << name << std::endl;
+                return false;
+            }
+            return true;
+        };
+
+        // 1. Interleave v.patch_embd.weight (t=0) and v.patch_embd.weight.1 (t=1) into [1152, 3, 2, 16, 16] BF16
+        {
+            auto it0 = tmap.find("v.patch_embd.weight");
+            auto it1 = tmap.find("v.patch_embd.weight.1");
+            if (it0 == tmap.end() || it1 == tmap.end()) {
+                std::cerr << "[Vision] Error: missing v.patch_embd.weight / v.patch_embd.weight.1 in GGUF" << std::endl;
+                return false;
+            }
+            const size_t total_elems = 1152ULL * 3 * 2 * 16 * 16; // 1,769,472
+            host_conv_buf.resize(total_elems);
+            const float* w0_f32 = reinterpret_cast<const float*>(it0->second.ptr);
+            const float* w1_f32 = reinterpret_cast<const float*>(it1->second.ptr);
+            const __nv_bfloat16* w0_bf16 = reinterpret_cast<const __nv_bfloat16*>(it0->second.ptr);
+            const __nv_bfloat16* w1_bf16 = reinterpret_cast<const __nv_bfloat16*>(it1->second.ptr);
+            const bool is_f32 = (it0->second.ggml_type == 0);
+
+            for (size_t oc = 0; oc < 1152; ++oc) {
+                for (size_t c = 0; c < 3; ++c) {
+                    const size_t src_off = (oc * 3 + c) * 256;
+                    const size_t dst_t0  = ((oc * 3 + c) * 2 + 0) * 256;
+                    const size_t dst_t1  = ((oc * 3 + c) * 2 + 1) * 256;
+                    for (size_t sp = 0; sp < 256; ++sp) {
+                        host_conv_buf[dst_t0 + sp] = is_f32 ? __float2bfloat16(w0_f32[src_off + sp]) : w0_bf16[src_off + sp];
+                        host_conv_buf[dst_t1 + sp] = is_f32 ? __float2bfloat16(w1_f32[src_off + sp]) : w1_bf16[src_off + sp];
+                    }
+                }
+            }
+            void* raw_pe = nullptr;
+            if (!alloc_vram_or_managed(raw_pe, total_elems * sizeof(__nv_bfloat16))) return false;
+            patch_embed_w_ = static_cast<__nv_bfloat16*>(raw_pe);
+            cudaMemcpyAsync(patch_embed_w_, host_conv_buf.data(), total_elems * sizeof(__nv_bfloat16), cudaMemcpyHostToDevice, stream_);
+            cudaStreamSynchronize(stream_);
+        }
+
+        if (!load_gguf_bf16(patch_embed_b_, "v.patch_embd.bias") ||
+            !load_gguf_bf16(pos_embed_w_,   "v.position_embd.weight")) {
+            return false;
+        }
+
+        // 2. 27 ViT Blocks
+        blocks_.resize(num_blocks_);
+        for (int i = 0; i < num_blocks_; ++i) {
+            std::string pfx = "v.blk." + std::to_string(i) + ".";
+            auto& b = blocks_[i];
+            if (!load_gguf_bf16(b.norm1_w, pfx + "ln1.weight") ||
+                !load_gguf_bf16(b.norm1_b, pfx + "ln1.bias") ||
+                !load_gguf_bf16(b.qkv_w,   pfx + "attn_qkv.weight") ||
+                !load_gguf_bf16(b.qkv_b,   pfx + "attn_qkv.bias") ||
+                !load_gguf_bf16(b.proj_w,  pfx + "attn_out.weight") ||
+                !load_gguf_bf16(b.proj_b,  pfx + "attn_out.bias") ||
+                !load_gguf_bf16(b.norm2_w, pfx + "ln2.weight") ||
+                !load_gguf_bf16(b.norm2_b, pfx + "ln2.bias") ||
+                !load_gguf_bf16(b.mlp1_w,  pfx + "ffn_up.weight") ||
+                !load_gguf_bf16(b.mlp1_b,  pfx + "ffn_up.bias") ||
+                !load_gguf_bf16(b.mlp2_w,  pfx + "ffn_down.weight") ||
+                !load_gguf_bf16(b.mlp2_b,  pfx + "ffn_down.bias")) {
+                return false;
+            }
+        }
+
+        // 3. Spatial Merger (4608 -> 4608 -> 2560)
+        if (!load_gguf_bf16(merger_.norm_w, "v.post_ln.weight") ||
+            !load_gguf_bf16(merger_.norm_b, "v.post_ln.bias") ||
+            !load_gguf_bf16(merger_.fc1_w,  "mm.0.weight") ||
+            !load_gguf_bf16(merger_.fc1_b,  "mm.0.bias") ||
+            !load_gguf_bf16(merger_.fc2_w,  "mm.2.weight") ||
+            !load_gguf_bf16(merger_.fc2_b,  "mm.2.bias")) {
+            return false;
+        }
+
+        cudaStreamSynchronize(stream_);
+        if (!init_persistent_buffers()) {
+            return false;
+        }
+
+        is_loaded_ = true;
+        return true;
+    }
+
     bool load_from_manifest(
         const std::string& dense_path,
         const json& tensor_map,
@@ -597,14 +825,17 @@ private:
     }
 
     bool init_persistent_buffers() {
-        if (cudaMalloc(&d_visual_out_, (size_t)merged_patches_ * output_dim_ * sizeof(__nv_bfloat16)) != cudaSuccess) return false;
-        allocated_ptrs_.push_back(d_visual_out_);
+        void* raw_vis = nullptr;
+        if (!alloc_vram_or_managed(raw_vis, (size_t)merged_patches_ * output_dim_ * sizeof(__nv_bfloat16))) return false;
+        d_visual_out_ = static_cast<__nv_bfloat16*>(raw_vis);
 
         if (is_qwen25_) {
-            if (cudaMalloc(&d_window_index_, (size_t)merged_patches_ * sizeof(int)) != cudaSuccess) return false;
-            allocated_ptrs_.push_back(d_window_index_);
-            if (cudaMalloc(&d_reverse_indices_, (size_t)merged_patches_ * sizeof(int)) != cudaSuccess) return false;
-            allocated_ptrs_.push_back(d_reverse_indices_);
+            void* raw_win = nullptr;
+            if (!alloc_vram_or_managed(raw_win, (size_t)merged_patches_ * sizeof(int))) return false;
+            d_window_index_ = static_cast<int*>(raw_win);
+            void* raw_rev = nullptr;
+            if (!alloc_vram_or_managed(raw_rev, (size_t)merged_patches_ * sizeof(int))) return false;
+            d_reverse_indices_ = static_cast<int*>(raw_rev);
         }
 
         if (!init_rotary_tables()) {
@@ -612,8 +843,9 @@ private:
         }
 
         size_t col_mean_bytes = (size_t)(output_dim_ + 256) * sizeof(float);
-        if (cudaMalloc(&d_col_mean_scratch_, col_mean_bytes) != cudaSuccess) return false;
-        allocated_ptrs_.push_back(d_col_mean_scratch_);
+        void* raw_cm = nullptr;
+        if (!alloc_vram_or_managed(raw_cm, col_mean_bytes)) return false;
+        d_col_mean_scratch_ = static_cast<float*>(raw_cm);
 
         return true;
     }
@@ -622,7 +854,14 @@ private:
         if (!scratch_ptrs_.empty()) return true;
 
         auto alloc_raw = [&](void*& ptr, size_t bytes) -> bool {
-            if (cudaMalloc(&ptr, bytes) != cudaSuccess) return false;
+            cudaError_t err = cudaMalloc(&ptr, bytes);
+            if (err != cudaSuccess) {
+                cudaGetLastError();
+                if (cudaMallocManaged(&ptr, bytes) != cudaSuccess) {
+                    cudaGetLastError();
+                    return false;
+                }
+            }
             scratch_ptrs_.push_back(ptr);
             return true;
         };
@@ -711,10 +950,12 @@ private:
     bool init_rotary_tables() {
         size_t total_elements = (size_t)num_patches_ * head_dim_;
         size_t bytes = total_elements * sizeof(float);
-        if (cudaMalloc(&d_cos_, bytes) != cudaSuccess) return false;
-        if (cudaMalloc(&d_sin_, bytes) != cudaSuccess) return false;
-        allocated_ptrs_.push_back(d_cos_);
-        allocated_ptrs_.push_back(d_sin_);
+        void* raw_cos = nullptr;
+        void* raw_sin = nullptr;
+        if (!alloc_vram_or_managed(raw_cos, bytes)) return false;
+        if (!alloc_vram_or_managed(raw_sin, bytes)) return false;
+        d_cos_ = static_cast<float*>(raw_cos);
+        d_sin_ = static_cast<float*>(raw_sin);
 
         std::vector<float> h_cos(total_elements);
         std::vector<float> h_sin(total_elements);

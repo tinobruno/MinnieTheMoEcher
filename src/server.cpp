@@ -207,6 +207,7 @@ void rebuild_system_prefix(
     if (full_prompt_text.empty() && resolved_tools.empty()) {
         engine.reset_all_kv_caches();
         engine.system_kv_snapshot_.valid = false;
+        engine.system_kv_snapshot_nothink_.valid = false;
         engine.turn_kv_snapshot_.valid = false;
         s_last_conv_messages.clear();
         g_base_system_prompt.clear();
@@ -261,11 +262,32 @@ void rebuild_system_prefix(
                  sys_tokens.size(), resolved_tools.size());
         engine.reset_all_kv_caches();
         engine.prefill_prefix(sys_tokens);
-        // Note: prefill_prefix() already calls snapshot_system_kv() internally on line 4060
+        // Note: prefill_prefix() already calls snapshot_system_kv() internally
         LOG_INFO("System KV Cache snapshot pinned successfully (%zu tokens).", sys_tokens.size());
+
+        // Also build & pin the Non-Thinking System KV Cache snapshot (for intent-gated short prompts)
+        std::vector<int> prompt_nt = engine.apply_chat_template(default_messages, false, "none", resolved_tools);
+        size_t sys_nt_len = prompt_nt.size();
+        for (size_t i = 1; i < prompt_nt.size(); i++) {
+            if (prompt_nt[i] == user_start) {
+                sys_nt_len = i;
+                break;
+            }
+        }
+        if (sys_nt_len > 0 && (sys_nt_len != sys_len || !std::equal(prompt_nt.begin(), prompt_nt.begin() + sys_nt_len, prompt.begin()))) {
+            std::vector<int> sys_tokens_nt(prompt_nt.begin(), prompt_nt.begin() + sys_nt_len);
+            LOG_INFO("Rebuilding Non-Thinking System KV Cache snapshot (%zu tokens)...", sys_tokens_nt.size());
+            engine.reset_all_kv_caches();
+            engine.prefill_prefix(sys_tokens_nt, /*is_nothink=*/true);
+            engine.restore_system_kv();
+            LOG_INFO("Non-Thinking System KV Cache snapshot pinned successfully (%zu tokens).", sys_tokens_nt.size());
+        } else {
+            engine.system_kv_snapshot_nothink_.valid = false;
+        }
     } else {
         engine.reset_all_kv_caches();
         engine.system_kv_snapshot_.valid = false;
+        engine.system_kv_snapshot_nothink_.valid = false;
         LOG_INFO("System KV Cache snapshot cleared.");
     }
 }
@@ -502,6 +524,20 @@ static json prune_messages_to_fit(
             return pruned;
         }
     }
+
+    // Step 2b: If still over budget (e.g. a massive assistant response in turn 1), allow evicting the initial turn
+    // so only the system prompt (if any) and the latest user turn remain
+    const size_t sys_preserve = (pruned.size() > 0 && pruned[0].value("role", "") == "system") ? 1 : 0;
+    while (pruned.size() > sys_preserve + 1 && test_prompt.size() > (size_t)max_allowed_tokens) {
+        pruned.erase(sys_preserve);
+        test_prompt = engine.apply_chat_template(pruned, enable_thinking, reasoning_effort, tools);
+        if (test_prompt.size() <= (size_t)max_allowed_tokens) {
+            LOG_INFO("[Context] Pruning complete (evicted initial turn): retained %zu messages, prompt length %zu / %d",
+                     pruned.size(), test_prompt.size(), max_allowed_tokens);
+            return pruned;
+        }
+    }
+    preserve_count = std::min(preserve_count, sys_preserve);
 
     // Step 3: If still too long, aggressively truncate remaining non-pinned messages down to 300 chars
     while (test_prompt.size() > (size_t)max_allowed_tokens) {
@@ -1841,9 +1877,10 @@ void run_server(MoecherEngine& engine, int port, int default_thinking_budget, in
             int top_k = request.value("top_k", default_top_k);
             int max_tokens = request.value("max_tokens", 20000);
             bool stream = request.value("stream", false);
-            float default_rep = g_server_config.repetition_penalty > 0.0f ? g_server_config.repetition_penalty :
+            float default_rep = (temperature <= 0.0f) ? 1.00f :
+                (g_server_config.repetition_penalty > 0.0f ? g_server_config.repetition_penalty :
                 (engine.cfg_.default_repetition_penalty > 0.0f ? engine.cfg_.default_repetition_penalty :
-                rec.value("repetition_penalty", 1.00f));
+                rec.value("repetition_penalty", 1.00f)));
             float repetition_penalty = request.value("repetition_penalty", default_rep);
             float presence_penalty = request.value("presence_penalty", 0.0f);
             float frequency_penalty = request.value("frequency_penalty", 0.0f);
@@ -2486,6 +2523,7 @@ void run_server(MoecherEngine& engine, int port, int default_thinking_budget, in
                             };
 
                             auto last_kv_emit_time = std::chrono::steady_clock::now();
+                            bool first_tok_seen = false;
 
                             auto token_stream_cb = [&](const std::string& text, bool is_reasoning) -> bool {
                                 if (g_stop_requested.load()) return false;
@@ -2493,7 +2531,10 @@ void run_server(MoecherEngine& engine, int port, int default_thinking_budget, in
 
                                 if (!is_external_provider) {
                                     auto now_tp = std::chrono::steady_clock::now();
-                                    if (std::chrono::duration<double>(now_tp - last_kv_emit_time).count() >= 1.0) {
+                                    if (!first_tok_seen) {
+                                        first_tok_seen = true;
+                                        last_kv_emit_time = now_tp;
+                                    } else if (std::chrono::duration<double>(now_tp - last_kv_emit_time).count() >= 2.0) {
                                         last_kv_emit_time = now_tp;
                                         json kv_chunk = {
                                             {"id", req_id},

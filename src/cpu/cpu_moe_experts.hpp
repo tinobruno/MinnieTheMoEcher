@@ -826,12 +826,36 @@ public:
         }
     }
 
+    void parallel_for(int total_units, void (*fn)(int, void*), void* ctx) {
+        if (total_units <= 0) return;
+        if (total_units == 1) {
+            fn(0, ctx);
+            return;
+        }
+        const uint64_t next_ep = epoch_.load(std::memory_order_relaxed) + 1;
+        JobSlot& slot = slots_[next_ep & (RING_SLOTS - 1)];
+
+        slot.mode          = Mode::CUSTOM_FOR;
+        slot.custom_fn     = fn;
+        slot.custom_ctx    = ctx;
+        slot.memcpy_chunks = total_units;
+        slot.s1_next.store(0, std::memory_order_relaxed);
+        slot.s2_done.store(0, std::memory_order_relaxed);
+
+        dispatch_epoch(next_ep);
+        run_custom_for_stage(slot);
+        while (slot.s2_done.load(std::memory_order_acquire) < total_units) {
+            _mm_pause();
+        }
+    }
+
 private:
     static constexpr int RING_SLOTS = 8;
 
     enum class Mode : int {
         COMPUTE_EXPERTS = 0,
-        MEMCPY_GATHER   = 1
+        MEMCPY_GATHER   = 1,
+        CUSTOM_FOR      = 2
     };
 
     struct alignas(64) JobSlot {
@@ -858,6 +882,8 @@ private:
         const CpuMemcpyTaskDesc* memcpy_tasks   = nullptr;
         int                      memcpy_count   = 0;
         int                      memcpy_chunks  = 0;
+        void                   (*custom_fn)(int, void*) = nullptr;
+        void*                    custom_ctx     = nullptr;
     };
 
     CpuMoEExpertPool() {
@@ -972,6 +998,18 @@ private:
         }
     }
 
+    void run_custom_for_stage(JobSlot& slot) {
+        const int total_units = slot.memcpy_chunks;
+        auto fn = slot.custom_fn;
+        void* ctx = slot.custom_ctx;
+        while (true) {
+            const int u = slot.s1_next.fetch_add(1, std::memory_order_relaxed);
+            if (u >= total_units) break;
+            fn(u, ctx);
+            slot.s2_done.fetch_add(1, std::memory_order_release);
+        }
+    }
+
     void worker_loop() {
         uint64_t last_ep = 0;
         uint32_t spin = 0;
@@ -1002,8 +1040,10 @@ private:
             JobSlot& slot = slots_[ep & (RING_SLOTS - 1)];
             if (slot.mode == Mode::COMPUTE_EXPERTS) {
                 run_expert_stages(slot);
-            } else {
+            } else if (slot.mode == Mode::MEMCPY_GATHER) {
                 run_memcpy_stage(slot);
+            } else {
+                run_custom_for_stage(slot);
             }
         }
     }

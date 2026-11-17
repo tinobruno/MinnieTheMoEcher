@@ -8175,10 +8175,10 @@ __global__ void mla_attention_fused_batch_kernel(
 }
 
 void init_mla_dynamic_shared_memory() {
-    static bool s_configured = false;
-    if (s_configured) return;
+    static bool s_configured[8] = {false};
     int dev = 0;
-    if (cudaGetDevice(&dev) != cudaSuccess) return;
+    if (cudaGetDevice(&dev) != cudaSuccess || dev < 0 || dev >= 8) return;
+    if (s_configured[dev]) return;
     cudaDeviceProp prop;
     if (cudaGetDeviceProperties(&prop, dev) != cudaSuccess) return;
 
@@ -8212,7 +8212,7 @@ void init_mla_dynamic_shared_memory() {
                                  (int)max_allowed);
         }
     }
-    s_configured = true;
+    s_configured[dev] = true;
 }
 
 void mla_attention_fused_cuda(
@@ -12939,18 +12939,21 @@ struct MoEWorkTile {
     int32_t tk_idx[8];  // each entry is t * 6 + k
 };
 
-static MoEWorkTile* s_d_hot_tiles = nullptr;
-static MoEWorkTile* s_d_cold_tiles = nullptr;
-static int32_t* s_d_num_hot_tiles = nullptr;
-static int32_t* s_d_num_cold_tiles = nullptr;
+static MoEWorkTile* s_d_hot_tiles[8] = {nullptr};
+static MoEWorkTile* s_d_cold_tiles[8] = {nullptr};
+static int32_t* s_d_num_hot_tiles[8] = {nullptr};
+static int32_t* s_d_num_cold_tiles[8] = {nullptr};
 
-static void ensure_moe_tile_buffers() {
-    if (!s_d_hot_tiles) {
-        cudaMalloc(&s_d_hot_tiles, 3072 * sizeof(MoEWorkTile));
-        cudaMalloc(&s_d_cold_tiles, 3072 * sizeof(MoEWorkTile));
-        cudaMalloc(&s_d_num_hot_tiles, sizeof(int32_t));
-        cudaMalloc(&s_d_num_cold_tiles, sizeof(int32_t));
+static int ensure_moe_tile_buffers() {
+    int dev = 0;
+    if (cudaGetDevice(&dev) != cudaSuccess || dev < 0 || dev >= 8) dev = 0;
+    if (!s_d_hot_tiles[dev]) {
+        cudaMalloc(&s_d_hot_tiles[dev], 3072 * sizeof(MoEWorkTile));
+        cudaMalloc(&s_d_cold_tiles[dev], 3072 * sizeof(MoEWorkTile));
+        cudaMalloc(&s_d_num_hot_tiles[dev], sizeof(int32_t));
+        cudaMalloc(&s_d_num_cold_tiles[dev], sizeof(int32_t));
     }
+    return dev;
 }
 
 __global__ void build_moe_work_tiles_kernel(
@@ -13398,11 +13401,11 @@ void build_moe_work_tiles_cuda(
     int layer_id, int n_experts, int M,
     cudaStream_t stream)
 {
-    ensure_moe_tile_buffers();
+    int dev = ensure_moe_tile_buffers();
     int threads = (n_experts <= 384) ? 384 : 512;
     build_moe_work_tiles_kernel<<<1, threads, 0, stream>>>(
-        s_d_hot_tiles, s_d_num_hot_tiles,
-        s_d_cold_tiles, s_d_num_cold_tiles,
+        s_d_hot_tiles[dev], s_d_num_hot_tiles[dev],
+        s_d_cold_tiles[dev], s_d_num_cold_tiles[dev],
         topk_ids, expert_type_map, layer_id, n_experts, M * 6);
 }
 
@@ -13417,7 +13420,7 @@ void gemv_mixed_moe_swiglu_grouped_pass_cuda(
     int exact_num_tiles)
 {
     if (exact_num_tiles == 0) return;
-    ensure_moe_tile_buffers();
+    int dev = ensure_moe_tile_buffers();
     int max_tiles = (exact_num_tiles > 0) ? exact_num_tiles
                   : std::min(M * 6, n_experts + (M * 6 + 7) / 8);
     if (max_tiles < 1) max_tiles = 1;
@@ -13425,8 +13428,8 @@ void gemv_mixed_moe_swiglu_grouped_pass_cuda(
     dim3 blocks((N + 7) / 8, max_tiles);
     gemv_mixed_moe_swiglu_grouped_kernel<<<blocks, threads, 0, stream>>>(
         gate_buf, vec, w1_cold_offset, w3_cold_offset, N, K, swiglu_limit,
-        is_hot_pass ? s_d_hot_tiles : s_d_cold_tiles,
-        is_hot_pass ? s_d_num_hot_tiles : s_d_num_cold_tiles,
+        is_hot_pass ? s_d_hot_tiles[dev] : s_d_cold_tiles[dev],
+        is_hot_pass ? s_d_num_hot_tiles[dev] : s_d_num_cold_tiles[dev],
         flat_expert_ptrs, layer_id, n_experts, is_hot_pass);
 }
 
@@ -13440,7 +13443,7 @@ void gemv_mixed_moe_down_grouped_pass_cuda(
     int exact_num_tiles)
 {
     if (exact_num_tiles == 0) return;
-    ensure_moe_tile_buffers();
+    int dev = ensure_moe_tile_buffers();
     int max_tiles = (exact_num_tiles > 0) ? exact_num_tiles
                   : std::min(M * 6, n_experts + (M * 6 + 7) / 8);
     if (max_tiles < 1) max_tiles = 1;
@@ -13448,8 +13451,8 @@ void gemv_mixed_moe_down_grouped_pass_cuda(
     dim3 blocks((N + 7) / 8, max_tiles);
     gemv_mixed_moe_down_grouped_kernel<<<blocks, threads, 0, stream>>>(
         down_buf, gate_buf,
-        is_hot_pass ? s_d_hot_tiles : s_d_cold_tiles,
-        is_hot_pass ? s_d_num_hot_tiles : s_d_num_cold_tiles,
+        is_hot_pass ? s_d_hot_tiles[dev] : s_d_cold_tiles[dev],
+        is_hot_pass ? s_d_num_hot_tiles[dev] : s_d_num_cold_tiles[dev],
         flat_expert_ptrs, layer_id, n_experts, w2_cold_offset, N, K, is_hot_pass);
 }
 

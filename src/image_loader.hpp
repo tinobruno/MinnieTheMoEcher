@@ -87,11 +87,19 @@ static inline bool preprocess_image(
                             STBIR_RGB);
     stbi_image_free(rgb);
 
-    // Qwen2.5-VL normalization (preprocessor_config.json):
-    // mean = [0.48145466, 0.4578275, 0.40821073]
-    // std  = [0.26862954, 0.26130258, 0.27577711]
-    const float mean[3] = {0.48145466f, 0.4578275f, 0.40821073f};
-    const float std_dev[3] = {0.26862954f, 0.26130258f, 0.27577711f};
+    // Qwen 3.8 (768x768) uses mean=[0.5, 0.5, 0.5], std=[0.5, 0.5, 0.5];
+    // Qwen2.5-VL (672x672) uses CLIP mean/std.
+    const bool use_half_norm = (target_size == 768);
+    const float mean[3] = {
+        use_half_norm ? 0.5f : 0.48145466f,
+        use_half_norm ? 0.5f : 0.4578275f,
+        use_half_norm ? 0.5f : 0.40821073f
+    };
+    const float std_dev[3] = {
+        use_half_norm ? 0.5f : 0.26862954f,
+        use_half_norm ? 0.5f : 0.26130258f,
+        use_half_norm ? 0.5f : 0.27577711f
+    };
 
     size_t plane_size = (size_t)target_size * target_size;
     size_t frame_size = 3 * plane_size;

@@ -312,9 +312,11 @@
                 1, top_k, n_experts, dim, moe_inter, main_stream_);
         }
 
-        // ── 3. Asynchronously Copy Top-6 Expert IDs to Host ──────────────────
+        // ── 3. Asynchronously Copy Top-6 Expert IDs & Routing Weights to Host ─
         CUDA_CHECK(cudaMemcpyAsync(topk_ids_host_, buf_topk_idx_.i32(),
                                    top_k * sizeof(int32_t), cudaMemcpyDeviceToHost, main_stream_));
+        CUDA_CHECK(cudaMemcpyAsync(topk_weights_host_, buf_topk_vals_.f32(),
+                                   top_k * sizeof(float), cudaMemcpyDeviceToHost, main_stream_));
         CUDA_CHECK(cudaEventRecord(dma_event_, main_stream_));
 
         // ── 4. Side-Stream Compute Overlap: 1 Shared Expert ───────────────────
@@ -349,10 +351,11 @@
         void* exp_ptrs[6] = {nullptr};
         bool is_cold_expert[6] = {false};
         void* dram_srcs[6] = {nullptr};
+        bool dram_src_is_pinned[6] = {false};
+        bool is_gated_out[6] = {false};
         int disk_miss_k[6];
         int n_disk_miss = 0;
         size_t exp_block_sz = expert_loader_.expert_block_size() > 0 ? (size_t)expert_loader_.expert_block_size() : (size_t)18800640;
-        size_t copy_sz = expert_loader_.is_mixed() ? (size_t)expert_loader_.cold_block_size() : exp_block_sz;
 
         for (int k = 0; k < top_k; k++) {
             int eid = topk_ids_host_[k];
@@ -360,10 +363,26 @@
 
             if (expert_loader_.is_mixed()) {
                 if (expert_loader_.is_hot(layer_id, eid)) {
-                    // Hot Expert: 100% VRAM Resident (Zero-latency hit)
-                    exp_ptrs[k] = expert_loader_.get_hot_vram_ptr(layer_id, eid);
                     is_cold_expert[k] = false;
-                    continue;
+                    // Hot Expert: Check Tier 1 (VRAM L1 Hot Pool)
+                    void* vram_hot = expert_loader_.get_hot_vram_ptr(layer_id, eid);
+                    if (vram_hot) {
+                        exp_ptrs[k] = vram_hot;
+                        continue;
+                    }
+                    // Tier 2: Check L2 Host DRAM Cache
+                    void* dram_hot = expert_loader_.try_get_hot_dram_ptr(layer_id, eid);
+                    if (dram_hot) {
+                        if (expert_loader_.has_hot_gpu_ptr(layer_id, eid)) {
+                            // Pinned cudaMallocHost UVA: execute directly via Zero-Copy UVA!
+                            exp_ptrs[k] = dram_hot;
+                        } else {
+                            dram_srcs[k] = dram_hot;
+                            dram_src_is_pinned[k] = false;
+                        }
+                    } else {
+                        disk_miss_k[n_disk_miss++] = k;
+                    }
                 } else {
                     is_cold_expert[k] = true;
                     debug_cold_routed_token_++;
@@ -374,9 +393,11 @@
                         continue;
                     }
                     // Tier 2: Check L2 Host DRAM Cache (updates LRU & active_req)
-                    void* dram_src = expert_loader_.try_get_dram_expert_ptr(layer_id, eid);
+                    bool is_pinned_cold = false;
+                    void* dram_src = expert_loader_.try_get_dram_expert_ptr_ex(layer_id, eid, is_pinned_cold);
                     if (dram_src) {
                         dram_srcs[k] = dram_src;
+                        dram_src_is_pinned[k] = is_pinned_cold;
                     } else {
                         disk_miss_k[n_disk_miss++] = k;
                     }
@@ -390,14 +411,61 @@
                 }
 
                 // Tier 2: Check L2 Host DRAM Cache (Microsecond PCIe DMA)
+                bool is_pinned_dram = expert_loader_.dram_is_pinned();
                 void* dram_src = expert_loader_.get_flat_dram_ptr(layer_id, eid);
-                if (!dram_src) dram_src = expert_loader_.try_get_dram_expert_ptr(layer_id, eid);
+                if (!dram_src) dram_src = expert_loader_.try_get_dram_expert_ptr_ex(layer_id, eid, is_pinned_dram);
 
                 if (dram_src) {
                     dram_srcs[k] = dram_src;
+                    dram_src_is_pinned[k] = is_pinned_dram;
                 } else {
                     disk_miss_k[n_disk_miss++] = k;
                 }
+            }
+        }
+
+        // High-confidence SATA SSD tail pruning with exact routing weight renormalization (optional, --ssd-tail-pruning):
+        // Only prune an individual Cold SSD miss k if its weight is < 11%
+        // of the token's total routing weight, at least 4 of the 6 routed experts remain active,
+        // and >= 82% of the token's total routing weight is preserved by the active experts.
+        if (n_disk_miss > 0 && enable_ssd_tail_pruning_) {
+            float total_w = 0.0f;
+            for (int k = 0; k < top_k; k++) {
+                total_w += topk_weights_host_[k];
+            }
+            float kept_w = total_w;
+            int active_cnt = top_k;
+            int filtered_miss_k[6];
+            int new_n_disk_miss = 0;
+            for (int m = 0; m < n_disk_miss; m++) {
+                int k = disk_miss_k[m];
+                float wk = topk_weights_host_[k];
+                if (is_cold_expert[k] &&
+                    total_w > 0.0f &&
+                    wk < 0.11f * total_w &&
+                    (active_cnt - 1) >= 4 &&
+                    (kept_w - wk) >= 0.82f * total_w) {
+                    is_gated_out[k] = true;
+                    kept_w -= wk;
+                    topk_weights_host_[k] = 0.0f;
+                    active_cnt--;
+                } else {
+                    filtered_miss_k[new_n_disk_miss++] = k;
+                }
+            }
+            if (new_n_disk_miss < n_disk_miss && kept_w > 0.0f) {
+                float scale = total_w / kept_w;
+                for (int k = 0; k < top_k; k++) {
+                    if (!is_gated_out[k]) {
+                        topk_weights_host_[k] *= scale;
+                    }
+                }
+                CUDA_CHECK(cudaMemcpyAsync(buf_topk_vals_.f32(), topk_weights_host_,
+                                           top_k * sizeof(float), cudaMemcpyHostToDevice, main_stream_));
+                for (int m = 0; m < new_n_disk_miss; m++) {
+                    disk_miss_k[m] = filtered_miss_k[m];
+                }
+                n_disk_miss = new_n_disk_miss;
             }
         }
 
@@ -411,11 +479,17 @@
                     expert_launched[k] = true;
                 } else if (dram_srcs[k] != nullptr) {
                     int eid = topk_ids_host_[k];
-                    void* vram_slot = expert_loader_.is_mixed()
+                    void* vram_slot = (expert_loader_.is_mixed() && is_cold_expert[k])
                         ? expert_loader_.allocate_cold_vram_l1_slot(layer_id, eid)
                         : nullptr;
                     if (!vram_slot) vram_slot = streaming_slots_gpu_[0][k];
-                    CUDA_CHECK(cudaMemcpyAsync(vram_slot, dram_srcs[k], copy_sz, cudaMemcpyHostToDevice, main_stream_));
+                    size_t cur_copy_sz = is_cold_expert[k]
+                        ? (size_t)expert_loader_.cold_block_size()
+                        : (expert_loader_.is_mixed() ? (size_t)expert_loader_.hot_block_size() : exp_block_sz);
+                    void* stage_src = dram_src_is_pinned[k]
+                        ? dram_srcs[k]
+                        : expert_loader_.stage_unpinned_to_pinned(dram_srcs[k], cur_copy_sz, k);
+                    CUDA_CHECK(cudaMemcpyAsync(vram_slot, stage_src, cur_copy_sz, cudaMemcpyHostToDevice, main_stream_));
                     exp_ptrs[k] = vram_slot;
                     execute_expert_swiglu(exp_ptrs[k], 1.0f, k, buf_hidden_.bf16(), is_cold_expert[k]);
                     expert_launched[k] = true;
@@ -429,7 +503,12 @@
                 int k = disk_miss_k[m];
                 int eid = topk_ids_host_[k];
                 int64_t key = (int64_t)layer_id * n_experts + eid;
-                dram_srcs[k] = expert_loader_.fetch_cold_expert_from_disk(layer_id, eid, key);
+                if (is_cold_expert[k]) {
+                    dram_srcs[k] = expert_loader_.fetch_cold_expert_from_disk(layer_id, eid, key);
+                } else {
+                    dram_srcs[k] = expert_loader_.fetch_hot_expert_from_disk(layer_id, eid, key);
+                }
+                dram_src_is_pinned[k] = (dram_srcs[k] != nullptr && !expert_loader_.is_unpinned_ptr(dram_srcs[k]));
             }
         } else if (n_disk_miss > 1) {
             std::future<void*> futs[6];
@@ -437,32 +516,41 @@
                 int k = disk_miss_k[m];
                 int eid = topk_ids_host_[k];
                 int64_t key = (int64_t)layer_id * n_experts + eid;
-                futs[m] = expert_pool_->enqueue([this, layer_id, eid, key]() {
-                    return expert_loader_.fetch_cold_expert_from_disk(layer_id, eid, key);
+                bool is_cold = is_cold_expert[k];
+                futs[m] = expert_pool_->enqueue([this, layer_id, eid, key, is_cold]() {
+                    return is_cold ? expert_loader_.fetch_cold_expert_from_disk(layer_id, eid, key)
+                                   : expert_loader_.fetch_hot_expert_from_disk(layer_id, eid, key);
                 });
             }
             for (int m = 0; m < n_disk_miss; m++) {
                 int k = disk_miss_k[m];
                 dram_srcs[k] = futs[m].get();
+                dram_src_is_pinned[k] = (dram_srcs[k] != nullptr && !expert_loader_.is_unpinned_ptr(dram_srcs[k]));
             }
         }
 
         // Queue async H2D DMA transfers into Dynamic VRAM L1 Cold Cache (or streaming slot fallback)
         for (int k = 0; k < top_k; k++) {
-            if (exp_ptrs[k] != nullptr) continue;
+            if (exp_ptrs[k] != nullptr || is_gated_out[k]) continue;
             int eid = topk_ids_host_[k];
             if (eid < 0 || eid >= n_experts) continue;
             void* dram_src = dram_srcs[k];
-            void* vram_slot = expert_loader_.is_mixed()
+            void* vram_slot = (expert_loader_.is_mixed() && is_cold_expert[k])
                 ? expert_loader_.allocate_cold_vram_l1_slot(layer_id, eid)
                 : nullptr;
             if (!vram_slot) vram_slot = streaming_slots_gpu_[0][k];
+            size_t cur_copy_sz = is_cold_expert[k]
+                ? (size_t)expert_loader_.cold_block_size()
+                : (expert_loader_.is_mixed() ? (size_t)expert_loader_.hot_block_size() : exp_block_sz);
             if (dram_src && vram_slot) {
-                CUDA_CHECK(cudaMemcpyAsync(vram_slot, dram_src, copy_sz, cudaMemcpyHostToDevice, main_stream_));
+                void* stage_src = dram_src_is_pinned[k]
+                    ? dram_src
+                    : expert_loader_.stage_unpinned_to_pinned(dram_src, cur_copy_sz, k);
+                CUDA_CHECK(cudaMemcpyAsync(vram_slot, stage_src, cur_copy_sz, cudaMemcpyHostToDevice, main_stream_));
                 exp_ptrs[k] = vram_slot;
             } else {
-                LOG_ERROR("Step %d L%d: Cold expert %d FAILED to load! (dram_src=%p, vram_slot=%p)",
-                          decode_step_idx_, layer_id, eid, dram_src, vram_slot);
+                LOG_ERROR("Step %d L%d: %s expert %d FAILED to load! (dram_src=%p, vram_slot=%p)",
+                          decode_step_idx_, layer_id, is_cold_expert[k] ? "Cold" : "Hot", eid, dram_src, vram_slot);
             }
         }
 
@@ -535,50 +623,66 @@
         }
 
         static int32_t* s_h_comp_counts = nullptr;
-        static int32_t* s_d_comp_counts = nullptr;
-        static int s_comp_counts_cap = 0;
-        if (!s_d_comp_counts || s_comp_counts_cap < 2 * max_super_m) {
+        static float* s_h_topk_vals = nullptr;
+        static size_t s_h_topk_vals_cap = 0;
+        static int32_t* s_d_comp_counts[2] = {nullptr, nullptr};
+        static int s_comp_counts_cap[2] = {0, 0};
+        static uint8_t* s_d_idx_mask_super[2] = {nullptr, nullptr};
+        static size_t s_idx_mask_cap[2] = {0, 0};
+        static float* s_d_idx_scores_chunk[2] = {nullptr, nullptr};
+        static size_t s_idx_scores_cap[2] = {0, 0};
+        static cudaEvent_t s_pfev[2][14] = {{nullptr}};
+        static bool s_pfev_init[2] = {false, false};
+        static bool s_cublas_warmup[2] = {false, false};
+        static cudaEvent_t s_topk_d2h_ev[2] = {nullptr, nullptr};
+
+        if (!s_h_comp_counts || s_comp_counts_cap[0] < 2 * max_super_m) {
             if (s_h_comp_counts) cudaFreeHost(s_h_comp_counts);
-            if (s_d_comp_counts) cudaFree(s_d_comp_counts);
-            s_comp_counts_cap = 2 * max_super_m;
-            CUDA_CHECK(cudaMallocHost(&s_h_comp_counts, (size_t)s_comp_counts_cap * sizeof(int32_t)));
-            CUDA_CHECK(cudaMalloc(&s_d_comp_counts, (size_t)s_comp_counts_cap * sizeof(int32_t)));
+            CUDA_CHECK(cudaMallocHost(&s_h_comp_counts, (size_t)(2 * max_super_m) * sizeof(int32_t)));
+        }
+        if (!s_h_topk_vals || s_h_topk_vals_cap < (size_t)chunk_size * top_k) {
+            if (s_h_topk_vals) cudaFreeHost(s_h_topk_vals);
+            s_h_topk_vals_cap = (size_t)chunk_size * top_k;
+            CUDA_CHECK(cudaMallocHost(&s_h_topk_vals, s_h_topk_vals_cap * sizeof(float)));
         }
 
-        static uint8_t* s_d_idx_mask_super = nullptr;
-        static size_t s_idx_mask_cap = 0;
-        static float* s_d_idx_scores_chunk = nullptr;
-        static size_t s_idx_scores_cap = 0;
-        if (total_tokens > 512) {
-            size_t req_mask_cap = (size_t)max_super_m * max_comp_stride;
-            if (!s_d_idx_mask_super || s_idx_mask_cap < req_mask_cap) {
-                if (s_d_idx_mask_super) cudaFree(s_d_idx_mask_super);
-                s_idx_mask_cap = req_mask_cap;
-                CUDA_CHECK(cudaMalloc(&s_d_idx_mask_super, s_idx_mask_cap * sizeof(uint8_t)));
+        for (int dev = 0; dev < num_gpus_; dev++) {
+            if (num_gpus_ > 1) set_active_pp_device(dev);
+            if (!s_d_comp_counts[dev] || s_comp_counts_cap[dev] < 2 * max_super_m) {
+                if (s_d_comp_counts[dev]) cudaFree(s_d_comp_counts[dev]);
+                s_comp_counts_cap[dev] = 2 * max_super_m;
+                CUDA_CHECK(cudaMalloc(&s_d_comp_counts[dev], (size_t)s_comp_counts_cap[dev] * sizeof(int32_t)));
             }
-            size_t req_scores_cap = std::min((size_t)chunk_size * max_comp_stride, (size_t)64 * 1024 * 1024);
-            if (!s_d_idx_scores_chunk || s_idx_scores_cap < req_scores_cap) {
-                if (s_d_idx_scores_chunk) cudaFree(s_d_idx_scores_chunk);
-                s_idx_scores_cap = req_scores_cap;
-                CUDA_CHECK(cudaMalloc(&s_d_idx_scores_chunk, s_idx_scores_cap * sizeof(float)));
+            if (total_tokens > 512) {
+                size_t req_mask_cap = (size_t)max_super_m * max_comp_stride;
+                if (!s_d_idx_mask_super[dev] || s_idx_mask_cap[dev] < req_mask_cap) {
+                    if (s_d_idx_mask_super[dev]) cudaFree(s_d_idx_mask_super[dev]);
+                    s_idx_mask_cap[dev] = req_mask_cap;
+                    CUDA_CHECK(cudaMalloc(&s_d_idx_mask_super[dev], s_idx_mask_cap[dev] * sizeof(uint8_t)));
+                }
+                size_t req_scores_cap = std::min((size_t)chunk_size * max_comp_stride, (size_t)64 * 1024 * 1024);
+                if (!s_d_idx_scores_chunk[dev] || s_idx_scores_cap[dev] < req_scores_cap) {
+                    if (s_d_idx_scores_chunk[dev]) cudaFree(s_d_idx_scores_chunk[dev]);
+                    s_idx_scores_cap[dev] = req_scores_cap;
+                    CUDA_CHECK(cudaMalloc(&s_d_idx_scores_chunk[dev], s_idx_scores_cap[dev] * sizeof(float)));
+                }
+            }
+            if (!s_pfev_init[dev]) {
+                s_pfev_init[dev] = true;
+                for (int i = 0; i < 14; i++) CUDA_CHECK(cudaEventCreate(&s_pfev[dev][i]));
+            }
+            if (!s_topk_d2h_ev[dev]) {
+                CUDA_CHECK(cudaEventCreateWithFlags(&s_topk_d2h_ev[dev], cudaEventDisableTiming));
+            }
+            if (!s_cublas_warmup[dev]) {
+                s_cublas_warmup[dev] = true;
+                gemm_bf16(prefill_bufs_.buf_hidden.bf16(), 1, 16, 16,
+                          prefill_bufs_.buf_hidden.bf16(), prefill_bufs_.buf_hidden.bf16(),
+                          1.0f, 0.0f, main_stream_);
+                CUDA_CHECK(cudaStreamSynchronize(main_stream_));
             }
         }
-
-        static cudaEvent_t s_pfev[14] = {nullptr};
-        static bool s_pfev_init = false;
-        if (!s_pfev_init) {
-            s_pfev_init = true;
-            for (int i = 0; i < 14; i++) CUDA_CHECK(cudaEventCreate(&s_pfev[i]));
-        }
-
-        static bool s_cublas_warmup = false;
-        if (!s_cublas_warmup) {
-            s_cublas_warmup = true;
-            gemm_bf16(prefill_bufs_.buf_hidden.bf16(), 1, 16, 16,
-                      prefill_bufs_.buf_hidden.bf16(), prefill_bufs_.buf_hidden.bf16(),
-                      1.0f, 0.0f, main_stream_);
-            CUDA_CHECK(cudaStreamSynchronize(main_stream_));
-        }
+        if (num_gpus_ > 1) set_active_pp_device(0);
 
         if (engram_loaded_ && !engram_token_map_.empty()) {
             if ((int)engram_compressed_cache_.size() < total_tokens + 64) {
@@ -592,6 +696,7 @@
         }
 
         for (int super_start = start_offset; super_start < total_tokens; super_start += max_super_m) {
+            if (num_gpus_ > 1 && active_pp_dev_ != 0) set_active_pp_device(0);
             int super_end = std::min(total_tokens, super_start + max_super_m);
             int super_M = super_end - super_start;
             bool is_last_super_chunk = (super_end == total_tokens);
@@ -608,7 +713,7 @@
                                        (size_t)super_M * sizeof(int32_t), cudaMemcpyHostToDevice, main_stream_));
             CUDA_CHECK(cudaMemcpyAsync(prefill_bufs_.buf_pos.i32(), h_prefill_pos_,
                                        (size_t)super_M * sizeof(int32_t), cudaMemcpyHostToDevice, main_stream_));
-            CUDA_CHECK(cudaMemcpyAsync(s_d_comp_counts, s_h_comp_counts,
+            CUDA_CHECK(cudaMemcpyAsync(s_d_comp_counts[0], s_h_comp_counts,
                                        (size_t)(2 * max_super_m) * sizeof(int32_t), cudaMemcpyHostToDevice, main_stream_));
 
             // Initialize HC pre-mix for layer 0 to [1, 0, 0, 0] for all super_M tokens
@@ -662,21 +767,50 @@
             //    Each layer stages its cold experts into buf_prefill_cold_scratch ONCE and reuses
             //    them across all 512-token sub-chunks of the 4,096-token super-chunk!
             for (int layer_id = 0; layer_id < cfg_.num_hidden_layers; layer_id++) {
+                if (num_gpus_ > 1 && layer_id == pp_split_layer_) {
+                    // Pipeline Stage 0 (GPU 0) -> Stage 1 (GPU 1) transition over NVLink / P2P
+                    pp_copy_d2d(pp_peer_.prefill_bufs_.buf_hc_state.data, 1,
+                                prefill_bufs_.buf_hc_state.data, 0,
+                                (size_t)super_M * hc_dim * sizeof(__nv_bfloat16));
+                    pp_copy_d2d(pp_peer_.prefill_bufs_.buf_hc_pre_mix.data, 1,
+                                prefill_bufs_.buf_hc_pre_mix.data, 0,
+                                (size_t)super_M * hc * sizeof(float));
+                    set_active_pp_device(1);
+                    CUDA_CHECK(cudaMemcpyAsync(prefill_bufs_.buf_pos.i32(), h_prefill_pos_,
+                                               (size_t)super_M * sizeof(int32_t), cudaMemcpyHostToDevice, main_stream_));
+                    CUDA_CHECK(cudaMemcpyAsync(s_d_comp_counts[1], s_h_comp_counts,
+                                               (size_t)(2 * max_super_m) * sizeof(int32_t), cudaMemcpyHostToDevice, main_stream_));
+                }
+                int dev = active_pp_dev_;
                 auto& lw = layers_[layer_id];
                 int cold_bs = expert_loader_.cold_block_size();
+                int hot_bs = expert_loader_.hot_block_size();
                 bool use_staged_cold = (cfg_.expert_dtype == "mixed_nvfp4_iq2" && prefill_bufs_.buf_prefill_cold_scratch.data != nullptr);
                 int max_stage_slots = (use_staged_cold && cold_bs > 0)
                     ? (int)(prefill_bufs_.buf_prefill_cold_scratch.size_bytes / (size_t)cold_bs)
                     : 0;
 
+                bool layer_has_unpinned_hot = false;
+                if (use_staged_cold) {
+                    for (int eid = 0; eid < n_experts; eid++) {
+                        if (expert_loader_.is_hot(layer_id, eid) && !expert_loader_.has_hot_gpu_ptr(layer_id, eid)) {
+                            layer_has_unpinned_hot = true;
+                            break;
+                        }
+                    }
+                }
+
                 int stage_slot_for_eid[384];
                 void* dram_ptr_for_eid[384];
+                void* hot_stage_ptr_for_eid[384];
                 int layer_eid_total_counts[384] = {0};
                 for (int eid = 0; eid < n_experts; eid++) {
                     stage_slot_for_eid[eid] = -1;
                     dram_ptr_for_eid[eid] = nullptr;
+                    hot_stage_ptr_for_eid[eid] = nullptr;
                 }
                 int next_stage_slot = 0;
+                int next_hot_stage_slot = 0;
 
                 for (int start = super_start; start < super_end; start += chunk_size) {
                     int M = std::min(chunk_size, super_end - start);
@@ -686,7 +820,7 @@
                     float* chunk_hc_pre_mix = prefill_bufs_.buf_hc_pre_mix.f32() + (size_t)sub_off * hc;
 
                     bool do_prof = (start == super_start) && (layer_id == 0 || layer_id == 20 || layer_id == 39);
-                    if (do_prof) CUDA_CHECK(cudaEventRecord(s_pfev[0], main_stream_));
+                    if (do_prof) CUDA_CHECK(cudaEventRecord(s_pfev[dev][0], main_stream_));
 
                     // ── 0. Engram Memory Module (Layers 1 and 14) ────────────────────────
                     if (engram_loaded_ && (layer_id == 1 || layer_id == 14) && lw.engram_wkv_w.data) {
@@ -721,7 +855,7 @@
                                                         lw.attn_norm_w.bf16(),
                                                         M, dim, hc, cfg_.rms_norm_eps, main_stream_);
 
-                    if (do_prof) CUDA_CHECK(cudaEventRecord(s_pfev[1], main_stream_));
+                    if (do_prof) CUDA_CHECK(cudaEventRecord(s_pfev[dev][1], main_stream_));
 
                     // ── 3. Attention Q & KV Projections ──────────────────────────────────
                     if (lw.wq_a_w.dtype == "fp4") {
@@ -772,7 +906,7 @@
                     rms_norm_cuda_batched(prefill_bufs_.buf_kv.bf16(), prefill_bufs_.buf_kv.bf16(),
                                           lw.kv_norm_w.bf16(), M, head_dim_val, cfg_.rms_norm_eps, main_stream_);
 
-                    if (do_prof) CUDA_CHECK(cudaEventRecord(s_pfev[2], main_stream_));
+                    if (do_prof) CUDA_CHECK(cudaEventRecord(s_pfev[dev][2], main_stream_));
 
                     // ── 4. Causal Attention loop across the M tokens ─────────────────────
                     bool is_compressed = (layer_id < (int)cfg_.compress_ratios.size() &&
@@ -853,7 +987,7 @@
                         int idx_topk = 512;
                         if (raw_comp_in_chunk > idx_topk && layers_[src_layer].indexer_comp_kv_cache.data) {
                             int max_comp_in_chunk = std::min((raw_comp_in_chunk + 3) & ~3, max_comp_stride);
-                            uint8_t* chunk_mask_ptr = s_d_idx_mask_super + (size_t)sub_off * max_comp_stride;
+                            uint8_t* chunk_mask_ptr = s_d_idx_mask_super[dev] + (size_t)sub_off * max_comp_stride;
                             if (lw.indexer_wq_b_w.data) {
                                 int idx_heads = 32;
                                 int idx_head_dim = 128;
@@ -887,12 +1021,12 @@
                                     &beta_zero,
                                     idx_weights_batch, CUDA_R_32F, idx_heads,
                                     CUBLAS_COMPUTE_32F, CUBLAS_GEMM_DEFAULT));
-                                int idx_sub_m = std::max(1, std::min(M, (int)(s_idx_scores_cap / (size_t)std::max(1, max_comp_in_chunk))));
+                                int idx_sub_m = std::max(1, std::min(M, (int)(s_idx_scores_cap[dev] / (size_t)std::max(1, max_comp_in_chunk))));
                                 for (int m_off = 0; m_off < M; m_off += idx_sub_m) {
                                     int cur_m = std::min(idx_sub_m, M - m_off);
                                     indexer_score_and_mask_batch_cuda(
                                         chunk_mask_ptr + (size_t)m_off * max_comp_in_chunk,
-                                        s_d_idx_scores_chunk,
+                                        s_d_idx_scores_chunk[dev],
                                         layers_[src_layer].indexer_comp_kv_cache.bf16(),
                                         idx_q_batch + (size_t)m_off * idx_heads * idx_head_dim,
                                         idx_weights_batch + (size_t)m_off * idx_heads,
@@ -912,7 +1046,7 @@
 
                     // 2. Batched Flash-MLA Attention across all M tokens in parallel
                     const int32_t* p_d_comp_counts = is_compressed
-                        ? ((ratio == 2) ? (s_d_comp_counts + max_super_m + sub_off) : (s_d_comp_counts + sub_off))
+                        ? ((ratio == 2) ? (s_d_comp_counts[dev] + max_super_m + sub_off) : (s_d_comp_counts[dev] + sub_off))
                         : nullptr;
                     mla_attention_fused_batch_cuda(
                         prefill_bufs_.buf_q.bf16(),
@@ -947,7 +1081,7 @@
                         head_dim_val,
                         main_stream_);
 
-                    if (do_prof) CUDA_CHECK(cudaEventRecord(s_pfev[3], main_stream_));
+                    if (do_prof) CUDA_CHECK(cudaEventRecord(s_pfev[dev][3], main_stream_));
 
                     // ── 5. Output projection (wo_a and wo_b) ──────────────────────────────
                     if (lw.wo_a_w.dtype == "int4") {
@@ -998,7 +1132,7 @@
                                               prefill_bufs_.buf_hc_comb.f32(),
                                               M, dim, hc, main_stream_);
 
-                    if (do_prof) CUDA_CHECK(cudaEventRecord(s_pfev[4], main_stream_));
+                    if (do_prof) CUDA_CHECK(cudaEventRecord(s_pfev[dev][4], main_stream_));
 
                     // ── 7. HC pre for FFN + FFN norm (reads buf_hc_after_attn, uses attn_pre in buf_hc_pre)
                     hc_pre_weighted_add_norm_batch_cuda(prefill_bufs_.buf_hidden.bf16(),
@@ -1021,7 +1155,7 @@
                                                  lw.hc_ffn_base.f32(),
                                                  M, hc, cfg_.hc_sinkhorn_iters, cfg_.hc_eps, main_stream_);
 
-                    if (do_prof) CUDA_CHECK(cudaEventRecord(s_pfev[5], main_stream_));
+                    if (do_prof) CUDA_CHECK(cudaEventRecord(s_pfev[dev][5], main_stream_));
 
                     // ── 9. Router Gating + DeepSeek-V4.1 Top-6 SqrtSoftplus across M tokens
                     gemm_bf16(prefill_bufs_.buf_scores_bf16.bf16(), M, n_experts, dim,
@@ -1036,26 +1170,28 @@
                         1.0f,
                         main_stream_);
 
-                    static cudaEvent_t s_topk_d2h_ev = nullptr;
-                    if (!s_topk_d2h_ev) CUDA_CHECK(cudaEventCreateWithFlags(&s_topk_d2h_ev, cudaEventDisableTiming));
-
                     // ── 9b. Active Cold Expert VRAM Staging & Grouped Work Tile Build ────
                     const uint8_t* layer_type_map = expert_loader_.expert_type_map_gpu() + (size_t)layer_id * n_experts;
                     const void* const* flat_ptrs = expert_loader_.flat_vram_ptrs_gpu();
 
                     if (use_staged_cold) {
-                        // Enqueue fast D2H copy of router selections
+                        // Enqueue fast D2H copy of router selections (and routing weights if SSD tail pruning is enabled)
                         CUDA_CHECK(cudaMemcpyAsync(h_topk_batch_, prefill_bufs_.buf_topk_idx.i32(),
                                                    (size_t)M * top_k * sizeof(int32_t),
                                                    cudaMemcpyDeviceToHost, main_stream_));
-                        CUDA_CHECK(cudaEventRecord(s_topk_d2h_ev, main_stream_));
+                        if (enable_ssd_tail_pruning_) {
+                            CUDA_CHECK(cudaMemcpyAsync(s_h_topk_vals, prefill_bufs_.buf_topk_vals.f32(),
+                                                       (size_t)M * top_k * sizeof(float),
+                                                       cudaMemcpyDeviceToHost, main_stream_));
+                        }
+                        CUDA_CHECK(cudaEventRecord(s_topk_d2h_ev[dev], main_stream_));
 
                         // Build expert-grouped work tiles (up to 8 tokens/tile) for Hot and Cold passes
                         build_moe_work_tiles_cuda(prefill_bufs_.buf_topk_idx.i32(),
                                                   layer_type_map, 0, n_experts, M, main_stream_);
                     }
 
-                    if (do_prof) CUDA_CHECK(cudaEventRecord(s_pfev[6], main_stream_));
+                    if (do_prof) CUDA_CHECK(cudaEventRecord(s_pfev[dev][6], main_stream_));
 
                     // ── 10. Shared Expert + Hot Routed Experts (overlapped with Cold DMA) ─
                     if (lw.shared_w1_w.dtype == "int4") {
@@ -1098,8 +1234,9 @@
                     size_t w3_cold_off = (size_t)moe_inter * (dim / 256) * sizeof(block_iq2_xxs);
                     size_t w2_cold_off = w3_cold_off + (size_t)moe_inter * (dim / 256) * sizeof(block_iq2_xxs);
 
-                    // Launch Hot Routed Experts IMMEDIATELY on main_stream_ before waiting for PCIe DMA!
-                    if (use_staged_cold) {
+                    // Launch Hot Routed Experts IMMEDIATELY on main_stream_ before waiting for PCIe DMA
+                    // (when all Hot experts of this layer have direct GPU pointers in VRAM or pinned UVA DRAM)
+                    if (use_staged_cold && !layer_has_unpinned_hot) {
                         const void* const* layer_flat_ptrs = flat_ptrs + (size_t)layer_id * n_experts;
                         gemv_mixed_moe_swiglu_grouped_pass_cuda(
                             prefill_bufs_.buf_gate.bf16(),
@@ -1116,32 +1253,38 @@
                             dim, moe_inter, M, true, main_stream_);
                     }
 
-                    if (do_prof) CUDA_CHECK(cudaEventRecord(s_pfev[7], main_stream_));
+                    if (do_prof) CUDA_CHECK(cudaEventRecord(s_pfev[dev][7], main_stream_));
 
-                    // Process cold expert DMA transfers concurrently with Shared + Hot Routed Experts
+                    // Process cold expert (and any unpinned hot expert) DMA transfers concurrently
                     int exact_cold_tiles = -1;
                     bool need_dma_wait = false;
                     if (use_staged_cold) {
-                        CUDA_CHECK(cudaEventSynchronize(s_topk_d2h_ev));
+                        CUDA_CHECK(cudaEventSynchronize(s_topk_d2h_ev[dev]));
 
-                        // Scan unique cold experts activated by any of the M tokens that are NOT already
-                        // in VRAM L1 cold_pool_gpu_ AND NOT already staged in buf_prefill_cold_scratch
-                        // from an earlier sub-chunk of this same layer!
                         uint8_t cold_needed[384] = {0};
+                        uint8_t hot_unpinned_needed[384] = {0};
                         int eid_counts[384] = {0};
                         int needed_count = 0;
+                        int hot_needed_count = 0;
                         int total_picks = M * top_k;
                         for (int i = 0; i < total_picks; i++) {
                             int eid = h_topk_batch_[i];
                             if (eid >= 0 && eid < n_experts) {
                                 eid_counts[eid]++;
                                 layer_eid_total_counts[eid]++;
-                                if (!expert_loader_.is_hot(layer_id, eid) &&
-                                    !expert_loader_.get_cold_vram_ptr(layer_id, eid) &&
-                                    stage_slot_for_eid[eid] < 0 &&
-                                    !cold_needed[eid]) {
-                                    cold_needed[eid] = 1;
-                                    needed_count++;
+                                if (!expert_loader_.is_hot(layer_id, eid)) {
+                                    if (!expert_loader_.get_cold_vram_ptr(layer_id, eid) &&
+                                        stage_slot_for_eid[eid] < 0 &&
+                                        !cold_needed[eid]) {
+                                        cold_needed[eid] = 1;
+                                        needed_count++;
+                                    }
+                                } else if (layer_has_unpinned_hot &&
+                                           !expert_loader_.has_hot_gpu_ptr(layer_id, eid) &&
+                                           hot_stage_ptr_for_eid[eid] == nullptr &&
+                                           !hot_unpinned_needed[eid]) {
+                                    hot_unpinned_needed[eid] = 1;
+                                    hot_needed_count++;
                                 }
                             }
                         }
@@ -1152,6 +1295,40 @@
                             }
                         }
 
+                        if (hot_needed_count > 0 && hot_bs > 0) {
+                            int deq2_slots = (int)(buf_dequant_2_.size_bytes / (size_t)hot_bs);
+                            int hot_stg_seq = 0;
+                            for (int eid = 0; eid < n_experts; eid++) {
+                                if (!hot_unpinned_needed[eid]) continue;
+                                void* src = expert_loader_.get_hot_expert_ptr(layer_id, eid);
+                                if (!src) continue;
+                                void* dst = nullptr;
+                                int s_idx = next_hot_stage_slot++;
+                                if (s_idx < deq2_slots) {
+                                    dst = (char*)buf_dequant_2_.data + (size_t)s_idx * hot_bs;
+                                    void* stage_src = expert_loader_.stage_unpinned_to_pinned(src, hot_bs, hot_stg_seq++);
+                                    CUDA_CHECK(cudaMemcpyAsync(dst, stage_src, hot_bs, cudaMemcpyHostToDevice, dma_stream_));
+                                } else {
+                                    int rem = s_idx - deq2_slots;
+                                    int b = rem / 8;
+                                    int k = rem % 8;
+                                    if (b < 2 && streaming_slots_gpu_[b][k] != nullptr) {
+                                        dst = streaming_slots_gpu_[b][k];
+                                        void* stage_src = expert_loader_.stage_unpinned_to_pinned(src, hot_bs, hot_stg_seq++);
+                                        CUDA_CHECK(cudaMemcpyAsync(dst, stage_src, hot_bs, cudaMemcpyHostToDevice, dma_stream_));
+                                    } else {
+                                        int stg_idx = rem - 16;
+                                        if (stg_idx >= 0 && stg_idx < (int)expert_loader_.staging_ring_.size() &&
+                                            expert_loader_.staging_ring_[stg_idx].ptr && expert_loader_.staging_ring_[stg_idx].is_pinned) {
+                                            dst = expert_loader_.staging_ring_[stg_idx].ptr;
+                                            std::memcpy(dst, src, hot_bs);
+                                        }
+                                    }
+                                }
+                                hot_stage_ptr_for_eid[eid] = dst;
+                            }
+                        }
+
                         if (needed_count > 0) {
                             expert_loader_.begin_request_epoch();
 
@@ -1159,24 +1336,105 @@
                             std::vector<int> miss_eids;
                             miss_eids.reserve(32);
                             int dram_hits_count = 0;
+                            int cold_stg_seq = 16;
                             for (int eid = 0; eid < n_experts; eid++) {
                                 if (!cold_needed[eid]) continue;
-                                void* src = expert_loader_.try_get_dram_expert_ptr(layer_id, eid);
+                                bool is_pinned_cold = false;
+                                void* src = expert_loader_.try_get_dram_expert_ptr_ex(layer_id, eid, is_pinned_cold);
                                 if (src) {
                                     dram_hits_count++;
-                                    dram_ptr_for_eid[eid] = src;
+                                    if (is_pinned_cold) {
+                                        dram_ptr_for_eid[eid] = src;
+                                    }
                                     if (next_stage_slot < max_stage_slots) {
                                         int slot = next_stage_slot++;
                                         stage_slot_for_eid[eid] = slot;
                                         void* dst = (char*)prefill_bufs_.buf_prefill_cold_scratch.data + (size_t)slot * cold_bs;
-                                        CUDA_CHECK(cudaMemcpyAsync(dst, src, cold_bs, cudaMemcpyHostToDevice, dma_stream_));
+                                        void* stage_src = is_pinned_cold
+                                            ? src
+                                            : expert_loader_.stage_unpinned_to_pinned(src, cold_bs, cold_stg_seq++);
+                                        CUDA_CHECK(cudaMemcpyAsync(dst, stage_src, cold_bs, cudaMemcpyHostToDevice, dma_stream_));
                                     }
                                 } else {
                                     miss_eids.push_back(eid);
                                 }
                             }
 
-                            // 2. If any cold experts missed L2 DRAM, wait for DRAM hit DMAs to finish BEFORE advancing epoch & evicting DRAM slots
+                            // 2. High-confidence SATA SSD tail pruning for Cold L2 DRAM misses during user prompt prefill (optional, --ssd-tail-pruning):
+                            //    Only prune a Cold SSD miss eid if:
+                            //    - compute_last_logits is true (never prune during startup System KV snapshot pre-warming),
+                            //    - it is NOT selected by the final 2 tokens of the prompt (which directly produce logits),
+                            //    - on every token m that selected eid, its weight is < 10% of token m's total routing weight,
+                            //      token m retains >= 4 active experts, and token m retains >= 84% of its total routing weight.
+                            if (!miss_eids.empty() && compute_last_logits && enable_ssd_tail_pruning_) {
+                                std::vector<float> tok_total_w(M, 0.0f);
+                                std::vector<float> tok_kept_w(M, 0.0f);
+                                std::vector<int> tok_active_cnt(M, top_k);
+                                for (int m = 0; m < M; m++) {
+                                    float tw = 0.0f;
+                                    for (int k = 0; k < top_k; k++) {
+                                        tw += s_h_topk_vals[m * top_k + k];
+                                    }
+                                    tok_total_w[m] = tw;
+                                    tok_kept_w[m] = tw;
+                                }
+                                std::sort(miss_eids.begin(), miss_eids.end(), [&](int a, int b) {
+                                    return eid_counts[a] < eid_counts[b];
+                                });
+                                std::vector<int> kept_miss_eids;
+                                kept_miss_eids.reserve(miss_eids.size());
+                                bool any_pruned = false;
+                                for (int eid : miss_eids) {
+                                    bool can_prune = true;
+                                    for (int m = 0; m < M; m++) {
+                                        for (int k = 0; k < top_k; k++) {
+                                            if (h_topk_batch_[m * top_k + k] == eid) {
+                                                float w = s_h_topk_vals[m * top_k + k];
+                                                float tw = tok_total_w[m];
+                                                if (start + m >= total_tokens - 2 ||
+                                                    tw <= 0.0f ||
+                                                    w >= 0.10f * tw ||
+                                                    (tok_active_cnt[m] - 1) < 4 ||
+                                                    (tok_kept_w[m] - w) < 0.84f * tw) {
+                                                    can_prune = false;
+                                                    break;
+                                                }
+                                            }
+                                        }
+                                        if (!can_prune) break;
+                                    }
+                                    if (can_prune) {
+                                        any_pruned = true;
+                                        for (int m = 0; m < M; m++) {
+                                            for (int k = 0; k < top_k; k++) {
+                                                if (h_topk_batch_[m * top_k + k] == eid) {
+                                                    tok_kept_w[m] -= s_h_topk_vals[m * top_k + k];
+                                                    s_h_topk_vals[m * top_k + k] = 0.0f;
+                                                    tok_active_cnt[m]--;
+                                                }
+                                            }
+                                        }
+                                    } else {
+                                        kept_miss_eids.push_back(eid);
+                                    }
+                                }
+                                if (any_pruned) {
+                                    for (int m = 0; m < M; m++) {
+                                        if (tok_kept_w[m] < tok_total_w[m] && tok_kept_w[m] > 0.0f) {
+                                            float scale = tok_total_w[m] / tok_kept_w[m];
+                                            for (int k = 0; k < top_k; k++) {
+                                                s_h_topk_vals[m * top_k + k] *= scale;
+                                            }
+                                        }
+                                    }
+                                    CUDA_CHECK(cudaMemcpyAsync(prefill_bufs_.buf_topk_vals.f32(), s_h_topk_vals,
+                                                               (size_t)M * top_k * sizeof(float),
+                                                               cudaMemcpyHostToDevice, dma_stream_));
+                                    miss_eids.swap(kept_miss_eids);
+                                }
+                            }
+
+                            // 3. If any cold experts still missed L2 DRAM, wait for DRAM hit DMAs to finish BEFORE advancing epoch & evicting DRAM slots
                             if (!miss_eids.empty()) {
                                 if (dram_hits_count > 0) {
                                     CUDA_CHECK(cudaStreamSynchronize(dma_stream_));
@@ -1202,12 +1460,18 @@
                                             int eid = miss_eids[m_off + idx];
                                             void* src = futs[idx].get();
                                             if (src) {
-                                                dram_ptr_for_eid[eid] = src;
+                                                bool is_pinned_cold = !expert_loader_.is_unpinned_ptr(src);
+                                                if (is_pinned_cold) {
+                                                    dram_ptr_for_eid[eid] = src;
+                                                }
                                                 if (next_stage_slot < max_stage_slots) {
                                                     int slot = next_stage_slot++;
                                                     stage_slot_for_eid[eid] = slot;
                                                     void* dst = (char*)prefill_bufs_.buf_prefill_cold_scratch.data + (size_t)slot * cold_bs;
-                                                    CUDA_CHECK(cudaMemcpyAsync(dst, src, cold_bs, cudaMemcpyHostToDevice, dma_stream_));
+                                                    void* stage_src = is_pinned_cold
+                                                        ? src
+                                                        : expert_loader_.stage_unpinned_to_pinned(src, cold_bs, cold_stg_seq++);
+                                                    CUDA_CHECK(cudaMemcpyAsync(dst, stage_src, cold_bs, cudaMemcpyHostToDevice, dma_stream_));
                                                 }
                                             }
                                         }
@@ -1216,12 +1480,18 @@
                                             int eid = miss_eids[idx];
                                             void* src = expert_loader_.get_dram_expert_ptr(layer_id, eid);
                                             if (src) {
-                                                dram_ptr_for_eid[eid] = src;
+                                                bool is_pinned_cold = !expert_loader_.is_unpinned_ptr(src);
+                                                if (is_pinned_cold) {
+                                                    dram_ptr_for_eid[eid] = src;
+                                                }
                                                 if (next_stage_slot < max_stage_slots) {
                                                     int slot = next_stage_slot++;
                                                     stage_slot_for_eid[eid] = slot;
                                                     void* dst = (char*)prefill_bufs_.buf_prefill_cold_scratch.data + (size_t)slot * cold_bs;
-                                                    CUDA_CHECK(cudaMemcpyAsync(dst, src, cold_bs, cudaMemcpyHostToDevice, dma_stream_));
+                                                    void* stage_src = is_pinned_cold
+                                                        ? src
+                                                        : expert_loader_.stage_unpinned_to_pinned(src, cold_bs, cold_stg_seq++);
+                                                    CUDA_CHECK(cudaMemcpyAsync(dst, stage_src, cold_bs, cudaMemcpyHostToDevice, dma_stream_));
                                                 }
                                             }
                                         }
@@ -1230,11 +1500,18 @@
                             }
                         }
 
-                        if (start == super_start || needed_count > 0) {
-                            // Populate fast device pointer table (Hot -> resident VRAM, Cold VRAM -> cold_pool_gpu_, Staged Cold -> scratch, Overflow -> UVA DRAM)
+                        if (start == super_start || needed_count > 0 || hot_needed_count > 0) {
+                            // Populate fast device pointer table (Hot -> resident VRAM / pinned DRAM / staged VRAM, Cold VRAM -> cold_pool_gpu_, Staged Cold -> scratch, Overflow -> UVA DRAM)
                             for (int eid = 0; eid < n_experts; eid++) {
                                 if (expert_loader_.is_hot(layer_id, eid)) {
-                                    h_layer_vram_ptrs_pinned_[eid] = expert_loader_.get_hot_vram_ptr(layer_id, eid);
+                                    void* vh = expert_loader_.get_hot_vram_ptr(layer_id, eid);
+                                    if (!vh && expert_loader_.has_hot_gpu_ptr(layer_id, eid)) {
+                                        vh = expert_loader_.try_get_hot_dram_ptr(layer_id, eid);
+                                    }
+                                    if (!vh) {
+                                        vh = hot_stage_ptr_for_eid[eid];
+                                    }
+                                    h_layer_vram_ptrs_pinned_[eid] = vh;
                                 } else if (void* vc = expert_loader_.get_cold_vram_ptr(layer_id, eid)) {
                                     h_layer_vram_ptrs_pinned_[eid] = vc;
                                 } else if (stage_slot_for_eid[eid] >= 0) {
@@ -1263,9 +1540,25 @@
                         if (need_dma_wait) {
                             CUDA_CHECK(cudaStreamWaitEvent(main_stream_, dma_event_, 0));
                         }
-                        if (do_prof) CUDA_CHECK(cudaEventRecord(s_pfev[10], main_stream_));
+                        if (do_prof) CUDA_CHECK(cudaEventRecord(s_pfev[dev][10], main_stream_));
 
                         const void* const* staged_ptrs = (const void* const*)prefill_bufs_.buf_layer_vram_ptrs.data;
+
+                        if (layer_has_unpinned_hot) {
+                            gemv_mixed_moe_swiglu_grouped_pass_cuda(
+                                prefill_bufs_.buf_gate.bf16(),
+                                prefill_bufs_.buf_hidden.bf16(),
+                                (int)w1_cold_off, (int)w3_cold_off,
+                                moe_inter, dim, cfg_.swiglu_limit,
+                                staged_ptrs, 0, n_experts, M, true, main_stream_);
+
+                            gemv_mixed_moe_down_grouped_pass_cuda(
+                                prefill_bufs_.buf_down.bf16(),
+                                prefill_bufs_.buf_gate.bf16(),
+                                staged_ptrs, 0, n_experts,
+                                (int)w2_cold_off,
+                                dim, moe_inter, M, true, main_stream_);
+                        }
 
                         gemv_mixed_moe_swiglu_grouped_pass_cuda(
                             prefill_bufs_.buf_gate.bf16(),
@@ -1275,7 +1568,7 @@
                             staged_ptrs, 0, n_experts, M, false, main_stream_,
                             exact_cold_tiles);
 
-                        if (do_prof) CUDA_CHECK(cudaEventRecord(s_pfev[11], main_stream_));
+                        if (do_prof) CUDA_CHECK(cudaEventRecord(s_pfev[dev][11], main_stream_));
 
                         gemv_mixed_moe_down_grouped_pass_cuda(
                             prefill_bufs_.buf_down.bf16(),
@@ -1320,7 +1613,7 @@
                             dim, moe_inter, M, main_stream_);
                     }
 
-                    if (do_prof) CUDA_CHECK(cudaEventRecord(s_pfev[8], main_stream_));
+                    if (do_prof) CUDA_CHECK(cudaEventRecord(s_pfev[dev][8], main_stream_));
 
                     // ── 12. Fused MoE Accumulation (routed experts + shared expert) ───────
                     fused_moe_accum_dynamic_batch_cuda(
@@ -1339,25 +1632,25 @@
                                               M, dim, hc, main_stream_);
 
                     if (do_prof) {
-                        CUDA_CHECK(cudaEventRecord(s_pfev[9], main_stream_));
+                        CUDA_CHECK(cudaEventRecord(s_pfev[dev][9], main_stream_));
                         CUDA_CHECK(cudaStreamSynchronize(main_stream_));
                         float t_attn_hc=0, t_qkv=0, t_attn=0, t_out=0, t_ffn_hc=0, t_gate=0, t_shared=0, t_moe=0, t_accum=0;
                         float t_dma=0, t_swiglu=0, t_down=0;
-                        cudaEventElapsedTime(&t_attn_hc, s_pfev[0], s_pfev[1]);
-                        cudaEventElapsedTime(&t_qkv, s_pfev[1], s_pfev[2]);
-                        cudaEventElapsedTime(&t_attn, s_pfev[2], s_pfev[3]);
-                        cudaEventElapsedTime(&t_out, s_pfev[3], s_pfev[4]);
-                        cudaEventElapsedTime(&t_ffn_hc, s_pfev[4], s_pfev[5]);
-                        cudaEventElapsedTime(&t_gate, s_pfev[5], s_pfev[6]);
-                        cudaEventElapsedTime(&t_shared, s_pfev[6], s_pfev[7]);
-                        cudaEventElapsedTime(&t_moe, s_pfev[7], s_pfev[8]);
-                        cudaEventElapsedTime(&t_accum, s_pfev[8], s_pfev[9]);
-                        cudaEventElapsedTime(&t_dma, s_pfev[7], s_pfev[10]);
-                        cudaEventElapsedTime(&t_swiglu, s_pfev[10], s_pfev[11]);
-                        cudaEventElapsedTime(&t_down, s_pfev[11], s_pfev[8]);
+                        cudaEventElapsedTime(&t_attn_hc, s_pfev[dev][0], s_pfev[dev][1]);
+                        cudaEventElapsedTime(&t_qkv, s_pfev[dev][1], s_pfev[dev][2]);
+                        cudaEventElapsedTime(&t_attn, s_pfev[dev][2], s_pfev[dev][3]);
+                        cudaEventElapsedTime(&t_out, s_pfev[dev][3], s_pfev[dev][4]);
+                        cudaEventElapsedTime(&t_ffn_hc, s_pfev[dev][4], s_pfev[dev][5]);
+                        cudaEventElapsedTime(&t_gate, s_pfev[dev][5], s_pfev[dev][6]);
+                        cudaEventElapsedTime(&t_shared, s_pfev[dev][6], s_pfev[dev][7]);
+                        cudaEventElapsedTime(&t_moe, s_pfev[dev][7], s_pfev[dev][8]);
+                        cudaEventElapsedTime(&t_accum, s_pfev[dev][8], s_pfev[dev][9]);
+                        cudaEventElapsedTime(&t_dma, s_pfev[dev][7], s_pfev[dev][10]);
+                        cudaEventElapsedTime(&t_swiglu, s_pfev[dev][10], s_pfev[dev][11]);
+                        cudaEventElapsedTime(&t_down, s_pfev[dev][11], s_pfev[dev][8]);
                         float t_tot = t_attn_hc + t_qkv + t_attn + t_out + t_ffn_hc + t_gate + t_shared + t_moe + t_accum;
-                        LOG_INFO("[V4.1 LAYER %d PROFILE M=%d] Total: %.2f ms | Attn_HC: %.2f ms | QKV: %.2f ms | Attn_Loop: %.2f ms | Out: %.2f ms | FFN_HC: %.2f ms | Gate: %.2f ms | Shared: %.2f ms | Routed_MoE: %.2f ms (DMA: %.2f, SwiGLU: %.2f, Down: %.2f) | Accum: %.2f ms",
-                                 layer_id, M, t_tot, t_attn_hc, t_qkv, t_attn, t_out, t_ffn_hc, t_gate, t_shared, t_moe, t_dma, t_swiglu, t_down, t_accum);
+                        LOG_INFO("[V4.1 LAYER %d (GPU %d) PROFILE M=%d] Total: %.2f ms | Attn_HC: %.2f ms | QKV: %.2f ms | Attn_Loop: %.2f ms | Out: %.2f ms | FFN_HC: %.2f ms | Gate: %.2f ms | Shared: %.2f ms | Routed_MoE: %.2f ms (DMA: %.2f, SwiGLU: %.2f, Down: %.2f) | Accum: %.2f ms",
+                                 layer_id, dev, M, t_tot, t_attn_hc, t_qkv, t_attn, t_out, t_ffn_hc, t_gate, t_shared, t_moe, t_dma, t_swiglu, t_down, t_accum);
                     }
                 } // end sub-chunk loop
 
@@ -1387,6 +1680,20 @@
                 size_t approx_prefilled = (size_t)super_start + ((size_t)super_M * (size_t)(layer_id + 1)) / (size_t)std::max(1, cfg_.num_hidden_layers);
                 live_context_tokens_.store(approx_prefilled, std::memory_order_relaxed);
             } // end layer loop
+
+            if (num_gpus_ > 1 && active_pp_dev_ == 1) {
+                if (is_last_super_chunk) {
+                    pp_copy_d2d(pp_peer_.prefill_bufs_.buf_hc_state.bf16() + (size_t)(super_M - 1) * hc_dim, 0,
+                                prefill_bufs_.buf_hc_state.bf16() + (size_t)(super_M - 1) * hc_dim, 1,
+                                hc_dim * sizeof(__nv_bfloat16));
+                    pp_copy_d2d(pp_peer_.prefill_bufs_.buf_hc_pre_mix.f32() + (size_t)(super_M - 1) * hc, 0,
+                                prefill_bufs_.buf_hc_pre_mix.f32() + (size_t)(super_M - 1) * hc, 1,
+                                hc * sizeof(float));
+                } else {
+                    CUDA_CHECK(cudaStreamSynchronize(main_stream_));
+                }
+                set_active_pp_device(0);
+            }
             live_context_tokens_.store((size_t)super_end, std::memory_order_relaxed);
 
             // 4. If this is the last super-chunk, prepare logits for the last token

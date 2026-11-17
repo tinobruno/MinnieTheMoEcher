@@ -140,6 +140,7 @@ static bool inspect_model_manifest(const std::filesystem::path& manifest_file, D
     out.n_experts = n_routed;
     out.max_seq_len = mc.value("max_seq_len", mc.value("original_seq_len", 32768));
     out.has_vision = mc.value("has_vision", false) || j.contains("visual_config") || mc.contains("vision_config") ||
+                     j.contains("mmproj_gguf") ||
                      std::filesystem::exists(base_dir / "vision" / "moecher_manifest.json", ec);
     out.total_weights_gb = (double)total_bytes / (1024.0 * 1024.0 * 1024.0);
     return true;
@@ -287,6 +288,8 @@ int main(int argc, char** argv) {
     int mtp_k = 0; // 0 = auto (1 on 16GB GPUs, 4 on >=24GB GPUs)
     bool enable_anti_loop = false;
     bool enable_cpu_experts = true;
+    bool enable_ssd_tail_pruning = false;
+    int max_gpus = 0; // 0 = auto (up to 2 GPUs if available), 1 = single GPU, 2 = dual GPU
     bool enable_vision = true;
     bool manifest_explicit = false;
     bool spec_explicit = false;
@@ -301,6 +304,9 @@ int main(int argc, char** argv) {
             printf("  --port, -p <port>           Server port (default: %d)\n", port);
             printf("  --proxy-port, -pp <port>    Proxy port (default: %d)\n", proxy_port);
             printf("  --max-vram, -V <gb>         Max VRAM budget in GB\n");
+            printf("  --gpus, --num-gpus <1|2|auto> Number of GPUs for Pipeline Parallelism (default: auto)\n");
+            printf("  --single-gpu                Force single-GPU execution on GPU 0\n");
+            printf("  --multi-gpu, --dual-gpu     Enable 2-GPU NVLink Pipeline Parallelism across GPU 0 + GPU 1\n");
             printf("  --dram-cache-gb <gb>        DRAM cache budget in GB\n");
             printf("  --ctx, -c <tokens>          Max context length in tokens (default: 65536)\n");
             printf("  --max-seq-len <tokens>      Alias for --ctx\n");
@@ -317,6 +323,8 @@ int main(int argc, char** argv) {
             printf("  --anti-loop                 Enable n-gram repetition loop detector & breaker (default: disabled)\n");
             printf("  --cpu-experts, --cpu-moe    Enable Hybrid CPU MoE expert evaluation for L2/L2.5 misses (default: enabled)\n");
             printf("  --no-cpu-experts            Disable Hybrid CPU MoE expert evaluation (DMA all misses to GPU)\n");
+            printf("  --ssd-tail-pruning          Enable high-confidence Cold SSD tail expert pruning (default: disabled)\n");
+            printf("  --no-ssd-tail-pruning       Disable Cold SSD tail expert pruning (default)\n");
             printf("  --max-tool-rounds <n>       Max sequential tool execution rounds per turn (default: %d)\n", g_max_tool_rounds);
             printf("  --mode <chat|agentic>       Operational mode: 'chat' (dynamic intent gating) or 'agentic' (unrestricted tools, default: chat)\n");
             printf("  --chat-mode                 Enable chat mode with dynamic intent gating (outputs code in chat by default)\n");
@@ -345,6 +353,21 @@ int main(int argc, char** argv) {
             log_path = argv[++i];
         } else if ((std::string(argv[i]) == "--max-vram" || std::string(argv[i]) == "-V") && i + 1 < argc) {
             max_vram_gb = std::stof(argv[++i]);
+        } else if ((std::string(argv[i]) == "--gpus" || std::string(argv[i]) == "--num-gpus") && i + 1 < argc) {
+            std::string gstr = argv[++i];
+            if (gstr == "auto" || gstr == "0") {
+                max_gpus = 0;
+            } else {
+                try {
+                    max_gpus = std::clamp(std::stoi(gstr), 1, 2);
+                } catch (...) {
+                    max_gpus = 0;
+                }
+            }
+        } else if (std::string(argv[i]) == "--single-gpu") {
+            max_gpus = 1;
+        } else if (std::string(argv[i]) == "--multi-gpu" || std::string(argv[i]) == "--dual-gpu") {
+            max_gpus = 2;
         } else if (std::string(argv[i]) == "--dram-cache-gb" && i + 1 < argc) {
             dram_cache_gb = std::stof(argv[++i]);
         } else if (std::string(argv[i]) == "--expert-dtype" && i + 1 < argc) {
@@ -401,6 +424,10 @@ int main(int argc, char** argv) {
             enable_cpu_experts = true;
         } else if (std::string(argv[i]) == "--no-cpu-experts" || std::string(argv[i]) == "--disable-cpu-experts" || std::string(argv[i]) == "--no-cpu-moe") {
             enable_cpu_experts = false;
+        } else if (std::string(argv[i]) == "--ssd-tail-pruning" || std::string(argv[i]) == "--enable-ssd-tail-pruning") {
+            enable_ssd_tail_pruning = true;
+        } else if (std::string(argv[i]) == "--no-ssd-tail-pruning" || std::string(argv[i]) == "--disable-ssd-tail-pruning") {
+            enable_ssd_tail_pruning = false;
         } else if ((std::string(argv[i]) == "--pld-tokens" || std::string(argv[i]) == "--pld-draft-tokens") && i + 1 < argc) {
             pld_draft_tokens = std::stoi(argv[++i]);
             spec_explicit = true;
@@ -738,6 +765,8 @@ int main(int argc, char** argv) {
     engine.default_enable_anti_loop_ = enable_anti_loop;
     engine.enable_cpu_experts_ = enable_cpu_experts;
     engine.default_enable_cpu_experts_ = enable_cpu_experts;
+    engine.enable_ssd_tail_pruning_ = enable_ssd_tail_pruning;
+    engine.max_gpus_ = max_gpus;
     engine.enable_vision_ = enable_vision;
     LOG_INFO("Speculative decoding: %s (PLD: %s, MTP: %s, Tree MTP: %s, tree_nodes=%d, mtp_k=%d)",
              enable_spec ? "enabled" : "disabled",

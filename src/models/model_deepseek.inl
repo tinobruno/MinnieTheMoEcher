@@ -445,9 +445,11 @@
                     }
 
                     // L1 miss — find eviction candidate
+                    int s_begin = 0, s_end = expert_loader_.cache_capacity_;
+                    expert_loader_.get_layer_slot_range(layer_id, s_begin, s_end);
                     int evict_slot = -1;
                     int64_t oldest = INT64_MAX;
-                    for (int i = 0; i < expert_loader_.cache_capacity_; i++) {
+                    for (int i = s_begin; i < s_end; i++) {
                         if (expert_loader_.cache_slots_[i].layer_id < 0) { evict_slot = i; break; }
                         if (expert_loader_.cache_slots_[i].last_used < oldest) {
                             oldest = expert_loader_.cache_slots_[i].last_used;
@@ -510,20 +512,23 @@
             std::future<bool> io_futures[32];
             for (int k = 0; k < top_k; k++) {
                 if (reqs[k].l1_hit) continue;
-                io_futures[k] = expert_pool_->enqueue([this, &reqs, k]() -> bool {
+                io_futures[k] = expert_pool_->enqueue([this, &reqs, k, layer_id]() -> bool {
+                    int dev = layer_device(layer_id);
+                    if (num_gpus_ > 1) CUDA_CHECK(cudaSetDevice(dev));
                     auto& r = reqs[k];
                     void* host_ptr = r.host_src;
                     if (r.stage_idx >= 0) {
                         // SSD path: 2.5ms SSD read provides enough time for writeback (0.27ms) to complete
                         auto& stage = expert_loader_.staging_ring_[r.stage_idx];
-                        CUDA_CHECK(cudaEventSynchronize(stage.event));
+                        cudaEvent_t st_ev = (dev == 1 && stage.event_dev1) ? stage.event_dev1 : stage.event;
+                        CUDA_CHECK(cudaEventSynchronize(st_ev));
                         int64_t bytes = expert_loader_.expert_file_.pread_exact(
                             stage.ptr, expert_loader_.expert_block_size_, r.key * expert_loader_.expert_block_size_);
                         if (bytes != expert_loader_.expert_block_size_) return false;
                         host_ptr = stage.ptr;
                         CUDA_CHECK(cudaMemcpyAsync(r.gpu_dst, host_ptr, expert_loader_.expert_block_size_,
                                                     cudaMemcpyHostToDevice, expert_streams_[k]));
-                        CUDA_CHECK(cudaEventRecord(stage.event, expert_streams_[k]));
+                        CUDA_CHECK(cudaEventRecord(st_ev, expert_streams_[k]));
                     } else {
                         // L2 hit path: DMA is immediate, must wait for writeback to complete first
                         expert_loader_.wait_for_writeback(expert_streams_[k]);
@@ -738,7 +743,7 @@
                                            (const block_iq2_xxs*)w1_data,
                                            (const block_iq2_xxs*)w3_data,
                                            moe_inter, dim, cfg_.swiglu_limit, stream);
-            gemm_q2_k_dequant(my_down, 1, dim, moe_inter, my_gate, (const block_q2_K*)w2_data, stream);
+            gemv_q2_k_cuda(my_down, my_gate, (const block_q2_K*)w2_data, dim, moe_inter, stream);
         } else if (cfg_.expert_dtype == "int2") {
             auto& w1s_info = expert_parts_["w1.scale"];
             auto& w3s_info = expert_parts_["w3.scale"];
@@ -783,12 +788,15 @@
             uint8_t* w1_scale = block + w1s_info.offset_in_block;
             uint8_t* w3_scale = block + w3s_info.offset_in_block;
             uint8_t* w2_scale = block + w2s_info.offset_in_block;
-            int w1_scale_cols = w1s_info.shape.size() > 1 ? w1s_info.shape[1] : 1;
-            int w2_scale_cols = w2s_info.shape.size() > 1 ? w2s_info.shape[1] : 1;
-            gemm_fp4_dequant(my_gate, 1, moe_inter, dim, in_hidden, w1_data, w1_scale, w1_scale_cols, stream);
-            gemm_fp4_dequant(my_up,   1, moe_inter, dim, in_hidden, w3_data, w3_scale, w1_scale_cols, stream);
-            silu_mul_cuda(my_gate, my_gate, my_up, moe_inter, cfg_.swiglu_limit, stream);
-            gemm_fp4_dequant(my_down, 1, dim, moe_inter, my_gate, w2_data, w2_scale, w2_scale_cols, stream);
+            gemv_fp4_swiglu_fused_cuda(
+                my_gate, in_hidden,
+                w1_data, w1_scale,
+                w3_data, w3_scale,
+                moe_inter, dim, cfg_.swiglu_limit, stream);
+            gemv_fp4_cuda(
+                my_down, my_gate,
+                w2_data, w2_scale,
+                dim, moe_inter, stream);
         }
     }
 
@@ -865,6 +873,9 @@
         int max_combined = window + cfg_.max_compressed_entries;
 
         for (int start = start_offset; start < total_tokens; start += chunk_size) {
+            if (num_gpus_ > 1 && active_pp_dev_ != 0) {
+                set_active_pp_device(0);
+            }
             int M = std::min(chunk_size, total_tokens - start);
             int position = start;
             bool is_last_chunk = (start + M == total_tokens);
@@ -910,6 +921,12 @@
 
             // 3. Process each layer
             for (int layer_id = 0; layer_id < cfg_.num_hidden_layers; layer_id++) {
+                if (num_gpus_ > 1 && layer_id == pp_split_layer_) {
+                    pp_copy_d2d(pp_peer_.prefill_bufs_.buf_hc_state.data, 1, prefill_bufs_.buf_hc_state.data, 0, (size_t)M * hc_dim * sizeof(__nv_bfloat16));
+                    pp_copy_d2d(pp_peer_.prefill_bufs_.buf_tokens.data, 1, prefill_bufs_.buf_tokens.data, 0, (size_t)M * sizeof(int32_t));
+                    pp_copy_d2d(pp_peer_.prefill_bufs_.buf_pos.data, 1, prefill_bufs_.buf_pos.data, 0, (size_t)M * sizeof(int32_t));
+                    set_active_pp_device(1);
+                }
                 auto& lw = layers_[layer_id];
 
                 // ── HC pre for attention + Attention norm (fused into 1 pass) ──
@@ -1209,6 +1226,11 @@
                                           prefill_bufs_.buf_hc_comb.f32(),
                                           M, dim, hc, main_stream_);
             } // end layer loop
+
+            if (num_gpus_ > 1 && active_pp_dev_ == 1) {
+                pp_copy_d2d(pp_peer_.prefill_bufs_.buf_hc_state.data, 0, prefill_bufs_.buf_hc_state.data, 1, (size_t)M * hc_dim * sizeof(__nv_bfloat16));
+                set_active_pp_device(0);
+            }
 
             // 4. If this is the last chunk, prepare logits for the last token
             if (is_last_chunk) {
